@@ -1,17 +1,21 @@
-use arrow::{array::{StringArray, TimestampNanosecondArray}, datatypes::{DataType, Field, Schema}};
 use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{StringArray, TimestampNanosecondArray},
+    datatypes::{DataType, Field, Schema},
+};
 use arrow_schema::TimeUnit;
-use datafusion::arrow::array::{StringBuilder, TimestampNanosecondBuilder};
+use chrono::{DateTime, Utc};
 use datafusion::common::DataFusionError;
 use datafusion::prelude::*;
-use deltalake::DeltaTable;
-use deltalake::ObjectStore;
-use deltalake::delta_datafusion::DeltaTableProvider;
+use deltalake::{kernel::StructField, DeltaOps, DeltaTable};
+use deltalake::{
+    DeltaTableBuilder,
+    delta_datafusion::{DeltaScanConfig, DeltaTableProvider},
+};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-type ProjectConfigs =
-    Arc<RwLock<HashMap<String, (String, Arc<dyn ObjectStore>, Arc<RwLock<DeltaTable>>)>>>;
+type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<DeltaTable>>)>>>;
 
 struct Database {
     project_configs: ProjectConfigs,
@@ -37,45 +41,72 @@ impl Database {
             project_id
         );
 
-        // Attempt to open the Delta table at the given path.
-        // If it does not exist, create it with a predefined schema.
-        let delta_table = match DeltaTable::open(&table_path).await {
+        let table = match DeltaTableBuilder::from_uri(&table_path).load().await {
             Ok(table) => table,
             Err(_) => {
-                let schema = Schema::new(vec![
-                    Field::new("project_id", DataType::Utf8, false),
-                    Field::new(
-                        "timestamp",
-                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                let struct_fields = vec![
+                    StructField::new(
+                        "project_id".to_string(),
+                        deltalake::kernel::DataType::Primitive(
+                            deltalake::kernel::PrimitiveType::String,
+                        ),
                         false,
                     ),
-                    Field::new(
-                        "start_time",
-                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    StructField::new(
+                        "timestamp".to_string(),
+                        deltalake::kernel::DataType::Primitive(
+                            deltalake::kernel::PrimitiveType::Timestamp,
+                        ),
+                        false,
+                    ),
+                    StructField::new(
+                        "start_time".to_string(),
+                        deltalake::kernel::DataType::Primitive(
+                            deltalake::kernel::PrimitiveType::Timestamp,
+                        ),
                         true,
                     ),
-                    Field::new(
-                        "end_time",
-                        DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    StructField::new(
+                        "end_time".to_string(),
+                        deltalake::kernel::DataType::Primitive(
+                            deltalake::kernel::PrimitiveType::Timestamp,
+                        ),
                         true,
                     ),
-                    Field::new("payload", DataType::Utf8, true),
-                ]);
-                DeltaTable::create_table(&table_path, schema).await?
+                    StructField::new(
+                        "payload".to_string(),
+                        deltalake::kernel::DataType::Primitive(
+                            deltalake::kernel::PrimitiveType::String,
+                        ),
+                        true,
+                    ),
+                ];
+                // DeltaOps::try_from_uri(&table_path).await.unwrap()
+                //     .create()
+                //     .with_columns(schema.fields)
+                //     .await?
+
+                DeltaOps::new_in_memory()
+                    .create()
+                    .with_columns(struct_fields)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?
+                // panic!("Dd")
             }
         };
 
-        // Store the mapping of project_id to (connection string, delta table) for later queries.
+        // Now insert a tuple of three elements (connection string, object store, delta table)
         self.project_configs.write().unwrap().insert(
             project_id.to_string(),
             (
                 s3_connection_string.to_string(),
-                Arc::new(RwLock::new(delta_table)),
+                Arc::new(RwLock::new(table)),
             ),
         );
 
         Ok(())
     }
+
     async fn query(&self, sql: &str) -> Result<DataFrame, DataFusionError> {
         let project_id = extract_project_id_from_sql(sql)?;
         let (.., delta_table) = self
@@ -84,58 +115,102 @@ impl Database {
             .unwrap()
             .get(&project_id)
             .ok_or_else(|| {
-                DataFusionError::External(format!("Project ID '{}' not found", project_id))
+                DataFusionError::External(format!("Project ID '{}' not found", project_id).into())
             })?;
+        let table = delta_table.read().unwrap();
+        let snapshot = table
+            .snapshot()
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let provider = DeltaTableProvider::try_new(
+            snapshot.clone(),
+            table.log_store().clone(),
+            DeltaScanConfig::default(),
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         self.ctx
-            .register_table("table", DeltaTableProvider::new(delta_table.clone()))?;
+            .register_table("table", Arc::new(provider))
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
         self.ctx.sql(sql).await
     }
 
     async fn write(
         &self,
         project_id: &str,
-        timestamp: i64,
-        start_time: Option<i64>,
-        end_time: Option<i64>,
+        timestamp: DateTime<Utc>,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
         payload: Option<&str>,
     ) -> Result<(), DataFusionError> {
         let (.., delta_table) = self
             .project_configs
             .read()
             .unwrap()
-            .get(project_id).expect("no project_id in sql query");
+            .get(project_id)
+            .expect("no project_id in sql query");
 
-        // delta_table.read().unwrap().schema().unwrap()    
-        let mut batch = RecordBatch::try_new(
-            delta_table.read().unwrap().schema().unwrap().clone(),
+        // Wrap the schema in an Arc since RecordBatch::try_new expects a SchemaRef.
+        let schema = Schema::new(vec![
+            Field::new("project_id", DataType::Utf8, false),
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new(
+                "start_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new(
+                "end_time",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+            Field::new("payload", DataType::Utf8, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema),
             vec![
                 Arc::new(StringArray::from(vec![project_id])),
-                Arc::new(TimestampNanosecondArray::from(vec![timestamp])),
-                Arc::new(TimestampNanosecondArray::from(vec![timestamp])),
-                Arc::new(TimestampNanosecondArray::from(vec![timestamp])),
-                Arc::new(StringArray::from(vec![project_id])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    timestamp.timestamp_nanos_opt().unwrap(),
+                ])),
+                // For illustration, we use the same timestamp for the optional times.
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    start_time.map_or(timestamp.timestamp_nanos_opt().unwrap(), |t| {
+                        t.timestamp_nanos_opt().unwrap()
+                    }),
+                ])),
+                Arc::new(TimestampNanosecondArray::from(vec![
+                    end_time.map_or(timestamp.timestamp_nanos_opt().unwrap(), |t| {
+                        t.timestamp_nanos_opt().unwrap()
+                    }),
+                ])),
+                Arc::new(StringArray::from(vec![payload.unwrap_or("")])),
             ],
         )?;
 
-        delta_table
-            .write()
-            .unwrap()
-            .update_and_commit_batch(batch, ParquetWriteOptions::default())
-            .await?;
+        let mut table = delta_table.write().unwrap();
+        DeltaOps::new_in_memory()
+            .write(&batch)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
         Ok(())
     }
 }
 
 fn extract_project_id_from_sql(sql: &str) -> Result<String, DataFusionError> {
-    // Simplified example, use a proper SQL parser for production.
+    // Very simple extraction; use a proper SQL parser in production.
     sql.to_lowercase()
         .find("where project_id = '")
         .map(|start| {
             let end = sql[start + 20..].find("'").unwrap();
             sql[start + 20..start + 20 + end].to_string()
         })
-        .ok_or_else(|| DataFusionError::External("Project ID not found in SQL".to_string()))
+        .ok_or_else(|| DataFusionError::External("Project ID not found in SQL".to_string().into()))
 }
 
 #[tokio::main]
@@ -147,11 +222,19 @@ async fn main() -> Result<(), DataFusionError> {
         .await?;
 
     let now = Utc::now();
-    db.write("project_123", now, Some(now), None, Some("data1")).await?;
-    db.write("project_456", now, None, Some(now), Some("data2")).await?;
+    db.write("project_123", now, Some(now), None, Some("data1"))
+        .await?;
+    db.write("project_456", now, None, Some(now), Some("data2"))
+        .await?;
 
-    db.query("SELECT * FROM table WHERE project_id = 'project_123'").await?.show().await?;
-    db.query("SELECT * FROM table WHERE project_id = 'project_456'").await?.show().await?;
+    db.query("SELECT * FROM table WHERE project_id = 'project_123'")
+        .await?
+        .show()
+        .await?;
+    db.query("SELECT * FROM table WHERE project_id = 'project_456'")
+        .await?
+        .show()
+        .await?;
 
     Ok(())
 }

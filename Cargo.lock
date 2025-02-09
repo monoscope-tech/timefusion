@@ -5684,6 +5684,7 @@ dependencies = [
  "arrow 54.1.0",
  "arrow-schema 54.1.0",
  "async-trait",
+ "chrono",
  "color-eyre",
  "datafusion 45.0.0",
  "deltalake",

@@ -20,3 +20,4 @@ color-eyre = "0.6.3"
 arrow-schema = "54.1.0"
 regex = "1.11.1"
 deltalake = { version = "0.24.0",  features=["datafusion", "datafusion-ext", "s3", "s3-native-tls"]}
+chrono = "0.4.39"
