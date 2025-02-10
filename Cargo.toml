@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
-datafusion = "45.0.0"  
+datafusion = "44.0.0"  
 arrow = "54.1.0"
 uuid = { version = "1.13", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
