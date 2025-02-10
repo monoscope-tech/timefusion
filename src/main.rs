@@ -1,9 +1,9 @@
-use arrow::record_batch::RecordBatch;
-use arrow::{
+use deltalake::arrow::record_batch::RecordBatch;
+use deltalake::arrow::{
     array::{StringArray, TimestampNanosecondArray},
     datatypes::{DataType, Field, Schema},
 };
-use arrow_schema::TimeUnit;
+use deltalake::arrow::datatypes::TimeUnit;
 use chrono::{DateTime, Utc};
 use datafusion::common::DataFusionError;
 use datafusion::prelude::*;
@@ -12,6 +12,7 @@ use deltalake::{
     DeltaTableBuilder,
     delta_datafusion::{DeltaScanConfig, DeltaTableProvider},
 };
+use datafusion::datasource::TableProvider;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -190,11 +191,12 @@ impl Database {
                 ])),
                 Arc::new(StringArray::from(vec![payload.unwrap_or("")])),
             ],
-        )?;
+        ).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let mut table = delta_table.write().unwrap();
+        // let mut table = delta_table.write().unwrap();
+        let batches: Vec<RecordBatch> = vec![batch];
         DeltaOps::new_in_memory()
-            .write(&batch)
+            .write(batches.into_iter())
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 

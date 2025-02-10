@@ -5,19 +5,19 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
-datafusion = "45.0.0"            # or your chosen version
+datafusion = "45.0.0"  
 arrow = "54.1.0"
 uuid = { version = "1.13", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-async-trait = "0.1"
-env_logger = "0.11"
-log = "0.4"
-iceberg = "0.4"              
+serde_json = "1.0.138"
+async-trait = "0.1.86"
+env_logger = "0.11.6"
+log = "0.4.25"
+iceberg = "0.4.0"              
 iceberg-catalog-rest = "0.4.0"
 iceberg-catalog-memory = "0.4.0"
 color-eyre = "0.6.3"
 arrow-schema = "54.1.0"
 regex = "1.11.1"
-deltalake = { version = "0.24.0",  features=["datafusion", "datafusion-ext", "s3", "s3-native-tls"]}
+deltalake = { version = "0.24.0",  features=["datafusion"]}
 chrono = "0.4.39"
