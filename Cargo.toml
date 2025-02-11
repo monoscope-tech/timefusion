@@ -19,5 +19,5 @@ iceberg-catalog-memory = "0.4.0"
 color-eyre = "0.6.3"
 arrow-schema = "54.1.0"
 regex = "1.11.1"
-deltalake = { version = "0.24.0",  features=["datafusion"]}
+deltalake = { version = "0.24.0",  features=["datafusion","s3"]}
 chrono = "0.4.39"

@@ -1,5 +1,3 @@
-//src/main.rs
-
 use deltalake::arrow::record_batch::RecordBatch;
 use deltalake::arrow::{
     array::{StringArray, TimestampMicrosecondArray},
@@ -16,14 +14,16 @@ use deltalake::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::env;
 
+// Define a type alias for shared project configuration.
 type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<DeltaTable>>)>>>;
  
-// Helper function to build a TimestampMicrosecondArray with microsecond precision.
-fn build_timestamp_array(values: Vec<i64>) -> TimestampMicrosecondArray {
+// Updated helper function to build a TimestampMicrosecondArray that accepts an optional timezone.
+fn build_timestamp_array(values: Vec<i64>, tz: Option<Arc<str>>) -> TimestampMicrosecondArray {
     use deltalake::arrow::array::ArrayData;
     use deltalake::arrow::buffer::Buffer;
-    let data_type = DataType::Timestamp(TimeUnit::Microsecond, None);
+    let data_type = DataType::Timestamp(TimeUnit::Microsecond, tz);
     let buffer = Buffer::from_slice_ref(&values);
     let array_data = ArrayData::builder(data_type.clone())
         .len(values.len())
@@ -49,14 +49,20 @@ impl Database {
     async fn add_project(
         &self,
         project_id: &str,
-        s3_connection_string: &str,
+        connection_string: &str,
     ) -> Result<(), DataFusionError> {
-        let table_path = format!(
-            "{}/{}",
-            s3_connection_string.trim_end_matches('/'),
-            project_id
-        );
+        // Determine the table URI: if connection_string starts with an S3 scheme, use it;
+        // otherwise, append the project_id.
+        let table_path = if connection_string.starts_with("s3://")
+            || connection_string.starts_with("s3a://")
+            || connection_string.starts_with("s3n://")
+        {
+            connection_string.to_string()
+        } else {
+            format!("{}/{}", connection_string.trim_end_matches('/'), project_id)
+        };
  
+        // Try to load the Delta table; if it doesn't exist, create it.
         let table = match DeltaTableBuilder::from_uri(&table_path).load().await {
             Ok(table) => table,
             Err(_) => {
@@ -96,33 +102,37 @@ impl Database {
                         ),
                         true,
                     ),
+                    // Partition column "event_date"
+                    StructField::new(
+                        "event_date".to_string(),
+                        deltalake::kernel::DataType::Primitive(
+                            deltalake::kernel::PrimitiveType::String,
+                        ),
+                        false,
+                    ),
                 ];
-                // Create a new Delta table with the specified schema.
-                DeltaOps::new_in_memory()
+                DeltaOps::try_from_uri(&table_path)
+                    .await?
                     .create()
                     .with_columns(struct_fields)
+                    .with_partition_columns(vec!["event_date".to_string()])
                     .await
                     .map_err(|e| DataFusionError::External(Box::new(e)))?
             }
         };
  
-        // Insert the project configuration.
         self.project_configs.write().unwrap().insert(
             project_id.to_string(),
-            (
-                s3_connection_string.to_string(),
-                Arc::new(RwLock::new(table)),
-            ),
+            (connection_string.to_string(), Arc::new(RwLock::new(table))),
         );
  
         Ok(())
     }
  
     async fn query(&self, sql: &str) -> Result<DataFrame, DataFusionError> {
+        // Extract project ID from the SQL (expects "WHERE project_id = '<id>'").
         let project_id = extract_project_id_from_sql(sql)?;
-        // Bind the read guard so that it lives long enough.
         let configs = self.project_configs.read().unwrap();
-        // Clone the Arc to extend the lifetime beyond the guard.
         let (.., delta_table) = configs
             .get(&project_id)
             .ok_or_else(|| {
@@ -140,11 +150,14 @@ impl Database {
         )
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
  
+        // Register a unique table name for DataFusion.
+        let unique_table_name = format!("table_{}", project_id);
         self.ctx
-            .register_table("table", Arc::new(provider))
+            .register_table(&unique_table_name, Arc::new(provider))
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
  
-        self.ctx.sql(sql).await
+        let new_sql = sql.replace("\"table\"", &format!("\"{}\"", unique_table_name));
+        self.ctx.sql(&new_sql).await
     }
  
     async fn write(
@@ -155,89 +168,121 @@ impl Database {
         end_time: Option<DateTime<Utc>>,
         payload: Option<&str>,
     ) -> Result<(), DataFusionError> {
-        // Bind the read guard to a variable.
+        // Retrieve connection string from the project configuration.
         let configs = self.project_configs.read().unwrap();
-        // Clone the Arc so that it lives beyond the guard.
-        let (.., _delta_table) = configs
+        let (conn_str, _) = configs
             .get(project_id)
             .expect("no project_id in sql query")
             .clone();
  
-        // Define the record batch schema with timestamps having microsecond precision.
+        // Define the Arrow schema with timestamp fields that include an explicit timezone.
         let schema = Schema::new(vec![
             Field::new("project_id", DataType::Utf8, false),
             Field::new(
                 "timestamp",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
             Field::new(
                 "start_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 true,
             ),
             Field::new(
                 "end_time",
-                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 true,
             ),
             Field::new("payload", DataType::Utf8, true),
+            Field::new("event_date", DataType::Utf8, false),
         ]);
+ 
+        // Compute the partition column "event_date" as "YYYY-MM-DD".
+        let event_date = timestamp.format("%Y-%m-%d").to_string();
+ 
+        // Build the record batch.
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
                 Arc::new(StringArray::from(vec![project_id])),
-                Arc::new(build_timestamp_array(vec![timestamp.timestamp_micros()])),
-                Arc::new(build_timestamp_array(vec![start_time.map_or(timestamp.timestamp_micros(), |t| t.timestamp_micros())])),
-                Arc::new(build_timestamp_array(vec![end_time.map_or(timestamp.timestamp_micros(), |t| t.timestamp_micros())])),
+                // Supply timezone "UTC" to the helper function.
+                Arc::new(build_timestamp_array(vec![timestamp.timestamp_micros()], Some("UTC".into()))),
+                Arc::new(build_timestamp_array(
+                    vec![start_time.map_or(timestamp.timestamp_micros(), |t| t.timestamp_micros())],
+                    Some("UTC".into())
+                )),
+                Arc::new(build_timestamp_array(
+                    vec![end_time.map_or(timestamp.timestamp_micros(), |t| t.timestamp_micros())],
+                    Some("UTC".into())
+                )),
                 Arc::new(StringArray::from(vec![payload.unwrap_or("")])),
+                Arc::new(StringArray::from(vec![event_date])),
             ],
-        ).map_err(|e| DataFusionError::External(Box::new(e)))?;
+        )
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
  
         let batches: Vec<RecordBatch> = vec![batch];
-        DeltaOps::new_in_memory()
+        // Write using DeltaOps::try_from_uri with the connection string.
+        DeltaOps::try_from_uri(&conn_str)
+            .await?
             .write(batches.into_iter())
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
  
         Ok(())
     }
+ 
+    // Stub for periodic compaction.
+    async fn compact(&self, project_id: &str) -> Result<(), DataFusionError> {
+        let configs = self.project_configs.read().unwrap();
+        let (_, delta_table_arc) = configs.get(project_id)
+            .ok_or_else(|| DataFusionError::External(format!("Project ID '{}' not found", project_id).into()))?
+            .clone();
+        let _table = delta_table_arc.read().unwrap();
+        println!("Compaction for project '{}' would run here.", project_id);
+        Ok(())
+    }
 }
  
+// Helper to extract the project ID from a SQL string (expects "WHERE project_id = '<id>'").
 fn extract_project_id_from_sql(sql: &str) -> Result<String, DataFusionError> {
-    // Very simple extraction; use a proper SQL parser in production.
     sql.to_lowercase()
         .find("where project_id = '")
         .map(|start| {
-            let end = sql[start + 20..].find("'").unwrap();
-            sql[start + 20..start + 20 + end].to_string()
+            let idx = start + "where project_id = '".len();
+            let end = sql[idx..].find('\'').unwrap();
+            sql[idx..idx + end].to_string()
         })
         .ok_or_else(|| DataFusionError::External("Project ID not found in SQL".to_string().into()))
 }
  
 #[tokio::main]
 async fn main() -> Result<(), DataFusionError> {
+    // Register S3 handlers so that arbitrary S3 URIs are recognized.
+    deltalake::aws::register_handlers(None);
+ 
+    // Retrieve the S3 bucket name from the environment.
+    let bucket = env::var("S3_BUCKET_NAME")
+        .expect("S3_BUCKET_NAME environment variable not set");
+    // Build the table URI, e.g., s3://<bucket>/delta_table.
+    let s3_uri = format!("s3://{}/delta_table", bucket);
+    
     let db = Database::new().await?;
-    db.add_project("project_123", "file:///tmp/delta_123")
-        .await?;
-    db.add_project("project_456", "file:///tmp/delta_456")
-        .await?;
- 
+    
+    // For now, support a single telemetry/events table.
+    db.add_project("events", &s3_uri).await?;
+    
     let now = Utc::now();
-    db.write("project_123", now, Some(now), None, Some("data1"))
-        .await?;
-    db.write("project_456", now, None, Some(now), Some("data2"))
-        .await?;
- 
-    // Note: Enclose the table name in double quotes to avoid SQL parser conflicts.
-    db.query("SELECT * FROM \"table\" WHERE project_id = 'project_123'")
+    db.write("events", now, Some(now), None, Some("data1")).await?;
+    
+    // Execute a query; the placeholder "table" is replaced with the unique table name.
+    db.query("SELECT * FROM \"table\" WHERE project_id = 'events'")
         .await?
         .show()
         .await?;
-    db.query("SELECT * FROM \"table\" WHERE project_id = 'project_456'")
-        .await?
-        .show()
-        .await?;
- 
+    
+    // Optionally run the compaction stub.
+    db.compact("events").await?;
+    
     Ok(())
 }
