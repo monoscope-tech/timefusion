@@ -25,25 +25,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     // Initialize the Database.
     let db = Arc::new(Database::new().await?);
-    db.add_project("events", &s3_uri).await?;
+    // Add the project.
+    (*db).add_project("events", &s3_uri).await?;
+    // Create and register the table under "table_events"
+    (*db).create_events_table("events", &s3_uri).await?;
     
     // Write a sample record.
     let now = Utc::now();
-    db.write("events", now, Some(now), None, Some("data1")).await?;
+    (*db).write("events", now, Some(now), None, Some("data1")).await?;
     
     // Run a sample query.
-    db.query("SELECT * FROM \"table_events\" WHERE project_id = 'events'")
+    // Use the generic table name "table" so that prepare_sql rewrites it to "table_events"
+    (*db).query("SELECT * FROM \"table\" WHERE project_id = 'events'")
         .await?
         .show()
         .await?;
     
-    db.compact("events").await?;
+    (*db).compact("events").await?;
     
     // Initialize the persistent queue.
     let queue = Arc::new(PersistentQueue::new("./queue_db"));
     
     // Initialize the ingestion status store.
-    let status_store = Arc::new(ingest::IngestStatusStore::new());
+    let status_store = ingest::IngestStatusStore::new();
 
     // Spawn a background task to flush the persistent queue.
     {
@@ -62,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if !records.is_empty() {
                     println!("Flushing {} enqueued records", records.len());
                     for (key, record) in records {
+                        // Convert key (IVec) to owned Vec<u8> then to String.
                         let key_vec = key.to_vec();
                         let id = match str::from_utf8(&key_vec) {
                             Ok(s) => s.to_string(),
@@ -85,14 +90,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                     let queue_clone2 = queue_clone.clone();
                                     let key_vec_owned = key_vec.clone();
                                     tokio::spawn(async move {
+                                        println!("Attempting to remove key: {:?}", key_vec_owned);
                                         let owned_key = sled::IVec::from(key_vec_owned);
                                         let remove_res = tokio::task::spawn_blocking(move || {
                                             queue_clone2.remove_sync(owned_key)
-                                        }).await;
+                                        })
+                                        .await;
                                         match remove_res {
                                             Ok(Ok(())) => println!("Successfully removed key."),
                                             Ok(Err(e)) => eprintln!("Removal failed: {}", e),
-                                            Err(e) => eprintln!("Spawn blocking join error during removal: {}", e),
+                                            Err(e) => eprintln!("Join error during removal: {}", e),
                                         }
                                     });
                                 }
@@ -107,11 +114,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             let key_vec_owned = key_vec.clone();
                             let remove_res = tokio::task::spawn_blocking(move || {
                                 queue_clone3.remove_sync(sled::IVec::from(key_vec_owned))
-                            }).await;
+                            })
+                            .await;
                             match remove_res {
                                 Ok(Ok(())) => println!("Successfully removed key for invalid timestamp."),
                                 Ok(Err(e)) => eprintln!("Removal failed for invalid timestamp: {}", e),
-                                Err(e) => eprintln!("Spawn blocking join error during removal for invalid timestamp: {}", e),
+                                Err(e) => eprintln!("Join error during removal for invalid timestamp: {}", e),
                             }
                             status_store_clone.set_status(id.clone(), "Invalid timestamp".to_string());
                         }

@@ -203,7 +203,6 @@ async fn encode_dataframe(
 }
  
 fn serialize_row(row_values: Vec<String>) -> BytesMut {
-    // Produce only the payload: field count and per-field data.
     let payload_len: usize = 2 + row_values.iter().map(|v| 4 + if v == "NULL" { 0 } else { v.len() }).sum::<usize>();
     let mut buf = BytesMut::with_capacity(payload_len);
     buf.extend_from_slice(&(row_values.len() as i16).to_be_bytes());

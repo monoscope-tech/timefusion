@@ -51,13 +51,14 @@ impl PersistentQueue {
         }).await?
     }
 
-    /// Synchronous removal function.
+    /// Synchronous removal method.
     pub fn remove_sync(&self, key: IVec) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.db.remove(key)?;
         self.db.flush()?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn remove(&self, key: IVec) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         tokio::task::spawn_blocking({
             let db = self.db.clone();

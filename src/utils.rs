@@ -4,6 +4,7 @@ use chrono::{Utc, LocalResult, TimeZone};
 use datafusion::arrow::array::{Array, StringArray, TimestampMicrosecondArray};
 use std::collections::HashMap;
 
+#[allow(dead_code)]
 pub fn parse_insert_query(query: &str) -> Result<HashMap<String, String>, DataFusionError> {
     let re = Regex::new(r#"(?i)insert\s+into\s+"table"\s*\(([^)]+)\)\s+values\s*\(([^)]+)\)"#)
         .map_err(|e| DataFusionError::External(e.to_string().into()))?;

@@ -1,5 +1,5 @@
 use actix_web::{get, post, web, HttpResponse, Responder};
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -45,7 +45,6 @@ pub async fn ingest(
     _db: web::Data<Arc<Database>>,
     queue: web::Data<Arc<PersistentQueue>>,
 ) -> impl Responder {
-    // Validate the timestamp.
     if DateTime::parse_from_rfc3339(&data.timestamp).is_err() {
         return HttpResponse::BadRequest().body("Invalid timestamp format");
     }

@@ -1,5 +1,6 @@
 use bytes::BytesMut;
 
+#[allow(dead_code)]
 pub enum PGServerMessage {
     AuthenticationRequest,
     BackendKeyData(i32, i32),
