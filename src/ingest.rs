@@ -1,8 +1,8 @@
 use actix_web::{get, post, web, HttpResponse, Responder};
 use chrono::DateTime;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
 
 use crate::persistent_queue::{IngestRecord, PersistentQueue};
 use crate::database::Database;
@@ -20,13 +20,15 @@ impl IngestStatusStore {
     }
 
     pub fn set_status(&self, id: String, status: String) {
-        let mut map = self.inner.write().unwrap();
-        map.insert(id, status);
+        if let Ok(mut map) = self.inner.write() {
+            map.insert(id, status);
+        } else {
+            eprintln!("Failed to acquire lock in set_status");
+        }
     }
 
     pub fn get_status(&self, id: &str) -> Option<String> {
-        let map = self.inner.read().unwrap();
-        map.get(id).cloned()
+        self.inner.read().ok().and_then(|map| map.get(id).cloned())
     }
 }
 
@@ -57,7 +59,7 @@ pub async fn ingest(
     };
     match queue.enqueue(&record).await {
         Ok(receipt) => HttpResponse::Ok().body(format!("Record enqueued. Receipt: {}", receipt)),
-        Err(e) => HttpResponse::InternalServerError().body(format!("Error enqueuing record: {}", e)),
+        Err(e) => HttpResponse::InternalServerError().body(format!("Error enqueuing record: {:?}", e)),
     }
 }
 

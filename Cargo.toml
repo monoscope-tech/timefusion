@@ -26,3 +26,8 @@ sled = "0.34.7"
 actix-web = "4.9.0"
 datafusion-postgres = "0.3.0"
 datafusion-functions-json = "0.45.0"
+anyhow = "1.0.95"
+tokio-util = "0.7.13"
+tracing-subscriber ={ version = "0.3.19", features = ["env-filter"]}
+tracing = "0.1.41"
+prometheus = "0.13.4"

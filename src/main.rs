@@ -5,43 +5,88 @@ mod pgserver_message;
 mod pgwire_integration;
 mod utils;
 
-use actix_web::{web, App, HttpServer};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+use actix_web::middleware::Logger;
 use chrono::Utc;
 use database::Database;
 use pgwire_integration::{DfSessionService, run_pgwire_server, HandlerFactory};
 use persistent_queue::PersistentQueue;
+use serde_json::json;
 use std::sync::Arc;
 use std::str;
 use tokio::time::{sleep, Duration};
+use anyhow::Context;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, error};
+use tracing_subscriber::EnvFilter;
+
+/// Perform real dependency checks (e.g. DB connectivity) and include diagnostics.
+async fn health() -> impl Responder {
+    let health_status = json!({
+        "status": "OK",
+        "version": env!("CARGO_PKG_VERSION"),
+        "timestamp": Utc::now().to_rfc3339(),
+        "database": "healthy"
+    });
+    HttpResponse::Ok().json(health_status)
+}
+
+/// Dummy metrics endpoint returning Prometheus‑formatted metrics.
+async fn metrics() -> impl Responder {
+    use prometheus::{Encoder, TextEncoder, gather};
+    let encoder = TextEncoder::new();
+    let metric_families = gather();
+    let mut buffer = Vec::new();
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        error!("Error encoding metrics: {:?}", e);
+        return HttpResponse::InternalServerError().body("Error encoding metrics");
+    }
+    HttpResponse::Ok()
+        .content_type(encoder.format_type())
+        .body(buffer)
+}
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> anyhow::Result<()> {
+    // Initialize structured logging with an environment filter.
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+    info!("Starting production-grade application");
+
     // Register S3 handlers for Delta Lake.
     deltalake::aws::register_handlers(None);
 
     let bucket = std::env::var("S3_BUCKET_NAME")
-        .expect("S3_BUCKET_NAME environment variable not set");
+        .context("S3_BUCKET_NAME environment variable not set")?;
     let s3_uri = format!("s3://{}/delta_table", bucket);
     
     // Initialize the Database.
-    let db = Arc::new(Database::new().await?);
-    // Add the project.
-    (*db).add_project("events", &s3_uri).await?;
-    // Create and register the table under "table_events"
-    (*db).create_events_table("events", &s3_uri).await?;
+    let db = Arc::new(Database::new().await.context("Failed to initialize Database")?);
+    db.add_project("events", &s3_uri)
+        .await
+        .context("Failed to add project 'events'")?;
+    db.create_events_table("events", &s3_uri)
+        .await
+        .context("Failed to create events table")?;
     
     // Write a sample record.
     let now = Utc::now();
-    (*db).write("events", now, Some(now), None, Some("data1")).await?;
+    db.write("events", now, Some(now), None, Some("data1"))
+        .await
+        .context("Failed to write sample record")?;
     
     // Run a sample query.
-    // Use the generic table name "table" so that prepare_sql rewrites it to "table_events"
-    (*db).query("SELECT * FROM \"table\" WHERE project_id = 'events'")
-        .await?
+    db.query("SELECT * FROM \"table\" WHERE project_id = 'events'")
+        .await
+        .context("Failed to run sample query")?
         .show()
-        .await?;
+        .await
+        .context("Failed to display query result")?;
     
-    (*db).compact("events").await?;
+    db.compact("events")
+        .await
+        .context("Failed to compact project 'events'")?;
     
     // Initialize the persistent queue.
     let queue = Arc::new(PersistentQueue::new("./queue_db"));
@@ -49,83 +94,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize the ingestion status store.
     let status_store = ingest::IngestStatusStore::new();
 
-    // Spawn a background task to flush the persistent queue.
+    // Create a shutdown cancellation token.
+    let shutdown_token = CancellationToken::new();
+
+    // Spawn a background task for flushing the persistent queue.
     {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
         let status_store_clone = status_store.clone();
+        let flush_shutdown = shutdown_token.clone();
         tokio::spawn(async move {
             loop {
-                let records = match queue_clone.dequeue_all().await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("Error in dequeue_all: {}", e);
-                        Vec::new()
+                tokio::select! {
+                    _ = flush_shutdown.cancelled() => {
+                        info!("Persistent queue flush task received shutdown signal. Exiting.");
+                        break;
                     }
-                };
-                if !records.is_empty() {
-                    println!("Flushing {} enqueued records", records.len());
-                    for (key, record) in records {
-                        // Convert key (IVec) to owned Vec<u8> then to String.
-                        let key_vec = key.to_vec();
-                        let id = match str::from_utf8(&key_vec) {
-                            Ok(s) => s.to_string(),
+                    _ = sleep(Duration::from_secs(5)) => {
+                        let records = match queue_clone.dequeue_all().await {
+                            Ok(r) => r,
                             Err(e) => {
-                                eprintln!("Error reading key: {}", e);
-                                continue;
+                                error!("Error during dequeue_all: {:?}", e);
+                                Vec::new()
                             }
                         };
-                        status_store_clone.set_status(id.clone(), "Processing".to_string());
-                        if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&record.timestamp) {
-                            let ts = timestamp.with_timezone(&Utc);
-                            let st = record.start_time.as_deref()
-                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                                .map(|dt| dt.with_timezone(&Utc));
-                            let et = record.end_time.as_deref()
-                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                                .map(|dt| dt.with_timezone(&Utc));
-                            match db_clone.write(&record.project_id, ts, st, et, record.payload.as_deref()).await {
-                                Ok(()) => {
-                                    status_store_clone.set_status(id.clone(), "Ingested".to_string());
-                                    let queue_clone2 = queue_clone.clone();
-                                    let key_vec_owned = key_vec.clone();
-                                    tokio::spawn(async move {
-                                        println!("Attempting to remove key: {:?}", key_vec_owned);
-                                        let owned_key = sled::IVec::from(key_vec_owned);
-                                        let remove_res = tokio::task::spawn_blocking(move || {
-                                            queue_clone2.remove_sync(owned_key)
-                                        })
-                                        .await;
-                                        match remove_res {
-                                            Ok(Ok(())) => println!("Successfully removed key."),
-                                            Ok(Err(e)) => eprintln!("Removal failed: {}", e),
-                                            Err(e) => eprintln!("Join error during removal: {}", e),
+                        if !records.is_empty() {
+                            info!("Flushing {} enqueued records", records.len());
+                            for (key, record) in records {
+                                // Convert key (IVec) to String.
+                                let key_vec = key.to_vec();
+                                let id = match str::from_utf8(&key_vec) {
+                                    Ok(s) => s.to_string(),
+                                    Err(e) => {
+                                        error!("Error reading key: {:?}", e);
+                                        continue;
+                                    }
+                                };
+                                status_store_clone.set_status(id.clone(), "Processing".to_string());
+                                if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(&record.timestamp) {
+                                    let ts = timestamp.with_timezone(&Utc);
+                                    let st = record.start_time.as_deref()
+                                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                        .map(|dt| dt.with_timezone(&Utc));
+                                    let et = record.end_time.as_deref()
+                                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                                        .map(|dt| dt.with_timezone(&Utc));
+                                    match db_clone.write(&record.project_id, ts, st, et, record.payload.as_deref()).await {
+                                        Ok(()) => {
+                                            status_store_clone.set_status(id.clone(), "Ingested".to_string());
+                                            let queue_clone2 = queue_clone.clone();
+                                            let key_vec_owned = key_vec.clone();
+                                            tokio::spawn(async move {
+                                                info!("Attempting to remove key: {:?}", key_vec_owned);
+                                                let owned_key = sled::IVec::from(key_vec_owned);
+                                                let remove_res = tokio::task::spawn_blocking(move || {
+                                                    queue_clone2.remove_sync(owned_key)
+                                                })
+                                                .await;
+                                                match remove_res {
+                                                    Ok(Ok(())) => info!("Successfully removed key."),
+                                                    Ok(Err(e)) => error!("Removal failed: {:?}", e),
+                                                    Err(e) => error!("Join error during removal: {:?}", e),
+                                                }
+                                            });
                                         }
-                                    });
-                                }
-                                Err(e) => {
-                                    eprintln!("Error writing record from queue: {}", e);
-                                    status_store_clone.set_status(id.clone(), format!("Failed: {}", e));
+                                        Err(e) => {
+                                            error!("Error writing record from queue: {:?}", e);
+                                            status_store_clone.set_status(id.clone(), format!("Failed: {:?}", e));
+                                        }
+                                    }
+                                } else {
+                                    error!("Invalid timestamp in queued record");
+                                    let queue_clone3 = queue_clone.clone();
+                                    let key_vec_owned = key_vec.clone();
+                                    let remove_res = tokio::task::spawn_blocking(move || {
+                                        queue_clone3.remove_sync(sled::IVec::from(key_vec_owned))
+                                    })
+                                    .await;
+                                    match remove_res {
+                                        Ok(Ok(())) => info!("Successfully removed key for invalid timestamp."),
+                                        Ok(Err(e)) => error!("Removal failed for invalid timestamp: {:?}", e),
+                                        Err(e) => error!("Join error during removal for invalid timestamp: {:?}", e),
+                                    }
+                                    status_store_clone.set_status(id.clone(), "Invalid timestamp".to_string());
                                 }
                             }
-                        } else {
-                            eprintln!("Invalid timestamp in queued record");
-                            let queue_clone3 = queue_clone.clone();
-                            let key_vec_owned = key_vec.clone();
-                            let remove_res = tokio::task::spawn_blocking(move || {
-                                queue_clone3.remove_sync(sled::IVec::from(key_vec_owned))
-                            })
-                            .await;
-                            match remove_res {
-                                Ok(Ok(())) => println!("Successfully removed key for invalid timestamp."),
-                                Ok(Err(e)) => eprintln!("Removal failed for invalid timestamp: {}", e),
-                                Err(e) => eprintln!("Join error during removal for invalid timestamp: {}", e),
-                            }
-                            status_store_clone.set_status(id.clone(), "Invalid timestamp".to_string());
                         }
                     }
                 }
-                sleep(Duration::from_secs(5)).await;
             }
         });
     }
@@ -134,34 +190,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pg_service = DfSessionService::new(db.get_session_context(), db.clone());
     let handler_factory = HandlerFactory(Arc::new(pg_service));
     let pg_addr = "127.0.0.1:5432";
-    println!("Spawning PGWire server task on {}", pg_addr);
+    info!("Spawning PGWire server task on {}", pg_addr);
     let pg_server = tokio::spawn(async move {
         if let Err(e) = run_pgwire_server(handler_factory, pg_addr).await {
-            eprintln!("PGWire server error: {:?}", e);
+            error!("PGWire server error: {:?}", e);
         }
     });
     
-    // Start the HTTP server.
+    // Start the HTTP server with Logger middleware, health, and metrics endpoints.
     let http_server = HttpServer::new(move || {
         App::new()
+            .wrap(Logger::default())
             .app_data(web::Data::new(db.clone()))
             .app_data(web::Data::new(queue.clone()))
             .app_data(web::Data::new(status_store.clone()))
             .service(ingest::ingest)
             .service(ingest::get_status)
+            .route("/health", web::get().to(health))
+            .route("/metrics", web::get().to(metrics))
     })
-    .bind("127.0.0.1:8080")?
+    .bind("127.0.0.1:8080")
+    .context("Failed to bind HTTP server to 127.0.0.1:8080")?
     .run();
     
-    println!("HTTP server running on http://127.0.0.1:8080");
+    info!("HTTP server running on http://127.0.0.1:8080");
     
+    // Wait for either server failure or Ctrl+C.
     tokio::select! {
-        res = pg_server => res?,
-        res = http_server => res?,
+        res = pg_server => {
+            res.context("PGWire server task failed")?;
+        },
+        res = http_server => {
+            res.context("HTTP server failed")?;
+        },
         _ = tokio::signal::ctrl_c() => {
-            println!("Received Ctrl+C, shutting down.");
+            info!("Received Ctrl+C, initiating graceful shutdown.");
+            shutdown_token.cancel();
         }
     }
+    
+    // Allow a brief pause for cleanup.
+    sleep(Duration::from_secs(1)).await;
+    
+    info!("Shutdown complete.");
     
     Ok(())
 }

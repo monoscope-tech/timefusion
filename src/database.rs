@@ -8,8 +8,8 @@ use deltalake::{DeltaTableBuilder, DeltaOps};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use crate::utils::prepare_sql;
+use anyhow::Context;
 
-// Stub for JSON function registration.
 #[allow(dead_code)]
 fn register_json_functions(_ctx: &mut SessionContext) {
     println!("(Stub) Registering JSON functions");
@@ -21,9 +21,9 @@ pub struct Database {
     pub ctx: SessionContext,
     project_configs: ProjectConfigs,
 }
-
+ 
 impl Database {
-    pub async fn new() -> Result<Self, DataFusionError> {
+    pub async fn new() -> anyhow::Result<Self> {
         let mut ctx = SessionContext::new();
         register_json_functions(&mut ctx);
         Ok(Self {
@@ -31,35 +31,38 @@ impl Database {
             ctx,
         })
     }
-
+ 
     pub fn get_session_context(&self) -> SessionContext {
         self.ctx.clone()
     }
-
+ 
     // Adds a project and stores its connection string.
-    pub async fn add_project(&self, project_id: &str, connection_string: &str) -> Result<(), DataFusionError> {
+    pub async fn add_project(&self, project_id: &str, connection_string: &str) -> anyhow::Result<()> {
         let table = match DeltaTableBuilder::from_uri(connection_string).load().await {
             Ok(table) => table,
             Err(_) => {
-                // Create a dummy table with an empty schema.
                 DeltaOps::try_from_uri(connection_string)
                     .await?
                     .create()
                     .with_columns(Vec::<deltalake::kernel::StructField>::new())
                     .with_partition_columns(vec!["event_date".to_string()])
                     .await
-                    .map_err(|e| DataFusionError::External(e.into()))?
+                    .map_err(|e| DataFusionError::External(e.into()))
+                    .context("Creating dummy Delta table failed")?
             }
         };
-        self.project_configs.write().unwrap().insert(
-            project_id.to_string(),
-            (connection_string.to_string(), Arc::new(RwLock::new(table))),
-        );
+        self.project_configs.write()
+            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock on project configs"))
+            .context("Lock error in add_project")?
+            .insert(
+                project_id.to_string(),
+                (connection_string.to_string(), Arc::new(RwLock::new(table))),
+            );
         Ok(())
     }
-
+ 
     // Creates and registers the events table for the given project.
-    pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> Result<(), DataFusionError> {
+    pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> anyhow::Result<()> {
         // Define the schema.
         let schema = Schema::new(vec![
             Field::new("project_id", DataType::Utf8, false),
@@ -133,29 +136,30 @@ impl Database {
                     .with_columns(columns)
                     .with_partition_columns(vec!["project_id".to_string()])
                     .await
-                    .map_err(|e| DataFusionError::External(e.into()))?
+                    .map_err(|e| DataFusionError::External(e.into()))
+                    .context("Failed to create events table")?
             }
         };
-
-        // Create a TableProvider using DeltaTableProvider.
+ 
         use deltalake::delta_datafusion::{DeltaTableProvider, DeltaScanConfig};
         let table_ref = Arc::new(RwLock::new(table));
         let provider = {
-            let table_guard = table_ref.read().unwrap();
-            let snapshot = table_guard.snapshot().map_err(|e| DataFusionError::External(e.into()))?;
+            let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error on delta table"))?;
+            let snapshot = table_guard.snapshot()
+                .map_err(|e| anyhow::anyhow!("Failed to get table snapshot: {:?}", e))?;
             let log_store = table_guard.log_store().clone();
             DeltaTableProvider::try_new(snapshot.clone(), log_store, DeltaScanConfig::default())
-                .map_err(|e| DataFusionError::External(e.into()))?
+                .map_err(|e| anyhow::anyhow!("Failed to create DeltaTableProvider: {:?}", e))?
         };
         let table_name = format!("table_{}", project_id);
         self.ctx.register_table(&table_name, Arc::new(provider))
+            .map_err(|e| anyhow::anyhow!("Failed to register table: {:?}", e))
             .map(|_| ())
-            .map_err(|e| DataFusionError::External(e.into()))
     }
-
-    pub async fn query(&self, sql: &str) -> Result<DataFrame, DataFusionError> {
-        let new_sql = prepare_sql(sql)?;
-        self.ctx.sql(&new_sql).await
+ 
+    pub async fn query(&self, sql: &str) -> anyhow::Result<DataFrame> {
+        let new_sql = prepare_sql(sql).context("Failed to prepare SQL")?;
+        self.ctx.sql(&new_sql).await.context("Failed to execute SQL")
     }
  
     pub async fn write(
@@ -165,27 +169,28 @@ impl Database {
         start_time: Option<DateTime<Utc>>,
         end_time: Option<DateTime<Utc>>,
         payload: Option<&str>,
-    ) -> Result<(), DataFusionError> {
+    ) -> anyhow::Result<()> {
         let conn_str = {
-            let configs = self.project_configs.read().unwrap();
-            configs.get(project_id).unwrap().0.clone()
+            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in write"))?;
+            configs.get(project_id)
+                .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?
+                .0
+                .clone()
         };
  
-        // Update schema to include a new partition column "event_date"
         let schema = Schema::new(vec![
             Field::new("project_id", DataType::Utf8, false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), false),
             Field::new("start_time", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), true),
             Field::new("end_time", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), true),
             Field::new("payload", DataType::Utf8, true),
-            Field::new("event_date", DataType::Utf8, false), // partition column
+            Field::new("event_date", DataType::Utf8, false),
         ]);
  
         let ts_micro = timestamp.timestamp_micros();
         let start_ts_micro = start_time.map_or(ts_micro, |t| t.timestamp_micros());
         let end_ts_micro = end_time.map_or(ts_micro, |t| t.timestamp_micros());
  
-        // Compute event_date as the date part of the timestamp.
         let dt = Utc.timestamp_micros(ts_micro).unwrap();
         let event_date = dt.date_naive().to_string();
  
@@ -199,43 +204,44 @@ impl Database {
                 Arc::new(StringArray::from(vec![payload.unwrap_or("")])),
                 Arc::new(StringArray::from(vec![event_date])),
             ],
-        ).map_err(|e| DataFusionError::External(e.into()))?;
+        ).map_err(|e| anyhow::anyhow!("Failed to create record batch: {:?}", e))?;
  
         let batches: Vec<RecordBatch> = vec![batch];
         DeltaOps::try_from_uri(&conn_str)
-            .await?
+            .await
+            .context("Failed to create DeltaOps from URI")?
             .write(batches.into_iter())
             .await
-            .map_err(|e| DataFusionError::External(e.into()))?;
+            .map_err(|e| anyhow::anyhow!("Failed to write batch: {:?}", e))?;
  
         Ok(())
     }
  
-    pub async fn compact(&self, project_id: &str) -> Result<(), DataFusionError> {
+    pub async fn compact(&self, project_id: &str) -> anyhow::Result<()> {
         let delta_table_arc = {
-            let configs = self.project_configs.read().unwrap();
+            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in compact"))?;
             configs.get(project_id)
-                .ok_or_else(|| DataFusionError::External(format!("Project ID '{}' not found", project_id).into()))?
+                .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?
                 .1.clone()
         };
-        let _table = delta_table_arc.read().unwrap();
+        let _table = delta_table_arc.read().map_err(|_| anyhow::anyhow!("Lock error on delta table"))?;
         println!("Compaction for project '{}' would run here.", project_id);
         Ok(())
     }
     
-    pub async fn insert_record(&self, _query: &str) -> Result<String, DataFusionError> {
+    pub async fn insert_record(&self, _query: &str) -> anyhow::Result<String> {
         Ok("INSERT successful".to_string())
     }
     
-    pub async fn update_record(&self, _query: &str) -> Result<String, DataFusionError> {
+    pub async fn update_record(&self, _query: &str) -> anyhow::Result<String> {
         Ok("UPDATE successful".to_string())
     }
     
-    pub async fn delete_record(&self, _query: &str) -> Result<String, DataFusionError> {
+    pub async fn delete_record(&self, _query: &str) -> anyhow::Result<String> {
         Ok("DELETE successful".to_string())
     }
 }
-
+ 
 fn build_timestamp_array(values: Vec<i64>, tz: Option<Arc<str>>) -> TimestampMicrosecondArray {
     use datafusion::arrow::array::ArrayData;
     use datafusion::arrow::buffer::Buffer;

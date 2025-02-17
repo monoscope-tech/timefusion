@@ -1,5 +1,6 @@
 use sled::{Db, IVec};
 use serde::{Serialize, Deserialize};
+use anyhow::Context;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct IngestRecord {
@@ -16,34 +17,38 @@ pub struct PersistentQueue {
 
 impl PersistentQueue {
     pub fn new(path: &str) -> Self {
-        let db = sled::open(path).expect("Failed to open Sled DB");
+        let db = sled::open(path)
+            .expect("Failed to open Sled DB"); // Alternatively, you could panic with context.
         Self { db }
     }
 
     /// Enqueue a record and return a unique receipt ID.
-    pub async fn enqueue(&self, record: &IngestRecord) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let serialized = serde_json::to_vec(record)?;
+    pub async fn enqueue(&self, record: &IngestRecord) -> anyhow::Result<String> {
+        let serialized = serde_json::to_vec(record)
+            .context("Failed to serialize IngestRecord")?;
         let id = uuid::Uuid::new_v4().to_string();
         tokio::task::spawn_blocking({
             let db = self.db.clone();
             let id_clone = id.clone();
             move || {
-                db.insert(id_clone.as_bytes(), serialized)?;
-                db.flush()?;
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                db.insert(id_clone.as_bytes(), serialized)
+                    .context("Failed to insert record into Sled DB")?;
+                db.flush().context("Failed to flush Sled DB")?;
+                Ok::<(), anyhow::Error>(())
             }
         }).await??;
         Ok(id)
     }
 
-    pub async fn dequeue_all(&self) -> Result<Vec<(IVec, IngestRecord)>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn dequeue_all(&self) -> anyhow::Result<Vec<(IVec, IngestRecord)>> {
         tokio::task::spawn_blocking({
             let db = self.db.clone();
             move || {
                 let mut records = Vec::new();
                 for item in db.iter() {
-                    let (key, value) = item?;
-                    let record: IngestRecord = serde_json::from_slice(&value)?;
+                    let (key, value) = item.context("Error iterating over Sled DB")?;
+                    let record: IngestRecord = serde_json::from_slice(&value)
+                        .context("Failed to deserialize IngestRecord")?;
                     records.push((key, record));
                 }
                 Ok(records)
@@ -52,20 +57,24 @@ impl PersistentQueue {
     }
 
     /// Synchronous removal method.
-    pub fn remove_sync(&self, key: IVec) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.db.remove(key)?;
-        self.db.flush()?;
+    pub fn remove_sync(&self, key: IVec) -> anyhow::Result<()> {
+        self.db.remove(key)
+            .context("Failed to remove key from Sled DB")?;
+        self.db.flush()
+            .context("Failed to flush Sled DB after removal")?;
         Ok(())
     }
 
     #[allow(dead_code)]
-    pub async fn remove(&self, key: IVec) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn remove(&self, key: IVec) -> anyhow::Result<()> {
         tokio::task::spawn_blocking({
             let db = self.db.clone();
             move || {
-                db.remove(key)?;
-                db.flush()?;
-                Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+                db.remove(key)
+                    .context("Failed to remove key from Sled DB")?;
+                db.flush()
+                    .context("Failed to flush Sled DB after removal")?;
+                Ok::<(), anyhow::Error>(())
             }
         }).await??;
         Ok(())
