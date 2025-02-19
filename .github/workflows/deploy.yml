@@ -19,10 +19,9 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GH_TOKEN }}
 
       - name: Preset Image Name
-        id: preset_image_name
         run: |
           echo "IMAGE_URL=$(echo ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:$(echo ${{ github.sha }} | cut -c1-7) | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
@@ -31,7 +30,15 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          tags: ${{ steps.preset_image_name.outputs.IMAGE_URL }}
+          push: true
+          tags: ${{ env.IMAGE_URL }}
+          # Enable GitHub cache for faster incremental builds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Save the built image to a tarball for the deploy action.
+      - name: Save Docker Image to tar
+        run: docker save ${{ env.IMAGE_URL }} -o deploy.tar
 
       - id: deploy
         name: Deploy Image to CapRover
@@ -40,7 +47,7 @@ jobs:
           server: ${{ secrets.CAPTAINROVER_SERVER }}
           app: ${{ secrets.CAPTAINROVER_APP_NAME }}
           token: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
-          image: ${{ steps.preset_image_name.outputs.IMAGE_URL }}
+          image: ${{ env.IMAGE_URL }}
 
       - name: Show Deployment Output
         run: |
