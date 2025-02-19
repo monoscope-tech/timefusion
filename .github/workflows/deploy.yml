@@ -19,9 +19,10 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
-          password: ${{ secrets.GH_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Preset Image Name
+        id: preset_image_name
         run: |
           echo "IMAGE_URL=$(echo ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:$(echo ${{ github.sha }} | cut -c1-7) | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
@@ -30,17 +31,16 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          push: true
-          tags: ${{ env.IMAGE_URL }}
+          tags: ${{ steps.preset_image_name.outputs.IMAGE_URL }}
 
       - id: deploy
         name: Deploy Image to CapRover
         uses: caprover/deploy-from-github@v1.1.2
         with:
-          server: '${{ secrets.CAPTAINROVER_SERVER }}'
-          app: '${{ secrets.CAPTAINROVER_APP_NAME }}'
-          token: '${{ secrets.CAPTAINROVER_APP_TOKEN }}'
-          image: '${{ env.IMAGE_URL }}'
+          server: ${{ secrets.CAPTAINROVER_SERVER }}
+          app: ${{ secrets.CAPTAINROVER_APP_NAME }}
+          token: ${{ secrets.CAPTAINROVER_APP_TOKEN }}
+          image: ${{ steps.preset_image_name.outputs.IMAGE_URL }}
 
       - name: Show Deployment Output
         run: |
