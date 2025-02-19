@@ -62,7 +62,8 @@ async fn main() -> anyhow::Result<()> {
     // Retrieve configuration values from the environment.
     let bucket = env::var("S3_BUCKET_NAME")
         .context("S3_BUCKET_NAME environment variable not set")?;
-    let http_port = env::var("HTTP_PORT").unwrap_or_else(|_| "8080".to_string());
+    // Prefer using the PORT environment variable for HTTP (default to 8080 if not set)
+    let http_port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let pgwire_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
     let s3_uri = format!("s3://{}/delta_table", bucket);
 
@@ -96,8 +97,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to compact project 'events'")?;
     
-    // Initialize the persistent queue using an absolute path matching the Dockerfile.
-    // Note: PersistentQueue::new returns a Result, so we use `?` here.
+    // Initialize the persistent queue using the absolute path (as set in the Dockerfile).
     let queue = Arc::new(PersistentQueue::new("/app/queue_db")?);
     
     // Initialize the ingestion status store.
@@ -207,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
     });
     
     // Start the HTTP server with Logger middleware, health, and metrics endpoints.
+    // Bind to the port provided by the PORT environment variable.
     let http_addr = format!("0.0.0.0:{}", http_port);
     let http_server = HttpServer::new(move || {
         App::new()
