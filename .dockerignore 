@@ -1,0 +1,7 @@
+# Exclude Cargo build artifacts
+/target
+# Exclude Git metadata
+.git
+# Exclude other unnecessary files
+node_modules
+*.log

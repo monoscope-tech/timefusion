@@ -14,13 +14,15 @@ use persistent_queue::PersistentQueue;
 use serde_json::json;
 use std::sync::Arc;
 use std::str;
+use std::env;
 use tokio::time::{sleep, Duration};
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error};
 use tracing_subscriber::EnvFilter;
+use dotenv::dotenv;
 
-/// Perform real dependency checks (e.g. DB connectivity) and include diagnostics.
+/// Health endpoint that returns version, timestamp, and diagnostics.
 async fn health() -> impl Responder {
     let health_status = json!({
         "status": "OK",
@@ -31,7 +33,7 @@ async fn health() -> impl Responder {
     HttpResponse::Ok().json(health_status)
 }
 
-/// Dummy metrics endpoint returning Prometheus‑formatted metrics.
+/// Metrics endpoint returning Prometheus‑formatted metrics.
 async fn metrics() -> impl Responder {
     use prometheus::{Encoder, TextEncoder, gather};
     let encoder = TextEncoder::new();
@@ -48,19 +50,25 @@ async fn metrics() -> impl Responder {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load environment variables from .env file.
+    dotenv().ok();
+
     // Initialize structured logging with an environment filter.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
     info!("Starting production-grade application");
 
+    // Retrieve configuration values from the environment.
+    let bucket = env::var("S3_BUCKET_NAME")
+        .context("S3_BUCKET_NAME environment variable not set")?;
+    let http_port = env::var("HTTP_PORT").unwrap_or_else(|_| "8080".to_string());
+    let pgwire_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
+    let s3_uri = format!("s3://{}/delta_table", bucket);
+
     // Register S3 handlers for Delta Lake.
     deltalake::aws::register_handlers(None);
 
-    let bucket = std::env::var("S3_BUCKET_NAME")
-        .context("S3_BUCKET_NAME environment variable not set")?;
-    let s3_uri = format!("s3://{}/delta_table", bucket);
-    
     // Initialize the Database.
     let db = Arc::new(Database::new().await.context("Failed to initialize Database")?);
     db.add_project("events", &s3_uri)
@@ -97,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
     // Create a shutdown cancellation token.
     let shutdown_token = CancellationToken::new();
 
-    // Spawn a background task for flushing the persistent queue.
+    // Spawn a background task to flush the persistent queue.
     {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
@@ -189,15 +197,16 @@ async fn main() -> anyhow::Result<()> {
     // Start the PGWire server.
     let pg_service = DfSessionService::new(db.get_session_context(), db.clone());
     let handler_factory = HandlerFactory(Arc::new(pg_service));
-    let pg_addr = "127.0.0.1:5432";
+    let pg_addr = format!("0.0.0.0:{}", pgwire_port);
     info!("Spawning PGWire server task on {}", pg_addr);
     let pg_server = tokio::spawn(async move {
-        if let Err(e) = run_pgwire_server(handler_factory, pg_addr).await {
+        if let Err(e) = run_pgwire_server(handler_factory, &pg_addr).await {
             error!("PGWire server error: {:?}", e);
         }
     });
     
     // Start the HTTP server with Logger middleware, health, and metrics endpoints.
+    let http_addr = format!("0.0.0.0:{}", http_port);
     let http_server = HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
@@ -209,11 +218,11 @@ async fn main() -> anyhow::Result<()> {
             .route("/health", web::get().to(health))
             .route("/metrics", web::get().to(metrics))
     })
-    .bind("127.0.0.1:8080")
-    .context("Failed to bind HTTP server to 127.0.0.1:8080")?
+    .bind(&http_addr)
+    .context(format!("Failed to bind HTTP server to {}", http_addr))?
     .run();
     
-    info!("HTTP server running on http://127.0.0.1:8080");
+    info!("HTTP server running on http://{}", http_addr);
     
     // Wait for either server failure or Ctrl+C.
     tokio::select! {

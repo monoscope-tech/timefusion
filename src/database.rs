@@ -9,21 +9,30 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use crate::utils::prepare_sql;
 use anyhow::Context;
+use dotenv::dotenv;
+use std::env;
+use tracing::error;
 
+/// Stub for JSON function registration.
 #[allow(dead_code)]
 fn register_json_functions(_ctx: &mut SessionContext) {
     println!("(Stub) Registering JSON functions");
 }
 
+/// Shared type for holding project configuration: connection string and a Delta table wrapped in an Arc/RwLock.
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
  
 pub struct Database {
     pub ctx: SessionContext,
     project_configs: ProjectConfigs,
 }
- 
+
 impl Database {
+    /// Creates a new Database. This function loads environment variables from a .env file,
+    /// initializes a DataFusion SessionContext, and registers any JSON functions.
     pub async fn new() -> anyhow::Result<Self> {
+        // Load environment variables from .env (if present)
+        dotenv().ok();
         let mut ctx = SessionContext::new();
         register_json_functions(&mut ctx);
         Ok(Self {
@@ -31,12 +40,14 @@ impl Database {
             ctx,
         })
     }
- 
+
+    /// Returns a clone of the session context.
     pub fn get_session_context(&self) -> SessionContext {
         self.ctx.clone()
     }
- 
-    // Adds a project and stores its connection string.
+
+    /// Adds a project and stores its connection string along with a Delta table loaded from the given URI.
+    /// In your deployment, you can override the connection string via environment variables if needed.
     pub async fn add_project(&self, project_id: &str, connection_string: &str) -> anyhow::Result<()> {
         let table = match DeltaTableBuilder::from_uri(connection_string).load().await {
             Ok(table) => table,
@@ -60,8 +71,8 @@ impl Database {
             );
         Ok(())
     }
- 
-    // Creates and registers the events table for the given project.
+
+    /// Creates and registers the events table for the given project.
     pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> anyhow::Result<()> {
         // Define the schema.
         let schema = Schema::new(vec![
@@ -145,8 +156,7 @@ impl Database {
         let table_ref = Arc::new(RwLock::new(table));
         let provider = {
             let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error on delta table"))?;
-            let snapshot = table_guard.snapshot()
-                .map_err(|e| anyhow::anyhow!("Failed to get table snapshot: {:?}", e))?;
+            let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Failed to get table snapshot: {:?}", e))?;
             let log_store = table_guard.log_store().clone();
             DeltaTableProvider::try_new(snapshot.clone(), log_store, DeltaScanConfig::default())
                 .map_err(|e| anyhow::anyhow!("Failed to create DeltaTableProvider: {:?}", e))?
@@ -157,11 +167,13 @@ impl Database {
             .map(|_| ())
     }
  
+    /// Executes the provided SQL query (after preparing it) using DataFusion.
     pub async fn query(&self, sql: &str) -> anyhow::Result<DataFrame> {
         let new_sql = prepare_sql(sql).context("Failed to prepare SQL")?;
         self.ctx.sql(&new_sql).await.context("Failed to execute SQL")
     }
  
+    /// Writes a single record to the Delta table for the specified project.
     pub async fn write(
         &self,
         project_id: &str,
@@ -217,6 +229,7 @@ impl Database {
         Ok(())
     }
  
+    /// Compacts the Delta table for the specified project (dummy implementation).
     pub async fn compact(&self, project_id: &str) -> anyhow::Result<()> {
         let delta_table_arc = {
             let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in compact"))?;
@@ -241,7 +254,8 @@ impl Database {
         Ok("DELETE successful".to_string())
     }
 }
- 
+
+/// Helper function to build a timestamp array.
 fn build_timestamp_array(values: Vec<i64>, tz: Option<Arc<str>>) -> TimestampMicrosecondArray {
     use datafusion::arrow::array::ArrayData;
     use datafusion::arrow::buffer::Buffer;

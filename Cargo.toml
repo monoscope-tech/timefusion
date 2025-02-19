@@ -31,3 +31,4 @@ tokio-util = "0.7.13"
 tracing-subscriber ={ version = "0.3.19", features = ["env-filter"]}
 tracing = "0.1.41"
 prometheus = "0.13.4"
+dotenv = "0.15.0"

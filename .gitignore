@@ -1,2 +1,3 @@
 /target
 /queue_db
+.env
