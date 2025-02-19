@@ -6,7 +6,7 @@
 FROM rustlang/rust:nightly-bullseye-slim AS builder
 WORKDIR /app
 
-# Install build dependencies (e.g., pkg-config and libssl-dev)
+# Install build dependencies.
 RUN apt-get update && \
     apt-get install -y pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
@@ -30,23 +30,28 @@ RUN cargo build --release
 #         Runtime Stage      #
 ##############################
 FROM ubuntu:20.04
+WORKDIR /app
 
 # Install runtime dependencies.
 RUN apt-get update && \
     apt-get install -y ca-certificates libssl1.1 && \
     rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user for security.
+# Create a non-root user.
 RUN groupadd -r appgroup && useradd -r -g appgroup appuser
 
+# Create a dedicated, writable directory for the Sled DB.
+RUN mkdir -p /app/queue_db && \
+    chown -R appuser:appgroup /app/queue_db && \
+    chmod -R 775 /app/queue_db
+
 # Copy the compiled binary from the builder stage.
-# The binary is expected to be named "timefusion" (matching your project name).
 COPY --from=builder /app/target/release/timefusion /usr/local/bin/timefusion
 
-# Adjust permissions.
+# Adjust ownership of the binary.
 RUN chown appuser:appgroup /usr/local/bin/timefusion
 
-# Expose the HTTP (8080) and PGWire (5432) ports.
+# Expose the required ports.
 EXPOSE 8080 5432
 
 # Switch to the non-root user.
