@@ -96,8 +96,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to compact project 'events'")?;
     
-    // Initialize the persistent queue.
-    let queue = Arc::new(PersistentQueue::new("./queue_db"));
+    // Initialize the persistent queue using an absolute path matching the Dockerfile.
+    // Note: PersistentQueue::new returns a Result, so we use `?` here.
+    let queue = Arc::new(PersistentQueue::new("/app/queue_db")?);
     
     // Initialize the ingestion status store.
     let status_store = ingest::IngestStatusStore::new();

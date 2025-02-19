@@ -16,10 +16,11 @@ pub struct PersistentQueue {
 }
 
 impl PersistentQueue {
-    pub fn new(path: &str) -> Self {
+    /// Opens a Sled database at the given path. Returns an error with context if the database cannot be opened.
+    pub fn new(path: &str) -> anyhow::Result<Self> {
         let db = sled::open(path)
-            .expect("Failed to open Sled DB"); // Alternatively, you could panic with context.
-        Self { db }
+            .with_context(|| format!("Failed to open Sled DB at path: {}", path))?;
+        Ok(Self { db })
     }
 
     /// Enqueue a record and return a unique receipt ID.
@@ -36,10 +37,12 @@ impl PersistentQueue {
                 db.flush().context("Failed to flush Sled DB")?;
                 Ok::<(), anyhow::Error>(())
             }
-        }).await??;
+        })
+        .await??;
         Ok(id)
     }
 
+    /// Dequeues all records from the Sled database.
     pub async fn dequeue_all(&self) -> anyhow::Result<Vec<(IVec, IngestRecord)>> {
         tokio::task::spawn_blocking({
             let db = self.db.clone();
@@ -53,19 +56,21 @@ impl PersistentQueue {
                 }
                 Ok(records)
             }
-        }).await?
+        })
+        .await?
     }
 
-    /// Synchronous removal method.
+    /// Synchronously removes a record with the given key from the Sled database.
     pub fn remove_sync(&self, key: IVec) -> anyhow::Result<()> {
-        self.db.remove(key)
+        self.db
+            .remove(key)
             .context("Failed to remove key from Sled DB")?;
-        self.db.flush()
-            .context("Failed to flush Sled DB after removal")?;
+        self.db.flush().context("Failed to flush Sled DB after removal")?;
         Ok(())
     }
 
     #[allow(dead_code)]
+    /// Asynchronously removes a record with the given key from the Sled database.
     pub async fn remove(&self, key: IVec) -> anyhow::Result<()> {
         tokio::task::spawn_blocking({
             let db = self.db.clone();
@@ -76,7 +81,8 @@ impl PersistentQueue {
                     .context("Failed to flush Sled DB after removal")?;
                 Ok::<(), anyhow::Error>(())
             }
-        }).await??;
+        })
+        .await??;
         Ok(())
     }
 }
