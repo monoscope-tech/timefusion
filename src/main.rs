@@ -53,21 +53,21 @@ async fn main() -> anyhow::Result<()> {
     // Load environment variables from .env file.
     dotenv().ok();
 
-    // Initialize structured logging with an environment filter.
+    // Initialize structured logging.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
     info!("Starting production-grade application");
 
-    // Retrieve configuration values from the environment.
+    // Retrieve configuration values.
     let bucket = env::var("S3_BUCKET_NAME")
         .context("S3_BUCKET_NAME environment variable not set")?;
-    // Prefer using the PORT environment variable for HTTP (default to 8080 if not set)
-    let http_port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    // Use PORT environment variable; default to "80" if not set.
+    let http_port = env::var("PORT").unwrap_or_else(|_| "80".to_string());
     let pgwire_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
     let s3_uri = format!("s3://{}/delta_table", bucket);
 
-    // Register S3 handlers for Delta Lake.
+    // Register S3 handlers.
     deltalake::aws::register_handlers(None);
 
     // Initialize the Database.
@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to compact project 'events'")?;
     
-    // Initialize the persistent queue using the absolute path (as set in the Dockerfile).
+    // Initialize persistent queue using the absolute path (as configured in the Dockerfile).
     let queue = Arc::new(PersistentQueue::new("/app/queue_db")?);
     
     // Initialize the ingestion status store.
@@ -130,7 +130,6 @@ async fn main() -> anyhow::Result<()> {
                         if !records.is_empty() {
                             info!("Flushing {} enqueued records", records.len());
                             for (key, record) in records {
-                                // Convert key (IVec) to String.
                                 let key_vec = key.to_vec();
                                 let id = match str::from_utf8(&key_vec) {
                                     Ok(s) => s.to_string(),
@@ -158,8 +157,7 @@ async fn main() -> anyhow::Result<()> {
                                                 let owned_key = sled::IVec::from(key_vec_owned);
                                                 let remove_res = tokio::task::spawn_blocking(move || {
                                                     queue_clone2.remove_sync(owned_key)
-                                                })
-                                                .await;
+                                                }).await;
                                                 match remove_res {
                                                     Ok(Ok(())) => info!("Successfully removed key."),
                                                     Ok(Err(e)) => error!("Removal failed: {:?}", e),
@@ -178,8 +176,7 @@ async fn main() -> anyhow::Result<()> {
                                     let key_vec_owned = key_vec.clone();
                                     let remove_res = tokio::task::spawn_blocking(move || {
                                         queue_clone3.remove_sync(sled::IVec::from(key_vec_owned))
-                                    })
-                                    .await;
+                                    }).await;
                                     match remove_res {
                                         Ok(Ok(())) => info!("Successfully removed key for invalid timestamp."),
                                         Ok(Err(e)) => error!("Removal failed for invalid timestamp: {:?}", e),
@@ -207,7 +204,6 @@ async fn main() -> anyhow::Result<()> {
     });
     
     // Start the HTTP server with Logger middleware, health, and metrics endpoints.
-    // Bind to the port provided by the PORT environment variable.
     let http_addr = format!("0.0.0.0:{}", http_port);
     let http_server = HttpServer::new(move || {
         App::new()
