@@ -14,6 +14,8 @@ use datafusion::common::ParamValues;
 use bytes::BytesMut;
 use crate::utils::{prepare_sql, value_to_string};
 use crate::pgserver_message::PGServerMessage;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, error};
 
 pub struct DfSessionService {
     pub session_context: Arc<SessionContext>,
@@ -247,7 +249,7 @@ fn deserialize_parameters<T>(
 fn ordered_param_types(
     _types: &HashMap<String, Option<datafusion::arrow::datatypes::DataType>>,
 ) -> Vec<Option<&datafusion::arrow::datatypes::DataType>> {
-    Vec::new()
+    Vec::new() // Simplified for now; could be enhanced later
 }
  
 #[derive(Clone)]
@@ -282,23 +284,32 @@ impl PgWireServerHandlers for HandlerFactory {
 pub async fn run_pgwire_server<H>(
     handler: H,
     addr: &str,
+    shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     H: PgWireServerHandlers + Clone + Send + Sync + 'static,
 {
     use tokio::net::TcpListener;
     let listener = TcpListener::bind(addr).await?;
-    println!("PGWire server listening on {}", addr);
+    info!("PGWire server listening on {}", addr);
  
     loop {
-        let (socket, peer_addr) = listener.accept().await?;
-        println!("Accepted connection from {:?}", peer_addr);
- 
-        let handler_clone = handler.clone();
-        tokio::spawn(async move {
-            if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_clone).await {
-                eprintln!("PGWire server error: {:?}", e);
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                info!("PGWire server shutting down");
+                break;
             }
-        });
+            result = listener.accept() => {
+                let (socket, peer_addr) = result?;
+                info!("Accepted connection from {:?}", peer_addr);
+                let handler_clone = handler.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_clone).await {
+                        error!("PGWire connection error: {:?}", e);
+                    }
+                });
+            }
+        }
     }
+    Ok(())
 }

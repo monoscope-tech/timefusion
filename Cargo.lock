@@ -77,7 +77,7 @@ dependencies = [
  "bytestring",
  "cfg-if",
  "http 0.2.12",
- "regex",
+ "regex 1.11.1",
  "regex-lite",
  "serde",
  "tracing",
@@ -158,18 +158,18 @@ dependencies = [
  "impl-more",
  "itoa",
  "language-tags",
- "log",
+ "log 0.4.25",
  "mime",
  "once_cell",
  "pin-project-lite",
- "regex",
+ "regex 1.11.1",
  "regex-lite",
  "serde",
  "serde_json",
  "serde_urlencoded",
  "smallvec",
  "socket2",
- "time",
+ "time 0.3.37",
  "url",
 ]
 
@@ -229,6 +229,15 @@ dependencies = [
  "once_cell",
  "version_check",
  "zerocopy 0.7.35",
+]
+
+[[package]]
+name = "aho-corasick"
+version = "0.6.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81ce3d38065e618af2d7b77e10c5ad9a069859b4be3c2250f674af3840d9c8a5"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -535,7 +544,7 @@ dependencies = [
  "csv-core",
  "lazy_static",
  "lexical-core",
- "regex",
+ "regex 1.11.1",
 ]
 
 [[package]]
@@ -551,7 +560,7 @@ dependencies = [
  "csv",
  "csv-core",
  "lazy_static",
- "regex",
+ "regex 1.11.1",
 ]
 
 [[package]]
@@ -758,7 +767,7 @@ dependencies = [
  "arrow-select 53.4.0",
  "memchr",
  "num",
- "regex",
+ "regex 1.11.1",
  "regex-syntax 0.8.5",
 ]
 
@@ -775,7 +784,7 @@ dependencies = [
  "arrow-select 54.1.0",
  "memchr",
  "num",
- "regex",
+ "regex 1.11.1",
  "regex-syntax 0.8.5",
 ]
 
@@ -851,7 +860,7 @@ dependencies = [
  "hex",
  "http 0.2.12",
  "ring",
- "time",
+ "time 0.3.37",
  "tokio",
  "tracing",
  "url",
@@ -1030,7 +1039,7 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "sha2",
- "time",
+ "time 0.3.37",
  "tracing",
 ]
 
@@ -1149,7 +1158,7 @@ dependencies = [
  "pin-utils",
  "ryu",
  "serde",
- "time",
+ "time 0.3.37",
  "tokio",
  "tokio-util",
 ]
@@ -1249,11 +1258,11 @@ dependencies = [
  "itertools 0.12.1",
  "lazy_static",
  "lazycell",
- "log",
+ "log 0.4.25",
  "prettyplease",
  "proc-macro2",
  "quote",
- "regex",
+ "regex 1.11.1",
  "rustc-hash 1.1.0",
  "shlex",
  "syn 2.0.98",
@@ -1636,7 +1645,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e859cd57d0710d9e06c381b550c06e76992472a8c6d527aecd2fc673dcc231fb"
 dependencies = [
  "percent-encoding",
- "time",
+ "time 0.3.37",
  "version_check",
 ]
 
@@ -1682,6 +1691,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a97769d94ddab943e4510d138150169a2758b5ef3eb191a9ee688de3e23ef7b3"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "crontab"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e016114148d59c50176f7a7f4dc719db6764a4b216d1392ccb337ff3fb9d763"
+dependencies = [
+ "regex 0.2.11",
+ "time 0.1.45",
 ]
 
 [[package]]
@@ -1785,7 +1804,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "num_cpus",
  "object_store",
  "parking_lot 0.12.3",
@@ -1835,12 +1854,12 @@ dependencies = [
  "futures",
  "glob",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "object_store",
  "parking_lot 0.12.3",
  "parquet",
  "rand 0.8.5",
- "regex",
+ "regex 1.11.1",
  "sqlparser 0.53.0",
  "tempfile",
  "tokio",
@@ -1882,11 +1901,11 @@ dependencies = [
  "futures",
  "glob",
  "itertools 0.14.0",
- "log",
+ "log 0.4.25",
  "object_store",
  "parking_lot 0.12.3",
  "rand 0.8.5",
- "regex",
+ "regex 1.11.1",
  "sqlparser 0.53.0",
  "tempfile",
  "tokio",
@@ -1940,7 +1959,7 @@ dependencies = [
  "datafusion-sql 45.0.0",
  "futures",
  "itertools 0.14.0",
- "log",
+ "log 0.4.25",
  "parking_lot 0.12.3",
  "sqlparser 0.53.0",
 ]
@@ -1983,7 +2002,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "libc",
- "log",
+ "log 0.4.25",
  "object_store",
  "parquet",
  "paste",
@@ -2010,7 +2029,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "libc",
- "log",
+ "log 0.4.25",
  "object_store",
  "paste",
  "sqlparser 0.53.0",
@@ -2024,7 +2043,7 @@ version = "42.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "694c9d7ea1b82f95768215c4cb5c2d5c613690624e832a7ee64be563139d582f"
 dependencies = [
- "log",
+ "log 0.4.25",
  "tokio",
 ]
 
@@ -2034,7 +2053,7 @@ version = "44.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72fbf14d4079f7ce5306393084fe5057dddfdc2113577e0049310afa12e94281"
 dependencies = [
- "log",
+ "log 0.4.25",
  "tokio",
 ]
 
@@ -2044,7 +2063,7 @@ version = "45.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d4603c8e8a4baf77660ab7074cc66fc15cc8a18f2ce9dfadb755fc6ee294e48"
 dependencies = [
- "log",
+ "log 0.4.25",
  "tokio",
 ]
 
@@ -2073,7 +2092,7 @@ dependencies = [
  "datafusion-expr 42.2.0",
  "futures",
  "hashbrown 0.14.5",
- "log",
+ "log 0.4.25",
  "object_store",
  "parking_lot 0.12.3",
  "rand 0.8.5",
@@ -2092,7 +2111,7 @@ dependencies = [
  "datafusion-common 44.0.0",
  "datafusion-expr 44.0.0",
  "futures",
- "log",
+ "log 0.4.25",
  "object_store",
  "parking_lot 0.12.3",
  "rand 0.8.5",
@@ -2111,7 +2130,7 @@ dependencies = [
  "datafusion-common 45.0.0",
  "datafusion-expr 45.0.0",
  "futures",
- "log",
+ "log 0.4.25",
  "object_store",
  "parking_lot 0.12.3",
  "rand 0.8.5",
@@ -2232,9 +2251,9 @@ dependencies = [
  "hashbrown 0.14.5",
  "hex",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "rand 0.8.5",
- "regex",
+ "regex 1.11.1",
  "unicode-segmentation",
  "uuid",
 ]
@@ -2260,10 +2279,10 @@ dependencies = [
  "hashbrown 0.14.5",
  "hex",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "md-5",
  "rand 0.8.5",
- "regex",
+ "regex 1.11.1",
  "sha2",
  "unicode-segmentation",
  "uuid",
@@ -2288,9 +2307,9 @@ dependencies = [
  "hashbrown 0.14.5",
  "hex",
  "itertools 0.14.0",
- "log",
+ "log 0.4.25",
  "rand 0.8.5",
- "regex",
+ "regex 1.11.1",
  "unicode-segmentation",
  "uuid",
 ]
@@ -2311,7 +2330,7 @@ dependencies = [
  "datafusion-physical-expr 42.2.0",
  "datafusion-physical-expr-common 42.2.0",
  "half",
- "log",
+ "log 0.4.25",
  "paste",
  "sqlparser 0.50.0",
 ]
@@ -2334,7 +2353,7 @@ dependencies = [
  "datafusion-physical-expr 44.0.0",
  "datafusion-physical-expr-common 44.0.0",
  "half",
- "log",
+ "log 0.4.25",
  "paste",
 ]
 
@@ -2357,7 +2376,7 @@ dependencies = [
  "datafusion-physical-expr 45.0.0",
  "datafusion-physical-expr-common 45.0.0",
  "half",
- "log",
+ "log 0.4.25",
  "paste",
 ]
 
@@ -2409,7 +2428,7 @@ checksum = "297b8bf3c213cbf1a0c9d0c5f0bc43f6d181591aeade02a189790d28d79c87d0"
 dependencies = [
  "datafusion 45.0.0",
  "jiter",
- "log",
+ "log 0.4.25",
  "paste",
 ]
 
@@ -2431,7 +2450,7 @@ dependencies = [
  "datafusion-functions-aggregate 44.0.0",
  "datafusion-physical-expr-common 44.0.0",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "paste",
 ]
 
@@ -2476,7 +2495,7 @@ dependencies = [
  "datafusion-common 42.2.0",
  "datafusion-expr 42.2.0",
  "datafusion-physical-expr-common 42.2.0",
- "log",
+ "log 0.4.25",
 ]
 
 [[package]]
@@ -2492,7 +2511,7 @@ dependencies = [
  "datafusion-macros 44.0.0",
  "datafusion-physical-expr 44.0.0",
  "datafusion-physical-expr-common 44.0.0",
- "log",
+ "log 0.4.25",
  "paste",
 ]
 
@@ -2509,7 +2528,7 @@ dependencies = [
  "datafusion-macros 45.0.0",
  "datafusion-physical-expr 45.0.0",
  "datafusion-physical-expr-common 45.0.0",
- "log",
+ "log 0.4.25",
  "paste",
 ]
 
@@ -2569,7 +2588,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "paste",
  "regex-syntax 0.8.5",
 ]
@@ -2587,9 +2606,9 @@ dependencies = [
  "datafusion-physical-expr 44.0.0",
  "indexmap",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "recursive",
- "regex",
+ "regex 1.11.1",
  "regex-syntax 0.8.5",
 ]
 
@@ -2606,8 +2625,8 @@ dependencies = [
  "datafusion-physical-expr 45.0.0",
  "indexmap",
  "itertools 0.14.0",
- "log",
- "regex",
+ "log 0.4.25",
+ "regex 1.11.1",
  "regex-syntax 0.8.5",
 ]
 
@@ -2637,10 +2656,10 @@ dependencies = [
  "hex",
  "indexmap",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "paste",
  "petgraph 0.6.5",
- "regex",
+ "regex 1.11.1",
 ]
 
 [[package]]
@@ -2663,7 +2682,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "paste",
  "petgraph 0.6.5",
 ]
@@ -2688,7 +2707,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "itertools 0.14.0",
- "log",
+ "log 0.4.25",
  "paste",
  "petgraph 0.7.1",
 ]
@@ -2763,7 +2782,7 @@ dependencies = [
  "datafusion-physical-expr 44.0.0",
  "datafusion-physical-plan 44.0.0",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "recursive",
 ]
 
@@ -2784,7 +2803,7 @@ dependencies = [
  "datafusion-physical-plan 45.0.0",
  "futures",
  "itertools 0.14.0",
- "log",
+ "log 0.4.25",
  "url",
 ]
 
@@ -2815,7 +2834,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "once_cell",
  "parking_lot 0.12.3",
  "pin-project-lite",
@@ -2849,7 +2868,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "itertools 0.13.0",
- "log",
+ "log 0.4.25",
  "parking_lot 0.12.3",
  "pin-project-lite",
  "tokio",
@@ -2881,7 +2900,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "indexmap",
  "itertools 0.14.0",
- "log",
+ "log 0.4.25",
  "parking_lot 0.12.3",
  "pin-project-lite",
  "tokio",
@@ -2938,8 +2957,8 @@ dependencies = [
  "arrow-schema 53.4.0",
  "datafusion-common 42.2.0",
  "datafusion-expr 42.2.0",
- "log",
- "regex",
+ "log 0.4.25",
+ "regex 1.11.1",
  "sqlparser 0.50.0",
  "strum",
 ]
@@ -2957,9 +2976,9 @@ dependencies = [
  "datafusion-common 44.0.0",
  "datafusion-expr 44.0.0",
  "indexmap",
- "log",
+ "log 0.4.25",
  "recursive",
- "regex",
+ "regex 1.11.1",
  "sqlparser 0.53.0",
 ]
 
@@ -2976,8 +2995,8 @@ dependencies = [
  "datafusion-common 45.0.0",
  "datafusion-expr 45.0.0",
  "indexmap",
- "log",
- "regex",
+ "log 0.4.25",
+ "regex 1.11.1",
  "sqlparser 0.53.0",
 ]
 
@@ -3059,7 +3078,7 @@ dependencies = [
  "futures",
  "maplit",
  "object_store",
- "regex",
+ "regex 1.11.1",
  "thiserror 2.0.11",
  "tokio",
  "tracing",
@@ -3118,7 +3137,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "rand 0.8.5",
- "regex",
+ "regex 1.11.1",
  "roaring",
  "serde",
  "serde_json",
@@ -3221,8 +3240,8 @@ version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "186e05a59d4c50738528153b83b0b0194d3a29507dfec16eccd4b342903397d0"
 dependencies = [
- "log",
- "regex",
+ "log 0.4.25",
+ "regex 1.11.1",
 ]
 
 [[package]]
@@ -3235,7 +3254,7 @@ dependencies = [
  "anstyle",
  "env_filter",
  "humantime",
- "log",
+ "log 0.4.25",
 ]
 
 [[package]]
@@ -3773,7 +3792,7 @@ dependencies = [
  "futures-util",
  "http 0.2.12",
  "hyper 0.14.32",
- "log",
+ "log 0.4.25",
  "rustls 0.21.12",
  "rustls-native-certs 0.6.3",
  "tokio",
@@ -3790,7 +3809,7 @@ dependencies = [
  "http 1.2.0",
  "hyper 1.6.0",
  "hyper-util",
- "rustls 0.23.22",
+ "rustls 0.23.23",
  "rustls-native-certs 0.8.1",
  "rustls-pki-types",
  "tokio",
@@ -4145,7 +4164,7 @@ checksum = "4ba01db5ef81e17eb10a5e0f2109d1b3a3e29bac3070fdbd7d156bf7dbd206a1"
 dependencies = [
  "proc-macro2",
  "quote",
- "regex",
+ "regex 1.11.1",
  "syn 2.0.98",
 ]
 
@@ -4318,6 +4337,15 @@ dependencies = [
 
 [[package]]
 name = "log"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
+dependencies = [
+ "log 0.4.25",
+]
+
+[[package]]
+name = "log"
 version = "0.4.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04cbf5b083de1c7e0222a7a51dbfdba1cbe1c6ab0b15e29fff3f6c077fd9cd9f"
@@ -4425,7 +4453,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2886843bf800fba2e3377cff24abf6379b4c4d5c6681eaf9ea5b0d15090450bd"
 dependencies = [
  "libc",
- "log",
+ "log 0.4.25",
  "wasi 0.11.0+wasi-snapshot-preview1",
  "windows-sys 0.52.0",
 ]
@@ -4437,7 +4465,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0dab59f8e050d5df8e4dd87d9206fb6f65a483e20ac9fda365ade4fab353196c"
 dependencies = [
  "libc",
- "log",
+ "log 0.4.25",
  "openssl",
  "openssl-probe",
  "openssl-sys",
@@ -4763,7 +4791,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f2a05b18d44e2957b88f96ba460715e295bc1d7510468a2f3d3b44535d26c24"
 dependencies = [
- "regex",
+ "regex 1.11.1",
 ]
 
 [[package]]
@@ -5140,7 +5168,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash 2.1.1",
- "rustls 0.23.22",
+ "rustls 0.23.23",
  "socket2",
  "thiserror 2.0.11",
  "tokio",
@@ -5158,7 +5186,7 @@ dependencies = [
  "rand 0.8.5",
  "ring",
  "rustc-hash 2.1.1",
- "rustls 0.23.22",
+ "rustls 0.23.23",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.11",
@@ -5297,11 +5325,24 @@ dependencies = [
 
 [[package]]
 name = "regex"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9329abc99e39129fcceabd24cf5d85b4671ef7c29c50e972bc5afe32438ec384"
+dependencies = [
+ "aho-corasick 0.6.10",
+ "memchr",
+ "regex-syntax 0.5.6",
+ "thread_local 0.3.6",
+ "utf8-ranges",
+]
+
+[[package]]
+name = "regex"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b544ef1b4eac5dc2db33ea63606ae9ffcfac26c1416a2806ae0bf5f56b201191"
 dependencies = [
- "aho-corasick",
+ "aho-corasick 1.1.3",
  "memchr",
  "regex-automata 0.4.9",
  "regex-syntax 0.8.5",
@@ -5322,7 +5363,7 @@ version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "809e8dc61f6de73b46c85f4c96486310fe304c434cfa43669d7b40f711150908"
 dependencies = [
- "aho-corasick",
+ "aho-corasick 1.1.3",
  "memchr",
  "regex-syntax 0.8.5",
 ]
@@ -5332,6 +5373,15 @@ name = "regex-lite"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53a49587ad06b26609c52e423de037e7f57f20d53535d66e08c695f347df952a"
+
+[[package]]
+name = "regex-syntax"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d707a4fa2637f2dca2ef9fd02225ec7661fe01a53623c1e6515b6916511f7a7"
+dependencies = [
+ "ucd-util",
+]
 
 [[package]]
 name = "regex-syntax"
@@ -5375,14 +5425,14 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "js-sys",
- "log",
+ "log 0.4.25",
  "mime",
  "native-tls",
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.22",
+ "rustls 0.23.23",
  "rustls-native-certs 0.8.1",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
@@ -5522,7 +5572,7 @@ version = "0.21.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
 dependencies = [
- "log",
+ "log 0.4.25",
  "ring",
  "rustls-webpki 0.101.7",
  "sct",
@@ -5530,12 +5580,12 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.22"
+version = "0.23.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fb9263ab4eb695e42321db096e3b8fbd715a59b154d5c88d82db2175b681ba7"
+checksum = "47796c98c480fce5406ef69d1c76378375492c3b0a0de587be0c1d9feb12f395"
 dependencies = [
  "aws-lc-rs",
- "log",
+ "log 0.4.25",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -5840,7 +5890,7 @@ dependencies = [
  "fs2",
  "fxhash",
  "libc",
- "log",
+ "log 0.4.25",
  "parking_lot 0.11.2",
 ]
 
@@ -5899,7 +5949,7 @@ version = "0.50.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2e5b515a2bd5168426033e9efbfd05500114833916f1d5c268f938b4ee130ac"
 dependencies = [
- "log",
+ "log 0.4.25",
  "sqlparser_derive 0.2.2",
 ]
 
@@ -5909,8 +5959,18 @@ version = "0.53.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05a528114c392209b3264855ad491fcce534b94a38771b0a0b97a79379275ce8"
 dependencies = [
- "log",
+ "log 0.4.25",
  "sqlparser_derive 0.3.0",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.54.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c66e3b7374ad4a6af849b08b3e7a6eda0edbd82f0fd59b57e22671bf16979899"
+dependencies = [
+ "log 0.4.25",
+ "recursive",
 ]
 
 [[package]]
@@ -6075,6 +6135,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c41af27dd6d1e27b1b16b489db798443478cef1f06a660c96db617ba5de3b1"
 
 [[package]]
+name = "task"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c1d0d37ae7c52e37fa55c82543700c5ed233d93cdb52cb8e578c3503405d2f6"
+dependencies = [
+ "crontab",
+ "log 0.3.9",
+ "threadpool",
+ "time 0.1.45",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6130,12 +6202,30 @@ dependencies = [
 
 [[package]]
 name = "thread_local"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6b53e329000edc2b34dbe8545fd20e55a333362d0a321909685a19bd28c3f1b"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
+name = "thread_local"
 version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b9ef9bad013ada3808854ceac7b46812a6465ba368859a37e2100283d2d719c"
 dependencies = [
  "cfg-if",
  "once_cell",
+]
+
+[[package]]
+name = "threadpool"
+version = "1.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2f0c90a5f3459330ac8bc0d2f879c693bb7a2f59689c1083fc4ef83834da865"
+dependencies = [
+ "num_cpus",
 ]
 
 [[package]]
@@ -6147,6 +6237,17 @@ dependencies = [
  "byteorder",
  "integer-encoding",
  "ordered-float",
+]
+
+[[package]]
+name = "time"
+version = "0.1.45"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b797afad3f312d1c66a56d11d0316f916356d11bd158fbc6ca6389ff6bf805a"
+dependencies = [
+ "libc",
+ "wasi 0.10.0+wasi-snapshot-preview1",
+ "winapi",
 ]
 
 [[package]]
@@ -6199,13 +6300,17 @@ dependencies = [
  "dotenv",
  "env_logger",
  "futures",
- "log",
+ "log 0.4.25",
  "pgwire 0.28.0",
  "prometheus",
- "regex",
+ "regex 1.11.1",
+ "rustls 0.23.23",
+ "rustls-pemfile 2.2.0",
  "serde",
  "serde_json",
  "sled",
+ "sqlparser 0.54.0",
+ "task",
  "tokio",
  "tokio-rustls 0.26.1",
  "tokio-util",
@@ -6303,7 +6408,7 @@ version = "0.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f6d0975eaace0cf0fcadee4e4aaa5da15b5c079146f2cffb67c113be122bf37"
 dependencies = [
- "rustls 0.23.22",
+ "rustls 0.23.23",
  "tokio",
 ]
 
@@ -6370,7 +6475,7 @@ version = "0.1.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "784e0ac535deb450455cbfa28a6f0df145ea1bb7ae51b821cf5e7927fdcfbdd0"
 dependencies = [
- "log",
+ "log 0.4.25",
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
@@ -6413,7 +6518,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
 dependencies = [
- "log",
+ "log 0.4.25",
  "once_cell",
  "tracing-core",
 ]
@@ -6427,10 +6532,10 @@ dependencies = [
  "matchers",
  "nu-ansi-term",
  "once_cell",
- "regex",
+ "regex 1.11.1",
  "sharded-slab",
  "smallvec",
- "thread_local",
+ "thread_local 1.1.8",
  "tracing",
  "tracing-core",
  "tracing-log",
@@ -6457,6 +6562,12 @@ name = "typenum"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42ff0bf0c66b8238c6f3b578df37d0b7848e55df8577b3f74f92a69acceeb825"
+
+[[package]]
+name = "ucd-util"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abd2fc5d32b590614af8b0a20d837f32eca055edd0bbead59a9cfe80858be003"
 
 [[package]]
 name = "unicode-bidi"
@@ -6539,6 +6650,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8232dd3cdaed5356e0f716d285e4b40b932ac434100fe9b7e0e8e935b9e6246"
 
 [[package]]
+name = "utf8-ranges"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fcfc827f90e53a02eaef5e535ee14266c1d569214c6aa70133a624d8a3164ba"
+
+[[package]]
 name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6617,6 +6734,12 @@ dependencies = [
 
 [[package]]
 name = "wasi"
+version = "0.10.0+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a143597ca7c7793eff794def352d41792a93c481eb1042423ff7ff72ba2c31f"
+
+[[package]]
+name = "wasi"
 version = "0.11.0+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c8d87e72b64a3b4db28d11ce29237c246188f4f51057d65a7eab63b7987e423"
@@ -6649,7 +6772,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f0a0651a5c2bc21487bde11ee802ccaf4c51935d0d3d42a6101f98161700bc6"
 dependencies = [
  "bumpalo",
- "log",
+ "log 0.4.25",
  "proc-macro2",
  "quote",
  "syn 2.0.98",

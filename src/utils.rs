@@ -57,7 +57,7 @@ pub fn prepare_sql(query: &str) -> Result<String> {
             let unique_table_name = format!("table_{}", project_id);
             Ok(query.replace("\"table\"", &format!("\"{}\"", unique_table_name)))
         } else {
-            Ok(query.to_string())
+            Err(anyhow::anyhow!("Project ID not found in SQL"))
         }
     } else {
         Ok(query.to_string())
