@@ -4,6 +4,8 @@ mod persistent_queue;
 mod pgserver_message;
 mod pgwire_integration;
 mod utils;
+mod metrics;
+mod metrics_middleware;
 
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use actix_web::middleware::Logger;
@@ -13,38 +15,82 @@ use pgwire_integration::{DfSessionService, run_pgwire_server, HandlerFactory};
 use persistent_queue::PersistentQueue;
 use serde_json::json;
 use std::sync::Arc;
-use std::str;
 use std::env;
 use tokio::time::{sleep, Duration, timeout};
-use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error};
 use tracing_subscriber::EnvFilter;
 use dotenv::dotenv;
 use tokio::task::spawn_blocking;
+use std::time::Duration as StdDuration;
+use anyhow::Context;
+use metrics::{UPTIME_GAUGE, gather_metrics};
 
-async fn health() -> impl Responder {
+/// AppInfo holds the application start time.
+struct AppInfo {
+    start_time: chrono::DateTime<Utc>,
+}
+
+async fn health(db: web::Data<Arc<Database>>, app_info: web::Data<AppInfo>) -> impl Responder {
+    let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds();
+    UPTIME_GAUGE.set(uptime as f64);
+    let db_status = match db.query("SELECT 1 AS test").await {
+        Ok(_) => "healthy",
+        Err(_) => "unhealthy",
+    };
     let health_status = json!({
         "status": "OK",
-        "version": env!("CARGO_PKG_VERSION"),
+        "version": "timefusion by APITOOLKIT",
         "timestamp": Utc::now().to_rfc3339(),
-        "database": "healthy"
+        "uptime_seconds": uptime,
+        "database": db_status
     });
     HttpResponse::Ok().json(health_status)
 }
 
-async fn metrics() -> impl Responder {
-    use prometheus::{Encoder, TextEncoder, gather};
-    let encoder = TextEncoder::new();
-    let metric_families = gather();
-    let mut buffer = Vec::new();
-    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
-        error!("Error encoding metrics: {:?}", e);
-        return HttpResponse::InternalServerError().body("Error encoding metrics");
-    }
+async fn metrics_endpoint() -> impl Responder {
+    let body = gather_metrics();
     HttpResponse::Ok()
-        .content_type(encoder.format_type())
-        .body(buffer)
+        .content_type("text/plain; version=0.0.4")
+        .body(body)
+}
+
+async fn landing() -> impl Responder {
+    let html = r#"
+    <!DOCTYPE html>
+    <html>
+      <head>
+         <meta charset="UTF-8">
+         <title>timefusion by APITOOLKIT</title>
+         <style>
+            body { background-color: #f4f4f4; color: #333; font-family: Arial, sans-serif; margin: 0; padding: 0; }
+            header { background-color: #1E90FF; color: white; padding: 20px; text-align: center; }
+            .container { margin: 20px auto; width: 80%; max-width: 800px; background-color: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+            footer { text-align: center; padding: 10px; font-size: 0.8em; color: #777; }
+            a { color: #1E90FF; text-decoration: none; }
+         </style>
+      </head>
+      <body>
+         <header>
+            <h1>timefusion by APITOOLKIT</h1>
+         </header>
+         <div class="container">
+            <h2>Welcome to timefusion</h2>
+            <p>This production‑ready API provides robust data ingestion, query, and monitoring capabilities.</p>
+            <ul>
+                <li><a href="/health">/health</a> - System health and uptime.</li>
+                <li><a href="/metrics">/metrics</a> - Prometheus metrics.</li>
+                <li><a href="/data?project_id=events">/data</a> - Retrieve all data for a project (supports limit/offset for batching).</li>
+                <li><a href="/data/your_record_id?project_id=events">/data/&lt;id&gt;</a> - Retrieve a record by ID.</li>
+            </ul>
+         </div>
+         <footer>
+            <p>&copy; 2025 APITOOLKIT</p>
+         </footer>
+      </body>
+    </html>
+    "#;
+    HttpResponse::Ok().content_type("text/html").body(html)
 }
 
 #[tokio::main]
@@ -71,9 +117,25 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to create events table")?;
     
-    let queue = Arc::new(PersistentQueue::new("/app/queue_db").context("Failed to initialize PersistentQueue - aborting")?);
+    let queue = Arc::new(PersistentQueue::new("/app/queue_db")
+        .context("Failed to initialize PersistentQueue - aborting")?);
     
     let status_store = ingest::IngestStatusStore::new();
+    let app_info = web::Data::new(AppInfo { start_time: Utc::now() });
+
+    // Spawn periodic compaction task every 24 hours.
+    let db_for_compaction = db.clone();
+    tokio::spawn(async move {
+        let mut compaction_interval = tokio::time::interval(StdDuration::from_secs(24 * 3600));
+        loop {
+            compaction_interval.tick().await;
+            if let Err(e) = db_for_compaction.compact_all_projects().await {
+                error!("Error during periodic compaction: {:?}", e);
+            } else {
+                info!("Periodic compaction completed successfully.");
+            }
+        }
+    });
 
     let shutdown_token = CancellationToken::new();
     let queue_shutdown = shutdown_token.clone();
@@ -104,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::select! {
                     _ = queue_shutdown.cancelled() => {
-                        info!("Persistent queue flush task received shutdown signal. Flushing remaining records.");
+                        info!("Queue flush task received shutdown signal. Flushing remaining records.");
                         let records = match queue_clone.dequeue_all().await {
                             Ok(r) => r,
                             Err(e) => {
@@ -143,13 +205,18 @@ async fn main() -> anyhow::Result<()> {
     let server = HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
+            .wrap(metrics_middleware::MetricsMiddleware)
             .app_data(web::Data::new(db.clone()))
             .app_data(web::Data::new(queue.clone()))
             .app_data(web::Data::new(status_store.clone()))
+            .app_data(app_info.clone())
+            .service(web::resource("/").route(web::get().to(landing)))
+            .service(web::resource("/health").route(web::get().to(health)))
+            .service(web::resource("/metrics").route(web::get().to(metrics_endpoint)))
             .service(ingest::ingest)
             .service(ingest::get_status)
-            .route("/health", web::get().to(health))
-            .route("/metrics", web::get().to(metrics))
+            .service(ingest::get_all_data)
+            .service(ingest::get_data_by_id)
     })
     .bind(&http_addr)
     .context(format!("Failed to bind HTTP server to {} - aborting", http_addr))?
@@ -204,6 +271,7 @@ async fn process_record(
     key: sled::IVec,
     record: persistent_queue::IngestRecord,
 ) {
+    use std::str;
     let key_vec = key.to_vec();
     let id = match str::from_utf8(&key_vec) {
         Ok(s) => s.to_string(),

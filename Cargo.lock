@@ -6285,6 +6285,7 @@ dependencies = [
 name = "timefusion"
 version = "0.1.0"
 dependencies = [
+ "actix-service",
  "actix-web",
  "anyhow",
  "arrow 54.1.0",
@@ -6300,6 +6301,7 @@ dependencies = [
  "dotenv",
  "env_logger",
  "futures",
+ "lazy_static",
  "log 0.4.25",
  "pgwire 0.28.0",
  "prometheus",

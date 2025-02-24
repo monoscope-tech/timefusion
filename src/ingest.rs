@@ -1,6 +1,7 @@
 use actix_web::{get, post, web, HttpResponse, Responder};
 use chrono::DateTime;
 use serde::Deserialize;
+use serde_json::{json, Value, Map};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use crate::persistent_queue::{IngestRecord, PersistentQueue};
@@ -35,7 +36,7 @@ impl IngestStatusStore {
 #[derive(Deserialize)]
 pub struct IngestData {
     pub project_id: String,
-    pub id: Option<String>, // Optional, defaults to gen_random_uuid()
+    pub id: Option<String>, // Optional, defaults to a generated uuid if not provided
     pub timestamp: String,
     pub trace_id: String,
     pub span_id: String,
@@ -57,24 +58,24 @@ pub struct IngestData {
     pub raw_url: String,
     pub method: String,
     pub referer: String,
-    pub path_params: Option<String>, // JSONB stored as String
-    pub query_params: Option<String>, // JSONB
-    pub request_headers: Option<String>, // JSONB
-    pub response_headers: Option<String>, // JSONB
-    pub request_body: Option<String>, // JSONB
-    pub response_body: Option<String>, // JSONB
+    pub path_params: Option<String>,
+    pub query_params: Option<String>,
+    pub request_headers: Option<String>,
+    pub response_headers: Option<String>,
+    pub request_body: Option<String>,
+    pub response_body: Option<String>,
     pub endpoint_hash: String,
     pub shape_hash: String,
     pub format_hashes: Vec<String>,
     pub field_hashes: Vec<String>,
     pub sdk_type: String,
     pub service_version: Option<String>,
-    pub attributes: Option<String>, // JSONB
-    pub events: Option<String>, // JSONB
-    pub links: Option<String>, // JSONB
-    pub resource: Option<String>, // JSONB
-    pub instrumentation_scope: Option<String>, // JSONB
-    pub errors: Option<String>, // JSONB
+    pub attributes: Option<String>,
+    pub events: Option<String>,
+    pub links: Option<String>,
+    pub resource: Option<String>,
+    pub instrumentation_scope: Option<String>,
+    pub errors: Option<String>,
     pub tags: Vec<String>,
 }
 
@@ -159,6 +160,90 @@ pub async fn ingest(
     }
 }
 
+#[post("/ingest/batch")]
+pub async fn ingest_batch(
+    data: web::Json<Vec<IngestData>>,
+    db: web::Data<Arc<Database>>,
+    queue: web::Data<Arc<PersistentQueue>>,
+    status_store: web::Data<Arc<IngestStatusStore>>,
+) -> impl Responder {
+    let mut results = Vec::new();
+    for (idx, rec) in data.iter().enumerate() {
+        if !db.has_project(&rec.project_id) {
+            results.push(json!({"index": idx, "error": "Invalid project_id"}));
+            continue;
+        }
+        if DateTime::parse_from_rfc3339(&rec.timestamp).is_err() {
+            results.push(json!({"index": idx, "error": "Invalid timestamp format"}));
+            continue;
+        }
+        if DateTime::parse_from_rfc3339(&rec.start_time).is_err() {
+            results.push(json!({"index": idx, "error": "Invalid start_time format"}));
+            continue;
+        }
+        if let Some(end_time) = &rec.end_time {
+            if DateTime::parse_from_rfc3339(end_time).is_err() {
+                results.push(json!({"index": idx, "error": "Invalid end_time format"}));
+                continue;
+            }
+        }
+        let record = IngestRecord {
+            project_id: rec.project_id.clone(),
+            id: rec.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            timestamp: rec.timestamp.clone(),
+            trace_id: rec.trace_id.clone(),
+            span_id: rec.span_id.clone(),
+            parent_span_id: rec.parent_span_id.clone(),
+            trace_state: rec.trace_state.clone(),
+            start_time: rec.start_time.clone(),
+            end_time: rec.end_time.clone(),
+            duration_ns: rec.duration_ns,
+            span_name: rec.span_name.clone(),
+            span_kind: rec.span_kind.clone(),
+            span_type: rec.span_type.clone(),
+            status: rec.status.clone(),
+            status_code: rec.status_code,
+            status_message: rec.status_message.clone(),
+            severity_text: rec.severity_text.clone(),
+            severity_number: rec.severity_number,
+            host: rec.host.clone(),
+            url_path: rec.url_path.clone(),
+            raw_url: rec.raw_url.clone(),
+            method: rec.method.clone(),
+            referer: rec.referer.clone(),
+            path_params: rec.path_params.clone(),
+            query_params: rec.query_params.clone(),
+            request_headers: rec.request_headers.clone(),
+            response_headers: rec.response_headers.clone(),
+            request_body: rec.request_body.clone(),
+            response_body: rec.response_body.clone(),
+            endpoint_hash: rec.endpoint_hash.clone(),
+            shape_hash: rec.shape_hash.clone(),
+            format_hashes: rec.format_hashes.clone(),
+            field_hashes: rec.field_hashes.clone(),
+            sdk_type: rec.sdk_type.clone(),
+            service_version: rec.service_version.clone(),
+            attributes: rec.attributes.clone(),
+            events: rec.events.clone(),
+            links: rec.links.clone(),
+            resource: rec.resource.clone(),
+            instrumentation_scope: rec.instrumentation_scope.clone(),
+            errors: rec.errors.clone(),
+            tags: rec.tags.clone(),
+        };
+        match queue.enqueue(&record).await {
+            Ok(receipt) => {
+                status_store.set_status(receipt.clone(), "Enqueued".to_string());
+                results.push(json!({"index": idx, "receipt": receipt}));
+            }
+            Err(e) => {
+                results.push(json!({"index": idx, "error": format!("{:?}", e)}));
+            }
+        }
+    }
+    HttpResponse::Ok().json(results)
+}
+
 #[get("/ingest/status/{id}")]
 pub async fn get_status(path: web::Path<String>, status_store: web::Data<Arc<IngestStatusStore>>) -> impl Responder {
     let id = path.into_inner();
@@ -166,5 +251,102 @@ pub async fn get_status(path: web::Path<String>, status_store: web::Data<Arc<Ing
         HttpResponse::Ok().body(status)
     } else {
         HttpResponse::NotFound().body("Record ID not found")
+    }
+}
+
+// Helper function to convert Arrow record batches to JSON rows.
+// This iterates over each batch and row, building a JSON object per row.
+fn record_batches_to_json_rows(
+    batches: &[datafusion::arrow::record_batch::RecordBatch]
+) -> serde_json::Result<Vec<Value>> {
+    let mut results = Vec::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let num_rows = batch.num_rows();
+        let num_cols = batch.num_columns();
+        for row in 0..num_rows {
+            let mut map = Map::new();
+            for col in 0..num_cols {
+                let field = schema.field(col);
+                let value = crate::utils::value_to_string(batch.column(col).as_ref(), row);
+                map.insert(field.name().clone(), Value::String(value));
+            }
+            results.push(Value::Object(map));
+        }
+    }
+    Ok(results)
+}
+
+#[get("/data")]
+pub async fn get_all_data(
+    db: web::Data<Arc<Database>>,
+    query: web::Query<HashMap<String, String>>,
+) -> impl Responder {
+    if let Some(project_id) = query.get("project_id") {
+        let mut sql = format!("SELECT * FROM table_{}", project_id);
+        if let Some(limit_str) = query.get("limit") {
+            if let Ok(limit) = limit_str.parse::<u32>() {
+                sql.push_str(&format!(" LIMIT {}", limit));
+            }
+        }
+        if let Some(offset_str) = query.get("offset") {
+            if let Ok(offset) = offset_str.parse::<u32>() {
+                sql.push_str(&format!(" OFFSET {}", offset));
+            }
+        }
+        match db.query(&sql).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) => match record_batches_to_json_rows(&batches) {
+                    Ok(rows) => HttpResponse::Ok().json(rows),
+                    Err(e) => {
+                        error!("JSON conversion error: {:?}", e);
+                        HttpResponse::InternalServerError().body("Error converting data to JSON")
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to collect DataFrame: {:?}", e);
+                    HttpResponse::InternalServerError().body("Error collecting data")
+                }
+            },
+            Err(e) => {
+                error!("Query error: {:?}", e);
+                HttpResponse::InternalServerError().body("Error executing query")
+            }
+        }
+    } else {
+        HttpResponse::BadRequest().body("Missing project_id parameter")
+    }
+}
+
+#[get("/data/{id}")]
+pub async fn get_data_by_id(
+    db: web::Data<Arc<Database>>,
+    path: web::Path<String>,
+    query: web::Query<HashMap<String, String>>,
+) -> impl Responder {
+    let record_id = path.into_inner();
+    if let Some(project_id) = query.get("project_id") {
+        let sql = format!("SELECT * FROM table_{} WHERE id = '{}'", project_id, record_id);
+        match db.query(&sql).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) => match record_batches_to_json_rows(&batches) {
+                    Ok(rows) => HttpResponse::Ok().json(rows),
+                    Err(e) => {
+                        error!("JSON conversion error: {:?}", e);
+                        HttpResponse::InternalServerError().body("Error converting data to JSON")
+                    }
+                },
+                Err(e) => {
+                    error!("Failed to collect DataFrame: {:?}", e);
+                    HttpResponse::InternalServerError().body("Error collecting data")
+                }
+            },
+            Err(e) => {
+                error!("Query error: {:?}", e);
+                HttpResponse::InternalServerError().body("Error executing query")
+            }
+        }
+    } else {
+        HttpResponse::BadRequest().body("Missing project_id parameter")
     }
 }

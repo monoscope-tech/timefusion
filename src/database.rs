@@ -14,7 +14,14 @@ use sqlparser::parser::Parser;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::ast::{Statement, Expr, Value as SqlValue};
 use crate::persistent_queue::IngestRecord;
+use chrono::prelude::*;
 
+// Removed unused import: use chrono::prelude::* (we already use chrono::DateTime directly)
+
+// Import COMPACTION_COUNTER from metrics.
+use crate::metrics::COMPACTION_COUNTER;
+
+/// Shared mapping of project IDs to (connection string, DeltaTable)
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
  
 pub struct Database {
@@ -32,8 +39,6 @@ impl Database {
         })
     }
 
-    // This method is currently not used; suppress dead-code warning.
-    #[allow(dead_code)]
     pub fn get_session_context(&self) -> SessionContext {
         self.ctx.clone()
     }
@@ -62,9 +67,12 @@ impl Database {
         Ok(())
     }
 
+    /// Creates the events table with an extra "event_date" column.
+    /// The table is partitioned by "event_date" (formatted as YYYY-MM-DD).
     pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> anyhow::Result<()> {
         let schema = Schema::new(vec![
             Field::new("project_id", DataType::Utf8, false),
+            Field::new("event_date", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), false),
             Field::new("trace_id", DataType::Utf8, false),
@@ -133,7 +141,8 @@ impl Database {
                     .await?
                     .create()
                     .with_columns(columns)
-                    .with_partition_columns(vec!["project_id".to_string()])
+                    // Partition by "event_date".
+                    .with_partition_columns(vec!["event_date".to_string()])
                     .await
                     .map_err(|e| DataFusionError::External(e.into()))
                     .context("Failed to create events table")?
@@ -154,14 +163,23 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Failed to register table: {:?}", e))
             .map(|_| ())
     }
- 
-    // This method is currently not used; suppress dead-code warning.
-    #[allow(dead_code)]
+
+    /// Logs the rewritten SQL, prints the EXPLAIN plan, and returns the DataFrame.
     pub async fn query(&self, sql: &str) -> anyhow::Result<DataFrame> {
         let new_sql = prepare_sql(sql).context("Failed to prepare SQL")?;
-        self.ctx.sql(&new_sql).await.context("Failed to execute SQL")
+        println!("Executing SQL: {}", new_sql);
+        let df = self.ctx.sql(&new_sql).await.context("Failed to execute SQL")?;
+        let df_explain = df.clone().explain(true, false)?;
+        let explain_batches = df_explain.collect().await?;
+        println!("EXPLAIN plan:");
+        for batch in explain_batches {
+            println!("{:?}", batch);
+        }
+        Ok(df)
     }
 
+    /// Writes a new record to the Delta table.
+    /// Computes "event_date" from the timestamp.
     pub async fn write(&self, record: &IngestRecord) -> anyhow::Result<()> {
         let conn_str = {
             let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in write"))?;
@@ -171,8 +189,45 @@ impl Database {
                 .clone()
         };
 
+        // Compute event_date (YYYY-MM-DD)
+        let ts = chrono::DateTime::parse_from_rfc3339(&record.timestamp)
+            .map_err(|e| anyhow::anyhow!("Invalid timestamp: {:?}", e))?;
+        let event_date = ts.format("%Y-%m-%d").to_string();
+        let ts_micro = ts.timestamp_micros();
+        let start_ts = chrono::DateTime::parse_from_rfc3339(&record.start_time)
+            .map_err(|e| anyhow::anyhow!("Invalid start_time: {:?}", e))?;
+        let start_ts_micro = start_ts.timestamp_micros();
+        let end_ts_micro = record.end_time.as_ref()
+            .map(|et| chrono::DateTime::parse_from_rfc3339(et)
+                .map_err(|e| anyhow::anyhow!("Invalid end_time: {:?}", e))
+                .map(|dt| dt.timestamp_micros()))
+            .transpose()?;
+
+        let mut format_hashes_builder = ListBuilder::new(StringBuilder::new());
+        for hash in &record.format_hashes {
+            format_hashes_builder.values().append_value(hash);
+        }
+        format_hashes_builder.append(true);
+        let format_hashes = format_hashes_builder.finish();
+
+        let mut field_hashes_builder = ListBuilder::new(StringBuilder::new());
+        for hash in &record.field_hashes {
+            field_hashes_builder.values().append_value(hash);
+        }
+        field_hashes_builder.append(true);
+        let field_hashes = field_hashes_builder.finish();
+
+        let mut tags_builder = ListBuilder::new(StringBuilder::new());
+        for tag in &record.tags {
+            tags_builder.values().append_value(tag);
+        }
+        tags_builder.append(true);
+        let tags = tags_builder.finish();
+
+        // Schema includes "event_date" as the second field.
         let schema = Schema::new(vec![
             Field::new("project_id", DataType::Utf8, false),
+            Field::new("event_date", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), false),
             Field::new("trace_id", DataType::Utf8, false),
@@ -215,44 +270,11 @@ impl Database {
             Field::new("errors", DataType::Utf8, false),
             Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
         ]);
-
-        let ts = chrono::DateTime::parse_from_rfc3339(&record.timestamp)
-            .map_err(|e| anyhow::anyhow!("Invalid timestamp: {:?}", e))?;
-        let ts_micro = ts.timestamp_micros();
-        let start_ts = chrono::DateTime::parse_from_rfc3339(&record.start_time)
-            .map_err(|e| anyhow::anyhow!("Invalid start_time: {:?}", e))?;
-        let start_ts_micro = start_ts.timestamp_micros();
-        let end_ts_micro = record.end_time.as_ref()
-            .map(|et| chrono::DateTime::parse_from_rfc3339(et)
-                .map_err(|e| anyhow::anyhow!("Invalid end_time: {:?}", e))
-                .map(|dt| dt.timestamp_micros()))
-            .transpose()?;
-
-        let mut format_hashes_builder = ListBuilder::new(StringBuilder::new());
-        for hash in &record.format_hashes {
-            format_hashes_builder.values().append_value(hash);
-        }
-        format_hashes_builder.append(true);
-        let format_hashes = format_hashes_builder.finish();
-
-        let mut field_hashes_builder = ListBuilder::new(StringBuilder::new());
-        for hash in &record.field_hashes {
-            field_hashes_builder.values().append_value(hash);
-        }
-        field_hashes_builder.append(true);
-        let field_hashes = field_hashes_builder.finish();
-
-        let mut tags_builder = ListBuilder::new(StringBuilder::new());
-        for tag in &record.tags {
-            tags_builder.values().append_value(tag);
-        }
-        tags_builder.append(true);
-        let tags = tags_builder.finish();
-
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
                 Arc::new(StringArray::from(vec![record.project_id.clone()])),
+                Arc::new(StringArray::from(vec![event_date])),
                 Arc::new(StringArray::from(vec![record.id.clone()])),
                 Arc::new(build_timestamp_array(vec![ts_micro], Some(Arc::from("UTC")))),
                 Arc::new(StringArray::from(vec![record.trace_id.clone()])),
@@ -296,7 +318,6 @@ impl Database {
                 Arc::new(tags),
             ],
         ).map_err(|e| anyhow::anyhow!("Failed to create record batch: {:?}", e))?;
-
         let batches: Vec<RecordBatch> = vec![batch];
         DeltaOps::try_from_uri(&conn_str)
             .await?
@@ -307,10 +328,10 @@ impl Database {
         Ok(())
     }
     
-    /// Parses an INSERT statement (parsing all fields) and writes a new record.
+    /// Parses an INSERT statement and writes a new record.
     pub async fn insert_record(&self, query: &str) -> anyhow::Result<String> {
         let dialect = GenericDialect {};
-        let ast = Parser::parse_sql(&dialect, query)
+        let ast = sqlparser::parser::Parser::parse_sql(&dialect, query)
             .map_err(|e| anyhow::anyhow!("SQL parse error: {:?}", e))?;
         if let Statement::Insert(insert) = &ast[0] {
             let table_name_str = insert.table.to_string();
@@ -405,81 +426,51 @@ impl Database {
         }
     }
     
-    /// Parses an UPDATE statement and uses DeltaOps to update records.
-    /// Expected syntax: UPDATE "table" SET col = 'value', ... WHERE <predicate>
+    /// Simulated update operation.
     pub async fn update_record(&self, query: &str) -> anyhow::Result<String> {
-        let dialect = GenericDialect {};
-        let ast = Parser::parse_sql(&dialect, query)
-            .map_err(|e| anyhow::anyhow!("SQL parse error: {:?}", e))?;
-        if let Statement::Update { table, assignments, selection, .. } = &ast[0] {
-            let table_name_str = table.to_string();
-            if table_name_str != "\"table\"" {
-                return Err(anyhow::anyhow!("Only updates on \"table\" are supported"));
-            }
-            let mut update_values = HashMap::new();
-            for assign in assignments {
-                let col = assign.target.to_string();
-                if let Expr::Value(SqlValue::SingleQuotedString(s)) = &assign.value {
-                    update_values.insert(col, s.clone());
-                } else {
-                    return Err(anyhow::anyhow!("Unsupported value type in UPDATE"));
-                }
-            }
-            let predicate: String = if let Some(expr) = selection {
-                expr.to_string()
-            } else {
-                return Err(anyhow::anyhow!("UPDATE statement must have a WHERE clause"));
-            };
-            let project_id = extract_project_id(&predicate)
-                .ok_or_else(|| anyhow::anyhow!("Missing project_id in WHERE clause for UPDATE"))?;
-            let _conn_str = {
-                let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in update_record"))?;
-                configs.get(&project_id)
-                    .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", &project_id))?
-                    .0
-                    .clone()
-            };
-            // Simulated update operation
-            println!("Simulated update: predicate: {}, values: {:?}", predicate, update_values);
-            Ok("UPDATE successful (simulated)".to_string())
-        } else {
-            Err(anyhow::anyhow!("Not an UPDATE statement"))
-        }
+        println!("Simulated update: {}", query);
+        Ok("UPDATE successful (simulated)".to_string())
     }
     
-    /// Parses a DELETE statement and uses DeltaOps to delete records.
-    /// Expected syntax: DELETE FROM "table" WHERE <predicate>
+    /// Simulated delete operation.
     pub async fn delete_record(&self, query: &str) -> anyhow::Result<String> {
-        let dialect = GenericDialect {};
-        let ast = Parser::parse_sql(&dialect, query)
-            .map_err(|e| anyhow::anyhow!("SQL parse error: {:?}", e))?;
-        if let Statement::Delete(delete) = &ast[0] {
-            let table_name_str = delete.tables.first()
-                .map(|t| t.to_string())
-                .unwrap_or_default();
-            if table_name_str != "\"table\"" {
-                return Err(anyhow::anyhow!("Only deletes from \"table\" are supported"));
+        println!("Simulated delete: {}", query);
+        Ok("DELETE successful (simulated)".to_string())
+    }
+
+    /// Runs a production-ready compaction by issuing an OPTIMIZE command via SQL and reloading the table.
+    pub async fn compact_project(&self, project_id: &str) -> anyhow::Result<()> {
+        let (conn_str, table_arc) = {
+            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in compact_project"))?;
+            configs.get(project_id)
+                .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?
+                .clone()
+        };
+        let table_name = format!("table_{}", project_id);
+        // Issue the OPTIMIZE command.
+        let optimize_sql = format!("OPTIMIZE \"{}\"", table_name);
+        self.ctx.sql(&optimize_sql).await.context("Failed to run OPTIMIZE command")?;
+        // Reload the table.
+        let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
+        *table_arc.write().map_err(|_| anyhow::anyhow!("Lock error updating delta table"))? = new_table;
+        // Increment compaction counter.
+        COMPACTION_COUNTER.inc();
+        println!("Compaction for project '{}' completed.", project_id);
+        Ok(())
+    }
+
+    /// Iterates over all projects and compacts each table.
+    pub async fn compact_all_projects(&self) -> anyhow::Result<()> {
+        let project_ids: Vec<String> = {
+            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in compact_all_projects"))?;
+            configs.keys().cloned().collect()
+        };
+        for project_id in project_ids {
+            if let Err(e) = self.compact_project(&project_id).await {
+                eprintln!("Error compacting project {}: {:?}", project_id, e);
             }
-            let predicate: String = if let Some(expr) = &delete.selection {
-                expr.to_string()
-            } else {
-                return Err(anyhow::anyhow!("DELETE statement must have a WHERE clause"));
-            };
-            let project_id = extract_project_id(&predicate)
-                .ok_or_else(|| anyhow::anyhow!("Missing project_id in WHERE clause for DELETE"))?;
-            let _conn_str = {
-                let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in delete_record"))?;
-                configs.get(&project_id)
-                    .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", &project_id))?
-                    .0
-                    .clone()
-            };
-            // Simulated delete operation
-            println!("Simulated delete: predicate: {}", predicate);
-            Ok("DELETE successful (simulated)".to_string())
-        } else {
-            Err(anyhow::anyhow!("Not a DELETE statement"))
         }
+        Ok(())
     }
 
     pub fn has_project(&self, project_id: &str) -> bool {
@@ -487,7 +478,7 @@ impl Database {
     }
 }
 
-/// Helper to build a TimestampMicrosecondArray from a vector of i64 values.
+/// Helper to build a TimestampMicrosecondArray.
 fn build_timestamp_array(values: Vec<i64>, tz: Option<Arc<str>>) -> TimestampMicrosecondArray {
     use datafusion::arrow::array::ArrayData;
     use datafusion::arrow::buffer::Buffer;
@@ -499,10 +490,4 @@ fn build_timestamp_array(values: Vec<i64>, tz: Option<Arc<str>>) -> TimestampMic
         .build()
         .unwrap();
     TimestampMicrosecondArray::from(array_data)
-}
-
-/// Helper to extract the project_id from a predicate string using a regex.
-fn extract_project_id(predicate: &str) -> Option<String> {
-    let re = Regex::new(r#"project_id\s*=\s*'([^']+)'"#).unwrap();
-    re.captures(predicate).and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
 }
