@@ -95,7 +95,7 @@ async fn landing() -> impl Responder {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv().context("Failed to load .env file")?;
+    dotenv::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
