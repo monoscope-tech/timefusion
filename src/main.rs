@@ -7,7 +7,9 @@ mod utils;
 mod metrics;
 mod metrics_middleware;
 
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
+// Remove duplicate import of the ingest module; functions will be referenced as ingest::function
+
+use actix_web::{web, App, HttpResponse, HttpServer, Responder, get};
 use actix_web::middleware::Logger;
 use chrono::Utc;
 use database::Database;
@@ -25,13 +27,121 @@ use tokio::task::spawn_blocking;
 use std::time::Duration as StdDuration;
 use anyhow::Context;
 use metrics::{UPTIME_GAUGE, gather_metrics};
+use prometheus::core::Collector;
+
+// ---------------------------------------------------------------------
+
+async fn dashboard_metrics() -> impl Responder {
+    // Get uptime from the gauge.
+    let uptime = UPTIME_GAUGE.get();
+    // Get compaction count (assuming your COMPACTION_COUNTER is defined in metrics).
+    let compactions = metrics::COMPACTION_COUNTER.get();
+
+    // Aggregate HTTP request total from our CounterVec.
+    let http_requests: f64 = {
+        let mfs = metrics::HTTP_REQUEST_COUNTER.collect();
+        let mut total = 0.0;
+        for mf in mfs {
+            for m in mf.get_metric() {
+                total += m.get_counter().get_value();
+            }
+        }
+        total
+    };
+
+    let data = json!({
+         "uptime_seconds": uptime,
+         "compactions": compactions,
+         "http_requests_total": http_requests,
+    });
+    HttpResponse::Ok().json(data)
+}
+// ---------------------------------------------------------------------
 
 /// AppInfo holds the application start time.
 struct AppInfo {
     start_time: chrono::DateTime<Utc>,
 }
 
-async fn health(db: web::Data<Arc<Database>>, app_info: web::Data<AppInfo>) -> impl Responder {
+/// Landing page/dashboard.
+async fn landing() -> impl Responder {
+    let html = r#"
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <title>timefusion by APITOOLKIT Dashboard</title>
+    <style>
+      body { font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0; }
+      header { background-color: #1E90FF; color: #fff; padding: 20px; text-align: center; }
+      .container { margin: 20px; }
+      .card { background: #fff; padding: 20px; margin-bottom: 20px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+      pre { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+    <!-- Load Chart.js from CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>timefusion by APITOOLKIT Dashboard</h1>
+    </header>
+    <div class="container">
+      <div class="card">
+        <h2>Health Status</h2>
+        <div id="healthStatus">Loading health...</div>
+      </div>
+      <div class="card">
+        <h2>Metrics</h2>
+        <canvas id="metricsChart" width="400" height="200"></canvas>
+      </div>
+    </div>
+    <script>
+      // Fetch health data and update the dashboard.
+      fetch('/health')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('healthStatus').innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+        })
+        .catch(error => {
+          document.getElementById('healthStatus').innerHTML = 'Error loading health data.';
+        });
+
+      // Fetch real metrics and render the chart.
+      fetch('/dashboard/metrics')
+        .then(response => response.json())
+        .then(data => {
+          const labels = Object.keys(data);
+          const values = Object.values(data);
+          const ctx = document.getElementById('metricsChart').getContext('2d');
+          new Chart(ctx, {
+            type: 'bar',
+            data: {
+              labels: labels,
+              datasets: [{
+                label: 'Real Metrics',
+                data: values,
+                backgroundColor: [
+                  'rgba(30, 144, 255, 0.6)', 
+                  'rgba(75, 192, 192, 0.6)', 
+                  'rgba(255, 99, 132, 0.6)'
+                ]
+              }]
+            },
+            options: {
+              responsive: true,
+              scales: { y: { beginAtZero: true } }
+            }
+          });
+        })
+        .catch(error => console.error('Error fetching dashboard metrics:', error));
+    </script>
+  </body>
+</html>
+    "#;
+    HttpResponse::Ok().content_type("text/html").body(html)
+}
+
+async fn health_endpoint(db: web::Data<Arc<Database>>, app_info: web::Data<AppInfo>) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds();
     UPTIME_GAUGE.set(uptime as f64);
     let db_status = match db.query("SELECT 1 AS test").await {
@@ -50,47 +160,7 @@ async fn health(db: web::Data<Arc<Database>>, app_info: web::Data<AppInfo>) -> i
 
 async fn metrics_endpoint() -> impl Responder {
     let body = gather_metrics();
-    HttpResponse::Ok()
-        .content_type("text/plain; version=0.0.4")
-        .body(body)
-}
-
-async fn landing() -> impl Responder {
-    let html = r#"
-    <!DOCTYPE html>
-    <html>
-      <head>
-         <meta charset="UTF-8">
-         <title>timefusion by APITOOLKIT</title>
-         <style>
-            body { background-color: #f4f4f4; color: #333; font-family: Arial, sans-serif; margin: 0; padding: 0; }
-            header { background-color: #1E90FF; color: white; padding: 20px; text-align: center; }
-            .container { margin: 20px auto; width: 80%; max-width: 800px; background-color: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-            footer { text-align: center; padding: 10px; font-size: 0.8em; color: #777; }
-            a { color: #1E90FF; text-decoration: none; }
-         </style>
-      </head>
-      <body>
-         <header>
-            <h1>timefusion by APITOOLKIT</h1>
-         </header>
-         <div class="container">
-            <h2>Welcome to timefusion</h2>
-            <p>This production‑ready API provides robust data ingestion, query, and monitoring capabilities.</p>
-            <ul>
-                <li><a href="/health">/health</a> - System health and uptime.</li>
-                <li><a href="/metrics">/metrics</a> - Prometheus metrics.</li>
-                <li><a href="/data?project_id=events">/data</a> - Retrieve all data for a project (supports limit/offset for batching).</li>
-                <li><a href="/data/your_record_id?project_id=events">/data/&lt;id&gt;</a> - Retrieve a record by ID.</li>
-            </ul>
-         </div>
-         <footer>
-            <p>&copy; 2025 APITOOLKIT</p>
-         </footer>
-      </body>
-    </html>
-    "#;
-    HttpResponse::Ok().content_type("text/html").body(html)
+    HttpResponse::Ok().content_type("text/plain; version=0.0.4").body(body)
 }
 
 #[tokio::main]
@@ -211,8 +281,9 @@ async fn main() -> anyhow::Result<()> {
             .app_data(web::Data::new(status_store.clone()))
             .app_data(app_info.clone())
             .service(web::resource("/").route(web::get().to(landing)))
-            .service(web::resource("/health").route(web::get().to(health)))
+            .service(web::resource("/health").route(web::get().to(health_endpoint)))
             .service(web::resource("/metrics").route(web::get().to(metrics_endpoint)))
+            .service(web::resource("/dashboard/metrics").route(web::get().to(dashboard_metrics)))
             .service(ingest::ingest)
             .service(ingest::get_status)
             .service(ingest::get_all_data)
