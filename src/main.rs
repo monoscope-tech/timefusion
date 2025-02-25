@@ -6,9 +6,6 @@ mod pgwire_integration;
 mod utils;
 mod metrics;
 mod metrics_middleware;
-
-// Remove duplicate import of the ingest module; functions will be referenced as ingest::function
-
 use actix_web::{web, App, HttpResponse, HttpServer, Responder, get};
 use actix_web::middleware::Logger;
 use chrono::Utc;
