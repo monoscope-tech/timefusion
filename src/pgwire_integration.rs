@@ -18,7 +18,7 @@ use bytes::BytesMut;
 use crate::utils::{prepare_sql, value_to_string};
 use crate::pgserver_message::PGServerMessage;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, error};
+use tracing::{info, error, debug};
 
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
@@ -42,8 +42,10 @@ impl UserDB {
         if let Ok(contents) = fs::read_to_string(path) {
             let db: UserDB = serde_json::from_str(&contents)
                 .map_err(|e| IoError::new(ErrorKind::InvalidData, e))?;
+            info!("Loaded user database from {}: {:?}", path, db.users);
             Ok(db)
         } else {
+            info!("No user database found at {}. Creating default admin user.", path);
             let default_user = User {
                 username: "admin".to_string(),
                 hashed_password: hash("admin123", DEFAULT_COST)
@@ -60,13 +62,17 @@ impl UserDB {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| IoError::new(ErrorKind::Other, e))?;
         fs::write(path, json)?;
+        info!("Saved user database to {}", path);
         Ok(())
     }
 
     pub fn verify_user(&self, username: &str, password: &str) -> bool {
         if let Some(user) = self.users.iter().find(|u| u.username == username) {
-            verify(password, &user.hashed_password).unwrap_or(false)
+            let result = verify(password, &user.hashed_password).unwrap_or(false);
+            debug!("Verifying user '{}': password match = {}", username, result);
+            result
         } else {
+            debug!("User '{}' not found in database", username);
             false
         }
     }
@@ -83,7 +89,13 @@ impl UserDB {
             is_admin,
         };
         self.users.push(user);
-        self.save_to_file("users.json")
+        self.save_to_file("users.json")?;
+        info!("Created new user: {}", username);
+        Ok(())
+    }
+
+    pub fn log_users(&self) {
+        info!("Registered users: {:?}", self.users);
     }
 }
 
@@ -101,15 +113,17 @@ impl DfSessionService {
             session_context: session_context.clone(),
         });
         let user_db = UserDB::load_from_file("users.json").unwrap_or_else(|e| {
-            error!("Failed to load user DB: {}", e);
+            error!("Failed to load user DB: {}. Starting with empty DB.", e);
             UserDB { users: vec![] }
         });
-        Self {
+        let service = Self {
             session_context,
             parser,
             db,
             user_db: Arc::new(Mutex::new(user_db)),
-        }
+        };
+        service.user_db.lock().unwrap().log_users();
+        service
     }
 }
 
@@ -255,7 +269,7 @@ fn command_complete_response(msg: &str) -> Response<'static> {
 
 async fn encode_dataframe(
     df: DataFrame,
-    _format: &pgwire::api::portal::Format, // Prefixed with _ to suppress unused warning
+    _format: &pgwire::api::portal::Format,
 ) -> Result<QueryResponse<'static>, Box<dyn std::error::Error + Send + Sync>> {
     let schema = (*df.schema()).clone();
     let batches = df.collect().await?;
@@ -292,7 +306,7 @@ fn serialize_row(row_values: Vec<Option<String>>) -> BytesMut {
                 buf.extend_from_slice(bytes);
             }
             None => {
-                buf.extend_from_slice(&(-1i32).to_be_bytes()); // NULL indicator
+                buf.extend_from_slice(&(-1i32).to_be_bytes());
             }
         }
     }
@@ -344,17 +358,25 @@ impl StartupHandler for DfSessionService {
     {
         if let PgWireFrontendMessage::Startup(startup) = msg {
             let user = startup.parameters.get("user").map(|s| s.as_str()).unwrap_or("");
-            let password = startup.parameters.get("password").map(|s| s.as_str());
-            info!("Authenticating user: {}", user);
-            let user_db = self.user_db.lock().unwrap();
-            if user_db.verify_user(user, password.unwrap_or("")) {
-                info!("User {} authenticated successfully", user);
+            let password = startup.parameters.get("password").map(|s| s.as_str()).unwrap_or("");
+            info!("Authenticating user: '{}'", user);
+            debug!("Received parameters: {:?}", startup.parameters);
+            let user_db = self.user_db.lock().map_err(|e| {
+                error!("Failed to lock user DB: {:?}", e);
+                PgWireError::ApiError("Internal server error".into())
+            })?;
+            if user_db.verify_user(user, password) {
+                info!("User '{}' authenticated successfully", user);
                 Ok(())
             } else {
-                error!("Authentication failed for user: {}", user);
+                error!(
+                    "Authentication failed for user: '{}'. Provided password length: {}, registered users: {:?}",
+                    user, password.len(), user_db.users
+                );
                 Err(PgWireError::ApiError("Authentication failed".into()))
             }
         } else {
+            error!("Expected startup message, received: {:?}", msg);
             Err(PgWireError::ApiError("Expected startup message".into()))
         }
     }
@@ -406,14 +428,20 @@ where
                 break;
             }
             result = listener.accept() => {
-                let (socket, peer_addr) = result?;
-                info!("Accepted connection from {:?}", peer_addr);
-                let handler_clone = handler.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_clone).await {
-                        error!("PGWire connection error: {:?}", e);
+                match result {
+                    Ok((socket, peer_addr)) => {
+                        info!("Accepted connection from {:?}", peer_addr);
+                        let handler_clone = handler.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_clone).await {
+                                error!("PGWire connection error: {:?}", e);
+                            }
+                        });
                     }
-                });
+                    Err(e) => {
+                        error!("Failed to accept connection: {:?}", e);
+                    }
+                }
             }
         }
     }

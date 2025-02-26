@@ -133,7 +133,10 @@ async fn health_endpoint(db: web::Data<Arc<Database>>, app_info: web::Data<AppIn
     UPTIME_GAUGE.set(uptime as f64);
     let db_status = match db.query("SELECT 1 AS test").await {
         Ok(_) => "healthy",
-        Err(_) => "unhealthy",
+        Err(e) => {
+            error!("Database health check failed: {:?}", e);
+            "unhealthy"
+        },
     };
     let health_status = json!({
         "status": "OK",

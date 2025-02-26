@@ -16,17 +16,14 @@ use crate::persistent_queue::IngestRecord;
 use chrono::DateTime;
 use crate::metrics::COMPACTION_COUNTER;
 
-// Define the ProjectConfigs type alias for clarity
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
 
-/// Represents a database instance with a DataFusion session context and project configurations.
 pub struct Database {
     pub ctx: SessionContext,
     project_configs: ProjectConfigs,
 }
 
 impl Database {
-    /// Creates a new `Database` instance with an initialized `SessionContext`.
     pub async fn new() -> Result<Self> {
         dotenv().ok();
         let ctx = SessionContext::new();
@@ -36,27 +33,26 @@ impl Database {
         })
     }
 
-    /// Returns a clone of the `SessionContext`.
     pub fn get_session_context(&self) -> SessionContext {
         self.ctx.clone()
     }
 
-    /// Adds a project with the specified `project_id` and `connection_string`.
     pub async fn add_project(&self, project_id: &str, connection_string: &str) -> Result<()> {
         let table = match DeltaTableBuilder::from_uri(connection_string).load().await {
             Ok(table) => table,
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!("Failed to load table '{}': {}. Creating new table.", connection_string, e);
                 DeltaOps::try_from_uri(connection_string)
                     .await?
                     .create()
                     .with_columns(Vec::<deltalake::kernel::StructField>::new())
                     .with_partition_columns(vec!["event_date".to_string()])
                     .await
-                    .map_err(|e| DataFusionError::External(e.into()))?
+                    .map_err(|e| anyhow::anyhow!("Failed to create table: {:?}", e))?
             }
         };
         self.project_configs.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock on project configs"))?
+            .map_err(|e| anyhow::anyhow!("Failed to acquire write lock: {:?}", e))?
             .insert(
                 project_id.to_string(),
                 (connection_string.to_string(), Arc::new(RwLock::new(table))),
@@ -64,9 +60,8 @@ impl Database {
         Ok(())
     }
 
-    /// Creates an events table for the specified `project_id` at the given `table_uri`.
-    pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> Result<()> {
-        let schema = Schema::new(vec![
+    fn event_schema() -> Schema {
+        Schema::new(vec![
             Field::new("project_id", DataType::Utf8, false),
             Field::new("event_date", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
@@ -110,8 +105,11 @@ impl Database {
             Field::new("instrumentation_scope", DataType::Utf8, false),
             Field::new("errors", DataType::Utf8, false),
             Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
-        ]);
+        ])
+    }
 
+    pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> Result<()> {
+        let schema = Self::event_schema();
         let columns: Vec<deltalake::kernel::StructField> = schema.fields().iter().map(|f| {
             deltalake::kernel::StructField::new(
                 f.name().to_string(),
@@ -129,7 +127,8 @@ impl Database {
 
         let table = match DeltaTableBuilder::from_uri(table_uri).load().await {
             Ok(table) => table,
-            Err(_) => {
+            Err(e) => {
+                tracing::warn!("Table '{}' not found: {}. Creating new table.", table_uri, e);
                 DeltaOps::try_from_uri(table_uri)
                     .await?
                     .create()
@@ -142,7 +141,7 @@ impl Database {
 
         let table_ref = Arc::new(RwLock::new(table));
         let provider = {
-            let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error on delta table"))?;
+            let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
             let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {:?}", e))?;
             let log_store = table_guard.log_store().clone();
             deltalake::delta_datafusion::DeltaTableProvider::try_new(
@@ -158,13 +157,12 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Failed to register table: {:?}", e))?;
 
         self.project_configs.write()
-            .map_err(|_| anyhow::anyhow!("Lock error"))?
+            .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?
             .insert(project_id.to_string(), (table_uri.to_string(), table_ref));
 
         Ok(())
     }
 
-    /// Executes a SQL query and returns a `DataFrame`.
     pub async fn query(&self, sql: &str) -> Result<DataFrame> {
         let new_sql = prepare_sql(sql)?;
         tracing::info!("Executing SQL: {}", new_sql);
@@ -174,10 +172,9 @@ impl Database {
         Ok(df)
     }
 
-    /// Writes an `IngestRecord` to the database.
     pub async fn write(&self, record: &IngestRecord) -> Result<()> {
         let (conn_str, _table_ref) = {
-            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             configs.get(&record.project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
         };
 
@@ -215,52 +212,7 @@ impl Database {
         tags_builder.append(true);
         let tags = tags_builder.finish();
 
-        let schema = Schema::new(vec![
-            Field::new("project_id", DataType::Utf8, false),
-            Field::new("event_date", DataType::Utf8, false),
-            Field::new("id", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), false),
-            Field::new("trace_id", DataType::Utf8, false),
-            Field::new("span_id", DataType::Utf8, false),
-            Field::new("parent_span_id", DataType::Utf8, true),
-            Field::new("trace_state", DataType::Utf8, true),
-            Field::new("start_time", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), false),
-            Field::new("end_time", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), true),
-            Field::new("duration_ns", DataType::Int64, false),
-            Field::new("span_name", DataType::Utf8, false),
-            Field::new("span_kind", DataType::Utf8, false),
-            Field::new("span_type", DataType::Utf8, false),
-            Field::new("status", DataType::Utf8, true),
-            Field::new("status_code", DataType::Int32, false),
-            Field::new("status_message", DataType::Utf8, false),
-            Field::new("severity_text", DataType::Utf8, true),
-            Field::new("severity_number", DataType::Int32, false),
-            Field::new("host", DataType::Utf8, false),
-            Field::new("url_path", DataType::Utf8, false),
-            Field::new("raw_url", DataType::Utf8, false),
-            Field::new("method", DataType::Utf8, false),
-            Field::new("referer", DataType::Utf8, false),
-            Field::new("path_params", DataType::Utf8, false),
-            Field::new("query_params", DataType::Utf8, false),
-            Field::new("request_headers", DataType::Utf8, false),
-            Field::new("response_headers", DataType::Utf8, false),
-            Field::new("request_body", DataType::Utf8, false),
-            Field::new("response_body", DataType::Utf8, false),
-            Field::new("endpoint_hash", DataType::Utf8, false),
-            Field::new("shape_hash", DataType::Utf8, false),
-            Field::new("format_hashes", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
-            Field::new("field_hashes", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
-            Field::new("sdk_type", DataType::Utf8, false),
-            Field::new("service_version", DataType::Utf8, true),
-            Field::new("attributes", DataType::Utf8, false),
-            Field::new("events", DataType::Utf8, false),
-            Field::new("links", DataType::Utf8, false),
-            Field::new("resource", DataType::Utf8, false),
-            Field::new("instrumentation_scope", DataType::Utf8, false),
-            Field::new("errors", DataType::Utf8, false),
-            Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
-        ]);
-
+        let schema = Self::event_schema();
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
@@ -317,7 +269,6 @@ impl Database {
         Ok(())
     }
 
-    /// Inserts a record into the `table_events` table based on a SQL INSERT statement.
     pub async fn insert_record(&self, query: &str) -> Result<String> {
         let dialect = GenericDialect {};
         let ast = Parser::parse_sql(&dialect, query)
@@ -407,18 +358,17 @@ impl Database {
         }
     }
 
-    /// Refreshes the table for the specified `project_id` by reloading it and re-registering it with the context.
     pub async fn refresh_table(&self, project_id: &str) -> Result<()> {
         let (conn_str, table_ref) = {
-            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             configs.get(project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
         };
 
         let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
-        *table_ref.write().map_err(|_| anyhow::anyhow!("Lock error"))? = new_table;
+        *table_ref.write().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = new_table;
 
         let provider = {
-            let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            let table_guard = table_ref.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Snapshot error: {:?}", e))?;
             let log_store = table_guard.log_store().clone();
             deltalake::delta_datafusion::DeltaTableProvider::try_new(
@@ -432,38 +382,41 @@ impl Database {
         Ok(())
     }
 
-    /// Simulates an UPDATE operation (placeholder implementation).
     pub async fn update_record(&self, query: &str) -> Result<String> {
-        println!("Simulated update: {}", query);
+        tracing::info!("Simulated update: {}", query);
         Ok("UPDATE successful (simulated)".to_string())
     }
 
-    /// Simulates a DELETE operation (placeholder implementation).
     pub async fn delete_record(&self, query: &str) -> Result<String> {
-        println!("Simulated delete: {}", query);
+        tracing::info!("Simulated delete: {}", query);
         Ok("DELETE successful (simulated)".to_string())
     }
 
-    /// Compacts the table for the specified `project_id`.
     pub async fn compact_project(&self, project_id: &str) -> Result<()> {
         let (conn_str, table_ref) = {
-            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             configs.get(project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
         };
         let table_name = "table_events".to_string();
-        let optimize_sql = format!("OPTIMIZE '{}'", table_name);
-        self.ctx.sql(&optimize_sql).await?;
-        let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
-        *table_ref.write().map_err(|_| anyhow::anyhow!("Lock error"))? = new_table;
-        COMPACTION_COUNTER.inc();
-        tracing::info!("Compaction for project '{}' completed.", project_id);
-        Ok(())
+        let optimize_sql = format!("OPTIMIZE TABLE {}", table_name);
+        match self.ctx.sql(&optimize_sql).await {
+            Ok(_) => {
+                let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
+                *table_ref.write().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = new_table;
+                COMPACTION_COUNTER.inc();
+                tracing::info!("Compaction for project '{}' completed.", project_id);
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!("Failed to execute '{}': {:?}", optimize_sql, e);
+                Err(anyhow::anyhow!("Compaction failed: {:?}", e))
+            }
+        }
     }
 
-    /// Compacts all projects in the database.
     pub async fn compact_all_projects(&self) -> Result<()> {
         let project_ids: Vec<String> = {
-            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             configs.keys().cloned().collect()
         };
         for project_id in project_ids {
@@ -474,13 +427,13 @@ impl Database {
         Ok(())
     }
 
-    /// Checks if a project with the specified `project_id` exists.
     pub fn has_project(&self, project_id: &str) -> bool {
-        self.project_configs.read().unwrap().contains_key(project_id)
+        self.project_configs.read()
+            .map(|configs| configs.contains_key(project_id))
+            .unwrap_or(false)
     }
 }
 
-/// Helper function to build a `TimestampMicrosecondArray` from a vector of microseconds.
 fn build_timestamp_array(values: Vec<i64>, tz: Option<Arc<str>>) -> TimestampMicrosecondArray {
     use datafusion::arrow::array::ArrayData;
     use datafusion::arrow::buffer::Buffer;
