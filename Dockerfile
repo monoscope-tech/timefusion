@@ -40,10 +40,10 @@ RUN apt-get update && \
 # Create a non-root user.
 RUN groupadd -r appgroup && useradd -r -g appgroup appuser
 
-# Create a dedicated, writable directory for the Sled DB.
-RUN mkdir -p /app/queue_db && \
-    chown -R appuser:appgroup /app/queue_db && \
-    chmod -R 775 /app/queue_db
+# Create and set permissions for directories.
+RUN mkdir -p /app/queue_db /app/data && \
+    chown -R appuser:appgroup /app /app/queue_db /app/data && \
+    chmod -R 775 /app /app/queue_db /app/data
 
 # Copy the compiled binary from the builder stage.
 COPY --from=builder /app/target/release/timefusion /usr/local/bin/timefusion
