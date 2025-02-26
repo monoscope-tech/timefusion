@@ -15,10 +15,6 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::ast::{Statement, Expr, Value as SqlValue};
 use crate::persistent_queue::IngestRecord;
 use chrono::prelude::*;
-
-// Removed unused import: use chrono::prelude::* (we already use chrono::DateTime directly)
-
-// Import COMPACTION_COUNTER from metrics.
 use crate::metrics::COMPACTION_COUNTER;
 
 /// Shared mapping of project IDs to (connection string, DeltaTable)

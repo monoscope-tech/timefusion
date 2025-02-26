@@ -6,10 +6,12 @@ mod pgwire_integration;
 mod utils;
 mod metrics;
 mod metrics_middleware;
-use actix_web::{web, App, HttpResponse, HttpServer, Responder, get};
+
+use actix_web::{web, HttpResponse, HttpServer, Responder, get};
 use actix_web::middleware::Logger;
 use chrono::Utc;
 use database::Database;
+use ingest::{ingest as ingest_handler, get_status, get_all_data, get_data_by_id};
 use pgwire_integration::{DfSessionService, run_pgwire_server, HandlerFactory};
 use persistent_queue::PersistentQueue;
 use serde_json::json;
@@ -26,15 +28,10 @@ use anyhow::Context;
 use metrics::{UPTIME_GAUGE, gather_metrics};
 use prometheus::core::Collector;
 
-// ---------------------------------------------------------------------
-
+#[get("/dashboard/metrics")]
 async fn dashboard_metrics() -> impl Responder {
-    // Get uptime from the gauge.
     let uptime = UPTIME_GAUGE.get();
-    // Get compaction count (assuming your COMPACTION_COUNTER is defined in metrics).
     let compactions = metrics::COMPACTION_COUNTER.get();
-
-    // Aggregate HTTP request total from our CounterVec.
     let http_requests: f64 = {
         let mfs = metrics::HTTP_REQUEST_COUNTER.collect();
         let mut total = 0.0;
@@ -53,7 +50,6 @@ async fn dashboard_metrics() -> impl Responder {
     });
     HttpResponse::Ok().json(data)
 }
-// ---------------------------------------------------------------------
 
 /// AppInfo holds the application start time.
 struct AppInfo {
@@ -75,7 +71,6 @@ async fn landing() -> impl Responder {
       .card { background: #fff; padding: 20px; margin-bottom: 20px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
       pre { white-space: pre-wrap; word-wrap: break-word; }
     </style>
-    <!-- Load Chart.js from CDN -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   </head>
   <body>
@@ -93,7 +88,6 @@ async fn landing() -> impl Responder {
       </div>
     </div>
     <script>
-      // Fetch health data and update the dashboard.
       fetch('/health')
         .then(response => response.json())
         .then(data => {
@@ -102,8 +96,6 @@ async fn landing() -> impl Responder {
         .catch(error => {
           document.getElementById('healthStatus').innerHTML = 'Error loading health data.';
         });
-
-      // Fetch real metrics and render the chart.
       fetch('/dashboard/metrics')
         .then(response => response.json())
         .then(data => {
@@ -118,8 +110,8 @@ async fn landing() -> impl Responder {
                 label: 'Real Metrics',
                 data: values,
                 backgroundColor: [
-                  'rgba(30, 144, 255, 0.6)', 
-                  'rgba(75, 192, 192, 0.6)', 
+                  'rgba(30, 144, 255, 0.6)',
+                  'rgba(75, 192, 192, 0.6)',
                   'rgba(255, 99, 132, 0.6)'
                 ]
               }]
@@ -162,7 +154,7 @@ async fn metrics_endpoint() -> impl Responder {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv::dotenv().ok();
+    dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
@@ -174,8 +166,10 @@ async fn main() -> anyhow::Result<()> {
     let pgwire_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
     let s3_uri = format!("s3://{}/delta_table", bucket);
 
+    // Register Delta Lake handlers.
     deltalake::aws::register_handlers(None);
 
+    // Initialize Database.
     let db = Arc::new(Database::new().await.context("Failed to initialize Database - aborting")?);
     db.add_project("events", &s3_uri)
         .await
@@ -183,14 +177,16 @@ async fn main() -> anyhow::Result<()> {
     db.create_events_table("events", &s3_uri)
         .await
         .context("Failed to create events table")?;
-    
+
+    // Initialize persistent queue.
     let queue = Arc::new(PersistentQueue::new("/app/queue_db")
         .context("Failed to initialize PersistentQueue - aborting")?);
-    
+
+    // Create IngestStatusStore.
     let status_store = ingest::IngestStatusStore::new();
     let app_info = web::Data::new(AppInfo { start_time: Utc::now() });
 
-    // Spawn periodic compaction task every 24 hours.
+    // Spawn periodic compaction task.
     let db_for_compaction = db.clone();
     tokio::spawn(async move {
         let mut compaction_interval = tokio::time::interval(StdDuration::from_secs(24 * 3600));
@@ -204,26 +200,30 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Setup shutdown token.
     let shutdown_token = CancellationToken::new();
     let queue_shutdown = shutdown_token.clone();
     let http_shutdown = shutdown_token.clone();
-    let pg_shutdown = shutdown_token.clone();
+    let pgwire_shutdown = shutdown_token.clone();
 
+    // Initialize PgWire service.
     let pg_service = DfSessionService::new(db.get_session_context(), db.clone());
     let handler_factory = HandlerFactory(Arc::new(pg_service));
 
+    // Spawn PGWire server.
     let pg_addr = format!("0.0.0.0:{}", pgwire_port);
     info!("Spawning PGWire server task on {}", pg_addr);
     let pg_server = tokio::spawn({
         let pg_addr = pg_addr.clone();
         let handler_factory = handler_factory.clone();
         async move {
-            if let Err(e) = run_pgwire_server(handler_factory, &pg_addr, pg_shutdown).await {
+            if let Err(e) = run_pgwire_server(handler_factory, &pg_addr, pgwire_shutdown).await {
                 error!("PGWire server error: {:?}", e);
             }
         }
     });
 
+    // Spawn queue flush task.
     let flush_task = {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
@@ -267,24 +267,25 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // Bind and run HTTP server.
     let http_addr = format!("0.0.0.0:{}", http_port);
     info!("Binding HTTP server to {}", http_addr);
     let server = HttpServer::new(move || {
-        App::new()
+        actix_web::App::new()
             .wrap(Logger::default())
             .wrap(metrics_middleware::MetricsMiddleware)
             .app_data(web::Data::new(db.clone()))
             .app_data(web::Data::new(queue.clone()))
             .app_data(web::Data::new(status_store.clone()))
-            .app_data(app_info.clone())
+            .app_data(web::Data::new(app_info.clone()))
             .service(web::resource("/").route(web::get().to(landing)))
             .service(web::resource("/health").route(web::get().to(health_endpoint)))
             .service(web::resource("/metrics").route(web::get().to(metrics_endpoint)))
-            .service(web::resource("/dashboard/metrics").route(web::get().to(dashboard_metrics)))
-            .service(ingest::ingest)
-            .service(ingest::get_status)
-            .service(ingest::get_all_data)
-            .service(ingest::get_data_by_id)
+            .service(dashboard_metrics)
+            .service(ingest_handler)
+            .service(get_status)
+            .service(get_all_data)
+            .service(get_data_by_id)
     })
     .bind(&http_addr)
     .context(format!("Failed to bind HTTP server to {} - aborting", http_addr))?
