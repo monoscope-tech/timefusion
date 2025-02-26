@@ -7,39 +7,42 @@ use deltalake::{DeltaTableBuilder, DeltaOps};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use crate::utils::prepare_sql;
-use anyhow::Context;
+use anyhow::Result;
 use dotenv::dotenv;
-use regex::Regex;
 use sqlparser::parser::Parser;
 use sqlparser::dialect::GenericDialect;
-use sqlparser::ast::{Statement, Expr, Value as SqlValue};
+use sqlparser::ast::{Statement, Expr, Value as SqlValue, SetExpr};
 use crate::persistent_queue::IngestRecord;
-use chrono::prelude::*;
+use chrono::DateTime;
 use crate::metrics::COMPACTION_COUNTER;
 
-/// Shared mapping of project IDs to (connection string, DeltaTable)
+// Define the ProjectConfigs type alias for clarity
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
- 
+
+/// Represents a database instance with a DataFusion session context and project configurations.
 pub struct Database {
     pub ctx: SessionContext,
     project_configs: ProjectConfigs,
 }
 
 impl Database {
-    pub async fn new() -> anyhow::Result<Self> {
+    /// Creates a new `Database` instance with an initialized `SessionContext`.
+    pub async fn new() -> Result<Self> {
         dotenv().ok();
         let ctx = SessionContext::new();
         Ok(Self {
-            project_configs: Arc::new(RwLock::new(HashMap::new())),
             ctx,
+            project_configs: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
+    /// Returns a clone of the `SessionContext`.
     pub fn get_session_context(&self) -> SessionContext {
         self.ctx.clone()
     }
 
-    pub async fn add_project(&self, project_id: &str, connection_string: &str) -> anyhow::Result<()> {
+    /// Adds a project with the specified `project_id` and `connection_string`.
+    pub async fn add_project(&self, project_id: &str, connection_string: &str) -> Result<()> {
         let table = match DeltaTableBuilder::from_uri(connection_string).load().await {
             Ok(table) => table,
             Err(_) => {
@@ -49,13 +52,11 @@ impl Database {
                     .with_columns(Vec::<deltalake::kernel::StructField>::new())
                     .with_partition_columns(vec!["event_date".to_string()])
                     .await
-                    .map_err(|e| DataFusionError::External(e.into()))
-                    .context("Creating dummy Delta table failed")?
+                    .map_err(|e| DataFusionError::External(e.into()))?
             }
         };
         self.project_configs.write()
-            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock on project configs"))
-            .context("Lock error in add_project")?
+            .map_err(|_| anyhow::anyhow!("Failed to acquire write lock on project configs"))?
             .insert(
                 project_id.to_string(),
                 (connection_string.to_string(), Arc::new(RwLock::new(table))),
@@ -63,9 +64,8 @@ impl Database {
         Ok(())
     }
 
-    /// Creates the events table with an extra "event_date" column.
-    /// The table is partitioned by "event_date" (formatted as YYYY-MM-DD).
-    pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> anyhow::Result<()> {
+    /// Creates an events table for the specified `project_id` at the given `table_uri`.
+    pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> Result<()> {
         let schema = Schema::new(vec![
             Field::new("project_id", DataType::Utf8, false),
             Field::new("event_date", DataType::Utf8, false),
@@ -111,25 +111,22 @@ impl Database {
             Field::new("errors", DataType::Utf8, false),
             Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
         ]);
+
         let columns: Vec<deltalake::kernel::StructField> = schema.fields().iter().map(|f| {
             deltalake::kernel::StructField::new(
                 f.name().to_string(),
-                if let DataType::Utf8 = f.data_type() {
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String)
-                } else if let DataType::Timestamp(_, _) = f.data_type() {
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Timestamp)
-                } else if let DataType::Int64 = f.data_type() {
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Long)
-                } else if let DataType::Int32 = f.data_type() {
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Integer)
-                } else if let DataType::List(_) = f.data_type() {
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String)
-                } else {
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String)
+                match f.data_type() {
+                    DataType::Utf8 => deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
+                    DataType::Timestamp(_, _) => deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Timestamp),
+                    DataType::Int64 => deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Long),
+                    DataType::Int32 => deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Integer),
+                    DataType::List(_) => deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
+                    _ => deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
                 },
                 f.is_nullable(),
             )
         }).collect();
+
         let table = match DeltaTableBuilder::from_uri(table_uri).load().await {
             Ok(table) => table,
             Err(_) => {
@@ -137,66 +134,64 @@ impl Database {
                     .await?
                     .create()
                     .with_columns(columns)
-                    // Partition by "event_date".
                     .with_partition_columns(vec!["event_date".to_string()])
                     .await
-                    .map_err(|e| DataFusionError::External(e.into()))
-                    .context("Failed to create events table")?
+                    .map_err(|e| anyhow::anyhow!("Failed to create events table: {:?}", e))?
             }
         };
- 
-        use deltalake::delta_datafusion::{DeltaTableProvider, DeltaScanConfig};
+
         let table_ref = Arc::new(RwLock::new(table));
         let provider = {
             let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error on delta table"))?;
-            let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Failed to get table snapshot: {:?}", e))?;
+            let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {:?}", e))?;
             let log_store = table_guard.log_store().clone();
-            DeltaTableProvider::try_new(snapshot.clone(), log_store, DeltaScanConfig::default())
-                .map_err(|e| anyhow::anyhow!("Failed to create DeltaTableProvider: {:?}", e))?
+            deltalake::delta_datafusion::DeltaTableProvider::try_new(
+                snapshot.clone(),
+                log_store,
+                deltalake::delta_datafusion::DeltaScanConfig::default(),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to create provider: {:?}", e))?
         };
-        let table_name = format!("table_{}", project_id);
+
+        let table_name = "table_events".to_string();
         self.ctx.register_table(&table_name, Arc::new(provider))
-            .map_err(|e| anyhow::anyhow!("Failed to register table: {:?}", e))
-            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to register table: {:?}", e))?;
+
+        self.project_configs.write()
+            .map_err(|_| anyhow::anyhow!("Lock error"))?
+            .insert(project_id.to_string(), (table_uri.to_string(), table_ref));
+
+        Ok(())
     }
 
-    /// Logs the rewritten SQL, prints the EXPLAIN plan, and returns the DataFrame.
-    pub async fn query(&self, sql: &str) -> anyhow::Result<DataFrame> {
-        let new_sql = prepare_sql(sql).context("Failed to prepare SQL")?;
-        println!("Executing SQL: {}", new_sql);
-        let df = self.ctx.sql(&new_sql).await.context("Failed to execute SQL")?;
-        let df_explain = df.clone().explain(true, false)?;
-        let explain_batches = df_explain.collect().await?;
-        println!("EXPLAIN plan:");
-        for batch in explain_batches {
-            println!("{:?}", batch);
-        }
+    /// Executes a SQL query and returns a `DataFrame`.
+    pub async fn query(&self, sql: &str) -> Result<DataFrame> {
+        let new_sql = prepare_sql(sql)?;
+        tracing::info!("Executing SQL: {}", new_sql);
+        let df = self.ctx.sql(&new_sql)
+            .await
+            .map_err(|e| anyhow::anyhow!("SQL execution failed: {:?}", e))?;
         Ok(df)
     }
 
-    /// Writes a new record to the Delta table.
-    /// Computes "event_date" from the timestamp.
-    pub async fn write(&self, record: &IngestRecord) -> anyhow::Result<()> {
-        let conn_str = {
-            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in write"))?;
-            configs.get(&record.project_id)
-                .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", &record.project_id))?
-                .0
-                .clone()
+    /// Writes an `IngestRecord` to the database.
+    pub async fn write(&self, record: &IngestRecord) -> Result<()> {
+        let (conn_str, _table_ref) = {
+            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            configs.get(&record.project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
         };
 
-        // Compute event_date (YYYY-MM-DD)
-        let ts = chrono::DateTime::parse_from_rfc3339(&record.timestamp)
+        let ts = DateTime::parse_from_rfc3339(&record.timestamp)
             .map_err(|e| anyhow::anyhow!("Invalid timestamp: {:?}", e))?;
         let event_date = ts.format("%Y-%m-%d").to_string();
         let ts_micro = ts.timestamp_micros();
-        let start_ts = chrono::DateTime::parse_from_rfc3339(&record.start_time)
+        let start_ts = DateTime::parse_from_rfc3339(&record.start_time)
             .map_err(|e| anyhow::anyhow!("Invalid start_time: {:?}", e))?;
         let start_ts_micro = start_ts.timestamp_micros();
         let end_ts_micro = record.end_time.as_ref()
-            .map(|et| chrono::DateTime::parse_from_rfc3339(et)
-                .map_err(|e| anyhow::anyhow!("Invalid end_time: {:?}", e))
-                .map(|dt| dt.timestamp_micros()))
+            .map(|et| DateTime::parse_from_rfc3339(et)
+                .map(|dt| dt.timestamp_micros())
+                .map_err(|e| anyhow::anyhow!("Invalid end_time: {:?}", e)))
             .transpose()?;
 
         let mut format_hashes_builder = ListBuilder::new(StringBuilder::new());
@@ -220,7 +215,6 @@ impl Database {
         tags_builder.append(true);
         let tags = tags_builder.finish();
 
-        // Schema includes "event_date" as the second field.
         let schema = Schema::new(vec![
             Field::new("project_id", DataType::Utf8, false),
             Field::new("event_date", DataType::Utf8, false),
@@ -266,6 +260,7 @@ impl Database {
             Field::new("errors", DataType::Utf8, false),
             Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
         ]);
+
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
@@ -313,168 +308,179 @@ impl Database {
                 Arc::new(StringArray::from_iter(vec![record.errors.as_ref()])),
                 Arc::new(tags),
             ],
-        ).map_err(|e| anyhow::anyhow!("Failed to create record batch: {:?}", e))?;
-        let batches: Vec<RecordBatch> = vec![batch];
+        )?;
         DeltaOps::try_from_uri(&conn_str)
             .await?
-            .write(batches.into_iter())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to write batch: {:?}", e))?;
- 
+            .write(vec![batch])
+            .await?;
+
         Ok(())
     }
-    
-    /// Parses an INSERT statement and writes a new record.
-    pub async fn insert_record(&self, query: &str) -> anyhow::Result<String> {
+
+    /// Inserts a record into the `table_events` table based on a SQL INSERT statement.
+    pub async fn insert_record(&self, query: &str) -> Result<String> {
         let dialect = GenericDialect {};
-        let ast = sqlparser::parser::Parser::parse_sql(&dialect, query)
+        let ast = Parser::parse_sql(&dialect, query)
             .map_err(|e| anyhow::anyhow!("SQL parse error: {:?}", e))?;
-        if let Statement::Insert(insert) = &ast[0] {
-            let table_name_str = insert.table.to_string();
-            if table_name_str != "\"table\"" {
-                return Err(anyhow::anyhow!("Only inserts into \"table\" are supported"));
-            }
-            let source_query = insert.source.as_ref().ok_or_else(|| anyhow::anyhow!("Missing source in INSERT"))?;
-            if let sqlparser::ast::SetExpr::Values(values) = &*source_query.body {
-                let rows = &values.rows;
-                if rows.len() != 1 {
-                    return Err(anyhow::anyhow!("Only single row inserts are supported"));
+
+        match &ast[0] {
+            Statement::Insert(insert) => {
+                let table_name_str = insert.table.to_string();
+                if table_name_str != "table_events" {
+                    return Err(anyhow::anyhow!("Only inserts into 'table_events' are supported"));
                 }
-                let row = &rows[0];
-                let mut insert_values = HashMap::new();
-                for (col, val) in insert.columns.iter().zip(row.iter()) {
-                    if let Expr::Value(SqlValue::SingleQuotedString(s)) = val {
-                        insert_values.insert(col.value.clone(), s.clone());
-                    } else {
-                        return Err(anyhow::anyhow!("Unsupported value type in INSERT"));
+
+                let source = insert.source.as_ref().ok_or_else(|| anyhow::anyhow!("Missing source in INSERT"))?;
+                if let SetExpr::Values(values) = &*source.body {
+                    let row = &values.rows[0];
+                    let mut insert_values = HashMap::new();
+                    for (col, val) in insert.columns.iter().zip(row.iter()) {
+                        match val {
+                            Expr::Value(SqlValue::SingleQuotedString(s)) => {
+                                insert_values.insert(col.to_string(), s.clone());
+                            }
+                            Expr::Value(SqlValue::Number(n, _)) => {
+                                insert_values.insert(col.to_string(), n.clone());
+                            }
+                            _ => return Err(anyhow::anyhow!("Unsupported value type: {:?}", val)),
+                        }
                     }
+
+                    let project_id = insert_values.get("project_id")
+                        .ok_or_else(|| anyhow::anyhow!("Missing project_id"))?;
+                    let timestamp = insert_values.get("timestamp")
+                        .ok_or_else(|| anyhow::anyhow!("Missing timestamp"))?;
+
+                    let record = IngestRecord {
+                        project_id: project_id.clone(),
+                        id: insert_values.get("id").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        timestamp: timestamp.clone(),
+                        trace_id: insert_values.get("trace_id").cloned().unwrap_or_default(),
+                        span_id: insert_values.get("span_id").cloned().unwrap_or_default(),
+                        parent_span_id: insert_values.get("parent_span_id").cloned(),
+                        trace_state: insert_values.get("trace_state").cloned(),
+                        start_time: insert_values.get("start_time").cloned().unwrap_or_default(),
+                        end_time: insert_values.get("end_time").cloned(),
+                        duration_ns: insert_values.get("duration_ns").and_then(|s| s.parse().ok()).unwrap_or(0),
+                        span_name: insert_values.get("span_name").cloned().unwrap_or_default(),
+                        span_kind: insert_values.get("span_kind").cloned().unwrap_or_default(),
+                        span_type: insert_values.get("span_type").cloned().unwrap_or_default(),
+                        status: insert_values.get("status").cloned(),
+                        status_code: insert_values.get("status_code").and_then(|s| s.parse().ok()).unwrap_or(0),
+                        status_message: insert_values.get("status_message").cloned().unwrap_or_default(),
+                        severity_text: insert_values.get("severity_text").cloned(),
+                        severity_number: insert_values.get("severity_number").and_then(|s| s.parse().ok()).unwrap_or(0),
+                        host: insert_values.get("host").cloned().unwrap_or_default(),
+                        url_path: insert_values.get("url_path").cloned().unwrap_or_default(),
+                        raw_url: insert_values.get("raw_url").cloned().unwrap_or_default(),
+                        method: insert_values.get("method").cloned().unwrap_or_default(),
+                        referer: insert_values.get("referer").cloned().unwrap_or_default(),
+                        path_params: insert_values.get("path_params").cloned(),
+                        query_params: insert_values.get("query_params").cloned(),
+                        request_headers: insert_values.get("request_headers").cloned(),
+                        response_headers: insert_values.get("response_headers").cloned(),
+                        request_body: insert_values.get("request_body").cloned(),
+                        response_body: insert_values.get("response_body").cloned(),
+                        endpoint_hash: insert_values.get("endpoint_hash").cloned().unwrap_or_default(),
+                        shape_hash: insert_values.get("shape_hash").cloned().unwrap_or_default(),
+                        format_hashes: insert_values.get("format_hashes").map(|s| vec![s.clone()]).unwrap_or_default(),
+                        field_hashes: insert_values.get("field_hashes").map(|s| vec![s.clone()]).unwrap_or_default(),
+                        sdk_type: insert_values.get("sdk_type").cloned().unwrap_or_default(),
+                        service_version: insert_values.get("service_version").cloned(),
+                        attributes: insert_values.get("attributes").cloned(),
+                        events: insert_values.get("events").cloned(),
+                        links: insert_values.get("links").cloned(),
+                        resource: insert_values.get("resource").cloned(),
+                        instrumentation_scope: insert_values.get("instrumentation_scope").cloned(),
+                        errors: insert_values.get("errors").cloned(),
+                        tags: insert_values.get("tags").map(|s| vec![s.clone()]).unwrap_or_default(),
+                    };
+
+                    self.write(&record).await?;
+                    self.refresh_table(&project_id).await?;
+                    Ok("INSERT 1".to_string())
+                } else {
+                    Err(anyhow::anyhow!("Unsupported INSERT source"))
                 }
-                self.write(&IngestRecord {
-                    project_id: insert_values.get("project_id")
-                        .ok_or_else(|| anyhow::anyhow!("Missing project_id"))?
-                        .clone(),
-                    id: insert_values.get("id")
-                        .cloned()
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                    timestamp: insert_values.get("timestamp")
-                        .ok_or_else(|| anyhow::anyhow!("Missing timestamp"))?
-                        .clone(),
-                    trace_id: insert_values.get("trace_id").cloned().unwrap_or_default(),
-                    span_id: insert_values.get("span_id").cloned().unwrap_or_default(),
-                    parent_span_id: insert_values.get("parent_span_id").cloned(),
-                    trace_state: insert_values.get("trace_state").cloned(),
-                    start_time: insert_values.get("start_time")
-                        .cloned()
-                        .unwrap_or_default(),
-                    end_time: insert_values.get("end_time").cloned(),
-                    duration_ns: insert_values.get("duration_ns")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0),
-                    span_name: insert_values.get("span_name").cloned().unwrap_or_default(),
-                    span_kind: insert_values.get("span_kind").cloned().unwrap_or_default(),
-                    span_type: insert_values.get("span_type").cloned().unwrap_or_default(),
-                    status: insert_values.get("status").cloned(),
-                    status_code: insert_values.get("status_code")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0),
-                    status_message: insert_values.get("status_message").cloned().unwrap_or_default(),
-                    severity_text: insert_values.get("severity_text").cloned(),
-                    severity_number: insert_values.get("severity_number")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0),
-                    host: insert_values.get("host").cloned().unwrap_or_default(),
-                    url_path: insert_values.get("url_path").cloned().unwrap_or_default(),
-                    raw_url: insert_values.get("raw_url").cloned().unwrap_or_default(),
-                    method: insert_values.get("method").cloned().unwrap_or_default(),
-                    referer: insert_values.get("referer").cloned().unwrap_or_default(),
-                    path_params: insert_values.get("path_params").cloned(),
-                    query_params: insert_values.get("query_params").cloned(),
-                    request_headers: insert_values.get("request_headers").cloned(),
-                    response_headers: insert_values.get("response_headers").cloned(),
-                    request_body: insert_values.get("request_body").cloned(),
-                    response_body: insert_values.get("response_body").cloned(),
-                    endpoint_hash: insert_values.get("endpoint_hash").cloned().unwrap_or_default(),
-                    shape_hash: insert_values.get("shape_hash").cloned().unwrap_or_default(),
-                    format_hashes: insert_values.get("format_hashes")
-                        .map(|s| vec![s.clone()])
-                        .unwrap_or_default(),
-                    field_hashes: insert_values.get("field_hashes")
-                        .map(|s| vec![s.clone()])
-                        .unwrap_or_default(),
-                    sdk_type: insert_values.get("sdk_type").cloned().unwrap_or_default(),
-                    service_version: insert_values.get("service_version").cloned(),
-                    attributes: insert_values.get("attributes").cloned(),
-                    events: insert_values.get("events").cloned(),
-                    links: insert_values.get("links").cloned(),
-                    resource: insert_values.get("resource").cloned(),
-                    instrumentation_scope: insert_values.get("instrumentation_scope").cloned(),
-                    errors: insert_values.get("errors").cloned(),
-                    tags: insert_values.get("tags")
-                        .map(|s| vec![s.clone()])
-                        .unwrap_or_default(),
-                }).await?;
-                Ok("INSERT successful".to_string())
-            } else {
-                Err(anyhow::anyhow!("Unsupported INSERT source"))
             }
-        } else {
-            Err(anyhow::anyhow!("Not an INSERT statement"))
+            _ => Err(anyhow::anyhow!("Not an INSERT statement")),
         }
     }
-    
-    /// Simulated update operation.
-    pub async fn update_record(&self, query: &str) -> anyhow::Result<String> {
+
+    /// Refreshes the table for the specified `project_id` by reloading it and re-registering it with the context.
+    pub async fn refresh_table(&self, project_id: &str) -> Result<()> {
+        let (conn_str, table_ref) = {
+            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            configs.get(project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
+        };
+
+        let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
+        *table_ref.write().map_err(|_| anyhow::anyhow!("Lock error"))? = new_table;
+
+        let provider = {
+            let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Snapshot error: {:?}", e))?;
+            let log_store = table_guard.log_store().clone();
+            deltalake::delta_datafusion::DeltaTableProvider::try_new(
+                snapshot.clone(),
+                log_store,
+                deltalake::delta_datafusion::DeltaScanConfig::default(),
+            )?
+        };
+
+        self.ctx.register_table("table_events", Arc::new(provider))?;
+        Ok(())
+    }
+
+    /// Simulates an UPDATE operation (placeholder implementation).
+    pub async fn update_record(&self, query: &str) -> Result<String> {
         println!("Simulated update: {}", query);
         Ok("UPDATE successful (simulated)".to_string())
     }
-    
-    /// Simulated delete operation.
-    pub async fn delete_record(&self, query: &str) -> anyhow::Result<String> {
+
+    /// Simulates a DELETE operation (placeholder implementation).
+    pub async fn delete_record(&self, query: &str) -> Result<String> {
         println!("Simulated delete: {}", query);
         Ok("DELETE successful (simulated)".to_string())
     }
 
-    /// Runs a production-ready compaction by issuing an OPTIMIZE command via SQL and reloading the table.
-    pub async fn compact_project(&self, project_id: &str) -> anyhow::Result<()> {
-        let (conn_str, table_arc) = {
-            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in compact_project"))?;
-            configs.get(project_id)
-                .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?
-                .clone()
+    /// Compacts the table for the specified `project_id`.
+    pub async fn compact_project(&self, project_id: &str) -> Result<()> {
+        let (conn_str, table_ref) = {
+            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            configs.get(project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
         };
-        let table_name = format!("table_{}", project_id);
-        // Issue the OPTIMIZE command.
-        let optimize_sql = format!("OPTIMIZE \"{}\"", table_name);
-        self.ctx.sql(&optimize_sql).await.context("Failed to run OPTIMIZE command")?;
-        // Reload the table.
+        let table_name = "table_events".to_string();
+        let optimize_sql = format!("OPTIMIZE '{}'", table_name);
+        self.ctx.sql(&optimize_sql).await?;
         let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
-        *table_arc.write().map_err(|_| anyhow::anyhow!("Lock error updating delta table"))? = new_table;
-        // Increment compaction counter.
+        *table_ref.write().map_err(|_| anyhow::anyhow!("Lock error"))? = new_table;
         COMPACTION_COUNTER.inc();
-        println!("Compaction for project '{}' completed.", project_id);
+        tracing::info!("Compaction for project '{}' completed.", project_id);
         Ok(())
     }
 
-    /// Iterates over all projects and compacts each table.
-    pub async fn compact_all_projects(&self) -> anyhow::Result<()> {
+    /// Compacts all projects in the database.
+    pub async fn compact_all_projects(&self) -> Result<()> {
         let project_ids: Vec<String> = {
-            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error in compact_all_projects"))?;
+            let configs = self.project_configs.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
             configs.keys().cloned().collect()
         };
         for project_id in project_ids {
             if let Err(e) = self.compact_project(&project_id).await {
-                eprintln!("Error compacting project {}: {:?}", project_id, e);
+                tracing::error!("Error compacting project {}: {:?}", project_id, e);
             }
         }
         Ok(())
     }
 
+    /// Checks if a project with the specified `project_id` exists.
     pub fn has_project(&self, project_id: &str) -> bool {
         self.project_configs.read().unwrap().contains_key(project_id)
     }
 }
 
-/// Helper to build a TimestampMicrosecondArray.
+/// Helper function to build a `TimestampMicrosecondArray` from a vector of microseconds.
 fn build_timestamp_array(values: Vec<i64>, tz: Option<Arc<str>>) -> TimestampMicrosecondArray {
     use datafusion::arrow::array::ArrayData;
     use datafusion::arrow::buffer::Buffer;

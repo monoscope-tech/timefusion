@@ -51,12 +51,10 @@ async fn dashboard_metrics() -> impl Responder {
     HttpResponse::Ok().json(data)
 }
 
-/// AppInfo holds the application start time.
 struct AppInfo {
     start_time: chrono::DateTime<Utc>,
 }
 
-/// Landing page/dashboard.
 async fn landing() -> impl Responder {
     let html = r#"
 <!DOCTYPE html>
@@ -166,10 +164,8 @@ async fn main() -> anyhow::Result<()> {
     let pgwire_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
     let s3_uri = format!("s3://{}/delta_table", bucket);
 
-    // Register Delta Lake handlers.
     deltalake::aws::register_handlers(None);
 
-    // Initialize Database.
     let db = Arc::new(Database::new().await.context("Failed to initialize Database - aborting")?);
     db.add_project("events", &s3_uri)
         .await
@@ -178,15 +174,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Failed to create events table")?;
 
-    // Initialize persistent queue.
     let queue = Arc::new(PersistentQueue::new("/app/queue_db")
         .context("Failed to initialize PersistentQueue - aborting")?);
 
-    // Create IngestStatusStore.
     let status_store = ingest::IngestStatusStore::new();
     let app_info = web::Data::new(AppInfo { start_time: Utc::now() });
 
-    // Spawn periodic compaction task.
     let db_for_compaction = db.clone();
     tokio::spawn(async move {
         let mut compaction_interval = tokio::time::interval(StdDuration::from_secs(24 * 3600));
@@ -200,17 +193,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Setup shutdown token.
     let shutdown_token = CancellationToken::new();
     let queue_shutdown = shutdown_token.clone();
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
-    // Initialize PgWire service.
     let pg_service = DfSessionService::new(db.get_session_context(), db.clone());
     let handler_factory = HandlerFactory(Arc::new(pg_service));
 
-    // Spawn PGWire server.
     let pg_addr = format!("0.0.0.0:{}", pgwire_port);
     info!("Spawning PGWire server task on {}", pg_addr);
     let pg_server = tokio::spawn({
@@ -223,7 +213,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Spawn queue flush task.
     let flush_task = {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
@@ -267,7 +256,6 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    // Bind and run HTTP server.
     let http_addr = format!("0.0.0.0:{}", http_port);
     info!("Binding HTTP server to {}", http_addr);
     let server = HttpServer::new(move || {
@@ -362,6 +350,9 @@ async fn process_record(
                     Ok(Ok(())) => info!("Successfully removed key."),
                     Ok(Err(e)) => error!("Removal failed: {:?}", e),
                     Err(e) => error!("Join error during removal: {:?}", e),
+                }
+                if let Err(e) = db.refresh_table(&record.project_id).await {
+                    error!("Failed to refresh table after write: {:?}", e);
                 }
             }
             Err(e) => {

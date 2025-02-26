@@ -87,7 +87,6 @@ impl UserDB {
     }
 }
 
-// --- DF SESSION SERVICE DEFINITION ---
 pub struct DfSessionService {
     pub session_context: Arc<SessionContext>,
     pub parser: Arc<PgQueryParser>,
@@ -134,7 +133,6 @@ impl QueryParser for PgQueryParser {
     }
 }
 
-// --- SIMPLE QUERY HANDLER IMPLEMENTATION ---
 #[async_trait]
 impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
     async fn do_query<'a, C>(
@@ -174,7 +172,6 @@ impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
     }
 }
 
-// --- EXTENDED QUERY HANDLER IMPLEMENTATION ---
 #[async_trait]
 impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
     type Statement = LogicalPlan;
@@ -249,7 +246,6 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
     }
 }
 
-// --- RESPONSE HELPERS ---
 fn command_complete_response(msg: &str) -> Response<'static> {
     let bytes = PGServerMessage::encode(PGServerMessage::CommandComplete(msg.to_string()));
     let row_stream = stream::iter(vec![Ok(DataRow::new(bytes, 0))]);
@@ -259,40 +255,45 @@ fn command_complete_response(msg: &str) -> Response<'static> {
 
 async fn encode_dataframe(
     df: DataFrame,
-    _format: &pgwire::api::portal::Format,
+    _format: &pgwire::api::portal::Format, // Prefixed with _ to suppress unused warning
 ) -> Result<QueryResponse<'static>, Box<dyn std::error::Error + Send + Sync>> {
     let schema = (*df.schema()).clone();
     let batches = df.collect().await?;
     let fields = pgwire_schema_from_arrow(&schema)?;
-    
-    let mut all_rows: Vec<pgwire::error::PgWireResult<DataRow>> = Vec::new();
+
+    let mut all_rows = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {
             let mut row_values = Vec::new();
             for col in 0..batch.num_columns() {
                 let array = batch.column(col);
-                let value = value_to_string(array.as_ref(), row);
+                let value = if array.is_null(row) {
+                    None
+                } else {
+                    Some(value_to_string(array.as_ref(), row))
+                };
                 row_values.push(value);
             }
-            let serialized = serialize_row(row_values);
-            all_rows.push(Ok(DataRow::new(serialized, batch.num_columns() as i16)));
+            all_rows.push(Ok(DataRow::new(serialize_row(row_values), batch.num_columns() as i16)));
         }
     }
     let row_stream = stream::iter(all_rows);
     Ok(QueryResponse::new(fields.into(), row_stream))
 }
 
-fn serialize_row(row_values: Vec<String>) -> BytesMut {
-    let payload_len: usize = 2 + row_values.iter().map(|v| 4 + if v == "NULL" { 0 } else { v.len() }).sum::<usize>();
-    let mut buf = BytesMut::with_capacity(payload_len);
+fn serialize_row(row_values: Vec<Option<String>>) -> BytesMut {
+    let mut buf = BytesMut::new();
     buf.extend_from_slice(&(row_values.len() as i16).to_be_bytes());
     for value in row_values {
-        if value == "NULL" {
-            buf.extend_from_slice(&(-1i32).to_be_bytes());
-        } else {
-            let bytes = value.as_bytes();
-            buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
-            buf.extend_from_slice(bytes);
+        match value {
+            Some(v) => {
+                let bytes = v.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            None => {
+                buf.extend_from_slice(&(-1i32).to_be_bytes()); // NULL indicator
+            }
         }
     }
     buf
@@ -317,7 +318,6 @@ fn into_pg_type(dt: &datafusion::arrow::datatypes::DataType) -> Result<Type, Box
     }
 }
 
-/// --- IMPROVED PARAMETER HANDLING (PLACEHOLDER IMPLEMENTATIONS) ---
 fn deserialize_parameters<T>(
     _portal: &pgwire::api::portal::Portal<T>,
     _ordered: &Vec<Option<&datafusion::arrow::datatypes::DataType>>,
@@ -328,7 +328,7 @@ fn deserialize_parameters<T>(
 fn ordered_param_types(
     types: &HashMap<String, Option<datafusion::arrow::datatypes::DataType>>,
 ) -> Vec<Option<&datafusion::arrow::datatypes::DataType>> {
-    types.values().map(|opt| (*opt).as_ref()).collect()
+    types.values().map(|opt| opt.as_ref()).collect()
 }
 
 #[async_trait]
@@ -343,7 +343,6 @@ impl StartupHandler for DfSessionService {
         C::Error: std::fmt::Debug,
     {
         if let PgWireFrontendMessage::Startup(startup) = msg {
-            // Access parameters from the startup message.
             let user = startup.parameters.get("user").map(|s| s.as_str()).unwrap_or("");
             let password = startup.parameters.get("password").map(|s| s.as_str());
             info!("Authenticating user: {}", user);

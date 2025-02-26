@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use crate::persistent_queue::{IngestRecord, PersistentQueue};
 use crate::database::Database;
 use tracing::error;
+use datafusion::arrow::record_batch::RecordBatch; // Added import for explicit typing
 
 #[derive(Clone)]
 pub struct IngestStatusStore {
@@ -36,7 +37,7 @@ impl IngestStatusStore {
 #[derive(Deserialize)]
 pub struct IngestData {
     pub project_id: String,
-    pub id: Option<String>, // Optional, defaults to a generated uuid if not provided
+    pub id: Option<String>,
     pub timestamp: String,
     pub trace_id: String,
     pub span_id: String,
@@ -245,7 +246,10 @@ pub async fn ingest_batch(
 }
 
 #[get("/ingest/status/{id}")]
-pub async fn get_status(path: web::Path<String>, status_store: web::Data<Arc<IngestStatusStore>>) -> impl Responder {
+pub async fn get_status(
+    path: web::Path<String>,
+    status_store: web::Data<Arc<IngestStatusStore>>,
+) -> impl Responder {
     let id = path.into_inner();
     if let Some(status) = status_store.get_status(&id) {
         HttpResponse::Ok().body(status)
@@ -254,11 +258,8 @@ pub async fn get_status(path: web::Path<String>, status_store: web::Data<Arc<Ing
     }
 }
 
-// Helper function to convert Arrow record batches to JSON rows.
-// This iterates over each batch and row, building a JSON object per row.
-fn record_batches_to_json_rows(
-    batches: &[datafusion::arrow::record_batch::RecordBatch]
-) -> serde_json::Result<Vec<Value>> {
+// Helper function to convert Arrow record batches to JSON rows
+fn record_batches_to_json_rows(batches: &[RecordBatch]) -> serde_json::Result<Vec<Value>> {
     let mut results = Vec::new();
     for batch in batches {
         let schema = batch.schema();
@@ -296,13 +297,16 @@ pub async fn get_all_data(
         }
         match db.query(&sql).await {
             Ok(df) => match df.collect().await {
-                Ok(batches) => match record_batches_to_json_rows(&batches) {
-                    Ok(rows) => HttpResponse::Ok().json(rows),
-                    Err(e) => {
-                        error!("JSON conversion error: {:?}", e);
-                        HttpResponse::InternalServerError().body("Error converting data to JSON")
+                Ok(batches) => {
+                    let batches: Vec<RecordBatch> = batches; // Explicitly type batches
+                    match record_batches_to_json_rows(&batches) {
+                        Ok(rows) => HttpResponse::Ok().json(rows),
+                        Err(e) => {
+                            error!("JSON conversion error: {:?}", e);
+                            HttpResponse::InternalServerError().body("Error converting data to JSON")
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     error!("Failed to collect DataFrame: {:?}", e);
                     HttpResponse::InternalServerError().body("Error collecting data")
@@ -329,13 +333,16 @@ pub async fn get_data_by_id(
         let sql = format!("SELECT * FROM table_{} WHERE id = '{}'", project_id, record_id);
         match db.query(&sql).await {
             Ok(df) => match df.collect().await {
-                Ok(batches) => match record_batches_to_json_rows(&batches) {
-                    Ok(rows) => HttpResponse::Ok().json(rows),
-                    Err(e) => {
-                        error!("JSON conversion error: {:?}", e);
-                        HttpResponse::InternalServerError().body("Error converting data to JSON")
+                Ok(batches) => {
+                    let batches: Vec<RecordBatch> = batches; // Explicitly type batches
+                    match record_batches_to_json_rows(&batches) {
+                        Ok(rows) => HttpResponse::Ok().json(rows),
+                        Err(e) => {
+                            error!("JSON conversion error: {:?}", e);
+                            HttpResponse::InternalServerError().body("Error converting data to JSON")
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     error!("Failed to collect DataFrame: {:?}", e);
                     HttpResponse::InternalServerError().body("Error collecting data")
