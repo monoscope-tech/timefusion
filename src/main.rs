@@ -27,7 +27,6 @@ use anyhow::Context;
 use metrics::{UPTIME_GAUGE, COMPACTION_COUNTER, HTTP_REQUEST_COUNTER, INGESTION_COUNTER, ERROR_COUNTER};
 use prometheus::core::Collector;
 use std::collections::HashMap;
-use std::fs;
 
 #[get("/dashboard")]
 async fn dashboard(
@@ -135,7 +134,7 @@ async fn dashboard(
         }
     };
 
-    let html = fs::read_to_string("./src/dashboard/dashboard.html").expect("Failed to read dashboard.html")
+    let html = include_str!("dashboard/dashboard.html")
         .replace("{{uptime}}", &uptime.to_string())
         .replace("{{compactions}}", &compactions.to_string())
         .replace("{{http_requests}}", &http_requests.to_string())
