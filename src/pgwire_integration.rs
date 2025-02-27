@@ -1,3 +1,4 @@
+// src/pgwire_integration.rs
 use async_trait::async_trait;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, FieldInfo};
@@ -16,7 +17,6 @@ use std::collections::HashMap;
 use datafusion::common::ParamValues;
 use bytes::BytesMut;
 use crate::utils::{prepare_sql, value_to_string};
-use crate::pgserver_message::PGServerMessage;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, debug};
 
@@ -209,7 +209,7 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         let params = plan.get_parameter_types()
             .map_err(|e| PgWireError::ApiError(e.into()))?;
         let mut param_types = Vec::with_capacity(params.len());
-        for param in ordered_param_types(&params).iter() {
+        for param in ordered_param_types(&params).iter() { // Fixed: Use &params
             if let Some(dt) = param {
                 let pgtype = into_pg_type(dt)
                     .map_err(|e| PgWireError::ApiError(e.into()))?;
@@ -246,9 +246,9 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         let plan = &portal.statement.statement;
         let params = plan.get_parameter_types()
             .map_err(|e| PgWireError::ApiError(e.into()))?;
-        let param_values = deserialize_parameters(portal, &ordered_param_types(&params))
+        let param_values = deserialize_parameters(portal, &ordered_param_types(&params)) // Fixed: Use &params
             .map_err(|e| PgWireError::ApiError(e.into()))?;
-        let plan_with_values = plan.clone().replace_params_with_values(&param_values)
+        let plan_with_values = plan.clone().replace_params_with_values(&param_values) // Fixed: Borrow param_values with &
             .map_err(|e| PgWireError::ApiError(e.into()))?;
         let df = self.session_context.execute_logical_plan(plan_with_values)
             .await
@@ -261,9 +261,21 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
 }
 
 fn command_complete_response(msg: &str) -> Response<'static> {
-    let bytes = PGServerMessage::encode(PGServerMessage::CommandComplete(msg.to_string()));
-    let row_stream = stream::iter(vec![Ok(DataRow::new(bytes, 0))]);
-    let qr = QueryResponse::new(Vec::new().into(), row_stream);
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(&(1_i16).to_be_bytes()); // Number of fields
+    let bytes = msg.as_bytes();
+    buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+    buf.extend_from_slice(bytes);
+
+    let row_stream = stream::iter(vec![Ok(DataRow::new(buf, 1))]); // Fixed: Added number of fields (1)
+    let fields = vec![FieldInfo::new(
+        "CommandComplete".to_string(),
+        None,
+        None,
+        Type::TEXT,
+        pgwire::api::results::FieldFormat::Text,
+    )];
+    let qr = QueryResponse::new(fields.into(), row_stream);
     Response::Query(qr)
 }
 

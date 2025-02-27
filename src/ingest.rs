@@ -1,3 +1,4 @@
+// src/ingest.rs
 use actix_web::{get, post, web, HttpResponse, Responder};
 use chrono::DateTime;
 use serde::Deserialize;
@@ -11,7 +12,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 
 #[derive(Clone)]
 pub struct IngestStatusStore {
-    inner: Arc<RwLock<HashMap<String, String>>>,
+    pub inner: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl IngestStatusStore {
