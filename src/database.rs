@@ -2,7 +2,6 @@ use datafusion::prelude::*;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::array::{StringArray, TimestampMicrosecondArray, Int32Array, Int64Array, ListBuilder, StringBuilder};
-use datafusion::common::DataFusionError;
 use deltalake::{DeltaTableBuilder, DeltaOps};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -397,21 +396,18 @@ impl Database {
             let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             configs.get(project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
         };
-        let table_name = "table_events".to_string();
-        let optimize_sql = format!("OPTIMIZE TABLE {}", table_name);
-        match self.ctx.sql(&optimize_sql).await {
-            Ok(_) => {
-                let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
-                *table_ref.write().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = new_table;
-                COMPACTION_COUNTER.inc();
-                tracing::info!("Compaction for project '{}' completed.", project_id);
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!("Failed to execute '{}': {:?}", optimize_sql, e);
-                Err(anyhow::anyhow!("Compaction failed: {:?}", e))
-            }
-        }
+
+        let (table, _metrics) = DeltaOps::try_from_uri(&conn_str)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to load table for optimization: {:?}", e))?
+            .optimize()
+            .await
+            .map_err(|e| anyhow::anyhow!("Optimization failed: {:?}", e))?;
+
+        *table_ref.write().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = table;
+        COMPACTION_COUNTER.inc();
+        tracing::info!("Compaction for project '{}' completed.", project_id);
+        Ok(())
     }
 
     pub async fn compact_all_projects(&self) -> Result<()> {

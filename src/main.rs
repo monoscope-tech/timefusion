@@ -7,8 +7,7 @@ mod utils;
 mod metrics;
 mod metrics_middleware;
 
-use actix_web::{web, HttpResponse, HttpServer, Responder, get};
-use actix_web::middleware::Logger;
+use actix_web::{web, HttpResponse, HttpServer, Responder, get, middleware::Logger};
 use chrono::Utc;
 use database::Database;
 use ingest::{ingest as ingest_handler, get_status, get_all_data, get_data_by_id};
@@ -29,7 +28,10 @@ use metrics::{UPTIME_GAUGE, gather_metrics};
 use prometheus::core::Collector;
 
 #[get("/dashboard/metrics")]
-async fn dashboard_metrics() -> impl Responder {
+async fn dashboard_metrics(
+    db: web::Data<Arc<Database>>,
+    queue: web::Data<Arc<PersistentQueue>>,
+) -> impl Responder {
     let uptime = UPTIME_GAUGE.get();
     let compactions = metrics::COMPACTION_COUNTER.get();
     let http_requests: f64 = {
@@ -42,11 +44,18 @@ async fn dashboard_metrics() -> impl Responder {
         }
         total
     };
+    let queue_size = queue.get_ref().len().await.unwrap_or(0); // Assumes len() is implemented
+    let db_status = match db.query("SELECT 1 AS test").await {
+        Ok(_) => 1.0,
+        Err(_) => 0.0,
+    };
 
     let data = json!({
-         "uptime_seconds": uptime,
-         "compactions": compactions,
-         "http_requests_total": http_requests,
+        "uptime_seconds": uptime,
+        "compactions": compactions,
+        "http_requests_total": http_requests,
+        "queue_size": queue_size,
+        "db_status": db_status,
     });
     HttpResponse::Ok().json(data)
 }
@@ -61,66 +70,101 @@ async fn landing() -> impl Responder {
 <html>
   <head>
     <meta charset="UTF-8">
-    <title>timefusion by APITOOLKIT Dashboard</title>
+    <title>TimeFusion by APITOOLKIT Dashboard</title>
     <style>
-      body { font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 0; }
-      header { background-color: #1E90FF; color: #fff; padding: 20px; text-align: center; }
-      .container { margin: 20px; }
-      .card { background: #fff; padding: 20px; margin-bottom: 20px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-      pre { white-space: pre-wrap; word-wrap: break-word; }
+      body { font-family: 'Segoe UI', Arial, sans-serif; background: #eef2f7; margin: 0; padding: 0; color: #333; }
+      header { background: linear-gradient(90deg, #1E90FF, #00BFFF); color: #fff; padding: 25px; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.2); }
+      h1 { margin: 0; font-size: 2.5em; }
+      .container { max-width: 1200px; margin: 30px auto; padding: 0 15px; }
+      .card { background: #fff; padding: 20px; margin-bottom: 20px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); transition: transform 0.2s; }
+      .card:hover { transform: translateY(-5px); }
+      .card h2 { margin-top: 0; color: #1E90FF; font-size: 1.5em; }
+      pre { background: #f9f9f9; padding: 10px; border-radius: 5px; font-size: 0.9em; }
+      button { background: #1E90FF; color: #fff; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 1em; }
+      button:hover { background: #00BFFF; }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   </head>
   <body>
     <header>
-      <h1>timefusion by APITOOLKIT Dashboard</h1>
+      <h1>TimeFusion by APITOOLKIT Dashboard</h1>
     </header>
     <div class="container">
       <div class="card">
         <h2>Health Status</h2>
+        <button onclick="fetchHealth()">Refresh Health</button>
         <div id="healthStatus">Loading health...</div>
       </div>
       <div class="card">
-        <h2>Metrics</h2>
+        <h2>System Metrics</h2>
+        <button onclick="fetchMetrics()">Refresh Metrics</button>
         <canvas id="metricsChart" width="400" height="200"></canvas>
       </div>
     </div>
     <script>
-      fetch('/health')
-        .then(response => response.json())
-        .then(data => {
-          document.getElementById('healthStatus').innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
-        })
-        .catch(error => {
-          document.getElementById('healthStatus').innerHTML = 'Error loading health data.';
-        });
-      fetch('/dashboard/metrics')
-        .then(response => response.json())
-        .then(data => {
-          const labels = Object.keys(data);
-          const values = Object.values(data);
-          const ctx = document.getElementById('metricsChart').getContext('2d');
-          new Chart(ctx, {
-            type: 'bar',
-            data: {
-              labels: labels,
-              datasets: [{
-                label: 'Real Metrics',
-                data: values,
-                backgroundColor: [
-                  'rgba(30, 144, 255, 0.6)',
-                  'rgba(75, 192, 192, 0.6)',
-                  'rgba(255, 99, 132, 0.6)'
-                ]
-              }]
-            },
-            options: {
-              responsive: true,
-              scales: { y: { beginAtZero: true } }
-            }
+      let metricsChart;
+
+      function fetchHealth() {
+        fetch('/health')
+          .then(response => response.json())
+          .then(data => {
+            document.getElementById('healthStatus').innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+          })
+          .catch(error => {
+            document.getElementById('healthStatus').innerHTML = 'Error loading health data: ' + error;
           });
-        })
-        .catch(error => console.error('Error fetching dashboard metrics:', error));
+      }
+
+      function fetchMetrics() {
+        fetch('/dashboard/metrics')
+          .then(response => response.json())
+          .then(data => {
+            const labels = Object.keys(data);
+            const values = Object.values(data);
+            const ctx = document.getElementById('metricsChart').getContext('2d');
+            if (metricsChart) metricsChart.destroy();
+            metricsChart = new Chart(ctx, {
+              type: 'bar',
+              data: {
+                labels: labels,
+                datasets: [{
+                  label: 'System Metrics',
+                  data: values,
+                  backgroundColor: [
+                    'rgba(30, 144, 255, 0.6)',
+                    'rgba(75, 192, 192, 0.6)',
+                    'rgba(255, 99, 132, 0.6)',
+                    'rgba(255, 205, 86, 0.6)',
+                    'rgba(54, 162, 235, 0.6)'
+                  ],
+                  borderColor: [
+                    'rgba(30, 144, 255, 1)',
+                    'rgba(75, 192, 192, 1)',
+                    'rgba(255, 99, 132, 1)',
+                    'rgba(255, 205, 86, 1)',
+                    'rgba(54, 162, 235, 1)'
+                  ],
+                  borderWidth: 1
+                }]
+              },
+              options: {
+                responsive: true,
+                scales: {
+                  y: { beginAtZero: true, title: { display: true, text: 'Value' } },
+                  x: { title: { display: true, text: 'Metric' } }
+                },
+                plugins: {
+                  legend: { position: 'top' },
+                  title: { display: true, text: 'Real-Time System Metrics' }
+                }
+              }
+            });
+          })
+          .catch(error => console.error('Error fetching metrics:', error));
+      }
+
+      fetchHealth();
+      fetchMetrics();
     </script>
   </body>
 </html>
@@ -156,9 +200,12 @@ async fn metrics_endpoint() -> impl Responder {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
+
+    // Basic tracing setup without OpenTelemetry
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
+
     info!("Starting production-grade application");
 
     let bucket = env::var("S3_BUCKET_NAME")

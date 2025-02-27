@@ -6,8 +6,8 @@ use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use crate::persistent_queue::{IngestRecord, PersistentQueue};
 use crate::database::Database;
-use tracing::error;
-use datafusion::arrow::record_batch::RecordBatch; // Added import for explicit typing
+use tracing::{error, info};
+use datafusion::arrow::record_batch::RecordBatch;
 
 #[derive(Clone)]
 pub struct IngestStatusStore {
@@ -25,7 +25,7 @@ impl IngestStatusStore {
         if let Ok(mut map) = self.inner.write() {
             map.insert(id, status);
         } else {
-            eprintln!("Failed to acquire lock in set_status");
+            error!("Failed to acquire lock in set_status");
         }
     }
 
@@ -152,6 +152,7 @@ pub async fn ingest(
     match queue.enqueue(&record).await {
         Ok(receipt) => {
             status_store.set_status(receipt.clone(), "Enqueued".to_string());
+            info!("Record enqueued with receipt: {}", receipt);
             HttpResponse::Ok().body(format!("Record enqueued. Receipt: {}", receipt))
         }
         Err(e) => {
@@ -238,6 +239,7 @@ pub async fn ingest_batch(
                 results.push(json!({"index": idx, "receipt": receipt}));
             }
             Err(e) => {
+                error!("Error enqueuing record at index {}: {:?}", idx, e);
                 results.push(json!({"index": idx, "error": format!("{:?}", e)}));
             }
         }
@@ -252,13 +254,14 @@ pub async fn get_status(
 ) -> impl Responder {
     let id = path.into_inner();
     if let Some(status) = status_store.get_status(&id) {
+        info!("Status for ID {}: {}", id, status);
         HttpResponse::Ok().body(status)
     } else {
+        error!("Record ID not found: {}", id);
         HttpResponse::NotFound().body("Record ID not found")
     }
 }
 
-// Helper function to convert Arrow record batches to JSON rows
 fn record_batches_to_json_rows(batches: &[RecordBatch]) -> serde_json::Result<Vec<Value>> {
     let mut results = Vec::new();
     for batch in batches {
@@ -284,7 +287,11 @@ pub async fn get_all_data(
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     if let Some(project_id) = query.get("project_id") {
-        let mut sql = format!("SELECT * FROM table_{}", project_id);
+        if !db.has_project(project_id) {
+            error!("Invalid project_id: {}", project_id);
+            return HttpResponse::BadRequest().body("Invalid project_id");
+        }
+        let mut sql = format!("SELECT * FROM table_events WHERE project_id = '{}'", project_id);
         if let Some(limit_str) = query.get("limit") {
             if let Ok(limit) = limit_str.parse::<u32>() {
                 sql.push_str(&format!(" LIMIT {}", limit));
@@ -295,10 +302,11 @@ pub async fn get_all_data(
                 sql.push_str(&format!(" OFFSET {}", offset));
             }
         }
+        info!("Executing query: {}", sql);
         match db.query(&sql).await {
             Ok(df) => match df.collect().await {
                 Ok(batches) => {
-                    let batches: Vec<RecordBatch> = batches; // Explicitly type batches
+                    let batches: Vec<RecordBatch> = batches;
                     match record_batches_to_json_rows(&batches) {
                         Ok(rows) => HttpResponse::Ok().json(rows),
                         Err(e) => {
@@ -318,6 +326,7 @@ pub async fn get_all_data(
             }
         }
     } else {
+        error!("Missing project_id parameter");
         HttpResponse::BadRequest().body("Missing project_id parameter")
     }
 }
@@ -330,11 +339,19 @@ pub async fn get_data_by_id(
 ) -> impl Responder {
     let record_id = path.into_inner();
     if let Some(project_id) = query.get("project_id") {
-        let sql = format!("SELECT * FROM table_{} WHERE id = '{}'", project_id, record_id);
+        if !db.has_project(project_id) {
+            error!("Invalid project_id: {}", project_id);
+            return HttpResponse::BadRequest().body("Invalid project_id");
+        }
+        let sql = format!(
+            "SELECT * FROM table_events WHERE project_id = '{}' AND id = '{}'",
+            project_id, record_id
+        );
+        info!("Executing query: {}", sql);
         match db.query(&sql).await {
             Ok(df) => match df.collect().await {
                 Ok(batches) => {
-                    let batches: Vec<RecordBatch> = batches; // Explicitly type batches
+                    let batches: Vec<RecordBatch> = batches;
                     match record_batches_to_json_rows(&batches) {
                         Ok(rows) => HttpResponse::Ok().json(rows),
                         Err(e) => {
@@ -354,6 +371,7 @@ pub async fn get_data_by_id(
             }
         }
     } else {
+        error!("Missing project_id parameter");
         HttpResponse::BadRequest().body("Missing project_id parameter")
     }
 }

@@ -1,9 +1,8 @@
-use sled::{Db, IVec};
+use sled;
 use serde::{Serialize, Deserialize};
-use anyhow::Context;
-use tokio::task;
+use anyhow::Result;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct IngestRecord {
     pub project_id: String,
     pub id: String,
@@ -50,52 +49,38 @@ pub struct IngestRecord {
 }
 
 pub struct PersistentQueue {
-    pub db: Db,
+    db: sled::Db,
 }
 
 impl PersistentQueue {
-    pub fn new(path: &str) -> anyhow::Result<Self> {
-        let db = sled::open(path)
-            .with_context(|| format!("Failed to open Sled DB at path: {}", path))?;
+    pub fn new(path: &str) -> Result<Self> {
+        let db = sled::open(path)?;
         Ok(Self { db })
     }
 
-    pub async fn enqueue(&self, record: &IngestRecord) -> anyhow::Result<String> {
-        let serialized = serde_json::to_vec(record)
-            .context("Failed to serialize IngestRecord")?;
+    pub async fn enqueue(&self, record: &IngestRecord) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let db = self.db.clone();
-        let id_clone = id.clone();
-        task::spawn_blocking(move || {
-            db.insert(id_clone.as_bytes(), serialized)
-                .context("Failed to insert record into Sled DB")?;
-            db.flush().context("Failed to flush Sled DB")?;
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
+        let serialized = bincode::serialize(record)?;
+        self.db.insert(id.as_bytes(), serialized)?;
         Ok(id)
     }
 
-    pub async fn dequeue_all(&self) -> anyhow::Result<Vec<(IVec, IngestRecord)>> {
-        let db = self.db.clone();
-        task::spawn_blocking(move || {
-            let mut records = Vec::new();
-            for item in db.iter() {
-                let (key, value) = item.context("Error iterating over Sled DB")?;
-                let record: IngestRecord = serde_json::from_slice(&value)
-                    .context("Failed to deserialize IngestRecord")?;
-                records.push((key, record));
-            }
-            Ok(records)
-        })
-        .await?
+    pub async fn dequeue_all(&self) -> Result<Vec<(sled::IVec, IngestRecord)>> {
+        let mut records = Vec::new();
+        for item in self.db.iter() {
+            let (key, value) = item?;
+            let record: IngestRecord = bincode::deserialize(&value)?;
+            records.push((key, record));
+        }
+        Ok(records)
     }
 
-    pub fn remove_sync(&self, key: IVec) -> anyhow::Result<()> {
-        self.db
-            .remove(key)
-            .context("Failed to remove key from Sled DB")?;
-        self.db.flush().context("Failed to flush Sled DB after removal")?;
+    pub fn remove_sync(&self, key: sled::IVec) -> Result<()> {
+        self.db.remove(key)?;
         Ok(())
+    }
+
+    pub async fn len(&self) -> Result<usize> {
+        Ok(self.db.len())
     }
 }

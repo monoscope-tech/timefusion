@@ -359,12 +359,15 @@ impl StartupHandler for DfSessionService {
         if let PgWireFrontendMessage::Startup(startup) = msg {
             let user = startup.parameters.get("user").map(|s| s.as_str()).unwrap_or("");
             let password = startup.parameters.get("password").map(|s| s.as_str()).unwrap_or("");
+
             info!("Authenticating user: '{}'", user);
-            debug!("Received parameters: {:?}", startup.parameters);
+            debug!("Received startup parameters: {:?}", startup.parameters);
+
             let user_db = self.user_db.lock().map_err(|e| {
                 error!("Failed to lock user DB: {:?}", e);
                 PgWireError::ApiError("Internal server error".into())
             })?;
+
             if user_db.verify_user(user, password) {
                 info!("User '{}' authenticated successfully", user);
                 Ok(())
