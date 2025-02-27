@@ -1,4 +1,3 @@
-<!-- src/dashboard/dashboard.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9,159 +8,280 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/tippy.js@6/dist/tippy-bundle.umd.min.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/tippy.js@6/themes/light.css">
-</head>
-<body>
-    <div class="sidebar">
-        <h2>TimeFusion</h2>
-        <nav>
-            <a href="#" class="active">Dashboard</a>
-            <a href="/ingest">Ingest</a>
-            <a href="/data">Data</a>
-            <button id="theme-toggle">Toggle Theme</button>
-        </nav>
-    </div>
-    <div class="main-content">
-        <header>
-            <h1>Dashboard</h1>
-            <p>Real-time application insights</p>
-            <button id="refresh-btn">Refresh</button>
-        </header>
-        <main>
-            <section class="stats-grid">
-                <div class="stat-card" data-tippy-content="Application uptime in seconds">
-                    <h2>Uptime (s)</h2>
-                    <p id="uptime">{{uptime}}</p>
-                </div>
-                <div class="stat-card" data-tippy-content="Current ingestion queue size">
-                    <h2>Queue Size</h2>
-                    <p id="queue_size">{{queue_size}}</p>
-                </div>
-                <div class="stat-card" data-tippy-content="Database health status">
-                    <h2>DB Status</h2>
-                    <p id="db_status" class="{{db_status}}">{{db_status}}</p>
-                </div>
-                <div class="stat-card" data-tippy-content="Ingestion rate (records/sec)">
-                    <h2>Ingestion Rate</h2>
-                    <p id="ingestion_rate">{{ingestion_rate}}</p>
-                </div>
-                <div class="stat-card" data-tippy-content="Error rate (errors/sec)">
-                    <h2>Error Rate</h2>
-                    <p id="error_rate">{{error_rate}}</p>
-                </div>
-                <div class="stat-card" data-tippy-content="Total records in database">
-                    <h2>Total Records</h2>
-                    <p id="total_records">{{total_records}}</p>
-                </div>
-                <div class="stat-card" data-tippy-content="Average latency in milliseconds">
-                    <h2>Avg Latency (ms)</h2>
-                    <p id="avg_latency">{{avg_latency}}</p>
-                </div>
-            </section>
-            <section class="charts-grid">
-                <div class="chart-container">
-                    <h2>Request Trends (Last Hour)</h2>
-                    <canvas id="trendsChart"></canvas>
-                </div>
-            </section>
-            <section class="tables-grid">
-                <div class="table-container">
-                    <h2>Recent Ingestion Statuses</h2>
-                    <input type="text" id="status-filter" placeholder="Filter by ID or Status">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>ID</th>
-                                <th>Status</th>
-                            </tr>
-                        </thead>
-                        <tbody id="status-table"></tbody>
-                    </table>
-                    <div class="pagination" id="status-pagination"></div>
-                </div>
-                <div class="table-container">
-                    <h2>Recent Records</h2>
-                    <input type="text" id="records-filter" placeholder="Filter by Project ID or Timestamp">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Project ID</th>
-                                <th>Record ID</th>
-                                <th>Timestamp</th>
-                                <th>Latency (ms)</th>
-                            </tr>
-                        </thead>
-                        <tbody id="records-table"></tbody>
-                    </table>
-                    <div class="pagination" id="records-pagination"></div>
-                </div>
-            </section>
-            <section class="logs-container">
-                <h2>Real-Time Logs</h2>
-                <pre id="logs">Connecting to log stream...</pre>
-            </section>
-        </main>
-        <footer>
-            <p>© 2025 TimeFusion</p>
-        </footer>
-    </div>
-
     <style>
         :root {
-            --primary: #3498db;
-            --secondary: #2980b9;
-            --text: #2c3e50;
-            --bg: #f5f7fa;
+            --primary: #4a90e2;
+            --secondary: #357abd;
+            --text: #1a2b49;
+            --bg: #f7fafc;
             --card-bg: #ffffff;
-            --shadow: rgba(0, 0, 0, 0.1);
-            --success: #27ae60;
-            --error: #e74c3c;
+            --shadow: rgba(0, 0, 0, 0.05);
+            --success: #38a169;
+            --error: #e53e3e;
+            --highlight: #edf2f7;
         }
         [data-theme="dark"] {
-            --primary: #5dade2;
-            --secondary: #4e91c6;
-            --text: #ecf0f1;
-            --bg: #2c3e50;
-            --card-bg: #34495e;
-            --shadow: rgba(0, 0, 0, 0.3);
+            --primary: #63b3ed;
+            --secondary: #4299e1;
+            --text: #e2e8f0;
+            --bg: #1a202c;
+            --card-bg: #2d3748;
+            --shadow: rgba(0, 0, 0, 0.2);
+            --highlight: #4a5568;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
-        body { background: var(--bg); color: var(--text); display: flex; transition: all 0.3s; }
-        .sidebar { width: 250px; background: var(--secondary); color: white; padding: 2rem 1rem; height: 100vh; position: fixed; }
-        .sidebar h2 { font-size: 1.8rem; font-weight: 700; margin-bottom: 2rem; }
-        .sidebar nav a, .sidebar nav button { display: block; color: white; padding: 0.75rem 1rem; margin: 0.5rem 0; border-radius: 8px; text-decoration: none; background: none; border: none; cursor: pointer; transition: background 0.3s; }
-        .sidebar nav a.active, .sidebar nav a:hover, .sidebar nav button:hover { background: var(--primary); }
-        .main-content { margin-left: 250px; flex-grow: 1; padding: 2rem; }
-        header { background: linear-gradient(135deg, var(--primary), var(--secondary)); color: white; padding: 2rem; border-radius: 15px; text-align: center; margin-bottom: 2rem; box-shadow: 0 4px 12px var(--shadow); }
+        body { background: var(--bg); color: var(--text); padding: 2rem; transition: all 0.3s ease; }
+        header {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            padding: 2rem;
+            border-radius: 20px;
+            text-align: center;
+            margin-bottom: 2rem;
+            box-shadow: 0 10px 20px var(--shadow);
+            position: relative;
+        }
         header h1 { font-size: 2.5rem; font-weight: 700; margin-bottom: 0.5rem; }
-        #refresh-btn { position: absolute; right: 2rem; top: 50%; transform: translateY(-50%); background: #ffffff33; color: white; border: none; padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer; }
-        #refresh-btn:hover { background: #ffffff66; }
-        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
-        .stat-card { background: var(--card-bg); border-radius: 15px; padding: 1.5rem; box-shadow: 0 6px 20px var(--shadow); transition: transform 0.3s; }
-        .stat-card:hover { transform: translateY(-5px); }
-        .stat-card h2 { font-size: 1.1rem; color: var(--primary); margin-bottom: 0.75rem; }
-        .stat-card p { font-size: 1.6rem; font-weight: 500; }
+        header p { font-size: 1.2rem; opacity: 0.9; }
+        header .controls {
+            position: absolute;
+            top: 50%;
+            right: 2rem;
+            transform: translateY(-50%);
+            display: flex;
+            gap: 1rem;
+        }
+        header button {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 10px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        header button:hover { background: rgba(255, 255, 255, 0.3); }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+        .stat-card {
+            background: var(--card-bg);
+            border-radius: 15px;
+            padding: 1.5rem;
+            box-shadow: 0 6px 15px var(--shadow);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+        .stat-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px var(--shadow);
+        }
+        .stat-card h2 {
+            font-size: 1.1rem;
+            color: var(--primary);
+            margin-bottom: 0.75rem;
+            font-weight: 600;
+        }
+        .stat-card p {
+            font-size: 1.8rem;
+            font-weight: 600;
+        }
         .stat-card p.healthy { color: var(--success); }
         .stat-card p.unhealthy { color: var(--error); }
-        .charts-grid, .tables-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem; margin-bottom: 2rem; }
-        .chart-container, .table-container, .logs-container { background: var(--card-bg); border-radius: 15px; padding: 2rem; box-shadow: 0 6px 20px var(--shadow); }
-        .chart-container h2, .table-container h2, .logs-container h2 { font-size: 1.4rem; margin-bottom: 1rem; }
-        input[type="text"] { width: 100%; padding: 0.75rem; margin-bottom: 1rem; border: 1px solid #ddd; border-radius: 8px; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 1rem; text-align: left; border-bottom: 1px solid #eee; }
-        th { background: var(--primary); color: white; }
-        .pagination { margin-top: 1rem; text-align: center; }
-        .pagination button { background: var(--primary); color: white; border: none; padding: 0.5rem 1rem; margin: 0 0.25rem; border-radius: 5px; cursor: pointer; }
-        .pagination button:disabled { background: #ccc; cursor: not-allowed; }
-        .logs-container pre { font-size: 0.9rem; white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
-        footer { text-align: center; padding: 1rem; font-size: 0.9rem; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 2rem;
+            margin-bottom: 2.5rem;
+        }
+        .tables-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 2rem;
+        }
+        .chart-container, .table-container {
+            background: var(--card-bg);
+            border-radius: 15px;
+            padding: 2rem;
+            box-shadow: 0 6px 15px var(--shadow);
+        }
+        .chart-container h2, .table-container h2 {
+            font-size: 1.5rem;
+            color: var(--text);
+            margin-bottom: 1rem;
+            font-weight: 600;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 0.75rem 1rem;
+            margin-bottom: 1rem;
+            border: 1px solid var(--highlight);
+            border-radius: 8px;
+            background: var(--highlight);
+            color: var(--text);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.95rem;
+        }
+        th, td {
+            padding: 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--highlight);
+        }
+        th {
+            background: var(--primary);
+            color: white;
+            font-weight: 600;
+        }
+        .pagination {
+            margin-top: 1rem;
+            text-align: center;
+            display: flex;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        .pagination button {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        .pagination button:disabled {
+            background: var(--highlight);
+            cursor: not-allowed;
+        }
+        .pagination button:hover:not(:disabled) {
+            background: var(--secondary);
+        }
+        footer {
+            text-align: center;
+            padding: 1rem;
+            color: #718096;
+            font-size: 0.9rem;
+            margin-top: 2rem;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
         .fade-in { animation: fadeIn 0.5s ease-in; }
+        @media (max-width: 768px) {
+            body { padding: 1rem; }
+            header { padding: 1.5rem; }
+            header h1 { font-size: 2rem; }
+            header p { font-size: 1rem; }
+            .controls { position: static; margin-top: 1rem; }
+            .stats-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+            .charts-grid, .tables-grid { grid-template-columns: 1fr; }
+        }
     </style>
+</head>
+<body>
+    <header>
+        <h1>TimeFusion Dashboard</h1>
+        <p>Real-time insights into TimeFusion</p>
+        <div class="controls">
+            <button id="refresh-btn">Refresh</button>
+            <button id="theme-toggle">Toggle Theme</button>
+        </div>
+    </header>
+    <main>
+        <section class="stats-grid">
+            <div class="stat-card" data-tippy-content="Application uptime in seconds">
+                <h2>Uptime (s)</h2>
+                <p id="uptime">{{uptime}}</p>
+            </div>
+            <div class="stat-card" data-tippy-content="Number of compactions performed">
+                <h2>Compactions</h2>
+                <p id="compactions">{{compactions}}</p>
+            </div>
+            <div class="stat-card" data-tippy-content="Total HTTP requests processed">
+                <h2>HTTP Requests</h2>
+                <p id="http_requests">{{http_requests}}</p>
+            </div>
+            <div class="stat-card" data-tippy-content="Current ingestion queue size">
+                <h2>Queue Size</h2>
+                <p id="queue_size">{{queue_size}}</p>
+            </div>
+            <div class="stat-card" data-tippy-content="Database health status">
+                <h2>DB Status</h2>
+                <p id="db_status" class="{{db_status}}">{{db_status}}</p>
+            </div>
+            <div class="stat-card" data-tippy-content="Ingestion rate (records/sec)">
+                <h2>Ingestion Rate</h2>
+                <p id="ingestion_rate">{{ingestion_rate}}</p>
+            </div>
+            <div class="stat-card" data-tippy-content="Error rate (errors/sec)">
+                <h2>Error Rate</h2>
+                <p id="error_rate">{{error_rate}}</p>
+            </div>
+            <div class="stat-card" data-tippy-content="Total records in database">
+                <h2>Total Records</h2>
+                <p id="total_records">{{total_records}}</p>
+            </div>
+            <div class="stat-card" data-tippy-content="Average latency in milliseconds">
+                <h2>Avg Latency (ms)</h2>
+                <p id="avg_latency">{{avg_latency}}</p>
+            </div>
+        </section>
+        <section class="charts-grid">
+            <div class="chart-container">
+                <h2>Key Metrics</h2>
+                <canvas id="metricsChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <h2>Ingestion Status Distribution</h2>
+                <canvas id="statusChart"></canvas>
+            </div>
+        </section>
+        <section class="tables-grid">
+            <div class="table-container">
+                <h2>Recent Ingestion Statuses</h2>
+                <input type="text" id="status-filter" placeholder="Filter by ID or Status">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="status-table"></tbody>
+                </table>
+                <div class="pagination" id="status-pagination"></div>
+            </div>
+            <div class="table-container">
+                <h2>Recent Records</h2>
+                <input type="text" id="records-filter" placeholder="Filter by Project ID or Timestamp">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Project ID</th>
+                            <th>Record ID</th>
+                            <th>Timestamp</th>
+                            <th>Latency (ms)</th>
+                        </tr>
+                    </thead>
+                    <tbody id="records-table"></tbody>
+                </table>
+                <div class="pagination" id="records-pagination"></div>
+            </div>
+        </section>
+    </main>
+    <footer>
+        <p>© 2025 TimeFusion</p>
+    </footer>
 
     <script>
         const recentStatuses = JSON.parse('{{ recent_statuses }}');
-        const recentRecords = JSON.parse('{{ recent_records | safe }}');
-        const requestTrends = JSON.parse('{{ request_trends | safe }}');
+        const recentRecords = JSON.parse('{{recent_records}}');
+        const statusCounts = JSON.parse('{{ status_counts | tojson | safe }}');
 
         document.addEventListener('DOMContentLoaded', () => {
             // Theme Toggle
@@ -174,20 +294,59 @@
             if (localStorage.getItem('theme') === 'dark') document.documentElement.dataset.theme = 'dark';
 
             // Tooltips
-            tippy('[data-tippy-content]', { theme: document.documentElement.dataset.theme || 'light' });
+            tippy('[data-tippy-content]', { theme: document.documentElement.dataset.theme || 'light', placement: 'top' });
 
-            // Request Trends Chart
-            const trendsChart = new Chart(document.getElementById('trendsChart').getContext('2d'), {
-                type: 'line',
+            // Metrics Chart (Bar)
+            const metricsChart = new Chart(document.getElementById('metricsChart').getContext('2d'), {
+                type: 'bar',
                 data: {
-                    labels: requestTrends.map(t => t.timestamp),
-                    datasets: [{ label: 'Requests', data: requestTrends.map(t => parseInt(t.requests)), borderColor: '#3498db', fill: false }]
+                    labels: ['Ingestion Rate', 'Error Rate', 'Avg Latency'],
+                    datasets: [{
+                        label: 'Metrics',
+                        data: [
+                            parseFloat(document.getElementById('ingestion_rate').textContent),
+                            parseFloat(document.getElementById('error_rate').textContent),
+                            parseFloat(document.getElementById('avg_latency').textContent)
+                        ],
+                        backgroundColor: ['#4a90e2', '#e53e3e', '#38a169'],
+                        borderColor: ['#357abd', '#c53030', '#2f855a'],
+                        borderWidth: 1
+                    }]
                 },
-                options: { responsive: true, scales: { y: { beginAtZero: true }, x: { title: { display: true, text: 'Time' } } } }
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: { beginAtZero: true, title: { display: true, text: 'Value' } },
+                        x: { title: { display: true, text: 'Metric' } }
+                    },
+                    plugins: {
+                        legend: { position: 'top' },
+                        title: { display: true, text: 'Key Metrics' }
+                    }
+                }
+            });
+
+            // Status Distribution Chart (Pie)
+            const statusChart = new Chart(document.getElementById('statusChart').getContext('2d'), {
+                type: 'pie',
+                data: {
+                    labels: Object.keys(statusCounts),
+                    datasets: [{
+                        data: Object.values(statusCounts),
+                        backgroundColor: ['#4a90e2', '#e53e3e', '#38a169', '#f6ad55']
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    plugins: {
+                        legend: { position: 'top' },
+                        title: { display: true, text: 'Status Distribution' }
+                    }
+                }
             });
 
             // Table Population with Pagination and Filtering
-            function populateTable(tableId, data, filterId, rowFn, paginationId, itemsPerPage = 5) {
+            function populateTable(tableId, data, filterId, paginationId, itemsPerPage = 5, rowFn) {
                 const table = document.getElementById(tableId);
                 const filter = document.getElementById(filterId);
                 const pagination = document.getElementById(paginationId);
@@ -205,7 +364,8 @@
                         table.appendChild(row);
                     });
                     pagination.innerHTML = '';
-                    for (let i = 1; i <= Math.ceil(filteredData.length / itemsPerPage); i++) {
+                    const pageCount = Math.ceil(filteredData.length / itemsPerPage);
+                    for (let i = 1; i <= pageCount; i++) {
                         const btn = document.createElement('button');
                         btn.textContent = i;
                         btn.disabled = i === currentPage;
@@ -222,46 +382,50 @@
                 render();
             }
 
-            populateTable('status-table', recentStatuses, 'status-filter', s => `<td>${s.id.substring(0, 8)}...</td><td>${s.status}</td>`, 'status-pagination');
-            populateTable('records-table', recentRecords, 'records-filter', r => `
+            populateTable('status-table', recentStatuses, 'status-filter', 'status-pagination', 5, s => `<td>${s.id.substring(0, 8)}...</td><td>${s.status}</td>`);
+            populateTable('records-table', recentRecords, 'records-filter', 'records-pagination', 5, r => `
                 <td>${r.project_id}</td>
                 <td>${r.id.substring(0, 8)}...</td>
                 <td>${r.timestamp}</td>
                 <td>${(parseInt(r.duration_ns) / 1000000).toFixed(2)}</td>
-            `, 'records-pagination');
-
-            // WebSocket for Real-Time Logs
-            const logs = document.getElementById('logs');
-            const ws = new WebSocket(`ws://${location.host}/ws/logs`);
-            ws.onmessage = (event) => logs.textContent += `\n${event.data}`;
-            ws.onerror = () => logs.textContent = 'Log stream error';
-            ws.onclose = () => logs.textContent += '\nLog stream closed';
+            `);
 
             // Refresh Button
-            document.getElementById('refresh-btn').addEventListener('click', () => {
-                fetch('/dashboard')
-                    .then(res => res.text())
-                    .then(html => {
-                        const doc = new DOMParser().parseFromString(html, 'text/html');
-                        document.body.innerHTML = doc.body.innerHTML;
+            document.getElementById('refresh-btn').addEventListener('click', async () => {
+                const response = await fetch('/dashboard');
+                const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
 
-                        // Reinitialize
-                        ['uptime', 'queue_size', 'db_status', 'ingestion_rate', 'error_rate', 'total_records', 'avg_latency'].forEach(id => 
-                            document.getElementById(id).textContent = doc.getElementById(id).textContent);
-                        const newTrends = JSON.parse(doc.querySelector('script').textContent.match(/const requestTrends = (.+?);/)[1]);
-                        trendsChart.data.labels = newTrends.map(t => t.timestamp);
-                        trendsChart.data.datasets[0].data = newTrends.map(t => parseInt(t.requests));
-                        trendsChart.update();
-                        populateTable('status-table', JSON.parse(doc.querySelector('script').textContent.match(/const recentStatuses = (.+?);/)[1]), 'status-filter', s => `<td>${s.id.substring(0, 8)}...</td><td>${s.status}</td>`, 'status-pagination');
-                        populateTable('records-table', JSON.parse(doc.querySelector('script').textContent.match(/const recentRecords = (.+?);/)[1]), 'records-filter', r => `
-                            <td>${r.project_id}</td>
-                            <td>${r.id.substring(0, 8)}...</td>
-                            <td>${r.timestamp}</td>
-                            <td>${(parseInt(r.duration_ns) / 1000000).toFixed(2)}</td>
-                        `, 'records-pagination');
-                        tippy('[data-tippy-content]', { theme: document.documentElement.dataset.theme || 'light' });
-                    });
+                // Update stats
+                ['uptime', 'compactions', 'http_requests', 'queue_size', 'db_status', 'ingestion_rate', 'error_rate', 'total_records', 'avg_latency'].forEach(id => 
+                    document.getElementById(id).textContent = doc.getElementById(id).textContent);
+
+                // Update charts
+                metricsChart.data.datasets[0].data = [
+                    parseFloat(doc.getElementById('ingestion_rate').textContent),
+                    parseFloat(doc.getElementById('error_rate').textContent),
+                    parseFloat(doc.getElementById('avg_latency').textContent)
+                ];
+                metricsChart.update();
+
+                const newStatusCounts = JSON.parse(doc.querySelector('script').textContent.match(/const statusCounts = (.+?);/)[1]);
+                statusChart.data.labels = Object.keys(newStatusCounts);
+                statusChart.data.datasets[0].data = Object.values(newStatusCounts);
+                statusChart.update();
+
+                // Update tables
+                const newStatuses = JSON.parse(doc.querySelector('script').textContent.match(/const recentStatuses = (.+?);/)[1]);
+                const newRecords = JSON.parse(doc.querySelector('script').textContent.match(/const recentRecords = (.+?);/)[1]);
+                populateTable('status-table', newStatuses, 'status-filter', 'status-pagination', 5, s => `<td>${s.id.substring(0, 8)}...</td><td>${s.status}</td>`);
+                populateTable('records-table', newRecords, 'records-filter', 'records-pagination', 5, r => `
+                    <td>${r.project_id}</td>
+                    <td>${r.id.substring(0, 8)}...</td>
+                    <td>${r.timestamp}</td>
+                    <td>${(parseInt(r.duration_ns) / 1000000).toFixed(2)}</td>
+                `);
             });
+
+            // Auto-refresh every 10 seconds
+            setInterval(() => document.getElementById('refresh-btn').click(), 10000);
         });
     </script>
 </body>

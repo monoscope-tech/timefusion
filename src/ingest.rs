@@ -263,14 +263,14 @@ pub async fn get_status(
     }
 }
 
-fn record_batches_to_json_rows(batches: &[RecordBatch]) -> serde_json::Result<Vec<Value>> {
+pub fn record_batches_to_json_rows(batches: &[RecordBatch]) -> serde_json::Result<Vec<Value>> {
     let mut results = Vec::new();
     for batch in batches {
         let schema = batch.schema();
         let num_rows = batch.num_rows();
         let num_cols = batch.num_columns();
         for row in 0..num_rows {
-            let mut map = Map::new();
+            let mut map = serde_json::Map::new();
             for col in 0..num_cols {
                 let field = schema.field(col);
                 let value = crate::utils::value_to_string(batch.column(col).as_ref(), row);
