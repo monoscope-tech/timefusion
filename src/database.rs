@@ -1,19 +1,22 @@
+// src/database.rs
 use datafusion::prelude::*;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::arrow::array::{StringArray, TimestampMicrosecondArray, Int32Array, Int64Array, ListBuilder, StringBuilder};
+use datafusion::arrow::array::{
+    StringArray, TimestampMicrosecondArray, Int32Array, Int64Array, ListBuilder, StringBuilder,
+};
 use deltalake::{DeltaTableBuilder, DeltaOps};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use crate::utils::prepare_sql;
 use anyhow::Result;
-use dotenv::dotenv;
 use sqlparser::parser::Parser;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::ast::{Statement, Expr, Value as SqlValue, SetExpr};
 use crate::persistent_queue::IngestRecord;
 use chrono::DateTime;
 use crate::metrics::COMPACTION_COUNTER;
+use dotenv::dotenv;
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
 
@@ -44,7 +47,7 @@ impl Database {
                 DeltaOps::try_from_uri(connection_string)
                     .await?
                     .create()
-                    .with_columns(Vec::<deltalake::kernel::StructField>::new())
+                    .with_columns(Self::event_schema_fields())
                     .with_partition_columns(vec!["event_date".to_string()])
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create table: {:?}", e))?
@@ -62,7 +65,6 @@ impl Database {
     fn event_schema() -> Schema {
         Schema::new(vec![
             Field::new("project_id", DataType::Utf8, false),
-            Field::new("event_date", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), false),
             Field::new("trace_id", DataType::Utf8, false),
@@ -73,7 +75,7 @@ impl Database {
             Field::new("end_time", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), true),
             Field::new("duration_ns", DataType::Int64, false),
             Field::new("span_name", DataType::Utf8, false),
-            Field::new("span_kind", DataType::Utf8, false),
+            Field::new("span_kind", DataType::Utf8, true),
             Field::new("span_type", DataType::Utf8, false),
             Field::new("status", DataType::Utf8, true),
             Field::new("status_code", DataType::Int32, false),
@@ -104,12 +106,13 @@ impl Database {
             Field::new("instrumentation_scope", DataType::Utf8, false),
             Field::new("errors", DataType::Utf8, false),
             Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
+            Field::new("event_date", DataType::Utf8, true), // Partition field
         ])
     }
 
-    pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> Result<()> {
+    fn event_schema_fields() -> Vec<deltalake::kernel::StructField> {
         let schema = Self::event_schema();
-        let columns: Vec<deltalake::kernel::StructField> = schema.fields().iter().map(|f| {
+        schema.fields().iter().map(|f| {
             deltalake::kernel::StructField::new(
                 f.name().to_string(),
                 match f.data_type() {
@@ -122,8 +125,11 @@ impl Database {
                 },
                 f.is_nullable(),
             )
-        }).collect();
+        }).collect()
+    }
 
+    pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> Result<()> {
+        let _schema = Self::event_schema(); // Used implicitly in DeltaTableBuilder
         let table = match DeltaTableBuilder::from_uri(table_uri).load().await {
             Ok(table) => table,
             Err(e) => {
@@ -131,7 +137,7 @@ impl Database {
                 DeltaOps::try_from_uri(table_uri)
                     .await?
                     .create()
-                    .with_columns(columns)
+                    .with_columns(Self::event_schema_fields())
                     .with_partition_columns(vec!["event_date".to_string()])
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create events table: {:?}", e))?
@@ -147,8 +153,7 @@ impl Database {
                 snapshot.clone(),
                 log_store,
                 deltalake::delta_datafusion::DeltaScanConfig::default(),
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create provider: {:?}", e))?
+            ).map_err(|e| anyhow::anyhow!("Failed to create provider: {:?}", e))?
         };
 
         let table_name = "table_events".to_string();
@@ -216,7 +221,6 @@ impl Database {
             Arc::new(schema),
             vec![
                 Arc::new(StringArray::from(vec![record.project_id.clone()])),
-                Arc::new(StringArray::from(vec![event_date])),
                 Arc::new(StringArray::from(vec![record.id.clone()])),
                 Arc::new(build_timestamp_array(vec![ts_micro], Some(Arc::from("UTC")))),
                 Arc::new(StringArray::from(vec![record.trace_id.clone()])),
@@ -227,7 +231,7 @@ impl Database {
                 Arc::new(build_timestamp_array(vec![end_ts_micro.unwrap_or(0)], Some(Arc::from("UTC")))),
                 Arc::new(Int64Array::from(vec![record.duration_ns])),
                 Arc::new(StringArray::from(vec![record.span_name.clone()])),
-                Arc::new(StringArray::from(vec![record.span_kind.clone()])),
+                Arc::new(StringArray::from_iter(vec![Some(&record.span_kind)])),
                 Arc::new(StringArray::from(vec![record.span_type.clone()])),
                 Arc::new(StringArray::from_iter(vec![record.status.as_ref()])),
                 Arc::new(Int32Array::from(vec![record.status_code])),
@@ -239,25 +243,26 @@ impl Database {
                 Arc::new(StringArray::from(vec![record.raw_url.clone()])),
                 Arc::new(StringArray::from(vec![record.method.clone()])),
                 Arc::new(StringArray::from(vec![record.referer.clone()])),
-                Arc::new(StringArray::from_iter(vec![record.path_params.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.query_params.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.request_headers.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.response_headers.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.request_body.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.response_body.as_ref()])),
+                Arc::new(StringArray::from(vec![record.path_params.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.query_params.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.request_headers.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.response_headers.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.request_body.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.response_body.clone().unwrap_or_else(|| "{}".to_string())])),
                 Arc::new(StringArray::from(vec![record.endpoint_hash.clone()])),
                 Arc::new(StringArray::from(vec![record.shape_hash.clone()])),
                 Arc::new(format_hashes),
                 Arc::new(field_hashes),
                 Arc::new(StringArray::from(vec![record.sdk_type.clone()])),
                 Arc::new(StringArray::from_iter(vec![record.service_version.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.attributes.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.events.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.links.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.resource.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.instrumentation_scope.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.errors.as_ref()])),
+                Arc::new(StringArray::from(vec![record.attributes.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.events.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.links.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.resource.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.instrumentation_scope.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(StringArray::from(vec![record.errors.clone().unwrap_or_else(|| "{}".to_string())])),
                 Arc::new(tags),
+                Arc::new(StringArray::from(vec![event_date])),
             ],
         )?;
         DeltaOps::try_from_uri(&conn_str)

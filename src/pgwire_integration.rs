@@ -7,10 +7,13 @@ use pgwire::api::{ClientInfo, Type, PgWireServerHandlers, NoopErrorHandler};
 use pgwire::api::auth::StartupHandler;
 use pgwire::messages::PgWireFrontendMessage;
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::startup::Authentication;
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use futures::stream;
-use std::sync::{Arc, Mutex};
+use futures::SinkExt;
+use tokio::sync::Mutex; // Changed to tokio::sync::Mutex
+use std::sync::Arc;
 use datafusion::prelude::*;
 use datafusion::logical_expr::LogicalPlan;
 use std::collections::HashMap;
@@ -103,7 +106,7 @@ pub struct DfSessionService {
     pub session_context: Arc<SessionContext>,
     pub parser: Arc<PgQueryParser>,
     pub db: Arc<crate::database::Database>,
-    pub user_db: Arc<Mutex<UserDB>>,
+    pub user_db: Arc<Mutex<UserDB>>, // Changed to tokio::sync::Mutex
 }
 
 impl DfSessionService {
@@ -122,7 +125,7 @@ impl DfSessionService {
             db,
             user_db: Arc::new(Mutex::new(user_db)),
         };
-        service.user_db.lock().unwrap().log_users();
+        service.user_db.blocking_lock().log_users(); // Use blocking_lock for synchronous call
         service
     }
 }
@@ -209,7 +212,7 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         let params = plan.get_parameter_types()
             .map_err(|e| PgWireError::ApiError(e.into()))?;
         let mut param_types = Vec::with_capacity(params.len());
-        for param in ordered_param_types(&params).iter() { // Fixed: Use &params
+        for param in ordered_param_types(&params).iter() {
             if let Some(dt) = param {
                 let pgtype = into_pg_type(dt)
                     .map_err(|e| PgWireError::ApiError(e.into()))?;
@@ -246,9 +249,9 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         let plan = &portal.statement.statement;
         let params = plan.get_parameter_types()
             .map_err(|e| PgWireError::ApiError(e.into()))?;
-        let param_values = deserialize_parameters(portal, &ordered_param_types(&params)) // Fixed: Use &params
+        let param_values = deserialize_parameters(portal, &ordered_param_types(&params))
             .map_err(|e| PgWireError::ApiError(e.into()))?;
-        let plan_with_values = plan.clone().replace_params_with_values(&param_values) // Fixed: Borrow param_values with &
+        let plan_with_values = plan.clone().replace_params_with_values(&param_values)
             .map_err(|e| PgWireError::ApiError(e.into()))?;
         let df = self.session_context.execute_logical_plan(plan_with_values)
             .await
@@ -267,7 +270,7 @@ fn command_complete_response(msg: &str) -> Response<'static> {
     buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
     buf.extend_from_slice(bytes);
 
-    let row_stream = stream::iter(vec![Ok(DataRow::new(buf, 1))]); // Fixed: Added number of fields (1)
+    let row_stream = stream::iter(vec![Ok(DataRow::new(buf, 1))]);
     let fields = vec![FieldInfo::new(
         "CommandComplete".to_string(),
         None,
@@ -361,35 +364,39 @@ fn ordered_param_types(
 impl StartupHandler for DfSessionService {
     async fn on_startup<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         msg: PgWireFrontendMessage,
     ) -> Result<(), PgWireError>
     where
         C: ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send,
         C::Error: std::fmt::Debug,
     {
+        debug!("Raw message received: {:?}", msg);
         if let PgWireFrontendMessage::Startup(startup) = msg {
             let user = startup.parameters.get("user").map(|s| s.as_str()).unwrap_or("");
             let password = startup.parameters.get("password").map(|s| s.as_str()).unwrap_or("");
+            debug!("Startup parameters: {:?}", startup.parameters);
+            info!("Authenticating user: '{}', password length: {}", user, password.len());
 
-            info!("Authenticating user: '{}'", user);
-            debug!("Received startup parameters: {:?}", startup.parameters);
-
-            let user_db = self.user_db.lock().map_err(|e| {
-                error!("Failed to lock user DB: {:?}", e);
-                PgWireError::ApiError("Internal server error".into())
-            })?;
-
-            if user_db.verify_user(user, password) {
-                info!("User '{}' authenticated successfully", user);
-                Ok(())
-            } else {
-                error!(
-                    "Authentication failed for user: '{}'. Provided password length: {}, registered users: {:?}",
-                    user, password.len(), user_db.users
-                );
-                Err(PgWireError::ApiError("Authentication failed".into()))
+            // Verify password if provided in Startup message
+            if !password.is_empty() {
+                let user_db = self.user_db.lock().await; // Async lock
+                if user_db.verify_user(user, password) {
+                    info!("User '{}' authenticated successfully via Startup", user);
+                    client.send(PgWireBackendMessage::Authentication(Authentication::Ok)).await
+                        .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+                    return Ok(());
+                } else {
+                    debug!("Authentication failed for user '{}'. Provided password length: {}", user, password.len());
+                    return Err(PgWireError::ApiError("Authentication failed".into()));
+                }
             }
+
+            // Request password if not provided
+            debug!("No password in Startup, requesting cleartext password");
+            client.send(PgWireBackendMessage::Authentication(Authentication::CleartextPassword)).await
+                .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+            Ok(())
         } else {
             error!("Expected startup message, received: {:?}", msg);
             Err(PgWireError::ApiError("Expected startup message".into()))

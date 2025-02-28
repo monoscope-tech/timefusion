@@ -58,7 +58,7 @@ async fn dashboard(
     };
     let ingestion_total = INGESTION_COUNTER.get();
     let error_total = ERROR_COUNTER.get();
-    let time_elapsed = 60.0; // Simplistic 60-second window
+    let time_elapsed = 60.0; // 60-second window
     let ingestion_rate = ingestion_total as f64 / time_elapsed;
     let error_rate = error_total as f64 / time_elapsed;
 
@@ -85,7 +85,7 @@ async fn dashboard(
             Ok(batches) => {
                 if let Some(batch) = batches.get(0) {
                     batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Float64Array>()
-                        .map_or(0.0, |arr| arr.value(0))
+                        .map_or(0.0, |arr| arr.value(0) / 1_000_000.0) // Convert ns to ms
                 } else { 0.0 }
             },
             Err(e) => {
@@ -143,7 +143,7 @@ async fn dashboard(
         .replace("{{ingestion_rate}}", &format!("{:.2}", ingestion_rate))
         .replace("{{error_rate}}", &format!("{:.2}", error_rate))
         .replace("{{total_records}}", &total_records.to_string())
-        .replace("{{avg_latency}}", &format!("{:.2}", avg_latency / 1_000_000.0)) // Convert ns to ms
+        .replace("{{avg_latency}}", &format!("{:.2}", avg_latency))
         .replace("{{recent_statuses}}", &serde_json::to_string(&recent_statuses).unwrap())
         .replace("{{recent_records}}", &serde_json::to_string(&recent_records).unwrap())
         .replace("{{request_trends}}", &serde_json::to_string(&request_trends).unwrap())
@@ -182,9 +182,17 @@ async fn main() -> anyhow::Result<()> {
     db.add_project("events", &s3_uri)
         .await
         .context("Failed to add project 'events'")?;
-    db.create_events_table("events", &s3_uri)
-        .await
-        .context("Failed to create events table")?;
+    match db.create_events_table("events", &s3_uri).await {
+        Ok(_) => info!("Events table created successfully"),
+        Err(e) => {
+            if e.to_string().contains("already exists") {
+                info!("Events table already exists, skipping creation");
+            } else {
+                error!("Failed to create events table: {:?}", e);
+                return Err(e);
+            }
+        }
+    }
 
     let queue = Arc::new(PersistentQueue::new("/app/queue_db")
         .context("Failed to initialize PersistentQueue")?);
@@ -328,9 +336,6 @@ async fn process_record(
                     move || queue.remove_sync(key)
                 }).await {
                     error!("Failed to remove record: {:?}", e);
-                }
-                if let Err(e) = db.refresh_table(&record.project_id).await {
-                    error!("Failed to refresh table: {:?}", e);
                 }
             }
             Err(e) => {

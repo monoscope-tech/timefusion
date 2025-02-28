@@ -4,133 +4,158 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>TimeFusion Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/tippy.js@6/dist/tippy-bundle.umd.min.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/tippy.js@6/themes/light.css">
     <style>
         :root {
             --primary: #4a90e2;
             --secondary: #357abd;
-            --text: #1a2b49;
-            --bg: #f7fafc;
+            --text: #1f2937;
+            --bg: #f9fafb;
             --card-bg: #ffffff;
-            --shadow: rgba(0, 0, 0, 0.05);
-            --success: #38a169;
-            --error: #e53e3e;
-            --highlight: #edf2f7;
+            --shadow: rgba(0, 0, 0, 0.1);
+            --success: #16a34a;
+            --warning: #f59e0b;
+            --error: #dc2626;
+            --muted: #6b7280;
+            --border: #e5e7eb;
         }
         [data-theme="dark"] {
-            --primary: #63b3ed;
-            --secondary: #4299e1;
-            --text: #e2e8f0;
-            --bg: #1a202c;
-            --card-bg: #2d3748;
-            --shadow: rgba(0, 0, 0, 0.2);
-            --highlight: #4a5568;
+            --primary: #60a5fa;
+            --secondary: #3b82f6;
+            --text: #d1d5db;
+            --bg: #111827;
+            --card-bg: #1f2a44;
+            --shadow: rgba(0, 0, 0, 0.3);
+            --muted: #9ca3af;
+            --border: #374151;
+            --warning: #d97706;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
-        body { background: var(--bg); color: var(--text); padding: 2rem; transition: all 0.3s ease; }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            padding: 1.5rem;
+            line-height: 1.5;
+            transition: background 0.3s ease, color 0.3s ease;
+        }
         header {
             background: linear-gradient(135deg, var(--primary), var(--secondary));
             color: white;
-            padding: 2rem;
-            border-radius: 20px;
-            text-align: center;
+            padding: 1.5rem 2rem;
+            border-radius: 12px;
             margin-bottom: 2rem;
-            box-shadow: 0 10px 20px var(--shadow);
-            position: relative;
-        }
-        header h1 { font-size: 2.5rem; font-weight: 700; margin-bottom: 0.5rem; }
-        header p { font-size: 1.2rem; opacity: 0.9; }
-        header .controls {
-            position: absolute;
-            top: 50%;
-            right: 2rem;
-            transform: translateY(-50%);
+            box-shadow: 0 4px 12px var(--shadow);
             display: flex;
-            gap: 1rem;
+            justify-content: space-between;
+            align-items: center;
+        }
+        header h1 {
+            font-size: 1.75rem;
+            font-weight: 700;
+        }
+        header .controls {
+            display: flex;
+            gap: 0.75rem;
         }
         header button {
-            background: rgba(255, 255, 255, 0.2);
+            background: rgba(255, 255, 255, 0.15);
             color: white;
             border: none;
-            padding: 0.75rem 1.5rem;
-            border-radius: 10px;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
             cursor: pointer;
-            transition: background 0.3s;
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: background 0.2s;
         }
-        header button:hover { background: rgba(255, 255, 255, 0.3); }
+        header button:hover {
+            background: rgba(255, 255, 255, 0.25);
+        }
+        header button:disabled {
+            background: rgba(255, 255, 255, 0.1);
+            cursor: not-allowed;
+        }
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 1.5rem;
-            margin-bottom: 2.5rem;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
         }
         .stat-card {
             background: var(--card-bg);
-            border-radius: 15px;
-            padding: 1.5rem;
-            box-shadow: 0 6px 15px var(--shadow);
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            border-radius: 12px;
+            padding: 1.25rem;
+            box-shadow: 0 2px 8px var(--shadow);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
         .stat-card:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 10px 25px var(--shadow);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px var(--shadow);
         }
         .stat-card h2 {
-            font-size: 1.1rem;
-            color: var(--primary);
-            margin-bottom: 0.75rem;
-            font-weight: 600;
+            font-size: 0.875rem;
+            color: var(--muted);
+            font-weight: 500;
+            margin-bottom: 0.5rem;
         }
         .stat-card p {
-            font-size: 1.8rem;
-            font-weight: 600;
+            font-size: 1.5rem;
+            font-weight: 700;
         }
-        .stat-card p.healthy { color: var(--success); }
-        .stat-card p.unhealthy { color: var(--error); }
+        .stat-card p.success { color: var(--success); }
+        .stat-card p.warning { color: var(--warning); }
+        .stat-card p.error { color: var(--error); }
+        .stat-card .trend {
+            font-size: 0.75rem;
+            margin-top: 0.25rem;
+            color: var(--muted);
+        }
+        .stat-card .trend.up::before { content: "▲ "; color: var(--success); }
+        .stat-card .trend.down::before { content: "▼ "; color: var(--error); }
         .charts-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 2rem;
-            margin-bottom: 2.5rem;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2rem;
         }
         .tables-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 2rem;
+            grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+            gap: 1.5rem;
         }
         .chart-container, .table-container {
             background: var(--card-bg);
-            border-radius: 15px;
-            padding: 2rem;
-            box-shadow: 0 6px 15px var(--shadow);
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 2px 8px var(--shadow);
         }
         .chart-container h2, .table-container h2 {
-            font-size: 1.5rem;
-            color: var(--text);
-            margin-bottom: 1rem;
+            font-size: 1.125rem;
             font-weight: 600;
+            margin-bottom: 1rem;
         }
         input[type="text"] {
             width: 100%;
-            padding: 0.75rem 1rem;
+            padding: 0.5rem 0.75rem;
             margin-bottom: 1rem;
-            border: 1px solid var(--highlight);
-            border-radius: 8px;
-            background: var(--highlight);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg);
             color: var(--text);
+            font-size: 0.875rem;
         }
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 0.95rem;
+            font-size: 0.875rem;
         }
         th, td {
-            padding: 1rem;
+            padding: 0.75rem;
             text-align: left;
-            border-bottom: 1px solid var(--highlight);
+            border-bottom: 1px solid var(--border);
         }
         th {
             background: var(--primary);
@@ -139,7 +164,6 @@
         }
         .pagination {
             margin-top: 1rem;
-            text-align: center;
             display: flex;
             justify-content: center;
             gap: 0.5rem;
@@ -148,13 +172,14 @@
             background: var(--primary);
             color: white;
             border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 8px;
+            padding: 0.375rem 0.75rem;
+            border-radius: 6px;
             cursor: pointer;
-            transition: background 0.3s;
+            font-size: 0.875rem;
+            transition: background 0.2s;
         }
         .pagination button:disabled {
-            background: var(--highlight);
+            background: var(--muted);
             cursor: not-allowed;
         }
         .pagination button:hover:not(:disabled) {
@@ -163,21 +188,19 @@
         footer {
             text-align: center;
             padding: 1rem;
-            color: #718096;
-            font-size: 0.9rem;
-            margin-top: 2rem;
+            color: var(--muted);
+            font-size: 0.75rem;
         }
         @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
+            from { opacity: 0; transform: translateY(5px); }
             to { opacity: 1; transform: translateY(0); }
         }
-        .fade-in { animation: fadeIn 0.5s ease-in; }
+        .fade-in { animation: fadeIn 0.3s ease-in; }
         @media (max-width: 768px) {
             body { padding: 1rem; }
-            header { padding: 1.5rem; }
-            header h1 { font-size: 2rem; }
-            header p { font-size: 1rem; }
-            .controls { position: static; margin-top: 1rem; }
+            header { flex-direction: column; padding: 1rem; }
+            header h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+            .controls { margin-top: 1rem; }
             .stats-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
             .charts-grid, .tables-grid { grid-template-columns: 1fr; }
         }
@@ -186,29 +209,27 @@
 <body>
     <header>
         <h1>TimeFusion Dashboard</h1>
-        <p>Real-time insights into TimeFusion</p>
         <div class="controls">
             <button id="refresh-btn">Refresh</button>
-            <button id="theme-toggle">Toggle Theme</button>
+            <button id="theme-toggle">Dark Mode</button>
         </div>
     </header>
     <main>
         <section class="stats-grid">
             <div class="stat-card" data-tippy-content="Application uptime in seconds">
-                <h2>Uptime (s)</h2>
+                <h2>Uptime</h2>
                 <p id="uptime">{{uptime}}</p>
-            </div>
-            <div class="stat-card" data-tippy-content="Number of compactions performed">
-                <h2>Compactions</h2>
-                <p id="compactions">{{compactions}}</p>
+                <span class="trend" id="uptime-trend"></span>
             </div>
             <div class="stat-card" data-tippy-content="Total HTTP requests processed">
-                <h2>HTTP Requests</h2>
+                <h2>Requests</h2>
                 <p id="http_requests">{{http_requests}}</p>
+                <span class="trend" id="requests-trend"></span>
             </div>
             <div class="stat-card" data-tippy-content="Current ingestion queue size">
                 <h2>Queue Size</h2>
                 <p id="queue_size">{{queue_size}}</p>
+                <span class="trend" id="queue-trend"></span>
             </div>
             <div class="stat-card" data-tippy-content="Database health status">
                 <h2>DB Status</h2>
@@ -217,27 +238,21 @@
             <div class="stat-card" data-tippy-content="Ingestion rate (records/sec)">
                 <h2>Ingestion Rate</h2>
                 <p id="ingestion_rate">{{ingestion_rate}}</p>
-            </div>
-            <div class="stat-card" data-tippy-content="Error rate (errors/sec)">
-                <h2>Error Rate</h2>
-                <p id="error_rate">{{error_rate}}</p>
-            </div>
-            <div class="stat-card" data-tippy-content="Total records in database">
-                <h2>Total Records</h2>
-                <p id="total_records">{{total_records}}</p>
+                <span class="trend" id="ingestion-trend"></span>
             </div>
             <div class="stat-card" data-tippy-content="Average latency in milliseconds">
-                <h2>Avg Latency (ms)</h2>
+                <h2>Avg Latency</h2>
                 <p id="avg_latency">{{avg_latency}}</p>
+                <span class="trend" id="latency-trend"></span>
             </div>
         </section>
         <section class="charts-grid">
             <div class="chart-container">
-                <h2>Key Metrics</h2>
-                <canvas id="metricsChart"></canvas>
+                <h2>Performance Trends</h2>
+                <canvas id="trendChart"></canvas>
             </div>
             <div class="chart-container">
-                <h2>Ingestion Status Distribution</h2>
+                <h2>Ingestion Status</h2>
                 <canvas id="statusChart"></canvas>
             </div>
         </section>
@@ -279,68 +294,117 @@
     </footer>
 
     <script>
-        const recentStatuses = JSON.parse('{{ recent_statuses }}');
+        const recentStatuses = JSON.parse('{{recent_statuses}}');
         const recentRecords = JSON.parse('{{recent_records}}');
-        const statusCounts = JSON.parse('{{ status_counts | tojson | safe }}');
+        const statusCounts = JSON.parse('{{status_counts}}');
 
         document.addEventListener('DOMContentLoaded', () => {
+            // Persistent state for trends
+            let prevData = {
+                uptime: parseFloat('{{uptime}}') || 0,
+                http_requests: parseFloat('{{http_requests}}') || 0,
+                queue_size: parseFloat('{{queue_size}}') || 0,
+                ingestion_rate: parseFloat('{{ingestion_rate}}') || 0,
+                avg_latency: parseFloat('{{avg_latency}}') || 0
+            };
+            let trendHistory = {
+                ingestion_rate: [prevData.ingestion_rate],
+                queue_size: [prevData.queue_size],
+                avg_latency: [prevData.avg_latency]
+            };
+
             // Theme Toggle
             const themeToggle = document.getElementById('theme-toggle');
             themeToggle.addEventListener('click', () => {
-                document.documentElement.dataset.theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
-                localStorage.setItem('theme', document.documentElement.dataset.theme);
-                tippy('[data-tippy-content]').forEach(t => t.setProps({ theme: document.documentElement.dataset.theme }));
+                const newTheme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+                document.documentElement.dataset.theme = newTheme;
+                localStorage.setItem('theme', newTheme);
+                tippy('[data-tippy-content]').forEach(t => t.setProps({ theme: newTheme }));
+                themeToggle.textContent = newTheme === 'dark' ? 'Light Mode' : 'Dark Mode';
             });
-            if (localStorage.getItem('theme') === 'dark') document.documentElement.dataset.theme = 'dark';
+            const savedTheme = localStorage.getItem('theme') || 'light';
+            document.documentElement.dataset.theme = savedTheme;
+            themeToggle.textContent = savedTheme === 'dark' ? 'Light Mode' : 'Dark Mode';
 
             // Tooltips
-            tippy('[data-tippy-content]', { theme: document.documentElement.dataset.theme || 'light', placement: 'top' });
+            tippy('[data-tippy-content]', { theme: savedTheme, placement: 'top', delay: [200, 0] });
 
-            // Metrics Chart (Bar)
-            const metricsChart = new Chart(document.getElementById('metricsChart').getContext('2d'), {
-                type: 'bar',
+            // Trend Chart (Line with multiple datasets)
+            const trendChart = new Chart(document.getElementById('trendChart'), {
+                type: 'line',
                 data: {
-                    labels: ['Ingestion Rate', 'Error Rate', 'Avg Latency'],
-                    datasets: [{
-                        label: 'Metrics',
-                        data: [
-                            parseFloat(document.getElementById('ingestion_rate').textContent),
-                            parseFloat(document.getElementById('error_rate').textContent),
-                            parseFloat(document.getElementById('avg_latency').textContent)
-                        ],
-                        backgroundColor: ['#4a90e2', '#e53e3e', '#38a169'],
-                        borderColor: ['#357abd', '#c53030', '#2f855a'],
-                        borderWidth: 1
-                    }]
+                    labels: [new Date().toLocaleTimeString()],
+                    datasets: [
+                        {
+                            label: 'Ingestion Rate',
+                            data: [trendHistory.ingestion_rate[0]],
+                            borderColor: '#4a90e2',
+                            backgroundColor: 'rgba(74, 144, 226, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Queue Size',
+                            data: [trendHistory.queue_size[0]],
+                            borderColor: '#16a34a',
+                            backgroundColor: 'rgba(22, 163, 74, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            yAxisID: 'y1'
+                        },
+                        {
+                            label: 'Avg Latency',
+                            data: [trendHistory.avg_latency[0]],
+                            borderColor: '#f59e0b',
+                            backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            yAxisID: 'y'
+                        }
+                    ]
                 },
                 options: {
                     responsive: true,
+                    maintainAspectRatio: false,
                     scales: {
-                        y: { beginAtZero: true, title: { display: true, text: 'Value' } },
-                        x: { title: { display: true, text: 'Metric' } }
+                        x: { title: { display: true, text: 'Time', font: { size: 12 } } },
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Rate/Latency', font: { size: 12 } },
+                            position: 'left'
+                        },
+                        y1: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Queue Size', font: { size: 12 } },
+                            position: 'right'
+                        }
                     },
                     plugins: {
-                        legend: { position: 'top' },
-                        title: { display: true, text: 'Key Metrics' }
+                        legend: { position: 'top', labels: { padding: 15, font: { size: 12 } } },
+                        title: { display: false }
                     }
                 }
             });
 
-            // Status Distribution Chart (Pie)
-            const statusChart = new Chart(document.getElementById('statusChart').getContext('2d'), {
-                type: 'pie',
+            // Status Chart (Doughnut)
+            const statusChart = new Chart(document.getElementById('statusChart'), {
+                type: 'doughnut',
                 data: {
                     labels: Object.keys(statusCounts),
                     datasets: [{
                         data: Object.values(statusCounts),
-                        backgroundColor: ['#4a90e2', '#e53e3e', '#38a169', '#f6ad55']
+                        backgroundColor: ['#16a34a', '#dc2626', '#4a90e2'],
+                        borderWidth: 0
                     }]
                 },
                 options: {
                     responsive: true,
+                    maintainAspectRatio: false,
+                    cutout: '60%',
                     plugins: {
-                        legend: { position: 'top' },
-                        title: { display: true, text: 'Status Distribution' }
+                        legend: { position: 'bottom', labels: { padding: 15, font: { size: 12 } } },
+                        title: { display: false }
                     }
                 }
             });
@@ -355,7 +419,7 @@
 
                 const render = () => {
                     const start = (currentPage - 1) * itemsPerPage;
-                    const end = start + itemsPerPage;
+                    const end = Math.min(start + itemsPerPage, filteredData.length);
                     table.innerHTML = '';
                     filteredData.slice(start, end).forEach(item => {
                         const row = document.createElement('tr');
@@ -365,67 +429,128 @@
                     });
                     pagination.innerHTML = '';
                     const pageCount = Math.ceil(filteredData.length / itemsPerPage);
-                    for (let i = 1; i <= pageCount; i++) {
-                        const btn = document.createElement('button');
-                        btn.textContent = i;
-                        btn.disabled = i === currentPage;
-                        btn.addEventListener('click', () => { currentPage = i; render(); });
-                        pagination.appendChild(btn);
+                    if (pageCount > 1) {
+                        for (let i = 1; i <= pageCount; i++) {
+                            const btn = document.createElement('button');
+                            btn.textContent = i;
+                            btn.disabled = i === currentPage;
+                            btn.addEventListener('click', () => { currentPage = i; render(); });
+                            pagination.appendChild(btn);
+                        }
                     }
                 };
 
                 filter.addEventListener('input', () => {
-                    filteredData = data.filter(item => Object.values(item).some(v => v.toString().toLowerCase().includes(filter.value.toLowerCase())));
+                    filteredData = data.filter(item => 
+                        Object.values(item).some(v => 
+                            v.toString().toLowerCase().includes(filter.value.toLowerCase())
+                        )
+                    );
                     currentPage = 1;
                     render();
                 });
                 render();
             }
 
-            populateTable('status-table', recentStatuses, 'status-filter', 'status-pagination', 5, s => `<td>${s.id.substring(0, 8)}...</td><td>${s.status}</td>`);
+            populateTable('status-table', recentStatuses, 'status-filter', 'status-pagination', 5, s => `
+                <td>${s.id.substring(0, 8)}...</td>
+                <td>${s.status}</td>
+            `);
             populateTable('records-table', recentRecords, 'records-filter', 'records-pagination', 5, r => `
                 <td>${r.project_id}</td>
                 <td>${r.id.substring(0, 8)}...</td>
-                <td>${r.timestamp}</td>
+                <td>${new Date(r.timestamp).toLocaleString()}</td>
                 <td>${(parseInt(r.duration_ns) / 1000000).toFixed(2)}</td>
             `);
 
-            // Refresh Button
-            document.getElementById('refresh-btn').addEventListener('click', async () => {
-                const response = await fetch('/dashboard');
-                const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+            // Refresh Button and Data Comparison
+            const refreshBtn = document.getElementById('refresh-btn');
+            async function refreshDashboard() {
+                try {
+                    refreshBtn.disabled = true;
+                    const response = await fetch('/dashboard');
+                    if (!response.ok) throw new Error('Network response was not ok');
+                    const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
 
-                // Update stats
-                ['uptime', 'compactions', 'http_requests', 'queue_size', 'db_status', 'ingestion_rate', 'error_rate', 'total_records', 'avg_latency'].forEach(id => 
-                    document.getElementById(id).textContent = doc.getElementById(id).textContent);
+                    // Update stats with comparison
+                    const stats = [
+                        { id: 'uptime', trendId: 'uptime-trend', format: v => `${Math.floor(v / 3600)}h ${Math.floor((v % 3600) / 60)}m` },
+                        { id: 'http_requests', trendId: 'requests-trend', format: v => v.toFixed(0) },
+                        { id: 'queue_size', trendId: 'queue-trend', format: v => v.toFixed(0) },
+                        { id: 'db_status', trendId: null, format: v => v },
+                        { id: 'ingestion_rate', trendId: 'ingestion-trend', format: v => v.toFixed(2) },
+                        { id: 'avg_latency', trendId: 'latency-trend', format: v => v.toFixed(2) }
+                    ];
 
-                // Update charts
-                metricsChart.data.datasets[0].data = [
-                    parseFloat(doc.getElementById('ingestion_rate').textContent),
-                    parseFloat(doc.getElementById('error_rate').textContent),
-                    parseFloat(doc.getElementById('avg_latency').textContent)
-                ];
-                metricsChart.update();
+                    stats.forEach(stat => {
+                        const el = document.getElementById(stat.id);
+                        const newValue = parseFloat(doc.getElementById(stat.id)?.textContent) || (stat.id === 'db_status' ? doc.getElementById(stat.id)?.textContent : 0);
+                        const oldValue = parseFloat(el.textContent) || (stat.id === 'db_status' ? el.textContent : 0);
+                        
+                        if (stat.id === 'db_status') {
+                            el.textContent = newValue;
+                            el.className = newValue === 'success' ? 'success' : 'error';
+                        } else {
+                            el.textContent = stat.format(newValue);
+                            if (stat.trendId) {
+                                const trendEl = document.getElementById(stat.trendId);
+                                const diff = newValue - prevData[stat.id];
+                                const percentChange = prevData[stat.id] ? (diff / prevData[stat.id] * 100).toFixed(1) : 0;
+                                trendEl.textContent = diff !== 0 ? `${percentChange}%` : 'No change';
+                                trendEl.className = `trend ${diff > 0 ? 'up' : diff < 0 ? 'down' : ''}`;
+                                if (stat.id === 'avg_latency' && newValue > 100) el.className = 'warning';
+                                else if (stat.id === 'queue_size' && newValue > 50) el.className = 'warning';
+                                else el.className = '';
+                                prevData[stat.id] = newValue;
+                            }
+                        }
+                    });
 
-                const newStatusCounts = JSON.parse(doc.querySelector('script').textContent.match(/const statusCounts = (.+?);/)[1]);
-                statusChart.data.labels = Object.keys(newStatusCounts);
-                statusChart.data.datasets[0].data = Object.values(newStatusCounts);
-                statusChart.update();
+                    // Update trend history (limit to 10 points)
+                    const now = new Date().toLocaleTimeString();
+                    trendHistory.ingestion_rate.push(parseFloat(doc.getElementById('ingestion_rate').textContent) || 0);
+                    trendHistory.queue_size.push(parseFloat(doc.getElementById('queue_size').textContent) || 0);
+                    trendHistory.avg_latency.push(parseFloat(doc.getElementById('avg_latency').textContent) || 0);
+                    if (trendHistory.ingestion_rate.length > 10) {
+                        trendHistory.ingestion_rate.shift();
+                        trendHistory.queue_size.shift();
+                        trendHistory.avg_latency.shift();
+                        trendChart.data.labels.shift();
+                    }
+                    trendChart.data.labels.push(now);
+                    trendChart.data.datasets[0].data = trendHistory.ingestion_rate;
+                    trendChart.data.datasets[1].data = trendHistory.queue_size;
+                    trendChart.data.datasets[2].data = trendHistory.avg_latency;
+                    trendChart.update({ duration: 300, easing: 'easeOutQuad' });
 
-                // Update tables
-                const newStatuses = JSON.parse(doc.querySelector('script').textContent.match(/const recentStatuses = (.+?);/)[1]);
-                const newRecords = JSON.parse(doc.querySelector('script').textContent.match(/const recentRecords = (.+?);/)[1]);
-                populateTable('status-table', newStatuses, 'status-filter', 'status-pagination', 5, s => `<td>${s.id.substring(0, 8)}...</td><td>${s.status}</td>`);
-                populateTable('records-table', newRecords, 'records-filter', 'records-pagination', 5, r => `
-                    <td>${r.project_id}</td>
-                    <td>${r.id.substring(0, 8)}...</td>
-                    <td>${r.timestamp}</td>
-                    <td>${(parseInt(r.duration_ns) / 1000000).toFixed(2)}</td>
-                `);
-            });
+                    // Update status chart
+                    const newStatusCounts = JSON.parse(doc.querySelector('script').textContent.match(/const statusCounts = (.+?);/)[1]);
+                    statusChart.data.labels = Object.keys(newStatusCounts);
+                    statusChart.data.datasets[0].data = Object.values(newStatusCounts);
+                    statusChart.update({ duration: 300, easing: 'easeOutQuad' });
 
-            // Auto-refresh every 10 seconds
-            setInterval(() => document.getElementById('refresh-btn').click(), 10000);
+                    // Update tables
+                    const newStatuses = JSON.parse(doc.querySelector('script').textContent.match(/const recentStatuses = (.+?);/)[1]);
+                    const newRecords = JSON.parse(doc.querySelector('script').textContent.match(/const recentRecords = (.+?);/)[1]);
+                    populateTable('status-table', newStatuses, 'status-filter', 'status-pagination', 5, s => `
+                        <td>${s.id.substring(0, 8)}...</td>
+                        <td>${s.status}</td>
+                    `);
+                    populateTable('records-table', newRecords, 'records-filter', 'records-pagination', 5, r => `
+                        <td>${r.project_id}</td>
+                        <td>${r.id.substring(0, 8)}...</td>
+                        <td>${new Date(r.timestamp).toLocaleString()}</td>
+                        <td>${(parseInt(r.duration_ns) / 1000000).toFixed(2)}</td>
+                    `);
+                } catch (error) {
+                    console.error('Refresh failed:', error);
+                } finally {
+                    refreshBtn.disabled = false;
+                }
+            }
+
+            refreshBtn.addEventListener('click', refreshDashboard);
+            setInterval(refreshDashboard, 10000); // Auto-refresh every 10 seconds
         });
     </script>
 </body>
