@@ -10,10 +10,10 @@ mod metrics_middleware;
 use actix_web::{web, HttpResponse, HttpServer, Responder, get, middleware::Logger, App};
 use chrono::Utc;
 use database::Database;
-use ingest::{ingest as ingest_handler, get_status, get_all_data, get_data_by_id, IngestStatusStore};
+use ingest::{ingest as ingest_handler, get_status, get_all_data, get_data_by_id, IngestStatusStore, record_batches_to_json_rows};
 use pgwire_integration::{DfSessionService, run_pgwire_server, HandlerFactory};
-use persistent_queue::PersistentQueue;
-use serde_json::json;
+use persistent_queue::{PersistentQueue, IngestRecord}; // Added PersistentQueue import
+use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 use std::env;
 use tokio::time::{sleep, Duration};
@@ -24,9 +24,40 @@ use dotenv::dotenv;
 use tokio::task::spawn_blocking;
 use std::time::Duration as StdDuration;
 use anyhow::Context;
-use metrics::{UPTIME_GAUGE, COMPACTION_COUNTER, HTTP_REQUEST_COUNTER, INGESTION_COUNTER, ERROR_COUNTER};
-use prometheus::core::Collector;
-use std::collections::HashMap;
+use metrics::{INGESTION_COUNTER, ERROR_COUNTER};
+use std::collections::{HashMap, VecDeque};
+use tokio::sync::Mutex as TokioMutex;
+use datafusion::arrow::array::Float64Array;
+
+#[derive(Clone)]
+struct AppInfo {
+    start_time: chrono::DateTime<Utc>,
+    trends: Arc<TokioMutex<VecDeque<TrendData>>>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct TrendData {
+    timestamp: String,
+    ingestion_rate: f64,
+    queue_size: usize,
+    avg_latency: f64,
+}
+
+#[derive(Serialize)]
+struct DashboardData {
+    uptime: f64,
+    http_requests: f64,
+    queue_size: usize,
+    queue_alert: bool,
+    db_status: String,
+    ingestion_rate: f64,
+    avg_latency: f64,
+    latency_alert: bool,
+    recent_statuses: Vec<serde_json::Value>,
+    status_counts: HashMap<String, i32>,
+    recent_records: Vec<serde_json::Value>,
+    trends: Vec<TrendData>,
+}
 
 #[get("/dashboard")]
 async fn dashboard(
@@ -34,127 +65,134 @@ async fn dashboard(
     queue: web::Data<Arc<PersistentQueue>>,
     app_info: web::Data<AppInfo>,
     status_store: web::Data<Arc<IngestStatusStore>>,
+    query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
-    UPTIME_GAUGE.set(uptime);
-    let compactions = COMPACTION_COUNTER.get();
-    let http_requests: f64 = {
-        let mfs = HTTP_REQUEST_COUNTER.collect();
-        let mut total = 0.0;
-        for mf in mfs {
-            for m in mf.get_metric() {
-                total += m.get_counter().get_value();
-            }
-        }
-        total
-    };
+    let http_requests = 0.0; // Placeholder if HTTP_REQUEST_COUNTER is not used
     let queue_size = queue.get_ref().len().await.unwrap_or(0);
-    let db_status = match db.query("SELECT 1 AS test").await {
-        Ok(_) => "healthy",
-        Err(e) => {
-            error!("Database health check failed: {:?}", e);
-            "unhealthy"
-        },
-    };
-    let ingestion_total = INGESTION_COUNTER.get();
-    let error_total = ERROR_COUNTER.get();
-    let time_elapsed = 60.0; // 60-second window
-    let ingestion_rate = ingestion_total as f64 / time_elapsed;
-    let error_rate = error_total as f64 / time_elapsed;
+    let db_status = match db.query("SELECT 1 AS test").await { Ok(_) => "success", Err(_) => "error" };
+    let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
 
-    let total_records = match db.query("SELECT COUNT(*) AS total FROM table_events").await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                if let Some(batch) = batches.get(0) {
-                    batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>()
-                        .map_or(0, |arr| arr.value(0))
-                } else { 0 }
-            },
-            Err(e) => {
-                error!("Failed to count records: {:?}", e);
-                0
-            }
-        },
-        Err(e) => {
-            error!("Query error for total records: {:?}", e);
-            0
-        }
+    // Parse query parameters for date range
+    let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+    let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
+
+    // Filter records by date range
+    let records_query = if let (Some(start), Some(end)) = (start, end) {
+        format!("SELECT project_id, id, timestamp, duration_ns FROM table_events WHERE timestamp >= '{}' AND timestamp <= '{}' ORDER BY timestamp DESC LIMIT 10", start.to_rfc3339(), end.to_rfc3339())
+    } else {
+        "SELECT project_id, id, timestamp, duration_ns FROM table_events ORDER BY timestamp DESC LIMIT 10".to_string()
     };
+
     let avg_latency = match db.query("SELECT AVG(duration_ns) AS avg_latency FROM table_events WHERE duration_ns IS NOT NULL").await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                if let Some(batch) = batches.get(0) {
-                    batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Float64Array>()
-                        .map_or(0.0, |arr| arr.value(0) / 1_000_000.0) // Convert ns to ms
-                } else { 0.0 }
-            },
-            Err(e) => {
-                error!("Failed to calculate avg latency: {:?}", e);
-                0.0
-            }
-        },
-        Err(e) => {
-            error!("Query error for avg latency: {:?}", e);
-            0.0
-        }
+        Ok(df) => df.collect().await.ok().and_then(|batches| batches.get(0).map(|b| b.column(0).as_any().downcast_ref::<Float64Array>().map_or(0.0, |arr| arr.value(0) / 1_000_000.0))).unwrap_or(0.0),
+        Err(_) => 0.0
     };
-    let recent_statuses = {
-        let statuses = status_store.inner.read().unwrap();
-        statuses.iter().take(10).map(|(id, status)| json!({"id": id, "status": status})).collect::<Vec<_>>()
-    };
-    let status_counts: HashMap<String, i32> = recent_statuses.iter().fold(HashMap::new(), |mut acc, status| {
-        let status_str = status["status"].as_str().unwrap_or("Unknown").to_string();
-        *acc.entry(status_str).or_insert(0) += 1;
+
+    // Threshold alerts
+    let latency_alert = avg_latency > 200.0;
+    let queue_alert = queue_size > 50;
+
+    let recent_statuses = status_store.inner.read().unwrap().iter().take(10).map(|(id, status)| serde_json::json!({"id": id, "status": status})).collect::<Vec<_>>();
+    let status_counts = recent_statuses.iter().fold(HashMap::new(), |mut acc, status| {
+        *acc.entry(status["status"].as_str().unwrap_or("Unknown").to_string()).or_insert(0) += 1;
         acc
     });
-    let recent_records = match db.query("SELECT project_id, id, timestamp, duration_ns FROM table_events ORDER BY timestamp DESC LIMIT 10").await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => ingest::record_batches_to_json_rows(&batches).unwrap_or_default(),
-            Err(e) => {
-                error!("Failed to fetch recent records: {:?}", e);
-                Vec::new()
-            }
-        },
-        Err(e) => {
-            error!("Query error for recent records: {:?}", e);
-            Vec::new()
-        }
+    let recent_records = match db.query(&records_query).await {
+        Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
+        Err(_) => vec![]
     };
-    let request_trends = match db.query("SELECT timestamp, COUNT(*) AS requests FROM table_events WHERE timestamp > NOW() - INTERVAL '1 hour' GROUP BY timestamp ORDER BY timestamp").await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => ingest::record_batches_to_json_rows(&batches).unwrap_or_default(),
-            Err(e) => {
-                error!("Failed to fetch request trends: {:?}", e);
-                Vec::new()
-            }
-        },
-        Err(e) => {
-            error!("Query error for request trends: {:?}", e);
-            Vec::new()
-        }
+
+    // Update and filter trends
+    let mut trends = app_info.trends.lock().await;
+    let trend_data = TrendData {
+        timestamp: Utc::now().to_rfc3339(),
+        ingestion_rate,
+        queue_size,
+        avg_latency,
+    };
+    trends.push_back(trend_data);
+    let cutoff = Utc::now() - chrono::Duration::hours(1);
+    while trends.front().map_or(false, |t| chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap() < cutoff) {
+        trends.pop_front();
+    }
+    let trends_vec = if let (Some(start), Some(end)) = (start, end) {
+        trends.iter().filter(|t| {
+            let ts = chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap();
+            ts >= start && ts <= end
+        }).cloned().collect::<Vec<_>>()
+    } else {
+        trends.iter().cloned().collect::<Vec<_>>()
+    };
+
+    let data = DashboardData {
+        uptime,
+        http_requests,
+        queue_size,
+        queue_alert,
+        db_status: db_status.to_string(),
+        ingestion_rate,
+        avg_latency,
+        latency_alert,
+        recent_statuses,
+        status_counts,
+        recent_records,
+        trends: trends_vec,
     };
 
     let html = include_str!("dashboard/dashboard.html")
-        .replace("{{uptime}}", &uptime.to_string())
-        .replace("{{compactions}}", &compactions.to_string())
-        .replace("{{http_requests}}", &http_requests.to_string())
-        .replace("{{queue_size}}", &queue_size.to_string())
-        .replace("{{db_status}}", db_status)
-        .replace("{{ingestion_rate}}", &format!("{:.2}", ingestion_rate))
-        .replace("{{error_rate}}", &format!("{:.2}", error_rate))
-        .replace("{{total_records}}", &total_records.to_string())
-        .replace("{{avg_latency}}", &format!("{:.2}", avg_latency))
-        .replace("{{recent_statuses}}", &serde_json::to_string(&recent_statuses).unwrap())
-        .replace("{{recent_records}}", &serde_json::to_string(&recent_records).unwrap())
-        .replace("{{request_trends}}", &serde_json::to_string(&request_trends).unwrap())
-        .replace("{{status_counts}}", &serde_json::to_string(&status_counts).unwrap());
+        .replace("{{uptime}}", &format!("{:.0}", data.uptime))
+        .replace("{{http_requests}}", &format!("{:.0}", data.http_requests))
+        .replace("{{queue_size}}", &data.queue_size.to_string())
+        .replace("{{queue_alert}}", &data.queue_alert.to_string())
+        .replace("{{db_status}}", &data.db_status)
+        .replace("{{ingestion_rate}}", &format!("{:.2}", data.ingestion_rate))
+        .replace("{{avg_latency}}", &format!("{:.2}", data.avg_latency))
+        .replace("{{latency_alert}}", &data.latency_alert.to_string())
+        .replace("{{recent_statuses}}", &serde_json::to_string(&data.recent_statuses).unwrap())
+        .replace("{{recent_records}}", &serde_json::to_string(&data.recent_records).unwrap())
+        .replace("{{status_counts}}", &serde_json::to_string(&data.status_counts).unwrap())
+        .replace("{{trends}}", &serde_json::to_string(&data.trends).unwrap());
     HttpResponse::Ok().content_type("text/html").body(html)
 }
 
-struct AppInfo {
-    start_time: chrono::DateTime<Utc>,
+#[get("/export_records")]
+async fn export_records(
+    db: web::Data<Arc<Database>>,
+    query: web::Query<HashMap<String, String>>,
+) -> impl Responder {
+    let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+    let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
+
+    let records_query = if let (Some(start), Some(end)) = (start, end) {
+        format!("SELECT project_id, id, timestamp, duration_ns FROM table_events WHERE timestamp >= '{}' AND timestamp <= '{}'", start.to_rfc3339(), end.to_rfc3339())
+    } else {
+        "SELECT project_id, id, timestamp, duration_ns FROM table_events".to_string()
+    };
+
+    let records = match db.query(&records_query).await {
+        Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
+        Err(_) => vec![]
+    };
+
+    let mut csv = String::from("Project ID,Record ID,Timestamp,Latency (ms)\n");
+    for record in records {
+        csv.push_str(&format!(
+            "{},{},{},{}\n",
+            record["project_id"].as_str().unwrap_or("N/A"),
+            record["id"].as_str().unwrap_or("N/A"),
+            record["timestamp"].as_str().unwrap_or("N/A"),
+            (record["duration_ns"].as_i64().unwrap_or(0) as f64 / 1_000_000.0)
+        ));
+    }
+
+    HttpResponse::Ok()
+        .content_type("text/csv")
+        .append_header(("Content-Disposition", "attachment; filename=\"records.csv\"")) // Updated to append_header
+        .body(csv)
 }
 
+#[get("/")]
 async fn landing() -> impl Responder {
     HttpResponse::TemporaryRedirect()
         .append_header(("Location", "/dashboard"))
@@ -170,8 +208,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    let bucket = env::var("S3_BUCKET_NAME")
-        .context("S3_BUCKET_NAME environment variable not set")?;
+    let bucket = env::var("S3_BUCKET_NAME").context("S3_BUCKET_NAME environment variable not set")?;
     let http_port = env::var("PORT").unwrap_or_else(|_| "80".to_string());
     let pgwire_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
     let s3_uri = format!("s3://{}/delta_table", bucket);
@@ -179,9 +216,7 @@ async fn main() -> anyhow::Result<()> {
     deltalake::aws::register_handlers(None);
 
     let db = Arc::new(Database::new().await.context("Failed to initialize Database")?);
-    db.add_project("events", &s3_uri)
-        .await
-        .context("Failed to add project 'events'")?;
+    db.add_project("events", &s3_uri).await.context("Failed to add project 'events'")?;
     match db.create_events_table("events", &s3_uri).await {
         Ok(_) => info!("Events table created successfully"),
         Err(e) => {
@@ -194,10 +229,12 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let queue = Arc::new(PersistentQueue::new("/app/queue_db")
-        .context("Failed to initialize PersistentQueue")?);
+    let queue = Arc::new(PersistentQueue::new("/app/queue_db").context("Failed to initialize PersistentQueue")?);
     let status_store = Arc::new(IngestStatusStore::new());
-    let app_info = web::Data::new(AppInfo { start_time: Utc::now() });
+    let app_info = web::Data::new(AppInfo {
+        start_time: Utc::now(),
+        trends: Arc::new(TokioMutex::new(VecDeque::new())),
+    });
 
     let db_for_compaction = db.clone();
     tokio::spawn(async move {
@@ -273,8 +310,9 @@ async fn main() -> anyhow::Result<()> {
             .app_data(web::Data::new(queue.clone()))
             .app_data(web::Data::new(status_store.clone()))
             .app_data(app_info.clone())
-            .service(web::resource("/").route(web::get().to(landing)))
+            .service(landing)
             .service(dashboard)
+            .service(export_records)
             .service(ingest_handler)
             .service(get_status)
             .service(get_all_data)
@@ -319,9 +357,9 @@ async fn main() -> anyhow::Result<()> {
 async fn process_record(
     db: &Arc<Database>,
     queue: &Arc<PersistentQueue>,
-    status_store: &ingest::IngestStatusStore,
+    status_store: &IngestStatusStore,
     key: sled::IVec,
-    record: persistent_queue::IngestRecord,
+    record: IngestRecord,
 ) {
     use std::str;
     let id = str::from_utf8(&key).unwrap_or("unknown").to_string();

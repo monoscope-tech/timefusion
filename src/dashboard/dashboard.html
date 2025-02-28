@@ -21,6 +21,8 @@
             --error: #dc2626;
             --muted: #6b7280;
             --border: #e5e7eb;
+            --alert-bg: #fef3c7;
+            --alert-border: #d97706;
         }
         [data-theme="dark"] {
             --primary: #60a5fa;
@@ -32,6 +34,8 @@
             --muted: #9ca3af;
             --border: #374151;
             --warning: #d97706;
+            --alert-bg: #713f12;
+            --alert-border: #f59e0b;
         }
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Inter', sans-serif; }
         body {
@@ -131,11 +135,25 @@
             border-radius: 12px;
             padding: 1.5rem;
             box-shadow: 0 2px 8px var(--shadow);
+            position: relative;
         }
         .chart-container h2, .table-container h2 {
             font-size: 1.125rem;
             font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+        .filter-container {
+            display: flex;
+            gap: 0.5rem;
             margin-bottom: 1rem;
+        }
+        input[type="datetime-local"] {
+            padding: 0.5rem 0.75rem;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            background: var(--bg);
+            color: var(--text);
+            font-size: 0.875rem;
         }
         input[type="text"] {
             width: 100%;
@@ -185,11 +203,62 @@
         .pagination button:hover:not(:disabled) {
             background: var(--secondary);
         }
+        .export-btn {
+            position: absolute;
+            top: 1.5rem;
+            right: 1.5rem;
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            transition: background 0.2s;
+        }
+        .export-btn:hover {
+            background: var(--secondary);
+        }
         footer {
             text-align: center;
             padding: 1rem;
             color: var(--muted);
             font-size: 0.75rem;
+        }
+        .alert {
+            position: fixed;
+            top: 1rem;
+            right: 1rem;
+            background: var(--alert-bg);
+            border: 1px solid var(--alert-border);
+            border-radius: 8px;
+            padding: 1rem;
+            box-shadow: 0 2px 8px var(--shadow);
+            max-width: 300px;
+            z-index: 1000;
+            animation: slideIn 0.3s ease-out;
+        }
+        .alert p {
+            font-size: 0.875rem;
+            color: var(--text);
+            margin-bottom: 0.5rem;
+        }
+        .alert button {
+            background: var(--warning);
+            color: white;
+            border: none;
+            padding: 0.25rem 0.75rem;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.75rem;
+            transition: background 0.2s;
+        }
+        .alert button:hover {
+            background: var(--secondary);
+        }
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(100%); }
+            to { opacity: 1; transform: translateX(0); }
         }
         @keyframes fadeIn {
             from { opacity: 0; transform: translateY(5px); }
@@ -203,6 +272,8 @@
             .controls { margin-top: 1rem; }
             .stats-grid { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
             .charts-grid, .tables-grid { grid-template-columns: 1fr; }
+            .filter-container { flex-direction: column; }
+            .alert { max-width: 90%; right: 0.5rem; top: 0.5rem; }
         }
     </style>
 </head>
@@ -226,9 +297,9 @@
                 <p id="http_requests">{{http_requests}}</p>
                 <span class="trend" id="requests-trend"></span>
             </div>
-            <div class="stat-card" data-tippy-content="Current ingestion queue size">
+            <div class="stat-card" data-tippy-content="Current ingestion queue size (Alert > 50)">
                 <h2>Queue Size</h2>
-                <p id="queue_size">{{queue_size}}</p>
+                <p id="queue_size" class="{{queue_alert ? 'warning' : ''}}">{{queue_size}}</p>
                 <span class="trend" id="queue-trend"></span>
             </div>
             <div class="stat-card" data-tippy-content="Database health status">
@@ -240,25 +311,33 @@
                 <p id="ingestion_rate">{{ingestion_rate}}</p>
                 <span class="trend" id="ingestion-trend"></span>
             </div>
-            <div class="stat-card" data-tippy-content="Average latency in milliseconds">
+            <div class="stat-card" data-tippy-content="Average latency in milliseconds (Alert > 200ms)">
                 <h2>Avg Latency</h2>
-                <p id="avg_latency">{{avg_latency}}</p>
+                <p id="avg_latency" class="{{latency_alert ? 'warning' : ''}}">{{avg_latency}}</p>
                 <span class="trend" id="latency-trend"></span>
             </div>
         </section>
         <section class="charts-grid">
             <div class="chart-container">
                 <h2>Performance Trends</h2>
-                <canvas id="trendChart"></canvas>
+                <div class="filter-container">
+                    <input type="datetime-local" id="trend-start" step="1">
+                    <input type="datetime-local" id="trend-end" step="1">
+                </div>
+                <canvas id="trendChart" style="height: 300px;"></canvas>
             </div>
             <div class="chart-container">
                 <h2>Ingestion Status</h2>
-                <canvas id="statusChart"></canvas>
+                <canvas id="statusChart" style="height: 300px;"></canvas>
             </div>
         </section>
         <section class="tables-grid">
             <div class="table-container">
                 <h2>Recent Ingestion Statuses</h2>
+                <div class="filter-container">
+                    <input type="datetime-local" id="status-start" step="1">
+                    <input type="datetime-local" id="status-end" step="1">
+                </div>
                 <input type="text" id="status-filter" placeholder="Filter by ID or Status">
                 <table>
                     <thead>
@@ -273,6 +352,10 @@
             </div>
             <div class="table-container">
                 <h2>Recent Records</h2>
+                <div class="filter-container">
+                    <input type="datetime-local" id="records-start" step="1">
+                    <input type="datetime-local" id="records-end" step="1">
+                </div>
                 <input type="text" id="records-filter" placeholder="Filter by Project ID or Timestamp">
                 <table>
                     <thead>
@@ -286,6 +369,7 @@
                     <tbody id="records-table"></tbody>
                 </table>
                 <div class="pagination" id="records-pagination"></div>
+                <button class="export-btn" id="export-btn">Export CSV</button>
             </div>
         </section>
     </main>
@@ -294,23 +378,23 @@
     </footer>
 
     <script>
-        const recentStatuses = JSON.parse('{{recent_statuses}}');
-        const recentRecords = JSON.parse('{{recent_records}}');
-        const statusCounts = JSON.parse('{{status_counts}}');
+        const initialData = {
+            recentStatuses: JSON.parse('{{recent_statuses}}'),
+            recentRecords: JSON.parse('{{recent_records}}'),
+            statusCounts: JSON.parse('{{status_counts}}'),
+            trends: JSON.parse('{{trends}}')
+        };
 
         document.addEventListener('DOMContentLoaded', () => {
-            // Persistent state for trends
+            // Persistent state for trends and alerts
             let prevData = {
                 uptime: parseFloat('{{uptime}}') || 0,
                 http_requests: parseFloat('{{http_requests}}') || 0,
                 queue_size: parseFloat('{{queue_size}}') || 0,
                 ingestion_rate: parseFloat('{{ingestion_rate}}') || 0,
-                avg_latency: parseFloat('{{avg_latency}}') || 0
-            };
-            let trendHistory = {
-                ingestion_rate: [prevData.ingestion_rate],
-                queue_size: [prevData.queue_size],
-                avg_latency: [prevData.avg_latency]
+                avg_latency: parseFloat('{{avg_latency}}') || 0,
+                queue_alert: '{{queue_alert}}' === 'true',
+                latency_alert: '{{latency_alert}}' === 'true'
             };
 
             // Theme Toggle
@@ -333,11 +417,11 @@
             const trendChart = new Chart(document.getElementById('trendChart'), {
                 type: 'line',
                 data: {
-                    labels: [new Date().toLocaleTimeString()],
+                    labels: initialData.trends.map(t => new Date(t.timestamp).toLocaleTimeString()),
                     datasets: [
                         {
                             label: 'Ingestion Rate',
-                            data: [trendHistory.ingestion_rate[0]],
+                            data: initialData.trends.map(t => t.ingestion_rate),
                             borderColor: '#4a90e2',
                             backgroundColor: 'rgba(74, 144, 226, 0.1)',
                             fill: true,
@@ -346,7 +430,7 @@
                         },
                         {
                             label: 'Queue Size',
-                            data: [trendHistory.queue_size[0]],
+                            data: initialData.trends.map(t => t.queue_size),
                             borderColor: '#16a34a',
                             backgroundColor: 'rgba(22, 163, 74, 0.1)',
                             fill: true,
@@ -355,7 +439,7 @@
                         },
                         {
                             label: 'Avg Latency',
-                            data: [trendHistory.avg_latency[0]],
+                            data: initialData.trends.map(t => t.avg_latency),
                             borderColor: '#f59e0b',
                             backgroundColor: 'rgba(245, 158, 11, 0.1)',
                             fill: true,
@@ -391,9 +475,9 @@
             const statusChart = new Chart(document.getElementById('statusChart'), {
                 type: 'doughnut',
                 data: {
-                    labels: Object.keys(statusCounts),
+                    labels: Object.keys(initialData.statusCounts),
                     datasets: [{
-                        data: Object.values(statusCounts),
+                        data: Object.values(initialData.statusCounts),
                         backgroundColor: ['#16a34a', '#dc2626', '#4a90e2'],
                         borderWidth: 0
                     }]
@@ -409,10 +493,24 @@
                 }
             });
 
+            // Alert Management
+            function showAlert(message) {
+                const alert = document.createElement('div');
+                alert.className = 'alert';
+                alert.innerHTML = `
+                    <p>${message}</p>
+                    <button onclick="this.parentElement.remove()">Dismiss</button>
+                `;
+                document.body.appendChild(alert);
+                setTimeout(() => alert.remove(), 5000); // Auto-dismiss after 5s
+            }
+
             // Table Population with Pagination and Filtering
-            function populateTable(tableId, data, filterId, paginationId, itemsPerPage = 5, rowFn) {
+            function populateTable(tableId, data, filterId, paginationId, startId, endId, itemsPerPage = 5, rowFn) {
                 const table = document.getElementById(tableId);
                 const filter = document.getElementById(filterId);
+                const startFilter = document.getElementById(startId);
+                const endFilter = document.getElementById(endId);
                 const pagination = document.getElementById(paginationId);
                 let filteredData = [...data];
                 let currentPage = 1;
@@ -440,35 +538,46 @@
                     }
                 };
 
-                filter.addEventListener('input', () => {
-                    filteredData = data.filter(item => 
-                        Object.values(item).some(v => 
+                const applyFilters = () => {
+                    filteredData = data.filter(item => {
+                        const textMatch = Object.values(item).some(v => 
                             v.toString().toLowerCase().includes(filter.value.toLowerCase())
-                        )
-                    );
+                        );
+                        const startTime = startFilter.value ? new Date(startFilter.value).getTime() : -Infinity;
+                        const endTime = endFilter.value ? new Date(endFilter.value).getTime() : Infinity;
+                        const itemTime = item.timestamp ? new Date(item.timestamp).getTime() : 0;
+                        return textMatch && itemTime >= startTime && itemTime <= endTime;
+                    });
                     currentPage = 1;
                     render();
-                });
+                };
+
+                filter.addEventListener('input', applyFilters);
+                startFilter.addEventListener('change', applyFilters);
+                endFilter.addEventListener('change', applyFilters);
                 render();
             }
 
-            populateTable('status-table', recentStatuses, 'status-filter', 'status-pagination', 5, s => `
+            populateTable('status-table', initialData.recentStatuses, 'status-filter', 'status-pagination', 'status-start', 'status-end', 5, s => `
                 <td>${s.id.substring(0, 8)}...</td>
                 <td>${s.status}</td>
             `);
-            populateTable('records-table', recentRecords, 'records-filter', 'records-pagination', 5, r => `
+            populateTable('records-table', initialData.recentRecords, 'records-filter', 'records-pagination', 'records-start', 'records-end', 5, r => `
                 <td>${r.project_id}</td>
                 <td>${r.id.substring(0, 8)}...</td>
                 <td>${new Date(r.timestamp).toLocaleString()}</td>
                 <td>${(parseInt(r.duration_ns) / 1000000).toFixed(2)}</td>
             `);
 
-            // Refresh Button and Data Comparison
+            // Refresh Button and Data Updates
             const refreshBtn = document.getElementById('refresh-btn');
             async function refreshDashboard() {
                 try {
                     refreshBtn.disabled = true;
-                    const response = await fetch('/dashboard');
+                    const start = document.getElementById('trend-start').value;
+                    const end = document.getElementById('trend-end').value;
+                    const url = `/dashboard${start || end ? '?' : ''}${start ? `start=${start}&` : ''}${end ? `end=${end}` : ''}`.replace(/&$/, '');
+                    const response = await fetch(url);
                     if (!response.ok) throw new Error('Network response was not ok');
                     const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
 
@@ -476,16 +585,16 @@
                     const stats = [
                         { id: 'uptime', trendId: 'uptime-trend', format: v => `${Math.floor(v / 3600)}h ${Math.floor((v % 3600) / 60)}m` },
                         { id: 'http_requests', trendId: 'requests-trend', format: v => v.toFixed(0) },
-                        { id: 'queue_size', trendId: 'queue-trend', format: v => v.toFixed(0) },
+                        { id: 'queue_size', trendId: 'queue-trend', format: v => v.toFixed(0), alertId: 'queue_alert' },
                         { id: 'db_status', trendId: null, format: v => v },
                         { id: 'ingestion_rate', trendId: 'ingestion-trend', format: v => v.toFixed(2) },
-                        { id: 'avg_latency', trendId: 'latency-trend', format: v => v.toFixed(2) }
+                        { id: 'avg_latency', trendId: 'latency-trend', format: v => v.toFixed(2), alertId: 'latency_alert' }
                     ];
 
                     stats.forEach(stat => {
                         const el = document.getElementById(stat.id);
-                        const newValue = parseFloat(doc.getElementById(stat.id)?.textContent) || (stat.id === 'db_status' ? doc.getElementById(stat.id)?.textContent : 0);
-                        const oldValue = parseFloat(el.textContent) || (stat.id === 'db_status' ? el.textContent : 0);
+                        const newValue = stat.id === 'db_status' ? doc.getElementById(stat.id)?.textContent || 'N/A' : parseFloat(doc.getElementById(stat.id)?.textContent) || 0;
+                        const oldValue = stat.id === 'db_status' ? el.textContent : parseFloat(el.textContent) || 0;
                         
                         if (stat.id === 'db_status') {
                             el.textContent = newValue;
@@ -498,29 +607,25 @@
                                 const percentChange = prevData[stat.id] ? (diff / prevData[stat.id] * 100).toFixed(1) : 0;
                                 trendEl.textContent = diff !== 0 ? `${percentChange}%` : 'No change';
                                 trendEl.className = `trend ${diff > 0 ? 'up' : diff < 0 ? 'down' : ''}`;
-                                if (stat.id === 'avg_latency' && newValue > 100) el.className = 'warning';
-                                else if (stat.id === 'queue_size' && newValue > 50) el.className = 'warning';
-                                else el.className = '';
+                                if (stat.alertId) {
+                                    const alert = doc.querySelector('script').textContent.includes(`{{${stat.alertId}}}"true`);
+                                    if (alert && !prevData[stat.alertId]) {
+                                        showAlert(`Alert: ${stat.id === 'queue_size' ? 'Queue Size' : 'Avg Latency'} exceeded threshold!`);
+                                    }
+                                    el.className = alert ? 'warning' : '';
+                                    prevData[stat.alertId] = alert;
+                                }
                                 prevData[stat.id] = newValue;
                             }
                         }
                     });
 
-                    // Update trend history (limit to 10 points)
-                    const now = new Date().toLocaleTimeString();
-                    trendHistory.ingestion_rate.push(parseFloat(doc.getElementById('ingestion_rate').textContent) || 0);
-                    trendHistory.queue_size.push(parseFloat(doc.getElementById('queue_size').textContent) || 0);
-                    trendHistory.avg_latency.push(parseFloat(doc.getElementById('avg_latency').textContent) || 0);
-                    if (trendHistory.ingestion_rate.length > 10) {
-                        trendHistory.ingestion_rate.shift();
-                        trendHistory.queue_size.shift();
-                        trendHistory.avg_latency.shift();
-                        trendChart.data.labels.shift();
-                    }
-                    trendChart.data.labels.push(now);
-                    trendChart.data.datasets[0].data = trendHistory.ingestion_rate;
-                    trendChart.data.datasets[1].data = trendHistory.queue_size;
-                    trendChart.data.datasets[2].data = trendHistory.avg_latency;
+                    // Update trend chart
+                    const newTrends = JSON.parse(doc.querySelector('script').textContent.match(/const trends = (.+?);/)[1]);
+                    trendChart.data.labels = newTrends.map(t => new Date(t.timestamp).toLocaleTimeString());
+                    trendChart.data.datasets[0].data = newTrends.map(t => t.ingestion_rate);
+                    trendChart.data.datasets[1].data = newTrends.map(t => t.queue_size);
+                    trendChart.data.datasets[2].data = newTrends.map(t => t.avg_latency);
                     trendChart.update({ duration: 300, easing: 'easeOutQuad' });
 
                     // Update status chart
@@ -532,11 +637,11 @@
                     // Update tables
                     const newStatuses = JSON.parse(doc.querySelector('script').textContent.match(/const recentStatuses = (.+?);/)[1]);
                     const newRecords = JSON.parse(doc.querySelector('script').textContent.match(/const recentRecords = (.+?);/)[1]);
-                    populateTable('status-table', newStatuses, 'status-filter', 'status-pagination', 5, s => `
+                    populateTable('status-table', newStatuses, 'status-filter', 'status-pagination', 'status-start', 'status-end', 5, s => `
                         <td>${s.id.substring(0, 8)}...</td>
                         <td>${s.status}</td>
                     `);
-                    populateTable('records-table', newRecords, 'records-filter', 'records-pagination', 5, r => `
+                    populateTable('records-table', newRecords, 'records-filter', 'records-pagination', 'records-start', 'records-end', 5, r => `
                         <td>${r.project_id}</td>
                         <td>${r.id.substring(0, 8)}...</td>
                         <td>${new Date(r.timestamp).toLocaleString()}</td>
@@ -551,6 +656,26 @@
 
             refreshBtn.addEventListener('click', refreshDashboard);
             setInterval(refreshDashboard, 10000); // Auto-refresh every 10 seconds
+
+            // Date Range Filter Application
+            const applyDateFilter = (startId, endId, chart) => {
+                const start = document.getElementById(startId);
+                const end = document.getElementById(endId);
+                const update = () => refreshDashboard();
+                start.addEventListener('change', update);
+                end.addEventListener('change', update);
+            };
+            applyDateFilter('trend-start', 'trend-end', trendChart);
+            applyDateFilter('status-start', 'status-end', null);
+            applyDateFilter('records-start', 'records-end', null);
+
+            // Export CSV
+            document.getElementById('export-btn').addEventListener('click', () => {
+                const start = document.getElementById('records-start').value;
+                const end = document.getElementById('records-end').value;
+                const url = `/export_records${start || end ? '?' : ''}${start ? `start=${start}&` : ''}${end ? `end=${end}` : ''}`.replace(/&$/, '');
+                window.location.href = url;
+            });
         });
     </script>
 </body>
