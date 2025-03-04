@@ -3,7 +3,7 @@
 ##############################
 #         Builder Stage      #
 ##############################
-FROM rust:1.76-bullseye-slim AS builder
+FROM rustlang/rust:nightly-bullseye-slim AS builder
 WORKDIR /app
 
 # Install build dependencies
@@ -20,9 +20,8 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 # Build a dummy release binary (to cache dependencies)
 RUN cargo build --release
 
-# Copy the full source code
+# Copy the full source code, including dashboard.html
 COPY src/ src/
-
 
 # Build the real release binary
 RUN cargo build --release
@@ -30,7 +29,7 @@ RUN cargo build --release
 ##############################
 #         Runtime Stage      #
 ##############################
-FROM ubuntu:22.04 AS runtime
+FROM ubuntu:22.04
 WORKDIR /app
 
 # Install runtime dependencies
@@ -42,9 +41,9 @@ RUN apt-get update && \
 RUN groupadd -r appgroup && useradd -r -g appgroup appuser
 
 # Create and set permissions for directories
-RUN mkdir -p /app/queue_db /app/data /app/dashboard && \
-    chown -R appuser:appgroup /app /app/queue_db /app/data /app/dashboard && \
-    chmod -R 775 /app /app/queue_db /app/data /app/dashboard
+RUN mkdir -p /app/queue_db /app/data && \
+    chown -R appuser:appgroup /app /app/queue_db /app/data && \
+    chmod -R 775 /app /app/queue_db /app/data
 
 # Copy the compiled binary from the builder stage
 COPY --from=builder /app/target/release/timefusion /usr/local/bin/timefusion
