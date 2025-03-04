@@ -34,7 +34,7 @@ WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y ca-certificates libssl1.1 && \
+    apt-get install -y ca-certificates libssl3 && \
     rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
