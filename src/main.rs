@@ -1,4 +1,3 @@
-// src/main.rs
 mod database;
 mod ingest;
 mod persistent_queue;
@@ -18,7 +17,7 @@ use std::sync::Arc;
 use std::env;
 use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, error};
+use tracing::{info, error, debug};
 use tracing_subscriber::EnvFilter;
 use dotenv::dotenv;
 use tokio::task::spawn_blocking;
@@ -188,7 +187,7 @@ async fn export_records(
 
     HttpResponse::Ok()
         .content_type("text/csv")
-        .append_header(("Content-Disposition", "attachment; filename=\"records.csv\"")) // Updated to append_header
+        .append_header(("Content-Disposition", "attachment; filename=\"records.csv\""))
         .body(csv)
 }
 
@@ -203,20 +202,46 @@ async fn landing() -> impl Responder {
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
         .init();
 
     info!("Starting TimeFusion application");
 
-    let bucket = env::var("S3_BUCKET_NAME").context("S3_BUCKET_NAME environment variable not set")?;
-    let http_port = env::var("PORT").unwrap_or_else(|_| "80".to_string());
-    let pgwire_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
+    let bucket = match env::var("S3_BUCKET_NAME") {
+        Ok(b) => b,
+        Err(e) => {
+            error!("S3_BUCKET_NAME not set: {:?}", e);
+            return Err(anyhow::anyhow!("S3_BUCKET_NAME environment variable not set"));
+        }
+    };
+    let http_port = env::var("PORT").unwrap_or_else(|_| {
+        info!("PORT not set, defaulting to 80");
+        "80".to_string()
+    });
+    let pgwire_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| {
+        info!("PGWIRE_PORT not set, defaulting to 5432");
+        "5432".to_string()
+    });
     let s3_uri = format!("s3://{}/delta_table", bucket);
+    info!("S3 URI configured: {}", s3_uri);
 
     deltalake::aws::register_handlers(None);
+    info!("AWS S3 handlers registered");
 
-    let db = Arc::new(Database::new().await.context("Failed to initialize Database")?);
-    db.add_project("events", &s3_uri).await.context("Failed to add project 'events'")?;
+    let db = match Database::new().await {
+        Ok(db) => {
+            info!("Database initialized successfully");
+            Arc::new(db)
+        },
+        Err(e) => {
+            error!("Failed to initialize Database: {:?}", e);
+            return Err(e);
+        }
+    };
+    if let Err(e) = db.add_project("events", &s3_uri).await {
+        error!("Failed to add project 'events': {:?}", e);
+        return Err(e);
+    }
     match db.create_events_table("events", &s3_uri).await {
         Ok(_) => info!("Events table created successfully"),
         Err(e) => {
@@ -229,7 +254,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let queue = Arc::new(PersistentQueue::new("/app/queue_db").context("Failed to initialize PersistentQueue")?);
+    let queue = match PersistentQueue::new("/app/queue_db") {
+        Ok(q) => {
+            info!("PersistentQueue initialized successfully");
+            Arc::new(q)
+        },
+        Err(e) => {
+            error!("Failed to initialize PersistentQueue: {:?}", e);
+            return Err(e);
+        }
+    };
     let status_store = Arc::new(IngestStatusStore::new());
     let app_info = web::Data::new(AppInfo {
         start_time: Utc::now(),
@@ -265,6 +299,8 @@ async fn main() -> anyhow::Result<()> {
         async move {
             if let Err(e) = run_pgwire_server(handler_factory, &pg_addr, pgwire_shutdown).await {
                 error!("PGWire server error: {:?}", e);
+            } else {
+                info!("PGWire server shut down gracefully");
             }
         }
     });
@@ -281,8 +317,12 @@ async fn main() -> anyhow::Result<()> {
                         break;
                     }
                     _ = sleep(Duration::from_secs(5)) => {
+                        debug!("Checking queue for records to flush");
                         let records = match queue_clone.dequeue_all().await {
-                            Ok(r) => r,
+                            Ok(r) => {
+                                debug!("Dequeued {} records", r.len());
+                                r
+                            },
                             Err(e) => {
                                 error!("Error during dequeue_all: {:?}", e);
                                 Vec::new()
@@ -302,7 +342,7 @@ async fn main() -> anyhow::Result<()> {
 
     let http_addr = format!("0.0.0.0:{}", http_port);
     info!("Binding HTTP server to {}", http_addr);
-    let server = HttpServer::new(move || {
+    let server = match HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
             .wrap(metrics_middleware::MetricsMiddleware)
@@ -318,8 +358,13 @@ async fn main() -> anyhow::Result<()> {
             .service(get_all_data)
             .service(get_data_by_id)
     })
-    .bind(&http_addr)
-    .context(format!("Failed to bind HTTP server to {}", http_addr))?
+    .bind(&http_addr) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to bind HTTP server to {}: {:?}", http_addr, e);
+            return Err(anyhow::anyhow!("Failed to bind HTTP server: {:?}", e));
+        }
+    }
     .run();
 
     let http_server_handle = server.handle();
@@ -331,6 +376,8 @@ async fn main() -> anyhow::Result<()> {
             result = server => {
                 if let Err(e) = result {
                     error!("HTTP server failed: {:?}", e);
+                } else {
+                    info!("HTTP server shut down gracefully");
                 }
             }
         }
@@ -339,9 +386,21 @@ async fn main() -> anyhow::Result<()> {
     info!("HTTP server running on http://{}", http_addr);
 
     tokio::select! {
-        res = pg_server => res.context("PGWire server task failed")?,
-        res = http_task => res.context("HTTP server task failed")?,
-        res = flush_task => res.context("Queue flush task failed")?,
+        res = pg_server => {
+            if let Err(e) = res {
+                error!("PGWire server task failed: {:?}", e);
+            }
+        },
+        res = http_task => {
+            if let Err(e) = res {
+                error!("HTTP server task failed: {:?}", e);
+            }
+        },
+        res = flush_task => {
+            if let Err(e) = res {
+                error!("Queue flush task failed: {:?}", e);
+            }
+        },
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, initiating shutdown.");
             shutdown_token.cancel();

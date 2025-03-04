@@ -6,12 +6,12 @@ use pgwire::api::{ClientInfo, Type, PgWireServerHandlers, NoopErrorHandler};
 use pgwire::api::auth::StartupHandler;
 use pgwire::messages::PgWireFrontendMessage;
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::messages::startup::{Authentication, PasswordMessageFamily};
+use pgwire::messages::startup::Authentication;
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use futures::stream;
 use futures::SinkExt;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex; // using tokio's async Mutex
 use std::sync::Arc;
 use datafusion::prelude::*;
 use datafusion::logical_expr::LogicalPlan;
@@ -27,7 +27,6 @@ use std::io::{Error as IoError, ErrorKind};
 use serde::{Serialize, Deserialize};
 use bcrypt::{hash, verify, DEFAULT_COST};
 
-/// Represents a user with a username, hashed password, and admin status.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
     pub username: String,
@@ -35,19 +34,17 @@ pub struct User {
     pub is_admin: bool,
 }
 
-/// Represents a user database storing a collection of users.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct UserDB {
     pub users: Vec<User>,
 }
 
 impl UserDB {
-    /// Loads the user database from a file or creates a default one if it doesn't exist.
     pub fn load_from_file(path: &str) -> Result<Self, IoError> {
         if let Ok(contents) = fs::read_to_string(path) {
             let db: UserDB = serde_json::from_str(&contents)
                 .map_err(|e| IoError::new(ErrorKind::InvalidData, e))?;
-            info!("Loaded user database from {} with {} users", path, db.users.len());
+            info!("Loaded user database from {}: {:?}", path, db.users);
             Ok(db)
         } else {
             info!("No user database found at {}. Creating default admin user.", path);
@@ -63,7 +60,6 @@ impl UserDB {
         }
     }
 
-    /// Saves the user database to a file.
     pub fn save_to_file(&self, path: &str) -> Result<(), IoError> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| IoError::new(ErrorKind::Other, e))?;
@@ -72,7 +68,6 @@ impl UserDB {
         Ok(())
     }
 
-    /// Verifies a user's credentials.
     pub fn verify_user(&self, username: &str, password: &str) -> bool {
         if let Some(user) = self.users.iter().find(|u| u.username == username) {
             let result = verify(password, &user.hashed_password).unwrap_or(false);
@@ -84,7 +79,6 @@ impl UserDB {
         }
     }
 
-    /// Creates a new user and saves it to the database.
     pub fn create_user(&mut self, username: &str, password: &str, is_admin: bool) -> Result<(), IoError> {
         if self.users.iter().any(|u| u.username == username) {
             return Err(IoError::new(ErrorKind::AlreadyExists, "User already exists"));
@@ -102,22 +96,20 @@ impl UserDB {
         Ok(())
     }
 
-    /// Logs the list of registered users.
     pub fn log_users(&self) {
         info!("Registered users: {:?}", self.users);
     }
 }
 
-/// Service for handling PostgreSQL wire protocol sessions with DataFusion.
 pub struct DfSessionService {
     pub session_context: Arc<SessionContext>,
     pub parser: Arc<PgQueryParser>,
     pub db: Arc<crate::database::Database>,
-    pub user_db: Arc<Mutex<UserDB>>,
+    pub user_db: Arc<Mutex<UserDB>>, // using tokio::sync::Mutex for async locking
 }
 
 impl DfSessionService {
-    /// Creates a new session service instance.
+    // Note: This constructor remains synchronous.
     pub fn new(session_context: SessionContext, db: Arc<crate::database::Database>) -> Self {
         let session_context = Arc::new(session_context);
         let parser = Arc::new(PgQueryParser {
@@ -133,17 +125,18 @@ impl DfSessionService {
             db,
             user_db: Arc::new(Mutex::new(user_db)),
         };
-        tokio::spawn({
-            let user_db = service.user_db.clone();
-            async move {
-                user_db.lock().await.log_users();
-            }
-        });
+        // Removed blocking_lock call.
+        // You can call `log_users_async()` later within an async context if desired.
         service
+    }
+
+    // Async logging method using .lock().await
+    pub async fn log_users_async(&self) {
+        let user_db = self.user_db.lock().await;
+        user_db.log_users();
     }
 }
 
-/// Parser for PostgreSQL queries into DataFusion logical plans.
 pub struct PgQueryParser {
     pub session_context: Arc<SessionContext>,
 }
@@ -277,7 +270,6 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
     }
 }
 
-/// Creates a command complete response for non-SELECT queries.
 fn command_complete_response(msg: &str) -> Response<'static> {
     let mut buf = BytesMut::new();
     buf.extend_from_slice(&(1_i16).to_be_bytes()); // Number of fields
@@ -297,7 +289,6 @@ fn command_complete_response(msg: &str) -> Response<'static> {
     Response::Query(qr)
 }
 
-/// Encodes a DataFusion DataFrame into a PostgreSQL wire protocol QueryResponse.
 async fn encode_dataframe(
     df: DataFrame,
     _format: &pgwire::api::portal::Format,
@@ -326,7 +317,6 @@ async fn encode_dataframe(
     Ok(QueryResponse::new(fields.into(), row_stream))
 }
 
-/// Serializes a row of values into a byte buffer.
 fn serialize_row(row_values: Vec<Option<String>>) -> BytesMut {
     let mut buf = BytesMut::new();
     buf.extend_from_slice(&(row_values.len() as i16).to_be_bytes());
@@ -345,7 +335,6 @@ fn serialize_row(row_values: Vec<Option<String>>) -> BytesMut {
     buf
 }
 
-/// Converts a DataFusion schema to PostgreSQL wire protocol field info.
 fn pgwire_schema_from_arrow(schema: &datafusion::common::DFSchema) -> Result<Vec<FieldInfo>, Box<dyn std::error::Error + Send + Sync>> {
     let mut fields = Vec::new();
     for field in schema.fields() {
@@ -355,7 +344,6 @@ fn pgwire_schema_from_arrow(schema: &datafusion::common::DFSchema) -> Result<Vec
     Ok(fields)
 }
 
-/// Maps DataFusion data types to PostgreSQL types.
 fn into_pg_type(dt: &datafusion::arrow::datatypes::DataType) -> Result<Type, Box<dyn std::error::Error + Send + Sync>> {
     match dt {
         datafusion::arrow::datatypes::DataType::Utf8 => Ok(Type::TEXT),
@@ -366,7 +354,6 @@ fn into_pg_type(dt: &datafusion::arrow::datatypes::DataType) -> Result<Type, Box
     }
 }
 
-/// Deserializes query parameters (placeholder implementation).
 fn deserialize_parameters<T>(
     _portal: &pgwire::api::portal::Portal<T>,
     _ordered: &Vec<Option<&datafusion::arrow::datatypes::DataType>>,
@@ -374,7 +361,6 @@ fn deserialize_parameters<T>(
     Ok(ParamValues::List(vec![]))
 }
 
-/// Orders parameter types from a HashMap.
 fn ordered_param_types(
     types: &HashMap<String, Option<datafusion::arrow::datatypes::DataType>>,
 ) -> Vec<Option<&datafusion::arrow::datatypes::DataType>> {
@@ -386,49 +372,45 @@ impl StartupHandler for DfSessionService {
     async fn on_startup<C>(
         &self,
         client: &mut C,
-        message: PgWireFrontendMessage,
-    ) -> PgWireResult<()>
+        msg: PgWireFrontendMessage,
+    ) -> Result<(), PgWireError>
     where
         C: ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send,
         C::Error: std::fmt::Debug,
     {
-        match message {
-            PgWireFrontendMessage::Startup(startup) => {
-                if let Some(username) = startup.parameters.get("user") {
-                    client.metadata_mut().insert("username".to_string(), username.to_string()); // Use metadata_mut()
-                    debug!("Startup - Username: '{}'", username);
-                    client.send(PgWireBackendMessage::Authentication(Authentication::CleartextPassword))
-                        .await
-                        .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("Send error: {:?}", e))))?;
-                    Ok(())
+        debug!("Raw message received: {:?}", msg);
+        if let PgWireFrontendMessage::Startup(startup) = msg {
+            let user = startup.parameters.get("user").map(|s| s.as_str()).unwrap_or("");
+            let password = startup.parameters.get("password").map(|s| s.as_str()).unwrap_or("");
+            debug!("Startup parameters: {:?}", startup.parameters);
+            info!("Authenticating user: '{}', password length: {}", user, password.len());
+
+            // Verify password if provided in Startup message
+            if !password.is_empty() {
+                let user_db = self.user_db.lock().await; // Async lock
+                if user_db.verify_user(user, password) {
+                    info!("User '{}' authenticated successfully via Startup", user);
+                    client.send(PgWireBackendMessage::Authentication(Authentication::Ok)).await
+                        .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+                    return Ok(());
                 } else {
-                    Err(PgWireError::ApiError("No username provided in startup".into()))
+                    debug!("Authentication failed for user '{}'. Provided password length: {}", user, password.len());
+                    return Err(PgWireError::ApiError("Authentication failed".into()));
                 }
             }
-            PgWireFrontendMessage::PasswordMessageFamily(msg) => {
-                if let PasswordMessageFamily::Password(ref pwd) = msg {
-                    let username = client.metadata().get("username").cloned().unwrap_or_default();
-                    debug!("Password message - Username: '{}', Password: '{:?}'", username, pwd.password);
-                    let user_db = self.user_db.lock().await;
-                    if user_db.verify_user(&username, &pwd.password) {
-                        info!("User '{}' authenticated successfully", username);
-                        client.send(PgWireBackendMessage::Authentication(Authentication::Ok))
-                            .await
-                            .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("Send error: {:?}", e))))?;
-                        Ok(())
-                    } else {
-                        Err(PgWireError::ApiError("Invalid username or password".into()))
-                    }
-                } else {
-                    Err(PgWireError::ApiError("Unexpected password message variant".into()))
-                }
-            }
-            _ => Err(PgWireError::ApiError("Expected startup or password message".into())),
+
+            // Request password if not provided
+            debug!("No password in Startup, requesting cleartext password");
+            client.send(PgWireBackendMessage::Authentication(Authentication::CleartextPassword)).await
+                .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+            Ok(())
+        } else {
+            error!("Expected startup message, received: {:?}", msg);
+            Err(PgWireError::ApiError("Expected startup message".into()))
         }
     }
 }
 
-/// Factory for creating PostgreSQL wire protocol handlers.
 #[derive(Clone)]
 pub struct HandlerFactory(pub Arc<DfSessionService>);
 
@@ -456,7 +438,6 @@ impl PgWireServerHandlers for HandlerFactory {
     }
 }
 
-/// Runs the PostgreSQL wire protocol server.
 pub async fn run_pgwire_server<H>(
     handler: H,
     addr: &str,
