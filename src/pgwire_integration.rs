@@ -1,17 +1,19 @@
+// src/pgwire_integration.rs
+
 use async_trait::async_trait;
 use pgwire::api::copy::NoopCopyHandler;
-use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, FieldInfo};
+use pgwire::api::results::{
+    DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, FieldInfo,
+};
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type, PgWireServerHandlers, NoopErrorHandler};
 use pgwire::api::auth::StartupHandler;
-use pgwire::messages::PgWireFrontendMessage;
-use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::{PgWireFrontendMessage, PgWireBackendMessage};
 use pgwire::messages::startup::Authentication;
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
-use futures::stream;
 use futures::SinkExt;
-use tokio::sync::Mutex; // using tokio's async Mutex
+use tokio::sync::Mutex; // using Tokio's async Mutex
 use std::sync::Arc;
 use datafusion::prelude::*;
 use datafusion::logical_expr::LogicalPlan;
@@ -21,7 +23,6 @@ use bytes::BytesMut;
 use crate::utils::{prepare_sql, value_to_string};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, error, debug};
-
 use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use serde::{Serialize, Deserialize};
@@ -105,11 +106,10 @@ pub struct DfSessionService {
     pub session_context: Arc<SessionContext>,
     pub parser: Arc<PgQueryParser>,
     pub db: Arc<crate::database::Database>,
-    pub user_db: Arc<Mutex<UserDB>>, // using tokio::sync::Mutex for async locking
+    pub user_db: Arc<Mutex<UserDB>>, // using Tokio's async Mutex for non-blocking access
 }
 
 impl DfSessionService {
-    // Note: This constructor remains synchronous.
     pub fn new(session_context: SessionContext, db: Arc<crate::database::Database>) -> Self {
         let session_context = Arc::new(session_context);
         let parser = Arc::new(PgQueryParser {
@@ -119,15 +119,12 @@ impl DfSessionService {
             error!("Failed to load user DB: {}. Starting with empty DB.", e);
             UserDB { users: vec![] }
         });
-        let service = Self {
+        Self {
             session_context,
             parser,
             db,
             user_db: Arc::new(Mutex::new(user_db)),
-        };
-        // Removed blocking_lock call.
-        // You can call `log_users_async()` later within an async context if desired.
-        service
+        }
     }
 
     // Async logging method using .lock().await
@@ -165,7 +162,7 @@ impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
         query: &'a str,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
     {
         let query_lower = query.trim_start().to_lowercase();
         if query_lower.starts_with("insert") {
@@ -211,7 +208,7 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
     {
         let plan = &target.statement;
         let schema = plan.schema();
@@ -237,7 +234,7 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         target: &pgwire::api::portal::Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
     {
         let plan = &target.statement.statement;
         let fields = pgwire_schema_from_arrow(plan.schema())?;
@@ -251,7 +248,7 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         _max_rows: usize,
     ) -> PgWireResult<Response<'a>>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
     {
         let plan = &portal.statement.statement;
         let params = plan.get_parameter_types()
@@ -272,12 +269,11 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
 
 fn command_complete_response(msg: &str) -> Response<'static> {
     let mut buf = BytesMut::new();
-    buf.extend_from_slice(&(1_i16).to_be_bytes()); // Number of fields
+    buf.extend_from_slice(&(1_i16).to_be_bytes());
     let bytes = msg.as_bytes();
     buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
     buf.extend_from_slice(bytes);
-
-    let row_stream = stream::iter(vec![Ok(DataRow::new(buf, 1))]);
+    let row_stream = futures::stream::iter(vec![Ok(DataRow::new(buf, 1))]);
     let fields = vec![FieldInfo::new(
         "CommandComplete".to_string(),
         None,
@@ -296,7 +292,6 @@ async fn encode_dataframe(
     let schema = (*df.schema()).clone();
     let batches = df.collect().await?;
     let fields = pgwire_schema_from_arrow(&schema)?;
-
     let mut all_rows = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {
@@ -313,7 +308,7 @@ async fn encode_dataframe(
             all_rows.push(Ok(DataRow::new(serialize_row(row_values), batch.num_columns() as i16)));
         }
     }
-    let row_stream = stream::iter(all_rows);
+    let row_stream = futures::stream::iter(all_rows);
     Ok(QueryResponse::new(fields.into(), row_stream))
 }
 
@@ -375,38 +370,42 @@ impl StartupHandler for DfSessionService {
         msg: PgWireFrontendMessage,
     ) -> Result<(), PgWireError>
     where
-        C: ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send,
+        C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
         C::Error: std::fmt::Debug,
     {
-        debug!("Raw message received: {:?}", msg);
+        debug!("Received Startup message: {:?}", msg);
         if let PgWireFrontendMessage::Startup(startup) = msg {
             let user = startup.parameters.get("user").map(|s| s.as_str()).unwrap_or("");
-            let password = startup.parameters.get("password").map(|s| s.as_str()).unwrap_or("");
-            debug!("Startup parameters: {:?}", startup.parameters);
-            info!("Authenticating user: '{}', password length: {}", user, password.len());
-
-            // Verify password if provided in Startup message
-            if !password.is_empty() {
-                let user_db = self.user_db.lock().await; // Async lock
-                if user_db.verify_user(user, password) {
-                    info!("User '{}' authenticated successfully via Startup", user);
-                    client.send(PgWireBackendMessage::Authentication(Authentication::Ok)).await
+            // Get the provided password, if any.
+            let provided_password = startup.parameters.get("password").map(|s| s.as_str()).unwrap_or("");
+            info!("Authenticating user '{}' (provided password length: {})", user, provided_password.len());
+            if !provided_password.is_empty() {
+                let user_db = self.user_db.lock().await;
+                if user_db.verify_user(user, provided_password) {
+                    client.send(PgWireBackendMessage::Authentication(Authentication::Ok))
+                        .await
                         .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
                     return Ok(());
                 } else {
-                    debug!("Authentication failed for user '{}'. Provided password length: {}", user, password.len());
                     return Err(PgWireError::ApiError("Authentication failed".into()));
                 }
+            } else {
+                // Attempt fallback using environment variable.
+                if let Ok(fallback_password) = std::env::var("PGPASSWORD") {
+                    let user_db = self.user_db.lock().await;
+                    if user_db.verify_user(user, &fallback_password) {
+                        info!("User '{}' authenticated using fallback password", user);
+                        client.send(PgWireBackendMessage::Authentication(Authentication::Ok))
+                            .await
+                            .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+                        return Ok(());
+                    }
+                }
+                // If no password is provided and fallback failed, return an error.
+                return Err(PgWireError::ApiError("No password provided".into()));
             }
-
-            // Request password if not provided
-            debug!("No password in Startup, requesting cleartext password");
-            client.send(PgWireBackendMessage::Authentication(Authentication::CleartextPassword)).await
-                .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
-            Ok(())
         } else {
-            error!("Expected startup message, received: {:?}", msg);
-            Err(PgWireError::ApiError("Expected startup message".into()))
+            return Err(PgWireError::ApiError("Expected Startup message".into()));
         }
     }
 }
