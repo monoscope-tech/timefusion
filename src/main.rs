@@ -12,7 +12,7 @@ use chrono::Utc;
 use database::Database;
 use ingest::{ingest as ingest_handler, get_status, get_all_data, get_data_by_id, IngestStatusStore, record_batches_to_json_rows};
 use pgwire_integration::{DfSessionService, run_pgwire_server, HandlerFactory};
-use persistent_queue::{PersistentQueue, IngestRecord}; // Added PersistentQueue import
+use persistent_queue::{PersistentQueue, IngestRecord}; 
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 use std::env;

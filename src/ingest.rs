@@ -2,7 +2,7 @@
 use actix_web::{get, post, web, HttpResponse, Responder};
 use chrono::DateTime;
 use serde::Deserialize;
-use serde_json::{json, Value, Map};
+use serde_json::{json, Value};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use crate::persistent_queue::{IngestRecord, PersistentQueue};
