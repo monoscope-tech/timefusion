@@ -29,12 +29,12 @@ RUN cargo build --release
 ##############################
 #         Runtime Stage      #
 ##############################
-FROM ubuntu:22.04
+FROM ubuntu:20.04
 WORKDIR /app
 
 # Install runtime dependencies
 RUN apt-get update && \
-    apt-get install -y ca-certificates libssl3 && \
+    apt-get install -y ca-certificates libssl1.1 && \
     rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user
@@ -48,20 +48,11 @@ RUN mkdir -p /app/queue_db /app/data && \
 # Copy the compiled binary from the builder stage
 COPY --from=builder /app/target/release/timefusion /usr/local/bin/timefusion
 
-# Initialize users.json for authentication (created empty if not present)
-RUN touch /app/users.json && \
-    chown appuser:appgroup /app/users.json && \
-    chmod 664 /app/users.json
-
 # Adjust ownership of the binary
 RUN chown appuser:appgroup /usr/local/bin/timefusion
 
 # Expose the required ports
 EXPOSE 80 5432
-
-# Healthcheck (optional but recommended)
-HEALTHCHECK --interval=30s --timeout=3s \
-    CMD curl -f http://localhost:80/ || exit 1
 
 # Switch to the non-root user
 USER appuser
