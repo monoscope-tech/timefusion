@@ -48,8 +48,7 @@ RUN mkdir -p /app/queue_db /app/data && \
 # Copy the compiled binary from the builder stage
 COPY --from=builder /app/target/release/timefusion /usr/local/bin/timefusion
 
-# Copy or initialize users.json for authentication (optional, adjust as needed)
-COPY --from=builder /app/users.json /app/users.json
+# Initialize users.json for authentication (created empty if not present)
 RUN touch /app/users.json && \
     chown appuser:appgroup /app/users.json && \
     chmod 664 /app/users.json
