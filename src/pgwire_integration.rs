@@ -9,11 +9,12 @@ use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type, PgWireServerHandlers, NoopErrorHandler};
 use pgwire::api::auth::StartupHandler;
 use pgwire::messages::{PgWireFrontendMessage, PgWireBackendMessage};
+use pgwire::messages::response::{ReadyForQuery, TransactionStatus}; // Updated import
 use pgwire::messages::startup::Authentication;
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use futures::SinkExt;
-use tokio::sync::Mutex; // using Tokio's async Mutex
+use tokio::sync::Mutex;
 use std::sync::Arc;
 use datafusion::prelude::*;
 use datafusion::logical_expr::LogicalPlan;
@@ -106,7 +107,7 @@ pub struct DfSessionService {
     pub session_context: Arc<SessionContext>,
     pub parser: Arc<PgQueryParser>,
     pub db: Arc<crate::database::Database>,
-    pub user_db: Arc<Mutex<UserDB>>, // using Tokio's async Mutex for non-blocking access
+    pub user_db: Arc<Mutex<UserDB>>,
 }
 
 impl DfSessionService {
@@ -127,7 +128,6 @@ impl DfSessionService {
         }
     }
 
-    // Async logging method using .lock().await
     pub async fn log_users_async(&self) {
         let user_db = self.user_db.lock().await;
         user_db.log_users();
@@ -376,7 +376,6 @@ impl StartupHandler for DfSessionService {
         debug!("Received Startup message: {:?}", msg);
         if let PgWireFrontendMessage::Startup(startup) = msg {
             let user = startup.parameters.get("user").map(|s| s.as_str()).unwrap_or("");
-            // Get the provided password, if any.
             let provided_password = startup.parameters.get("password").map(|s| s.as_str()).unwrap_or("");
             info!("Authenticating user '{}' (provided password length: {})", user, provided_password.len());
             if !provided_password.is_empty() {
@@ -385,12 +384,14 @@ impl StartupHandler for DfSessionService {
                     client.send(PgWireBackendMessage::Authentication(Authentication::Ok))
                         .await
                         .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+                    client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)))
+                        .await
+                        .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
                     return Ok(());
                 } else {
                     return Err(PgWireError::ApiError("Authentication failed".into()));
                 }
             } else {
-                // Attempt fallback using environment variable.
                 if let Ok(fallback_password) = std::env::var("PGPASSWORD") {
                     let user_db = self.user_db.lock().await;
                     if user_db.verify_user(user, &fallback_password) {
@@ -398,10 +399,12 @@ impl StartupHandler for DfSessionService {
                         client.send(PgWireBackendMessage::Authentication(Authentication::Ok))
                             .await
                             .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+                        client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)))
+                            .await
+                            .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
                         return Ok(());
                     }
                 }
-                // If no password is provided and fallback failed, return an error.
                 return Err(PgWireError::ApiError("No password provided".into()));
             }
         } else {
