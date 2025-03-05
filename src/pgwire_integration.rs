@@ -1,5 +1,3 @@
-// src/pgwire_integration.rs
-
 use async_trait::async_trait;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::results::{
@@ -123,19 +121,20 @@ impl DfSessionService {
             UserDB { users: vec![] }
         });
         
-        // Register table_events (example in-memory table)
+        // Register table_events (in-memory table with enhanced logging)
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("event_name", DataType::Utf8, true),
         ]));
         let table = Arc::new(MemTable::try_new(schema, vec![]).unwrap());
         match session_context.register_table("table_events", table) {
-            Ok(_) => {},
+            Ok(_) => info!("Table 'table_events' registered successfully"),
             Err(e) => {
                 if e.to_string().contains("already exists") {
-                    debug!("Table 'table_events' already exists, ignoring registration error: {}", e);
+                    debug!("Table 'table_events' already exists, ignoring: {}", e);
                 } else {
-                    panic!("Error registering table_events: {:?}", e);
+                    error!("Error registering table_events: {:?}", e);
+                    panic!("Failed to register table_events");
                 }
             }
         }
@@ -196,10 +195,8 @@ impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
                 Type::INT4,
                 pgwire::api::results::FieldFormat::Text,
             )];
-            let row = DataRow::new(
-                BytesMut::from(&b"1"[..]),
-                1, // One column
-            );
+            let row_values = vec![Some("1".to_string())];
+            let row = DataRow::new(serialize_row(row_values), 1);
             let row_stream = futures::stream::iter(vec![Ok(row)]);
             let qr = QueryResponse::new(fields.into(), row_stream);
             return Ok(vec![Response::Query(qr)]);
@@ -344,11 +341,11 @@ async fn encode_dataframe(
     df: DataFrame,
     _format: &pgwire::api::portal::Format,
 ) -> Result<QueryResponse<'static>, Box<dyn std::error::Error + Send + Sync>> {
-    debug!("Entering encode_dataframe with DataFrame schema: {:?}", df.schema());
+    debug!("Entering encode_dataframe with schema: {:?}", df.schema());
     let schema = (*df.schema()).clone();
-    debug!("Collecting DataFrame");
+    debug!("Collecting DataFrame...");
     let batches = df.collect().await?;
-    debug!("Converting schema to pgwire format");
+    debug!("Collected {} batches", batches.len());
     let fields = pgwire_schema_from_arrow(&schema)?;
     let mut all_rows = Vec::new();
     for batch in batches {
@@ -367,7 +364,7 @@ async fn encode_dataframe(
             all_rows.push(Ok(DataRow::new(serialize_row(row_values), batch.num_columns() as i16)));
         }
     }
-    debug!("Creating QueryResponse with {} rows", all_rows.len());
+    debug!("Returning QueryResponse with {} rows", all_rows.len());
     let row_stream = futures::stream::iter(all_rows);
     Ok(QueryResponse::new(fields.into(), row_stream))
 }
@@ -524,8 +521,13 @@ where
                         info!("Accepted connection from {:?}", peer_addr);
                         let handler_clone = handler.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_clone).await {
-                                error!("PGWire connection error: {:?}", e);
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| async {
+                                if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_clone).await {
+                                    error!("PGWire connection error: {:?}", e);
+                                }
+                            }));
+                            if let Err(panic) = result {
+                                error!("Connection handler panicked: {:?}", panic);
                             }
                         });
                     }
