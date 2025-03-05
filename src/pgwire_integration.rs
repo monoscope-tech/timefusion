@@ -129,7 +129,16 @@ impl DfSessionService {
             Field::new("event_name", DataType::Utf8, true),
         ]));
         let table = Arc::new(MemTable::try_new(schema, vec![]).unwrap());
-        session_context.register_table("table_events", table).unwrap();
+        match session_context.register_table("table_events", table) {
+            Ok(_) => {},
+            Err(e) => {
+                if e.to_string().contains("already exists") {
+                    debug!("Table 'table_events' already exists, ignoring registration error: {}", e);
+                } else {
+                    panic!("Error registering table_events: {:?}", e);
+                }
+            }
+        }
 
         Self {
             session_context,
