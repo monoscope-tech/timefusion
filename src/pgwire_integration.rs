@@ -430,41 +430,67 @@ impl StartupHandler for DfSessionService {
         C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
         C::Error: std::fmt::Debug,
     {
-        debug!("Received Startup message: {:?}", msg);
+        debug!("Received message: {:?}", msg);
         if let PgWireFrontendMessage::Startup(startup) = msg {
+            debug!("Processing Startup message: {:?}", startup);
             let user = startup.parameters.get("user").map(|s| s.as_str()).unwrap_or("");
             let provided_password = startup.parameters.get("password").map(|s| s.as_str()).unwrap_or("");
-            info!("Authenticating user '{}' (provided password length: {})", user, provided_password.len());
+            info!("Authenticating user '{}'", user);
+            debug!("Provided password length: {}", provided_password.len());
+
             if !provided_password.is_empty() {
+                debug!("Attempting authentication with provided password");
                 let user_db = self.user_db.lock().await;
                 if user_db.verify_user(user, provided_password) {
+                    info!("User '{}' authenticated successfully", user);
                     client.send(PgWireBackendMessage::Authentication(Authentication::Ok))
                         .await
-                        .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+                        .map_err(|e| {
+                            error!("Failed to send AuthenticationOk: {:?}", e);
+                            PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+                        })?;
                     client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)))
                         .await
-                        .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+                        .map_err(|e| {
+                            error!("Failed to send ReadyForQuery: {:?}", e);
+                            PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+                        })?;
+                    debug!("Startup completed successfully for user '{}'", user);
                     return Ok(());
                 } else {
-                    return Err(PgWireError::ApiError("Authentication failed".into()));
+                    error!("Authentication failed for user '{}': invalid password", user);
+                    return Err(PgWireError::ApiError("Authentication failed: invalid username or password".into()));
                 }
             } else {
+                debug!("No password provided in startup message, checking PGPASSWORD");
                 if let Ok(fallback_password) = std::env::var("PGPASSWORD") {
                     let user_db = self.user_db.lock().await;
                     if user_db.verify_user(user, &fallback_password) {
                         info!("User '{}' authenticated using fallback password", user);
                         client.send(PgWireBackendMessage::Authentication(Authentication::Ok))
                             .await
-                            .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+                            .map_err(|e| {
+                                error!("Failed to send AuthenticationOk: {:?}", e);
+                                PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+                            })?;
                         client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)))
                             .await
-                            .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))))?;
+                            .map_err(|e| {
+                                error!("Failed to send ReadyForQuery: {:?}", e);
+                                PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+                            })?;
+                        debug!("Startup completed successfully with fallback for user '{}'", user);
                         return Ok(());
+                    } else {
+                        error!("Authentication failed for user '{}': invalid fallback password", user);
+                        return Err(PgWireError::ApiError("Authentication failed: invalid fallback password".into()));
                     }
                 }
-                return Err(PgWireError::ApiError("No password provided".into()));
+                error!("No password provided and PGPASSWORD not set for user '{}'", user);
+                return Err(PgWireError::ApiError("No password provided and PGPASSWORD not set".into()));
             }
         } else {
+            error!("Expected Startup message, received: {:?}", msg);
             return Err(PgWireError::ApiError("Expected Startup message".into()));
         }
     }
@@ -521,13 +547,16 @@ where
                         info!("Accepted connection from {:?}", peer_addr);
                         let handler_clone = handler.clone();
                         tokio::spawn(async move {
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| async {
+                            debug!("Spawning new connection handler for {:?}", peer_addr);
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| async move {
                                 if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_clone).await {
-                                    error!("PGWire connection error: {:?}", e);
+                                    error!("PGWire connection error for {:?}: {:?}", peer_addr, e);
+                                } else {
+                                    debug!("Connection handling completed successfully for {:?}", peer_addr);
                                 }
                             }));
                             if let Err(panic) = result {
-                                error!("Connection handler panicked: {:?}", panic);
+                                error!("Connection handler panicked for {:?}: {:?}", peer_addr, panic);
                             }
                         });
                     }

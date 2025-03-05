@@ -72,11 +72,9 @@ async fn dashboard(
     let db_status = match db.query("SELECT 1 AS test").await { Ok(_) => "success", Err(_) => "error" };
     let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
 
-    // Parse query parameters for date range
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
 
-    // Filter records by date range
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!("SELECT project_id, id, timestamp, duration_ns FROM table_events WHERE timestamp >= '{}' AND timestamp <= '{}' ORDER BY timestamp DESC LIMIT 10", start.to_rfc3339(), end.to_rfc3339())
     } else {
@@ -88,7 +86,6 @@ async fn dashboard(
         Err(_) => 0.0
     };
 
-    // Threshold alerts
     let latency_alert = avg_latency > 200.0;
     let queue_alert = queue_size > 50;
 
@@ -102,7 +99,6 @@ async fn dashboard(
         Err(_) => vec![]
     };
 
-    // Update and filter trends
     let mut trends = app_info.trends.lock().await;
     let trend_data = TrendData {
         timestamp: Utc::now().to_rfc3339(),
@@ -290,7 +286,6 @@ async fn main() -> anyhow::Result<()> {
 
     let pg_service = DfSessionService::new(db.get_session_context(), db.clone());
     let handler_factory = HandlerFactory(Arc::new(pg_service));
-
     let pg_addr = format!("0.0.0.0:{}", pgwire_port);
     info!("Spawning PGWire server task on {}", pg_addr);
     let pg_server = tokio::spawn({
@@ -304,6 +299,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
+
+    // Verify PGWire server startup
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    if pg_server.is_finished() {
+        error!("PGWire server failed to start, aborting...");
+        return Err(anyhow::anyhow!("PGWire server failed to start"));
+    }
 
     let flush_task = {
         let db_clone = db.clone();
