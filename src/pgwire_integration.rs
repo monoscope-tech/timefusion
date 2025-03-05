@@ -9,7 +9,7 @@ use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type, PgWireServerHandlers, NoopErrorHandler};
 use pgwire::api::auth::StartupHandler;
 use pgwire::messages::{PgWireFrontendMessage, PgWireBackendMessage};
-use pgwire::messages::response::{ReadyForQuery, TransactionStatus}; // Updated import
+use pgwire::messages::response::{ReadyForQuery, TransactionStatus};
 use pgwire::messages::startup::Authentication;
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
@@ -28,6 +28,8 @@ use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use serde::{Serialize, Deserialize};
 use bcrypt::{hash, verify, DEFAULT_COST};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::datasource::MemTable;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
@@ -120,6 +122,15 @@ impl DfSessionService {
             error!("Failed to load user DB: {}. Starting with empty DB.", e);
             UserDB { users: vec![] }
         });
+        
+        // Register table_events (example in-memory table)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("event_name", DataType::Utf8, true),
+        ]));
+        let table = Arc::new(MemTable::try_new(schema, vec![]).unwrap());
+        session_context.register_table("table_events", table).unwrap();
+
         Self {
             session_context,
             parser,
@@ -164,31 +175,40 @@ impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
     where
         C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
     {
+        debug!("Received query: {}", query);
         let query_lower = query.trim_start().to_lowercase();
+        debug!("Query lowercase: {}", query_lower);
         if query_lower.starts_with("insert") {
+            debug!("Processing INSERT query");
             let msg = (&*self.db).insert_record(query)
                 .await
                 .map_err(|e| PgWireError::ApiError(e.into()))?;
             return Ok(vec![command_complete_response(&msg)]);
         } else if query_lower.starts_with("update") {
+            debug!("Processing UPDATE query");
             let msg = (&*self.db).update_record(query)
                 .await
                 .map_err(|e| PgWireError::ApiError(e.into()))?;
             return Ok(vec![command_complete_response(&msg)]);
         } else if query_lower.starts_with("delete") {
+            debug!("Processing DELETE query");
             let msg = (&*self.db).delete_record(query)
                 .await
                 .map_err(|e| PgWireError::ApiError(e.into()))?;
             return Ok(vec![command_complete_response(&msg)]);
         }
 
+        debug!("Preparing SQL: {}", query);
         let new_sql = prepare_sql(query).map_err(|e| PgWireError::ApiError(e.into()))?;
+        debug!("Executing SQL: {}", new_sql);
         let df = self.session_context.sql(&new_sql)
             .await
             .map_err(|e| PgWireError::ApiError(e.into()))?;
+        debug!("Encoding DataFrame");
         let resp = encode_dataframe(df, &pgwire::api::portal::Format::UnifiedText)
             .await
             .map_err(|e| PgWireError::ApiError(e.into()))?;
+        debug!("Query completed successfully");
         Ok(vec![Response::Query(resp)])
     }
 }
@@ -289,11 +309,15 @@ async fn encode_dataframe(
     df: DataFrame,
     _format: &pgwire::api::portal::Format,
 ) -> Result<QueryResponse<'static>, Box<dyn std::error::Error + Send + Sync>> {
+    debug!("Starting encode_dataframe");
     let schema = (*df.schema()).clone();
+    debug!("Collecting DataFrame");
     let batches = df.collect().await?;
+    debug!("Converting schema to pgwire format");
     let fields = pgwire_schema_from_arrow(&schema)?;
     let mut all_rows = Vec::new();
     for batch in batches {
+        debug!("Processing batch with {} rows", batch.num_rows());
         for row in 0..batch.num_rows() {
             let mut row_values = Vec::new();
             for col in 0..batch.num_columns() {
@@ -308,6 +332,7 @@ async fn encode_dataframe(
             all_rows.push(Ok(DataRow::new(serialize_row(row_values), batch.num_columns() as i16)));
         }
     }
+    debug!("Creating QueryResponse with {} rows", all_rows.len());
     let row_stream = futures::stream::iter(all_rows);
     Ok(QueryResponse::new(fields.into(), row_stream))
 }
