@@ -22,7 +22,6 @@ use tracing_subscriber::EnvFilter;
 use dotenv::dotenv;
 use tokio::task::spawn_blocking;
 use std::time::Duration as StdDuration;
-use anyhow::Context;
 use metrics::{INGESTION_COUNTER, ERROR_COUNTER};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::Mutex as TokioMutex;
@@ -300,7 +299,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Verify PGWire server startup
     tokio::time::sleep(Duration::from_secs(1)).await;
     if pg_server.is_finished() {
         error!("PGWire server failed to start, aborting...");

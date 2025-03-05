@@ -26,8 +26,8 @@ use std::fs;
 use std::io::{Error as IoError, ErrorKind};
 use serde::{Serialize, Deserialize};
 use bcrypt::{hash, verify, DEFAULT_COST};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::datasource::MemTable;
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use datafusion::datasource::MemTable; // Added this import
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
@@ -121,7 +121,6 @@ impl DfSessionService {
             UserDB { users: vec![] }
         });
         
-        // Register table_events (in-memory table with enhanced logging)
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("event_name", DataType::Utf8, true),
@@ -396,26 +395,26 @@ fn pgwire_schema_from_arrow(schema: &datafusion::common::DFSchema) -> Result<Vec
     Ok(fields)
 }
 
-fn into_pg_type(dt: &datafusion::arrow::datatypes::DataType) -> Result<Type, Box<dyn std::error::Error + Send + Sync>> {
+fn into_pg_type(dt: &DataType) -> Result<Type, Box<dyn std::error::Error + Send + Sync>> {
     match dt {
-        datafusion::arrow::datatypes::DataType::Utf8 => Ok(Type::TEXT),
-        datafusion::arrow::datatypes::DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, _) => Ok(Type::TIMESTAMP),
-        datafusion::arrow::datatypes::DataType::Int64 => Ok(Type::INT8),
-        datafusion::arrow::datatypes::DataType::Int32 => Ok(Type::INT4),
+        DataType::Utf8 => Ok(Type::TEXT),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(Type::TIMESTAMP),
+        DataType::Int64 => Ok(Type::INT8),
+        DataType::Int32 => Ok(Type::INT4),
         _ => Ok(Type::TEXT),
     }
 }
 
 fn deserialize_parameters<T>(
     _portal: &pgwire::api::portal::Portal<T>,
-    _ordered: &Vec<Option<&datafusion::arrow::datatypes::DataType>>,
+    _ordered: &Vec<Option<&DataType>>,
 ) -> Result<ParamValues, Box<dyn std::error::Error + Send + Sync>> {
     Ok(ParamValues::List(vec![]))
 }
 
 fn ordered_param_types(
-    types: &HashMap<String, Option<datafusion::arrow::datatypes::DataType>>,
-) -> Vec<Option<&datafusion::arrow::datatypes::DataType>> {
+    types: &HashMap<String, Option<DataType>>,
+) -> Vec<Option<&DataType>> {
     types.values().map(|opt| opt.as_ref()).collect()
 }
 
@@ -447,13 +446,13 @@ impl StartupHandler for DfSessionService {
                         .await
                         .map_err(|e| {
                             error!("Failed to send AuthenticationOk: {:?}", e);
-                            PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+                            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                         })?;
                     client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)))
                         .await
                         .map_err(|e| {
                             error!("Failed to send ReadyForQuery: {:?}", e);
-                            PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+                            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                         })?;
                     debug!("Startup completed successfully for user '{}'", user);
                     return Ok(());
@@ -471,13 +470,13 @@ impl StartupHandler for DfSessionService {
                             .await
                             .map_err(|e| {
                                 error!("Failed to send AuthenticationOk: {:?}", e);
-                                PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+                                PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                             })?;
                         client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)))
                             .await
                             .map_err(|e| {
                                 error!("Failed to send ReadyForQuery: {:?}", e);
-                                PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e)))
+                                PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                             })?;
                         debug!("Startup completed successfully with fallback for user '{}'", user);
                         return Ok(());
@@ -548,11 +547,15 @@ where
                         let handler_clone = handler.clone();
                         tokio::spawn(async move {
                             debug!("Spawning new connection handler for {:?}", peer_addr);
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| async move {
-                                if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_clone).await {
-                                    error!("PGWire connection error for {:?}: {:?}", peer_addr, e);
-                                } else {
-                                    debug!("Connection handling completed successfully for {:?}", peer_addr);
+                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| async {
+                                debug!("Starting process_socket for {:?}", peer_addr);
+                                match pgwire::tokio::process_socket(socket, None, handler_clone).await {
+                                    Ok(()) => {
+                                        debug!("Connection handling completed successfully for {:?}", peer_addr);
+                                    }
+                                    Err(e) => {
+                                        error!("PGWire connection error for {:?}: {:?}", peer_addr, e);
+                                    }
                                 }
                             }));
                             if let Err(panic) = result {
