@@ -1,3 +1,4 @@
+// src/pgwire_integration.rs
 use async_trait::async_trait;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::results::{
@@ -5,7 +6,6 @@ use pgwire::api::results::{
 };
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, Type, PgWireServerHandlers, NoopErrorHandler};
-use pgwire::api::auth::StartupHandler;
 use pgwire::messages::{PgWireFrontendMessage, PgWireBackendMessage};
 use pgwire::messages::response::{ReadyForQuery, TransactionStatus};
 use pgwire::messages::startup::Authentication;
@@ -419,7 +419,7 @@ fn ordered_param_types(
 }
 
 #[async_trait]
-impl StartupHandler for DfSessionService {
+impl pgwire::api::auth::StartupHandler for DfSessionService {
     async fn on_startup<C>(
         &self,
         client: &mut C,

@@ -17,25 +17,31 @@ use crate::persistent_queue::IngestRecord;
 use chrono::DateTime;
 use crate::metrics::COMPACTION_COUNTER;
 use dotenv::dotenv;
+use datafusion_query_cache::cache::QueryCacheSessionContext;
+use datafusion_uwheel::SessionContext;
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
 
 pub struct Database {
-    pub ctx: SessionContext,
+    // Note: our context now is a QueryCacheSessionContext that wraps a UwheelSessionContext.
+    pub ctx: QueryCacheSessionContext<UwheelSessionContext>,
     project_configs: ProjectConfigs,
 }
 
 impl Database {
     pub async fn new() -> Result<Self> {
         dotenv().ok();
-        let ctx = SessionContext::new();
+        // Create a Uwheel session context as the base DataFusion engine with Uwheel enhancements.
+        let base_ctx = UwheelSessionContext::new();
+        // Wrap the base context with a query cache (here using a capacity of 1000 entries; adjust as needed).
+        let ctx = QueryCacheSessionContext::new(base_ctx, 1000);
         Ok(Self {
             ctx,
             project_configs: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
-    pub fn get_session_context(&self) -> SessionContext {
+    pub fn get_session_context(&self) -> QueryCacheSessionContext<UwheelSessionContext> {
         self.ctx.clone()
     }
 
