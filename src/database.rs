@@ -5,6 +5,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::array::{
     StringArray, TimestampMicrosecondArray, Int32Array, Int64Array, ListBuilder, StringBuilder,
 };
+use datafusion::execution::context::SessionContext; // Updated import
 use deltalake::{DeltaTableBuilder, DeltaOps};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -17,31 +18,25 @@ use crate::persistent_queue::IngestRecord;
 use chrono::DateTime;
 use crate::metrics::COMPACTION_COUNTER;
 use dotenv::dotenv;
-use datafusion_query_cache::cache::QueryCacheSessionContext;
-use datafusion_uwheel::SessionContext;
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
 
 pub struct Database {
-    // Note: our context now is a QueryCacheSessionContext that wraps a UwheelSessionContext.
-    pub ctx: QueryCacheSessionContext<UwheelSessionContext>,
+    pub ctx: SessionContext, // Updated type
     project_configs: ProjectConfigs,
 }
 
 impl Database {
     pub async fn new() -> Result<Self> {
         dotenv().ok();
-        // Create a Uwheel session context as the base DataFusion engine with Uwheel enhancements.
-        let base_ctx = UwheelSessionContext::new();
-        // Wrap the base context with a query cache (here using a capacity of 1000 entries; adjust as needed).
-        let ctx = QueryCacheSessionContext::new(base_ctx, 1000);
+        let ctx = SessionContext::new(); // Updated initialization
         Ok(Self {
             ctx,
             project_configs: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
-    pub fn get_session_context(&self) -> QueryCacheSessionContext<UwheelSessionContext> {
+    pub fn get_session_context(&self) -> SessionContext { // Updated return type
         self.ctx.clone()
     }
 
@@ -112,7 +107,7 @@ impl Database {
             Field::new("instrumentation_scope", DataType::Utf8, false),
             Field::new("errors", DataType::Utf8, false),
             Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
-            Field::new("event_date", DataType::Utf8, true), // Partition field
+            Field::new("event_date", DataType::Utf8, true),
         ])
     }
 
@@ -135,7 +130,7 @@ impl Database {
     }
 
     pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> Result<()> {
-        let _schema = Self::event_schema(); // Used implicitly in DeltaTableBuilder
+        let _schema = Self::event_schema();
         let table = match DeltaTableBuilder::from_uri(table_uri).load().await {
             Ok(table) => table,
             Err(e) => {
