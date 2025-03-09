@@ -30,7 +30,7 @@ use bcrypt::{hash, verify, DEFAULT_COST};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::datasource::MemTable;
 
-// New imports for SSL handling:
+// Imports for SSL handling:
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use std::convert::TryInto;
@@ -178,20 +178,22 @@ impl QueryParser for PgQueryParser {
     }
 }
 
+/// --- SIMPLE QUERY HANDLER ---
 #[async_trait]
 impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
     async fn do_query<'a, C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         query: &'a str,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
         C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
+        <C as futures::Sink<PgWireBackendMessage>>::Error: std::fmt::Debug,
     {
         debug!("Starting do_query for query: {}", query);
         let query_lower = query.trim_start().to_lowercase();
         debug!("Query after lowercase: {}", query_lower);
-        if query_lower == "select 1 as number" {
+        let responses = if query_lower == "select 1 as number" {
             debug!("Handling simple SELECT 1 AS number");
             let fields = vec![FieldInfo::new(
                 "number".to_string(),
@@ -203,52 +205,58 @@ impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
             let row_values = vec![Some("1".to_string())];
             let row = DataRow::new(serialize_row(row_values), 1);
             let row_stream = futures::stream::iter(vec![Ok(row)]);
-            let qr = QueryResponse::new(fields.into(), row_stream);
-            return Ok(vec![Response::Query(qr)]);
-        }
-
-        if query_lower.starts_with("insert") {
+            vec![Response::Query(QueryResponse::new(fields.into(), row_stream))]
+        } else if query_lower.starts_with("insert") {
             debug!("Processing INSERT query");
             let msg = (&*self.db).insert_record(query)
                 .await
                 .map_err(|e| PgWireError::ApiError(e.into()))?;
-            return Ok(vec![command_complete_response(&msg)]);
+            vec![command_complete_response(&msg)]
         } else if query_lower.starts_with("update") {
             debug!("Processing UPDATE query");
             let msg = (&*self.db).update_record(query)
                 .await
                 .map_err(|e| PgWireError::ApiError(e.into()))?;
-            return Ok(vec![command_complete_response(&msg)]);
+            vec![command_complete_response(&msg)]
         } else if query_lower.starts_with("delete") {
             debug!("Processing DELETE query");
             let msg = (&*self.db).delete_record(query)
                 .await
                 .map_err(|e| PgWireError::ApiError(e.into()))?;
-            return Ok(vec![command_complete_response(&msg)]);
-        }
-
-        debug!("Preparing SQL: {}", query);
-        let new_sql = prepare_sql(query).map_err(|e| PgWireError::ApiError(e.into()))?;
-        debug!("Executing SQL: {}", new_sql);
-        let df = self.session_context.sql(&new_sql)
-            .await
-            .map_err(|e| {
-                error!("DataFusion SQL execution failed: {:?}", e);
-                PgWireError::ApiError(e.into())
-            })?;
-        debug!("DataFrame created successfully");
-        debug!("Encoding DataFrame");
-        let resp = encode_dataframe(df, &pgwire::api::portal::Format::UnifiedText)
-            .await
-            .map_err(|e| {
-                error!("Encoding DataFrame failed: {:?}", e);
-                PgWireError::ApiError(e.into())
-            })?;
-        debug!("Query completed successfully");
-        Ok(vec![Response::Query(resp)])
+            vec![command_complete_response(&msg)]
+        } else {
+            debug!("Preparing SQL: {}", query);
+            let new_sql = prepare_sql(query).map_err(|e| PgWireError::ApiError(e.into()))?;
+            debug!("Executing SQL: {}", new_sql);
+            let df = self.session_context.sql(&new_sql)
+                .await
+                .map_err(|e| {
+                    error!("DataFusion SQL execution failed: {:?}", e);
+                    PgWireError::ApiError(e.into())
+                })?;
+            debug!("DataFrame created successfully");
+            debug!("Encoding DataFrame");
+            let qr = encode_dataframe(df, &pgwire::api::portal::Format::UnifiedText)
+                .await
+                .map_err(|e| {
+                    error!("Encoding DataFrame failed: {:?}", e);
+                    PgWireError::ApiError(e.into())
+                })?;
+            vec![Response::Query(qr)]
+        };
+        // Send ReadyForQuery after finishing the query response.
+        client.send(PgWireBackendMessage::ReadyForQuery(
+            ReadyForQuery::new(TransactionStatus::Idle)
+        ))
+        .await
+        .map_err(|e| 
+            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
+        )?;
+        Ok(responses)
     }
 }
 
+/// --- EXTENDED QUERY HANDLER ---
 #[async_trait]
 impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
     type Statement = LogicalPlan;
@@ -299,12 +307,13 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
 
     async fn do_query<'a, C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &'a pgwire::api::portal::Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response<'a>>
     where
         C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
+        <C as futures::Sink<PgWireBackendMessage>>::Error: std::fmt::Debug,
     {
         let plan = &portal.statement.statement;
         let params = plan.get_parameter_types()
@@ -320,6 +329,14 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         let resp = encode_dataframe(df, &portal.result_column_format)
             .await
             .map_err(|e| PgWireError::ApiError(e.into()))?;
+        // Send ReadyForQuery before finishing extended query.
+        client.send(PgWireBackendMessage::ReadyForQuery(
+            ReadyForQuery::new(TransactionStatus::Idle)
+        ))
+        .await
+        .map_err(|e| 
+            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
+        )?;
         Ok(Response::Query(resp))
     }
 }
@@ -454,8 +471,10 @@ impl pgwire::api::auth::StartupHandler for DfSessionService {
                             error!("Failed to send AuthenticationOk: {:?}", e);
                             PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                         })?;
-                    client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)))
-                        .await
+                    client.send(PgWireBackendMessage::ReadyForQuery(
+                        ReadyForQuery::new(TransactionStatus::Idle)
+                    ))
+                    .await
                         .map_err(|e| {
                             error!("Failed to send ReadyForQuery: {:?}", e);
                             PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
@@ -478,8 +497,10 @@ impl pgwire::api::auth::StartupHandler for DfSessionService {
                                 error!("Failed to send AuthenticationOk: {:?}", e);
                                 PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                             })?;
-                        client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle)))
-                            .await
+                        client.send(PgWireBackendMessage::ReadyForQuery(
+                            ReadyForQuery::new(TransactionStatus::Idle)
+                        ))
+                        .await
                             .map_err(|e| {
                                 error!("Failed to send ReadyForQuery: {:?}", e);
                                 PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
