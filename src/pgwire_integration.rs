@@ -28,7 +28,7 @@ use std::io::{Error as IoError, ErrorKind};
 use serde::{Serialize, Deserialize};
 use bcrypt::{hash, verify, DEFAULT_COST};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::datasource::MemTable; // Added this import
+use datafusion::datasource::MemTable;
 
 // New imports for SSL handling:
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -554,27 +554,17 @@ where
                         let handler_clone = handler.clone();
                         tokio::spawn(async move {
                             debug!("Spawning new connection handler for {:?}", peer_addr);
-                            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| async {
-                                // Handle potential SSLRequest before processing further.
-                                let socket = match handle_ssl_request(socket).await {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        error!("Error handling SSLRequest for {:?}: {:?}", peer_addr, e);
-                                        return;
-                                    }
-                                };
-                                debug!("Starting process_socket for {:?}", peer_addr);
-                                match pgwire::tokio::process_socket(socket, None, handler_clone).await {
-                                    Ok(()) => {
-                                        debug!("Connection handling completed successfully for {:?}", peer_addr);
-                                    }
-                                    Err(e) => {
-                                        error!("PGWire connection error for {:?}: {:?}", peer_addr, e);
-                                    }
+                            // Handle potential SSLRequest before processing further.
+                            let socket = match handle_ssl_request(socket).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    error!("Error handling SSLRequest for {:?}: {:?}", peer_addr, e);
+                                    return;
                                 }
-                            }));
-                            if let Err(panic) = result {
-                                error!("Connection handler panicked for {:?}: {:?}", peer_addr, panic);
+                            };
+                            debug!("Starting process_socket for {:?}", peer_addr);
+                            if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_clone).await {
+                                error!("PGWire connection error for {:?}: {:?}", peer_addr, e);
                             }
                         });
                     }
@@ -593,7 +583,7 @@ where
 /// the function reads the request, sends back 'N' to indicate no SSL support, and returns the socket.
 async fn handle_ssl_request(mut socket: TcpStream) -> std::io::Result<TcpStream> {
     let mut buf = [0u8; 8];
-    // Peek into the socket to check for an SSLRequest
+    // Peek into the socket to check for an SSLRequest.
     let n = socket.peek(&mut buf).await?;
     if n >= 8 {
         let len = i32::from_be_bytes(buf[0..4].try_into().unwrap());
