@@ -183,7 +183,7 @@ impl QueryParser for PgQueryParser {
 impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
     async fn do_query<'a, C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         query: &'a str,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
@@ -244,14 +244,7 @@ impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
                 })?;
             vec![Response::Query(qr)]
         };
-        // Send ReadyForQuery after finishing the query response.
-        client.send(PgWireBackendMessage::ReadyForQuery(
-            ReadyForQuery::new(TransactionStatus::Idle)
-        ))
-        .await
-        .map_err(|e| 
-            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
-        )?;
+        // Do not manually send ReadyForQuery here; the PGWire framework handles it.
         Ok(responses)
     }
 }
@@ -307,7 +300,7 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
 
     async fn do_query<'a, C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         portal: &'a pgwire::api::portal::Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response<'a>>
@@ -329,14 +322,7 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         let resp = encode_dataframe(df, &portal.result_column_format)
             .await
             .map_err(|e| PgWireError::ApiError(e.into()))?;
-        // Send ReadyForQuery before finishing extended query.
-        client.send(PgWireBackendMessage::ReadyForQuery(
-            ReadyForQuery::new(TransactionStatus::Idle)
-        ))
-        .await
-        .map_err(|e| 
-            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
-        )?;
+        // Do not manually send ReadyForQuery here.
         Ok(Response::Query(resp))
     }
 }
@@ -471,14 +457,7 @@ impl pgwire::api::auth::StartupHandler for DfSessionService {
                             error!("Failed to send AuthenticationOk: {:?}", e);
                             PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                         })?;
-                    client.send(PgWireBackendMessage::ReadyForQuery(
-                        ReadyForQuery::new(TransactionStatus::Idle)
-                    ))
-                    .await
-                        .map_err(|e| {
-                            error!("Failed to send ReadyForQuery: {:?}", e);
-                            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
-                        })?;
+                    // ReadyForQuery is already sent by the framework after startup.
                     debug!("Startup completed successfully for user '{}'", user);
                     return Ok(());
                 } else {
@@ -495,14 +474,6 @@ impl pgwire::api::auth::StartupHandler for DfSessionService {
                             .await
                             .map_err(|e| {
                                 error!("Failed to send AuthenticationOk: {:?}", e);
-                                PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
-                            })?;
-                        client.send(PgWireBackendMessage::ReadyForQuery(
-                            ReadyForQuery::new(TransactionStatus::Idle)
-                        ))
-                        .await
-                            .map_err(|e| {
-                                error!("Failed to send ReadyForQuery: {:?}", e);
                                 PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                             })?;
                         debug!("Startup completed successfully with fallback for user '{}'", user);
@@ -549,7 +520,7 @@ impl PgWireServerHandlers for HandlerFactory {
     }
 }
 
-/// Updated run_pgwire_server that intercepts and handles SSLRequest from clients.
+/// run_pgwire_server intercepts SSLRequest and passes the socket to pgwire::tokio::process_socket.
 pub async fn run_pgwire_server<H>(
     handler: H,
     addr: &str,
@@ -599,24 +570,19 @@ where
     Ok(())
 }
 
-/// Helper function to detect and handle an SSLRequest.
-/// If an SSLRequest is detected (first 8 bytes with length 8 and request code 80877103),
-/// the function reads the request, sends back 'N' to indicate no SSL support, and returns the socket.
+/// handle_ssl_request inspects the connection for an SSLRequest and responds with 'N'.
 async fn handle_ssl_request(mut socket: TcpStream) -> std::io::Result<TcpStream> {
     let mut buf = [0u8; 8];
-    // Peek into the socket to check for an SSLRequest.
     let n = socket.peek(&mut buf).await?;
     if n >= 8 {
         let len = i32::from_be_bytes(buf[0..4].try_into().unwrap());
         if len == 8 {
             let request_code = i32::from_be_bytes(buf[4..8].try_into().unwrap());
-            // 80877103 is the SSLRequest code in the PostgreSQL protocol.
+            // 80877103 is the SSLRequest code.
             if request_code == 80877103 {
                 debug!("Received SSLRequest, rejecting SSL by sending 'N'");
-                // Consume the SSLRequest bytes.
                 let mut discard = [0u8; 8];
                 socket.read_exact(&mut discard).await?;
-                // Respond with a single byte 'N' (no SSL support).
                 socket.write_all(b"N").await?;
             }
         }
