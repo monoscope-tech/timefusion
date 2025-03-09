@@ -1,4 +1,5 @@
 // src/pgwire_integration.rs
+
 use async_trait::async_trait;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::results::{
@@ -28,6 +29,11 @@ use serde::{Serialize, Deserialize};
 use bcrypt::{hash, verify, DEFAULT_COST};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::datasource::MemTable; // Added this import
+
+// New imports for SSL handling:
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use std::convert::TryInto;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
@@ -522,6 +528,7 @@ impl PgWireServerHandlers for HandlerFactory {
     }
 }
 
+/// Updated run_pgwire_server that intercepts and handles SSLRequest from clients.
 pub async fn run_pgwire_server<H>(
     handler: H,
     addr: &str,
@@ -548,6 +555,14 @@ where
                         tokio::spawn(async move {
                             debug!("Spawning new connection handler for {:?}", peer_addr);
                             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| async {
+                                // Handle potential SSLRequest before processing further.
+                                let socket = match handle_ssl_request(socket).await {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        error!("Error handling SSLRequest for {:?}: {:?}", peer_addr, e);
+                                        return;
+                                    }
+                                };
                                 debug!("Starting process_socket for {:?}", peer_addr);
                                 match pgwire::tokio::process_socket(socket, None, handler_clone).await {
                                     Ok(()) => {
@@ -571,4 +586,29 @@ where
         }
     }
     Ok(())
+}
+
+/// Helper function to detect and handle an SSLRequest.
+/// If an SSLRequest is detected (first 8 bytes with length 8 and request code 80877103),
+/// the function reads the request, sends back 'N' to indicate no SSL support, and returns the socket.
+async fn handle_ssl_request(mut socket: TcpStream) -> std::io::Result<TcpStream> {
+    let mut buf = [0u8; 8];
+    // Peek into the socket to check for an SSLRequest
+    let n = socket.peek(&mut buf).await?;
+    if n >= 8 {
+        let len = i32::from_be_bytes(buf[0..4].try_into().unwrap());
+        if len == 8 {
+            let request_code = i32::from_be_bytes(buf[4..8].try_into().unwrap());
+            // 80877103 is the SSLRequest code in the PostgreSQL protocol.
+            if request_code == 80877103 {
+                debug!("Received SSLRequest, rejecting SSL by sending 'N'");
+                // Consume the SSLRequest bytes.
+                let mut discard = [0u8; 8];
+                socket.read_exact(&mut discard).await?;
+                // Respond with a single byte 'N' (no SSL support).
+                socket.write_all(b"N").await?;
+            }
+        }
+    }
+    Ok(socket)
 }
