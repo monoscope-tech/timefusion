@@ -1,11 +1,10 @@
-// src/database.rs
 use datafusion::prelude::*;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::array::{
     StringArray, TimestampMicrosecondArray, Int32Array, Int64Array, ListBuilder, StringBuilder,
 };
-use datafusion::execution::context::SessionContext; // Updated import
+use datafusion::execution::context::SessionContext;
 use deltalake::{DeltaTableBuilder, DeltaOps};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -22,21 +21,21 @@ use dotenv::dotenv;
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
 
 pub struct Database {
-    pub ctx: SessionContext, // Updated type
+    pub ctx: SessionContext,
     project_configs: ProjectConfigs,
 }
 
 impl Database {
     pub async fn new() -> Result<Self> {
         dotenv().ok();
-        let ctx = SessionContext::new(); // Updated initialization
+        let ctx = SessionContext::new();
         Ok(Self {
             ctx,
             project_configs: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
-    pub fn get_session_context(&self) -> SessionContext { // Updated return type
+    pub fn get_session_context(&self) -> SessionContext {
         self.ctx.clone()
     }
 
@@ -276,7 +275,7 @@ impl Database {
 
     pub async fn insert_record(&self, query: &str) -> Result<String> {
         let dialect = GenericDialect {};
-        let ast = Parser::parse_sql(&dialect, query)
+        let ast = sqlparser::parser::Parser::parse_sql(&dialect, query)
             .map_err(|e| anyhow::anyhow!("SQL parse error: {:?}", e))?;
 
         match &ast[0] {
