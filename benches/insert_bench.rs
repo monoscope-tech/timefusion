@@ -1,12 +1,31 @@
 // benches/insert_bench.rs
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use criterion::async_executor::TokioExecutor;
+use criterion::async_executor::AsyncExecutor;
 use timefusion::database::Database;
 use timefusion::persistent_queue::IngestRecord;
 use uuid::Uuid;
 use chrono::Utc;
 use std::sync::Arc;
+
+/// A custom Tokio executor implementing Criterion's AsyncExecutor trait.
+struct TokioExecutor {
+    runtime: tokio::runtime::Runtime,
+}
+
+impl TokioExecutor {
+    fn new() -> Self {
+        // Create a multi-threaded runtime.
+        let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        Self { runtime }
+    }
+}
+
+impl<F: std::future::Future> AsyncExecutor<F> for TokioExecutor {
+    fn block_on(&self, future: F) -> F::Output {
+        self.runtime.block_on(future)
+    }
+}
 
 /// Generates a vector of dummy IngestRecord values.
 fn generate_records(count: usize) -> Vec<IngestRecord> {
@@ -65,7 +84,9 @@ async fn setup_database() -> Arc<Database> {
 
 /// Benchmark insertion performance for varying record counts.
 fn benchmark_insertion(c: &mut Criterion) {
-    // Use futures::executor::block_on to run async setup.
+    // Create our custom Tokio executor.
+    let executor = TokioExecutor::new();
+    // Setup database using our executor.
     let db = futures::executor::block_on(setup_database());
 
     // Define record counts.
@@ -78,9 +99,9 @@ fn benchmark_insertion(c: &mut Criterion) {
         let records = generate_records(size);
         let bench_name = format!("Insertion of {} records", size);
         c.bench_function(&bench_name, move |b| {
-            b.to_async(TokioExecutor).iter(|| async {
+            b.to_async(&executor).iter(|| async {
+                // TODO For production,batch inserts or use transactions.
                 for record in &records {
-                    // TODO: For production, consider batching or using transactions.
                     let _ = db.write(record).await;
                 }
             });
