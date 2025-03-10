@@ -244,7 +244,7 @@ impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
                 })?;
             vec![Response::Query(qr)]
         };
-        // Do not manually send ReadyForQuery here; the PGWire framework handles it.
+        // Let PGWire automatically send ReadyForQuery.
         Ok(responses)
     }
 }
@@ -322,7 +322,7 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         let resp = encode_dataframe(df, &portal.result_column_format)
             .await
             .map_err(|e| PgWireError::ApiError(e.into()))?;
-        // Do not manually send ReadyForQuery here.
+        // Let PGWire automatically send ReadyForQuery.
         Ok(Response::Query(resp))
     }
 }
@@ -457,7 +457,14 @@ impl pgwire::api::auth::StartupHandler for DfSessionService {
                             error!("Failed to send AuthenticationOk: {:?}", e);
                             PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                         })?;
-                    // ReadyForQuery is already sent by the framework after startup.
+                    client.send(PgWireBackendMessage::ReadyForQuery(
+                        ReadyForQuery::new(TransactionStatus::Idle)
+                    ))
+                    .await
+                        .map_err(|e| {
+                            error!("Failed to send ReadyForQuery: {:?}", e);
+                            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
+                        })?;
                     debug!("Startup completed successfully for user '{}'", user);
                     return Ok(());
                 } else {
@@ -474,6 +481,14 @@ impl pgwire::api::auth::StartupHandler for DfSessionService {
                             .await
                             .map_err(|e| {
                                 error!("Failed to send AuthenticationOk: {:?}", e);
+                                PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
+                            })?;
+                        client.send(PgWireBackendMessage::ReadyForQuery(
+                            ReadyForQuery::new(TransactionStatus::Idle)
+                        ))
+                        .await
+                            .map_err(|e| {
+                                error!("Failed to send ReadyForQuery: {:?}", e);
                                 PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
                             })?;
                         debug!("Startup completed successfully with fallback for user '{}'", user);
