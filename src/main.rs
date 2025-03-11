@@ -219,12 +219,18 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    let bucket = match env::var("S3_BUCKET_NAME") {
-        Ok(b) => b,
-        Err(e) => {
-            error!("S3_BUCKET_NAME not set: {:?}", e);
-            return Err(anyhow::anyhow!("S3_BUCKET_NAME environment variable not set"));
-        }
+    // Determine storage provider: either "s3" (default) or "ovh"
+    let storage_provider = env::var("STORAGE_PROVIDER").unwrap_or_else(|_| "s3".to_string());
+    let s3_uri = if storage_provider.to_lowercase() == "ovh" {
+        let bucket = env::var("OVH_BUCKET_NAME")
+            .expect("OVH_BUCKET_NAME environment variable not set");
+        let endpoint = env::var("OVH_ENDPOINT")
+            .expect("OVH_ENDPOINT environment variable not set");
+        format!("s3://{}/delta_table?endpoint={}", bucket, endpoint)
+    } else {
+        let bucket = env::var("S3_BUCKET_NAME")
+            .expect("S3_BUCKET_NAME environment variable not set");
+        format!("s3://{}/delta_table", bucket)
     };
     let http_port = env::var("PORT").unwrap_or_else(|_| {
         info!("PORT not set, defaulting to 80");
@@ -234,8 +240,7 @@ async fn main() -> anyhow::Result<()> {
         info!("PGWIRE_PORT not set, defaulting to 5432");
         "5432".to_string()
     });
-    let s3_uri = format!("s3://{}/delta_table", bucket);
-    info!("S3 URI configured: {}", s3_uri);
+    info!("Storage URI configured: {}", s3_uri);
 
     deltalake::aws::register_handlers(None);
     info!("AWS S3 handlers registered");
@@ -274,8 +279,7 @@ async fn main() -> anyhow::Result<()> {
         },
         Err(e) => {
             error!("Failed to initialize PersistentQueue: {:?}", e);
-            return return Err(e.into());
-            (e);
+            return Err(e.into());
         }
     };
     let status_store = Arc::new(IngestStatusStore::new());
@@ -470,3 +474,4 @@ async fn process_record(
         }).await;
     }
 }
+    

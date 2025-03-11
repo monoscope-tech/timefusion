@@ -1,4 +1,4 @@
-// src/pgwire_integration.rs
+// pgwire_integration.rs
 
 use async_trait::async_trait;
 use pgwire::api::copy::NoopCopyHandler;
@@ -585,7 +585,7 @@ where
     Ok(())
 }
 
-/// handle_ssl_request inspects the connection for an SSLRequest and responds with 'N'.
+/// handle_ssl_request inspects the connection for an SSLRequest and responds with 'N'
 async fn handle_ssl_request(mut socket: TcpStream) -> std::io::Result<TcpStream> {
     let mut buf = [0u8; 8];
     let n = socket.peek(&mut buf).await?;
