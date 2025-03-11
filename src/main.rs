@@ -73,13 +73,20 @@ async fn dashboard(
     let db_status = match db.query("SELECT 1 AS test").await { Ok(_) => "success", Err(_) => "error" };
     let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
 
+    // For filtering, we now use "table_name" as the primary key.
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
 
+    // Update the query to return the new columns
     let records_query = if let (Some(start), Some(end)) = (start, end) {
-        format!("SELECT project_id, id, timestamp, duration_ns FROM table_events WHERE timestamp >= '{}' AND timestamp <= '{}' ORDER BY timestamp DESC LIMIT 10", start.to_rfc3339(), end.to_rfc3339())
+        format!(
+            "SELECT table_name, project_id, id, version, event_type, timestamp, duration_ns \
+             FROM table_events WHERE timestamp >= '{}' AND timestamp <= '{}' ORDER BY timestamp DESC LIMIT 10",
+            start.to_rfc3339(),
+            end.to_rfc3339()
+        )
     } else {
-        "SELECT project_id, id, timestamp, duration_ns FROM table_events ORDER BY timestamp DESC LIMIT 10".to_string()
+        "SELECT table_name, project_id, id, version, event_type, timestamp, duration_ns FROM table_events ORDER BY timestamp DESC LIMIT 10".to_string()
     };
 
     let avg_latency = match db.query("SELECT AVG(duration_ns) AS avg_latency FROM table_events WHERE duration_ns IS NOT NULL").await {
@@ -161,9 +168,14 @@ async fn export_records(
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
 
     let records_query = if let (Some(start), Some(end)) = (start, end) {
-        format!("SELECT project_id, id, timestamp, duration_ns FROM table_events WHERE timestamp >= '{}' AND timestamp <= '{}'", start.to_rfc3339(), end.to_rfc3339())
+        format!(
+            "SELECT table_name, project_id, id, version, event_type, timestamp, duration_ns \
+             FROM table_events WHERE timestamp >= '{}' AND timestamp <= '{}'",
+            start.to_rfc3339(),
+            end.to_rfc3339()
+        )
     } else {
-        "SELECT project_id, id, timestamp, duration_ns FROM table_events".to_string()
+        "SELECT table_name, project_id, id, version, event_type, timestamp, duration_ns FROM table_events".to_string()
     };
 
     let records = match db.query(&records_query).await {
@@ -171,12 +183,15 @@ async fn export_records(
         Err(_) => vec![]
     };
 
-    let mut csv = String::from("Project ID,Record ID,Timestamp,Latency (ms)\n");
+    let mut csv = String::from("Table Name,Project ID,Record ID,Version,Event Type,Timestamp,Latency (ms)\n");
     for record in records {
         csv.push_str(&format!(
-            "{},{},{},{}\n",
+            "{},{},{},{},{},{},{}\n",
+            record["table_name"].as_str().unwrap_or("N/A"),
             record["project_id"].as_str().unwrap_or("N/A"),
             record["id"].as_str().unwrap_or("N/A"),
+            record["version"].as_str().unwrap_or("N/A"),
+            record["event_type"].as_str().unwrap_or("N/A"),
             record["timestamp"].as_str().unwrap_or("N/A"),
             (record["duration_ns"].as_i64().unwrap_or(0) as f64 / 1_000_000.0)
         ));
@@ -235,11 +250,12 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    if let Err(e) = db.add_project("events", &s3_uri).await {
-        error!("Failed to add project 'events': {:?}", e);
+    // In this updated version, we use table_name as key.
+    if let Err(e) = db.add_project("events_table", &s3_uri).await {
+        error!("Failed to add table 'events_table': {:?}", e);
         return Err(e);
     }
-    match db.create_events_table("events", &s3_uri).await {
+    match db.create_events_table("events_table", &s3_uri).await {
         Ok(_) => info!("Events table created successfully"),
         Err(e) => {
             if e.to_string().contains("already exists") {
@@ -258,7 +274,8 @@ async fn main() -> anyhow::Result<()> {
         },
         Err(e) => {
             error!("Failed to initialize PersistentQueue: {:?}", e);
-            return Err(e);
+            return return Err(e.into());
+            (e);
         }
     };
     let status_store = Arc::new(IngestStatusStore::new());

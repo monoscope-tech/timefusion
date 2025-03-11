@@ -1,7 +1,7 @@
 // tests/insert_tests.rs
 
 use timefusion::database::Database;
-use persistent_queue::IngestRecord;
+use timefusion::persistent_queue::IngestRecord;
 use uuid::Uuid;
 use chrono::Utc;
 use std::sync::Arc;
@@ -76,7 +76,6 @@ fn test_edge_case_insertion_empty_optional_fields() {
     rt.block_on(async {
         let db = Arc::new(Database::new().await.expect("Failed to initialize database"));
         let mut record = generate_record();
-        // Ensure optional fields are None.
         record.parent_span_id = None;
         record.trace_state = None;
         record.end_time = None;
@@ -96,7 +95,7 @@ fn test_duplicate_insertion() {
         let record = generate_record();
         db.write(&record).await.expect("First insertion failed");
         let second_result = db.write(&record).await;
-        // Adjust this behavior as needed: here we expect duplicates to be rejected.
+        // Depending on your design, duplicates might be rejected.
         assert!(second_result.is_err(), "Duplicate insertion did not error as expected");
     });
 }

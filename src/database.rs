@@ -1,3 +1,5 @@
+// database.rs
+
 use datafusion::prelude::*;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -10,18 +12,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use crate::utils::prepare_sql;
 use anyhow::Result;
-use sqlparser::parser::Parser;
 use sqlparser::dialect::GenericDialect;
 use sqlparser::ast::{Statement, Expr, Value as SqlValue, SetExpr};
-use crate::persistent_queue::IngestRecord;
 use chrono::DateTime;
 use crate::metrics::COMPACTION_COUNTER;
 use dotenv::dotenv;
+use std::sync::Arc as StdArc;
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
 
 pub struct Database {
     pub ctx: SessionContext,
+    // Keyed by table_name now.
     project_configs: ProjectConfigs,
 }
 
@@ -39,7 +41,8 @@ impl Database {
         self.ctx.clone()
     }
 
-    pub async fn add_project(&self, project_id: &str, connection_string: &str) -> Result<()> {
+    /// Add a table (project) by its table_name.
+    pub async fn add_project(&self, table_name: &str, connection_string: &str) -> Result<()> {
         let table = match DeltaTableBuilder::from_uri(connection_string).load().await {
             Ok(table) => table,
             Err(e) => {
@@ -56,23 +59,28 @@ impl Database {
         self.project_configs.write()
             .map_err(|e| anyhow::anyhow!("Failed to acquire write lock: {:?}", e))?
             .insert(
-                project_id.to_string(),
+                table_name.to_string(),
                 (connection_string.to_string(), Arc::new(RwLock::new(table))),
             );
         Ok(())
     }
 
+    /// Updated schema including new columns.
     fn event_schema() -> Schema {
         Schema::new(vec![
+            Field::new("table_name", DataType::Utf8, false),
             Field::new("project_id", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), false),
+            Field::new("version", DataType::Int64, false),
+            Field::new("event_type", DataType::Utf8, false),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), false),
+            // ... remaining fields as before:
             Field::new("trace_id", DataType::Utf8, false),
             Field::new("span_id", DataType::Utf8, false),
             Field::new("parent_span_id", DataType::Utf8, true),
             Field::new("trace_state", DataType::Utf8, true),
-            Field::new("start_time", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), false),
-            Field::new("end_time", DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), true),
+            Field::new("start_time", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), false),
+            Field::new("end_time", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), true),
             Field::new("duration_ns", DataType::Int64, false),
             Field::new("span_name", DataType::Utf8, false),
             Field::new("span_kind", DataType::Utf8, true),
@@ -95,8 +103,8 @@ impl Database {
             Field::new("response_body", DataType::Utf8, false),
             Field::new("endpoint_hash", DataType::Utf8, false),
             Field::new("shape_hash", DataType::Utf8, false),
-            Field::new("format_hashes", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
-            Field::new("field_hashes", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
+            Field::new("format_hashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
+            Field::new("field_hashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
             Field::new("sdk_type", DataType::Utf8, false),
             Field::new("service_version", DataType::Utf8, true),
             Field::new("attributes", DataType::Utf8, false),
@@ -105,7 +113,7 @@ impl Database {
             Field::new("resource", DataType::Utf8, false),
             Field::new("instrumentation_scope", DataType::Utf8, false),
             Field::new("errors", DataType::Utf8, false),
-            Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), false),
+            Field::new("tags", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
             Field::new("event_date", DataType::Utf8, true),
         ])
     }
@@ -128,7 +136,7 @@ impl Database {
         }).collect()
     }
 
-    pub async fn create_events_table(&self, project_id: &str, table_uri: &str) -> Result<()> {
+    pub async fn create_events_table(&self, table_name: &str, table_uri: &str) -> Result<()> {
         let _schema = Self::event_schema();
         let table = match DeltaTableBuilder::from_uri(table_uri).load().await {
             Ok(table) => table,
@@ -156,13 +164,13 @@ impl Database {
             ).map_err(|e| anyhow::anyhow!("Failed to create provider: {:?}", e))?
         };
 
-        let table_name = "table_events".to_string();
-        self.ctx.register_table(&table_name, Arc::new(provider))
+        // Register the table under the name "table_events"
+        self.ctx.register_table("table_events", Arc::new(provider))
             .map_err(|e| anyhow::anyhow!("Failed to register table: {:?}", e))?;
 
         self.project_configs.write()
             .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?
-            .insert(project_id.to_string(), (table_uri.to_string(), table_ref));
+            .insert(table_name.to_string(), (table_uri.to_string(), table_ref));
 
         Ok(())
     }
@@ -176,10 +184,11 @@ impl Database {
         Ok(df)
     }
 
-    pub async fn write(&self, record: &IngestRecord) -> Result<()> {
+    pub async fn write(&self, record: &crate::persistent_queue::IngestRecord) -> Result<()> {
+        // Lookup using table_name as the key.
         let (conn_str, _table_ref) = {
             let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
-            configs.get(&record.project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
+            configs.get(&record.table_name).ok_or_else(|| anyhow::anyhow!("Table not found"))?.clone()
         };
 
         let ts = DateTime::parse_from_rfc3339(&record.timestamp)
@@ -220,23 +229,26 @@ impl Database {
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
+                Arc::new(StringArray::from(vec![record.table_name.clone()])),
                 Arc::new(StringArray::from(vec![record.project_id.clone()])),
                 Arc::new(StringArray::from(vec![record.id.clone()])),
-                Arc::new(build_timestamp_array(vec![ts_micro], Some(Arc::from("UTC")))),
+                Arc::new(Int64Array::from(vec![record.version])),
+                Arc::new(StringArray::from(vec![record.event_type.clone()])),
+                Arc::new(build_timestamp_array(vec![ts_micro], Some(StdArc::from("UTC")))),
                 Arc::new(StringArray::from(vec![record.trace_id.clone()])),
                 Arc::new(StringArray::from(vec![record.span_id.clone()])),
-                Arc::new(StringArray::from_iter(vec![record.parent_span_id.as_ref()])),
-                Arc::new(StringArray::from_iter(vec![record.trace_state.as_ref()])),
-                Arc::new(build_timestamp_array(vec![start_ts_micro], Some(Arc::from("UTC")))),
-                Arc::new(build_timestamp_array(vec![end_ts_micro.unwrap_or(0)], Some(Arc::from("UTC")))),
+                Arc::new(StringArray::from(vec![record.parent_span_id.as_deref()])),
+                Arc::new(StringArray::from(vec![record.trace_state.as_deref()])),
+                Arc::new(build_timestamp_array(vec![start_ts_micro], Some(StdArc::from("UTC")))),
+                Arc::new(build_timestamp_array(vec![end_ts_micro.unwrap_or(0)], Some(StdArc::from("UTC")))),
                 Arc::new(Int64Array::from(vec![record.duration_ns])),
                 Arc::new(StringArray::from(vec![record.span_name.clone()])),
-                Arc::new(StringArray::from_iter(vec![Some(&record.span_kind)])),
+                Arc::new(StringArray::from(vec![record.span_kind.clone()])),
                 Arc::new(StringArray::from(vec![record.span_type.clone()])),
-                Arc::new(StringArray::from_iter(vec![record.status.as_ref()])),
+                Arc::new(StringArray::from(vec![record.status.as_deref()])),
                 Arc::new(Int32Array::from(vec![record.status_code])),
                 Arc::new(StringArray::from(vec![record.status_message.clone()])),
-                Arc::new(StringArray::from_iter(vec![record.severity_text.as_ref()])),
+                Arc::new(StringArray::from(vec![record.severity_text.as_deref()])),
                 Arc::new(Int32Array::from(vec![record.severity_number])),
                 Arc::new(StringArray::from(vec![record.host.clone()])),
                 Arc::new(StringArray::from(vec![record.url_path.clone()])),
@@ -254,7 +266,7 @@ impl Database {
                 Arc::new(format_hashes),
                 Arc::new(field_hashes),
                 Arc::new(StringArray::from(vec![record.sdk_type.clone()])),
-                Arc::new(StringArray::from_iter(vec![record.service_version.as_ref()])),
+                Arc::new(StringArray::from(vec![record.service_version.as_deref()])),
                 Arc::new(StringArray::from(vec![record.attributes.clone().unwrap_or_else(|| "{}".to_string())])),
                 Arc::new(StringArray::from(vec![record.events.clone().unwrap_or_else(|| "{}".to_string())])),
                 Arc::new(StringArray::from(vec![record.links.clone().unwrap_or_else(|| "{}".to_string())])),
@@ -301,14 +313,20 @@ impl Database {
                         }
                     }
 
+                    // Use the new fields from the updated schema
+                    let table_name = insert_values.get("table_name")
+                        .ok_or_else(|| anyhow::anyhow!("Missing table_name"))?;
                     let project_id = insert_values.get("project_id")
                         .ok_or_else(|| anyhow::anyhow!("Missing project_id"))?;
                     let timestamp = insert_values.get("timestamp")
                         .ok_or_else(|| anyhow::anyhow!("Missing timestamp"))?;
 
-                    let record = IngestRecord {
+                    let record = crate::persistent_queue::IngestRecord {
+                        table_name: table_name.clone(),
                         project_id: project_id.clone(),
                         id: insert_values.get("id").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        version: insert_values.get("version").and_then(|s| s.parse().ok()).unwrap_or(1),
+                        event_type: insert_values.get("event_type").cloned().unwrap_or_default(),
                         timestamp: timestamp.clone(),
                         trace_id: insert_values.get("trace_id").cloned().unwrap_or_default(),
                         span_id: insert_values.get("span_id").cloned().unwrap_or_default(),
@@ -352,7 +370,7 @@ impl Database {
                     };
 
                     self.write(&record).await?;
-                    self.refresh_table(&project_id).await?;
+                    self.refresh_table(&table_name).await?;
                     Ok("INSERT 1".to_string())
                 } else {
                     Err(anyhow::anyhow!("Unsupported INSERT source"))
@@ -362,10 +380,10 @@ impl Database {
         }
     }
 
-    pub async fn refresh_table(&self, project_id: &str) -> Result<()> {
+    pub async fn refresh_table(&self, table_name: &str) -> Result<()> {
         let (conn_str, table_ref) = {
             let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
-            configs.get(project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
+            configs.get(table_name).ok_or_else(|| anyhow::anyhow!("Table not found"))?.clone()
         };
 
         let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
@@ -396,10 +414,10 @@ impl Database {
         Ok("DELETE successful (simulated)".to_string())
     }
 
-    pub async fn compact_project(&self, project_id: &str) -> Result<()> {
+    pub async fn compact_project(&self, table_name: &str) -> Result<()> {
         let (conn_str, table_ref) = {
             let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
-            configs.get(project_id).ok_or_else(|| anyhow::anyhow!("Project not found"))?.clone()
+            configs.get(table_name).ok_or_else(|| anyhow::anyhow!("Table not found"))?.clone()
         };
 
         let (table, _metrics) = DeltaOps::try_from_uri(&conn_str)
@@ -411,31 +429,32 @@ impl Database {
 
         *table_ref.write().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = table;
         COMPACTION_COUNTER.inc();
-        tracing::info!("Compaction for project '{}' completed.", project_id);
+        tracing::info!("Compaction for table '{}' completed.", table_name);
         Ok(())
     }
 
     pub async fn compact_all_projects(&self) -> Result<()> {
-        let project_ids: Vec<String> = {
+        let table_names: Vec<String> = {
             let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             configs.keys().cloned().collect()
         };
-        for project_id in project_ids {
-            if let Err(e) = self.compact_project(&project_id).await {
-                tracing::error!("Error compacting project {}: {:?}", project_id, e);
+        for table_name in table_names {
+            if let Err(e) = self.compact_project(&table_name).await {
+                tracing::error!("Error compacting table {}: {:?}", table_name, e);
             }
         }
         Ok(())
     }
 
-    pub fn has_project(&self, project_id: &str) -> bool {
+    pub fn has_table(&self, table_name: &str) -> bool {
         self.project_configs.read()
-            .map(|configs| configs.contains_key(project_id))
+            .map(|configs| configs.contains_key(table_name))
             .unwrap_or(false)
     }
 }
 
-fn build_timestamp_array(values: Vec<i64>, tz: Option<Arc<str>>) -> TimestampMicrosecondArray {
+/// Helper function to build a timestamp array.
+fn build_timestamp_array(values: Vec<i64>, tz: Option<StdArc<str>>) -> TimestampMicrosecondArray {
     use datafusion::arrow::array::ArrayData;
     use datafusion::arrow::buffer::Buffer;
     let data_type = DataType::Timestamp(TimeUnit::Microsecond, tz);

@@ -1,9 +1,10 @@
 -- tests/logic.test
+
 statement ok
 SELECT 1 AS number;
 
 statement ok
--- Edge case: query returns an empty result set.
+-- Edge case: query returns an empty result.
 SELECT * FROM table_events WHERE 1 = 0;
 
 statement error

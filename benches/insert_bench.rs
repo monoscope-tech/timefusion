@@ -8,22 +8,20 @@ use uuid::Uuid;
 use chrono::Utc;
 use std::sync::Arc;
 
-/// A custom Tokio executor implementing Criterion's AsyncExecutor trait.
-struct TokioExecutor {
-    runtime: tokio::runtime::Runtime,
-}
+/// A custom Tokio executor that implements Criterion's AsyncExecutor trait.
+#[derive(Clone)]
+struct TokioExecutor(Arc<tokio::runtime::Runtime>);
 
 impl TokioExecutor {
     fn new() -> Self {
-        // Create a multi-threaded runtime.
         let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        Self { runtime }
+        TokioExecutor(Arc::new(runtime))
     }
 }
 
-impl<F: std::future::Future> AsyncExecutor<F> for TokioExecutor {
-    fn block_on(&self, future: F) -> F::Output {
-        self.runtime.block_on(future)
+impl AsyncExecutor for TokioExecutor {
+    fn block_on<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        self.0.block_on(future)
     }
 }
 
@@ -86,7 +84,7 @@ async fn setup_database() -> Arc<Database> {
 fn benchmark_insertion(c: &mut Criterion) {
     // Create our custom Tokio executor.
     let executor = TokioExecutor::new();
-    // Setup database using our executor.
+    // Initialize the database.
     let db = futures::executor::block_on(setup_database());
 
     // Define record counts.
@@ -95,14 +93,17 @@ fn benchmark_insertion(c: &mut Criterion) {
     ];
 
     for &size in &sizes {
-        // Generate records outside of the timing loop.
+        // Generate records once per benchmark.
         let records = generate_records(size);
         let bench_name = format!("Insertion of {} records", size);
+        // Move the records into the closure.
         c.bench_function(&bench_name, move |b| {
-            b.to_async(&executor).iter(|| async {
-                // TODO For production,batch inserts or use transactions.
+            // Clone executor and db inside the closure so each iteration gets its own copy.
+            let exec = executor.clone();
+            let db_clone = db.clone();
+            b.to_async(exec).iter(|| async {
                 for record in &records {
-                    let _ = db.write(record).await;
+                    let _ = db_clone.write(record).await;
                 }
             });
         });

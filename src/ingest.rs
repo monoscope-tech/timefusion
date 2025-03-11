@@ -1,4 +1,5 @@
-// src/ingest.rs
+// ingest.rs
+
 use actix_web::{get, post, web, HttpResponse, Responder};
 use chrono::DateTime;
 use serde::Deserialize;
@@ -37,8 +38,16 @@ impl IngestStatusStore {
 
 #[derive(Deserialize)]
 pub struct IngestData {
+    // Renamed field from project_id to table_name for the destination table.
+    pub table_name: String,
+    // New foreign key project_id field.
     pub project_id: String,
+    // Optional id – if not provided, will be auto-generated.
     pub id: Option<String>,
+    // New version field; default to 1 if not provided.
+    pub version: Option<i64>,
+    // New field to differentiate event types.
+    pub event_type: String,
     pub timestamp: String,
     pub trace_id: String,
     pub span_id: String,
@@ -88,9 +97,10 @@ pub async fn ingest(
     queue: web::Data<Arc<PersistentQueue>>,
     status_store: web::Data<Arc<IngestStatusStore>>,
 ) -> impl Responder {
-    if !db.has_project(&data.project_id) {
-        error!("Invalid project_id: {}", data.project_id);
-        return HttpResponse::BadRequest().body("Invalid project_id");
+    // Check if the table exists.
+    if !db.has_table(&data.table_name) {
+        error!("Invalid table_name: {}", data.table_name);
+        return HttpResponse::BadRequest().body("Invalid table_name");
     }
     if DateTime::parse_from_rfc3339(&data.timestamp).is_err() {
         error!("Invalid timestamp: {}", data.timestamp);
@@ -107,8 +117,11 @@ pub async fn ingest(
         }
     }
     let record = IngestRecord {
+        table_name: data.table_name.clone(),
         project_id: data.project_id.clone(),
         id: data.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        version: data.version.unwrap_or(1),
+        event_type: data.event_type.clone(),
         timestamp: data.timestamp.clone(),
         trace_id: data.trace_id.clone(),
         span_id: data.span_id.clone(),
@@ -172,8 +185,8 @@ pub async fn ingest_batch(
 ) -> impl Responder {
     let mut results = Vec::new();
     for (idx, rec) in data.iter().enumerate() {
-        if !db.has_project(&rec.project_id) {
-            results.push(json!({"index": idx, "error": "Invalid project_id"}));
+        if !db.has_table(&rec.table_name) {
+            results.push(json!({"index": idx, "error": "Invalid table_name"}));
             continue;
         }
         if DateTime::parse_from_rfc3339(&rec.timestamp).is_err() {
@@ -191,8 +204,11 @@ pub async fn ingest_batch(
             }
         }
         let record = IngestRecord {
+            table_name: rec.table_name.clone(),
             project_id: rec.project_id.clone(),
             id: rec.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            version: rec.version.unwrap_or(1),
+            event_type: rec.event_type.clone(),
             timestamp: rec.timestamp.clone(),
             trace_id: rec.trace_id.clone(),
             span_id: rec.span_id.clone(),
@@ -287,12 +303,12 @@ pub async fn get_all_data(
     db: web::Data<Arc<Database>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
-    if let Some(project_id) = query.get("project_id") {
-        if !db.has_project(project_id) {
-            error!("Invalid project_id: {}", project_id);
-            return HttpResponse::BadRequest().body("Invalid project_id");
+    if let Some(table_name) = query.get("table_name") {
+        if !db.has_table(table_name) {
+            error!("Invalid table_name: {}", table_name);
+            return HttpResponse::BadRequest().body("Invalid table_name");
         }
-        let mut sql = format!("SELECT * FROM table_events WHERE project_id = '{}'", project_id);
+        let mut sql = format!("SELECT * FROM table_events WHERE table_name = '{}'", table_name);
         if let Some(limit_str) = query.get("limit") {
             if let Ok(limit) = limit_str.parse::<u32>() {
                 sql.push_str(&format!(" LIMIT {}", limit));
@@ -327,8 +343,8 @@ pub async fn get_all_data(
             }
         }
     } else {
-        error!("Missing project_id parameter");
-        HttpResponse::BadRequest().body("Missing project_id parameter")
+        error!("Missing table_name parameter");
+        HttpResponse::BadRequest().body("Missing table_name parameter")
     }
 }
 
@@ -339,14 +355,14 @@ pub async fn get_data_by_id(
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let record_id = path.into_inner();
-    if let Some(project_id) = query.get("project_id") {
-        if !db.has_project(project_id) {
-            error!("Invalid project_id: {}", project_id);
-            return HttpResponse::BadRequest().body("Invalid project_id");
+    if let Some(table_name) = query.get("table_name") {
+        if !db.has_table(table_name) {
+            error!("Invalid table_name: {}", table_name);
+            return HttpResponse::BadRequest().body("Invalid table_name");
         }
         let sql = format!(
-            "SELECT * FROM table_events WHERE project_id = '{}' AND id = '{}'",
-            project_id, record_id
+            "SELECT * FROM table_events WHERE table_name = '{}' AND id = '{}'",
+            table_name, record_id
         );
         info!("Executing query: {}", sql);
         match db.query(&sql).await {
@@ -372,7 +388,7 @@ pub async fn get_data_by_id(
             }
         }
     } else {
-        error!("Missing project_id parameter");
-        HttpResponse::BadRequest().body("Missing project_id parameter")
+        error!("Missing table_name parameter");
+        HttpResponse::BadRequest().body("Missing table_name parameter")
     }
 }

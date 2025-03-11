@@ -1,12 +1,16 @@
-// src/persistent_queue.rs
-use sled;
-use serde::{Serialize, Deserialize};
-use anyhow::Result;
+// persistent_queue.rs
 
-#[derive(Clone, Serialize, Deserialize)]
+use serde::{Serialize, Deserialize};
+use sled::{Db, IVec};
+use std::path::Path;
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct IngestRecord {
+    pub table_name: String,
     pub project_id: String,
     pub id: String,
+    pub version: i64,
+    pub event_type: String,
     pub timestamp: String,
     pub trace_id: String,
     pub span_id: String,
@@ -50,38 +54,40 @@ pub struct IngestRecord {
 }
 
 pub struct PersistentQueue {
-    db: sled::Db,
+    db: Db,
 }
 
 impl PersistentQueue {
-    pub fn new(path: &str) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, sled::Error> {
         let db = sled::open(path)?;
         Ok(Self { db })
     }
 
-    pub async fn enqueue(&self, record: &IngestRecord) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string();
-        let serialized = bincode::serialize(record)?;
-        self.db.insert(id.as_bytes(), serialized)?;
-        Ok(id)
+    /// Enqueue an ingest record. Here we use the record's id as the key.
+    pub async fn enqueue(&self, record: &IngestRecord) -> Result<String, sled::Error> {
+        let key = record.id.clone();
+        let value = serde_json::to_vec(record).unwrap();
+        self.db.insert(key.as_bytes(), value)?;
+        Ok(key)
     }
 
-    pub async fn dequeue_all(&self) -> Result<Vec<(sled::IVec, IngestRecord)>> {
+    /// Dequeue all records.
+    pub async fn dequeue_all(&self) -> Result<Vec<(IVec, IngestRecord)>, sled::Error> {
         let mut records = Vec::new();
-        for item in self.db.iter() {
-            let (key, value) = item?;
-            let record: IngestRecord = bincode::deserialize(&value)?;
+        for result in self.db.iter() {
+            let (key, value) = result?;
+            let record: IngestRecord = serde_json::from_slice(&value).unwrap();
             records.push((key, record));
         }
         Ok(records)
     }
 
-    pub fn remove_sync(&self, key: sled::IVec) -> Result<()> {
+    pub fn remove_sync(&self, key: IVec) -> Result<(), sled::Error> {
         self.db.remove(key)?;
         Ok(())
     }
 
-    pub async fn len(&self) -> Result<usize> {
+    pub async fn len(&self) -> Result<usize, sled::Error> {
         Ok(self.db.len())
     }
 }
