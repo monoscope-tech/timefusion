@@ -1,56 +1,56 @@
-// persistent_queue.rs
-
 use serde::{Serialize, Deserialize};
 use sled::{Db, IVec};
 use std::path::Path;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IngestRecord {
-    pub table_name: String,
-    pub project_id: String,
+    pub projectId: String,
     pub id: String,
-    pub version: i64,
-    pub event_type: String,
     pub timestamp: String,
-    pub trace_id: String,
-    pub span_id: String,
-    pub parent_span_id: Option<String>,
-    pub trace_state: Option<String>,
-    pub start_time: String,
-    pub end_time: Option<String>,
-    pub duration_ns: i64,
-    pub span_name: String,
-    pub span_kind: String,
-    pub span_type: String,
+    pub traceId: String,
+    pub spanId: String,
+    pub eventType: String,
     pub status: Option<String>,
-    pub status_code: i32,
-    pub status_message: String,
-    pub severity_text: Option<String>,
-    pub severity_number: i32,
-    pub host: String,
-    pub url_path: String,
-    pub raw_url: String,
-    pub method: String,
-    pub referer: String,
-    pub path_params: Option<String>,
-    pub query_params: Option<String>,
-    pub request_headers: Option<String>,
-    pub response_headers: Option<String>,
-    pub request_body: Option<String>,
-    pub response_body: Option<String>,
-    pub endpoint_hash: String,
-    pub shape_hash: String,
-    pub format_hashes: Vec<String>,
-    pub field_hashes: Vec<String>,
-    pub sdk_type: String,
-    pub service_version: Option<String>,
+    pub endTime: Option<String>,
+    pub durationNs: i64,
+    pub spanName: String,
+    pub spanKind: Option<String>,
+    pub parentSpanId: Option<String>,
+    pub traceState: Option<String>,
+    pub hasError: bool,
+    pub severityText: Option<String>,
+    pub severityNumber: i32,
+    pub body: Option<String>,
+    pub httpMethod: Option<String>,
+    pub httpUrl: Option<String>,
+    pub httpRoute: Option<String>,
+    pub httpHost: Option<String>,
+    pub httpStatusCode: Option<i32>,
+    pub pathParams: Option<String>,
+    pub queryParams: Option<String>,
+    pub requestBody: Option<String>,
+    pub responseBody: Option<String>,
+    pub sdkType: String,
+    pub serviceVersion: Option<String>,
+    pub errors: Option<String>,
+    pub tags: Vec<String>,
+    pub parentId: Option<String>,
+    pub dbSystem: Option<String>,
+    pub dbName: Option<String>,
+    pub dbStatement: Option<String>,
+    pub dbOperation: Option<String>,
+    pub rpcSystem: Option<String>,
+    pub rpcService: Option<String>,
+    pub rpcMethod: Option<String>,
+    pub endpointHash: String,
+    pub shapeHash: String,
+    pub formatHashes: Vec<String>,
+    pub fieldHashes: Vec<String>,
     pub attributes: Option<String>,
     pub events: Option<String>,
     pub links: Option<String>,
     pub resource: Option<String>,
-    pub instrumentation_scope: Option<String>,
-    pub errors: Option<String>,
-    pub tags: Vec<String>,
+    pub instrumentationScope: Option<String>,
 }
 
 pub struct PersistentQueue {
@@ -63,7 +63,7 @@ impl PersistentQueue {
         Ok(Self { db })
     }
 
-    /// Enqueue an ingest record. Here we use the record's id as the key.
+    /// Enqueue an ingest record. Uses the record's `id` as the key.
     pub async fn enqueue(&self, record: &IngestRecord) -> Result<String, sled::Error> {
         let key = record.id.clone();
         let value = serde_json::to_vec(record).unwrap();
@@ -82,11 +82,13 @@ impl PersistentQueue {
         Ok(records)
     }
 
+    /// Remove a record by key.
     pub fn remove_sync(&self, key: IVec) -> Result<(), sled::Error> {
         self.db.remove(key)?;
         Ok(())
     }
 
+    /// Returns the number of records in the queue.
     pub async fn len(&self) -> Result<usize, sled::Error> {
         Ok(self.db.len())
     }

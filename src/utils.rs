@@ -1,17 +1,14 @@
-// src/utils.rs
 use anyhow::Result;
 use datafusion::arrow::array::{Array, StringArray, TimestampMicrosecondArray};
 use chrono::{LocalResult, TimeZone, Utc};
 
+/// In our updated application the table name is fixed to "telemetry.events",
 pub fn prepare_sql(query: &str) -> Result<String> {
-    let query_lower = query.trim().to_lowercase();
-    if query_lower.starts_with("insert") || query_lower.starts_with("select") {
-        Ok(query.replace("\"table\"", "\"table_events\""))
-    } else {
-        Ok(query.to_string())
-    }
+    Ok(query.to_string())
 }
 
+/// Converts an Arrow array value to a string.
+/// For null values, returns "NULL". Timestamps are converted using RFC3339.
 pub fn value_to_string(array: &dyn Array, index: usize) -> String {
     if array.is_null(index) {
         return "NULL".to_string();

@@ -11,7 +11,7 @@ mod metrics_middleware;
 use actix_web::{web, HttpResponse, HttpServer, Responder, get, middleware::Logger, App};
 use chrono::Utc;
 use database::Database;
-use ingest::{ingest as ingest_handler, get_status, get_all_data, get_data_by_id, IngestStatusStore, record_batches_to_json_rows};
+use ingest::{ingest as ingest_handler, ingest_batch, get_status, get_all_data, get_data_by_id, IngestStatusStore, record_batches_to_json_rows};
 use pgwire_integration::{DfSessionService, run_pgwire_server, HandlerFactory};
 use persistent_queue::{PersistentQueue, IngestRecord}; 
 use serde::{Serialize, Deserialize};
@@ -64,40 +64,44 @@ async fn dashboard(
     db: web::Data<Arc<Database>>,
     queue: web::Data<Arc<PersistentQueue>>,
     app_info: web::Data<AppInfo>,
-    status_store: web::Data<Arc<IngestStatusStore>>,
+    status_store: web::Data<Arc<ingest::IngestStatusStore>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
-    let http_requests = 0.0; // Placeholder if HTTP_REQUEST_COUNTER is not used
+    let http_requests = 0.0; // Placeholder
     let queue_size = queue.get_ref().len().await.unwrap_or(0);
     let db_status = match db.query("SELECT 1 AS test").await { Ok(_) => "success", Err(_) => "error" };
     let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
 
-    // For filtering, we now use "table_name" as the primary key.
+    // Use the fixed table name "telemetry_events"
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
-
-    // Update the query to return the new columns
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
-            "SELECT table_name, project_id, id, version, event_type, timestamp, duration_ns \
-             FROM table_events WHERE timestamp >= '{}' AND timestamp <= '{}' ORDER BY timestamp DESC LIMIT 10",
+            "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs \
+             FROM telemetry_events WHERE timestamp >= '{}' AND timestamp <= '{}' ORDER BY timestamp DESC LIMIT 10",
             start.to_rfc3339(),
             end.to_rfc3339()
         )
     } else {
-        "SELECT table_name, project_id, id, version, event_type, timestamp, duration_ns FROM table_events ORDER BY timestamp DESC LIMIT 10".to_string()
+        "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events ORDER BY timestamp DESC LIMIT 10".to_string()
     };
 
-    let avg_latency = match db.query("SELECT AVG(duration_ns) AS avg_latency FROM table_events WHERE duration_ns IS NOT NULL").await {
-        Ok(df) => df.collect().await.ok().and_then(|batches| batches.get(0).map(|b| b.column(0).as_any().downcast_ref::<Float64Array>().map_or(0.0, |arr| arr.value(0) / 1_000_000.0))).unwrap_or(0.0),
+    let avg_latency = match db.query("SELECT AVG(durationNs) AS avg_latency FROM telemetry_events WHERE durationNs IS NOT NULL").await {
+        Ok(df) => df.collect().await.ok().and_then(|batches| batches.get(0)
+            .map(|b| b.column(0).as_any().downcast_ref::<Float64Array>()
+            .map_or(0.0, |arr| arr.value(0) / 1_000_000.0)))
+            .unwrap_or(0.0),
         Err(_) => 0.0
     };
 
     let latency_alert = avg_latency > 200.0;
     let queue_alert = queue_size > 50;
 
-    let recent_statuses = status_store.inner.read().unwrap().iter().take(10).map(|(id, status)| serde_json::json!({"id": id, "status": status})).collect::<Vec<_>>();
+    let recent_statuses = status_store.inner.read().unwrap().iter()
+        .take(10)
+        .map(|(id, status)| serde_json::json!({"id": id, "status": status}))
+        .collect::<Vec<_>>();
     let status_counts = recent_statuses.iter().fold(HashMap::new(), |mut acc, status| {
         *acc.entry(status["status"].as_str().unwrap_or("Unknown").to_string()).or_insert(0) += 1;
         acc
@@ -169,13 +173,13 @@ async fn export_records(
 
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
-            "SELECT table_name, project_id, id, version, event_type, timestamp, duration_ns \
-             FROM table_events WHERE timestamp >= '{}' AND timestamp <= '{}'",
+            "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs \
+             FROM telemetry_events WHERE timestamp >= '{}' AND timestamp <= '{}'",
             start.to_rfc3339(),
             end.to_rfc3339()
         )
     } else {
-        "SELECT table_name, project_id, id, version, event_type, timestamp, duration_ns FROM table_events".to_string()
+        "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events".to_string()
     };
 
     let records = match db.query(&records_query).await {
@@ -183,17 +187,17 @@ async fn export_records(
         Err(_) => vec![]
     };
 
-    let mut csv = String::from("Table Name,Project ID,Record ID,Version,Event Type,Timestamp,Latency (ms)\n");
+    let mut csv = String::from("Project ID,Record ID,Timestamp,Trace ID,Span ID,Event Type,Latency (ms)\n");
     for record in records {
         csv.push_str(&format!(
             "{},{},{},{},{},{},{}\n",
-            record["table_name"].as_str().unwrap_or("N/A"),
-            record["project_id"].as_str().unwrap_or("N/A"),
+            record["projectId"].as_str().unwrap_or("N/A"),
             record["id"].as_str().unwrap_or("N/A"),
-            record["version"].as_str().unwrap_or("N/A"),
-            record["event_type"].as_str().unwrap_or("N/A"),
             record["timestamp"].as_str().unwrap_or("N/A"),
-            (record["duration_ns"].as_i64().unwrap_or(0) as f64 / 1_000_000.0)
+            record["traceId"].as_str().unwrap_or("N/A"),
+            record["spanId"].as_str().unwrap_or("N/A"),
+            record["eventType"].as_str().unwrap_or("N/A"),
+            (record["durationNs"].as_i64().unwrap_or(0) as f64 / 1_000_000.0)
         ));
     }
 
@@ -219,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // Determine storage provider: either "s3" (default) or "ovh"
+    // S3 / OVH storage configuration remains unchanged.
     let storage_provider = env::var("STORAGE_PROVIDER").unwrap_or_else(|_| "s3".to_string());
     let s3_uri = if storage_provider.to_lowercase() == "ovh" {
         let bucket = env::var("OVH_BUCKET_NAME")
@@ -255,12 +259,12 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    // In this updated version, we use table_name as key.
-    if let Err(e) = db.add_project("events_table", &s3_uri).await {
-        error!("Failed to add table 'events_table': {:?}", e);
+    // Use the fixed table name "telemetry_events"
+    if let Err(e) = db.add_project("telemetry_events", &s3_uri).await {
+        error!("Failed to add table 'telemetry_events': {:?}", e);
         return Err(e);
     }
-    match db.create_events_table("events_table", &s3_uri).await {
+    match db.create_events_table("telemetry_events", &s3_uri).await {
         Ok(_) => info!("Events table created successfully"),
         Err(e) => {
             if e.to_string().contains("already exists") {
@@ -282,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
-    let status_store = Arc::new(IngestStatusStore::new());
+    let status_store = Arc::new(ingest::IngestStatusStore::new());
     let app_info = web::Data::new(AppInfo {
         start_time: Utc::now(),
         trends: Arc::new(TokioMutex::new(VecDeque::new())),
@@ -301,7 +305,7 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let shutdown_token = CancellationToken::new();
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
     let queue_shutdown = shutdown_token.clone();
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
@@ -377,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
             .service(dashboard)
             .service(export_records)
             .service(ingest_handler)
+            .service(ingest_batch)
             .service(get_status)
             .service(get_all_data)
             .service(get_data_by_id)
@@ -439,7 +444,7 @@ async fn main() -> anyhow::Result<()> {
 async fn process_record(
     db: &Arc<Database>,
     queue: &Arc<PersistentQueue>,
-    status_store: &IngestStatusStore,
+    status_store: &ingest::IngestStatusStore,
     key: sled::IVec,
     record: IngestRecord,
 ) {
@@ -474,4 +479,3 @@ async fn process_record(
         }).await;
     }
 }
-    
