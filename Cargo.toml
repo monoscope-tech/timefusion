@@ -49,3 +49,6 @@ datafusion-uwheel = { git = "https://github.com/uwheel/datafusion-uwheel.git" }
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
 criterion = {version = "0.5.1", features = ["async"] }
 tempfile = "3.18.0"
+aws-config = "1.6.0"
+aws-types = "1.3.6"
+url = "2.5.4"

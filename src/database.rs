@@ -23,7 +23,6 @@ pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltala
 
 pub struct Database {
     pub ctx: SessionContext,
-    // Keyed by table name.
     project_configs: ProjectConfigs,
 }
 
@@ -41,7 +40,7 @@ impl Database {
         self.ctx.clone()
     }
 
-    /// Add a table (project) using the fixed key "telemetry_events".
+    /// Add a table using the fixed key "telemetry_events"
     pub async fn add_project(&self, table_name: &str, connection_string: &str) -> Result<()> {
         let table = match DeltaTableBuilder::from_uri(connection_string).load().await {
             Ok(table) => table,
@@ -58,14 +57,11 @@ impl Database {
         };
         self.project_configs.write()
             .map_err(|e| anyhow::anyhow!("Failed to acquire write lock: {:?}", e))?
-            .insert(
-                table_name.to_string(),
-                (connection_string.to_string(), Arc::new(RwLock::new(table))),
-            );
+            .insert(table_name.to_string(), (connection_string.to_string(), Arc::new(RwLock::new(table))));
         Ok(())
     }
 
-    /// Schema matching your new DB table.
+    /// Schema matching your new DB table definition.
     fn event_schema() -> Schema {
         Schema::new(vec![
             Field::new("projectId", DataType::Utf8, false),
@@ -122,13 +118,41 @@ impl Database {
         let schema = Self::event_schema();
         schema.fields().iter().map(|f| {
             match f.data_type() {
-                DataType::Utf8 => deltalake::kernel::StructField::new(f.name().to_string(), deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String), f.is_nullable()),
-                DataType::Timestamp(_, _) => deltalake::kernel::StructField::new(f.name().to_string(), deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Timestamp), f.is_nullable()),
-                DataType::Int64 => deltalake::kernel::StructField::new(f.name().to_string(), deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Long), f.is_nullable()),
-                DataType::Int32 => deltalake::kernel::StructField::new(f.name().to_string(), deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Integer), f.is_nullable()),
-                DataType::Boolean => deltalake::kernel::StructField::new(f.name().to_string(), deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Boolean), f.is_nullable()),
-                DataType::List(_) => deltalake::kernel::StructField::new(f.name().to_string(), deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String), f.is_nullable()),
-                _ => deltalake::kernel::StructField::new(f.name().to_string(), deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String), f.is_nullable()),
+                DataType::Utf8 => deltalake::kernel::StructField::new(
+                    f.name().to_string(), 
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String), 
+                    f.is_nullable()
+                ),
+                DataType::Timestamp(_, _) => deltalake::kernel::StructField::new(
+                    f.name().to_string(), 
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Timestamp), 
+                    f.is_nullable()
+                ),
+                DataType::Int64 => deltalake::kernel::StructField::new(
+                    f.name().to_string(), 
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Long), 
+                    f.is_nullable()
+                ),
+                DataType::Int32 => deltalake::kernel::StructField::new(
+                    f.name().to_string(), 
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Integer), 
+                    f.is_nullable()
+                ),
+                DataType::Boolean => deltalake::kernel::StructField::new(
+                    f.name().to_string(), 
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Boolean), 
+                    f.is_nullable()
+                ),
+                DataType::List(_) => deltalake::kernel::StructField::new(
+                    f.name().to_string(), 
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String), 
+                    f.is_nullable()
+                ),
+                _ => deltalake::kernel::StructField::new(
+                    f.name().to_string(), 
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String), 
+                    f.is_nullable()
+                ),
             }
         }).collect()
     }
@@ -223,7 +247,7 @@ impl Database {
         let sdk_type_array = StringArray::from(vec![record.sdkType.clone()]);
         let service_version_array = StringArray::from(vec![record.serviceVersion.clone().unwrap_or_default()]);
         let errors_array = StringArray::from(vec![record.errors.clone().unwrap_or_else(|| "{}".to_string())]);
-        
+
         let mut tags_builder = ListBuilder::new(StringBuilder::new());
         for tag in &record.tags {
             tags_builder.values().append_value(tag);

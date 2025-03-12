@@ -8,12 +8,17 @@ mod utils;
 mod metrics;
 mod metrics_middleware;
 
-use actix_web::{web, HttpResponse, HttpServer, Responder, get, middleware::Logger, App};
+use actix_web::{
+    web, App, HttpResponse, HttpServer, Responder, get, middleware::Logger,
+};
 use chrono::Utc;
 use database::Database;
-use ingest::{ingest as ingest_handler, ingest_batch, get_status, get_all_data, get_data_by_id, IngestStatusStore, record_batches_to_json_rows};
+use ingest::{
+    ingest as ingest_handler, ingest_batch, get_status, get_all_data, get_data_by_id,
+    IngestStatusStore, record_batches_to_json_rows,
+};
 use pgwire_integration::{DfSessionService, run_pgwire_server, HandlerFactory};
-use persistent_queue::{PersistentQueue, IngestRecord}; 
+use persistent_queue::{PersistentQueue, IngestRecord};
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 use std::env;
@@ -28,6 +33,7 @@ use metrics::{INGESTION_COUNTER, ERROR_COUNTER};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::Mutex as TokioMutex;
 use datafusion::arrow::array::Float64Array;
+use url::Url;
 
 #[derive(Clone)]
 struct AppInfo {
@@ -64,13 +70,16 @@ async fn dashboard(
     db: web::Data<Arc<Database>>,
     queue: web::Data<Arc<PersistentQueue>>,
     app_info: web::Data<AppInfo>,
-    status_store: web::Data<Arc<ingest::IngestStatusStore>>,
+    status_store: web::Data<Arc<IngestStatusStore>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
     let http_requests = 0.0; // Placeholder
     let queue_size = queue.get_ref().len().await.unwrap_or(0);
-    let db_status = match db.query("SELECT 1 AS test").await { Ok(_) => "success", Err(_) => "error" };
+    let db_status = match db.query("SELECT 1 AS test").await {
+        Ok(_) => "success",
+        Err(_) => "error",
+    };
     let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
 
     // Use the fixed table name "telemetry_events"
@@ -87,12 +96,19 @@ async fn dashboard(
         "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events ORDER BY timestamp DESC LIMIT 10".to_string()
     };
 
-    let avg_latency = match db.query("SELECT AVG(durationNs) AS avg_latency FROM telemetry_events WHERE durationNs IS NOT NULL").await {
-        Ok(df) => df.collect().await.ok().and_then(|batches| batches.get(0)
-            .map(|b| b.column(0).as_any().downcast_ref::<Float64Array>()
-            .map_or(0.0, |arr| arr.value(0) / 1_000_000.0)))
-            .unwrap_or(0.0),
-        Err(_) => 0.0
+    let avg_latency = match db
+        .query("SELECT AVG(durationNs) AS avg_latency FROM telemetry_events WHERE durationNs IS NOT NULL")
+        .await
+    {
+        Ok(df) => df.collect().await.ok().and_then(|batches| {
+            batches.get(0).map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .map_or(0.0, |arr| arr.value(0) / 1_000_000.0)
+            })
+        }).unwrap_or(0.0),
+        Err(_) => 0.0,
     };
 
     let latency_alert = avg_latency > 200.0;
@@ -100,7 +116,7 @@ async fn dashboard(
 
     let recent_statuses = status_store.inner.read().unwrap().iter()
         .take(10)
-        .map(|(id, status)| serde_json::json!({"id": id, "status": status}))
+        .map(|(id, status)| serde_json::json!({ "id": id, "status": status }))
         .collect::<Vec<_>>();
     let status_counts = recent_statuses.iter().fold(HashMap::new(), |mut acc, status| {
         *acc.entry(status["status"].as_str().unwrap_or("Unknown").to_string()).or_insert(0) += 1;
@@ -108,7 +124,7 @@ async fn dashboard(
     });
     let recent_records = match db.query(&records_query).await {
         Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
-        Err(_) => vec![]
+        Err(_) => vec![],
     };
 
     let mut trends = app_info.trends.lock().await;
@@ -184,7 +200,7 @@ async fn export_records(
 
     let records = match db.query(&records_query).await {
         Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
-        Err(_) => vec![]
+        Err(_) => vec![],
     };
 
     let mut csv = String::from("Project ID,Record ID,Timestamp,Trace ID,Span ID,Event Type,Latency (ms)\n");
@@ -223,32 +239,29 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // S3 / OVH storage configuration remains unchanged.
+    // Determine which storage provider to use.
     let storage_provider = env::var("STORAGE_PROVIDER").unwrap_or_else(|_| "s3".to_string());
-    let s3_uri = if storage_provider.to_lowercase() == "ovh" {
-        let bucket = env::var("OVH_BUCKET_NAME")
-            .expect("OVH_BUCKET_NAME environment variable not set");
-        let endpoint = env::var("OVH_ENDPOINT")
-            .expect("OVH_ENDPOINT environment variable not set");
-        format!("s3://{}/delta_table?endpoint={}", bucket, endpoint)
-    } else {
-        let bucket = env::var("S3_BUCKET_NAME")
-            .expect("S3_BUCKET_NAME environment variable not set");
-        format!("s3://{}/delta_table", bucket)
-    };
-    let http_port = env::var("PORT").unwrap_or_else(|_| {
-        info!("PORT not set, defaulting to 80");
-        "80".to_string()
-    });
-    let pgwire_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| {
-        info!("PGWIRE_PORT not set, defaulting to 5432");
-        "5432".to_string()
-    });
-    info!("Storage URI configured: {}", s3_uri);
 
-    deltalake::aws::register_handlers(None);
-    info!("AWS S3 handlers registered");
+    // Build the OVH storage URI using OVH environment variables.
+    let bucket = env::var("OVH_BUCKET_NAME")
+        .expect("OVH_BUCKET_NAME environment variable not set");
+    let endpoint = env::var("OVH_ENDPOINT")
+        .expect("OVH_ENDPOINT environment variable not set");
+    let storage_uri = format!("s3://{}/delta_table?endpoint={}", bucket, endpoint);
+    info!("Storage URI configured: {}", storage_uri);
 
+    // Set AWS_ENDPOINT explicitly so that the underlying client uses the OVH endpoint.
+    // (Unsafe block required by your build configuration)
+    unsafe {
+        env::set_var("AWS_ENDPOINT", &endpoint);
+    }
+
+    // Parse the OVH endpoint URL and register it.
+    let ovh_url = Url::parse(&endpoint).expect("OVH_ENDPOINT must be a valid URL");
+    deltalake::aws::register_handlers(Some(ovh_url));
+    info!("OVH handlers registered");
+
+    // Initialize the database.
     let db = match Database::new().await {
         Ok(db) => {
             info!("Database initialized successfully");
@@ -259,12 +272,13 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    // Use the fixed table name "telemetry_events"
-    if let Err(e) = db.add_project("telemetry_events", &s3_uri).await {
+
+    // Use the fixed table name "telemetry_events".
+    if let Err(e) = db.add_project("telemetry_events", &storage_uri).await {
         error!("Failed to add table 'telemetry_events': {:?}", e);
         return Err(e);
     }
-    match db.create_events_table("telemetry_events", &s3_uri).await {
+    match db.create_events_table("telemetry_events", &storage_uri).await {
         Ok(_) => info!("Events table created successfully"),
         Err(e) => {
             if e.to_string().contains("already exists") {
@@ -286,12 +300,14 @@ async fn main() -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
-    let status_store = Arc::new(ingest::IngestStatusStore::new());
+
+    let status_store = Arc::new(IngestStatusStore::new());
     let app_info = web::Data::new(AppInfo {
         start_time: Utc::now(),
         trends: Arc::new(TokioMutex::new(VecDeque::new())),
     });
 
+    // Spawn periodic compaction.
     let db_for_compaction = db.clone();
     tokio::spawn(async move {
         let mut compaction_interval = tokio::time::interval(StdDuration::from_secs(24 * 3600));
@@ -305,14 +321,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    let shutdown_token = CancellationToken::new();
     let queue_shutdown = shutdown_token.clone();
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
     let pg_service = DfSessionService::new(db.get_session_context(), db.clone());
     let handler_factory = HandlerFactory(Arc::new(pg_service));
-    let pg_addr = format!("0.0.0.0:{}", pgwire_port);
+    let pg_addr = format!("0.0.0.0:{}", env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()));
     info!("Spawning PGWire server task on {}", pg_addr);
     let pg_server = tokio::spawn({
         let pg_addr = pg_addr.clone();
@@ -367,7 +383,7 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    let http_addr = format!("0.0.0.0:{}", http_port);
+    let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
     info!("Binding HTTP server to {}", http_addr);
     let server = match HttpServer::new(move || {
         App::new()
@@ -444,7 +460,7 @@ async fn main() -> anyhow::Result<()> {
 async fn process_record(
     db: &Arc<Database>,
     queue: &Arc<PersistentQueue>,
-    status_store: &ingest::IngestStatusStore,
+    status_store: &IngestStatusStore,
     key: sled::IVec,
     record: IngestRecord,
 ) {
