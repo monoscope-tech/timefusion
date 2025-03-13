@@ -82,7 +82,6 @@ async fn dashboard(
     };
     let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
 
-    // Use the fixed table name "telemetry_events"
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
     let records_query = if let (Some(start), Some(end)) = (start, end) {
@@ -239,27 +238,27 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // Determine which storage provider to use.
-    let storage_provider = env::var("STORAGE_PROVIDER").unwrap_or_else(|_| "s3".to_string());
+    // Read AWS configuration from environment variables.
+    // AWS_S3_BUCKET should be your bucket name, e.g. "my-aws-bucket"
+    // AWS_S3_ENDPOINT should be your AWS S3 endpoint, e.g. "https://s3.amazonaws.com"
+    let bucket = env::var("AWS_S3_BUCKET")
+        .expect("AWS_S3_BUCKET environment variable not set");
+    let aws_endpoint = env::var("AWS_S3_ENDPOINT")
+        .unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
 
-    // Build the OVH storage URI using OVH environment variables.
-    let bucket = env::var("OVH_BUCKET_NAME")
-        .expect("OVH_BUCKET_NAME environment variable not set");
-    let endpoint = env::var("OVH_ENDPOINT")
-        .expect("OVH_ENDPOINT environment variable not set");
-    let storage_uri = format!("s3://{}/delta_table?endpoint={}", bucket, endpoint);
+    // Build the storage URI for AWS S3.
+    let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
     info!("Storage URI configured: {}", storage_uri);
 
-    // Set AWS_ENDPOINT explicitly so that the underlying client uses the OVH endpoint.
-    // (Unsafe block required by your build configuration)
+    // Set AWS_ENDPOINT so that the underlying S3 client uses the specified endpoint.
     unsafe {
-        env::set_var("AWS_ENDPOINT", &endpoint);
+        env::set_var("AWS_ENDPOINT", &aws_endpoint);
     }
 
-    // Parse the OVH endpoint URL and register it.
-    let ovh_url = Url::parse(&endpoint).expect("OVH_ENDPOINT must be a valid URL");
-    deltalake::aws::register_handlers(Some(ovh_url));
-    info!("OVH handlers registered");
+    // Parse the AWS endpoint URL and register it.
+    let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
+    deltalake::aws::register_handlers(Some(aws_url));
+    info!("AWS handlers registered");
 
     // Initialize the database.
     let db = match Database::new().await {
