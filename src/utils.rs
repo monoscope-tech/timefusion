@@ -1,6 +1,6 @@
 use anyhow::Result;
-use datafusion::arrow::array::{Array, StringArray, TimestampMicrosecondArray};
 use chrono::{LocalResult, TimeZone, Utc};
+use datafusion::arrow::array::{Array, StringArray, TimestampMicrosecondArray};
 
 /// In our updated application the table name is fixed to "telemetry.events",
 pub fn prepare_sql(query: &str) -> Result<String> {

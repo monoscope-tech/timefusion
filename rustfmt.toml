@@ -1,0 +1,38 @@
+# rustfmt.toml - Configuration to allow longer lines in Rust code
+max_width = 160
+
+# Controls the maximum width of a single line if_else expression (default is 50)
+# Setting this higher allows more complex conditions on a single line
+single_line_if_else_max_width = 100
+
+# Don't force items to be on their own line
+empty_item_single_line = true
+
+# Allow function arguments to use block-like formatting instead of line-per-argument
+fn_params_layout = "Compressed"
+
+# Control how chains of calls are formatted
+# "Block" will always put each call on a separate line
+# "Visual" tends to produce longer lines with multiple calls in a row
+chain_width = 120
+
+# Format array and struct literals to conserve vertical space
+# "Block" formats arrays and structs with one item per line
+# "Mixed" allows multiple items per line when they fit
+array_width = 120
+struct_field_align_threshold = 40
+
+# Allow attributes to be formatted more compactly
+# Setting to true allows putting multiple attributes on the same line
+format_code_in_doc_comments = true
+
+# How to handle imports
+# "Merge" combines imports from the same crate onto a single line
+imports_granularity = "Crate"
+group_imports = "StdExternalCrate"
+
+# Don't break comments to fit within the configured max_width
+wrap_comments = false
+
+# Don't force /// comments to have a space after them
+normalize_doc_attributes = false

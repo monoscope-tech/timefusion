@@ -1,13 +1,12 @@
 #[cfg(test)]
 #[allow(warnings)] // Suppress warnings for the test module
 mod sqllogictest_tests {
-    use sqllogictest::{Runner, DefaultColumnType, DBOutput, AsyncDB};
-    use std::sync::Arc;
-    use tokio;
-    use timefusion::database::Database;
-    use timefusion::utils::value_to_string;
-    use std::error::Error as StdError;
+    use std::{error::Error as StdError, sync::Arc};
+
     use datafusion::error::DataFusionError;
+    use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType, Runner};
+    use timefusion::{database::Database, utils::value_to_string};
+    use tokio;
     use uuid::Uuid;
 
     // Custom error type to wrap anyhow::Error
@@ -40,9 +39,9 @@ mod sqllogictest_tests {
 
     // Define a custom database wrapper for sqllogictest
     struct TimeFusionDB {
-        db: Arc<Database>,
+        db:         Arc<Database>,
         project_id: String, // Store the generated projectId
-        id: String,        // Store the generated id
+        id:         String, // Store the generated id
     }
 
     #[async_trait::async_trait]
@@ -52,9 +51,7 @@ mod sqllogictest_tests {
 
         async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
             // Replace placeholders with generated UUIDs
-            let sql = sql
-                .replace("PROJECT_ID_PLACEHOLDER", &self.project_id)
-                .replace("ID_PLACEHOLDER", &self.id);
+            let sql = sql.replace("PROJECT_ID_PLACEHOLDER", &self.project_id).replace("ID_PLACEHOLDER", &self.id);
             println!("Executing SQL: {}", sql);
 
             let df = self.db.query(&sql).await.map_err(|e| {
@@ -87,16 +84,17 @@ mod sqllogictest_tests {
                 }
             }
 
-            if sql.trim().to_lowercase().starts_with("insert") ||
-               sql.trim().to_lowercase().starts_with("update") ||
-               sql.trim().to_lowercase().starts_with("delete") {
+            if sql.trim().to_lowercase().starts_with("insert")
+                || sql.trim().to_lowercase().starts_with("update")
+                || sql.trim().to_lowercase().starts_with("delete")
+            {
                 println!("Returning StatementComplete with row count: {}", row_count);
                 Ok(DBOutput::StatementComplete(row_count as u64))
             } else {
                 println!("Returning Rows with {} rows and {} columns", rows.len(), batches[0].num_columns());
-                Ok(DBOutput::Rows { 
-                    types: vec![DefaultColumnType::Text; batches[0].num_columns()], 
-                    rows 
+                Ok(DBOutput::Rows {
+                    types: vec![DefaultColumnType::Text; batches[0].num_columns()],
+                    rows,
                 })
             }
         }
@@ -117,7 +115,7 @@ mod sqllogictest_tests {
 
         // Initialize the database
         let db: Arc<Database> = Arc::new(Database::new().await?);
-        
+
         // Use an in-memory table for testing
         let storage_uri = "memory://test_table";
         println!("Creating events table: telemetry_events at {}", storage_uri);
@@ -130,10 +128,10 @@ mod sqllogictest_tests {
 
         // Create a closure that implements MakeConnection
         let make_db = || async {
-            Ok(TimeFusionDB { 
-                db: db.clone(),
+            Ok(TimeFusionDB {
+                db:         db.clone(),
                 project_id: project_id.clone(),
-                id: id.clone(),
+                id:         id.clone(),
             }) as Result<TimeFusionDB, TestError>
         };
 
@@ -143,10 +141,10 @@ mod sqllogictest_tests {
         // Specify the path to your .slt files
         let test_file = "tests/example.slt";
         println!("Running SQL logic test from file: {}", test_file);
-        
+
         // Run the tests
         runner.run_file_async(test_file).await?;
-        
+
         Ok(())
     }
 }

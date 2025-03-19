@@ -1,9 +1,12 @@
 // src/metrics_middleware.rs
-use actix_web::{dev::{Service, ServiceRequest, ServiceResponse, Transform}, Error};
-use futures::future::{ok, Ready};
-use std::future::Future;
-use std::pin::Pin;
-use std::time::Instant;
+use std::{future::Future, pin::Pin, time::Instant};
+
+use actix_web::{
+    Error,
+    dev::{Service, ServiceRequest, ServiceResponse, Transform},
+};
+use futures::future::{Ready, ok};
+
 use crate::metrics::{HTTP_REQUEST_COUNTER, HTTP_REQUEST_DURATION};
 
 pub struct MetricsMiddleware;

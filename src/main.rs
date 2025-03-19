@@ -2,75 +2,72 @@
 
 mod database;
 mod ingest;
+mod metrics;
+mod metrics_middleware;
 mod persistent_queue;
 mod pgwire_integration;
 mod utils;
-mod metrics;
-mod metrics_middleware;
 
-use actix_web::{
-    web, App, HttpResponse, HttpServer, Responder, get, middleware::Logger,
+use std::{
+    collections::{HashMap, VecDeque},
+    env,
+    sync::Arc,
+    time::Duration as StdDuration,
 };
+
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, middleware::Logger, web};
 use chrono::Utc;
 use database::Database;
-use ingest::{
-    ingest as ingest_handler, ingest_batch, get_status, get_all_data, get_data_by_id,
-    IngestStatusStore, record_batches_to_json_rows,
-};
-use pgwire_integration::{DfSessionService, run_pgwire_server, HandlerFactory};
-use persistent_queue::{PersistentQueue, IngestRecord};
-use serde::{Serialize, Deserialize};
-use std::sync::Arc;
-use std::env;
-use tokio::time::{sleep, Duration};
-use tokio_util::sync::CancellationToken;
-use tracing::{info, error, debug};
-use tracing_subscriber::EnvFilter;
-use dotenv::dotenv;
-use tokio::task::spawn_blocking;
-use std::time::Duration as StdDuration;
-use metrics::{INGESTION_COUNTER, ERROR_COUNTER};
-use std::collections::{HashMap, VecDeque};
-use tokio::sync::Mutex as TokioMutex;
 use datafusion::arrow::array::Float64Array;
+use dotenv::dotenv;
+use ingest::{IngestStatusStore, get_all_data, get_data_by_id, get_status, ingest as ingest_handler, ingest_batch, record_batches_to_json_rows};
+use metrics::{ERROR_COUNTER, INGESTION_COUNTER};
+use persistent_queue::{IngestRecord, PersistentQueue};
+use pgwire_integration::{DfSessionService, HandlerFactory, run_pgwire_server};
+use serde::{Deserialize, Serialize};
+use tokio::{
+    sync::Mutex as TokioMutex,
+    task::spawn_blocking,
+    time::{Duration, sleep},
+};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info};
+use tracing_subscriber::EnvFilter;
 use url::Url;
 
 #[derive(Clone)]
 struct AppInfo {
     start_time: chrono::DateTime<Utc>,
-    trends: Arc<TokioMutex<VecDeque<TrendData>>>,
+    trends:     Arc<TokioMutex<VecDeque<TrendData>>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct TrendData {
-    timestamp: String,
+    timestamp:      String,
     ingestion_rate: f64,
-    queue_size: usize,
-    avg_latency: f64,
+    queue_size:     usize,
+    avg_latency:    f64,
 }
 
 #[derive(Serialize)]
 struct DashboardData {
-    uptime: f64,
-    http_requests: f64,
-    queue_size: usize,
-    queue_alert: bool,
-    db_status: String,
-    ingestion_rate: f64,
-    avg_latency: f64,
-    latency_alert: bool,
+    uptime:          f64,
+    http_requests:   f64,
+    queue_size:      usize,
+    queue_alert:     bool,
+    db_status:       String,
+    ingestion_rate:  f64,
+    avg_latency:     f64,
+    latency_alert:   bool,
     recent_statuses: Vec<serde_json::Value>,
-    status_counts: HashMap<String, i32>,
-    recent_records: Vec<serde_json::Value>,
-    trends: Vec<TrendData>,
+    status_counts:   HashMap<String, i32>,
+    recent_records:  Vec<serde_json::Value>,
+    trends:          Vec<TrendData>,
 }
 
 #[get("/dashboard")]
 async fn dashboard(
-    db: web::Data<Arc<Database>>,
-    queue: web::Data<Arc<PersistentQueue>>,
-    app_info: web::Data<AppInfo>,
-    status_store: web::Data<Arc<IngestStatusStore>>,
+    db: web::Data<Arc<Database>>, queue: web::Data<Arc<PersistentQueue>>, app_info: web::Data<AppInfo>, status_store: web::Data<Arc<IngestStatusStore>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
@@ -95,25 +92,28 @@ async fn dashboard(
         "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events ORDER BY timestamp DESC LIMIT 10".to_string()
     };
 
-    let avg_latency = match db
-        .query("SELECT AVG(durationNs) AS avg_latency FROM telemetry_events WHERE durationNs IS NOT NULL")
-        .await
-    {
-        Ok(df) => df.collect().await.ok().and_then(|batches| {
-            batches.get(0).map(|b| {
-                b.column(0)
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .map_or(0.0, |arr| arr.value(0) / 1_000_000.0)
+    let avg_latency = match db.query("SELECT AVG(durationNs) AS avg_latency FROM telemetry_events WHERE durationNs IS NOT NULL").await {
+        Ok(df) => df
+            .collect()
+            .await
+            .ok()
+            .and_then(|batches| {
+                batches
+                    .get(0)
+                    .map(|b| b.column(0).as_any().downcast_ref::<Float64Array>().map_or(0.0, |arr| arr.value(0) / 1_000_000.0))
             })
-        }).unwrap_or(0.0),
+            .unwrap_or(0.0),
         Err(_) => 0.0,
     };
 
     let latency_alert = avg_latency > 200.0;
     let queue_alert = queue_size > 50;
 
-    let recent_statuses = status_store.inner.read().unwrap().iter()
+    let recent_statuses = status_store
+        .inner
+        .read()
+        .unwrap()
+        .iter()
         .take(10)
         .map(|(id, status)| serde_json::json!({ "id": id, "status": status }))
         .collect::<Vec<_>>();
@@ -139,10 +139,14 @@ async fn dashboard(
         trends.pop_front();
     }
     let trends_vec = if let (Some(start), Some(end)) = (start, end) {
-        trends.iter().filter(|t| {
-            let ts = chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap();
-            ts >= start && ts <= end
-        }).cloned().collect::<Vec<_>>()
+        trends
+            .iter()
+            .filter(|t| {
+                let ts = chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap();
+                ts >= start && ts <= end
+            })
+            .cloned()
+            .collect::<Vec<_>>()
     } else {
         trends.iter().cloned().collect::<Vec<_>>()
     };
@@ -179,10 +183,7 @@ async fn dashboard(
 }
 
 #[get("/export_records")]
-async fn export_records(
-    db: web::Data<Arc<Database>>,
-    query: web::Query<HashMap<String, String>>,
-) -> impl Responder {
+async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<String, String>>) -> impl Responder {
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
 
@@ -224,9 +225,7 @@ async fn export_records(
 
 #[get("/")]
 async fn landing() -> impl Responder {
-    HttpResponse::TemporaryRedirect()
-        .append_header(("Location", "/dashboard"))
-        .finish()
+    HttpResponse::TemporaryRedirect().append_header(("Location", "/dashboard")).finish()
 }
 
 #[tokio::main]
@@ -241,10 +240,8 @@ async fn main() -> anyhow::Result<()> {
     // Read AWS configuration from environment variables.
     // AWS_S3_BUCKET should be your bucket name, e.g. "my-aws-bucket"
     // AWS_S3_ENDPOINT should be your AWS S3 endpoint, e.g. "https://s3.amazonaws.com"
-    let bucket = env::var("AWS_S3_BUCKET")
-        .expect("AWS_S3_BUCKET environment variable not set");
-    let aws_endpoint = env::var("AWS_S3_ENDPOINT")
-        .unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
+    let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
+    let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
 
     // Build the storage URI for AWS S3.
     let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
@@ -265,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(db) => {
             info!("Database initialized successfully");
             Arc::new(db)
-        },
+        }
         Err(e) => {
             error!("Failed to initialize Database: {:?}", e);
             return Err(e);
@@ -292,12 +289,12 @@ async fn main() -> anyhow::Result<()> {
     // Get queue DB path from environment variable or use default
     let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "/app/queue_db".to_string());
     info!("Using queue DB path: {}", queue_db_path);
-    
+
     let queue = match PersistentQueue::new(&queue_db_path) {
         Ok(q) => {
             info!("PersistentQueue initialized successfully");
             Arc::new(q)
-        },
+        }
         Err(e) => {
             error!("Failed to initialize PersistentQueue: {:?}", e);
             return Err(e.into());
@@ -307,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
     let status_store = Arc::new(IngestStatusStore::new());
     let app_info = web::Data::new(AppInfo {
         start_time: Utc::now(),
-        trends: Arc::new(TokioMutex::new(VecDeque::new())),
+        trends:     Arc::new(TokioMutex::new(VecDeque::new())),
     });
 
     // Spawn periodic compaction.
@@ -405,7 +402,8 @@ async fn main() -> anyhow::Result<()> {
             .service(get_all_data)
             .service(get_data_by_id)
     })
-    .bind(&http_addr) {
+    .bind(&http_addr)
+    {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to bind HTTP server to {}: {:?}", http_addr, e);
@@ -460,13 +458,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn process_record(
-    db: &Arc<Database>,
-    queue: &Arc<PersistentQueue>,
-    status_store: &IngestStatusStore,
-    key: sled::IVec,
-    record: IngestRecord,
-) {
+async fn process_record(db: &Arc<Database>, queue: &Arc<PersistentQueue>, status_store: &IngestStatusStore, key: sled::IVec, record: IngestRecord) {
     use std::str;
     let id = str::from_utf8(&key).unwrap_or("unknown").to_string();
     status_store.set_status(id.clone(), "Processing".to_string());
@@ -478,7 +470,9 @@ async fn process_record(
                 if let Err(e) = spawn_blocking({
                     let queue = queue.clone();
                     move || queue.remove_sync(key)
-                }).await {
+                })
+                .await
+                {
                     error!("Failed to remove record: {:?}", e);
                 }
             }
@@ -495,6 +489,7 @@ async fn process_record(
         let _ = spawn_blocking({
             let queue = queue.clone();
             move || queue.remove_sync(key)
-        }).await;
+        })
+        .await;
     }
 }

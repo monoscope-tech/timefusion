@@ -1,30 +1,34 @@
 // database.rs
 
-use crate::metrics::COMPACTION_COUNTER;
-use crate::utils::prepare_sql;
+use std::{
+    collections::HashMap,
+    sync::{Arc as StdArc, Arc, RwLock},
+};
+
 use anyhow::Result;
 use chrono::DateTime;
-use datafusion::arrow::array::{
-    BooleanArray, Int32Array, Int64Array, ListBuilder, StringArray, StringBuilder,
-    TimestampMicrosecondArray,
+use datafusion::{
+    arrow::{
+        array::{BooleanArray, Int32Array, Int64Array, ListBuilder, StringArray, StringBuilder, TimestampMicrosecondArray},
+        datatypes::{DataType, Field, Schema, TimeUnit},
+        record_batch::RecordBatch,
+    },
+    execution::context::SessionContext,
+    prelude::*,
 };
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::execution::context::SessionContext;
-use datafusion::prelude::*;
 use deltalake::{DeltaOps, DeltaTableBuilder};
 use dotenv::dotenv;
-use sqlparser::ast::{Expr, SetExpr, Statement, Value as SqlValue};
-use sqlparser::dialect::GenericDialect;
-use std::collections::HashMap;
-use std::sync::Arc as StdArc;
-use std::sync::{Arc, RwLock};
+use sqlparser::{
+    ast::{Expr, SetExpr, Statement, Value as SqlValue},
+    dialect::GenericDialect,
+};
 
-pub type ProjectConfigs =
-    Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
+use crate::{metrics::COMPACTION_COUNTER, utils::prepare_sql};
+
+pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
 
 pub struct Database {
-    pub ctx: SessionContext,
+    pub ctx:         SessionContext,
     project_configs: ProjectConfigs,
 }
 
@@ -47,11 +51,7 @@ impl Database {
         let table = match DeltaTableBuilder::from_uri(connection_string).load().await {
             Ok(table) => table,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to load table '{}': {}. Creating new table.",
-                    connection_string,
-                    e
-                );
+                tracing::warn!("Failed to load table '{}': {}. Creating new table.", connection_string, e);
                 DeltaOps::try_from_uri(connection_string)
                     .await?
                     .create()
@@ -64,10 +64,7 @@ impl Database {
         self.project_configs
             .write()
             .map_err(|e| anyhow::anyhow!("Failed to acquire write lock: {:?}", e))?
-            .insert(
-                table_name.to_string(),
-                (connection_string.to_string(), Arc::new(RwLock::new(table))),
-            );
+            .insert(table_name.to_string(), (connection_string.to_string(), Arc::new(RwLock::new(table))));
         Ok(())
     }
 
@@ -76,20 +73,12 @@ impl Database {
         Schema::new(vec![
             Field::new("projectId", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
-            Field::new(
-                "timestamp",
-                DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))),
-                false,
-            ),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), false),
             Field::new("traceId", DataType::Utf8, false),
             Field::new("spanId", DataType::Utf8, false),
             Field::new("eventType", DataType::Utf8, false),
             Field::new("status", DataType::Utf8, true),
-            Field::new(
-                "endTime",
-                DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))),
-                true,
-            ),
+            Field::new("endTime", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), true),
             Field::new("durationNs", DataType::Int64, false),
             Field::new("spanName", DataType::Utf8, false),
             Field::new("spanKind", DataType::Utf8, true),
@@ -111,11 +100,7 @@ impl Database {
             Field::new("sdkType", DataType::Utf8, false),
             Field::new("serviceVersion", DataType::Utf8, true),
             Field::new("errors", DataType::Utf8, false),
-            Field::new(
-                "tags",
-                DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))),
-                false,
-            ),
+            Field::new("tags", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
             Field::new("parentId", DataType::Utf8, true),
             Field::new("dbSystem", DataType::Utf8, true),
             Field::new("dbName", DataType::Utf8, true),
@@ -126,16 +111,8 @@ impl Database {
             Field::new("rpcMethod", DataType::Utf8, true),
             Field::new("endpointHash", DataType::Utf8, false),
             Field::new("shapeHash", DataType::Utf8, false),
-            Field::new(
-                "formatHashes",
-                DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))),
-                false,
-            ),
-            Field::new(
-                "fieldHashes",
-                DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))),
-                false,
-            ),
+            Field::new("formatHashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
+            Field::new("fieldHashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
             Field::new("attributes", DataType::Utf8, false),
             Field::new("events", DataType::Utf8, false),
             Field::new("links", DataType::Utf8, false),
@@ -152,16 +129,12 @@ impl Database {
             .map(|f| match f.data_type() {
                 DataType::Utf8 => deltalake::kernel::StructField::new(
                     f.name().to_string(),
-                    deltalake::kernel::DataType::Primitive(
-                        deltalake::kernel::PrimitiveType::String,
-                    ),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
                     f.is_nullable(),
                 ),
                 DataType::Timestamp(_, _) => deltalake::kernel::StructField::new(
                     f.name().to_string(),
-                    deltalake::kernel::DataType::Primitive(
-                        deltalake::kernel::PrimitiveType::Timestamp,
-                    ),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Timestamp),
                     f.is_nullable(),
                 ),
                 DataType::Int64 => deltalake::kernel::StructField::new(
@@ -171,30 +144,22 @@ impl Database {
                 ),
                 DataType::Int32 => deltalake::kernel::StructField::new(
                     f.name().to_string(),
-                    deltalake::kernel::DataType::Primitive(
-                        deltalake::kernel::PrimitiveType::Integer,
-                    ),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Integer),
                     f.is_nullable(),
                 ),
                 DataType::Boolean => deltalake::kernel::StructField::new(
                     f.name().to_string(),
-                    deltalake::kernel::DataType::Primitive(
-                        deltalake::kernel::PrimitiveType::Boolean,
-                    ),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Boolean),
                     f.is_nullable(),
                 ),
                 DataType::List(_) => deltalake::kernel::StructField::new(
                     f.name().to_string(),
-                    deltalake::kernel::DataType::Primitive(
-                        deltalake::kernel::PrimitiveType::String,
-                    ),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
                     f.is_nullable(),
                 ),
                 _ => deltalake::kernel::StructField::new(
                     f.name().to_string(),
-                    deltalake::kernel::DataType::Primitive(
-                        deltalake::kernel::PrimitiveType::String,
-                    ),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
                     f.is_nullable(),
                 ),
             })
@@ -205,11 +170,7 @@ impl Database {
         let table = match DeltaTableBuilder::from_uri(table_uri).load().await {
             Ok(table) => table,
             Err(e) => {
-                tracing::warn!(
-                    "Table '{}' not found: {}. Creating new table.",
-                    table_uri,
-                    e
-                );
+                tracing::warn!("Table '{}' not found: {}. Creating new table.", table_uri, e);
                 DeltaOps::try_from_uri(table_uri)
                     .await?
                     .create()
@@ -222,19 +183,11 @@ impl Database {
 
         let table_ref = Arc::new(RwLock::new(table));
         let provider = {
-            let table_guard = table_ref
-                .read()
-                .map_err(|_| anyhow::anyhow!("Lock error"))?;
-            let snapshot = table_guard
-                .snapshot()
-                .map_err(|e| anyhow::anyhow!("Failed to get snapshot: {:?}", e))?;
+            let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
+            let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {:?}", e))?;
             let log_store = table_guard.log_store().clone();
-            deltalake::delta_datafusion::DeltaTableProvider::try_new(
-                snapshot.clone(),
-                log_store,
-                deltalake::delta_datafusion::DeltaScanConfig::default(),
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create provider: {:?}", e))?
+            deltalake::delta_datafusion::DeltaTableProvider::try_new(snapshot.clone(), log_store, deltalake::delta_datafusion::DeltaScanConfig::default())
+                .map_err(|e| anyhow::anyhow!("Failed to create provider: {:?}", e))?
         };
 
         // Register the table under the fixed name "telemetry_events"
@@ -253,95 +206,50 @@ impl Database {
     pub async fn query(&self, sql: &str) -> Result<DataFrame> {
         let new_sql = prepare_sql(sql)?;
         tracing::info!("Executing SQL: {}", new_sql);
-        let df = self
-            .ctx
-            .sql(&new_sql)
-            .await
-            .map_err(|e| anyhow::anyhow!("SQL execution failed: {:?}", e))?;
+        let df = self.ctx.sql(&new_sql).await.map_err(|e| anyhow::anyhow!("SQL execution failed: {:?}", e))?;
         Ok(df)
     }
 
     /// Write an IngestRecord into the fixed "telemetry_events" table.
     pub async fn write(&self, record: &crate::persistent_queue::IngestRecord) -> Result<()> {
         let (conn_str, _table_ref) = {
-            let configs = self
-                .project_configs
-                .read()
-                .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
-            configs
-                .get("telemetry_events")
-                .ok_or_else(|| anyhow::anyhow!("Table not found"))?
-                .clone()
+            let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
+            configs.get("telemetry_events").ok_or_else(|| anyhow::anyhow!("Table not found"))?.clone()
         };
 
-        let ts = DateTime::parse_from_rfc3339(&record.timestamp)
-            .map_err(|e| anyhow::anyhow!("Invalid timestamp: {:?}", e))?;
+        let ts = DateTime::parse_from_rfc3339(&record.timestamp).map_err(|e| anyhow::anyhow!("Invalid timestamp: {:?}", e))?;
         let ts_micro = ts.timestamp_micros();
-        let end_ts_micro = record
-            .endTime
-            .as_ref()
-            .map(|et| DateTime::parse_from_rfc3339(et).map(|dt| dt.timestamp_micros()))
-            .transpose()?;
+        let end_ts_micro = record.endTime.as_ref().map(|et| DateTime::parse_from_rfc3339(et).map(|dt| dt.timestamp_micros())).transpose()?;
 
         let project_id_array = StringArray::from(vec![record.projectId.clone()]);
         let id_array = StringArray::from(vec![record.id.clone()]);
-        let timestamp_array = Arc::new(build_timestamp_array(
-            vec![ts_micro],
-            Some(StdArc::from("UTC")),
-        ));
+        let timestamp_array = Arc::new(build_timestamp_array(vec![ts_micro], Some(StdArc::from("UTC"))));
         let trace_id_array = StringArray::from(vec![record.traceId.clone()]);
         let span_id_array = StringArray::from(vec![record.spanId.clone()]);
         let event_type_array = StringArray::from(vec![record.eventType.clone()]);
         let status_array = StringArray::from(vec![record.status.clone().unwrap_or_default()]);
-        let end_time_array = Arc::new(build_timestamp_array(
-            vec![end_ts_micro.unwrap_or(0)],
-            Some(StdArc::from("UTC")),
-        ));
+        let end_time_array = Arc::new(build_timestamp_array(vec![end_ts_micro.unwrap_or(0)], Some(StdArc::from("UTC"))));
         let duration_ns_array = Int64Array::from(vec![record.durationNs]);
         let span_name_array = StringArray::from(vec![record.spanName.clone()]);
         let span_kind_array = StringArray::from(vec![record.spanKind.clone().unwrap_or_default()]);
-        let parent_span_id_array =
-            StringArray::from(vec![record.parentSpanId.as_deref().unwrap_or("")]);
-        let trace_state_array =
-            StringArray::from(vec![record.traceState.clone().unwrap_or_default()]);
+        let parent_span_id_array = StringArray::from(vec![record.parentSpanId.as_deref().unwrap_or("")]);
+        let trace_state_array = StringArray::from(vec![record.traceState.clone().unwrap_or_default()]);
         let has_error_array = BooleanArray::from(vec![record.hasError]);
-        let severity_text_array =
-            StringArray::from(vec![record.severityText.clone().unwrap_or_default()]);
+        let severity_text_array = StringArray::from(vec![record.severityText.clone().unwrap_or_default()]);
         let severity_number_array = Int32Array::from(vec![record.severityNumber]);
-        let body_array = StringArray::from(vec![record
-            .body
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
-        let http_method_array =
-            StringArray::from(vec![record.httpMethod.clone().unwrap_or_default()]);
+        let body_array = StringArray::from(vec![record.body.clone().unwrap_or_else(|| "{}".to_string())]);
+        let http_method_array = StringArray::from(vec![record.httpMethod.clone().unwrap_or_default()]);
         let http_url_array = StringArray::from(vec![record.httpUrl.clone().unwrap_or_default()]);
-        let http_route_array =
-            StringArray::from(vec![record.httpRoute.clone().unwrap_or_default()]);
+        let http_route_array = StringArray::from(vec![record.httpRoute.clone().unwrap_or_default()]);
         let http_host_array = StringArray::from(vec![record.httpHost.clone().unwrap_or_default()]);
         let http_status_code_array = Int32Array::from(vec![record.httpStatusCode.unwrap_or(0)]);
-        let path_params_array = StringArray::from(vec![record
-            .pathParams
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
-        let query_params_array = StringArray::from(vec![record
-            .queryParams
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
-        let request_body_array = StringArray::from(vec![record
-            .requestBody
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
-        let response_body_array = StringArray::from(vec![record
-            .responseBody
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
+        let path_params_array = StringArray::from(vec![record.pathParams.clone().unwrap_or_else(|| "{}".to_string())]);
+        let query_params_array = StringArray::from(vec![record.queryParams.clone().unwrap_or_else(|| "{}".to_string())]);
+        let request_body_array = StringArray::from(vec![record.requestBody.clone().unwrap_or_else(|| "{}".to_string())]);
+        let response_body_array = StringArray::from(vec![record.responseBody.clone().unwrap_or_else(|| "{}".to_string())]);
         let sdk_type_array = StringArray::from(vec![record.sdkType.clone()]);
-        let service_version_array =
-            StringArray::from(vec![record.serviceVersion.clone().unwrap_or_default()]);
-        let errors_array = StringArray::from(vec![record
-            .errors
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
+        let service_version_array = StringArray::from(vec![record.serviceVersion.clone().unwrap_or_default()]);
+        let errors_array = StringArray::from(vec![record.errors.clone().unwrap_or_else(|| "{}".to_string())]);
 
         let mut tags_builder = ListBuilder::new(StringBuilder::new());
         for tag in &record.tags {
@@ -353,16 +261,11 @@ impl Database {
         let parent_id_array = StringArray::from(vec![record.parentId.clone().unwrap_or_default()]);
         let db_system_array = StringArray::from(vec![record.dbSystem.clone().unwrap_or_default()]);
         let db_name_array = StringArray::from(vec![record.dbName.clone().unwrap_or_default()]);
-        let db_statement_array =
-            StringArray::from(vec![record.dbStatement.clone().unwrap_or_default()]);
-        let db_operation_array =
-            StringArray::from(vec![record.dbOperation.clone().unwrap_or_default()]);
-        let rpc_system_array =
-            StringArray::from(vec![record.rpcSystem.clone().unwrap_or_default()]);
-        let rpc_service_array =
-            StringArray::from(vec![record.rpcService.clone().unwrap_or_default()]);
-        let rpc_method_array =
-            StringArray::from(vec![record.rpcMethod.clone().unwrap_or_default()]);
+        let db_statement_array = StringArray::from(vec![record.dbStatement.clone().unwrap_or_default()]);
+        let db_operation_array = StringArray::from(vec![record.dbOperation.clone().unwrap_or_default()]);
+        let rpc_system_array = StringArray::from(vec![record.rpcSystem.clone().unwrap_or_default()]);
+        let rpc_service_array = StringArray::from(vec![record.rpcService.clone().unwrap_or_default()]);
+        let rpc_method_array = StringArray::from(vec![record.rpcMethod.clone().unwrap_or_default()]);
         let endpoint_hash_array = StringArray::from(vec![record.endpointHash.clone()]);
         let shape_hash_array = StringArray::from(vec![record.shapeHash.clone()]);
 
@@ -380,26 +283,11 @@ impl Database {
         field_hashes_builder.append(true);
         let field_hashes_array = field_hashes_builder.finish();
 
-        let attributes_array = StringArray::from(vec![record
-            .attributes
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
-        let events_array = StringArray::from(vec![record
-            .events
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
-        let links_array = StringArray::from(vec![record
-            .links
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
-        let resource_array = StringArray::from(vec![record
-            .resource
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
-        let instrumentation_scope_array = StringArray::from(vec![record
-            .instrumentationScope
-            .clone()
-            .unwrap_or_else(|| "{}".to_string())]);
+        let attributes_array = StringArray::from(vec![record.attributes.clone().unwrap_or_else(|| "{}".to_string())]);
+        let events_array = StringArray::from(vec![record.events.clone().unwrap_or_else(|| "{}".to_string())]);
+        let links_array = StringArray::from(vec![record.links.clone().unwrap_or_else(|| "{}".to_string())]);
+        let resource_array = StringArray::from(vec![record.resource.clone().unwrap_or_else(|| "{}".to_string())]);
+        let instrumentation_scope_array = StringArray::from(vec![record.instrumentationScope.clone().unwrap_or_else(|| "{}".to_string())]);
 
         let schema = Self::event_schema();
         let batch = RecordBatch::try_new(
@@ -454,30 +342,21 @@ impl Database {
                 Arc::new(instrumentation_scope_array),
             ],
         )?;
-        DeltaOps::try_from_uri(&conn_str)
-            .await?
-            .write(vec![batch])
-            .await?;
+        DeltaOps::try_from_uri(&conn_str).await?.write(vec![batch]).await?;
         Ok(())
     }
 
     pub async fn insert_record(&self, query: &str) -> Result<String> {
         let dialect = GenericDialect {};
-        let ast = sqlparser::parser::Parser::parse_sql(&dialect, query)
-            .map_err(|e| anyhow::anyhow!("SQL parse error: {:?}", e))?;
+        let ast = sqlparser::parser::Parser::parse_sql(&dialect, query).map_err(|e| anyhow::anyhow!("SQL parse error: {:?}", e))?;
 
         match &ast[0] {
             Statement::Insert(insert) => {
                 let table_name_str = insert.table.to_string();
                 if table_name_str != "telemetry_events" {
-                    return Err(anyhow::anyhow!(
-                        "Only inserts into 'telemetry_events' are supported"
-                    ));
+                    return Err(anyhow::anyhow!("Only inserts into 'telemetry_events' are supported"));
                 }
-                let source = insert
-                    .source
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Missing source in INSERT"))?;
+                let source = insert.source.as_ref().ok_or_else(|| anyhow::anyhow!("Missing source in INSERT"))?;
                 if let SetExpr::Values(values) = &*source.body {
                     let row = &values.rows[0];
                     let mut insert_values = HashMap::new();
@@ -498,85 +377,55 @@ impl Database {
                             _ => return Err(anyhow::anyhow!("Unsupported value type: {:?}", val)),
                         }
                     }
-                    let project_id = insert_values
-                        .get("projectId")
-                        .ok_or_else(|| anyhow::anyhow!("Missing projectId"))?;
-                    let timestamp = insert_values
-                        .get("timestamp")
-                        .ok_or_else(|| anyhow::anyhow!("Missing timestamp"))?;
+                    let project_id = insert_values.get("projectId").ok_or_else(|| anyhow::anyhow!("Missing projectId"))?;
+                    let timestamp = insert_values.get("timestamp").ok_or_else(|| anyhow::anyhow!("Missing timestamp"))?;
                     let record = crate::persistent_queue::IngestRecord {
-                        projectId: project_id.clone(),
-                        id: insert_values
-                            .get("id")
-                            .cloned()
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        timestamp: timestamp.clone(),
-                        traceId: insert_values.get("traceId").cloned().unwrap_or_default(),
-                        spanId: insert_values.get("spanId").cloned().unwrap_or_default(),
-                        eventType: insert_values
-                            .get("eventType")
-                            .cloned()
-                            .unwrap_or_else(|| "span".to_string()),
-                        status: insert_values.get("status").cloned(),
-                        endTime: insert_values.get("endTime").cloned(),
-                        durationNs: insert_values
-                            .get("durationNs")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0),
-                        spanName: insert_values.get("spanName").cloned().unwrap_or_default(),
-                        spanKind: insert_values.get("spanKind").cloned(),
-                        parentSpanId: insert_values.get("parentSpanId").cloned(),
-                        traceState: insert_values.get("traceState").cloned(),
-                        hasError: false,
-                        severityText: insert_values.get("severityText").cloned(),
-                        severityNumber: insert_values
-                            .get("severityNumber")
-                            .and_then(|s| s.parse().ok())
-                            .unwrap_or(0),
-                        body: insert_values.get("body").cloned(),
-                        httpMethod: insert_values.get("httpMethod").cloned(),
-                        httpUrl: insert_values.get("httpUrl").cloned(),
-                        httpRoute: insert_values.get("httpRoute").cloned(),
-                        httpHost: insert_values.get("httpHost").cloned(),
-                        httpStatusCode: insert_values
-                            .get("httpStatusCode")
-                            .and_then(|s| s.parse().ok()),
-                        pathParams: insert_values.get("pathParams").cloned(),
-                        queryParams: insert_values.get("queryParams").cloned(),
-                        requestBody: insert_values.get("requestBody").cloned(),
-                        responseBody: insert_values.get("responseBody").cloned(),
-                        sdkType: insert_values.get("sdkType").cloned().unwrap_or_default(),
-                        serviceVersion: insert_values.get("serviceVersion").cloned(),
-                        errors: insert_values.get("errors").cloned(),
-                        tags: insert_values
-                            .get("tags")
-                            .map(|s| vec![s.clone()])
-                            .unwrap_or_default(),
-                        parentId: insert_values.get("parentId").cloned(),
-                        dbSystem: insert_values.get("dbSystem").cloned(),
-                        dbName: insert_values.get("dbName").cloned(),
-                        dbStatement: insert_values.get("dbStatement").cloned(),
-                        dbOperation: insert_values.get("dbOperation").cloned(),
-                        rpcSystem: insert_values.get("rpcSystem").cloned(),
-                        rpcService: insert_values.get("rpcService").cloned(),
-                        rpcMethod: insert_values.get("rpcMethod").cloned(),
-                        endpointHash: insert_values
-                            .get("endpointHash")
-                            .cloned()
-                            .unwrap_or_default(),
-                        shapeHash: insert_values.get("shapeHash").cloned().unwrap_or_default(),
-                        formatHashes: insert_values
-                            .get("formatHashes")
-                            .map(|s| vec![s.clone()])
-                            .unwrap_or_default(),
-                        fieldHashes: insert_values
-                            .get("fieldHashes")
-                            .map(|s| vec![s.clone()])
-                            .unwrap_or_default(),
-                        attributes: insert_values.get("attributes").cloned(),
-                        events: insert_values.get("events").cloned(),
-                        links: insert_values.get("links").cloned(),
-                        resource: insert_values.get("resource").cloned(),
+                        projectId:            project_id.clone(),
+                        id:                   insert_values.get("id").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        timestamp:            timestamp.clone(),
+                        traceId:              insert_values.get("traceId").cloned().unwrap_or_default(),
+                        spanId:               insert_values.get("spanId").cloned().unwrap_or_default(),
+                        eventType:            insert_values.get("eventType").cloned().unwrap_or_else(|| "span".to_string()),
+                        status:               insert_values.get("status").cloned(),
+                        endTime:              insert_values.get("endTime").cloned(),
+                        durationNs:           insert_values.get("durationNs").and_then(|s| s.parse().ok()).unwrap_or(0),
+                        spanName:             insert_values.get("spanName").cloned().unwrap_or_default(),
+                        spanKind:             insert_values.get("spanKind").cloned(),
+                        parentSpanId:         insert_values.get("parentSpanId").cloned(),
+                        traceState:           insert_values.get("traceState").cloned(),
+                        hasError:             false,
+                        severityText:         insert_values.get("severityText").cloned(),
+                        severityNumber:       insert_values.get("severityNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
+                        body:                 insert_values.get("body").cloned(),
+                        httpMethod:           insert_values.get("httpMethod").cloned(),
+                        httpUrl:              insert_values.get("httpUrl").cloned(),
+                        httpRoute:            insert_values.get("httpRoute").cloned(),
+                        httpHost:             insert_values.get("httpHost").cloned(),
+                        httpStatusCode:       insert_values.get("httpStatusCode").and_then(|s| s.parse().ok()),
+                        pathParams:           insert_values.get("pathParams").cloned(),
+                        queryParams:          insert_values.get("queryParams").cloned(),
+                        requestBody:          insert_values.get("requestBody").cloned(),
+                        responseBody:         insert_values.get("responseBody").cloned(),
+                        sdkType:              insert_values.get("sdkType").cloned().unwrap_or_default(),
+                        serviceVersion:       insert_values.get("serviceVersion").cloned(),
+                        errors:               insert_values.get("errors").cloned(),
+                        tags:                 insert_values.get("tags").map(|s| vec![s.clone()]).unwrap_or_default(),
+                        parentId:             insert_values.get("parentId").cloned(),
+                        dbSystem:             insert_values.get("dbSystem").cloned(),
+                        dbName:               insert_values.get("dbName").cloned(),
+                        dbStatement:          insert_values.get("dbStatement").cloned(),
+                        dbOperation:          insert_values.get("dbOperation").cloned(),
+                        rpcSystem:            insert_values.get("rpcSystem").cloned(),
+                        rpcService:           insert_values.get("rpcService").cloned(),
+                        rpcMethod:            insert_values.get("rpcMethod").cloned(),
+                        endpointHash:         insert_values.get("endpointHash").cloned().unwrap_or_default(),
+                        shapeHash:            insert_values.get("shapeHash").cloned().unwrap_or_default(),
+                        formatHashes:         insert_values.get("formatHashes").map(|s| vec![s.clone()]).unwrap_or_default(),
+                        fieldHashes:          insert_values.get("fieldHashes").map(|s| vec![s.clone()]).unwrap_or_default(),
+                        attributes:           insert_values.get("attributes").cloned(),
+                        events:               insert_values.get("events").cloned(),
+                        links:                insert_values.get("links").cloned(),
+                        resource:             insert_values.get("resource").cloned(),
                         instrumentationScope: insert_values.get("instrumentationScope").cloned(),
                     };
                     self.write(&record).await?;
@@ -592,38 +441,21 @@ impl Database {
 
     pub async fn refresh_table(&self, table_name: &str) -> Result<()> {
         let (conn_str, table_ref) = {
-            let configs = self
-                .project_configs
-                .read()
-                .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
-            configs
-                .get(table_name)
-                .ok_or_else(|| anyhow::anyhow!("Table not found"))?
-                .clone()
+            let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
+            configs.get(table_name).ok_or_else(|| anyhow::anyhow!("Table not found"))?.clone()
         };
 
         let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
-        *table_ref
-            .write()
-            .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = new_table;
+        *table_ref.write().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = new_table;
 
         let provider = {
-            let table_guard = table_ref
-                .read()
-                .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
-            let snapshot = table_guard
-                .snapshot()
-                .map_err(|e| anyhow::anyhow!("Snapshot error: {:?}", e))?;
+            let table_guard = table_ref.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
+            let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Snapshot error: {:?}", e))?;
             let log_store = table_guard.log_store().clone();
-            deltalake::delta_datafusion::DeltaTableProvider::try_new(
-                snapshot.clone(),
-                log_store,
-                deltalake::delta_datafusion::DeltaScanConfig::default(),
-            )?
+            deltalake::delta_datafusion::DeltaTableProvider::try_new(snapshot.clone(), log_store, deltalake::delta_datafusion::DeltaScanConfig::default())?
         };
 
-        self.ctx
-            .register_table("telemetry_events", Arc::new(provider))?;
+        self.ctx.register_table("telemetry_events", Arc::new(provider))?;
         Ok(())
     }
 
@@ -639,14 +471,8 @@ impl Database {
 
     pub async fn compact_project(&self, table_name: &str) -> Result<()> {
         let (conn_str, table_ref) = {
-            let configs = self
-                .project_configs
-                .read()
-                .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
-            configs
-                .get(table_name)
-                .ok_or_else(|| anyhow::anyhow!("Table not found"))?
-                .clone()
+            let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
+            configs.get(table_name).ok_or_else(|| anyhow::anyhow!("Table not found"))?.clone()
         };
 
         let (table, _metrics) = DeltaOps::try_from_uri(&conn_str)
@@ -656,9 +482,7 @@ impl Database {
             .await
             .map_err(|e| anyhow::anyhow!("Optimization failed: {:?}", e))?;
 
-        *table_ref
-            .write()
-            .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = table;
+        *table_ref.write().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = table;
         COMPACTION_COUNTER.inc();
         tracing::info!("Compaction for table '{}' completed.", table_name);
         Ok(())
@@ -666,10 +490,7 @@ impl Database {
 
     pub async fn compact_all_projects(&self) -> Result<()> {
         let table_names: Vec<String> = {
-            let configs = self
-                .project_configs
-                .read()
-                .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
+            let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             configs.keys().cloned().collect()
         };
         for table_name in table_names {
@@ -681,23 +502,15 @@ impl Database {
     }
 
     pub fn has_table(&self, table_name: &str) -> bool {
-        self.project_configs
-            .read()
-            .map(|configs| configs.contains_key(table_name))
-            .unwrap_or(false)
+        self.project_configs.read().map(|configs| configs.contains_key(table_name)).unwrap_or(false)
     }
 }
 
 /// Helper function to build a TimestampMicrosecondArray.
 fn build_timestamp_array(values: Vec<i64>, tz: Option<StdArc<str>>) -> TimestampMicrosecondArray {
-    use datafusion::arrow::array::ArrayData;
-    use datafusion::arrow::buffer::Buffer;
+    use datafusion::arrow::{array::ArrayData, buffer::Buffer};
     let data_type = DataType::Timestamp(TimeUnit::Microsecond, tz);
     let buffer = Buffer::from_slice_ref(&values);
-    let array_data = ArrayData::builder(data_type.clone())
-        .len(values.len())
-        .add_buffer(buffer)
-        .build()
-        .unwrap();
+    let array_data = ArrayData::builder(data_type.clone()).len(values.len()).add_buffer(buffer).build().unwrap();
     TimestampMicrosecondArray::from(array_data)
 }

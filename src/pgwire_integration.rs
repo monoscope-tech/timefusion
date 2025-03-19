@@ -1,45 +1,53 @@
 // pgwire_integration.rs
 
-use async_trait::async_trait;
-use pgwire::api::copy::NoopCopyHandler;
-use pgwire::api::results::{
-    DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, FieldInfo,
+use std::{
+    collections::HashMap,
+    convert::TryInto,
+    fs,
+    io::{Error as IoError, ErrorKind},
+    sync::Arc,
 };
-use pgwire::api::stmt::{QueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, Type, PgWireServerHandlers, NoopErrorHandler};
-use pgwire::messages::{PgWireFrontendMessage, PgWireBackendMessage};
-use pgwire::messages::response::{ReadyForQuery, TransactionStatus};
-use pgwire::messages::startup::Authentication;
-use pgwire::error::{PgWireError, PgWireResult};
-use pgwire::messages::data::DataRow;
-use futures::SinkExt;
-use tokio::sync::Mutex;
-use std::sync::Arc;
-use datafusion::prelude::*;
-use datafusion::logical_expr::LogicalPlan;
-use std::collections::HashMap;
-use datafusion::common::ParamValues;
-use bytes::BytesMut;
-use crate::utils::{prepare_sql, value_to_string};
-use tokio_util::sync::CancellationToken;
-use tracing::{info, error, debug};
-use std::fs;
-use std::io::{Error as IoError, ErrorKind};
-use serde::{Serialize, Deserialize};
-use bcrypt::{hash, verify, DEFAULT_COST};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::datasource::MemTable;
 
+use async_trait::async_trait;
+use bcrypt::{DEFAULT_COST, hash, verify};
+use bytes::BytesMut;
+use datafusion::{
+    arrow::datatypes::{DataType, Field, Schema, TimeUnit},
+    common::ParamValues,
+    datasource::MemTable,
+    logical_expr::LogicalPlan,
+    prelude::*,
+};
+use futures::SinkExt;
+use pgwire::{
+    api::{
+        ClientInfo, NoopErrorHandler, PgWireServerHandlers, Type,
+        copy::NoopCopyHandler,
+        results::{DescribePortalResponse, DescribeStatementResponse, FieldInfo, QueryResponse, Response},
+        stmt::{QueryParser, StoredStatement},
+    },
+    error::{PgWireError, PgWireResult},
+    messages::{
+        PgWireBackendMessage, PgWireFrontendMessage,
+        data::DataRow,
+        response::{ReadyForQuery, TransactionStatus},
+        startup::Authentication,
+    },
+};
+use serde::{Deserialize, Serialize};
 // Imports for SSL handling:
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use std::convert::TryInto;
+use tokio::{net::TcpStream, sync::Mutex};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info};
+
+use crate::utils::{prepare_sql, value_to_string};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct User {
-    pub username: String,
+    pub username:        String,
     pub hashed_password: String,
-    pub is_admin: bool,
+    pub is_admin:        bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -50,17 +58,15 @@ pub struct UserDB {
 impl UserDB {
     pub fn load_from_file(path: &str) -> Result<Self, IoError> {
         if let Ok(contents) = fs::read_to_string(path) {
-            let db: UserDB = serde_json::from_str(&contents)
-                .map_err(|e| IoError::new(ErrorKind::InvalidData, e))?;
+            let db: UserDB = serde_json::from_str(&contents).map_err(|e| IoError::new(ErrorKind::InvalidData, e))?;
             info!("Loaded user database from {}: {:?}", path, db.users);
             Ok(db)
         } else {
             info!("No user database found at {}. Creating default admin user.", path);
             let default_user = User {
-                username: "admin".to_string(),
-                hashed_password: hash("admin123", DEFAULT_COST)
-                    .map_err(|e| IoError::new(ErrorKind::Other, e))?,
-                is_admin: true,
+                username:        "admin".to_string(),
+                hashed_password: hash("admin123", DEFAULT_COST).map_err(|e| IoError::new(ErrorKind::Other, e))?,
+                is_admin:        true,
             };
             let db = UserDB { users: vec![default_user] };
             db.save_to_file(path)?;
@@ -69,8 +75,7 @@ impl UserDB {
     }
 
     pub fn save_to_file(&self, path: &str) -> Result<(), IoError> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(self).map_err(|e| IoError::new(ErrorKind::Other, e))?;
         fs::write(path, json)?;
         info!("Saved user database to {}", path);
         Ok(())
@@ -91,8 +96,7 @@ impl UserDB {
         if self.users.iter().any(|u| u.username == username) {
             return Err(IoError::new(ErrorKind::AlreadyExists, "User already exists"));
         }
-        let hashed = hash(password, DEFAULT_COST)
-            .map_err(|e| IoError::new(ErrorKind::Other, e))?;
+        let hashed = hash(password, DEFAULT_COST).map_err(|e| IoError::new(ErrorKind::Other, e))?;
         let user = User {
             username: username.to_string(),
             hashed_password: hashed,
@@ -111,9 +115,9 @@ impl UserDB {
 
 pub struct DfSessionService {
     pub session_context: Arc<SessionContext>,
-    pub parser: Arc<PgQueryParser>,
-    pub db: Arc<crate::database::Database>,
-    pub user_db: Arc<Mutex<UserDB>>,
+    pub parser:          Arc<PgQueryParser>,
+    pub db:              Arc<crate::database::Database>,
+    pub user_db:         Arc<Mutex<UserDB>>,
 }
 
 impl DfSessionService {
@@ -126,7 +130,7 @@ impl DfSessionService {
             error!("Failed to load user DB: {}. Starting with empty DB.", e);
             UserDB { users: vec![] }
         });
-        
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("event_name", DataType::Utf8, true),
@@ -169,11 +173,8 @@ impl QueryParser for PgQueryParser {
     async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<Self::Statement> {
         let new_sql = prepare_sql(sql).map_err(|e| PgWireError::ApiError(e.into()))?;
         let state = self.session_context.state();
-        let logical_plan = state.create_logical_plan(&new_sql)
-            .await
-            .map_err(|e| PgWireError::ApiError(e.into()))?;
-        let optimised = state.optimize(&logical_plan)
-            .map_err(|e| PgWireError::ApiError(e.into()))?;
+        let logical_plan = state.create_logical_plan(&new_sql).await.map_err(|e| PgWireError::ApiError(e.into()))?;
+        let optimised = state.optimize(&logical_plan).map_err(|e| PgWireError::ApiError(e.into()))?;
         Ok(optimised)
     }
 }
@@ -181,11 +182,7 @@ impl QueryParser for PgQueryParser {
 /// --- SIMPLE QUERY HANDLER ---
 #[async_trait]
 impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
-    async fn do_query<'a, C>(
-        &self,
-        _client: &mut C,
-        query: &'a str,
-    ) -> PgWireResult<Vec<Response<'a>>>
+    async fn do_query<'a, C>(&self, _client: &mut C, query: &'a str) -> PgWireResult<Vec<Response<'a>>>
     where
         C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
         <C as futures::Sink<PgWireBackendMessage>>::Error: std::fmt::Debug,
@@ -195,53 +192,37 @@ impl pgwire::api::query::SimpleQueryHandler for DfSessionService {
         debug!("Query after lowercase: {}", query_lower);
         let responses = if query_lower == "select 1 as number" {
             debug!("Handling simple SELECT 1 AS number");
-            let fields = vec![FieldInfo::new(
-                "number".to_string(),
-                None,
-                None,
-                Type::INT4,
-                pgwire::api::results::FieldFormat::Text,
-            )];
+            let fields = vec![FieldInfo::new("number".to_string(), None, None, Type::INT4, pgwire::api::results::FieldFormat::Text)];
             let row_values = vec![Some("1".to_string())];
             let row = DataRow::new(serialize_row(row_values), 1);
             let row_stream = futures::stream::iter(vec![Ok(row)]);
             vec![Response::Query(QueryResponse::new(fields.into(), row_stream))]
         } else if query_lower.starts_with("insert") {
             debug!("Processing INSERT query");
-            let msg = (&*self.db).insert_record(query)
-                .await
-                .map_err(|e| PgWireError::ApiError(e.into()))?;
+            let msg = (&*self.db).insert_record(query).await.map_err(|e| PgWireError::ApiError(e.into()))?;
             vec![command_complete_response(&msg)]
         } else if query_lower.starts_with("update") {
             debug!("Processing UPDATE query");
-            let msg = (&*self.db).update_record(query)
-                .await
-                .map_err(|e| PgWireError::ApiError(e.into()))?;
+            let msg = (&*self.db).update_record(query).await.map_err(|e| PgWireError::ApiError(e.into()))?;
             vec![command_complete_response(&msg)]
         } else if query_lower.starts_with("delete") {
             debug!("Processing DELETE query");
-            let msg = (&*self.db).delete_record(query)
-                .await
-                .map_err(|e| PgWireError::ApiError(e.into()))?;
+            let msg = (&*self.db).delete_record(query).await.map_err(|e| PgWireError::ApiError(e.into()))?;
             vec![command_complete_response(&msg)]
         } else {
             debug!("Preparing SQL: {}", query);
             let new_sql = prepare_sql(query).map_err(|e| PgWireError::ApiError(e.into()))?;
             debug!("Executing SQL: {}", new_sql);
-            let df = self.session_context.sql(&new_sql)
-                .await
-                .map_err(|e| {
-                    error!("DataFusion SQL execution failed: {:?}", e);
-                    PgWireError::ApiError(e.into())
-                })?;
+            let df = self.session_context.sql(&new_sql).await.map_err(|e| {
+                error!("DataFusion SQL execution failed: {:?}", e);
+                PgWireError::ApiError(e.into())
+            })?;
             debug!("DataFrame created successfully");
             debug!("Encoding DataFrame");
-            let qr = encode_dataframe(df, &pgwire::api::portal::Format::UnifiedText)
-                .await
-                .map_err(|e| {
-                    error!("Encoding DataFrame failed: {:?}", e);
-                    PgWireError::ApiError(e.into())
-                })?;
+            let qr = encode_dataframe(df, &pgwire::api::portal::Format::UnifiedText).await.map_err(|e| {
+                error!("Encoding DataFrame failed: {:?}", e);
+                PgWireError::ApiError(e.into())
+            })?;
             vec![Response::Query(qr)]
         };
         // Let PGWire automatically send ReadyForQuery.
@@ -259,24 +240,18 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         self.parser.clone()
     }
 
-    async fn do_describe_statement<C>(
-        &self,
-        _client: &mut C,
-        target: &StoredStatement<Self::Statement>,
-    ) -> PgWireResult<DescribeStatementResponse>
+    async fn do_describe_statement<C>(&self, _client: &mut C, target: &StoredStatement<Self::Statement>) -> PgWireResult<DescribeStatementResponse>
     where
         C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
     {
         let plan = &target.statement;
         let schema = plan.schema();
         let fields = pgwire_schema_from_arrow(schema)?;
-        let params = plan.get_parameter_types()
-            .map_err(|e| PgWireError::ApiError(e.into()))?;
+        let params = plan.get_parameter_types().map_err(|e| PgWireError::ApiError(e.into()))?;
         let mut param_types = Vec::with_capacity(params.len());
         for param in ordered_param_types(&params).iter() {
             if let Some(dt) = param {
-                let pgtype = into_pg_type(dt)
-                    .map_err(|e| PgWireError::ApiError(e.into()))?;
+                let pgtype = into_pg_type(dt).map_err(|e| PgWireError::ApiError(e.into()))?;
                 param_types.push(pgtype);
             } else {
                 param_types.push(Type::UNKNOWN);
@@ -285,11 +260,7 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
-    async fn do_describe_portal<C>(
-        &self,
-        _client: &mut C,
-        target: &pgwire::api::portal::Portal<Self::Statement>,
-    ) -> PgWireResult<DescribePortalResponse>
+    async fn do_describe_portal<C>(&self, _client: &mut C, target: &pgwire::api::portal::Portal<Self::Statement>) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
     {
@@ -298,30 +269,17 @@ impl pgwire::api::query::ExtendedQueryHandler for DfSessionService {
         Ok(DescribePortalResponse::new(fields))
     }
 
-    async fn do_query<'a, C>(
-        &self,
-        _client: &mut C,
-        portal: &'a pgwire::api::portal::Portal<Self::Statement>,
-        _max_rows: usize,
-    ) -> PgWireResult<Response<'a>>
+    async fn do_query<'a, C>(&self, _client: &mut C, portal: &'a pgwire::api::portal::Portal<Self::Statement>, _max_rows: usize) -> PgWireResult<Response<'a>>
     where
         C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
         <C as futures::Sink<PgWireBackendMessage>>::Error: std::fmt::Debug,
     {
         let plan = &portal.statement.statement;
-        let params = plan.get_parameter_types()
-            .map_err(|e| PgWireError::ApiError(e.into()))?;
-        let param_values = deserialize_parameters(portal, &ordered_param_types(&params))
-            .map_err(|e| PgWireError::ApiError(e.into()))?;
-        let plan_with_values = plan.clone()
-            .replace_params_with_values(&param_values)
-            .map_err(|e| PgWireError::ApiError(e.into()))?;
-        let df = self.session_context.execute_logical_plan(plan_with_values)
-            .await
-            .map_err(|e| PgWireError::ApiError(e.into()))?;
-        let resp = encode_dataframe(df, &portal.result_column_format)
-            .await
-            .map_err(|e| PgWireError::ApiError(e.into()))?;
+        let params = plan.get_parameter_types().map_err(|e| PgWireError::ApiError(e.into()))?;
+        let param_values = deserialize_parameters(portal, &ordered_param_types(&params)).map_err(|e| PgWireError::ApiError(e.into()))?;
+        let plan_with_values = plan.clone().replace_params_with_values(&param_values).map_err(|e| PgWireError::ApiError(e.into()))?;
+        let df = self.session_context.execute_logical_plan(plan_with_values).await.map_err(|e| PgWireError::ApiError(e.into()))?;
+        let resp = encode_dataframe(df, &portal.result_column_format).await.map_err(|e| PgWireError::ApiError(e.into()))?;
         // Let PGWire automatically send ReadyForQuery.
         Ok(Response::Query(resp))
     }
@@ -334,21 +292,12 @@ fn command_complete_response(msg: &str) -> Response<'static> {
     buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
     buf.extend_from_slice(bytes);
     let row_stream = futures::stream::iter(vec![Ok(DataRow::new(buf, 1))]);
-    let fields = vec![FieldInfo::new(
-        "CommandComplete".to_string(),
-        None,
-        None,
-        Type::TEXT,
-        pgwire::api::results::FieldFormat::Text,
-    )];
+    let fields = vec![FieldInfo::new("CommandComplete".to_string(), None, None, Type::TEXT, pgwire::api::results::FieldFormat::Text)];
     let qr = QueryResponse::new(fields.into(), row_stream);
     Response::Query(qr)
 }
 
-async fn encode_dataframe(
-    df: DataFrame,
-    _format: &pgwire::api::portal::Format,
-) -> Result<QueryResponse<'static>, Box<dyn std::error::Error + Send + Sync>> {
+async fn encode_dataframe(df: DataFrame, _format: &pgwire::api::portal::Format) -> Result<QueryResponse<'static>, Box<dyn std::error::Error + Send + Sync>> {
     debug!("Entering encode_dataframe with schema: {:?}", df.schema());
     let schema = (*df.schema()).clone();
     debug!("Collecting DataFrame...");
@@ -362,11 +311,7 @@ async fn encode_dataframe(
             let mut row_values = Vec::new();
             for col in 0..batch.num_columns() {
                 let array = batch.column(col);
-                let value = if array.is_null(row) {
-                    None
-                } else {
-                    Some(value_to_string(array.as_ref(), row))
-                };
+                let value = if array.is_null(row) { None } else { Some(value_to_string(array.as_ref(), row)) };
                 row_values.push(value);
             }
             all_rows.push(Ok(DataRow::new(serialize_row(row_values), batch.num_columns() as i16)));
@@ -399,7 +344,13 @@ fn pgwire_schema_from_arrow(schema: &datafusion::common::DFSchema) -> Result<Vec
     let mut fields = Vec::new();
     for field in schema.fields() {
         let pg_type = into_pg_type(field.data_type())?;
-        fields.push(FieldInfo::new(field.name().to_string(), None, None, pg_type, pgwire::api::results::FieldFormat::Text));
+        fields.push(FieldInfo::new(
+            field.name().to_string(),
+            None,
+            None,
+            pg_type,
+            pgwire::api::results::FieldFormat::Text,
+        ));
     }
     Ok(fields)
 }
@@ -415,25 +366,18 @@ fn into_pg_type(dt: &DataType) -> Result<Type, Box<dyn std::error::Error + Send 
 }
 
 fn deserialize_parameters<T>(
-    _portal: &pgwire::api::portal::Portal<T>,
-    _ordered: &Vec<Option<&DataType>>,
+    _portal: &pgwire::api::portal::Portal<T>, _ordered: &Vec<Option<&DataType>>,
 ) -> Result<ParamValues, Box<dyn std::error::Error + Send + Sync>> {
     Ok(ParamValues::List(vec![]))
 }
 
-fn ordered_param_types(
-    types: &HashMap<String, Option<DataType>>,
-) -> Vec<Option<&DataType>> {
+fn ordered_param_types(types: &HashMap<String, Option<DataType>>) -> Vec<Option<&DataType>> {
     types.values().map(|opt| opt.as_ref()).collect()
 }
 
 #[async_trait]
 impl pgwire::api::auth::StartupHandler for DfSessionService {
-    async fn on_startup<C>(
-        &self,
-        client: &mut C,
-        msg: PgWireFrontendMessage,
-    ) -> Result<(), PgWireError>
+    async fn on_startup<C>(&self, client: &mut C, msg: PgWireFrontendMessage) -> Result<(), PgWireError>
     where
         C: ClientInfo + SinkExt<PgWireBackendMessage> + Unpin + Send,
         C::Error: std::fmt::Debug,
@@ -451,20 +395,14 @@ impl pgwire::api::auth::StartupHandler for DfSessionService {
                 let user_db = self.user_db.lock().await;
                 if user_db.verify_user(user, provided_password) {
                     info!("User '{}' authenticated successfully", user);
-                    client.send(PgWireBackendMessage::Authentication(Authentication::Ok))
-                        .await
-                        .map_err(|e| {
-                            error!("Failed to send AuthenticationOk: {:?}", e);
-                            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
-                        })?;
-                    client.send(PgWireBackendMessage::ReadyForQuery(
-                        ReadyForQuery::new(TransactionStatus::Idle)
-                    ))
-                    .await
-                        .map_err(|e| {
-                            error!("Failed to send ReadyForQuery: {:?}", e);
-                            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
-                        })?;
+                    client.send(PgWireBackendMessage::Authentication(Authentication::Ok)).await.map_err(|e| {
+                        error!("Failed to send AuthenticationOk: {:?}", e);
+                        PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
+                    })?;
+                    client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle))).await.map_err(|e| {
+                        error!("Failed to send ReadyForQuery: {:?}", e);
+                        PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
+                    })?;
                     debug!("Startup completed successfully for user '{}'", user);
                     return Ok(());
                 } else {
@@ -477,20 +415,14 @@ impl pgwire::api::auth::StartupHandler for DfSessionService {
                     let user_db = self.user_db.lock().await;
                     if user_db.verify_user(user, &fallback_password) {
                         info!("User '{}' authenticated using fallback password", user);
-                        client.send(PgWireBackendMessage::Authentication(Authentication::Ok))
-                            .await
-                            .map_err(|e| {
-                                error!("Failed to send AuthenticationOk: {:?}", e);
-                                PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
-                            })?;
-                        client.send(PgWireBackendMessage::ReadyForQuery(
-                            ReadyForQuery::new(TransactionStatus::Idle)
-                        ))
-                        .await
-                            .map_err(|e| {
-                                error!("Failed to send ReadyForQuery: {:?}", e);
-                                PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
-                            })?;
+                        client.send(PgWireBackendMessage::Authentication(Authentication::Ok)).await.map_err(|e| {
+                            error!("Failed to send AuthenticationOk: {:?}", e);
+                            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
+                        })?;
+                        client.send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(TransactionStatus::Idle))).await.map_err(|e| {
+                            error!("Failed to send ReadyForQuery: {:?}", e);
+                            PgWireError::IoError(std::io::Error::new(ErrorKind::Other, format!("{:?}", e)))
+                        })?;
                         debug!("Startup completed successfully with fallback for user '{}'", user);
                         return Ok(());
                     } else {
@@ -536,11 +468,7 @@ impl PgWireServerHandlers for HandlerFactory {
 }
 
 /// run_pgwire_server intercepts SSLRequest and passes the socket to pgwire::tokio::process_socket.
-pub async fn run_pgwire_server<H>(
-    handler: H,
-    addr: &str,
-    shutdown: CancellationToken,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+pub async fn run_pgwire_server<H>(handler: H, addr: &str, shutdown: CancellationToken) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     H: PgWireServerHandlers + Clone + Send + Sync + 'static,
 {
