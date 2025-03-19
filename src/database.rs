@@ -1,13 +1,9 @@
-// database.rs
-
 use datafusion::prelude::*;
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::arrow::array::{
-    StringArray, TimestampMicrosecondArray, Int32Array, Int64Array, ListBuilder, StringBuilder, BooleanArray,
-};
 use datafusion::execution::context::SessionContext;
-use deltalake::{DeltaTableBuilder, DeltaOps};
+use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use deltalake::arrow::array::{self as delta_arrow, TimestampMicrosecondArray};
+use deltalake::arrow::buffer::{ScalarBuffer, NullBuffer};
+use deltalake::{DeltaTableBuilder, DeltaOps, DeltaTable};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use crate::utils::prepare_sql;
@@ -19,7 +15,7 @@ use crate::metrics::COMPACTION_COUNTER;
 use dotenv::dotenv;
 use std::sync::Arc as StdArc;
 
-pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
+pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<DeltaTable>>)>>>;
 
 pub struct Database {
     pub ctx: SessionContext,
@@ -40,7 +36,6 @@ impl Database {
         self.ctx.clone()
     }
 
-    /// Add a table using the fixed key "telemetry_events"
     pub async fn add_project(&self, table_name: &str, connection_string: &str) -> Result<()> {
         let table = match DeltaTableBuilder::from_uri(connection_string).load().await {
             Ok(table) => table,
@@ -61,56 +56,55 @@ impl Database {
         Ok(())
     }
 
-    /// Schema matching your new DB table definition.
-    fn event_schema() -> Schema {
+    pub fn event_schema() -> Schema {
         Schema::new(vec![
-            Field::new("projectId", DataType::Utf8, false),
+            Field::new("project_id", DataType::Utf8, false),
             Field::new("id", DataType::Utf8, false),
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), false),
-            Field::new("traceId", DataType::Utf8, false),
-            Field::new("spanId", DataType::Utf8, false),
-            Field::new("eventType", DataType::Utf8, false),
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("span_id", DataType::Utf8, false),
+            Field::new("event_type", DataType::Utf8, false),
             Field::new("status", DataType::Utf8, true),
-            Field::new("endTime", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), true),
-            Field::new("durationNs", DataType::Int64, false),
-            Field::new("spanName", DataType::Utf8, false),
-            Field::new("spanKind", DataType::Utf8, true),
-            Field::new("parentSpanId", DataType::Utf8, true),
-            Field::new("traceState", DataType::Utf8, true),
-            Field::new("hasError", DataType::Boolean, false),
-            Field::new("severityText", DataType::Utf8, true),
-            Field::new("severityNumber", DataType::Int32, false),
+            Field::new("end_time", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), true),
+            Field::new("duration_ns", DataType::Int64, false),
+            Field::new("span_name", DataType::Utf8, false),
+            Field::new("span_kind", DataType::Utf8, true),
+            Field::new("parent_span_id", DataType::Utf8, true),
+            Field::new("trace_state", DataType::Utf8, true),
+            Field::new("has_error", DataType::Boolean, false),
+            Field::new("severity_text", DataType::Utf8, true),
+            Field::new("severity_number", DataType::Int32, false),
             Field::new("body", DataType::Utf8, true),
-            Field::new("httpMethod", DataType::Utf8, true),
-            Field::new("httpUrl", DataType::Utf8, true),
-            Field::new("httpRoute", DataType::Utf8, true),
-            Field::new("httpHost", DataType::Utf8, true),
-            Field::new("httpStatusCode", DataType::Int32, true),
-            Field::new("pathParams", DataType::Utf8, false),
-            Field::new("queryParams", DataType::Utf8, false),
-            Field::new("requestBody", DataType::Utf8, false),
-            Field::new("responseBody", DataType::Utf8, false),
-            Field::new("sdkType", DataType::Utf8, false),
-            Field::new("serviceVersion", DataType::Utf8, true),
+            Field::new("http_method", DataType::Utf8, true),
+            Field::new("http_url", DataType::Utf8, true),
+            Field::new("http_route", DataType::Utf8, true),
+            Field::new("http_host", DataType::Utf8, true),
+            Field::new("http_status_code", DataType::Int32, true),
+            Field::new("path_params", DataType::Utf8, false),
+            Field::new("query_params", DataType::Utf8, false),
+            Field::new("request_body", DataType::Utf8, false),
+            Field::new("response_body", DataType::Utf8, false),
+            Field::new("sdk_type", DataType::Utf8, false),
+            Field::new("service_version", DataType::Utf8, true),
             Field::new("errors", DataType::Utf8, false),
             Field::new("tags", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
-            Field::new("parentId", DataType::Utf8, true),
-            Field::new("dbSystem", DataType::Utf8, true),
-            Field::new("dbName", DataType::Utf8, true),
-            Field::new("dbStatement", DataType::Utf8, true),
-            Field::new("dbOperation", DataType::Utf8, true),
-            Field::new("rpcSystem", DataType::Utf8, true),
-            Field::new("rpcService", DataType::Utf8, true),
-            Field::new("rpcMethod", DataType::Utf8, true),
-            Field::new("endpointHash", DataType::Utf8, false),
-            Field::new("shapeHash", DataType::Utf8, false),
-            Field::new("formatHashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
-            Field::new("fieldHashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
+            Field::new("parent_id", DataType::Utf8, true),
+            Field::new("db_system", DataType::Utf8, true),
+            Field::new("db_name", DataType::Utf8, true),
+            Field::new("db_statement", DataType::Utf8, true),
+            Field::new("db_operation", DataType::Utf8, true),
+            Field::new("rpc_system", DataType::Utf8, true),
+            Field::new("rpc_service", DataType::Utf8, true),
+            Field::new("rpc_method", DataType::Utf8, true),
+            Field::new("endpoint_hash", DataType::Utf8, false),
+            Field::new("shape_hash", DataType::Utf8, false),
+            Field::new("format_hashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
+            Field::new("field_hashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
             Field::new("attributes", DataType::Utf8, false),
             Field::new("events", DataType::Utf8, false),
             Field::new("links", DataType::Utf8, false),
             Field::new("resource", DataType::Utf8, false),
-            Field::new("instrumentationScope", DataType::Utf8, false),
+            Field::new("instrumentation_scope", DataType::Utf8, false),
         ])
     }
 
@@ -119,38 +113,38 @@ impl Database {
         schema.fields().iter().map(|f| {
             match f.data_type() {
                 DataType::Utf8 => deltalake::kernel::StructField::new(
-                    f.name().to_string(), 
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String), 
+                    f.name().to_string(),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
                     f.is_nullable()
                 ),
                 DataType::Timestamp(_, _) => deltalake::kernel::StructField::new(
-                    f.name().to_string(), 
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Timestamp), 
+                    f.name().to_string(),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Timestamp),
                     f.is_nullable()
                 ),
                 DataType::Int64 => deltalake::kernel::StructField::new(
-                    f.name().to_string(), 
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Long), 
+                    f.name().to_string(),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Long),
                     f.is_nullable()
                 ),
                 DataType::Int32 => deltalake::kernel::StructField::new(
-                    f.name().to_string(), 
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Integer), 
+                    f.name().to_string(),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Integer),
                     f.is_nullable()
                 ),
                 DataType::Boolean => deltalake::kernel::StructField::new(
-                    f.name().to_string(), 
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Boolean), 
+                    f.name().to_string(),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Boolean),
                     f.is_nullable()
                 ),
                 DataType::List(_) => deltalake::kernel::StructField::new(
-                    f.name().to_string(), 
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String), 
+                    f.name().to_string(),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
                     f.is_nullable()
                 ),
                 _ => deltalake::kernel::StructField::new(
-                    f.name().to_string(), 
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String), 
+                    f.name().to_string(),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
                     f.is_nullable()
                 ),
             }
@@ -172,22 +166,16 @@ impl Database {
             }
         };
 
+        // Create the DeltaTableProvider and cast it into the expected trait object.
+        let provider_raw = deltalake::delta_datafusion::DeltaTableProvider::try_new(
+            table.state.clone().expect("Table state should be loaded"),
+            table.log_store().clone(),
+            deltalake::delta_datafusion::DeltaScanConfig::default(),
+        )?;
+        let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(provider_raw);
+        self.ctx.register_table("telemetry_events", provider)?;
+
         let table_ref = Arc::new(RwLock::new(table));
-        let provider = {
-            let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
-            let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {:?}", e))?;
-            let log_store = table_guard.log_store().clone();
-            deltalake::delta_datafusion::DeltaTableProvider::try_new(
-                snapshot.clone(),
-                log_store,
-                deltalake::delta_datafusion::DeltaScanConfig::default(),
-            ).map_err(|e| anyhow::anyhow!("Failed to create provider: {:?}", e))?
-        };
-
-        // Register the table under the fixed name "telemetry_events"
-        self.ctx.register_table("telemetry_events", Arc::new(provider))
-            .map_err(|e| anyhow::anyhow!("Failed to register table: {:?}", e))?;
-
         self.project_configs.write()
             .map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?
             .insert(table_name.to_string(), (table_uri.to_string(), table_ref));
@@ -204,7 +192,6 @@ impl Database {
         Ok(df)
     }
 
-    /// Write an IngestRecord into the fixed "telemetry_events" table.
     pub async fn write(&self, record: &crate::persistent_queue::IngestRecord) -> Result<()> {
         let (conn_str, _table_ref) = {
             let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
@@ -214,131 +201,91 @@ impl Database {
         let ts = DateTime::parse_from_rfc3339(&record.timestamp)
             .map_err(|e| anyhow::anyhow!("Invalid timestamp: {:?}", e))?;
         let ts_micro = ts.timestamp_micros();
-        let end_ts_micro = record.endTime.as_ref()
+        let end_ts_micro = record.end_time.as_ref()
             .map(|et| DateTime::parse_from_rfc3339(et).map(|dt| dt.timestamp_micros()))
             .transpose()?;
 
-        let project_id_array = StringArray::from(vec![record.projectId.clone()]);
-        let id_array = StringArray::from(vec![record.id.clone()]);
-        let timestamp_array = Arc::new(build_timestamp_array(vec![ts_micro], Some(StdArc::from("UTC"))));
-        let trace_id_array = StringArray::from(vec![record.traceId.clone()]);
-        let span_id_array = StringArray::from(vec![record.spanId.clone()]);
-        let event_type_array = StringArray::from(vec![record.eventType.clone()]);
-        let status_array = StringArray::from(vec![record.status.clone().unwrap_or_default()]);
-        let end_time_array = Arc::new(build_timestamp_array(vec![end_ts_micro.unwrap_or(0)], Some(StdArc::from("UTC"))));
-        let duration_ns_array = Int64Array::from(vec![record.durationNs]);
-        let span_name_array = StringArray::from(vec![record.spanName.clone()]);
-        let span_kind_array = StringArray::from(vec![record.spanKind.clone().unwrap_or_default()]);
-        let parent_span_id_array = StringArray::from(vec![record.parentSpanId.as_deref().unwrap_or("")]);
-        let trace_state_array = StringArray::from(vec![record.traceState.clone().unwrap_or_default()]);
-        let has_error_array = BooleanArray::from(vec![record.hasError]);
-        let severity_text_array = StringArray::from(vec![record.severityText.clone().unwrap_or_default()]);
-        let severity_number_array = Int32Array::from(vec![record.severityNumber]);
-        let body_array = StringArray::from(vec![record.body.clone().unwrap_or_else(|| "{}".to_string())]);
-        let http_method_array = StringArray::from(vec![record.httpMethod.clone().unwrap_or_default()]);
-        let http_url_array = StringArray::from(vec![record.httpUrl.clone().unwrap_or_default()]);
-        let http_route_array = StringArray::from(vec![record.httpRoute.clone().unwrap_or_default()]);
-        let http_host_array = StringArray::from(vec![record.httpHost.clone().unwrap_or_default()]);
-        let http_status_code_array = Int32Array::from(vec![record.httpStatusCode.unwrap_or(0)]);
-        let path_params_array = StringArray::from(vec![record.pathParams.clone().unwrap_or_else(|| "{}".to_string())]);
-        let query_params_array = StringArray::from(vec![record.queryParams.clone().unwrap_or_else(|| "{}".to_string())]);
-        let request_body_array = StringArray::from(vec![record.requestBody.clone().unwrap_or_else(|| "{}".to_string())]);
-        let response_body_array = StringArray::from(vec![record.responseBody.clone().unwrap_or_else(|| "{}".to_string())]);
-        let sdk_type_array = StringArray::from(vec![record.sdkType.clone()]);
-        let service_version_array = StringArray::from(vec![record.serviceVersion.clone().unwrap_or_default()]);
-        let errors_array = StringArray::from(vec![record.errors.clone().unwrap_or_else(|| "{}".to_string())]);
-
-        let mut tags_builder = ListBuilder::new(StringBuilder::new());
-        for tag in &record.tags {
-            tags_builder.values().append_value(tag);
-        }
-        tags_builder.append(true);
-        let tags_array = tags_builder.finish();
-
-        let parent_id_array = StringArray::from(vec![record.parentId.clone().unwrap_or_default()]);
-        let db_system_array = StringArray::from(vec![record.dbSystem.clone().unwrap_or_default()]);
-        let db_name_array = StringArray::from(vec![record.dbName.clone().unwrap_or_default()]);
-        let db_statement_array = StringArray::from(vec![record.dbStatement.clone().unwrap_or_default()]);
-        let db_operation_array = StringArray::from(vec![record.dbOperation.clone().unwrap_or_default()]);
-        let rpc_system_array = StringArray::from(vec![record.rpcSystem.clone().unwrap_or_default()]);
-        let rpc_service_array = StringArray::from(vec![record.rpcService.clone().unwrap_or_default()]);
-        let rpc_method_array = StringArray::from(vec![record.rpcMethod.clone().unwrap_or_default()]);
-        let endpoint_hash_array = StringArray::from(vec![record.endpointHash.clone()]);
-        let shape_hash_array = StringArray::from(vec![record.shapeHash.clone()]);
-        
-        let mut format_hashes_builder = ListBuilder::new(StringBuilder::new());
-        for hash in &record.formatHashes {
-            format_hashes_builder.values().append_value(hash);
-        }
-        format_hashes_builder.append(true);
-        let format_hashes_array = format_hashes_builder.finish();
-
-        let mut field_hashes_builder = ListBuilder::new(StringBuilder::new());
-        for hash in &record.fieldHashes {
-            field_hashes_builder.values().append_value(hash);
-        }
-        field_hashes_builder.append(true);
-        let field_hashes_array = field_hashes_builder.finish();
-
-        let attributes_array = StringArray::from(vec![record.attributes.clone().unwrap_or_else(|| "{}".to_string())]);
-        let events_array = StringArray::from(vec![record.events.clone().unwrap_or_else(|| "{}".to_string())]);
-        let links_array = StringArray::from(vec![record.links.clone().unwrap_or_else(|| "{}".to_string())]);
-        let resource_array = StringArray::from(vec![record.resource.clone().unwrap_or_else(|| "{}".to_string())]);
-        let instrumentation_scope_array = StringArray::from(vec![record.instrumentationScope.clone().unwrap_or_else(|| "{}".to_string())]);
-
-        let schema = Self::event_schema();
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
+        let schema = Arc::new(Self::event_schema());
+        let batch = delta_arrow::RecordBatch::try_new(
+            schema.clone(),
             vec![
-                Arc::new(project_id_array),
-                Arc::new(id_array),
-                timestamp_array,
-                Arc::new(trace_id_array),
-                Arc::new(span_id_array),
-                Arc::new(event_type_array),
-                Arc::new(status_array),
-                end_time_array,
-                Arc::new(duration_ns_array),
-                Arc::new(span_name_array),
-                Arc::new(span_kind_array),
-                Arc::new(parent_span_id_array),
-                Arc::new(trace_state_array),
-                Arc::new(has_error_array),
-                Arc::new(severity_text_array),
-                Arc::new(severity_number_array),
-                Arc::new(body_array),
-                Arc::new(http_method_array),
-                Arc::new(http_url_array),
-                Arc::new(http_route_array),
-                Arc::new(http_host_array),
-                Arc::new(http_status_code_array),
-                Arc::new(path_params_array),
-                Arc::new(query_params_array),
-                Arc::new(request_body_array),
-                Arc::new(response_body_array),
-                Arc::new(sdk_type_array),
-                Arc::new(service_version_array),
-                Arc::new(errors_array),
-                Arc::new(tags_array),
-                Arc::new(parent_id_array),
-                Arc::new(db_system_array),
-                Arc::new(db_name_array),
-                Arc::new(db_statement_array),
-                Arc::new(db_operation_array),
-                Arc::new(rpc_system_array),
-                Arc::new(rpc_service_array),
-                Arc::new(rpc_method_array),
-                Arc::new(endpoint_hash_array),
-                Arc::new(shape_hash_array),
-                Arc::new(format_hashes_array),
-                Arc::new(field_hashes_array),
-                Arc::new(attributes_array),
-                Arc::new(events_array),
-                Arc::new(links_array),
-                Arc::new(resource_array),
-                Arc::new(instrumentation_scope_array),
+                Arc::new(delta_arrow::StringArray::from(vec![record.project_id.clone()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.id.clone()])),
+                Arc::new(delta_arrow::TimestampMicrosecondArray::new(
+                    ScalarBuffer::from(vec![ts_micro]),
+                    None,
+                )),
+                Arc::new(delta_arrow::StringArray::from(vec![record.trace_id.clone()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.span_id.clone()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.event_type.clone()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.status.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::TimestampMicrosecondArray::new(
+                    ScalarBuffer::from(vec![end_ts_micro.unwrap_or(0)]),
+                    end_ts_micro.is_none().then(|| NullBuffer::new_null(1)),
+                )),
+                Arc::new(delta_arrow::Int64Array::from(vec![record.duration_ns])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.span_name.clone()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.span_kind.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.parent_span_id.as_deref().unwrap_or("")])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.trace_state.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::BooleanArray::from(vec![record.has_error])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.severity_text.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::Int32Array::from(vec![record.severity_number])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.body.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.http_method.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.http_url.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.http_route.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.http_host.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::Int32Array::from(vec![record.http_status_code.unwrap_or(0)])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.path_params.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.query_params.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.request_body.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.response_body.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.sdk_type.clone()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.service_version.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.errors.clone().unwrap_or_else(|| "{}".to_string())])),
+                {
+                    let mut tags_builder = delta_arrow::ListBuilder::new(delta_arrow::StringBuilder::new());
+                    for tag in &record.tags {
+                        tags_builder.values().append_value(tag);
+                    }
+                    tags_builder.append(true);
+                    Arc::new(tags_builder.finish())
+                },
+                Arc::new(delta_arrow::StringArray::from(vec![record.parent_id.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.db_system.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.db_name.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.db_statement.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.db_operation.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.rpc_system.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.rpc_service.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.rpc_method.clone().unwrap_or_default()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.endpoint_hash.clone()])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.shape_hash.clone()])),
+                {
+                    let mut format_hashes_builder = delta_arrow::ListBuilder::new(delta_arrow::StringBuilder::new());
+                    for hash in &record.format_hashes {
+                        format_hashes_builder.values().append_value(hash);
+                    }
+                    format_hashes_builder.append(true);
+                    Arc::new(format_hashes_builder.finish())
+                },
+                {
+                    let mut field_hashes_builder = delta_arrow::ListBuilder::new(delta_arrow::StringBuilder::new());
+                    for hash in &record.field_hashes {
+                        field_hashes_builder.values().append_value(hash);
+                    }
+                    field_hashes_builder.append(true);
+                    Arc::new(field_hashes_builder.finish())
+                },
+                Arc::new(delta_arrow::StringArray::from(vec![record.attributes.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.events.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.links.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.resource.clone().unwrap_or_else(|| "{}".to_string())])),
+                Arc::new(delta_arrow::StringArray::from(vec![record.instrumentation_scope.clone().unwrap_or_else(|| "{}".to_string())])),
             ],
         )?;
+
         DeltaOps::try_from_uri(&conn_str)
             .await?
             .write(vec![batch])
@@ -372,58 +319,58 @@ impl Database {
                             _ => return Err(anyhow::anyhow!("Unsupported value type: {:?}", val)),
                         }
                     }
-                    let project_id = insert_values.get("projectId")
-                        .ok_or_else(|| anyhow::anyhow!("Missing projectId"))?;
+                    let project_id = insert_values.get("project_id")
+                        .ok_or_else(|| anyhow::anyhow!("Missing project_id"))?;
                     let timestamp = insert_values.get("timestamp")
                         .ok_or_else(|| anyhow::anyhow!("Missing timestamp"))?;
                     let record = crate::persistent_queue::IngestRecord {
-                        projectId: project_id.clone(),
+                        project_id: project_id.clone(),
                         id: insert_values.get("id").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                         timestamp: timestamp.clone(),
-                        traceId: insert_values.get("traceId").cloned().unwrap_or_default(),
-                        spanId: insert_values.get("spanId").cloned().unwrap_or_default(),
-                        eventType: insert_values.get("eventType").cloned().unwrap_or_else(|| "span".to_string()),
+                        trace_id: insert_values.get("trace_id").cloned().unwrap_or_default(),
+                        span_id: insert_values.get("span_id").cloned().unwrap_or_default(),
+                        event_type: insert_values.get("event_type").cloned().unwrap_or_else(|| "span".to_string()),
                         status: insert_values.get("status").cloned(),
-                        endTime: insert_values.get("endTime").cloned(),
-                        durationNs: insert_values.get("durationNs").and_then(|s| s.parse().ok()).unwrap_or(0),
-                        spanName: insert_values.get("spanName").cloned().unwrap_or_default(),
-                        spanKind: insert_values.get("spanKind").cloned(),
-                        parentSpanId: insert_values.get("parentSpanId").cloned(),
-                        traceState: insert_values.get("traceState").cloned(),
-                        hasError: false,
-                        severityText: insert_values.get("severityText").cloned(),
-                        severityNumber: insert_values.get("severityNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
+                        end_time: insert_values.get("end_time").cloned(),
+                        duration_ns: insert_values.get("duration_ns").and_then(|s| s.parse().ok()).unwrap_or(0),
+                        span_name: insert_values.get("span_name").cloned().unwrap_or_default(),
+                        span_kind: insert_values.get("span_kind").cloned(),
+                        parent_span_id: insert_values.get("parent_span_id").cloned(),
+                        trace_state: insert_values.get("trace_state").cloned(),
+                        has_error: false,
+                        severity_text: insert_values.get("severity_text").cloned(),
+                        severity_number: insert_values.get("severity_number").and_then(|s| s.parse().ok()).unwrap_or(0),
                         body: insert_values.get("body").cloned(),
-                        httpMethod: insert_values.get("httpMethod").cloned(),
-                        httpUrl: insert_values.get("httpUrl").cloned(),
-                        httpRoute: insert_values.get("httpRoute").cloned(),
-                        httpHost: insert_values.get("httpHost").cloned(),
-                        httpStatusCode: insert_values.get("httpStatusCode").and_then(|s| s.parse().ok()),
-                        pathParams: insert_values.get("pathParams").cloned(),
-                        queryParams: insert_values.get("queryParams").cloned(),
-                        requestBody: insert_values.get("requestBody").cloned(),
-                        responseBody: insert_values.get("responseBody").cloned(),
-                        sdkType: insert_values.get("sdkType").cloned().unwrap_or_default(),
-                        serviceVersion: insert_values.get("serviceVersion").cloned(),
+                        http_method: insert_values.get("http_method").cloned(),
+                        http_url: insert_values.get("http_url").cloned(),
+                        http_route: insert_values.get("http_route").cloned(),
+                        http_host: insert_values.get("http_host").cloned(),
+                        http_status_code: insert_values.get("http_status_code").and_then(|s| s.parse().ok()),
+                        path_params: insert_values.get("path_params").cloned(),
+                        query_params: insert_values.get("query_params").cloned(),
+                        request_body: insert_values.get("request_body").cloned(),
+                        response_body: insert_values.get("response_body").cloned(),
+                        sdk_type: insert_values.get("sdk_type").cloned().unwrap_or_default(),
+                        service_version: insert_values.get("service_version").cloned(),
                         errors: insert_values.get("errors").cloned(),
                         tags: insert_values.get("tags").map(|s| vec![s.clone()]).unwrap_or_default(),
-                        parentId: insert_values.get("parentId").cloned(),
-                        dbSystem: insert_values.get("dbSystem").cloned(),
-                        dbName: insert_values.get("dbName").cloned(),
-                        dbStatement: insert_values.get("dbStatement").cloned(),
-                        dbOperation: insert_values.get("dbOperation").cloned(),
-                        rpcSystem: insert_values.get("rpcSystem").cloned(),
-                        rpcService: insert_values.get("rpcService").cloned(),
-                        rpcMethod: insert_values.get("rpcMethod").cloned(),
-                        endpointHash: insert_values.get("endpointHash").cloned().unwrap_or_default(),
-                        shapeHash: insert_values.get("shapeHash").cloned().unwrap_or_default(),
-                        formatHashes: insert_values.get("formatHashes").map(|s| vec![s.clone()]).unwrap_or_default(),
-                        fieldHashes: insert_values.get("fieldHashes").map(|s| vec![s.clone()]).unwrap_or_default(),
+                        parent_id: insert_values.get("parent_id").cloned(),
+                        db_system: insert_values.get("db_system").cloned(),
+                        db_name: insert_values.get("db_name").cloned(),
+                        db_statement: insert_values.get("db_statement").cloned(),
+                        db_operation: insert_values.get("db_operation").cloned(),
+                        rpc_system: insert_values.get("rpc_system").cloned(),
+                        rpc_service: insert_values.get("rpc_service").cloned(),
+                        rpc_method: insert_values.get("rpc_method").cloned(),
+                        endpoint_hash: insert_values.get("endpoint_hash").cloned().unwrap_or_default(),
+                        shape_hash: insert_values.get("shape_hash").cloned().unwrap_or_default(),
+                        format_hashes: insert_values.get("format_hashes").map(|s| vec![s.clone()]).unwrap_or_default(),
+                        field_hashes: insert_values.get("field_hashes").map(|s| vec![s.clone()]).unwrap_or_default(),
                         attributes: insert_values.get("attributes").cloned(),
                         events: insert_values.get("events").cloned(),
                         links: insert_values.get("links").cloned(),
                         resource: insert_values.get("resource").cloned(),
-                        instrumentationScope: insert_values.get("instrumentationScope").cloned(),
+                        instrumentation_scope: insert_values.get("instrumentation_scope").cloned(),
                     };
                     self.write(&record).await?;
                     self.refresh_table("telemetry_events").await?;
@@ -443,20 +390,16 @@ impl Database {
         };
 
         let new_table = DeltaTableBuilder::from_uri(&conn_str).load().await?;
-        *table_ref.write().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = new_table;
+        *table_ref.write().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))? = new_table.clone();
 
-        let provider = {
-            let table_guard = table_ref.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
-            let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Snapshot error: {:?}", e))?;
-            let log_store = table_guard.log_store().clone();
-            deltalake::delta_datafusion::DeltaTableProvider::try_new(
-                snapshot.clone(),
-                log_store,
-                deltalake::delta_datafusion::DeltaScanConfig::default(),
-            )?
-        };
+        let provider_raw = deltalake::delta_datafusion::DeltaTableProvider::try_new(
+            new_table.state.clone().expect("Table state should be loaded"),
+            new_table.log_store().clone(),
+            deltalake::delta_datafusion::DeltaScanConfig::default(),
+        )?;
+        let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(provider_raw);
+        self.ctx.register_table("telemetry_events", provider)?;
 
-        self.ctx.register_table("telemetry_events", Arc::new(provider))?;
         Ok(())
     }
 
@@ -509,16 +452,8 @@ impl Database {
     }
 }
 
-/// Helper function to build a TimestampMicrosecondArray.
-fn build_timestamp_array(values: Vec<i64>, tz: Option<StdArc<str>>) -> TimestampMicrosecondArray {
-    use datafusion::arrow::array::ArrayData;
-    use datafusion::arrow::buffer::Buffer;
-    let data_type = DataType::Timestamp(TimeUnit::Microsecond, tz);
-    let buffer = Buffer::from_slice_ref(&values);
-    let array_data = ArrayData::builder(data_type.clone())
-        .len(values.len())
-        .add_buffer(buffer)
-        .build()
-        .unwrap();
-    TimestampMicrosecondArray::from(array_data)
+#[allow(dead_code)]
+fn build_timestamp_array(values: Vec<i64>, _tz: Option<StdArc<str>>) -> TimestampMicrosecondArray {
+    let buffer = ScalarBuffer::from(values);
+    TimestampMicrosecondArray::new(buffer, None)
 }

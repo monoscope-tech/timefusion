@@ -1,56 +1,57 @@
 use serde::{Serialize, Deserialize};
 use sled::{Db, IVec};
 use std::path::Path;
+use anyhow::Result;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct IngestRecord {
-    pub projectId: String,
+    pub project_id: String,
     pub id: String,
     pub timestamp: String,
-    pub traceId: String,
-    pub spanId: String,
-    pub eventType: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub event_type: String,
     pub status: Option<String>,
-    pub endTime: Option<String>,
-    pub durationNs: i64,
-    pub spanName: String,
-    pub spanKind: Option<String>,
-    pub parentSpanId: Option<String>,
-    pub traceState: Option<String>,
-    pub hasError: bool,
-    pub severityText: Option<String>,
-    pub severityNumber: i32,
+    pub end_time: Option<String>,
+    pub duration_ns: i64,
+    pub span_name: String,
+    pub span_kind: Option<String>,
+    pub parent_span_id: Option<String>,
+    pub trace_state: Option<String>,
+    pub has_error: bool,
+    pub severity_text: Option<String>,
+    pub severity_number: i32,
     pub body: Option<String>,
-    pub httpMethod: Option<String>,
-    pub httpUrl: Option<String>,
-    pub httpRoute: Option<String>,
-    pub httpHost: Option<String>,
-    pub httpStatusCode: Option<i32>,
-    pub pathParams: Option<String>,
-    pub queryParams: Option<String>,
-    pub requestBody: Option<String>,
-    pub responseBody: Option<String>,
-    pub sdkType: String,
-    pub serviceVersion: Option<String>,
+    pub http_method: Option<String>,
+    pub http_url: Option<String>,
+    pub http_route: Option<String>,
+    pub http_host: Option<String>,
+    pub http_status_code: Option<i32>,
+    pub path_params: Option<String>,
+    pub query_params: Option<String>,
+    pub request_body: Option<String>,
+    pub response_body: Option<String>,
+    pub sdk_type: String,
+    pub service_version: Option<String>,
     pub errors: Option<String>,
     pub tags: Vec<String>,
-    pub parentId: Option<String>,
-    pub dbSystem: Option<String>,
-    pub dbName: Option<String>,
-    pub dbStatement: Option<String>,
-    pub dbOperation: Option<String>,
-    pub rpcSystem: Option<String>,
-    pub rpcService: Option<String>,
-    pub rpcMethod: Option<String>,
-    pub endpointHash: String,
-    pub shapeHash: String,
-    pub formatHashes: Vec<String>,
-    pub fieldHashes: Vec<String>,
+    pub parent_id: Option<String>,
+    pub db_system: Option<String>,
+    pub db_name: Option<String>,
+    pub db_statement: Option<String>,
+    pub db_operation: Option<String>,
+    pub rpc_system: Option<String>,
+    pub rpc_service: Option<String>,
+    pub rpc_method: Option<String>,
+    pub endpoint_hash: String,
+    pub shape_hash: String,
+    pub format_hashes: Vec<String>,
+    pub field_hashes: Vec<String>,
     pub attributes: Option<String>,
     pub events: Option<String>,
     pub links: Option<String>,
     pub resource: Option<String>,
-    pub instrumentationScope: Option<String>,
+    pub instrumentation_scope: Option<String>,
 }
 
 pub struct PersistentQueue {
@@ -58,38 +59,39 @@ pub struct PersistentQueue {
 }
 
 impl PersistentQueue {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, sled::Error> {
+    /// Creates a new persistent queue at the specified path.
+    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let db = sled::open(path)?;
         Ok(Self { db })
     }
 
-    /// Enqueue an ingest record. Uses the record's `id` as the key.
-    pub async fn enqueue(&self, record: &IngestRecord) -> Result<String, sled::Error> {
+    /// Enqueues an ingest record using its `id` as the key.
+    pub async fn enqueue(&self, record: &IngestRecord) -> Result<String> {
         let key = record.id.clone();
-        let value = serde_json::to_vec(record).unwrap();
+        let value = serde_json::to_vec(record)?;
         self.db.insert(key.as_bytes(), value)?;
         Ok(key)
     }
 
-    /// Dequeue all records.
-    pub async fn dequeue_all(&self) -> Result<Vec<(IVec, IngestRecord)>, sled::Error> {
+    /// Dequeues all records from the queue.
+    pub async fn dequeue_all(&self) -> Result<Vec<(IVec, IngestRecord)>> {
         let mut records = Vec::new();
         for result in self.db.iter() {
             let (key, value) = result?;
-            let record: IngestRecord = serde_json::from_slice(&value).unwrap();
+            let record: IngestRecord = serde_json::from_slice(&value)?;
             records.push((key, record));
         }
         Ok(records)
     }
 
-    /// Remove a record by key.
-    pub fn remove_sync(&self, key: IVec) -> Result<(), sled::Error> {
+    /// Removes a record from the queue by key synchronously.
+    pub fn remove_sync(&self, key: IVec) -> Result<()> {
         self.db.remove(key)?;
         Ok(())
     }
 
     /// Returns the number of records in the queue.
-    pub async fn len(&self) -> Result<usize, sled::Error> {
+    pub async fn len(&self) -> Result<usize> {
         Ok(self.db.len())
     }
 }

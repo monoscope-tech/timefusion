@@ -1,9 +1,6 @@
-// main.rs
-
 mod database;
 mod ingest;
 mod persistent_queue;
-mod pgwire_integration;
 mod utils;
 mod metrics;
 mod metrics_middleware;
@@ -13,11 +10,8 @@ use actix_web::{
 };
 use chrono::Utc;
 use database::Database;
-use ingest::{
-    ingest as ingest_handler, ingest_batch, get_status, get_all_data, get_data_by_id,
-    IngestStatusStore, record_batches_to_json_rows,
-};
-use pgwire_integration::{DfSessionService, run_pgwire_server, HandlerFactory};
+use ingest::start_ingestion_service;
+use datafusion_postgres::{DfSessionService, HandlerFactory};
 use persistent_queue::{PersistentQueue, IngestRecord};
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
@@ -34,6 +28,8 @@ use std::collections::{HashMap, VecDeque};
 use tokio::sync::Mutex as TokioMutex;
 use datafusion::arrow::array::Float64Array;
 use url::Url;
+use tokio::net::TcpListener;
+use pgwire::tokio::process_socket;
 
 #[derive(Clone)]
 struct AppInfo {
@@ -65,6 +61,25 @@ struct DashboardData {
     trends: Vec<TrendData>,
 }
 
+// Placeholder IngestStatusStore since it’s not defined in ingest.rs yet
+#[derive(Clone)]
+pub struct IngestStatusStore {
+    inner: Arc<std::sync::RwLock<HashMap<String, String>>>,
+}
+
+impl IngestStatusStore {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn set_status(&self, id: String, status: String) {
+        let mut inner = self.inner.write().unwrap();
+        inner.insert(id, status);
+    }
+}
+
 #[get("/dashboard")]
 async fn dashboard(
     db: web::Data<Arc<Database>>,
@@ -79,24 +94,24 @@ async fn dashboard(
     let db_status = match db.query("SELECT 1 AS test").await {
         Ok(_) => "success",
         Err(_) => "error",
-    };
+    }.to_string();
     let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
 
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
-            "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs \
+            "SELECT project_id, id, timestamp, trace_id, span_id, event_type, duration_ns \
              FROM telemetry_events WHERE timestamp >= '{}' AND timestamp <= '{}' ORDER BY timestamp DESC LIMIT 10",
             start.to_rfc3339(),
             end.to_rfc3339()
         )
     } else {
-        "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events ORDER BY timestamp DESC LIMIT 10".to_string()
+        "SELECT project_id, id, timestamp, trace_id, span_id, event_type, duration_ns FROM telemetry_events ORDER BY timestamp DESC LIMIT 10".to_string()
     };
 
     let avg_latency = match db
-        .query("SELECT AVG(durationNs) AS avg_latency FROM telemetry_events WHERE durationNs IS NOT NULL")
+        .query("SELECT AVG(duration_ns) AS avg_latency FROM telemetry_events WHERE duration_ns IS NOT NULL")
         .await
     {
         Ok(df) => df.collect().await.ok().and_then(|batches| {
@@ -122,7 +137,7 @@ async fn dashboard(
         acc
     });
     let recent_records = match db.query(&records_query).await {
-        Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
+        Ok(df) => df.collect().await.ok().map_or(vec![], |batches| ingest::record_batches_to_json_rows(&batches).unwrap_or_default()),
         Err(_) => vec![],
     };
 
@@ -152,7 +167,7 @@ async fn dashboard(
         http_requests,
         queue_size,
         queue_alert,
-        db_status: db_status.to_string(),
+        db_status,
         ingestion_rate,
         avg_latency,
         latency_alert,
@@ -188,17 +203,17 @@ async fn export_records(
 
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
-            "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs \
+            "SELECT project_id, id, timestamp, trace_id, span_id, event_type, duration_ns \
              FROM telemetry_events WHERE timestamp >= '{}' AND timestamp <= '{}'",
             start.to_rfc3339(),
             end.to_rfc3339()
         )
     } else {
-        "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events".to_string()
+        "SELECT project_id, id, timestamp, trace_id, span_id, event_type, duration_ns FROM telemetry_events".to_string()
     };
 
     let records = match db.query(&records_query).await {
-        Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
+        Ok(df) => df.collect().await.ok().map_or(vec![], |batches| ingest::record_batches_to_json_rows(&batches).unwrap_or_default()),
         Err(_) => vec![],
     };
 
@@ -206,13 +221,13 @@ async fn export_records(
     for record in records {
         csv.push_str(&format!(
             "{},{},{},{},{},{},{}\n",
-            record["projectId"].as_str().unwrap_or("N/A"),
+            record["project_id"].as_str().unwrap_or("N/A"),
             record["id"].as_str().unwrap_or("N/A"),
             record["timestamp"].as_str().unwrap_or("N/A"),
-            record["traceId"].as_str().unwrap_or("N/A"),
-            record["spanId"].as_str().unwrap_or("N/A"),
-            record["eventType"].as_str().unwrap_or("N/A"),
-            (record["durationNs"].as_i64().unwrap_or(0) as f64 / 1_000_000.0)
+            record["trace_id"].as_str().unwrap_or("N/A"),
+            record["span_id"].as_str().unwrap_or("N/A"),
+            record["event_type"].as_str().unwrap_or("N/A"),
+            (record["duration_ns"].as_i64().unwrap_or(0) as f64 / 1_000_000.0)
         ));
     }
 
@@ -238,15 +253,11 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // Read AWS configuration from environment variables.
-    // AWS_S3_BUCKET should be your bucket name, e.g. "my-aws-bucket"
-    // AWS_S3_ENDPOINT should be your AWS S3 endpoint, e.g. "https://s3.amazonaws.com"
+    // AWS configuration from environment variables.
     let bucket = env::var("AWS_S3_BUCKET")
         .expect("AWS_S3_BUCKET environment variable not set");
     let aws_endpoint = env::var("AWS_S3_ENDPOINT")
         .unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-
-    // Build the storage URI for AWS S3.
     let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
     info!("Storage URI configured: {}", storage_uri);
 
@@ -255,7 +266,6 @@ async fn main() -> anyhow::Result<()> {
         env::set_var("AWS_ENDPOINT", &aws_endpoint);
     }
 
-    // Parse the AWS endpoint URL and register it.
     let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
     deltalake::aws::register_handlers(Some(aws_url));
     info!("AWS handlers registered");
@@ -306,6 +316,10 @@ async fn main() -> anyhow::Result<()> {
         trends: Arc::new(TokioMutex::new(VecDeque::new())),
     });
 
+    // Spawn ingestion service using ingest.rs
+    let ingestion_queue = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    start_ingestion_service(db.clone(), ingestion_queue.clone()).await?;
+
     // Spawn periodic compaction.
     let db_for_compaction = db.clone();
     tokio::spawn(async move {
@@ -325,28 +339,45 @@ async fn main() -> anyhow::Result<()> {
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
-    let pg_service = DfSessionService::new(db.get_session_context(), db.clone());
-    let handler_factory = HandlerFactory(Arc::new(pg_service));
+    // --- DataFusion-Postgres Integration ---
     let pg_addr = format!("0.0.0.0:{}", env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()));
-    info!("Spawning PGWire server task on {}", pg_addr);
+    info!("Starting DataFusion-Postgres server on {}", pg_addr);
+    let listener = TcpListener::bind(&pg_addr).await?;
+    let df_session_service = DfSessionService::new(db.get_session_context());
+    let handler_factory = HandlerFactory(Arc::new(df_session_service));
+
     let pg_server = tokio::spawn({
-        let pg_addr = pg_addr.clone();
-        let handler_factory = handler_factory.clone();
+        let pg_shutdown = pgwire_shutdown.clone();
         async move {
-            if let Err(e) = run_pgwire_server(handler_factory, &pg_addr, pgwire_shutdown).await {
-                error!("PGWire server error: {:?}", e);
-            } else {
-                info!("PGWire server shut down gracefully");
+            loop {
+                tokio::select! {
+                    _ = pg_shutdown.cancelled() => {
+                        info!("DataFusion-Postgres server shutting down.");
+                        break;
+                    }
+                    accept_result = listener.accept() => {
+                        match accept_result {
+                            Ok((socket, peer_addr)) => {
+                                info!("Accepted PG connection from {:?}", peer_addr);
+                                let handler = HandlerFactory(handler_factory.0.clone());
+                                tokio::spawn(async move {
+                                    if let Err(e) = process_socket(socket, None, handler).await {
+                                        error!("Error processing PG connection: {:?}", e);
+                                    }
+                                });
+                            },
+                            Err(e) => {
+                                error!("Error accepting PG connection: {:?}", e);
+                            }
+                        }
+                    }
+                }
             }
+            Ok::<(), anyhow::Error>(())
         }
     });
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    if pg_server.is_finished() {
-        error!("PGWire server failed to start, aborting...");
-        return Err(anyhow::anyhow!("PGWire server failed to start"));
-    }
-
+    // --- Queue Flush Task ---
     let flush_task = {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
@@ -382,9 +413,10 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // --- HTTP Server ---
     let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
     info!("Binding HTTP server to {}", http_addr);
-    let server = match HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
             .wrap(metrics_middleware::MetricsMiddleware)
@@ -395,21 +427,10 @@ async fn main() -> anyhow::Result<()> {
             .service(landing)
             .service(dashboard)
             .service(export_records)
-            .service(ingest_handler)
-            .service(ingest_batch)
-            .service(get_status)
-            .service(get_all_data)
-            .service(get_data_by_id)
+            // Add ingestion endpoints if implemented in ingest.rs
     })
-    .bind(&http_addr) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to bind HTTP server to {}: {:?}", http_addr, e);
-            return Err(anyhow::anyhow!("Failed to bind HTTP server: {:?}", e));
-        }
-    }
+    .bind(&http_addr)?
     .run();
-
     let http_server_handle = server.handle();
     let http_task = tokio::spawn(async move {
         tokio::select! {
@@ -428,10 +449,11 @@ async fn main() -> anyhow::Result<()> {
 
     info!("HTTP server running on http://{}", http_addr);
 
+    // --- Wait for Shutdown Signal or Task Completion ---
     tokio::select! {
         res = pg_server => {
             if let Err(e) = res {
-                error!("PGWire server task failed: {:?}", e);
+                error!("DataFusion-Postgres server task failed: {:?}", e);
             }
         },
         res = http_task => {
