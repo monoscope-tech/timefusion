@@ -1,0 +1,8 @@
+statement ok
+INSERT INTO telemetry_events (projectId, id, timestamp, traceId, spanId, eventType, durationNs, spanName, endpointHash, shapeHash, sdkType)
+VALUES ('proj1', 'rec1', '2025-03-19T12:00:00Z', 'trace1', 'span1', 'span', 1000, 'test_span', 'hash1', 'hash2', 'rust')
+
+query T
+SELECT projectId, id, timestamp FROM telemetry_events WHERE projectId = 'proj1'
+----
+proj1 rec1 2025-03-19T12:00:00Z
