@@ -297,21 +297,21 @@
             </div>
             <div class="stat-card" data-tippy-content="Current ingestion queue size (Alert > 50)">
                 <h2>Queue Size</h2>
-                <p id="queue_size" class="{{queue_alert ? 'warning' : ''}}">{{queue_size}}</p>
+                <p id="queue_size" class="{{queueAlert ? 'warning' : ''}}">{{queueSize}}</p>
                 <span class="trend" id="queue-trend"></span>
             </div>
             <div class="stat-card" data-tippy-content="Database health status">
                 <h2>DB Status</h2>
-                <p id="db_status" class="{{db_status}}">{{db_status}}</p>
+                <p id="db_status" class="{{dbStatus}}">{{dbStatus}}</p>
             </div>
             <div class="stat-card" data-tippy-content="Ingestion rate (records/sec)">
                 <h2>Ingestion Rate</h2>
-                <p id="ingestion_rate">{{ingestion_rate}}</p>
+                <p id="ingestion_rate">{{ingestionRate}}</p>
                 <span class="trend" id="ingestion-trend"></span>
             </div>
             <div class="stat-card" data-tippy-content="Average latency in milliseconds (Alert > 200ms)">
                 <h2>Avg Latency</h2>
-                <p id="avg_latency" class="{{latency_alert ? 'warning' : ''}}">{{avg_latency}}</p>
+                <p id="avg_latency" class="{{latencyAlert ? 'warning' : ''}}">{{avgLatency}}</p>
                 <span class="trend" id="latency-trend"></span>
             </div>
         </section>
@@ -376,34 +376,25 @@
     </footer>
 
     <script>
-        // Initialize with fallback data to ensure charts render
+        // Initialize with server-rendered data
         const initialData = {
-            recentStatuses: (() => {
-                try { return JSON.parse('{{recent_statuses}}' || '[]'); } catch { return []; }
-            })(),
-            recentRecords: (() => {
-                try { return JSON.parse('{{recent_records}}' || '[]'); } catch { return []; }
-            })(),
-            statusCounts: (() => {
-                try { return JSON.parse('{{status_counts}}' || '{"Success": 0, "Failed": 0, "Pending": 0}'); } catch { return { "Success": 0, "Failed": 0, "Pending": 0 }; }
-            })(),
-            trends: (() => {
-                try { return JSON.parse('{{trends}}' || '[]'); } catch { return []; }
-            })()
+            recentStatuses: JSON.parse('{{recentStatuses}}' || '[]'),
+            recentRecords: JSON.parse('{{recentRecords}}' || '[]'),
+            statusCounts: JSON.parse('{{statusCounts}}' || '{"Success": 0, "Failed": 0, "Pending": 0}'),
+            trends: JSON.parse('{{trends}}' || '[]')
         };
 
         document.addEventListener('DOMContentLoaded', () => {
             let prevData = {
                 uptime: parseFloat('{{uptime}}') || 0,
-                http_requests: parseFloat('{{http_requests}}') || 0,
-                queue_size: parseFloat('{{queue_size}}') || 0,
-                ingestion_rate: parseFloat('{{ingestion_rate}}') || 0,
-                avg_latency: parseFloat('{{avg_latency}}') || 0,
-                queue_alert: '{{queue_alert}}' === 'true',
-                latency_alert: '{{latency_alert}}' === 'true'
+                httpRequests: parseFloat('{{httpRequests}}') || 0,
+                queueSize: parseFloat('{{queueSize}}') || 0,
+                ingestionRate: parseFloat('{{ingestionRate}}') || 0,
+                avgLatency: parseFloat('{{avgLatency}}') || 0,
+                queueAlert: '{{queueAlert}}' === 'true',
+                latencyAlert: '{{latencyAlert}}' === 'true'
             };
 
-            // Debugging: Log initial data to console
             console.log('Initial Data:', initialData);
 
             // Theme Toggle
@@ -424,19 +415,17 @@
             // Tooltips
             tippy('[data-tippy-content]', { theme: savedTheme, placement: 'top', delay: [200, 0] });
 
-            // Trend Chart with Default Data
+            // Trend Chart
             const trendChartCtx = document.getElementById('trendChart').getContext('2d');
             const trendChart = new Chart(trendChartCtx, {
                 type: 'line',
                 data: {
-                    labels: initialData.trends.length ? 
-                        initialData.trends.map(t => new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) : 
-                        ['No Data'],
+                    labels: initialData.trends.map(t => new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })),
                     datasets: [
                         {
                             label: 'Ingestion Rate',
-                            data: initialData.trends.length ? initialData.trends.map(t => t.ingestion_rate || 0) : [0],
-                            borderColor: '#8b5cf6', // Purple
+                            data: initialData.trends.map(t => t.ingestionRate || 0),
+                            borderColor: '#8b5cf6',
                             backgroundColor: 'rgba(139, 92, 246, 0.2)',
                             fill: true,
                             tension: 0.4,
@@ -446,8 +435,8 @@
                         },
                         {
                             label: 'Queue Size',
-                            data: initialData.trends.length ? initialData.trends.map(t => t.queue_size || 0) : [0],
-                            borderColor: '#06b6d4', // Cyan
+                            data: initialData.trends.map(t => t.queueSize || 0),
+                            borderColor: '#06b6d4',
                             backgroundColor: 'rgba(6, 182, 212, 0.2)',
                             fill: true,
                             tension: 0.4,
@@ -457,8 +446,8 @@
                         },
                         {
                             label: 'Avg Latency',
-                            data: initialData.trends.length ? initialData.trends.map(t => t.avg_latency || 0) : [0],
-                            borderColor: '#ec4899', // Pink
+                            data: initialData.trends.map(t => t.avgLatency || 0),
+                            borderColor: '#ec4899',
                             backgroundColor: 'rgba(236, 72, 153, 0.2)',
                             fill: true,
                             tension: 0.4,
@@ -498,7 +487,7 @@
                             padding: 10
                         },
                         title: {
-                            display: !initialData.trends.length,
+                            display: initialData.trends.length === 0,
                             text: 'No Performance Data Available',
                             font: { size: 16 },
                             padding: 20
@@ -507,17 +496,15 @@
                 }
             });
 
-            // Status Chart with Default Data
+            // Status Chart
             const statusChartCtx = document.getElementById('statusChart').getContext('2d');
             const statusChart = new Chart(statusChartCtx, {
                 type: 'doughnut',
                 data: {
-                    labels: Object.keys(initialData.statusCounts).length ? Object.keys(initialData.statusCounts) : ['No Data'],
+                    labels: Object.keys(initialData.statusCounts),
                     datasets: [{
-                        data: Object.keys(initialData.statusCounts).length ? Object.values(initialData.statusCounts) : [1],
-                        backgroundColor: Object.keys(initialData.statusCounts).length ? 
-                            ['#22c55e', '#ef4444', '#3b82f6'] : 
-                            ['#d1d5db'], // Gray for "No Data"
+                        data: Object.values(initialData.statusCounts),
+                        backgroundColor: ['#22c55e', '#ef4444', '#3b82f6'],
                         borderWidth: 0,
                         hoverOffset: 10
                     }]
@@ -535,7 +522,7 @@
                             padding: 10
                         },
                         title: {
-                            display: !Object.keys(initialData.statusCounts).length,
+                            display: Object.keys(initialData.statusCounts).length === 0,
                             text: 'No Status Data Available',
                             font: { size: 16 },
                             padding: 20
@@ -569,17 +556,13 @@
                 const render = () => {
                     const start = (currentPage - 1) * itemsPerPage;
                     const end = Math.min(start + itemsPerPage, filteredData.length);
-                    table.innerHTML = '';
-                    if (filteredData.length === 0) {
-                        table.innerHTML = '<tr><td colspan="2">No data available</td></tr>';
-                    } else {
-                        filteredData.slice(start, end).forEach(item => {
-                            const row = document.createElement('tr');
-                            row.classList.add('fade-in');
-                            row.innerHTML = rowFn(item);
-                            table.appendChild(row);
-                        });
-                    }
+                    table.innerHTML = filteredData.length === 0 ? '<tr><td colspan="100%">No data available</td></tr>' : '';
+                    filteredData.slice(start, end).forEach(item => {
+                        const row = document.createElement('tr');
+                        row.classList.add('fade-in');
+                        row.innerHTML = rowFn(item);
+                        table.appendChild(row);
+                    });
                     pagination.innerHTML = '';
                     const pageCount = Math.ceil(filteredData.length / itemsPerPage);
                     if (pageCount > 1) {
@@ -618,10 +601,10 @@
                 <td>${s.status || 'N/A'}</td>
             `);
             populateTable('records-table', initialData.recentRecords, 'records-filter', 'records-pagination', 'records-start', 'records-end', 5, r => `
-                <td>${r.project_id || 'N/A'}</td>
+                <td>${r.projectId || 'N/A'}</td>
                 <td>${r.id?.substring(0, 8) || 'N/A'}...</td>
                 <td>${r.timestamp ? new Date(r.timestamp).toLocaleString() : 'N/A'}</td>
-                <td>${r.duration_ns ? (parseInt(r.duration_ns) / 1000000).toFixed(2) : 'N/A'}</td>
+                <td>${r.durationNs ? (parseInt(r.durationNs) / 1000000).toFixed(2) : 'N/A'}</td>
             `);
 
             // Refresh Dashboard
@@ -639,28 +622,19 @@
 
                     // Update Stats
                     const stats = [
-                        { 
-                            id: 'uptime', 
-                            trendId: 'uptime-trend', 
-                            format: v => {
-                                const hours = Math.floor(v / 3600).toString().padStart(2, '0');
-                                const minutes = Math.floor((v % 3600) / 60).toString().padStart(2, '0');
-                                const seconds = Math.floor(v % 60).toString().padStart(2, '0');
-                                return `${hours}:${minutes}:${seconds}`;
-                            }
-                        },
+                        { id: 'uptime', trendId: 'uptime-trend', format: v => `${Math.floor(v / 3600).toString().padStart(2, '0')}:${Math.floor((v % 3600) / 60).toString().padStart(2, '0')}:${Math.floor(v % 60).toString().padStart(2, '0')}` },
                         { id: 'http_requests', trendId: 'requests-trend', format: v => v.toFixed(0) },
-                        { id: 'queue_size', trendId: 'queue-trend', format: v => v.toFixed(0), alertId: 'queue_alert' },
+                        { id: 'queue_size', trendId: 'queue-trend', format: v => v.toFixed(0), alertId: 'queueAlert' },
                         { id: 'db_status', trendId: null, format: v => v },
                         { id: 'ingestion_rate', trendId: 'ingestion-trend', format: v => v.toFixed(2) },
-                        { id: 'avg_latency', trendId: 'latency-trend', format: v => v.toFixed(2), alertId: 'latency_alert' }
+                        { id: 'avg_latency', trendId: 'latency-trend', format: v => v.toFixed(2), alertId: 'latencyAlert' }
                     ];
 
                     stats.forEach(stat => {
                         const el = document.getElementById(stat.id);
                         const newValue = stat.id === 'db_status' ? doc.getElementById(stat.id)?.textContent || 'N/A' : parseFloat(doc.getElementById(stat.id)?.textContent) || 0;
                         const oldValue = stat.id === 'db_status' ? el.textContent : parseFloat(el.textContent) || 0;
-                        
+
                         if (stat.id === 'db_status') {
                             el.textContent = newValue;
                             el.className = newValue === 'success' ? 'success' : 'error';
@@ -685,50 +659,39 @@
                         }
                     });
 
-                    // Update Charts with Debugging
-                    let newTrends, newStatusCounts;
-                    try {
-                        newTrends = JSON.parse(scriptContent.match(/const trends = (.+?);/)?.[1] || '[]');
-                        newStatusCounts = JSON.parse(scriptContent.match(/const statusCounts = (.+?);/)?.[1] || '{"Success": 0, "Failed": 0, "Pending": 0}');
-                    } catch (e) {
-                        console.error('Error parsing chart data:', e);
-                        newTrends = [];
-                        newStatusCounts = { "Success": 0, "Failed": 0, "Pending": 0 };
-                    }
-                    console.log('New Trends:', newTrends);
-                    console.log('New Status Counts:', newStatusCounts);
+                    // Update Charts
+                    const newData = {
+                        trends: JSON.parse(scriptContent.match(/const trends = (.+?);/)?.[1] || '[]'),
+                        statusCounts: JSON.parse(scriptContent.match(/const statusCounts = (.+?);/)?.[1] || '{"Success": 0, "Failed": 0, "Pending": 0}'),
+                        recentStatuses: JSON.parse(scriptContent.match(/const recentStatuses = (.+?);/)?.[1] || '[]'),
+                        recentRecords: JSON.parse(scriptContent.match(/const recentRecords = (.+?);/)?.[1] || '[]')
+                    };
 
                     // Update Trend Chart
-                    trendChart.data.labels = newTrends.length ? 
-                        newTrends.map(t => new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })) : 
-                        ['No Data'];
-                    trendChart.data.datasets[0].data = newTrends.length ? newTrends.map(t => t.ingestion_rate || 0) : [0];
-                    trendChart.data.datasets[1].data = newTrends.length ? newTrends.map(t => t.queue_size || 0) : [0];
-                    trendChart.data.datasets[2].data = newTrends.length ? newTrends.map(t => t.avg_latency || 0) : [0];
-                    trendChart.options.plugins.title.display = !newTrends.length;
+                    trendChart.data.labels = newData.trends.map(t => new Date(t.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+                    trendChart.data.datasets[0].data = newData.trends.map(t => t.ingestionRate || 0);
+                    trendChart.data.datasets[1].data = newData.trends.map(t => t.queueSize || 0);
+                    trendChart.data.datasets[2].data = newData.trends.map(t => t.avgLatency || 0);
+                    trendChart.options.plugins.title.display = newData.trends.length === 0;
                     trendChart.update({ duration: 500, easing: 'easeOutQuad' });
 
                     // Update Status Chart
-                    statusChart.data.labels = Object.keys(newStatusCounts).length ? Object.keys(newStatusCounts) : ['No Data'];
-                    statusChart.data.datasets[0].data = Object.keys(newStatusCounts).length ? Object.values(newStatusCounts) : [1];
-                    statusChart.data.datasets[0].backgroundColor = Object.keys(newStatusCounts).length ? 
-                        ['#22c55e', '#ef4444', '#3b82f6'] : 
-                        ['#d1d5db'];
-                    statusChart.options.plugins.title.display = !Object.keys(newStatusCounts).length;
+                    statusChart.data.labels = Object.keys(newData.statusCounts);
+                    statusChart.data.datasets[0].data = Object.values(newData.statusCounts);
+                    statusChart.data.datasets[0].backgroundColor = Object.keys(newData.statusCounts).length ? ['#22c55e', '#ef4444', '#3b82f6'] : ['#d1d5db'];
+                    statusChart.options.plugins.title.display = Object.keys(newData.statusCounts).length === 0;
                     statusChart.update({ duration: 500, easing: 'easeOutQuad' });
 
                     // Update Tables
-                    const newStatuses = JSON.parse(scriptContent.match(/const recentStatuses = (.+?);/)?.[1] || '[]');
-                    const newRecords = JSON.parse(scriptContent.match(/const recentRecords = (.+?);/)?.[1] || '[]');
-                    populateTable('status-table', newStatuses, 'status-filter', 'status-pagination', 'status-start', 'status-end', 5, s => `
+                    populateTable('status-table', newData.recentStatuses, 'status-filter', 'status-pagination', 'status-start', 'status-end', 5, s => `
                         <td>${s.id?.substring(0, 8) || 'N/A'}...</td>
                         <td>${s.status || 'N/A'}</td>
                     `);
-                    populateTable('records-table', newRecords, 'records-filter', 'records-pagination', 'records-start', 'records-end', 5, r => `
-                        <td>${r.project_id || 'N/A'}</td>
+                    populateTable('records-table', newData.recentRecords, 'records-filter', 'records-pagination', 'records-start', 'records-end', 5, r => `
+                        <td>${r.projectId || 'N/A'}</td>
                         <td>${r.id?.substring(0, 8) || 'N/A'}...</td>
                         <td>${r.timestamp ? new Date(r.timestamp).toLocaleString() : 'N/A'}</td>
-                        <td>${r.duration_ns ? (parseInt(r.duration_ns) / 1000000).toFixed(2) : 'N/A'}</td>
+                        <td>${r.durationNs ? (parseInt(r.durationNs) / 1000000).toFixed(2) : 'N/A'}</td>
                     `);
                 } catch (error) {
                     console.error('Refresh failed:', error);

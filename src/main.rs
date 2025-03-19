@@ -1,11 +1,8 @@
-// main.rs
-
 mod database;
 mod ingest;
 mod metrics;
 mod metrics_middleware;
 mod persistent_queue;
-mod pgwire_integration;
 mod utils;
 
 use std::{
@@ -19,13 +16,14 @@ use actix_web::{App, HttpResponse, HttpServer, Responder, get, middleware::Logge
 use chrono::Utc;
 use database::Database;
 use datafusion::arrow::array::Float64Array;
+use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
 use ingest::{IngestStatusStore, get_all_data, get_data_by_id, get_status, ingest as ingest_handler, ingest_batch, record_batches_to_json_rows};
 use metrics::{ERROR_COUNTER, INGESTION_COUNTER};
 use persistent_queue::{IngestRecord, PersistentQueue};
-use pgwire_integration::{DfSessionService, HandlerFactory, run_pgwire_server};
 use serde::{Deserialize, Serialize};
 use tokio::{
+    net::TcpListener,
     sync::Mutex as TokioMutex,
     task::spawn_blocking,
     time::{Duration, sleep},
@@ -67,11 +65,14 @@ struct DashboardData {
 
 #[get("/dashboard")]
 async fn dashboard(
-    db: web::Data<Arc<Database>>, queue: web::Data<Arc<PersistentQueue>>, app_info: web::Data<AppInfo>, status_store: web::Data<Arc<IngestStatusStore>>,
+    db: web::Data<Arc<Database>>,
+    queue: web::Data<Arc<PersistentQueue>>,
+    app_info: web::Data<AppInfo>,
+    status_store: web::Data<Arc<IngestStatusStore>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
-    let http_requests = 0.0; // Placeholder
+    let http_requests = 0.0;
     let queue_size = queue.get_ref().len().await.unwrap_or(0);
     let db_status = match db.query("SELECT 1 AS test").await {
         Ok(_) => "success",
@@ -242,22 +243,19 @@ async fn main() -> anyhow::Result<()> {
     // AWS_S3_ENDPOINT should be your AWS S3 endpoint, e.g. "https://s3.amazonaws.com"
     let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
     let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-
     // Build the storage URI for AWS S3.
     let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
     info!("Storage URI configured: {}", storage_uri);
-
     // Set AWS_ENDPOINT so that the underlying S3 client uses the specified endpoint.
     unsafe {
         env::set_var("AWS_ENDPOINT", &aws_endpoint);
     }
-
     // Parse the AWS endpoint URL and register it.
     let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
     deltalake::aws::register_handlers(Some(aws_url));
     info!("AWS handlers registered");
 
-    // Initialize the database.
+    // Initialize the database
     let db = match Database::new().await {
         Ok(db) => {
             info!("Database initialized successfully");
@@ -268,7 +266,6 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-
     // Use the fixed table name "telemetry_events".
     if let Err(e) = db.add_project("telemetry_events", &storage_uri).await {
         error!("Failed to add table 'telemetry_events': {:?}", e);
@@ -307,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
         trends:     Arc::new(TokioMutex::new(VecDeque::new())),
     });
 
-    // Spawn periodic compaction.
+    // Spawn periodic compaction
     let db_for_compaction = db.clone();
     tokio::spawn(async move {
         let mut compaction_interval = tokio::time::interval(StdDuration::from_secs(24 * 3600));
@@ -326,18 +323,46 @@ async fn main() -> anyhow::Result<()> {
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
-    let pg_service = DfSessionService::new(db.get_session_context(), db.clone());
-    let handler_factory = HandlerFactory(Arc::new(pg_service));
+    // Set up datafusion-postgres server
+    let pg_service = Arc::new(DfSessionService::new(db.get_session_context()));
+    let handler_factory = HandlerFactory(pg_service.clone());
     let pg_addr = format!("0.0.0.0:{}", env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()));
     info!("Spawning PGWire server task on {}", pg_addr);
+
     let pg_server = tokio::spawn({
         let pg_addr = pg_addr.clone();
-        let handler_factory = handler_factory.clone();
         async move {
-            if let Err(e) = run_pgwire_server(handler_factory, &pg_addr, pgwire_shutdown).await {
-                error!("PGWire server error: {:?}", e);
-            } else {
-                info!("PGWire server shut down gracefully");
+            let listener = match TcpListener::bind(&pg_addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    error!("Failed to bind PGWire server to {}: {:?}", pg_addr, e);
+                    return;
+                }
+            };
+            info!("PGWire server running on {}", pg_addr);
+
+            loop {
+                tokio::select! {
+                    _ = pgwire_shutdown.cancelled() => {
+                        info!("PGWire server shutting down.");
+                        break;
+                    }
+                    result = listener.accept() => {
+                        match result {
+                            Ok((socket, _addr)) => {
+                                let handler_factory = HandlerFactory(pg_service.clone());
+                                tokio::spawn(async move {
+                                    if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_factory).await {
+                                        error!("Error processing PGWire socket: {:?}", e);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("Error accepting connection: {:?}", e);
+                            }
+                        }
+                    }
+                }
             }
         }
     });
@@ -348,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("PGWire server failed to start"));
     }
 
+    // Queue flush task
     let flush_task = {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
@@ -383,6 +409,7 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // HTTP server setup
     let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
     info!("Binding HTTP server to {}", http_addr);
     let server = match HttpServer::new(move || {
