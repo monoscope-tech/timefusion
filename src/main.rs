@@ -289,7 +289,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let queue = match PersistentQueue::new("/app/queue_db") {
+    // Get queue DB path from environment variable or use default
+    let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "/app/queue_db".to_string());
+    info!("Using queue DB path: {}", queue_db_path);
+    
+    let queue = match PersistentQueue::new(&queue_db_path) {
         Ok(q) => {
             info!("PersistentQueue initialized successfully");
             Arc::new(q)

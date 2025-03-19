@@ -1,3 +1,4 @@
 /target
 /queue_db
 .env
+users.json
