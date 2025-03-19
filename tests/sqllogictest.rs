@@ -8,7 +8,7 @@ mod sqllogictest_tests {
     use timefusion::utils::value_to_string;
     use std::error::Error as StdError;
     use datafusion::error::DataFusionError;
-    use log::debug; // Add logging for debugging
+    use uuid::Uuid;
 
     // Custom error type to wrap anyhow::Error
     #[derive(Debug)]
@@ -41,6 +41,8 @@ mod sqllogictest_tests {
     // Define a custom database wrapper for sqllogictest
     struct TimeFusionDB {
         db: Arc<Database>,
+        project_id: String, // Store the generated projectId
+        id: String,        // Store the generated id
     }
 
     #[async_trait::async_trait]
@@ -49,15 +51,25 @@ mod sqllogictest_tests {
         type ColumnType = DefaultColumnType;
 
         async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
-            debug!("Executing SQL: {}", sql);
+            // Replace placeholders with generated UUIDs
+            let sql = sql
+                .replace("PROJECT_ID_PLACEHOLDER", &self.project_id)
+                .replace("ID_PLACEHOLDER", &self.id);
+            println!("Executing SQL: {}", sql);
 
-            let df = self.db.query(sql).await.map_err(TestError::from)?;
-            debug!("Query executed successfully, collecting batches...");
-            let batches = df.collect().await.map_err(TestError::from)?;
-            debug!("Collected {} batches", batches.len());
+            let df = self.db.query(&sql).await.map_err(|e| {
+                println!("Query error: {:?}", e);
+                TestError::from(e)
+            })?;
+            println!("Query executed successfully, collecting batches...");
+            let batches = df.collect().await.map_err(|e| {
+                println!("Collect error: {:?}", e);
+                TestError::from(e)
+            })?;
+            println!("Collected {} batches", batches.len());
 
             if batches.is_empty() {
-                debug!("No batches returned, assuming statement complete");
+                println!("No batches returned, assuming statement complete");
                 return Ok(DBOutput::StatementComplete(0));
             }
 
@@ -78,10 +90,10 @@ mod sqllogictest_tests {
             if sql.trim().to_lowercase().starts_with("insert") ||
                sql.trim().to_lowercase().starts_with("update") ||
                sql.trim().to_lowercase().starts_with("delete") {
-                debug!("Returning StatementComplete with row count: {}", row_count);
+                println!("Returning StatementComplete with row count: {}", row_count);
                 Ok(DBOutput::StatementComplete(row_count as u64))
             } else {
-                debug!("Returning Rows with {} rows and {} columns", rows.len(), batches[0].num_columns());
+                println!("Returning Rows with {} rows and {} columns", rows.len(), batches[0].num_columns());
                 Ok(DBOutput::Rows { 
                     types: vec![DefaultColumnType::Text; batches[0].num_columns()], 
                     rows 
@@ -100,20 +112,29 @@ mod sqllogictest_tests {
 
     #[tokio::test]
     async fn run_sqllogictest() -> anyhow::Result<()> {
-        // Initialize logging
-        env_logger::init();
+        // Initialize logging with a default level
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
         // Initialize the database
         let db: Arc<Database> = Arc::new(Database::new().await?);
         
         // Use an in-memory table for testing
         let storage_uri = "memory://test_table";
-        debug!("Creating events table: telemetry_events at {}", storage_uri);
+        println!("Creating events table: telemetry_events at {}", storage_uri);
         db.create_events_table("telemetry_events", storage_uri).await?;
+
+        // Generate random UUIDs
+        let project_id = Uuid::new_v4().to_string();
+        let id = Uuid::new_v4().to_string();
+        println!("Generated projectId: {}, id: {}", project_id, id);
 
         // Create a closure that implements MakeConnection
         let make_db = || async {
-            Ok(TimeFusionDB { db: db.clone() }) as Result<TimeFusionDB, TestError>
+            Ok(TimeFusionDB { 
+                db: db.clone(),
+                project_id: project_id.clone(),
+                id: id.clone(),
+            }) as Result<TimeFusionDB, TestError>
         };
 
         // Create a runner with the connection factory
@@ -121,7 +142,7 @@ mod sqllogictest_tests {
 
         // Specify the path to your .slt files
         let test_file = "tests/example.slt";
-        debug!("Running SQL logic test from file: {}", test_file);
+        println!("Running SQL logic test from file: {}", test_file);
         
         // Run the tests
         runner.run_file_async(test_file).await?;

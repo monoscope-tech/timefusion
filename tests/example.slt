@@ -1,8 +1,62 @@
 statement ok
-INSERT INTO telemetry_events (projectId, id, timestamp, traceId, spanId, eventType, durationNs, spanName, endpointHash, shapeHash, sdkType)
-VALUES ('proj1', 'rec1', '2025-03-19T12:00:00Z', 'trace1', 'span1', 'span', 1000, 'test_span', 'hash1', 'hash2', 'rust')
+INSERT INTO telemetry_events (
+    projectid, id, timestamp, traceid, spanid, eventtype, status, endtime, durationns, spanname,
+    spankind, parentspanid, tracestate, haserror, severitytext, severitynumber, body, httpmethod,
+    httpurl, httproute, httphost, httpstatuscode, pathparams, queryparams, requestbody, responsebody,
+    sdktype, serviceversion, errors, tags, parentid, dbsystem, dbname, dbstatement, dboperation,
+    rpcsystem, rpcservice, rpcmethod, endpointhash, shapehash, formathashes, fieldhashes, attributes,
+    events, links, resource, instrumentationscope
+) VALUES (
+    'PROJECT_ID_PLACEHOLDER',
+    'ID_PLACEHOLDER',
+    '2023-11-25T12:34:56.789Z',
+    'trace123',
+    'span123',
+    'ERROR',
+    'ok',
+    '2023-11-25T12:35:56.000Z',
+    60000000000,
+    'sample_span',
+    'server',
+    'parent123',
+    'state123',
+    FALSE,
+    'INFO',
+    1,
+    '{"message": "Sample event body"}',
+    'GET',
+    'http://localhost/api/test',
+    '/api/test',
+    'localhost',
+    200,
+    '{"id": "1"}',
+    '{"q": "test"}',
+    '{"key": "value"}',
+    '{"result": "ok"}',
+    'rust',
+    'v1.0',
+    '{}',
+    '["tag1", "tag2"]',
+    'parent0',
+    'postgres',
+    'sample_db',
+    'SELECT * FROM table',
+    'read',
+    'grpc',
+    'sample_service',
+    'GetSample',
+    'endpointhash123',
+    'shapehash123',
+    '["format1", "format2"]',
+    '["field1", "field2"]',
+    '{"attr": "value"}',
+    '{"event": "value"}',
+    '{"link": "value"}',
+    '{"resource": "value"}',
+    '{"scope": "value"}'
+)
 
 query T
-SELECT projectId, id, timestamp FROM telemetry_events WHERE projectId = 'proj1'
+SELECT projectid, id, timestamp FROM telemetry_events WHERE projectid = 'PROJECT_ID_PLACEHOLDER'
 ----
-proj1 rec1 2025-03-19T12:00:00Z
+PROJECT_ID_PLACEHOLDER ID_PLACEHOLDER 2023-11-25T12:34:56.789Z
