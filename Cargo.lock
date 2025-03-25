@@ -2274,13 +2274,14 @@ dependencies = [
 [[package]]
 name = "datafusion-postgres"
 version = "0.3.0"
-source = "git+https://github.com/sunng87/datafusion-postgres.git#3896daf2c0f9048e88a43cc61fab5cd33d2117f1"
+source = "git+https://github.com/apitoolkit/FusionGate.git#b322274c5cf46e67a121d06b11359a6208a7051f"
 dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
  "futures",
  "pgwire",
+ "sqlparser 0.55.0",
 ]
 
 [[package]]
