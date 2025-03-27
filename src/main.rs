@@ -10,21 +10,18 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     sync::Arc,
-    time::Duration as StdDuration,
 };
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, middleware::Logger, web};
 use chrono::Utc;
 use database::Database;
 use datafusion::arrow::array::Float64Array;
-use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
 use ingest::{get_all_data, get_data_by_id, get_status, record_batches_to_json_rows};
 use metrics::ERROR_COUNTER;
 use persistent_queue::PersistentQueue;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    net::TcpListener,
     sync::Mutex as TokioMutex,
     task::spawn_blocking,
     time::{Duration, sleep},
@@ -32,78 +29,77 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
-use url::Url;
 
 #[derive(Clone)]
 struct AppInfo {
     start_time: chrono::DateTime<Utc>,
-    trends:     Arc<TokioMutex<VecDeque<TrendData>>>,
+    trends: Arc<TokioMutex<VecDeque<TrendData>>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct TrendData {
-    timestamp:      String,
+    timestamp: String,
     ingestion_rate: f64,
-    queue_size:     usize,
-    avg_latency:    f64,
+    queue_size: usize,
+    avg_latency: f64,
 }
 
 #[derive(Serialize)]
 struct DashboardData {
-    uptime:          f64,
-    http_requests:   f64,
-    queue_size:      usize,
-    queue_alert:     bool,
-    db_status:       String,
-    ingestion_rate:  f64,
-    avg_latency:     f64,
-    latency_alert:   bool,
+    uptime: f64,
+    http_requests: f64,
+    queue_size: usize,
+    queue_alert: bool,
+    db_status: String,
+    ingestion_rate: f64,
+    avg_latency: f64,
+    latency_alert: bool,
     recent_statuses: Vec<serde_json::Value>,
-    status_counts:   HashMap<String, i32>,
-    recent_records:  Vec<serde_json::Value>,
-    trends:          Vec<TrendData>,
+    status_counts: HashMap<String, i32>,
+    recent_records: Vec<serde_json::Value>,
+    trends: Vec<TrendData>,
 }
 
 #[get("/dashboard")]
 async fn dashboard(
     db: web::Data<Arc<Database>>,
-    queue: web::Data<Arc<PersistentQueue>>,
+    // If not directly used here, prefix with an underscore.
+    _queue: web::Data<Arc<PersistentQueue>>,
     app_info: web::Data<AppInfo>,
     status_store: web::Data<Arc<ingest::IngestStatusStore>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
-    let http_requests = 0.0; // Placeholder; update if metrics_middleware tracks this
-    let queue_size = 0; // Placeholder; PersistentQueue doesn't expose len yet
+    let http_requests = 0.0; // Placeholder for HTTP metrics.
+    let queue_size = 0; // Placeholder; update if your queue exposes its length.
     let db_status = match db.query("SELECT 1 AS test").await {
         Ok(_) => "success",
         Err(_) => "error",
     };
-    let ingestion_rate = 0.0; // Placeholder since INGESTION_COUNTER is no longer incremented
+    let ingestion_rate = 0.0; // Placeholder.
 
+    // Use timestamp_nanos_opt().unwrap_or(0) to avoid deprecation warnings.
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
             "SELECT * FROM otel_logs_and_spans WHERE start_time_unix_nano >= {} AND start_time_unix_nano <= {} ORDER BY start_time_unix_nano DESC LIMIT 10",
-            start.timestamp_nanos(),
-            end.timestamp_nanos()
+            start.timestamp_nanos_opt().unwrap_or(0),
+            end.timestamp_nanos_opt().unwrap_or(0)
         )
     } else {
         "SELECT * FROM otel_logs_and_spans ORDER BY start_time_unix_nano DESC LIMIT 10".to_string()
     };
 
     let avg_latency = match db.query("SELECT AVG(end_time_unix_nano - start_time_unix_nano) AS avg_latency FROM otel_logs_and_spans WHERE end_time_unix_nano IS NOT NULL").await {
-        Ok(df) => df
-            .collect()
-            .await
-            .ok()
-            .and_then(|batches| {
-                batches
-                    .get(0)
-                    .map(|b| b.column(0).as_any().downcast_ref::<Float64Array>().map_or(0.0, |arr| arr.value(0) / 1_000_000.0))
+        Ok(df) => df.collect().await.ok().and_then(|batches| {
+            batches.get(0).map(|b| {
+                b.column(0)
+                 .as_any()
+                 .downcast_ref::<Float64Array>()
+                 .map_or(0.0, |arr| arr.value(0) / 1_000_000.0)
             })
-            .unwrap_or(0.0),
+        }).unwrap_or(0.0),
         Err(_) => 0.0,
     };
 
@@ -140,14 +136,10 @@ async fn dashboard(
         trends.pop_front();
     }
     let trends_vec = if let (Some(start), Some(end)) = (start, end) {
-        trends
-            .iter()
-            .filter(|t| {
-                let ts = chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap();
-                ts >= start && ts <= end
-            })
-            .cloned()
-            .collect::<Vec<_>>()
+        trends.iter().filter(|t| {
+            let ts = chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap();
+            ts >= start && ts <= end
+        }).cloned().collect::<Vec<_>>()
     } else {
         trends.iter().cloned().collect::<Vec<_>>()
     };
@@ -191,8 +183,8 @@ async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
             "SELECT * FROM otel_logs_and_spans WHERE start_time_unix_nano >= {} AND start_time_unix_nano <= {}",
-            start.timestamp_nanos(),
-            end.timestamp_nanos()
+            start.timestamp_nanos_opt().unwrap_or(0),
+            end.timestamp_nanos_opt().unwrap_or(0)
         )
     } else {
         "SELECT * FROM otel_logs_and_spans".to_string()
@@ -207,9 +199,9 @@ async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<
     for record in records {
         csv.push_str(&format!(
             "{},{},{},{}\n",
-            record["trace_id"].as_str().unwrap_or("N/A"),
-            record["span_id"].as_str().unwrap_or("N/A"),
-            record["start_time_unix_nano"].as_i64().unwrap_or(0),
+            record["traceId"].as_str().unwrap_or("N/A"),
+            record["spanId"].as_str().unwrap_or("N/A"),
+            record["startTimeUnixNano"].as_i64().unwrap_or(0),
             record["name"].as_str().unwrap_or("N/A")
         ));
     }
@@ -222,7 +214,9 @@ async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<
 
 #[get("/")]
 async fn landing() -> impl Responder {
-    HttpResponse::TemporaryRedirect().append_header(("Location", "/dashboard")).finish()
+    HttpResponse::TemporaryRedirect()
+        .append_header(("Location", "/dashboard"))
+        .finish()
 }
 
 #[tokio::main]
@@ -262,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
     let status_store = Arc::new(ingest::IngestStatusStore::new());
     let app_info = web::Data::new(AppInfo {
         start_time: Utc::now(),
-        trends:     Arc::new(TokioMutex::new(VecDeque::new())),
+        trends: Arc::new(TokioMutex::new(VecDeque::new())),
     });
 
     let shutdown_token = CancellationToken::new();
@@ -282,8 +276,28 @@ async fn main() -> anyhow::Result<()> {
                     }
                     _ = sleep(Duration::from_secs(5)) => {
                         debug!("Checking queue for records to flush");
-                        while let Ok(Some(record)) = queue_clone.dequeue().await {
-                            process_record(&db_clone, &status_store_clone, record).await;
+                        loop {
+                            let maybe_record = spawn_blocking({
+                                let queue_clone = queue_clone.clone();
+                                move || {
+                                    // Run the async dequeue() in a blocking context.
+                                    futures::executor::block_on(queue_clone.dequeue())
+                                }
+                            }).await;
+                            match maybe_record {
+                                Ok(Ok(Some(record))) => {
+                                    process_record(&db_clone, &status_store_clone, record).await;
+                                },
+                                Ok(Ok(None)) => break, // No more records.
+                                Ok(Err(e)) => {
+                                    error!("Error in dequeue: {:?}", e);
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!("Spawn blocking error: {:?}", e);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -360,7 +374,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn process_record(db: &Arc<Database>, status_store: &Arc<ingest::IngestStatusStore>, record: persistent_queue::IngestRecord) {
-    let key = format!("{}_{}", record.trace_id, record.span_id);
+    // Use the correct field names from IngestRecord.
+    let key = format!("{}_{}", record.traceId, record.spanId);
     status_store.set_status(key.clone(), "Processing".to_string());
 
     match db.insert_record(&record).await {

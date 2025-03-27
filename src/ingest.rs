@@ -3,7 +3,7 @@ use std::sync::Arc;
 use actix_web::{get, web, HttpResponse, Responder};
 use anyhow::Result;
 use serde_json::Value;
-use tracing::{error};
+use tracing::error;
 
 use crate::database::Database;
 
@@ -30,7 +30,10 @@ impl IngestStatusStore {
 
     pub fn get_status(&self, id: &str) -> Option<String> {
         let inner = self.inner.read().unwrap();
-        inner.iter().find(|(existing_id, _)| existing_id == id).map(|(_, status)| status.clone())
+        inner
+            .iter()
+            .find(|(existing_id, _)| existing_id == id)
+            .map(|(_, status)| status.clone())
     }
 }
 
@@ -41,14 +44,16 @@ pub async fn get_status(
 ) -> impl Responder {
     let id = path.into_inner();
     match status_store.get_status(&id) {
-        Some(status) => HttpResponse::Ok().json(serde_json::json!({"id": id, "status": status})),
-        None => HttpResponse::NotFound().json(serde_json::json!({"error": "Status not found"})),
+        Some(status) => HttpResponse::Ok().json(serde_json::json!({ "id": id, "status": status })),
+        None => HttpResponse::NotFound()
+            .json(serde_json::json!({ "error": "Status not found" })),
     }
 }
 
 #[get("/data")]
 pub async fn get_all_data(db: web::Data<Arc<Database>>) -> impl Responder {
-    let query = "SELECT * FROM otel_logs_and_spans ORDER BY start_time_unix_nano DESC LIMIT 100";
+    // Updated column name: startTimeUnixNano (camelCase as declared in fields.rs)
+    let query = "SELECT * FROM otel_logs_and_spans ORDER BY startTimeUnixNano DESC LIMIT 100";
     match db.query(query).await {
         Ok(df) => match df.collect().await {
             Ok(batches) => {
@@ -57,12 +62,16 @@ pub async fn get_all_data(db: web::Data<Arc<Database>>) -> impl Responder {
             }
             Err(e) => {
                 error!("Failed to collect data: {:?}", e);
-                HttpResponse::InternalServerError().json(serde_json::json!({"error": "Failed to fetch data"}))
+                HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": "Failed to fetch data"
+                }))
             }
         },
         Err(e) => {
             error!("Failed to query data: {:?}", e);
-            HttpResponse::InternalServerError().json(serde_json::json!({"error": "Failed to query data"}))
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to query data"
+            }))
         }
     }
 }
@@ -73,33 +82,39 @@ pub async fn get_data_by_id(
     db: web::Data<Arc<Database>>,
 ) -> impl Responder {
     let id = path.into_inner();
-    let query = format!(
-        "SELECT * FROM otel_logs_and_spans WHERE trace_id = '{}'",
-        id
-    );
+    // Updated column name: traceId (camelCase)
+    let query = format!("SELECT * FROM otel_logs_and_spans WHERE traceId = '{}'", id);
     match db.query(&query).await {
         Ok(df) => match df.collect().await {
             Ok(batches) => {
                 let rows = record_batches_to_json_rows(&batches).unwrap_or_default();
                 if rows.is_empty() {
-                    HttpResponse::NotFound().json(serde_json::json!({"error": "Record not found"}))
+                    HttpResponse::NotFound().json(serde_json::json!({
+                        "error": "Record not found"
+                    }))
                 } else {
                     HttpResponse::Ok().json(rows)
                 }
             }
             Err(e) => {
                 error!("Failed to collect data by ID: {:?}", e);
-                HttpResponse::InternalServerError().json(serde_json::json!({"error": "Failed to fetch data"}))
+                HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": "Failed to fetch data"
+                }))
             }
         },
         Err(e) => {
             error!("Failed to query data by ID: {:?}", e);
-            HttpResponse::InternalServerError().json(serde_json::json!({"error": "Failed to query data"}))
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to query data"
+            }))
         }
     }
 }
 
-pub fn record_batches_to_json_rows(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> Result<Vec<Value>> {
+pub fn record_batches_to_json_rows(
+    batches: &[datafusion::arrow::record_batch::RecordBatch],
+) -> Result<Vec<Value>> {
     use datafusion::arrow::array::Array;
 
     let mut rows = Vec::new();
@@ -110,7 +125,10 @@ pub fn record_batches_to_json_rows(batches: &[datafusion::arrow::record_batch::R
             for (field, column) in schema.fields().iter().zip(batch.columns()) {
                 let value = match column.data_type() {
                     datafusion::arrow::datatypes::DataType::Utf8 => {
-                        let array = column.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().unwrap();
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::StringArray>()
+                            .unwrap();
                         if array.is_null(i) {
                             Value::Null
                         } else {
@@ -118,7 +136,10 @@ pub fn record_batches_to_json_rows(batches: &[datafusion::arrow::record_batch::R
                         }
                     }
                     datafusion::arrow::datatypes::DataType::Int32 => {
-                        let array = column.as_any().downcast_ref::<datafusion::arrow::array::Int32Array>().unwrap();
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                            .unwrap();
                         if array.is_null(i) {
                             Value::Null
                         } else {
@@ -126,7 +147,10 @@ pub fn record_batches_to_json_rows(batches: &[datafusion::arrow::record_batch::R
                         }
                     }
                     datafusion::arrow::datatypes::DataType::Int64 => {
-                        let array = column.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().unwrap();
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                            .unwrap();
                         if array.is_null(i) {
                             Value::Null
                         } else {
@@ -134,15 +158,24 @@ pub fn record_batches_to_json_rows(batches: &[datafusion::arrow::record_batch::R
                         }
                     }
                     datafusion::arrow::datatypes::DataType::Float64 => {
-                        let array = column.as_any().downcast_ref::<datafusion::arrow::array::Float64Array>().unwrap();
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::Float64Array>()
+                            .unwrap();
                         if array.is_null(i) {
                             Value::Null
                         } else {
-                            Value::Number(serde_json::Number::from_f64(array.value(i)).unwrap())
+                            Value::Number(
+                                serde_json::Number::from_f64(array.value(i))
+                                    .expect("Invalid f64 value"),
+                            )
                         }
                     }
                     datafusion::arrow::datatypes::DataType::Boolean => {
-                        let array = column.as_any().downcast_ref::<datafusion::arrow::array::BooleanArray>().unwrap();
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::BooleanArray>()
+                            .unwrap();
                         if array.is_null(i) {
                             Value::Null
                         } else {
@@ -150,7 +183,10 @@ pub fn record_batches_to_json_rows(batches: &[datafusion::arrow::record_batch::R
                         }
                     }
                     datafusion::arrow::datatypes::DataType::Timestamp(_, _) => {
-                        let array = column.as_any().downcast_ref::<datafusion::arrow::array::TimestampNanosecondArray>().unwrap();
+                        let array = column
+                            .as_any()
+                            .downcast_ref::<datafusion::arrow::array::TimestampNanosecondArray>()
+                            .unwrap();
                         if array.is_null(i) {
                             Value::Null
                         } else {
