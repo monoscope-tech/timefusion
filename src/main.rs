@@ -1,4 +1,5 @@
 mod database;
+mod fields;
 mod ingest;
 mod metrics;
 mod metrics_middleware;
@@ -18,9 +19,9 @@ use database::Database;
 use datafusion::arrow::array::Float64Array;
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
-use ingest::{IngestStatusStore, get_all_data, get_data_by_id, get_status, ingest as ingest_handler, ingest_batch, record_batches_to_json_rows};
-use metrics::{ERROR_COUNTER, INGESTION_COUNTER};
-use persistent_queue::{IngestRecord, PersistentQueue};
+use ingest::{get_all_data, get_data_by_id, get_status, record_batches_to_json_rows};
+use metrics::ERROR_COUNTER;
+use persistent_queue::PersistentQueue;
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
@@ -68,32 +69,31 @@ async fn dashboard(
     db: web::Data<Arc<Database>>,
     queue: web::Data<Arc<PersistentQueue>>,
     app_info: web::Data<AppInfo>,
-    status_store: web::Data<Arc<IngestStatusStore>>,
+    status_store: web::Data<Arc<ingest::IngestStatusStore>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
     let http_requests = 0.0; // Placeholder; update if metrics_middleware tracks this
-    let queue_size = queue.len().unwrap_or(0);
+    let queue_size = 0; // Placeholder; PersistentQueue doesn't expose len yet
     let db_status = match db.query("SELECT 1 AS test").await {
         Ok(_) => "success",
         Err(_) => "error",
     };
-    let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
+    let ingestion_rate = 0.0; // Placeholder since INGESTION_COUNTER is no longer incremented
 
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
-            "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs \
-             FROM telemetry_events WHERE timestamp >= '{}' AND timestamp <= '{}' ORDER BY timestamp DESC LIMIT 10",
-            start.to_rfc3339(),
-            end.to_rfc3339()
+            "SELECT * FROM otel_logs_and_spans WHERE start_time_unix_nano >= {} AND start_time_unix_nano <= {} ORDER BY start_time_unix_nano DESC LIMIT 10",
+            start.timestamp_nanos(),
+            end.timestamp_nanos()
         )
     } else {
-        "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events ORDER BY timestamp DESC LIMIT 10".to_string()
+        "SELECT * FROM otel_logs_and_spans ORDER BY start_time_unix_nano DESC LIMIT 10".to_string()
     };
 
-    let avg_latency = match db.query("SELECT AVG(durationNs) AS avg_latency FROM telemetry_events WHERE durationNs IS NOT NULL").await {
+    let avg_latency = match db.query("SELECT AVG(end_time_unix_nano - start_time_unix_nano) AS avg_latency FROM otel_logs_and_spans WHERE end_time_unix_nano IS NOT NULL").await {
         Ok(df) => df
             .collect()
             .await
@@ -190,13 +190,12 @@ async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<
 
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
-            "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs \
-             FROM telemetry_events WHERE timestamp >= '{}' AND timestamp <= '{}'",
-            start.to_rfc3339(),
-            end.to_rfc3339()
+            "SELECT * FROM otel_logs_and_spans WHERE start_time_unix_nano >= {} AND start_time_unix_nano <= {}",
+            start.timestamp_nanos(),
+            end.timestamp_nanos()
         )
     } else {
-        "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events".to_string()
+        "SELECT * FROM otel_logs_and_spans".to_string()
     };
 
     let records = match db.query(&records_query).await {
@@ -204,17 +203,14 @@ async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<
         Err(_) => vec![],
     };
 
-    let mut csv = String::from("Project ID,Record ID,Timestamp,Trace ID,Span ID,Event Type,Latency (ms)\n");
+    let mut csv = String::from("Trace ID,Span ID,Timestamp,Name\n");
     for record in records {
         csv.push_str(&format!(
-            "{},{},{},{},{},{},{}\n",
-            record["projectId"].as_str().unwrap_or("N/A"),
-            record["id"].as_str().unwrap_or("N/A"),
-            record["timestamp"].as_str().unwrap_or("N/A"),
-            record["traceId"].as_str().unwrap_or("N/A"),
-            record["spanId"].as_str().unwrap_or("N/A"),
-            record["eventType"].as_str().unwrap_or("N/A"),
-            (record["durationNs"].as_i64().unwrap_or(0) as f64 / 1_000_000.0)
+            "{},{},{},{}\n",
+            record["trace_id"].as_str().unwrap_or("N/A"),
+            record["span_id"].as_str().unwrap_or("N/A"),
+            record["start_time_unix_nano"].as_i64().unwrap_or(0),
+            record["name"].as_str().unwrap_or("N/A")
         ));
     }
 
@@ -238,19 +234,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // Read AWS configuration from environment variables
-    let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
-    let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-    let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
-    info!("Storage URI configured: {}", storage_uri);
-    unsafe {
-        env::set_var("AWS_ENDPOINT", &aws_endpoint);
-    }
-    let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
-    deltalake::aws::register_handlers(Some(aws_url));
-    info!("AWS handlers registered");
-
-    // Initialize the database
     let db = match Database::new().await {
         Ok(db) => {
             info!("Database initialized successfully");
@@ -261,113 +244,31 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    if let Err(e) = db.add_project("telemetry_events", &storage_uri).await {
-        error!("Failed to add table 'telemetry_events': {:?}", e);
-        return Err(e);
-    }
-    match db.create_events_table("telemetry_events", &storage_uri).await {
-        Ok(_) => info!("Events table created successfully"),
-        Err(e) => {
-            if e.to_string().contains("already exists") {
-                info!("Events table already exists, skipping creation");
-            } else {
-                error!("Failed to create events table: {:?}", e);
-                return Err(e);
-            }
-        }
-    }
 
-    // Get queue DB path from environment variable or use default
-    let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "/app/queue_db".to_string());
+    let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "./queue_db/queue.log".to_string());
     info!("Using queue DB path: {}", queue_db_path);
 
-    let queue = match PersistentQueue::new(&queue_db_path, db.clone()) {
+    let queue = match PersistentQueue::new(&queue_db_path).await {
         Ok(q) => {
             info!("PersistentQueue initialized successfully");
             Arc::new(q)
         }
         Err(e) => {
             error!("Failed to initialize PersistentQueue: {:?}", e);
-            return Err(e.into());
+            return Err(e);
         }
     };
 
-    let status_store = Arc::new(IngestStatusStore::new());
+    let status_store = Arc::new(ingest::IngestStatusStore::new());
     let app_info = web::Data::new(AppInfo {
         start_time: Utc::now(),
         trends:     Arc::new(TokioMutex::new(VecDeque::new())),
     });
 
-    // Spawn periodic compaction
-    let db_for_compaction = db.clone();
-    tokio::spawn(async move {
-        let mut compaction_interval = tokio::time::interval(StdDuration::from_secs(24 * 3600));
-        loop {
-            compaction_interval.tick().await;
-            if let Err(e) = db_for_compaction.compact_all_projects().await {
-                error!("Error during periodic compaction: {:?}", e);
-            } else {
-                info!("Periodic compaction completed successfully.");
-            }
-        }
-    });
-
     let shutdown_token = CancellationToken::new();
     let queue_shutdown = shutdown_token.clone();
     let http_shutdown = shutdown_token.clone();
-    let pgwire_shutdown = shutdown_token.clone();
 
-    // Set up datafusion-postgres server
-    let pg_service = Arc::new(DfSessionService::new(db.get_session_context()));
-    let handler_factory = HandlerFactory(pg_service.clone());
-    let pg_addr = format!("0.0.0.0:{}", env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()));
-    info!("Spawning PGWire server task on {}", pg_addr);
-
-    let pg_server = tokio::spawn({
-        let pg_addr = pg_addr.clone();
-        async move {
-            let listener = match TcpListener::bind(&pg_addr).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    error!("Failed to bind PGWire server to {}: {:?}", pg_addr, e);
-                    return;
-                }
-            };
-            info!("PGWire server running on {}", pg_addr);
-
-            loop {
-                tokio::select! {
-                    _ = pgwire_shutdown.cancelled() => {
-                        info!("PGWire server shutting down.");
-                        break;
-                    }
-                    result = listener.accept() => {
-                        match result {
-                            Ok((socket, _addr)) => {
-                                let handler_factory = HandlerFactory(pg_service.clone());
-                                tokio::spawn(async move {
-                                    if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_factory).await {
-                                        error!("Error processing PGWire socket: {:?}", e);
-                                    }
-                                });
-                            }
-                            Err(e) => {
-                                error!("Error accepting connection: {:?}", e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    if pg_server.is_finished() {
-        error!("PGWire server failed to start, aborting...");
-        return Err(anyhow::anyhow!("PGWire server failed to start"));
-    }
-
-    // Queue flush task
     let flush_task = {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
@@ -381,19 +282,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     _ = sleep(Duration::from_secs(5)) => {
                         debug!("Checking queue for records to flush");
-                        match queue_clone.dequeue_all().await {
-                            Ok(records) => {
-                                debug!("Dequeued {} records", records.len());
-                                if !records.is_empty() {
-                                    info!("Flushing {} enqueued records", records.len());
-                                    for (key, record) in records {
-                                        process_record(&db_clone, &queue_clone, &status_store_clone, key, record).await;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Error during dequeue_all: {:?}", e);
-                            }
+                        while let Ok(Some(record)) = queue_clone.dequeue().await {
+                            process_record(&db_clone, &status_store_clone, record).await;
                         }
                     }
                 }
@@ -401,7 +291,6 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    // HTTP server setup
     let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
     info!("Binding HTTP server to {}", http_addr);
     let server = match HttpServer::new(move || {
@@ -415,8 +304,6 @@ async fn main() -> anyhow::Result<()> {
             .service(landing)
             .service(dashboard)
             .service(export_records)
-            .service(ingest_handler)
-            .service(ingest_batch)
             .service(get_status)
             .service(get_all_data)
             .service(get_data_by_id)
@@ -450,11 +337,6 @@ async fn main() -> anyhow::Result<()> {
     info!("HTTP server running on http://{}", http_addr);
 
     tokio::select! {
-        res = pg_server => {
-            if let Err(e) = res {
-                error!("PGWire server task failed: {:?}", e);
-            }
-        },
         res = http_task => {
             if let Err(e) = res {
                 error!("HTTP server task failed: {:?}", e);
@@ -477,58 +359,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn process_record(
-    db: &Arc<Database>,
-    queue: &Arc<PersistentQueue>,
-    status_store: &Arc<IngestStatusStore>,
-    key: String,
-    record: IngestRecord,
-) {
+async fn process_record(db: &Arc<Database>, status_store: &Arc<ingest::IngestStatusStore>, record: persistent_queue::IngestRecord) {
+    let key = format!("{}_{}", record.trace_id, record.span_id);
     status_store.set_status(key.clone(), "Processing".to_string());
-    let timestamp = chrono::DateTime::from_timestamp(
-        record.start_time_unix_nano / 1_000_000_000,
-        (record.start_time_unix_nano % 1_000_000_000) as u32,
-    )
-    .unwrap_or(Utc::now())
-    .to_rfc3339();
 
-    if chrono::DateTime::parse_from_rfc3339(&timestamp).is_ok() {
-        match db.write(&record).await {
-            Ok(()) => {
-                INGESTION_COUNTER.inc();
-                status_store.set_status(key.clone(), "Ingested".to_string());
-                if let Err(e) = spawn_blocking({
-                    let queue = queue.clone();
-                    let key = key.clone();
-                    move || {
-                        if let Err(e) = queue.db.remove(key.as_bytes()) {
-                            error!("Failed to remove record from queue: {:?}", e);
-                        }
-                    }
-                })
-                .await
-                {
-                    error!("Failed to remove record: {:?}", e);
-                }
-            }
-            Err(e) => {
-                ERROR_COUNTER.inc();
-                error!("Error writing record: {:?}", e);
-                status_store.set_status(key, format!("Failed: {:?}", e));
-            }
+    match db.insert_record(&record).await {
+        Ok(()) => {
+            status_store.set_status(key, "Ingested".to_string());
         }
-    } else {
-        ERROR_COUNTER.inc();
-        error!("Invalid timestamp in record: {}", timestamp);
-        status_store.set_status(key.clone(), "Invalid timestamp".to_string());
-        let _ = spawn_blocking({
-            let queue = queue.clone();
-            move || {
-                if let Err(e) = queue.db.remove(key.as_bytes()) {
-                    error!("Failed to remove record from queue: {:?}", e);
-                }
-            }
-        })
-        .await;
+        Err(e) => {
+            ERROR_COUNTER.inc();
+            error!("Error writing record: {:?}", e);
+            status_store.set_status(key, format!("Failed: {:?}", e));
+        }
     }
 }

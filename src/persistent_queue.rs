@@ -1,14 +1,9 @@
-use std::path::Path;
-use std::sync::Arc;
-
-use anyhow::Result;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom};
 use serde::{Deserialize, Serialize};
-use sled::Db;
-use tokio::sync::mpsc::{self, Sender};
-use tracing::error;
-use uuid::Uuid;
-
-use crate::database::Database;
+use anyhow::Result;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IngestRecord {
@@ -20,184 +15,178 @@ pub struct IngestRecord {
     pub kind: Option<String>,
     pub start_time_unix_nano: i64,
     pub end_time_unix_nano: Option<i64>,
-
-    // Span attributes
-    pub http_method: Option<String>,
-    pub http_url: Option<String>,
-    pub http_status_code: Option<i32>,
-    pub http_request_content_length: Option<i64>,
-    pub http_response_content_length: Option<i64>,
-    pub http_route: Option<String>,
-    pub http_scheme: Option<String>,
-    pub http_client_ip: Option<String>,
-    pub http_user_agent: Option<String>,
-    pub http_flavor: Option<String>,
-    pub http_target: Option<String>,
-    pub http_host: Option<String>,
-    pub rpc_system: Option<String>,
-    pub rpc_service: Option<String>,
-    pub rpc_method: Option<String>,
-    pub rpc_grpc_status_code: Option<i32>,
-    pub db_system: Option<String>,
-    pub db_connection_string: Option<String>,
-    pub db_user: Option<String>,
-    pub db_name: Option<String>,
-    pub db_statement: Option<String>,
-    pub db_operation: Option<String>,
-    pub db_sql_table: Option<String>,
-    pub messaging_system: Option<String>,
-    pub messaging_destination: Option<String>,
-    pub messaging_destination_kind: Option<String>,
-    pub messaging_message_id: Option<String>,
-    pub messaging_operation: Option<String>,
-    pub messaging_url: Option<String>,
-    pub messaging_client_id: Option<String>,
-    pub messaging_kafka_partition: Option<i32>,
-    pub messaging_kafka_offset: Option<i64>,
-    pub messaging_kafka_consumer_group: Option<String>,
-    pub messaging_message_payload_size_bytes: Option<i64>,
-    pub messaging_protocol: Option<String>,
-    pub messaging_protocol_version: Option<String>,
-    pub cache_system: Option<String>,
-    pub cache_operation: Option<String>,
-    pub cache_key: Option<String>,
-    pub cache_hit: Option<bool>,
-    pub net_peer_ip: Option<String>,
-    pub net_peer_port: Option<i32>,
-    pub net_host_ip: Option<String>,
-    pub net_host_port: Option<i32>,
-    pub net_transport: Option<String>,
-    pub enduser_id: Option<String>,
-    pub enduser_role: Option<String>,
-    pub enduser_scope: Option<String>,
-    pub exception_type: Option<String>,
-    pub exception_message: Option<String>,
-    pub exception_stacktrace: Option<String>,
-    pub exception_escaped: Option<bool>,
-    pub thread_id: Option<i64>,
-    pub thread_name: Option<String>,
-    pub code_function: Option<String>,
-    pub code_filepath: Option<String>,
-    pub code_namespace: Option<String>,
-    pub code_lineno: Option<i32>,
-    pub deployment_environment: Option<String>,
-    pub deployment_version: Option<String>,
-    pub service_name: Option<String>,
-    pub service_version: Option<String>,
-    pub service_instance_id: Option<String>,
-    pub otel_library_name: Option<String>,
-    pub otel_library_version: Option<String>,
-    pub k8s_pod_name: Option<String>,
-    pub k8s_namespace_name: Option<String>,
-    pub k8s_deployment_name: Option<String>,
-    pub container_id: Option<String>,
-    pub host_name: Option<String>,
-    pub os_type: Option<String>,
-    pub os_version: Option<String>,
-    pub process_pid: Option<i64>,
-    pub process_command_line: Option<String>,
-    pub process_runtime_name: Option<String>,
-    pub process_runtime_version: Option<String>,
-    pub aws_region: Option<String>,
-    pub aws_account_id: Option<String>,
-    pub aws_dynamodb_table_name: Option<String>,
-    pub aws_dynamodb_operation: Option<String>,
-    pub aws_dynamodb_consumed_capacity_total: Option<f64>,
-    pub aws_sqs_queue_url: Option<String>,
-    pub aws_sqs_message_id: Option<String>,
-    pub azure_resource_id: Option<String>,
-    pub azure_storage_container_name: Option<String>,
-    pub azure_storage_blob_name: Option<String>,
-    pub gcp_project_id: Option<String>,
-    pub gcp_cloudsql_instance_id: Option<String>,
-    pub gcp_pubsub_message_id: Option<String>,
-    pub http_request_method: Option<String>,
-    pub db_instance_identifier: Option<String>,
-    pub db_rows_affected: Option<i64>,
-    pub net_sock_peer_addr: Option<String>,
-    pub net_sock_peer_port: Option<i32>,
-    pub net_sock_host_addr: Option<String>,
-    pub net_sock_host_port: Option<i32>,
-    pub messaging_consumer_id: Option<String>,
-    pub messaging_message_payload_compressed_size_bytes: Option<i64>,
-    pub faas_invocation_id: Option<String>,
-    pub faas_trigger: Option<String>,
-    pub cloud_zone: Option<String>,
-
-    // Resource attributes
-    pub resource_attributes_service_name: Option<String>,
-    pub resource_attributes_service_version: Option<String>,
-    pub resource_attributes_service_instance_id: Option<String>,
-    pub resource_attributes_service_namespace: Option<String>,
-    pub resource_attributes_host_name: Option<String>,
-    pub resource_attributes_host_id: Option<String>,
-    pub resource_attributes_host_type: Option<String>,
-    pub resource_attributes_host_arch: Option<String>,
-    pub resource_attributes_os_type: Option<String>,
-    pub resource_attributes_os_version: Option<String>,
-    pub resource_attributes_process_pid: Option<i64>,
-    pub resource_attributes_process_executable_name: Option<String>,
-    pub resource_attributes_process_command_line: Option<String>,
-    pub resource_attributes_process_runtime_name: Option<String>,
-    pub resource_attributes_process_runtime_version: Option<String>,
-    pub resource_attributes_process_runtime_description: Option<String>,
-    pub resource_attributes_process_executable_path: Option<String>,
-    pub resource_attributes_k8s_cluster_name: Option<String>,
-    pub resource_attributes_k8s_namespace_name: Option<String>,
-    pub resource_attributes_k8s_deployment_name: Option<String>,
-    pub resource_attributes_k8s_pod_name: Option<String>,
-    pub resource_attributes_k8s_pod_uid: Option<String>,
-    pub resource_attributes_k8s_replicaset_name: Option<String>,
-    pub resource_attributes_k8s_deployment_strategy: Option<String>,
-    pub resource_attributes_k8s_container_name: Option<String>,
-    pub resource_attributes_k8s_node_name: Option<String>,
-    pub resource_attributes_container_id: Option<String>,
-    pub resource_attributes_container_image_name: Option<String>,
-    pub resource_attributes_container_image_tag: Option<String>,
-    pub resource_attributes_deployment_environment: Option<String>,
-    pub resource_attributes_deployment_version: Option<String>,
-    pub resource_attributes_cloud_provider: Option<String>,
-    pub resource_attributes_cloud_platform: Option<String>,
-    pub resource_attributes_cloud_region: Option<String>,
-    pub resource_attributes_cloud_availability_zone: Option<String>,
-    pub resource_attributes_cloud_account_id: Option<String>,
-    pub resource_attributes_cloud_resource_id: Option<String>,
-    pub resource_attributes_cloud_instance_type: Option<String>,
-    pub resource_attributes_telemetry_sdk_name: Option<String>,
-    pub resource_attributes_telemetry_sdk_language: Option<String>,
-    pub resource_attributes_telemetry_sdk_version: Option<String>,
-    pub resource_attributes_application_name: Option<String>,
-    pub resource_attributes_application_version: Option<String>,
-    pub resource_attributes_application_tier: Option<String>,
-    pub resource_attributes_application_owner: Option<String>,
-    pub resource_attributes_customer_id: Option<String>,
-    pub resource_attributes_tenant_id: Option<String>,
-    pub resource_attributes_feature_flag_enabled: Option<bool>,
-    pub resource_attributes_payment_gateway: Option<String>,
-    pub resource_attributes_database_type: Option<String>,
-    pub resource_attributes_database_instance: Option<String>,
-    pub resource_attributes_cache_provider: Option<String>,
-    pub resource_attributes_message_queue_type: Option<String>,
-    pub resource_attributes_http_route: Option<String>,
-    pub resource_attributes_aws_ecs_cluster_arn: Option<String>,
-    pub resource_attributes_aws_ecs_container_arn: Option<String>,
-    pub resource_attributes_aws_ecs_task_arn: Option<String>,
-    pub resource_attributes_aws_ecs_task_family: Option<String>,
-    pub resource_attributes_aws_ec2_instance_id: Option<String>,
-    pub resource_attributes_gcp_project_id: Option<String>,
-    pub resource_attributes_gcp_zone: Option<String>,
-    pub resource_attributes_azure_resource_id: Option<String>,
-    pub resource_attributes_dynatrace_entity_process_id: Option<String>,
-    pub resource_attributes_elastic_node_name: Option<String>,
-    pub resource_attributes_istio_mesh_id: Option<String>,
-    pub resource_attributes_cloudfoundry_application_id: Option<String>,
-    pub resource_attributes_cloudfoundry_space_id: Option<String>,
-    pub resource_attributes_opentelemetry_collector_name: Option<String>,
-    pub resource_attributes_instrumentation_name: Option<String>,
-    pub resource_attributes_instrumentation_version: Option<String>,
-    pub resource_attributes_log_source: Option<String>,
-
-    // Nested structures
+    pub span___http_method: Option<String>,
+    pub span___http_url: Option<String>,
+    pub span___http_status_code: Option<i32>,
+    pub span___http_request_content_length: Option<i64>,
+    pub span___http_response_content_length: Option<i64>,
+    pub span___http_route: Option<String>,
+    pub span___http_scheme: Option<String>,
+    pub span___http_client_ip: Option<String>,
+    pub span___http_user_agent: Option<String>,
+    pub span___http_flavor: Option<String>,
+    pub span___http_target: Option<String>,
+    pub span___http_host: Option<String>,
+    pub span___rpc_system: Option<String>,
+    pub span___rpc_service: Option<String>,
+    pub span___rpc_method: Option<String>,
+    pub span___rpc_grpc_status_code: Option<i32>,
+    pub span___db_system: Option<String>,
+    pub span___db_connection_string: Option<String>,
+    pub span___db_user: Option<String>,
+    pub span___db_name: Option<String>,
+    pub span___db_statement: Option<String>,
+    pub span___db_operation: Option<String>,
+    pub span___db_sql_table: Option<String>,
+    pub span___messaging_system: Option<String>,
+    pub span___messaging_destination: Option<String>,
+    pub span___messaging_destination_kind: Option<String>,
+    pub span___messaging_message_id: Option<String>,
+    pub span___messaging_operation: Option<String>,
+    pub span___messaging_url: Option<String>,
+    pub span___messaging_client_id: Option<String>,
+    pub span___messaging_kafka_partition: Option<i32>,
+    pub span___messaging_kafka_offset: Option<i64>,
+    pub span___messaging_kafka_consumer_group: Option<String>,
+    pub span___messaging_message_payload_size_bytes: Option<i64>,
+    pub span___messaging_protocol: Option<String>,
+    pub span___messaging_protocol_version: Option<String>,
+    pub span___cache_system: Option<String>,
+    pub span___cache_operation: Option<String>,
+    pub span___cache_key: Option<String>,
+    pub span___cache_hit: Option<bool>,
+    pub span___net_peer_ip: Option<String>,
+    pub span___net_peer_port: Option<i32>,
+    pub span___net_host_ip: Option<String>,
+    pub span___net_host_port: Option<i32>,
+    pub span___net_transport: Option<String>,
+    pub span___enduser_id: Option<String>,
+    pub span___enduser_role: Option<String>,
+    pub span___enduser_scope: Option<String>,
+    pub span___exception_type: Option<String>,
+    pub span___exception_message: Option<String>,
+    pub span___exception_stacktrace: Option<String>,
+    pub span___exception_escaped: Option<bool>,
+    pub span___thread_id: Option<i64>,
+    pub span___thread_name: Option<String>,
+    pub span___code_function: Option<String>,
+    pub span___code_filepath: Option<String>,
+    pub span___code_namespace: Option<String>,
+    pub span___code_lineno: Option<i32>,
+    pub span___deployment_environment: Option<String>,
+    pub span___deployment_version: Option<String>,
+    pub span___service_name: Option<String>,
+    pub span___service_version: Option<String>,
+    pub span___service_instance_id: Option<String>,
+    pub span___otel_library_name: Option<String>,
+    pub span___otel_library_version: Option<String>,
+    pub span___k8s_pod_name: Option<String>,
+    pub span___k8s_namespace_name: Option<String>,
+    pub span___k8s_deployment_name: Option<String>,
+    pub span___container_id: Option<String>,
+    pub span___host_name: Option<String>,
+    pub span___os_type: Option<String>,
+    pub span___os_version: Option<String>,
+    pub span___process_pid: Option<i64>,
+    pub span___process_command_line: Option<String>,
+    pub span___process_runtime_name: Option<String>,
+    pub span___process_runtime_version: Option<String>,
+    pub span___aws_region: Option<String>,
+    pub span___aws_account_id: Option<String>,
+    pub span___aws_dynamodb_table_name: Option<String>,
+    pub span___aws_dynamodb_operation: Option<String>,
+    pub span___aws_dynamodb_consumed_capacity_total: Option<f64>,
+    pub span___aws_sqs_queue_url: Option<String>,
+    pub span___aws_sqs_message_id: Option<String>,
+    pub span___azure_resource_id: Option<String>,
+    pub span___azure_storage_container_name: Option<String>,
+    pub span___azure_storage_blob_name: Option<String>,
+    pub span___gcp_project_id: Option<String>,
+    pub span___gcp_cloudsql_instance_id: Option<String>,
+    pub span___gcp_pubsub_message_id: Option<String>,
+    pub span___http_request_method: Option<String>,
+    pub span___db_instance_identifier: Option<String>,
+    pub span___db_rows_affected: Option<i64>,
+    pub span___net_sock_peer_addr: Option<String>,
+    pub span___net_sock_peer_port: Option<i32>,
+    pub span___net_sock_host_addr: Option<String>,
+    pub span___net_sock_host_port: Option<i32>,
+    pub span___messaging_consumer_id: Option<String>,
+    pub span___messaging_message_payload_compressed_size_bytes: Option<i64>,
+    pub span___faas_invocation_id: Option<String>,
+    pub span___faas_trigger: Option<String>,
+    pub span___cloud_zone: Option<String>,
+    pub attributes____service_name: Option<String>,
+    pub attributes____service_version: Option<String>,
+    pub attributes____service_instance_id: Option<String>,
+    pub attributes____service_namespace: Option<String>,
+    pub attributes____host_name: Option<String>,
+    pub attributes____host_id: Option<String>,
+    pub attributes____host_type: Option<String>,
+    pub attributes____host_arch: Option<String>,
+    pub attributes____os_type: Option<String>,
+    pub attributes____os_version: Option<String>,
+    pub attributes____process_pid: Option<i64>,
+    pub attributes____process_executable_name: Option<String>,
+    pub attributes____process_command_line: Option<String>,
+    pub attributes____process_runtime_name: Option<String>,
+    pub attributes____process_runtime_version: Option<String>,
+    pub attributes____process_runtime_description: Option<String>,
+    pub attributes____process_executable_path: Option<String>,
+    pub attributes____k8s_cluster_name: Option<String>,
+    pub attributes____k8s_namespace_name: Option<String>,
+    pub attributes____k8s_deployment_name: Option<String>,
+    pub attributes____k8s_pod_name: Option<String>,
+    pub attributes____k8s_pod_uid: Option<String>,
+    pub attributes____k8s_replicaset_name: Option<String>,
+    pub attributes____k8s_deployment_strategy: Option<String>,
+    pub attributes____k8s_container_name: Option<String>,
+    pub attributes____k8s_node_name: Option<String>,
+    pub attributes____container_id: Option<String>,
+    pub attributes____container_image_name: Option<String>,
+    pub attributes____container_image_tag: Option<String>,
+    pub attributes____deployment_environment: Option<String>,
+    pub attributes____deployment_version: Option<String>,
+    pub attributes____cloud_provider: Option<String>,
+    pub attributes____cloud_platform: Option<String>,
+    pub attributes____cloud_region: Option<String>,
+    pub attributes____cloud_availability_zone: Option<String>,
+    pub attributes____cloud_account_id: Option<String>,
+    pub attributes____cloud_resource_id: Option<String>,
+    pub attributes____cloud_instance_type: Option<String>,
+    pub attributes____telemetry_sdk_name: Option<String>,
+    pub attributes____telemetry_sdk_language: Option<String>,
+    pub attributes____telemetry_sdk_version: Option<String>,
+    pub attributes____application_name: Option<String>,
+    pub attributes____application_version: Option<String>,
+    pub attributes____application_tier: Option<String>,
+    pub attributes____application_owner: Option<String>,
+    pub attributes____customer_id: Option<String>,
+    pub attributes____tenant_id: Option<String>,
+    pub attributes____feature_flag_enabled: Option<bool>,
+    pub attributes____payment_gateway: Option<String>,
+    pub attributes____database_type: Option<String>,
+    pub attributes____database_instance: Option<String>,
+    pub attributes____cache_provider: Option<String>,
+    pub attributes____message_queue_type: Option<String>,
+    pub attributes____http_route: Option<String>,
+    pub attributes____aws_ecs_cluster_arn: Option<String>,
+    pub attributes____aws_ecs_container_arn: Option<String>,
+    pub attributes____aws_ecs_task_arn: Option<String>,
+    pub attributes____aws_ecs_task_family: Option<String>,
+    pub attributes____aws_ec2_instance_id: Option<String>,
+    pub attributes____gcp_project_id: Option<String>,
+    pub attributes____gcp_zone: Option<String>,
+    pub attributes____azure_resource_id: Option<String>,
+    pub attributes____dynatrace_entity_process_id: Option<String>,
+    pub attributes____elastic_node_name: Option<String>,
+    pub attributes____istio_mesh_id: Option<String>,
+    pub attributes____cloudfoundry_application_id: Option<String>,
+    pub attributes____cloudfoundry_space_id: Option<String>,
+    pub attributes____opentelemetry_collector_name: Option<String>,
+    pub attributes____instrumentation_name: Option<String>,
+    pub attributes____instrumentation_version: Option<String>,
+    pub attributes____log_source: Option<String>,
     pub events: Option<String>,
     pub links: Option<String>,
     pub status_code: Option<String>,
@@ -206,83 +195,88 @@ pub struct IngestRecord {
     pub instrumentation_library_version: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct PersistentQueue {
-    pub db: Db,
-    sender: Sender<(String, IngestRecord)>,
-    database: Arc<Database>,
+    path: PathBuf,
+    file: Arc<Mutex<File>>,
+    position: Arc<Mutex<u64>>,
 }
 
 impl PersistentQueue {
-    pub fn new<P: AsRef<Path>>(path: P, database: Arc<Database>) -> Result<Self> {
-        let db = sled::open(path)?;
-        let (sender, mut receiver) = mpsc::channel::<(String, IngestRecord)>(1000);
-
-        let queue = Self {
-            db,
-            sender,
-            database,
-        };
-
-        // Clone necessary components for the spawned task
-        let db_clone = queue.db.clone();
-        let database_clone = queue.database.clone();
-
-        tokio::spawn(async move {
-            while let Some((receipt, record)) = receiver.recv().await {
-                if let Err(e) = Self::process_record_static(&db_clone, &database_clone, receipt.clone(), &record).await {
-                    error!("Failed to process record with receipt {}: {:?}", receipt, e);
-                }
-            }
-        });
-
-        Ok(queue)
+    pub async fn new(path: &str) -> Result<Self> {
+        let path = PathBuf::from(path);
+        if !path.parent().unwrap().exists() {
+            tokio::fs::create_dir_all(path.parent().unwrap()).await?;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .await?;
+        Ok(Self {
+            path,
+            file: Arc::new(Mutex::new(file)),
+            position: Arc::new(Mutex::new(0)),
+        })
     }
 
-    async fn process_record_static(db: &Db, database: &Arc<Database>, receipt: String, record: &IngestRecord) -> Result<()> {
-        tracing::info!("Processing record with receipt: {}", receipt);
-        database.write(record).await?;
-        db.remove(receipt.as_bytes())?;
-        tracing::info!("Record processed and removed from queue: {}", record.trace_id);
+    pub async fn enqueue(&self, record: IngestRecord) -> Result<()> {
+        let mut file = self.file.lock().unwrap();
+        let serialized = serde_json::to_string(&record)?;
+        let len = serialized.len() as u64;
+        file.write_all(serialized.as_bytes()).await?;
+        file.write_all(b"\n").await?;
+        file.flush().await?;
+
+        let mut pos = self.position.lock().unwrap();
+        *pos += len + 1; // +1 for newline
         Ok(())
     }
 
-    pub async fn enqueue(&self, record: &IngestRecord) -> Result<String> {
-        let receipt = Uuid::new_v4().to_string();
-        let serialized = bincode::serialize(record)?;
-        self.db.insert(receipt.as_bytes(), serialized)?;
-        self.sender.send((receipt.clone(), record.clone())).await?;
-        Ok(receipt)
-    }
+    pub async fn dequeue(&self) -> Result<Option<IngestRecord>> {
+        let mut file = self.file.lock().unwrap();
+        let mut pos = self.position.lock().unwrap();
 
-    pub async fn process_record(&self, receipt: String, record: &IngestRecord) -> Result<()> {
-        Self::process_record_static(&self.db, &self.database, receipt, record).await
-    }
-
-    pub async fn dequeue(&self) -> Result<Option<(String, IngestRecord)>> {
-        if let Some((key, value)) = self.db.pop_min()? {
-            let receipt = String::from_utf8(key.to_vec())?;
-            let record: IngestRecord = bincode::deserialize(&value)?;
-            Ok(Some((receipt, record)))
-        } else {
-            Ok(None)
+        if *pos == 0 {
+            return Ok(None); // Queue is empty
         }
-    }
 
-    pub async fn dequeue_all(&self) -> Result<Vec<(String, IngestRecord)>> {
-        let mut records = Vec::new();
-        while let Some((key, value)) = self.db.pop_min()? {
-            let receipt = String::from_utf8(key.to_vec())?;
-            let record: IngestRecord = bincode::deserialize(&value)?;
-            records.push((receipt, record));
+        // Read the first line
+        file.seek(SeekFrom::Start(0)).await?;
+        let mut reader = BufReader::new(&mut *file);
+        let mut line = String::new();
+        let bytes_read = reader.read_line(&mut line).await?;
+
+        if bytes_read == 0 {
+            return Ok(None); // No data to read
         }
-        Ok(records)
-    }
 
-    pub fn len(&self) -> Result<usize> {
-        Ok(self.db.len())
-    }
+        let record: IngestRecord = serde_json::from_str(&line.trim_end())?;
+        let consumed = bytes_read as u64;
 
-    pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.db.is_empty())
+        // Drop the reader to release the mutable borrow
+        drop(reader);
+
+        // Now we can mutate the file again
+        *pos -= consumed;
+        file.set_len(*pos).await?;
+        file.seek(SeekFrom::Start(0)).await?;
+
+        if *pos > 0 {
+            // Read remaining content with a new reader
+            let mut remaining = Vec::new();
+            let mut new_reader = BufReader::new(&mut *file);
+            new_reader.seek(SeekFrom::Start(consumed)).await?;
+            new_reader.read_to_end(&mut remaining).await?;
+            drop(new_reader);
+
+            // Write remaining content back
+            file.seek(SeekFrom::Start(0)).await?;
+            file.write_all(&remaining).await?;
+            file.flush().await?;
+        }
+
+        Ok(Some(record))
     }
 }
