@@ -6,10 +6,11 @@ use std::{
 };
 
 use anyhow::Result;
-use chrono::DateTime;
 use datafusion::{
     arrow::{
-        array::{BooleanArray, Int32Array, Int64Array, ListBuilder, StringArray, StringBuilder, TimestampMicrosecondArray},
+        array::{
+            BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, TimestampNanosecondArray,
+        },
         datatypes::{DataType, Field, Schema, TimeUnit},
         record_batch::RecordBatch,
     },
@@ -46,7 +47,6 @@ impl Database {
         self.ctx.clone()
     }
 
-    /// Add a table using the fixed key "telemetry_events"
     pub async fn add_project(&self, table_name: &str, connection_string: &str) -> Result<()> {
         let table = match DeltaTableBuilder::from_uri(connection_string).load().await {
             Ok(table) => table,
@@ -56,7 +56,7 @@ impl Database {
                     .await?
                     .create()
                     .with_columns(Self::event_schema_fields())
-                    .with_partition_columns(vec!["timestamp".to_string()])
+                    .with_partition_columns(vec!["start_time_unix_nano".to_string()])
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create table: {:?}", e))?
             }
@@ -68,56 +68,201 @@ impl Database {
         Ok(())
     }
 
-    /// Schema matching your new DB table definition.
     fn event_schema() -> Schema {
         Schema::new(vec![
-            Field::new("projectId", DataType::Utf8, false),
-            Field::new("id", DataType::Utf8, false),
-            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), false),
-            Field::new("traceId", DataType::Utf8, false),
-            Field::new("spanId", DataType::Utf8, false),
-            Field::new("eventType", DataType::Utf8, false),
-            Field::new("status", DataType::Utf8, true),
-            Field::new("endTime", DataType::Timestamp(TimeUnit::Microsecond, Some(StdArc::from("UTC"))), true),
-            Field::new("durationNs", DataType::Int64, false),
-            Field::new("spanName", DataType::Utf8, false),
-            Field::new("spanKind", DataType::Utf8, true),
-            Field::new("parentSpanId", DataType::Utf8, true),
-            Field::new("traceState", DataType::Utf8, true),
-            Field::new("hasError", DataType::Boolean, false),
-            Field::new("severityText", DataType::Utf8, true),
-            Field::new("severityNumber", DataType::Int32, false),
-            Field::new("body", DataType::Utf8, true),
-            Field::new("httpMethod", DataType::Utf8, true),
-            Field::new("httpUrl", DataType::Utf8, true),
-            Field::new("httpRoute", DataType::Utf8, true),
-            Field::new("httpHost", DataType::Utf8, true),
-            Field::new("httpStatusCode", DataType::Int32, true),
-            Field::new("pathParams", DataType::Utf8, false),
-            Field::new("queryParams", DataType::Utf8, false),
-            Field::new("requestBody", DataType::Utf8, false),
-            Field::new("responseBody", DataType::Utf8, false),
-            Field::new("sdkType", DataType::Utf8, false),
-            Field::new("serviceVersion", DataType::Utf8, true),
-            Field::new("errors", DataType::Utf8, false),
-            Field::new("tags", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
-            Field::new("parentId", DataType::Utf8, true),
-            Field::new("dbSystem", DataType::Utf8, true),
-            Field::new("dbName", DataType::Utf8, true),
-            Field::new("dbStatement", DataType::Utf8, true),
-            Field::new("dbOperation", DataType::Utf8, true),
-            Field::new("rpcSystem", DataType::Utf8, true),
-            Field::new("rpcService", DataType::Utf8, true),
-            Field::new("rpcMethod", DataType::Utf8, true),
-            Field::new("endpointHash", DataType::Utf8, false),
-            Field::new("shapeHash", DataType::Utf8, false),
-            Field::new("formatHashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
-            Field::new("fieldHashes", DataType::List(StdArc::new(Field::new("item", DataType::Utf8, true))), false),
-            Field::new("attributes", DataType::Utf8, false),
-            Field::new("events", DataType::Utf8, false),
-            Field::new("links", DataType::Utf8, false),
-            Field::new("resource", DataType::Utf8, false),
-            Field::new("instrumentationScope", DataType::Utf8, false),
+            // Core span fields
+            Field::new("trace_id", DataType::Utf8, false),
+            Field::new("span_id", DataType::Utf8, false),
+            Field::new("trace_state", DataType::Utf8, true),
+            Field::new("parent_span_id", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("kind", DataType::Utf8, true),
+            Field::new("start_time_unix_nano", DataType::Timestamp(TimeUnit::Nanosecond, Some(StdArc::from("UTC"))), false),
+            Field::new("end_time_unix_nano", DataType::Timestamp(TimeUnit::Nanosecond, Some(StdArc::from("UTC"))), true),
+
+            // Span attributes
+            Field::new("http_method", DataType::Utf8, true),
+            Field::new("http_url", DataType::Utf8, true),
+            Field::new("http_status_code", DataType::Int32, true),
+            Field::new("http_request_content_length", DataType::Int64, true),
+            Field::new("http_response_content_length", DataType::Int64, true),
+            Field::new("http_route", DataType::Utf8, true),
+            Field::new("http_scheme", DataType::Utf8, true),
+            Field::new("http_client_ip", DataType::Utf8, true),
+            Field::new("http_user_agent", DataType::Utf8, true),
+            Field::new("http_flavor", DataType::Utf8, true),
+            Field::new("http_target", DataType::Utf8, true),
+            Field::new("http_host", DataType::Utf8, true),
+            Field::new("rpc_system", DataType::Utf8, true),
+            Field::new("rpc_service", DataType::Utf8, true),
+            Field::new("rpc_method", DataType::Utf8, true),
+            Field::new("rpc_grpc_status_code", DataType::Int32, true),
+            Field::new("db_system", DataType::Utf8, true),
+            Field::new("db_connection_string", DataType::Utf8, true),
+            Field::new("db_user", DataType::Utf8, true),
+            Field::new("db_name", DataType::Utf8, true),
+            Field::new("db_statement", DataType::Utf8, true),
+            Field::new("db_operation", DataType::Utf8, true),
+            Field::new("db_sql_table", DataType::Utf8, true),
+            Field::new("messaging_system", DataType::Utf8, true),
+            Field::new("messaging_destination", DataType::Utf8, true),
+            Field::new("messaging_destination_kind", DataType::Utf8, true),
+            Field::new("messaging_message_id", DataType::Utf8, true),
+            Field::new("messaging_operation", DataType::Utf8, true),
+            Field::new("messaging_url", DataType::Utf8, true),
+            Field::new("messaging_client_id", DataType::Utf8, true),
+            Field::new("messaging_kafka_partition", DataType::Int32, true),
+            Field::new("messaging_kafka_offset", DataType::Int64, true),
+            Field::new("messaging_kafka_consumer_group", DataType::Utf8, true),
+            Field::new("messaging_message_payload_size_bytes", DataType::Int64, true),
+            Field::new("messaging_protocol", DataType::Utf8, true),
+            Field::new("messaging_protocol_version", DataType::Utf8, true),
+            Field::new("cache_system", DataType::Utf8, true),
+            Field::new("cache_operation", DataType::Utf8, true),
+            Field::new("cache_key", DataType::Utf8, true),
+            Field::new("cache_hit", DataType::Boolean, true),
+            Field::new("net_peer_ip", DataType::Utf8, true),
+            Field::new("net_peer_port", DataType::Int32, true),
+            Field::new("net_host_ip", DataType::Utf8, true),
+            Field::new("net_host_port", DataType::Int32, true),
+            Field::new("net_transport", DataType::Utf8, true),
+            Field::new("enduser_id", DataType::Utf8, true),
+            Field::new("enduser_role", DataType::Utf8, true),
+            Field::new("enduser_scope", DataType::Utf8, true),
+            Field::new("exception_type", DataType::Utf8, true),
+            Field::new("exception_message", DataType::Utf8, true),
+            Field::new("exception_stacktrace", DataType::Utf8, true),
+            Field::new("exception_escaped", DataType::Boolean, true),
+            Field::new("thread_id", DataType::Int64, true),
+            Field::new("thread_name", DataType::Utf8, true),
+            Field::new("code_function", DataType::Utf8, true),
+            Field::new("code_filepath", DataType::Utf8, true),
+            Field::new("code_namespace", DataType::Utf8, true),
+            Field::new("code_lineno", DataType::Int32, true),
+            Field::new("deployment_environment", DataType::Utf8, true),
+            Field::new("deployment_version", DataType::Utf8, true),
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("service_version", DataType::Utf8, true),
+            Field::new("service_instance_id", DataType::Utf8, true),
+            Field::new("otel_library_name", DataType::Utf8, true),
+            Field::new("otel_library_version", DataType::Utf8, true),
+            Field::new("k8s_pod_name", DataType::Utf8, true),
+            Field::new("k8s_namespace_name", DataType::Utf8, true),
+            Field::new("k8s_deployment_name", DataType::Utf8, true),
+            Field::new("container_id", DataType::Utf8, true),
+            Field::new("host_name", DataType::Utf8, true),
+            Field::new("os_type", DataType::Utf8, true),
+            Field::new("os_version", DataType::Utf8, true),
+            Field::new("process_pid", DataType::Int64, true),
+            Field::new("process_command_line", DataType::Utf8, true),
+            Field::new("process_runtime_name", DataType::Utf8, true),
+            Field::new("process_runtime_version", DataType::Utf8, true),
+            Field::new("aws_region", DataType::Utf8, true),
+            Field::new("aws_account_id", DataType::Utf8, true),
+            Field::new("aws_dynamodb_table_name", DataType::Utf8, true),
+            Field::new("aws_dynamodb_operation", DataType::Utf8, true),
+            Field::new("aws_dynamodb_consumed_capacity_total", DataType::Float64, true),
+            Field::new("aws_sqs_queue_url", DataType::Utf8, true),
+            Field::new("aws_sqs_message_id", DataType::Utf8, true),
+            Field::new("azure_resource_id", DataType::Utf8, true),
+            Field::new("azure_storage_container_name", DataType::Utf8, true),
+            Field::new("azure_storage_blob_name", DataType::Utf8, true),
+            Field::new("gcp_project_id", DataType::Utf8, true),
+            Field::new("gcp_cloudsql_instance_id", DataType::Utf8, true),
+            Field::new("gcp_pubsub_message_id", DataType::Utf8, true),
+            Field::new("http_request_method", DataType::Utf8, true),
+            Field::new("db_instance_identifier", DataType::Utf8, true),
+            Field::new("db_rows_affected", DataType::Int64, true),
+            Field::new("net_sock_peer_addr", DataType::Utf8, true),
+            Field::new("net_sock_peer_port", DataType::Int32, true),
+            Field::new("net_sock_host_addr", DataType::Utf8, true),
+            Field::new("net_sock_host_port", DataType::Int32, true),
+            Field::new("messaging_consumer_id", DataType::Utf8, true),
+            Field::new("messaging_message_payload_compressed_size_bytes", DataType::Int64, true),
+            Field::new("faas_invocation_id", DataType::Utf8, true),
+            Field::new("faas_trigger", DataType::Utf8, true),
+            Field::new("cloud_zone", DataType::Utf8, true),
+
+            // Resource attributes
+            Field::new("resource_attributes_service_name", DataType::Utf8, true),
+            Field::new("resource_attributes_service_version", DataType::Utf8, true),
+            Field::new("resource_attributes_service_instance_id", DataType::Utf8, true),
+            Field::new("resource_attributes_service_namespace", DataType::Utf8, true),
+            Field::new("resource_attributes_host_name", DataType::Utf8, true),
+            Field::new("resource_attributes_host_id", DataType::Utf8, true),
+            Field::new("resource_attributes_host_type", DataType::Utf8, true),
+            Field::new("resource_attributes_host_arch", DataType::Utf8, true),
+            Field::new("resource_attributes_os_type", DataType::Utf8, true),
+            Field::new("resource_attributes_os_version", DataType::Utf8, true),
+            Field::new("resource_attributes_process_pid", DataType::Int64, true),
+            Field::new("resource_attributes_process_executable_name", DataType::Utf8, true),
+            Field::new("resource_attributes_process_command_line", DataType::Utf8, true),
+            Field::new("resource_attributes_process_runtime_name", DataType::Utf8, true),
+            Field::new("resource_attributes_process_runtime_version", DataType::Utf8, true),
+            Field::new("resource_attributes_process_runtime_description", DataType::Utf8, true),
+            Field::new("resource_attributes_process_executable_path", DataType::Utf8, true),
+            Field::new("resource_attributes_k8s_cluster_name", DataType::Utf8, true),
+            Field::new("resource_attributes_k8s_namespace_name", DataType::Utf8, true),
+            Field::new("resource_attributes_k8s_deployment_name", DataType::Utf8, true),
+            Field::new("resource_attributes_k8s_pod_name", DataType::Utf8, true),
+            Field::new("resource_attributes_k8s_pod_uid", DataType::Utf8, true),
+            Field::new("resource_attributes_k8s_replicaset_name", DataType::Utf8, true),
+            Field::new("resource_attributes_k8s_deployment_strategy", DataType::Utf8, true),
+            Field::new("resource_attributes_k8s_container_name", DataType::Utf8, true),
+            Field::new("resource_attributes_k8s_node_name", DataType::Utf8, true),
+            Field::new("resource_attributes_container_id", DataType::Utf8, true),
+            Field::new("resource_attributes_container_image_name", DataType::Utf8, true),
+            Field::new("resource_attributes_container_image_tag", DataType::Utf8, true),
+            Field::new("resource_attributes_deployment_environment", DataType::Utf8, true),
+            Field::new("resource_attributes_deployment_version", DataType::Utf8, true),
+            Field::new("resource_attributes_cloud_provider", DataType::Utf8, true),
+            Field::new("resource_attributes_cloud_platform", DataType::Utf8, true),
+            Field::new("resource_attributes_cloud_region", DataType::Utf8, true),
+            Field::new("resource_attributes_cloud_availability_zone", DataType::Utf8, true),
+            Field::new("resource_attributes_cloud_account_id", DataType::Utf8, true),
+            Field::new("resource_attributes_cloud_resource_id", DataType::Utf8, true),
+            Field::new("resource_attributes_cloud_instance_type", DataType::Utf8, true),
+            Field::new("resource_attributes_telemetry_sdk_name", DataType::Utf8, true),
+            Field::new("resource_attributes_telemetry_sdk_language", DataType::Utf8, true),
+            Field::new("resource_attributes_telemetry_sdk_version", DataType::Utf8, true),
+            Field::new("resource_attributes_application_name", DataType::Utf8, true),
+            Field::new("resource_attributes_application_version", DataType::Utf8, true),
+            Field::new("resource_attributes_application_tier", DataType::Utf8, true),
+            Field::new("resource_attributes_application_owner", DataType::Utf8, true),
+            Field::new("resource_attributes_customer_id", DataType::Utf8, true),
+            Field::new("resource_attributes_tenant_id", DataType::Utf8, true),
+            Field::new("resource_attributes_feature_flag_enabled", DataType::Boolean, true),
+            Field::new("resource_attributes_payment_gateway", DataType::Utf8, true),
+            Field::new("resource_attributes_database_type", DataType::Utf8, true),
+            Field::new("resource_attributes_database_instance", DataType::Utf8, true),
+            Field::new("resource_attributes_cache_provider", DataType::Utf8, true),
+            Field::new("resource_attributes_message_queue_type", DataType::Utf8, true),
+            Field::new("resource_attributes_http_route", DataType::Utf8, true),
+            Field::new("resource_attributes_aws_ecs_cluster_arn", DataType::Utf8, true),
+            Field::new("resource_attributes_aws_ecs_container_arn", DataType::Utf8, true),
+            Field::new("resource_attributes_aws_ecs_task_arn", DataType::Utf8, true),
+            Field::new("resource_attributes_aws_ecs_task_family", DataType::Utf8, true),
+            Field::new("resource_attributes_aws_ec2_instance_id", DataType::Utf8, true),
+            Field::new("resource_attributes_gcp_project_id", DataType::Utf8, true),
+            Field::new("resource_attributes_gcp_zone", DataType::Utf8, true),
+            Field::new("resource_attributes_azure_resource_id", DataType::Utf8, true),
+            Field::new("resource_attributes_dynatrace_entity_process_id", DataType::Utf8, true),
+            Field::new("resource_attributes_elastic_node_name", DataType::Utf8, true),
+            Field::new("resource_attributes_istio_mesh_id", DataType::Utf8, true),
+            Field::new("resource_attributes_cloudfoundry_application_id", DataType::Utf8, true),
+            Field::new("resource_attributes_cloudfoundry_space_id", DataType::Utf8, true),
+            Field::new("resource_attributes_opentelemetry_collector_name", DataType::Utf8, true),
+            Field::new("resource_attributes_instrumentation_name", DataType::Utf8, true),
+            Field::new("resource_attributes_instrumentation_version", DataType::Utf8, true),
+            Field::new("resource_attributes_log_source", DataType::Utf8, true),
+
+            // Nested structures
+            Field::new("events", DataType::Utf8, true),
+            Field::new("links", DataType::Utf8, true),
+            Field::new("status_code", DataType::Utf8, true),
+            Field::new("status_message", DataType::Utf8, true),
+            Field::new("instrumentation_library_name", DataType::Utf8, true),
+            Field::new("instrumentation_library_version", DataType::Utf8, true),
         ])
     }
 
@@ -152,9 +297,9 @@ impl Database {
                     deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Boolean),
                     f.is_nullable(),
                 ),
-                DataType::List(_) => deltalake::kernel::StructField::new(
+                DataType::Float64 => deltalake::kernel::StructField::new(
                     f.name().to_string(),
-                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::String),
+                    deltalake::kernel::DataType::Primitive(deltalake::kernel::PrimitiveType::Double),
                     f.is_nullable(),
                 ),
                 _ => deltalake::kernel::StructField::new(
@@ -175,7 +320,7 @@ impl Database {
                     .await?
                     .create()
                     .with_columns(Self::event_schema_fields())
-                    .with_partition_columns(vec!["timestamp".to_string()])
+                    .with_partition_columns(vec!["start_time_unix_nano".to_string()])
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to create events table: {:?}", e))?
             }
@@ -186,11 +331,14 @@ impl Database {
             let table_guard = table_ref.read().map_err(|_| anyhow::anyhow!("Lock error"))?;
             let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {:?}", e))?;
             let log_store = table_guard.log_store().clone();
-            deltalake::delta_datafusion::DeltaTableProvider::try_new(snapshot.clone(), log_store, deltalake::delta_datafusion::DeltaScanConfig::default())
-                .map_err(|e| anyhow::anyhow!("Failed to create provider: {:?}", e))?
+            deltalake::delta_datafusion::DeltaTableProvider::try_new(
+                snapshot.clone(),
+                log_store,
+                deltalake::delta_datafusion::DeltaScanConfig::default(),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to create provider: {:?}", e))?
         };
 
-        // Register the table under the fixed name "telemetry_events"
         self.ctx
             .register_table("telemetry_events", Arc::new(provider))
             .map_err(|e| anyhow::anyhow!("Failed to register table: {:?}", e))?;
@@ -210,136 +358,395 @@ impl Database {
         Ok(df)
     }
 
-    /// Write an IngestRecord into the fixed "telemetry_events" table.
     pub async fn write(&self, record: &crate::persistent_queue::IngestRecord) -> Result<()> {
         let (conn_str, _table_ref) = {
             let configs = self.project_configs.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             configs.get("telemetry_events").ok_or_else(|| anyhow::anyhow!("Table not found"))?.clone()
         };
 
-        let ts = DateTime::parse_from_rfc3339(&record.timestamp).map_err(|e| anyhow::anyhow!("Invalid timestamp: {:?}", e))?;
-        let ts_micro = ts.timestamp_micros();
-        let end_ts_micro = record.endTime.as_ref().map(|et| DateTime::parse_from_rfc3339(et).map(|dt| dt.timestamp_micros())).transpose()?;
+        let ts_nano = record.start_time_unix_nano;
+        let end_ts_nano = record.end_time_unix_nano;
 
-        let project_id_array = StringArray::from(vec![record.projectId.clone()]);
-        let id_array = StringArray::from(vec![record.id.clone()]);
-        let timestamp_array = Arc::new(build_timestamp_array(vec![ts_micro], Some(StdArc::from("UTC"))));
-        let trace_id_array = StringArray::from(vec![record.traceId.clone()]);
-        let span_id_array = StringArray::from(vec![record.spanId.clone()]);
-        let event_type_array = StringArray::from(vec![record.eventType.clone()]);
-        let status_array = StringArray::from(vec![record.status.clone().unwrap_or_default()]);
-        let end_time_array = Arc::new(build_timestamp_array(vec![end_ts_micro.unwrap_or(0)], Some(StdArc::from("UTC"))));
-        let duration_ns_array = Int64Array::from(vec![record.durationNs]);
-        let span_name_array = StringArray::from(vec![record.spanName.clone()]);
-        let span_kind_array = StringArray::from(vec![record.spanKind.clone().unwrap_or_default()]);
-        let parent_span_id_array = StringArray::from(vec![record.parentSpanId.as_deref().unwrap_or("")]);
-        let trace_state_array = StringArray::from(vec![record.traceState.clone().unwrap_or_default()]);
-        let has_error_array = BooleanArray::from(vec![record.hasError]);
-        let severity_text_array = StringArray::from(vec![record.severityText.clone().unwrap_or_default()]);
-        let severity_number_array = Int32Array::from(vec![record.severityNumber]);
-        let body_array = StringArray::from(vec![record.body.clone().unwrap_or_else(|| "{}".to_string())]);
-        let http_method_array = StringArray::from(vec![record.httpMethod.clone().unwrap_or_default()]);
-        let http_url_array = StringArray::from(vec![record.httpUrl.clone().unwrap_or_default()]);
-        let http_route_array = StringArray::from(vec![record.httpRoute.clone().unwrap_or_default()]);
-        let http_host_array = StringArray::from(vec![record.httpHost.clone().unwrap_or_default()]);
-        let http_status_code_array = Int32Array::from(vec![record.httpStatusCode.unwrap_or(0)]);
-        let path_params_array = StringArray::from(vec![record.pathParams.clone().unwrap_or_else(|| "{}".to_string())]);
-        let query_params_array = StringArray::from(vec![record.queryParams.clone().unwrap_or_else(|| "{}".to_string())]);
-        let request_body_array = StringArray::from(vec![record.requestBody.clone().unwrap_or_else(|| "{}".to_string())]);
-        let response_body_array = StringArray::from(vec![record.responseBody.clone().unwrap_or_else(|| "{}".to_string())]);
-        let sdk_type_array = StringArray::from(vec![record.sdkType.clone()]);
-        let service_version_array = StringArray::from(vec![record.serviceVersion.clone().unwrap_or_default()]);
-        let errors_array = StringArray::from(vec![record.errors.clone().unwrap_or_else(|| "{}".to_string())]);
+        let trace_id_array = StringArray::from(vec![record.trace_id.clone()]);
+        let span_id_array = StringArray::from(vec![record.span_id.clone()]);
+        let trace_state_array = StringArray::from(vec![record.trace_state.clone().unwrap_or_default()]);
+        let parent_span_id_array = StringArray::from(vec![record.parent_span_id.clone().unwrap_or_default()]);
+        let name_array = StringArray::from(vec![record.name.clone()]);
+        let kind_array = StringArray::from(vec![record.kind.clone().unwrap_or_default()]);
+        let start_time_array = Arc::new(build_timestamp_array(vec![ts_nano], Some(StdArc::from("UTC"))));
+        let end_time_array = Arc::new(build_timestamp_array(vec![end_ts_nano.unwrap_or(0)], Some(StdArc::from("UTC"))));
 
-        let mut tags_builder = ListBuilder::new(StringBuilder::new());
-        for tag in &record.tags {
-            tags_builder.values().append_value(tag);
-        }
-        tags_builder.append(true);
-        let tags_array = tags_builder.finish();
+        let http_method_array = StringArray::from(vec![record.http_method.clone().unwrap_or_default()]);
+        let http_url_array = StringArray::from(vec![record.http_url.clone().unwrap_or_default()]);
+        let http_status_code_array = Int32Array::from(vec![record.http_status_code]);
+        let http_request_content_length_array = Int64Array::from(vec![record.http_request_content_length]);
+        let http_response_content_length_array = Int64Array::from(vec![record.http_response_content_length]);
+        let http_route_array = StringArray::from(vec![record.http_route.clone().unwrap_or_default()]);
+        let http_scheme_array = StringArray::from(vec![record.http_scheme.clone().unwrap_or_default()]);
+        let http_client_ip_array = StringArray::from(vec![record.http_client_ip.clone().unwrap_or_default()]);
+        let http_user_agent_array = StringArray::from(vec![record.http_user_agent.clone().unwrap_or_default()]);
+        let http_flavor_array = StringArray::from(vec![record.http_flavor.clone().unwrap_or_default()]);
+        let http_target_array = StringArray::from(vec![record.http_target.clone().unwrap_or_default()]);
+        let http_host_array = StringArray::from(vec![record.http_host.clone().unwrap_or_default()]);
+        let rpc_system_array = StringArray::from(vec![record.rpc_system.clone().unwrap_or_default()]);
+        let rpc_service_array = StringArray::from(vec![record.rpc_service.clone().unwrap_or_default()]);
+        let rpc_method_array = StringArray::from(vec![record.rpc_method.clone().unwrap_or_default()]);
+        let rpc_grpc_status_code_array = Int32Array::from(vec![record.rpc_grpc_status_code]);
+        let db_system_array = StringArray::from(vec![record.db_system.clone().unwrap_or_default()]);
+        let db_connection_string_array = StringArray::from(vec![record.db_connection_string.clone().unwrap_or_default()]);
+        let db_user_array = StringArray::from(vec![record.db_user.clone().unwrap_or_default()]);
+        let db_name_array = StringArray::from(vec![record.db_name.clone().unwrap_or_default()]);
+        let db_statement_array = StringArray::from(vec![record.db_statement.clone().unwrap_or_default()]);
+        let db_operation_array = StringArray::from(vec![record.db_operation.clone().unwrap_or_default()]);
+        let db_sql_table_array = StringArray::from(vec![record.db_sql_table.clone().unwrap_or_default()]);
+        let messaging_system_array = StringArray::from(vec![record.messaging_system.clone().unwrap_or_default()]);
+        let messaging_destination_array = StringArray::from(vec![record.messaging_destination.clone().unwrap_or_default()]);
+        let messaging_destination_kind_array = StringArray::from(vec![record.messaging_destination_kind.clone().unwrap_or_default()]);
+        let messaging_message_id_array = StringArray::from(vec![record.messaging_message_id.clone().unwrap_or_default()]);
+        let messaging_operation_array = StringArray::from(vec![record.messaging_operation.clone().unwrap_or_default()]);
+        let messaging_url_array = StringArray::from(vec![record.messaging_url.clone().unwrap_or_default()]);
+        let messaging_client_id_array = StringArray::from(vec![record.messaging_client_id.clone().unwrap_or_default()]);
+        let messaging_kafka_partition_array = Int32Array::from(vec![record.messaging_kafka_partition]);
+        let messaging_kafka_offset_array = Int64Array::from(vec![record.messaging_kafka_offset]);
+        let messaging_kafka_consumer_group_array = StringArray::from(vec![record.messaging_kafka_consumer_group.clone().unwrap_or_default()]);
+        let messaging_message_payload_size_bytes_array = Int64Array::from(vec![record.messaging_message_payload_size_bytes]);
+        let messaging_protocol_array = StringArray::from(vec![record.messaging_protocol.clone().unwrap_or_default()]);
+        let messaging_protocol_version_array = StringArray::from(vec![record.messaging_protocol_version.clone().unwrap_or_default()]);
+        let cache_system_array = StringArray::from(vec![record.cache_system.clone().unwrap_or_default()]);
+        let cache_operation_array = StringArray::from(vec![record.cache_operation.clone().unwrap_or_default()]);
+        let cache_key_array = StringArray::from(vec![record.cache_key.clone().unwrap_or_default()]);
+        let cache_hit_array = BooleanArray::from(vec![record.cache_hit]);
+        let net_peer_ip_array = StringArray::from(vec![record.net_peer_ip.clone().unwrap_or_default()]);
+        let net_peer_port_array = Int32Array::from(vec![record.net_peer_port]);
+        let net_host_ip_array = StringArray::from(vec![record.net_host_ip.clone().unwrap_or_default()]);
+        let net_host_port_array = Int32Array::from(vec![record.net_host_port]);
+        let net_transport_array = StringArray::from(vec![record.net_transport.clone().unwrap_or_default()]);
+        let enduser_id_array = StringArray::from(vec![record.enduser_id.clone().unwrap_or_default()]);
+        let enduser_role_array = StringArray::from(vec![record.enduser_role.clone().unwrap_or_default()]);
+        let enduser_scope_array = StringArray::from(vec![record.enduser_scope.clone().unwrap_or_default()]);
+        let exception_type_array = StringArray::from(vec![record.exception_type.clone().unwrap_or_default()]);
+        let exception_message_array = StringArray::from(vec![record.exception_message.clone().unwrap_or_default()]);
+        let exception_stacktrace_array = StringArray::from(vec![record.exception_stacktrace.clone().unwrap_or_default()]);
+        let exception_escaped_array = BooleanArray::from(vec![record.exception_escaped]);
+        let thread_id_array = Int64Array::from(vec![record.thread_id]);
+        let thread_name_array = StringArray::from(vec![record.thread_name.clone().unwrap_or_default()]);
+        let code_function_array = StringArray::from(vec![record.code_function.clone().unwrap_or_default()]);
+        let code_filepath_array = StringArray::from(vec![record.code_filepath.clone().unwrap_or_default()]);
+        let code_namespace_array = StringArray::from(vec![record.code_namespace.clone().unwrap_or_default()]);
+        let code_lineno_array = Int32Array::from(vec![record.code_lineno]);
+        let deployment_environment_array = StringArray::from(vec![record.deployment_environment.clone().unwrap_or_default()]);
+        let deployment_version_array = StringArray::from(vec![record.deployment_version.clone().unwrap_or_default()]);
+        let service_name_array = StringArray::from(vec![record.service_name.clone().unwrap_or_default()]);
+        let service_version_array = StringArray::from(vec![record.service_version.clone().unwrap_or_default()]);
+        let service_instance_id_array = StringArray::from(vec![record.service_instance_id.clone().unwrap_or_default()]);
+        let otel_library_name_array = StringArray::from(vec![record.otel_library_name.clone().unwrap_or_default()]);
+        let otel_library_version_array = StringArray::from(vec![record.otel_library_version.clone().unwrap_or_default()]);
+        let k8s_pod_name_array = StringArray::from(vec![record.k8s_pod_name.clone().unwrap_or_default()]);
+        let k8s_namespace_name_array = StringArray::from(vec![record.k8s_namespace_name.clone().unwrap_or_default()]);
+        let k8s_deployment_name_array = StringArray::from(vec![record.k8s_deployment_name.clone().unwrap_or_default()]);
+        let container_id_array = StringArray::from(vec![record.container_id.clone().unwrap_or_default()]);
+        let host_name_array = StringArray::from(vec![record.host_name.clone().unwrap_or_default()]);
+        let os_type_array = StringArray::from(vec![record.os_type.clone().unwrap_or_default()]);
+        let os_version_array = StringArray::from(vec![record.os_version.clone().unwrap_or_default()]);
+        let process_pid_array = Int64Array::from(vec![record.process_pid]);
+        let process_command_line_array = StringArray::from(vec![record.process_command_line.clone().unwrap_or_default()]);
+        let process_runtime_name_array = StringArray::from(vec![record.process_runtime_name.clone().unwrap_or_default()]);
+        let process_runtime_version_array = StringArray::from(vec![record.process_runtime_version.clone().unwrap_or_default()]);
+        let aws_region_array = StringArray::from(vec![record.aws_region.clone().unwrap_or_default()]);
+        let aws_account_id_array = StringArray::from(vec![record.aws_account_id.clone().unwrap_or_default()]);
+        let aws_dynamodb_table_name_array = StringArray::from(vec![record.aws_dynamodb_table_name.clone().unwrap_or_default()]);
+        let aws_dynamodb_operation_array = StringArray::from(vec![record.aws_dynamodb_operation.clone().unwrap_or_default()]);
+        let aws_dynamodb_consumed_capacity_total_array = Float64Array::from(vec![record.aws_dynamodb_consumed_capacity_total]);
+        let aws_sqs_queue_url_array = StringArray::from(vec![record.aws_sqs_queue_url.clone().unwrap_or_default()]);
+        let aws_sqs_message_id_array = StringArray::from(vec![record.aws_sqs_message_id.clone().unwrap_or_default()]);
+        let azure_resource_id_array = StringArray::from(vec![record.azure_resource_id.clone().unwrap_or_default()]);
+        let azure_storage_container_name_array = StringArray::from(vec![record.azure_storage_container_name.clone().unwrap_or_default()]);
+        let azure_storage_blob_name_array = StringArray::from(vec![record.azure_storage_blob_name.clone().unwrap_or_default()]);
+        let gcp_project_id_array = StringArray::from(vec![record.gcp_project_id.clone().unwrap_or_default()]);
+        let gcp_cloudsql_instance_id_array = StringArray::from(vec![record.gcp_cloudsql_instance_id.clone().unwrap_or_default()]);
+        let gcp_pubsub_message_id_array = StringArray::from(vec![record.gcp_pubsub_message_id.clone().unwrap_or_default()]);
+        let http_request_method_array = StringArray::from(vec![record.http_request_method.clone().unwrap_or_default()]);
+        let db_instance_identifier_array = StringArray::from(vec![record.db_instance_identifier.clone().unwrap_or_default()]);
+        let db_rows_affected_array = Int64Array::from(vec![record.db_rows_affected]);
+        let net_sock_peer_addr_array = StringArray::from(vec![record.net_sock_peer_addr.clone().unwrap_or_default()]);
+        let net_sock_peer_port_array = Int32Array::from(vec![record.net_sock_peer_port]);
+        let net_sock_host_addr_array = StringArray::from(vec![record.net_sock_host_addr.clone().unwrap_or_default()]);
+        let net_sock_host_port_array = Int32Array::from(vec![record.net_sock_host_port]);
+        let messaging_consumer_id_array = StringArray::from(vec![record.messaging_consumer_id.clone().unwrap_or_default()]);
+        let messaging_message_payload_compressed_size_bytes_array = Int64Array::from(vec![record.messaging_message_payload_compressed_size_bytes]);
+        let faas_invocation_id_array = StringArray::from(vec![record.faas_invocation_id.clone().unwrap_or_default()]);
+        let faas_trigger_array = StringArray::from(vec![record.faas_trigger.clone().unwrap_or_default()]);
+        let cloud_zone_array = StringArray::from(vec![record.cloud_zone.clone().unwrap_or_default()]);
 
-        let parent_id_array = StringArray::from(vec![record.parentId.clone().unwrap_or_default()]);
-        let db_system_array = StringArray::from(vec![record.dbSystem.clone().unwrap_or_default()]);
-        let db_name_array = StringArray::from(vec![record.dbName.clone().unwrap_or_default()]);
-        let db_statement_array = StringArray::from(vec![record.dbStatement.clone().unwrap_or_default()]);
-        let db_operation_array = StringArray::from(vec![record.dbOperation.clone().unwrap_or_default()]);
-        let rpc_system_array = StringArray::from(vec![record.rpcSystem.clone().unwrap_or_default()]);
-        let rpc_service_array = StringArray::from(vec![record.rpcService.clone().unwrap_or_default()]);
-        let rpc_method_array = StringArray::from(vec![record.rpcMethod.clone().unwrap_or_default()]);
-        let endpoint_hash_array = StringArray::from(vec![record.endpointHash.clone()]);
-        let shape_hash_array = StringArray::from(vec![record.shapeHash.clone()]);
+        let resource_attributes_service_name_array = StringArray::from(vec![record.resource_attributes_service_name.clone().unwrap_or_default()]);
+        let resource_attributes_service_version_array = StringArray::from(vec![record.resource_attributes_service_version.clone().unwrap_or_default()]);
+        let resource_attributes_service_instance_id_array = StringArray::from(vec![record.resource_attributes_service_instance_id.clone().unwrap_or_default()]);
+        let resource_attributes_service_namespace_array = StringArray::from(vec![record.resource_attributes_service_namespace.clone().unwrap_or_default()]);
+        let resource_attributes_host_name_array = StringArray::from(vec![record.resource_attributes_host_name.clone().unwrap_or_default()]);
+        let resource_attributes_host_id_array = StringArray::from(vec![record.resource_attributes_host_id.clone().unwrap_or_default()]);
+        let resource_attributes_host_type_array = StringArray::from(vec![record.resource_attributes_host_type.clone().unwrap_or_default()]);
+        let resource_attributes_host_arch_array = StringArray::from(vec![record.resource_attributes_host_arch.clone().unwrap_or_default()]);
+        let resource_attributes_os_type_array = StringArray::from(vec![record.resource_attributes_os_type.clone().unwrap_or_default()]);
+        let resource_attributes_os_version_array = StringArray::from(vec![record.resource_attributes_os_version.clone().unwrap_or_default()]);
+        let resource_attributes_process_pid_array = Int64Array::from(vec![record.resource_attributes_process_pid]);
+        let resource_attributes_process_executable_name_array = StringArray::from(vec![record.resource_attributes_process_executable_name.clone().unwrap_or_default()]);
+        let resource_attributes_process_command_line_array = StringArray::from(vec![record.resource_attributes_process_command_line.clone().unwrap_or_default()]);
+        let resource_attributes_process_runtime_name_array = StringArray::from(vec![record.resource_attributes_process_runtime_name.clone().unwrap_or_default()]);
+        let resource_attributes_process_runtime_version_array = StringArray::from(vec![record.resource_attributes_process_runtime_version.clone().unwrap_or_default()]);
+        let resource_attributes_process_runtime_description_array = StringArray::from(vec![record.resource_attributes_process_runtime_description.clone().unwrap_or_default()]);
+        let resource_attributes_process_executable_path_array = StringArray::from(vec![record.resource_attributes_process_executable_path.clone().unwrap_or_default()]);
+        let resource_attributes_k8s_cluster_name_array = StringArray::from(vec![record.resource_attributes_k8s_cluster_name.clone().unwrap_or_default()]);
+        let resource_attributes_k8s_namespace_name_array = StringArray::from(vec![record.resource_attributes_k8s_namespace_name.clone().unwrap_or_default()]);
+        let resource_attributes_k8s_deployment_name_array = StringArray::from(vec![record.resource_attributes_k8s_deployment_name.clone().unwrap_or_default()]);
+        let resource_attributes_k8s_pod_name_array = StringArray::from(vec![record.resource_attributes_k8s_pod_name.clone().unwrap_or_default()]);
+        let resource_attributes_k8s_pod_uid_array = StringArray::from(vec![record.resource_attributes_k8s_pod_uid.clone().unwrap_or_default()]);
+        let resource_attributes_k8s_replicaset_name_array = StringArray::from(vec![record.resource_attributes_k8s_replicaset_name.clone().unwrap_or_default()]);
+        let resource_attributes_k8s_deployment_strategy_array = StringArray::from(vec![record.resource_attributes_k8s_deployment_strategy.clone().unwrap_or_default()]);
+        let resource_attributes_k8s_container_name_array = StringArray::from(vec![record.resource_attributes_k8s_container_name.clone().unwrap_or_default()]);
+        let resource_attributes_k8s_node_name_array = StringArray::from(vec![record.resource_attributes_k8s_node_name.clone().unwrap_or_default()]);
+        let resource_attributes_container_id_array = StringArray::from(vec![record.resource_attributes_container_id.clone().unwrap_or_default()]);
+        let resource_attributes_container_image_name_array = StringArray::from(vec![record.resource_attributes_container_image_name.clone().unwrap_or_default()]);
+        let resource_attributes_container_image_tag_array = StringArray::from(vec![record.resource_attributes_container_image_tag.clone().unwrap_or_default()]);
+        let resource_attributes_deployment_environment_array = StringArray::from(vec![record.resource_attributes_deployment_environment.clone().unwrap_or_default()]);
+        let resource_attributes_deployment_version_array = StringArray::from(vec![record.resource_attributes_deployment_version.clone().unwrap_or_default()]);
+        let resource_attributes_cloud_provider_array = StringArray::from(vec![record.resource_attributes_cloud_provider.clone().unwrap_or_default()]);
+        let resource_attributes_cloud_platform_array = StringArray::from(vec![record.resource_attributes_cloud_platform.clone().unwrap_or_default()]);
+        let resource_attributes_cloud_region_array = StringArray::from(vec![record.resource_attributes_cloud_region.clone().unwrap_or_default()]);
+        let resource_attributes_cloud_availability_zone_array = StringArray::from(vec![record.resource_attributes_cloud_availability_zone.clone().unwrap_or_default()]);
+        let resource_attributes_cloud_account_id_array = StringArray::from(vec![record.resource_attributes_cloud_account_id.clone().unwrap_or_default()]);
+        let resource_attributes_cloud_resource_id_array = StringArray::from(vec![record.resource_attributes_cloud_resource_id.clone().unwrap_or_default()]);
+        let resource_attributes_cloud_instance_type_array = StringArray::from(vec![record.resource_attributes_cloud_instance_type.clone().unwrap_or_default()]);
+        let resource_attributes_telemetry_sdk_name_array = StringArray::from(vec![record.resource_attributes_telemetry_sdk_name.clone().unwrap_or_default()]);
+        let resource_attributes_telemetry_sdk_language_array = StringArray::from(vec![record.resource_attributes_telemetry_sdk_language.clone().unwrap_or_default()]);
+        let resource_attributes_telemetry_sdk_version_array = StringArray::from(vec![record.resource_attributes_telemetry_sdk_version.clone().unwrap_or_default()]);
+        let resource_attributes_application_name_array = StringArray::from(vec![record.resource_attributes_application_name.clone().unwrap_or_default()]);
+        let resource_attributes_application_version_array = StringArray::from(vec![record.resource_attributes_application_version.clone().unwrap_or_default()]);
+        let resource_attributes_application_tier_array = StringArray::from(vec![record.resource_attributes_application_tier.clone().unwrap_or_default()]);
+        let resource_attributes_application_owner_array = StringArray::from(vec![record.resource_attributes_application_owner.clone().unwrap_or_default()]);
+        let resource_attributes_customer_id_array = StringArray::from(vec![record.resource_attributes_customer_id.clone().unwrap_or_default()]);
+        let resource_attributes_tenant_id_array = StringArray::from(vec![record.resource_attributes_tenant_id.clone().unwrap_or_default()]);
+        let resource_attributes_feature_flag_enabled_array = BooleanArray::from(vec![record.resource_attributes_feature_flag_enabled]);
+        let resource_attributes_payment_gateway_array = StringArray::from(vec![record.resource_attributes_payment_gateway.clone().unwrap_or_default()]);
+        let resource_attributes_database_type_array = StringArray::from(vec![record.resource_attributes_database_type.clone().unwrap_or_default()]);
+        let resource_attributes_database_instance_array = StringArray::from(vec![record.resource_attributes_database_instance.clone().unwrap_or_default()]);
+        let resource_attributes_cache_provider_array = StringArray::from(vec![record.resource_attributes_cache_provider.clone().unwrap_or_default()]);
+        let resource_attributes_message_queue_type_array = StringArray::from(vec![record.resource_attributes_message_queue_type.clone().unwrap_or_default()]);
+        let resource_attributes_http_route_array = StringArray::from(vec![record.resource_attributes_http_route.clone().unwrap_or_default()]);
+        let resource_attributes_aws_ecs_cluster_arn_array = StringArray::from(vec![record.resource_attributes_aws_ecs_cluster_arn.clone().unwrap_or_default()]);
+        let resource_attributes_aws_ecs_container_arn_array = StringArray::from(vec![record.resource_attributes_aws_ecs_container_arn.clone().unwrap_or_default()]);
+        let resource_attributes_aws_ecs_task_arn_array = StringArray::from(vec![record.resource_attributes_aws_ecs_task_arn.clone().unwrap_or_default()]);
+        let resource_attributes_aws_ecs_task_family_array = StringArray::from(vec![record.resource_attributes_aws_ecs_task_family.clone().unwrap_or_default()]);
+        let resource_attributes_aws_ec2_instance_id_array = StringArray::from(vec![record.resource_attributes_aws_ec2_instance_id.clone().unwrap_or_default()]);
+        let resource_attributes_gcp_project_id_array = StringArray::from(vec![record.resource_attributes_gcp_project_id.clone().unwrap_or_default()]);
+        let resource_attributes_gcp_zone_array = StringArray::from(vec![record.resource_attributes_gcp_zone.clone().unwrap_or_default()]);
+        let resource_attributes_azure_resource_id_array = StringArray::from(vec![record.resource_attributes_azure_resource_id.clone().unwrap_or_default()]);
+        let resource_attributes_dynatrace_entity_process_id_array = StringArray::from(vec![record.resource_attributes_dynatrace_entity_process_id.clone().unwrap_or_default()]);
+        let resource_attributes_elastic_node_name_array = StringArray::from(vec![record.resource_attributes_elastic_node_name.clone().unwrap_or_default()]);
+        let resource_attributes_istio_mesh_id_array = StringArray::from(vec![record.resource_attributes_istio_mesh_id.clone().unwrap_or_default()]);
+        let resource_attributes_cloudfoundry_application_id_array = StringArray::from(vec![record.resource_attributes_cloudfoundry_application_id.clone().unwrap_or_default()]);
+        let resource_attributes_cloudfoundry_space_id_array = StringArray::from(vec![record.resource_attributes_cloudfoundry_space_id.clone().unwrap_or_default()]);
+        let resource_attributes_opentelemetry_collector_name_array = StringArray::from(vec![record.resource_attributes_opentelemetry_collector_name.clone().unwrap_or_default()]);
+        let resource_attributes_instrumentation_name_array = StringArray::from(vec![record.resource_attributes_instrumentation_name.clone().unwrap_or_default()]);
+        let resource_attributes_instrumentation_version_array = StringArray::from(vec![record.resource_attributes_instrumentation_version.clone().unwrap_or_default()]);
+        let resource_attributes_log_source_array = StringArray::from(vec![record.resource_attributes_log_source.clone().unwrap_or_default()]);
 
-        let mut format_hashes_builder = ListBuilder::new(StringBuilder::new());
-        for hash in &record.formatHashes {
-            format_hashes_builder.values().append_value(hash);
-        }
-        format_hashes_builder.append(true);
-        let format_hashes_array = format_hashes_builder.finish();
-
-        let mut field_hashes_builder = ListBuilder::new(StringBuilder::new());
-        for hash in &record.fieldHashes {
-            field_hashes_builder.values().append_value(hash);
-        }
-        field_hashes_builder.append(true);
-        let field_hashes_array = field_hashes_builder.finish();
-
-        let attributes_array = StringArray::from(vec![record.attributes.clone().unwrap_or_else(|| "{}".to_string())]);
-        let events_array = StringArray::from(vec![record.events.clone().unwrap_or_else(|| "{}".to_string())]);
-        let links_array = StringArray::from(vec![record.links.clone().unwrap_or_else(|| "{}".to_string())]);
-        let resource_array = StringArray::from(vec![record.resource.clone().unwrap_or_else(|| "{}".to_string())]);
-        let instrumentation_scope_array = StringArray::from(vec![record.instrumentationScope.clone().unwrap_or_else(|| "{}".to_string())]);
+        let events_array = StringArray::from(vec![record.events.clone().unwrap_or_default()]);
+        let links_array = StringArray::from(vec![record.links.clone().unwrap_or_default()]);
+        let status_code_array = StringArray::from(vec![record.status_code.clone().unwrap_or_default()]);
+        let status_message_array = StringArray::from(vec![record.status_message.clone().unwrap_or_default()]);
+        let instrumentation_library_name_array = StringArray::from(vec![record.instrumentation_library_name.clone().unwrap_or_default()]);
+        let instrumentation_library_version_array = StringArray::from(vec![record.instrumentation_library_version.clone().unwrap_or_default()]);
 
         let schema = Self::event_schema();
         let batch = RecordBatch::try_new(
             Arc::new(schema),
             vec![
-                Arc::new(project_id_array),
-                Arc::new(id_array),
-                timestamp_array,
                 Arc::new(trace_id_array),
                 Arc::new(span_id_array),
-                Arc::new(event_type_array),
-                Arc::new(status_array),
-                end_time_array,
-                Arc::new(duration_ns_array),
-                Arc::new(span_name_array),
-                Arc::new(span_kind_array),
-                Arc::new(parent_span_id_array),
                 Arc::new(trace_state_array),
-                Arc::new(has_error_array),
-                Arc::new(severity_text_array),
-                Arc::new(severity_number_array),
-                Arc::new(body_array),
+                Arc::new(parent_span_id_array),
+                Arc::new(name_array),
+                Arc::new(kind_array),
+                start_time_array,
+                end_time_array,
                 Arc::new(http_method_array),
                 Arc::new(http_url_array),
-                Arc::new(http_route_array),
-                Arc::new(http_host_array),
                 Arc::new(http_status_code_array),
-                Arc::new(path_params_array),
-                Arc::new(query_params_array),
-                Arc::new(request_body_array),
-                Arc::new(response_body_array),
-                Arc::new(sdk_type_array),
-                Arc::new(service_version_array),
-                Arc::new(errors_array),
-                Arc::new(tags_array),
-                Arc::new(parent_id_array),
-                Arc::new(db_system_array),
-                Arc::new(db_name_array),
-                Arc::new(db_statement_array),
-                Arc::new(db_operation_array),
+                Arc::new(http_request_content_length_array),
+                Arc::new(http_response_content_length_array),
+                Arc::new(http_route_array),
+                Arc::new(http_scheme_array),
+                Arc::new(http_client_ip_array),
+                Arc::new(http_user_agent_array),
+                Arc::new(http_flavor_array),
+                Arc::new(http_target_array),
+                Arc::new(http_host_array),
                 Arc::new(rpc_system_array),
                 Arc::new(rpc_service_array),
                 Arc::new(rpc_method_array),
-                Arc::new(endpoint_hash_array),
-                Arc::new(shape_hash_array),
-                Arc::new(format_hashes_array),
-                Arc::new(field_hashes_array),
-                Arc::new(attributes_array),
+                Arc::new(rpc_grpc_status_code_array),
+                Arc::new(db_system_array),
+                Arc::new(db_connection_string_array),
+                Arc::new(db_user_array),
+                Arc::new(db_name_array),
+                Arc::new(db_statement_array),
+                Arc::new(db_operation_array),
+                Arc::new(db_sql_table_array),
+                Arc::new(messaging_system_array),
+                Arc::new(messaging_destination_array),
+                Arc::new(messaging_destination_kind_array),
+                Arc::new(messaging_message_id_array),
+                Arc::new(messaging_operation_array),
+                Arc::new(messaging_url_array),
+                Arc::new(messaging_client_id_array),
+                Arc::new(messaging_kafka_partition_array),
+                Arc::new(messaging_kafka_offset_array),
+                Arc::new(messaging_kafka_consumer_group_array),
+                Arc::new(messaging_message_payload_size_bytes_array),
+                Arc::new(messaging_protocol_array),
+                Arc::new(messaging_protocol_version_array),
+                Arc::new(cache_system_array),
+                Arc::new(cache_operation_array),
+                Arc::new(cache_key_array),
+                Arc::new(cache_hit_array),
+                Arc::new(net_peer_ip_array),
+                Arc::new(net_peer_port_array),
+                Arc::new(net_host_ip_array),
+                Arc::new(net_host_port_array),
+                Arc::new(net_transport_array),
+                Arc::new(enduser_id_array),
+                Arc::new(enduser_role_array),
+                Arc::new(enduser_scope_array),
+                Arc::new(exception_type_array),
+                Arc::new(exception_message_array),
+                Arc::new(exception_stacktrace_array),
+                Arc::new(exception_escaped_array),
+                Arc::new(thread_id_array),
+                Arc::new(thread_name_array),
+                Arc::new(code_function_array),
+                Arc::new(code_filepath_array),
+                Arc::new(code_namespace_array),
+                Arc::new(code_lineno_array),
+                Arc::new(deployment_environment_array),
+                Arc::new(deployment_version_array),
+                Arc::new(service_name_array),
+                Arc::new(service_version_array),
+                Arc::new(service_instance_id_array),
+                Arc::new(otel_library_name_array),
+                Arc::new(otel_library_version_array),
+                Arc::new(k8s_pod_name_array),
+                Arc::new(k8s_namespace_name_array),
+                Arc::new(k8s_deployment_name_array),
+                Arc::new(container_id_array),
+                Arc::new(host_name_array),
+                Arc::new(os_type_array),
+                Arc::new(os_version_array),
+                Arc::new(process_pid_array),
+                Arc::new(process_command_line_array),
+                Arc::new(process_runtime_name_array),
+                Arc::new(process_runtime_version_array),
+                Arc::new(aws_region_array),
+                Arc::new(aws_account_id_array),
+                Arc::new(aws_dynamodb_table_name_array),
+                Arc::new(aws_dynamodb_operation_array),
+                Arc::new(aws_dynamodb_consumed_capacity_total_array),
+                Arc::new(aws_sqs_queue_url_array),
+                Arc::new(aws_sqs_message_id_array),
+                Arc::new(azure_resource_id_array),
+                Arc::new(azure_storage_container_name_array),
+                Arc::new(azure_storage_blob_name_array),
+                Arc::new(gcp_project_id_array),
+                Arc::new(gcp_cloudsql_instance_id_array),
+                Arc::new(gcp_pubsub_message_id_array),
+                Arc::new(http_request_method_array),
+                Arc::new(db_instance_identifier_array),
+                Arc::new(db_rows_affected_array),
+                Arc::new(net_sock_peer_addr_array),
+                Arc::new(net_sock_peer_port_array),
+                Arc::new(net_sock_host_addr_array),
+                Arc::new(net_sock_host_port_array),
+                Arc::new(messaging_consumer_id_array),
+                Arc::new(messaging_message_payload_compressed_size_bytes_array),
+                Arc::new(faas_invocation_id_array),
+                Arc::new(faas_trigger_array),
+                Arc::new(cloud_zone_array),
+                Arc::new(resource_attributes_service_name_array),
+                Arc::new(resource_attributes_service_version_array),
+                Arc::new(resource_attributes_service_instance_id_array),
+                Arc::new(resource_attributes_service_namespace_array),
+                Arc::new(resource_attributes_host_name_array),
+                Arc::new(resource_attributes_host_id_array),
+                Arc::new(resource_attributes_host_type_array),
+                Arc::new(resource_attributes_host_arch_array),
+                Arc::new(resource_attributes_os_type_array),
+                Arc::new(resource_attributes_os_version_array),
+                Arc::new(resource_attributes_process_pid_array),
+                Arc::new(resource_attributes_process_executable_name_array),
+                Arc::new(resource_attributes_process_command_line_array),
+                Arc::new(resource_attributes_process_runtime_name_array),
+                Arc::new(resource_attributes_process_runtime_version_array),
+                Arc::new(resource_attributes_process_runtime_description_array),
+                Arc::new(resource_attributes_process_executable_path_array),
+                Arc::new(resource_attributes_k8s_cluster_name_array),
+                Arc::new(resource_attributes_k8s_namespace_name_array),
+                Arc::new(resource_attributes_k8s_deployment_name_array),
+                Arc::new(resource_attributes_k8s_pod_name_array),
+                Arc::new(resource_attributes_k8s_pod_uid_array),
+                Arc::new(resource_attributes_k8s_replicaset_name_array),
+                Arc::new(resource_attributes_k8s_deployment_strategy_array),
+                Arc::new(resource_attributes_k8s_container_name_array),
+                Arc::new(resource_attributes_k8s_node_name_array),
+                Arc::new(resource_attributes_container_id_array),
+                Arc::new(resource_attributes_container_image_name_array),
+                Arc::new(resource_attributes_container_image_tag_array),
+                Arc::new(resource_attributes_deployment_environment_array),
+                Arc::new(resource_attributes_deployment_version_array),
+                Arc::new(resource_attributes_cloud_provider_array),
+                Arc::new(resource_attributes_cloud_platform_array),
+                Arc::new(resource_attributes_cloud_region_array),
+                Arc::new(resource_attributes_cloud_availability_zone_array),
+                Arc::new(resource_attributes_cloud_account_id_array),
+                Arc::new(resource_attributes_cloud_resource_id_array),
+                Arc::new(resource_attributes_cloud_instance_type_array),
+                Arc::new(resource_attributes_telemetry_sdk_name_array),
+                Arc::new(resource_attributes_telemetry_sdk_language_array),
+                Arc::new(resource_attributes_telemetry_sdk_version_array),
+                Arc::new(resource_attributes_application_name_array),
+                Arc::new(resource_attributes_application_version_array),
+                Arc::new(resource_attributes_application_tier_array),
+                Arc::new(resource_attributes_application_owner_array),
+                Arc::new(resource_attributes_customer_id_array),
+                Arc::new(resource_attributes_tenant_id_array),
+                Arc::new(resource_attributes_feature_flag_enabled_array),
+                Arc::new(resource_attributes_payment_gateway_array),
+                Arc::new(resource_attributes_database_type_array),
+                Arc::new(resource_attributes_database_instance_array),
+                Arc::new(resource_attributes_cache_provider_array),
+                Arc::new(resource_attributes_message_queue_type_array),
+                Arc::new(resource_attributes_http_route_array),
+                Arc::new(resource_attributes_aws_ecs_cluster_arn_array),
+                Arc::new(resource_attributes_aws_ecs_container_arn_array),
+                Arc::new(resource_attributes_aws_ecs_task_arn_array),
+                Arc::new(resource_attributes_aws_ecs_task_family_array),
+                Arc::new(resource_attributes_aws_ec2_instance_id_array),
+                Arc::new(resource_attributes_gcp_project_id_array),
+                Arc::new(resource_attributes_gcp_zone_array),
+                Arc::new(resource_attributes_azure_resource_id_array),
+                Arc::new(resource_attributes_dynatrace_entity_process_id_array),
+                Arc::new(resource_attributes_elastic_node_name_array),
+                Arc::new(resource_attributes_istio_mesh_id_array),
+                Arc::new(resource_attributes_cloudfoundry_application_id_array),
+                Arc::new(resource_attributes_cloudfoundry_space_id_array),
+                Arc::new(resource_attributes_opentelemetry_collector_name_array),
+                Arc::new(resource_attributes_instrumentation_name_array),
+                Arc::new(resource_attributes_instrumentation_version_array),
+                Arc::new(resource_attributes_log_source_array),
                 Arc::new(events_array),
                 Arc::new(links_array),
-                Arc::new(resource_array),
-                Arc::new(instrumentation_scope_array),
+                Arc::new(status_code_array),
+                Arc::new(status_message_array),
+                Arc::new(instrumentation_library_name_array),
+                Arc::new(instrumentation_library_version_array),
             ],
         )?;
         DeltaOps::try_from_uri(&conn_str).await?.write(vec![batch]).await?;
@@ -362,71 +769,208 @@ impl Database {
                     let mut insert_values = HashMap::new();
                     for (col, val) in insert.columns.iter().zip(row.iter()) {
                         match val {
-                            Expr::Value(sqlparser::ast::ValueWithSpan {
-                                span: _,
-                                value: SqlValue::SingleQuotedString(s),
-                            }) => {
+                            Expr::Value(sqlparser::ast::ValueWithSpan { span: _, value: SqlValue::SingleQuotedString(s) }) => {
                                 insert_values.insert(col.to_string(), s.clone());
                             }
-                            Expr::Value(sqlparser::ast::ValueWithSpan {
-                                span: _,
-                                value: SqlValue::Number(n, _),
-                            }) => {
+                            Expr::Value(sqlparser::ast::ValueWithSpan { span: _, value: SqlValue::Number(n, _) }) => {
                                 insert_values.insert(col.to_string(), n.clone());
                             }
                             _ => return Err(anyhow::anyhow!("Unsupported value type: {:?}", val)),
                         }
                     }
-                    let project_id = insert_values.get("projectId").ok_or_else(|| anyhow::anyhow!("Missing projectId"))?;
-                    let timestamp = insert_values.get("timestamp").ok_or_else(|| anyhow::anyhow!("Missing timestamp"))?;
+                    let trace_id = insert_values.get("trace_id").ok_or_else(|| anyhow::anyhow!("Missing trace_id"))?;
+                    let span_id = insert_values.get("span_id").ok_or_else(|| anyhow::anyhow!("Missing span_id"))?;
+                    let start_time_unix_nano = insert_values
+                        .get("start_time_unix_nano")
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| anyhow::anyhow!("Missing or invalid start_time_unix_nano"))?;
                     let record = crate::persistent_queue::IngestRecord {
-                        projectId:            project_id.clone(),
-                        id:                   insert_values.get("id").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        timestamp:            timestamp.clone(),
-                        traceId:              insert_values.get("traceId").cloned().unwrap_or_default(),
-                        spanId:               insert_values.get("spanId").cloned().unwrap_or_default(),
-                        eventType:            insert_values.get("eventType").cloned().unwrap_or_else(|| "span".to_string()),
-                        status:               insert_values.get("status").cloned(),
-                        endTime:              insert_values.get("endTime").cloned(),
-                        durationNs:           insert_values.get("durationNs").and_then(|s| s.parse().ok()).unwrap_or(0),
-                        spanName:             insert_values.get("spanName").cloned().unwrap_or_default(),
-                        spanKind:             insert_values.get("spanKind").cloned(),
-                        parentSpanId:         insert_values.get("parentSpanId").cloned(),
-                        traceState:           insert_values.get("traceState").cloned(),
-                        hasError:             false,
-                        severityText:         insert_values.get("severityText").cloned(),
-                        severityNumber:       insert_values.get("severityNumber").and_then(|s| s.parse().ok()).unwrap_or(0),
-                        body:                 insert_values.get("body").cloned(),
-                        httpMethod:           insert_values.get("httpMethod").cloned(),
-                        httpUrl:              insert_values.get("httpUrl").cloned(),
-                        httpRoute:            insert_values.get("httpRoute").cloned(),
-                        httpHost:             insert_values.get("httpHost").cloned(),
-                        httpStatusCode:       insert_values.get("httpStatusCode").and_then(|s| s.parse().ok()),
-                        pathParams:           insert_values.get("pathParams").cloned(),
-                        queryParams:          insert_values.get("queryParams").cloned(),
-                        requestBody:          insert_values.get("requestBody").cloned(),
-                        responseBody:         insert_values.get("responseBody").cloned(),
-                        sdkType:              insert_values.get("sdkType").cloned().unwrap_or_default(),
-                        serviceVersion:       insert_values.get("serviceVersion").cloned(),
-                        errors:               insert_values.get("errors").cloned(),
-                        tags:                 insert_values.get("tags").map(|s| vec![s.clone()]).unwrap_or_default(),
-                        parentId:             insert_values.get("parentId").cloned(),
-                        dbSystem:             insert_values.get("dbSystem").cloned(),
-                        dbName:               insert_values.get("dbName").cloned(),
-                        dbStatement:          insert_values.get("dbStatement").cloned(),
-                        dbOperation:          insert_values.get("dbOperation").cloned(),
-                        rpcSystem:            insert_values.get("rpcSystem").cloned(),
-                        rpcService:           insert_values.get("rpcService").cloned(),
-                        rpcMethod:            insert_values.get("rpcMethod").cloned(),
-                        endpointHash:         insert_values.get("endpointHash").cloned().unwrap_or_default(),
-                        shapeHash:            insert_values.get("shapeHash").cloned().unwrap_or_default(),
-                        formatHashes:         insert_values.get("formatHashes").map(|s| vec![s.clone()]).unwrap_or_default(),
-                        fieldHashes:          insert_values.get("fieldHashes").map(|s| vec![s.clone()]).unwrap_or_default(),
-                        attributes:           insert_values.get("attributes").cloned(),
-                        events:               insert_values.get("events").cloned(),
-                        links:                insert_values.get("links").cloned(),
-                        resource:             insert_values.get("resource").cloned(),
-                        instrumentationScope: insert_values.get("instrumentationScope").cloned(),
+                        trace_id: trace_id.clone(),
+                        span_id: span_id.clone(),
+                        trace_state: insert_values.get("trace_state").cloned(),
+                        parent_span_id: insert_values.get("parent_span_id").cloned(),
+                        name: insert_values.get("name").cloned().unwrap_or_default(),
+                        kind: insert_values.get("kind").cloned(),
+                        start_time_unix_nano,
+                        end_time_unix_nano: insert_values.get("end_time_unix_nano").and_then(|s| s.parse().ok()),
+                        http_method: insert_values.get("http_method").cloned(),
+                        http_url: insert_values.get("http_url").cloned(),
+                        http_status_code: insert_values.get("http_status_code").and_then(|s| s.parse().ok()),
+                        http_request_content_length: insert_values.get("http_request_content_length").and_then(|s| s.parse().ok()),
+                        http_response_content_length: insert_values.get("http_response_content_length").and_then(|s| s.parse().ok()),
+                        http_route: insert_values.get("http_route").cloned(),
+                        http_scheme: insert_values.get("http_scheme").cloned(),
+                        http_client_ip: insert_values.get("http_client_ip").cloned(),
+                        http_user_agent: insert_values.get("http_user_agent").cloned(),
+                        http_flavor: insert_values.get("http_flavor").cloned(),
+                        http_target: insert_values.get("http_target").cloned(),
+                        http_host: insert_values.get("http_host").cloned(),
+                        rpc_system: insert_values.get("rpc_system").cloned(),
+                        rpc_service: insert_values.get("rpc_service").cloned(),
+                        rpc_method: insert_values.get("rpc_method").cloned(),
+                        rpc_grpc_status_code: insert_values.get("rpc_grpc_status_code").and_then(|s| s.parse().ok()),
+                        db_system: insert_values.get("db_system").cloned(),
+                        db_connection_string: insert_values.get("db_connection_string").cloned(),
+                        db_user: insert_values.get("db_user").cloned(),
+                        db_name: insert_values.get("db_name").cloned(),
+                        db_statement: insert_values.get("db_statement").cloned(),
+                        db_operation: insert_values.get("db_operation").cloned(),
+                        db_sql_table: insert_values.get("db_sql_table").cloned(),
+                        messaging_system: insert_values.get("messaging_system").cloned(),
+                        messaging_destination: insert_values.get("messaging_destination").cloned(),
+                        messaging_destination_kind: insert_values.get("messaging_destination_kind").cloned(),
+                        messaging_message_id: insert_values.get("messaging_message_id").cloned(),
+                        messaging_operation: insert_values.get("messaging_operation").cloned(),
+                        messaging_url: insert_values.get("messaging_url").cloned(),
+                        messaging_client_id: insert_values.get("messaging_client_id").cloned(),
+                        messaging_kafka_partition: insert_values.get("messaging_kafka_partition").and_then(|s| s.parse().ok()),
+                        messaging_kafka_offset: insert_values.get("messaging_kafka_offset").and_then(|s| s.parse().ok()),
+                        messaging_kafka_consumer_group: insert_values.get("messaging_kafka_consumer_group").cloned(),
+                        messaging_message_payload_size_bytes: insert_values.get("messaging_message_payload_size_bytes").and_then(|s| s.parse().ok()),
+                        messaging_protocol: insert_values.get("messaging_protocol").cloned(),
+                        messaging_protocol_version: insert_values.get("messaging_protocol_version").cloned(),
+                        cache_system: insert_values.get("cache_system").cloned(),
+                        cache_operation: insert_values.get("cache_operation").cloned(),
+                        cache_key: insert_values.get("cache_key").cloned(),
+                        cache_hit: insert_values.get("cache_hit").and_then(|s| s.parse::<i32>().ok().map(|v| v != 0)),
+                        net_peer_ip: insert_values.get("net_peer_ip").cloned(),
+                        net_peer_port: insert_values.get("net_peer_port").and_then(|s| s.parse().ok()),
+                        net_host_ip: insert_values.get("net_host_ip").cloned(),
+                        net_host_port: insert_values.get("net_host_port").and_then(|s| s.parse().ok()),
+                        net_transport: insert_values.get("net_transport").cloned(),
+                        enduser_id: insert_values.get("enduser_id").cloned(),
+                        enduser_role: insert_values.get("enduser_role").cloned(),
+                        enduser_scope: insert_values.get("enduser_scope").cloned(),
+                        exception_type: insert_values.get("exception_type").cloned(),
+                        exception_message: insert_values.get("exception_message").cloned(),
+                        exception_stacktrace: insert_values.get("exception_stacktrace").cloned(),
+                        exception_escaped: insert_values.get("exception_escaped").and_then(|s| s.parse::<i32>().ok().map(|v| v != 0)),
+                        thread_id: insert_values.get("thread_id").and_then(|s| s.parse().ok()),
+                        thread_name: insert_values.get("thread_name").cloned(),
+                        code_function: insert_values.get("code_function").cloned(),
+                        code_filepath: insert_values.get("code_filepath").cloned(),
+                        code_namespace: insert_values.get("code_namespace").cloned(),
+                        code_lineno: insert_values.get("code_lineno").and_then(|s| s.parse().ok()),
+                        deployment_environment: insert_values.get("deployment_environment").cloned(),
+                        deployment_version: insert_values.get("deployment_version").cloned(),
+                        service_name: insert_values.get("service_name").cloned(),
+                        service_version: insert_values.get("service_version").cloned(),
+                        service_instance_id: insert_values.get("service_instance_id").cloned(),
+                        otel_library_name: insert_values.get("otel_library_name").cloned(),
+                        otel_library_version: insert_values.get("otel_library_version").cloned(),
+                        k8s_pod_name: insert_values.get("k8s_pod_name").cloned(),
+                        k8s_namespace_name: insert_values.get("k8s_namespace_name").cloned(),
+                        k8s_deployment_name: insert_values.get("k8s_deployment_name").cloned(),
+                        container_id: insert_values.get("container_id").cloned(),
+                        host_name: insert_values.get("host_name").cloned(),
+                        os_type: insert_values.get("os_type").cloned(),
+                        os_version: insert_values.get("os_version").cloned(),
+                        process_pid: insert_values.get("process_pid").and_then(|s| s.parse().ok()),
+                        process_command_line: insert_values.get("process_command_line").cloned(),
+                        process_runtime_name: insert_values.get("process_runtime_name").cloned(),
+                        process_runtime_version: insert_values.get("process_runtime_version").cloned(),
+                        aws_region: insert_values.get("aws_region").cloned(),
+                        aws_account_id: insert_values.get("aws_account_id").cloned(),
+                        aws_dynamodb_table_name: insert_values.get("aws_dynamodb_table_name").cloned(),
+                        aws_dynamodb_operation: insert_values.get("aws_dynamodb_operation").cloned(),
+                        aws_dynamodb_consumed_capacity_total: insert_values.get("aws_dynamodb_consumed_capacity_total").and_then(|s| s.parse().ok()),
+                        aws_sqs_queue_url: insert_values.get("aws_sqs_queue_url").cloned(),
+                        aws_sqs_message_id: insert_values.get("aws_sqs_message_id").cloned(),
+                        azure_resource_id: insert_values.get("azure_resource_id").cloned(),
+                        azure_storage_container_name: insert_values.get("azure_storage_container_name").cloned(),
+                        azure_storage_blob_name: insert_values.get("azure_storage_blob_name").cloned(),
+                        gcp_project_id: insert_values.get("gcp_project_id").cloned(),
+                        gcp_cloudsql_instance_id: insert_values.get("gcp_cloudsql_instance_id").cloned(),
+                        gcp_pubsub_message_id: insert_values.get("gcp_pubsub_message_id").cloned(),
+                        http_request_method: insert_values.get("http_request_method").cloned(),
+                        db_instance_identifier: insert_values.get("db_instance_identifier").cloned(),
+                        db_rows_affected: insert_values.get("db_rows_affected").and_then(|s| s.parse().ok()),
+                        net_sock_peer_addr: insert_values.get("net_sock_peer_addr").cloned(),
+                        net_sock_peer_port: insert_values.get("net_sock_peer_port").and_then(|s| s.parse().ok()),
+                        net_sock_host_addr: insert_values.get("net_sock_host_addr").cloned(),
+                        net_sock_host_port: insert_values.get("net_sock_host_port").and_then(|s| s.parse().ok()),
+                        messaging_consumer_id: insert_values.get("messaging_consumer_id").cloned(),
+                        messaging_message_payload_compressed_size_bytes: insert_values.get("messaging_message_payload_compressed_size_bytes").and_then(|s| s.parse().ok()),
+                        faas_invocation_id: insert_values.get("faas_invocation_id").cloned(),
+                        faas_trigger: insert_values.get("faas_trigger").cloned(),
+                        cloud_zone: insert_values.get("cloud_zone").cloned(),
+                        resource_attributes_service_name: insert_values.get("resource_attributes_service_name").cloned(),
+                        resource_attributes_service_version: insert_values.get("resource_attributes_service_version").cloned(),
+                        resource_attributes_service_instance_id: insert_values.get("resource_attributes_service_instance_id").cloned(),
+                        resource_attributes_service_namespace: insert_values.get("resource_attributes_service_namespace").cloned(),
+                        resource_attributes_host_name: insert_values.get("resource_attributes_host_name").cloned(),
+                        resource_attributes_host_id: insert_values.get("resource_attributes_host_id").cloned(),
+                        resource_attributes_host_type: insert_values.get("resource_attributes_host_type").cloned(),
+                        resource_attributes_host_arch: insert_values.get("resource_attributes_host_arch").cloned(),
+                        resource_attributes_os_type: insert_values.get("resource_attributes_os_type").cloned(),
+                        resource_attributes_os_version: insert_values.get("resource_attributes_os_version").cloned(),
+                        resource_attributes_process_pid: insert_values.get("resource_attributes_process_pid").and_then(|s| s.parse().ok()),
+                        resource_attributes_process_executable_name: insert_values.get("resource_attributes_process_executable_name").cloned(),
+                        resource_attributes_process_command_line: insert_values.get("resource_attributes_process_command_line").cloned(),
+                        resource_attributes_process_runtime_name: insert_values.get("resource_attributes_process_runtime_name").cloned(),
+                        resource_attributes_process_runtime_version: insert_values.get("resource_attributes_process_runtime_version").cloned(),
+                        resource_attributes_process_runtime_description: insert_values.get("resource_attributes_process_runtime_description").cloned(),
+                        resource_attributes_process_executable_path: insert_values.get("resource_attributes_process_executable_path").cloned(),
+                        resource_attributes_k8s_cluster_name: insert_values.get("resource_attributes_k8s_cluster_name").cloned(),
+                        resource_attributes_k8s_namespace_name: insert_values.get("resource_attributes_k8s_namespace_name").cloned(),
+                        resource_attributes_k8s_deployment_name: insert_values.get("resource_attributes_k8s_deployment_name").cloned(),
+                        resource_attributes_k8s_pod_name: insert_values.get("resource_attributes_k8s_pod_name").cloned(),
+                        resource_attributes_k8s_pod_uid: insert_values.get("resource_attributes_k8s_pod_uid").cloned(),
+                        resource_attributes_k8s_replicaset_name: insert_values.get("resource_attributes_k8s_replicaset_name").cloned(),
+                        resource_attributes_k8s_deployment_strategy: insert_values.get("resource_attributes_k8s_deployment_strategy").cloned(),
+                        resource_attributes_k8s_container_name: insert_values.get("resource_attributes_k8s_container_name").cloned(),
+                        resource_attributes_k8s_node_name: insert_values.get("resource_attributes_k8s_node_name").cloned(),
+                        resource_attributes_container_id: insert_values.get("resource_attributes_container_id").cloned(),
+                        resource_attributes_container_image_name: insert_values.get("resource_attributes_container_image_name").cloned(),
+                        resource_attributes_container_image_tag: insert_values.get("resource_attributes_container_image_tag").cloned(),
+                        resource_attributes_deployment_environment: insert_values.get("resource_attributes_deployment_environment").cloned(),
+                        resource_attributes_deployment_version: insert_values.get("resource_attributes_deployment_version").cloned(),
+                        resource_attributes_cloud_provider: insert_values.get("resource_attributes_cloud_provider").cloned(),
+                        resource_attributes_cloud_platform: insert_values.get("resource_attributes_cloud_platform").cloned(),
+                        resource_attributes_cloud_region: insert_values.get("resource_attributes_cloud_region").cloned(),
+                        resource_attributes_cloud_availability_zone: insert_values.get("resource_attributes_cloud_availability_zone").cloned(),
+                        resource_attributes_cloud_account_id: insert_values.get("resource_attributes_cloud_account_id").cloned(),
+                        resource_attributes_cloud_resource_id: insert_values.get("resource_attributes_cloud_resource_id").cloned(),
+                        resource_attributes_cloud_instance_type: insert_values.get("resource_attributes_cloud_instance_type").cloned(),
+                        resource_attributes_telemetry_sdk_name: insert_values.get("resource_attributes_telemetry_sdk_name").cloned(),
+                        resource_attributes_telemetry_sdk_language: insert_values.get("resource_attributes_telemetry_sdk_language").cloned(),
+                        resource_attributes_telemetry_sdk_version: insert_values.get("resource_attributes_telemetry_sdk_version").cloned(),
+                        resource_attributes_application_name: insert_values.get("resource_attributes_application_name").cloned(),
+                        resource_attributes_application_version: insert_values.get("resource_attributes_application_version").cloned(),
+                        resource_attributes_application_tier: insert_values.get("resource_attributes_application_tier").cloned(),
+                        resource_attributes_application_owner: insert_values.get("resource_attributes_application_owner").cloned(),
+                        resource_attributes_customer_id: insert_values.get("resource_attributes_customer_id").cloned(),
+                        resource_attributes_tenant_id: insert_values.get("resource_attributes_tenant_id").cloned(),
+                        resource_attributes_feature_flag_enabled: insert_values.get("resource_attributes_feature_flag_enabled").and_then(|s| s.parse::<i32>().ok().map(|v| v != 0)),
+                        resource_attributes_payment_gateway: insert_values.get("resource_attributes_payment_gateway").cloned(),
+                        resource_attributes_database_type: insert_values.get("resource_attributes_database_type").cloned(),
+                        resource_attributes_database_instance: insert_values.get("resource_attributes_database_instance").cloned(),
+                        resource_attributes_cache_provider: insert_values.get("resource_attributes_cache_provider").cloned(),
+                        resource_attributes_message_queue_type: insert_values.get("resource_attributes_message_queue_type").cloned(),
+                        resource_attributes_http_route: insert_values.get("resource_attributes_http_route").cloned(),
+                        resource_attributes_aws_ecs_cluster_arn: insert_values.get("resource_attributes_aws_ecs_cluster_arn").cloned(),
+                        resource_attributes_aws_ecs_container_arn: insert_values.get("resource_attributes_aws_ecs_container_arn").cloned(),
+                        resource_attributes_aws_ecs_task_arn: insert_values.get("resource_attributes_aws_ecs_task_arn").cloned(),
+                        resource_attributes_aws_ecs_task_family: insert_values.get("resource_attributes_aws_ecs_task_family").cloned(),
+                        resource_attributes_aws_ec2_instance_id: insert_values.get("resource_attributes_aws_ec2_instance_id").cloned(),
+                        resource_attributes_gcp_project_id: insert_values.get("resource_attributes_gcp_project_id").cloned(),
+                        resource_attributes_gcp_zone: insert_values.get("resource_attributes_gcp_zone").cloned(),
+                        resource_attributes_azure_resource_id: insert_values.get("resource_attributes_azure_resource_id").cloned(),
+                        resource_attributes_dynatrace_entity_process_id: insert_values.get("resource_attributes_dynatrace_entity_process_id").cloned(),
+                        resource_attributes_elastic_node_name: insert_values.get("resource_attributes_elastic_node_name").cloned(),
+                        resource_attributes_istio_mesh_id: insert_values.get("resource_attributes_istio_mesh_id").cloned(),
+                        resource_attributes_cloudfoundry_application_id: insert_values.get("resource_attributes_cloudfoundry_application_id").cloned(),
+                        resource_attributes_cloudfoundry_space_id: insert_values.get("resource_attributes_cloudfoundry_space_id").cloned(),
+                        resource_attributes_opentelemetry_collector_name: insert_values.get("resource_attributes_opentelemetry_collector_name").cloned(),
+                        resource_attributes_instrumentation_name: insert_values.get("resource_attributes_instrumentation_name").cloned(),
+                        resource_attributes_instrumentation_version: insert_values.get("resource_attributes_instrumentation_version").cloned(),
+                        resource_attributes_log_source: insert_values.get("resource_attributes_log_source").cloned(),
+                        events: insert_values.get("events").cloned(),
+                        links: insert_values.get("links").cloned(),
+                        status_code: insert_values.get("status_code").cloned(),
+                        status_message: insert_values.get("status_message").cloned(),
+                        instrumentation_library_name: insert_values.get("instrumentation_library_name").cloned(),
+                        instrumentation_library_version: insert_values.get("instrumentation_library_version").cloned(),
                     };
                     self.write(&record).await?;
                     self.refresh_table("telemetry_events").await?;
@@ -452,7 +996,11 @@ impl Database {
             let table_guard = table_ref.read().map_err(|e| anyhow::anyhow!("Lock error: {:?}", e))?;
             let snapshot = table_guard.snapshot().map_err(|e| anyhow::anyhow!("Snapshot error: {:?}", e))?;
             let log_store = table_guard.log_store().clone();
-            deltalake::delta_datafusion::DeltaTableProvider::try_new(snapshot.clone(), log_store, deltalake::delta_datafusion::DeltaScanConfig::default())?
+            deltalake::delta_datafusion::DeltaTableProvider::try_new(
+                snapshot.clone(),
+                log_store,
+                deltalake::delta_datafusion::DeltaScanConfig::default(),
+            )?
         };
 
         self.ctx.register_table("telemetry_events", Arc::new(provider))?;
@@ -506,11 +1054,10 @@ impl Database {
     }
 }
 
-/// Helper function to build a TimestampMicrosecondArray.
-fn build_timestamp_array(values: Vec<i64>, tz: Option<StdArc<str>>) -> TimestampMicrosecondArray {
+fn build_timestamp_array(values: Vec<i64>, tz: Option<StdArc<str>>) -> TimestampNanosecondArray {
     use datafusion::arrow::{array::ArrayData, buffer::Buffer};
-    let data_type = DataType::Timestamp(TimeUnit::Microsecond, tz);
+    let data_type = DataType::Timestamp(TimeUnit::Nanosecond, tz);
     let buffer = Buffer::from_slice_ref(&values);
     let array_data = ArrayData::builder(data_type.clone()).len(values.len()).add_buffer(buffer).build().unwrap();
-    TimestampMicrosecondArray::from(array_data)
+    TimestampNanosecondArray::from(array_data)
 }
