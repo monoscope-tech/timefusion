@@ -1,7 +1,5 @@
-// persistent_queue.rs
-
 use std::path::Path;
-use std::sync::Arc; // Added missing import
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -209,32 +207,43 @@ pub struct IngestRecord {
 }
 
 pub struct PersistentQueue {
-    db: Db,
+    pub db: Db,
     sender: Sender<(String, IngestRecord)>,
-    database: Arc<Database>, // Added to enable writing to the database
+    database: Arc<Database>,
 }
 
 impl PersistentQueue {
-    pub fn new<P: AsRef<Path>>(path: P, database: &Database) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(path: P, database: Arc<Database>) -> Result<Self> {
         let db = sled::open(path)?;
-        let database = Arc::new(database.clone()); // Clone the database reference
         let (sender, mut receiver) = mpsc::channel::<(String, IngestRecord)>(1000);
 
         let queue = Self {
-            db: db.clone(),
-            sender: sender.clone(),
-            database: database.clone(),
+            db,
+            sender,
+            database,
         };
+
+        // Clone necessary components for the spawned task
+        let db_clone = queue.db.clone();
+        let database_clone = queue.database.clone();
 
         tokio::spawn(async move {
             while let Some((receipt, record)) = receiver.recv().await {
-                if let Err(e) = queue.process_record(receipt.clone(), &record).await {
+                if let Err(e) = Self::process_record_static(&db_clone, &database_clone, receipt.clone(), &record).await {
                     error!("Failed to process record with receipt {}: {:?}", receipt, e);
                 }
             }
         });
 
         Ok(queue)
+    }
+
+    async fn process_record_static(db: &Db, database: &Arc<Database>, receipt: String, record: &IngestRecord) -> Result<()> {
+        tracing::info!("Processing record with receipt: {}", receipt);
+        database.write(record).await?;
+        db.remove(receipt.as_bytes())?;
+        tracing::info!("Record processed and removed from queue: {}", record.trace_id);
+        Ok(())
     }
 
     pub async fn enqueue(&self, record: &IngestRecord) -> Result<String> {
@@ -246,13 +255,7 @@ impl PersistentQueue {
     }
 
     pub async fn process_record(&self, receipt: String, record: &IngestRecord) -> Result<()> {
-        tracing::info!("Processing record with receipt: {}", receipt);
-        // Write to the database
-        self.database.write(record).await?;
-        // Remove from the queue after successful write
-        self.db.remove(receipt.as_bytes())?;
-        tracing::info!("Record processed and removed from queue: {}", record.trace_id);
-        Ok(())
+        Self::process_record_static(&self.db, &self.database, receipt, record).await
     }
 
     pub async fn dequeue(&self) -> Result<Option<(String, IngestRecord)>> {
@@ -263,6 +266,16 @@ impl PersistentQueue {
         } else {
             Ok(None)
         }
+    }
+
+    pub async fn dequeue_all(&self) -> Result<Vec<(String, IngestRecord)>> {
+        let mut records = Vec::new();
+        while let Some((key, value)) = self.db.pop_min()? {
+            let receipt = String::from_utf8(key.to_vec())?;
+            let record: IngestRecord = bincode::deserialize(&value)?;
+            records.push((receipt, record));
+        }
+        Ok(records)
     }
 
     pub fn len(&self) -> Result<usize> {

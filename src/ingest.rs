@@ -1,14 +1,11 @@
-// ingest.rs
-
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use actix_web::{get, post, web, HttpResponse, Responder};
+use datafusion::arrow::record_batch::RecordBatch;
 use futures::future::join_all;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tracing::{error, info};
 
 use crate::{
@@ -697,4 +694,123 @@ pub async fn queue_length(queue: web::Data<Arc<PersistentQueue>>) -> impl Respon
             HttpResponse::InternalServerError().body("Error getting queue length")
         }
     }
+}
+
+#[get("/data")]
+pub async fn get_all_data(db: web::Data<Arc<Database>>) -> impl Responder {
+    let query = "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events";
+    match db.query(query).await {
+        Ok(df) => {
+            match df.collect().await {
+                Ok(batches) => {
+                    let json_rows = record_batches_to_json_rows(&batches).unwrap_or_default();
+                    HttpResponse::Ok().json(json_rows)
+                }
+                Err(e) => {
+                    error!("Error collecting data: {:?}", e);
+                    HttpResponse::InternalServerError().body("Error collecting data")
+                }
+            }
+        }
+        Err(e) => {
+            error!("Error querying data: {:?}", e);
+            HttpResponse::InternalServerError().body("Error querying data")
+        }
+    }
+}
+
+#[get("/data/{id}")]
+pub async fn get_data_by_id(
+    path: web::Path<String>,
+    db: web::Data<Arc<Database>>,
+) -> impl Responder {
+    let id = path.into_inner();
+    let query = format!(
+        "SELECT projectId, id, timestamp, traceId, spanId, eventType, durationNs FROM telemetry_events WHERE id = '{}'",
+        id
+    );
+    match db.query(&query).await {
+        Ok(df) => {
+            match df.collect().await {
+                Ok(batches) => {
+                    let json_rows = record_batches_to_json_rows(&batches).unwrap_or_default();
+                    if json_rows.is_empty() {
+                        HttpResponse::NotFound().body(format!("No data found for id: {}", id))
+                    } else {
+                        HttpResponse::Ok().json(json_rows)
+                    }
+                }
+                Err(e) => {
+                    error!("Error collecting data for id {}: {:?}", id, e);
+                    HttpResponse::InternalServerError().body("Error collecting data")
+                }
+            }
+        }
+        Err(e) => {
+            error!("Error querying data for id {}: {:?}", id, e);
+            HttpResponse::InternalServerError().body("Error querying data")
+        }
+    }
+}
+
+pub fn record_batches_to_json_rows(batches: &[RecordBatch]) -> Result<Vec<Value>, anyhow::Error> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let schema = batch.schema();
+        let num_rows = batch.num_rows();
+        for row_idx in 0..num_rows {
+            let mut row = json!({});
+            for (col_idx, field) in schema.fields().iter().enumerate() {
+                let column = batch.column(col_idx);
+                let value = if column.is_null(row_idx) {
+                    Value::Null
+                } else {
+                    match column.data_type() {
+                        datafusion::arrow::datatypes::DataType::Int32 => {
+                            column
+                                .as_any()
+                                .downcast_ref::<datafusion::arrow::array::Int32Array>()
+                                .map_or(Value::Null, |arr| Value::Number(arr.value(row_idx).into()))
+                        }
+                        datafusion::arrow::datatypes::DataType::Int64 => {
+                            column
+                                .as_any()
+                                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                                .map_or(Value::Null, |arr| Value::Number(arr.value(row_idx).into()))
+                        }
+                        datafusion::arrow::datatypes::DataType::Float64 => {
+                            column
+                                .as_any()
+                                .downcast_ref::<datafusion::arrow::array::Float64Array>()
+                                .map_or(Value::Null, |arr| {
+                                    Value::Number(
+                                        serde_json::Number::from_f64(arr.value(row_idx))
+                                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                                    )
+                                })
+                        }
+                        datafusion::arrow::datatypes::DataType::Utf8 => {
+                            column
+                                .as_any()
+                                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                                .map_or(Value::Null, |arr| Value::String(arr.value(row_idx).to_string()))
+                        }
+                        datafusion::arrow::datatypes::DataType::Timestamp(_, _) => {
+                            column
+                                .as_any()
+                                .downcast_ref::<datafusion::arrow::array::TimestampNanosecondArray>()
+                                .map_or(Value::Null, |arr| Value::String(arr.value(row_idx).to_string()))
+                        }
+                        _ => {
+                            // Fallback for unsupported types
+                            Value::Null
+                        }
+                    }
+                };
+                row[field.name()] = value;
+            }
+            rows.push(row);
+        }
+    }
+    Ok(rows)
 }

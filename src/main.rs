@@ -72,8 +72,8 @@ async fn dashboard(
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
-    let http_requests = 0.0;
-    let queue_size = queue.get_ref().len().await.unwrap_or(0);
+    let http_requests = 0.0; // Placeholder; update if metrics_middleware tracks this
+    let queue_size = queue.len().unwrap_or(0);
     let db_status = match db.query("SELECT 1 AS test").await {
         Ok(_) => "success",
         Err(_) => "error",
@@ -238,19 +238,14 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // Read AWS configuration from environment variables.
-    // AWS_S3_BUCKET should be your bucket name, e.g. "my-aws-bucket"
-    // AWS_S3_ENDPOINT should be your AWS S3 endpoint, e.g. "https://s3.amazonaws.com"
+    // Read AWS configuration from environment variables
     let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
     let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-    // Build the storage URI for AWS S3.
     let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
     info!("Storage URI configured: {}", storage_uri);
-    // Set AWS_ENDPOINT so that the underlying S3 client uses the specified endpoint.
     unsafe {
         env::set_var("AWS_ENDPOINT", &aws_endpoint);
     }
-    // Parse the AWS endpoint URL and register it.
     let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
     deltalake::aws::register_handlers(Some(aws_url));
     info!("AWS handlers registered");
@@ -266,7 +261,6 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    // Use the fixed table name "telemetry_events".
     if let Err(e) = db.add_project("telemetry_events", &storage_uri).await {
         error!("Failed to add table 'telemetry_events': {:?}", e);
         return Err(e);
@@ -287,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
     let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "/app/queue_db".to_string());
     info!("Using queue DB path: {}", queue_db_path);
 
-    let queue = match PersistentQueue::new(&queue_db_path) {
+    let queue = match PersistentQueue::new(&queue_db_path, db.clone()) {
         Ok(q) => {
             info!("PersistentQueue initialized successfully");
             Arc::new(q)
@@ -387,20 +381,18 @@ async fn main() -> anyhow::Result<()> {
                     }
                     _ = sleep(Duration::from_secs(5)) => {
                         debug!("Checking queue for records to flush");
-                        let records = match queue_clone.dequeue_all().await {
-                            Ok(r) => {
-                                debug!("Dequeued {} records", r.len());
-                                r
-                            },
+                        match queue_clone.dequeue_all().await {
+                            Ok(records) => {
+                                debug!("Dequeued {} records", records.len());
+                                if !records.is_empty() {
+                                    info!("Flushing {} enqueued records", records.len());
+                                    for (key, record) in records {
+                                        process_record(&db_clone, &queue_clone, &status_store_clone, key, record).await;
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 error!("Error during dequeue_all: {:?}", e);
-                                Vec::new()
-                            }
-                        };
-                        if !records.is_empty() {
-                            info!("Flushing {} enqueued records", records.len());
-                            for (key, record) in records {
-                                process_record(&db_clone, &queue_clone, &status_store_clone, key, record).await;
                             }
                         }
                     }
@@ -485,18 +477,34 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn process_record(db: &Arc<Database>, queue: &Arc<PersistentQueue>, status_store: &IngestStatusStore, key: sled::IVec, record: IngestRecord) {
-    use std::str;
-    let id = str::from_utf8(&key).unwrap_or("unknown").to_string();
-    status_store.set_status(id.clone(), "Processing".to_string());
-    if chrono::DateTime::parse_from_rfc3339(&record.timestamp).is_ok() {
+async fn process_record(
+    db: &Arc<Database>,
+    queue: &Arc<PersistentQueue>,
+    status_store: &Arc<IngestStatusStore>,
+    key: String,
+    record: IngestRecord,
+) {
+    status_store.set_status(key.clone(), "Processing".to_string());
+    let timestamp = chrono::DateTime::from_timestamp(
+        record.start_time_unix_nano / 1_000_000_000,
+        (record.start_time_unix_nano % 1_000_000_000) as u32,
+    )
+    .unwrap_or(Utc::now())
+    .to_rfc3339();
+
+    if chrono::DateTime::parse_from_rfc3339(&timestamp).is_ok() {
         match db.write(&record).await {
             Ok(()) => {
                 INGESTION_COUNTER.inc();
-                status_store.set_status(id.clone(), "Ingested".to_string());
+                status_store.set_status(key.clone(), "Ingested".to_string());
                 if let Err(e) = spawn_blocking({
                     let queue = queue.clone();
-                    move || queue.remove_sync(key)
+                    let key = key.clone();
+                    move || {
+                        if let Err(e) = queue.db.remove(key.as_bytes()) {
+                            error!("Failed to remove record from queue: {:?}", e);
+                        }
+                    }
                 })
                 .await
                 {
@@ -506,16 +514,20 @@ async fn process_record(db: &Arc<Database>, queue: &Arc<PersistentQueue>, status
             Err(e) => {
                 ERROR_COUNTER.inc();
                 error!("Error writing record: {:?}", e);
-                status_store.set_status(id, format!("Failed: {:?}", e));
+                status_store.set_status(key, format!("Failed: {:?}", e));
             }
         }
     } else {
         ERROR_COUNTER.inc();
-        error!("Invalid timestamp in record: {}", record.timestamp);
-        status_store.set_status(id, "Invalid timestamp".to_string());
+        error!("Invalid timestamp in record: {}", timestamp);
+        status_store.set_status(key.clone(), "Invalid timestamp".to_string());
         let _ = spawn_blocking({
             let queue = queue.clone();
-            move || queue.remove_sync(key)
+            move || {
+                if let Err(e) = queue.db.remove(key.as_bytes()) {
+                    error!("Failed to remove record from queue: {:?}", e);
+                }
+            }
         })
         .await;
     }
