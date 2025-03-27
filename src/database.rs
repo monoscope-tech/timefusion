@@ -13,7 +13,7 @@ use datafusion::{
 };
 use deltalake::{DeltaOps, DeltaTableBuilder};
 
-use crate::fields::define_telemetry_fields; // Ensure this import works
+use crate::fields::define_telemetry_fields; 
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, (String, Arc<RwLock<deltalake::DeltaTable>>)>>>;
 
