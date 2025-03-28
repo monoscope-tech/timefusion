@@ -323,4 +323,25 @@ impl PersistentQueue {
 
         Ok(Some(record))
     }
+
+    pub async fn len(&self) -> Result<usize> {
+        // Reopen the file to avoid borrowing issues with the locked file
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&self.path)
+            .await?;
+        let mut reader = BufReader::new(file);
+        let mut count = 0;
+        let mut line = String::new();
+
+        reader.seek(SeekFrom::Start(0)).await?;
+        while reader.read_line(&mut line).await? > 0 {
+            if !line.trim().is_empty() {
+                count += 1;
+            }
+            line.clear();
+        }
+
+        Ok(count)
+    }
 }

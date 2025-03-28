@@ -10,18 +10,21 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     sync::Arc,
+    time::Duration as StdDuration,
 };
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, middleware::Logger, web};
 use chrono::Utc;
 use database::Database;
 use datafusion::arrow::array::Float64Array;
+use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
 use ingest::{get_all_data, get_data_by_id, get_status, record_batches_to_json_rows};
 use metrics::ERROR_COUNTER;
 use persistent_queue::PersistentQueue;
 use serde::{Deserialize, Serialize};
 use tokio::{
+    net::TcpListener,
     sync::Mutex as TokioMutex,
     task::spawn_blocking,
     time::{Duration, sleep},
@@ -29,6 +32,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use tracing_subscriber::EnvFilter;
+use url::Url;
 
 #[derive(Clone)]
 struct AppInfo {
@@ -63,22 +67,20 @@ struct DashboardData {
 #[get("/dashboard")]
 async fn dashboard(
     db: web::Data<Arc<Database>>,
-    // If not directly used here, prefix with an underscore.
-    _queue: web::Data<Arc<PersistentQueue>>,
+    queue: web::Data<Arc<PersistentQueue>>,
     app_info: web::Data<AppInfo>,
     status_store: web::Data<Arc<ingest::IngestStatusStore>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
-    let http_requests = 0.0; // Placeholder for HTTP metrics.
-    let queue_size = 0; // Placeholder; update if your queue exposes its length.
+    let http_requests = 0.0; // Placeholder
+    let queue_size = queue.get_ref().len().await.unwrap_or(0); // Fixed to use get_ref()
     let db_status = match db.query("SELECT 1 AS test").await {
         Ok(_) => "success",
         Err(_) => "error",
     };
-    let ingestion_rate = 0.0; // Placeholder.
+    let ingestion_rate = 0.0; // Placeholder
 
-    // Use timestamp_nanos_opt().unwrap_or(0) to avoid deprecation warnings.
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
     let records_query = if let (Some(start), Some(end)) = (start, end) {
@@ -228,7 +230,20 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    let db = match Database::new().await {
+    // AWS S3 Configuration
+    let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
+    let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
+    let storage_uri = format!("s3://{}/otel_logs_and_spans?endpoint={}", bucket, aws_endpoint);
+    info!("Storage URI configured: {}", storage_uri);
+    unsafe {
+        env::set_var("AWS_ENDPOINT", &aws_endpoint);
+    }
+    let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
+    deltalake::aws::register_handlers(Some(aws_url));
+    info!("AWS handlers registered");
+
+    // Database Initialization with S3
+    let db = match Database::new(&storage_uri).await {
         Ok(db) => {
             info!("Database initialized successfully");
             Arc::new(db)
@@ -262,6 +277,57 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_token = CancellationToken::new();
     let queue_shutdown = shutdown_token.clone();
     let http_shutdown = shutdown_token.clone();
+    let pgwire_shutdown = shutdown_token.clone();
+
+    // DataFusion-Postgres Setup
+    let pg_service = Arc::new(DfSessionService::new(db.get_session_context()));
+    let handler_factory = HandlerFactory(pg_service.clone());
+    let pg_addr = format!("0.0.0.0:{}", env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()));
+    info!("Spawning PGWire server task on {}", pg_addr);
+
+    let pg_server = tokio::spawn({
+        let pg_addr = pg_addr.clone();
+        async move {
+            let listener = match TcpListener::bind(&pg_addr).await {
+                Ok(listener) => listener,
+                Err(e) => {
+                    error!("Failed to bind PGWire server to {}: {:?}", pg_addr, e);
+                    return;
+                }
+            };
+            info!("PGWire server running on {}", pg_addr);
+
+            loop {
+                tokio::select! {
+                    _ = pgwire_shutdown.cancelled() => {
+                        info!("PGWire server shutting down.");
+                        break;
+                    }
+                    result = listener.accept() => {
+                        match result {
+                            Ok((socket, _addr)) => {
+                                let handler_factory = HandlerFactory(pg_service.clone());
+                                tokio::spawn(async move {
+                                    if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_factory).await {
+                                        error!("Error processing PGWire socket: {:?}", e);
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                error!("Error accepting connection: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    if pg_server.is_finished() {
+        error!("PGWire server failed to start, aborting...");
+        return Err(anyhow::anyhow!("PGWire server failed to start"));
+    }
 
     let flush_task = {
         let db_clone = db.clone();
@@ -280,7 +346,6 @@ async fn main() -> anyhow::Result<()> {
                             let maybe_record = spawn_blocking({
                                 let queue_clone = queue_clone.clone();
                                 move || {
-                                    // Run the async dequeue() in a blocking context.
                                     futures::executor::block_on(queue_clone.dequeue())
                                 }
                             }).await;
@@ -288,7 +353,7 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(Ok(Some(record))) => {
                                     process_record(&db_clone, &status_store_clone, record).await;
                                 },
-                                Ok(Ok(None)) => break, // No more records.
+                                Ok(Ok(None)) => break,
                                 Ok(Err(e)) => {
                                     error!("Error in dequeue: {:?}", e);
                                     break;
@@ -351,6 +416,11 @@ async fn main() -> anyhow::Result<()> {
     info!("HTTP server running on http://{}", http_addr);
 
     tokio::select! {
+        res = pg_server => {
+            if let Err(e) = res {
+                error!("PGWire server task failed: {:?}", e);
+            }
+        },
         res = http_task => {
             if let Err(e) = res {
                 error!("HTTP server task failed: {:?}", e);
@@ -374,7 +444,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn process_record(db: &Arc<Database>, status_store: &Arc<ingest::IngestStatusStore>, record: persistent_queue::IngestRecord) {
-    // Use the correct field names from IngestRecord.
     let key = format!("{}_{}", record.traceId, record.spanId);
     status_store.set_status(key.clone(), "Processing".to_string());
 
