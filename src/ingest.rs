@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use actix_web::{get, web, HttpResponse, Responder};
@@ -51,64 +52,74 @@ pub async fn get_status(
 }
 
 #[get("/data")]
-pub async fn get_all_data(db: web::Data<Arc<Database>>) -> impl Responder {
-    // Updated column name: startTimeUnixNano (camelCase as declared in fields.rs)
-    let query = "SELECT * FROM otel_logs_and_spans ORDER BY startTimeUnixNano DESC LIMIT 100";
-    match db.query(query).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                let rows = record_batches_to_json_rows(&batches).unwrap_or_default();
-                HttpResponse::Ok().json(rows)
-            }
-            Err(e) => {
-                error!("Failed to collect data: {:?}", e);
-                HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": "Failed to fetch data"
-                }))
-            }
-        },
+pub async fn get_all_data(
+    db: web::Data<Arc<Database>>,
+    query: web::Query<HashMap<String, String>>,
+) -> impl Responder {
+    let project_id = query.get("project_id").unwrap_or(&"default".to_string()).clone();
+    let query_str = "SELECT * FROM otel_logs_and_spans ORDER BY startTimeUnixNano DESC LIMIT 100";
+
+    let df = match db.query(&project_id, query_str).await {
+        Ok(df) => df,
         Err(e) => {
-            error!("Failed to query data: {:?}", e);
-            HttpResponse::InternalServerError().json(serde_json::json!({
+            error!("Failed to query data for project '{}': {:?}", project_id, e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": "Failed to query data"
-            }))
+            }));
         }
-    }
+    };
+
+    let batches: Vec<datafusion::arrow::record_batch::RecordBatch> = match df.collect().await {
+        Ok(batches) => batches,
+        Err(e) => {
+            error!("Failed to collect data for project '{}': {:?}", project_id, e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to fetch data"
+            }));
+        }
+    };
+
+    let rows = record_batches_to_json_rows(&batches).unwrap_or_default();
+    HttpResponse::Ok().json(rows)
 }
 
 #[get("/data/{id}")]
 pub async fn get_data_by_id(
     path: web::Path<String>,
     db: web::Data<Arc<Database>>,
+    query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let id = path.into_inner();
-    // Updated column name: traceId (camelCase)
+    let project_id = query.get("project_id").unwrap_or(&"default".to_string()).clone();
     let query = format!("SELECT * FROM otel_logs_and_spans WHERE traceId = '{}'", id);
-    match db.query(&query).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                let rows = record_batches_to_json_rows(&batches).unwrap_or_default();
-                if rows.is_empty() {
-                    HttpResponse::NotFound().json(serde_json::json!({
-                        "error": "Record not found"
-                    }))
-                } else {
-                    HttpResponse::Ok().json(rows)
-                }
-            }
-            Err(e) => {
-                error!("Failed to collect data by ID: {:?}", e);
-                HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": "Failed to fetch data"
-                }))
-            }
-        },
+
+    let df = match db.query(&project_id, &query).await {
+        Ok(df) => df,
         Err(e) => {
-            error!("Failed to query data by ID: {:?}", e);
-            HttpResponse::InternalServerError().json(serde_json::json!({
+            error!("Failed to query data by ID for project '{}': {:?}", project_id, e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": "Failed to query data"
-            }))
+            }));
         }
+    };
+
+    let batches: Vec<datafusion::arrow::record_batch::RecordBatch> = match df.collect().await {
+        Ok(batches) => batches,
+        Err(e) => {
+            error!("Failed to collect data by ID for project '{}': {:?}", project_id, e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": "Failed to fetch data"
+            }));
+        }
+    };
+
+    let rows = record_batches_to_json_rows(&batches).unwrap_or_default();
+    if rows.is_empty() {
+        HttpResponse::NotFound().json(serde_json::json!({
+            "error": "Record not found"
+        }))
+    } else {
+        HttpResponse::Ok().json(rows)
     }
 }
 

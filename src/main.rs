@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use actix_web::{App, HttpResponse, HttpServer, Responder, get, middleware::Logger, web};
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, middleware::Logger, post, web};
 use chrono::Utc;
 use database::Database;
 use datafusion::arrow::array::Float64Array;
@@ -61,6 +61,39 @@ struct DashboardData {
     trends: Vec<TrendData>,
 }
 
+#[derive(Deserialize)]
+struct RegisterProjectRequest {
+    project_id: String,
+    bucket: String,
+    access_key: String,
+    secret_key: String,
+    endpoint: String,
+}
+
+#[post("/register_project")]
+async fn register_project(
+    req: web::Json<RegisterProjectRequest>,
+    db: web::Data<Arc<Database>>,
+) -> impl Responder {
+    match db
+        .register_project(
+            &req.project_id,
+            &req.bucket,
+            &req.access_key,
+            &req.secret_key,
+            &req.endpoint,
+        )
+        .await
+    {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
+            "message": format!("Project '{}' registered successfully", req.project_id)
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
+            "error": format!("Failed to register project: {:?}", e)
+        })),
+    }
+}
+
 #[get("/dashboard")]
 async fn dashboard(
     db: web::Data<Arc<Database>>,
@@ -69,10 +102,11 @@ async fn dashboard(
     status_store: web::Data<Arc<IngestStatusStore>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
+    let project_id = query.get("project_id").unwrap_or(&"default".to_string()).clone();
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
     let http_requests = 0.0;
     let queue_size = queue.len().await.unwrap_or(0);
-    let db_status = match db.query("SELECT 1 AS test").await {
+    let db_status = match db.query(&project_id, "SELECT 1 AS test").await {
         Ok(_) => "success",
         Err(_) => "error",
     };
@@ -91,7 +125,7 @@ async fn dashboard(
         "SELECT traceId, spanId, startTimeUnixNano as timestamp FROM otel_logs_and_spans ORDER BY startTimeUnixNano DESC LIMIT 10".to_string()
     };
 
-    let avg_latency = match db.query("SELECT AVG(endTimeUnixNano - startTimeUnixNano) AS avg_latency FROM otel_logs_and_spans WHERE endTimeUnixNano IS NOT NULL").await {
+    let avg_latency = match db.query(&project_id, "SELECT AVG(endTimeUnixNano - startTimeUnixNano) AS avg_latency FROM otel_logs_and_spans WHERE endTimeUnixNano IS NOT NULL").await {
         Ok(df) => df
             .collect()
             .await
@@ -120,7 +154,7 @@ async fn dashboard(
         *acc.entry(status["status"].as_str().unwrap_or("Unknown").to_string()).or_insert(0) += 1;
         acc
     });
-    let recent_records = match db.query(&records_query).await {
+    let recent_records = match db.query(&project_id, &records_query).await {
         Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
         Err(_) => vec![],
     };
@@ -183,6 +217,7 @@ async fn dashboard(
 
 #[get("/export_records")]
 async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<String, String>>) -> impl Responder {
+    let project_id = query.get("project_id").unwrap_or(&"default".to_string()).clone();
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
 
@@ -197,7 +232,7 @@ async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<
         "SELECT traceId, spanId, startTimeUnixNano as timestamp FROM otel_logs_and_spans".to_string()
     };
 
-    let records = match db.query(&records_query).await {
+    let records = match db.query(&project_id, &records_query).await {
         Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
         Err(_) => vec![],
     };
@@ -232,7 +267,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // Read AWS configuration from environment variables.
     let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
     let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
     let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
@@ -244,7 +278,6 @@ async fn main() -> anyhow::Result<()> {
     deltalake::aws::register_handlers(Some(aws_url));
     info!("AWS handlers registered");
 
-    // Initialize the database with the storage URI.
     let db = match Database::new(&storage_uri).await {
         Ok(db) => {
             info!("Database initialized successfully");
@@ -256,9 +289,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Initialize persistent queue.
     let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "/app/queue_db".to_string());
-    let queue_file_path = format!("{}/queue.db", queue_db_path); // Ensure it’s a file
+    let queue_file_path = format!("{}/queue.db", queue_db_path);
     info!("Using queue DB path: {}", queue_file_path);
     let queue = match PersistentQueue::new(&queue_file_path).await {
         Ok(q) => {
@@ -282,7 +314,6 @@ async fn main() -> anyhow::Result<()> {
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
-    // Set up datafusion-postgres PGWire server without authentication
     let pg_service = Arc::new(DfSessionService::new(db.get_session_context()));
     let handler_factory = HandlerFactory(pg_service.clone());
     let pg_addr = format!("0.0.0.0:{}", env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()));
@@ -342,7 +373,6 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("PGWire server failed to start"));
     }
 
-    // Queue flush task
     let flush_task = {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
@@ -363,7 +393,8 @@ async fn main() -> anyhow::Result<()> {
                         if !records.is_empty() {
                             info!("Flushing {} enqueued records", records.len());
                             for record in records {
-                                process_record(&db_clone, &queue_clone, &status_store_clone, record).await;
+                                // Use "default" project_id for now; ideally, record should include project_id
+                                process_record(&db_clone, &queue_clone, &status_store_clone, "default", record).await;
                             }
                         }
                     }
@@ -372,7 +403,6 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
-    // HTTP server setup
     let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
     info!("Binding HTTP server to {}", http_addr);
     let server = match HttpServer::new(move || {
@@ -389,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
             .service(get_status)
             .service(get_all_data)
             .service(get_data_by_id)
+            .service(register_project)
     })
     .bind(&http_addr)
     {
@@ -446,17 +477,23 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn process_record(db: &Arc<Database>, _queue: &Arc<PersistentQueue>, status_store: &IngestStatusStore, record: IngestRecord) {
-    let id = record.traceId.clone(); // Use traceId as a simple ID
+async fn process_record(
+    db: &Arc<Database>,
+    _queue: &Arc<PersistentQueue>,
+    status_store: &IngestStatusStore,
+    project_id: &str,
+    record: IngestRecord,
+) {
+    let id = record.traceId.clone();
     status_store.set_status(id.clone(), "Processing".to_string());
-    match db.insert_record(&record).await {
+    match db.insert_record(project_id, &record).await {
         Ok(()) => {
             INGESTION_COUNTER.inc();
             status_store.set_status(id.clone(), "Ingested".to_string());
         }
         Err(e) => {
             ERROR_COUNTER.inc();
-            error!("Error writing record: {:?}", e);
+            error!("Error writing record for project '{}': {:?}", project_id, e);
             status_store.set_status(id, format!("Failed: {:?}", e));
         }
     }
