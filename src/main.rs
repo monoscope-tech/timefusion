@@ -1,36 +1,27 @@
 // main.rs
 mod database;
-mod ingest;
-mod metrics;
-mod metrics_middleware;
 mod persistent_queue;
-mod utils;
+use std::{env, sync::Arc};
 
-use std::{
-    collections::{HashMap, VecDeque},
-    env,
-    sync::Arc,
-};
-
-use actix_web::{App, HttpResponse, HttpServer, Responder, get, middleware::Logger, post, web};
-use chrono::Utc;
+use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
 use database::Database;
-use datafusion::arrow::array::{Array, ArrayRef, Float64Array, Int32Array, StringArray, StringBuilder};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::config::ConfigOptions;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{create_udf, Volatility, ScalarFunctionImplementation, ColumnarValue};
+use datafusion::{
+    arrow::{
+        array::{Array, ArrayRef, Float64Array, Int32Array, StringArray, StringBuilder},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    },
+    config::ConfigOptions,
+    execution::context::SessionContext,
+    logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility},
+};
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
-use ingest::{IngestStatusStore, get_all_data, get_data_by_id, get_status, record_batches_to_json_rows};
-use metrics::{ERROR_COUNTER, INGESTION_COUNTER};
 use persistent_queue::{IngestRecord, PersistentQueue};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::{
     net::TcpListener,
-    sync::Mutex as TokioMutex,
-    time::{Duration, sleep},
+    time::{sleep, Duration},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -43,53 +34,32 @@ fn register_pg_settings_table(ctx: &SessionContext) -> datafusion::error::Result
         Field::new("setting", DataType::Utf8, false),
     ]));
 
-    let names = vec![
-        "TimeZone".to_string(),
-        "client_encoding".to_string(),
-        "datestyle".to_string(),
-        "client_min_messages".to_string(),
-    ];
-    let settings = vec![
-        "UTC".to_string(),
-        "UTF8".to_string(),
-        "ISO, MDY".to_string(),
-        "notice".to_string(),
-    ];
+    let names = vec!["TimeZone".to_string(), "client_encoding".to_string(), "datestyle".to_string(), "client_min_messages".to_string()];
+    let settings = vec!["UTC".to_string(), "UTF8".to_string(), "ISO, MDY".to_string(), "notice".to_string()];
 
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(names)),
-            Arc::new(StringArray::from(settings)),
-        ],
-    )?;
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(names)), Arc::new(StringArray::from(settings))])?;
 
     ctx.register_batch("pg_settings", batch)?;
     Ok(())
 }
 
 fn register_set_config_udf(ctx: &SessionContext) {
-    let set_config_fn: ScalarFunctionImplementation = Arc::new(
-        move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
-            let param_value_array = match &args[1] {
-                ColumnarValue::Array(array) => array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("set_config second arg must be a StringArray"),
-                _ => panic!("set_config second arg must be an array"),
-            };
-            
-            let mut builder = StringBuilder::new();
-            for i in 0..param_value_array.len() {
-                if param_value_array.is_null(i) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(param_value_array.value(i));
-                }
+    let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
+        let param_value_array = match &args[1] {
+            ColumnarValue::Array(array) => array.as_any().downcast_ref::<StringArray>().expect("set_config second arg must be a StringArray"),
+            _ => panic!("set_config second arg must be an array"),
+        };
+
+        let mut builder = StringBuilder::new();
+        for i in 0..param_value_array.len() {
+            if param_value_array.is_null(i) {
+                builder.append_null();
+            } else {
+                builder.append_value(param_value_array.value(i));
             }
-            Ok(ColumnarValue::Array(Arc::new(builder.finish())))
-        },
-    );
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    });
 
     let set_config_udf = create_udf(
         "set_config",
@@ -103,59 +73,20 @@ fn register_set_config_udf(ctx: &SessionContext) {
 }
 
 #[derive(Clone)]
-struct AppInfo {
-    start_time: chrono::DateTime<Utc>,
-    trends: Arc<TokioMutex<VecDeque<TrendData>>>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-struct TrendData {
-    timestamp: String,
-    ingestion_rate: f64,
-    queue_size: usize,
-    avg_latency: f64,
-}
-
-#[derive(Serialize)]
-struct DashboardData {
-    uptime: f64,
-    http_requests: f64,
-    queue_size: usize,
-    queue_alert: bool,
-    db_status: String,
-    ingestion_rate: f64,
-    avg_latency: f64,
-    latency_alert: bool,
-    recent_statuses: Vec<serde_json::Value>,
-    status_counts: HashMap<String, i32>,
-    recent_records: Vec<serde_json::Value>,
-    trends: Vec<TrendData>,
-}
+struct AppInfo {}
 
 #[derive(Deserialize)]
 struct RegisterProjectRequest {
     project_id: String,
-    bucket: String,
+    bucket:     String,
     access_key: String,
     secret_key: String,
-    endpoint: String,
+    endpoint:   String,
 }
 
 #[post("/register_project")]
-async fn register_project(
-    req: web::Json<RegisterProjectRequest>,
-    db: web::Data<Arc<Database>>,
-) -> impl Responder {
-    match db
-        .register_project(
-            &req.project_id,
-            &req.bucket,
-            &req.access_key,
-            &req.secret_key,
-            &req.endpoint,
-        )
-        .await
-    {
+async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<Arc<Database>>) -> impl Responder {
+    match db.register_project(&req.project_id, &req.bucket, &req.access_key, &req.secret_key, &req.endpoint).await {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({
             "message": format!("Project '{}' registered successfully", req.project_id)
         })),
@@ -163,170 +94,6 @@ async fn register_project(
             "error": format!("Failed to register project: {:?}", e)
         })),
     }
-}
-
-#[get("/dashboard")]
-async fn dashboard(
-    db: web::Data<Arc<Database>>,
-    queue: web::Data<Arc<PersistentQueue>>,
-    app_info: web::Data<AppInfo>,
-    status_store: web::Data<Arc<IngestStatusStore>>,
-    query: web::Query<HashMap<String, String>>,
-) -> impl Responder {
-    let project_id = query.get("project_id").unwrap_or(&"default".to_string()).clone();
-    let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
-    let http_requests = 0.0;
-    let queue_size = queue.len().await.unwrap_or(0);
-    let db_status = match db.query(&project_id, "SELECT 1 AS test").await {
-        Ok(_) => "success",
-        Err(_) => "error",
-    };
-    let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
-
-    let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
-    let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
-    let records_query = if let (Some(start), Some(end)) = (start, end) {
-        format!(
-            "SELECT traceId, spanId, startTimeUnixNano as timestamp \
-             FROM otel_logs_and_spans WHERE startTimeUnixNano >= '{}' AND startTimeUnixNano <= '{}' ORDER BY startTimeUnixNano DESC LIMIT 10",
-            start.to_rfc3339(),
-            end.to_rfc3339()
-        )
-    } else {
-        "SELECT traceId, spanId, startTimeUnixNano as timestamp FROM otel_logs_and_spans ORDER BY startTimeUnixNano DESC LIMIT 10".to_string()
-    };
-
-    let avg_latency = match db.query(&project_id, "SELECT AVG(endTimeUnixNano - startTimeUnixNano) AS avg_latency FROM otel_logs_and_spans WHERE endTimeUnixNano IS NOT NULL").await {
-        Ok(df) => df
-            .collect()
-            .await
-            .ok()
-            .and_then(|batches| {
-                batches
-                    .get(0)
-                    .map(|b| b.column(0).as_any().downcast_ref::<Float64Array>().map_or(0.0, |arr| arr.value(0) / 1_000_000.0))
-            })
-            .unwrap_or(0.0),
-        Err(_) => 0.0,
-    };
-
-    let latency_alert = avg_latency > 200.0;
-    let queue_alert = queue_size > 50;
-
-    let recent_statuses = status_store
-        .inner
-        .read()
-        .unwrap()
-        .iter()
-        .take(10)
-        .map(|(id, status)| serde_json::json!({ "id": id, "status": status }))
-        .collect::<Vec<_>>();
-    let status_counts = recent_statuses.iter().fold(HashMap::new(), |mut acc, status| {
-        *acc.entry(status["status"].as_str().unwrap_or("Unknown").to_string()).or_insert(0) += 1;
-        acc
-    });
-    let recent_records = match db.query(&project_id, &records_query).await {
-        Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
-        Err(_) => vec![],
-    };
-
-    let mut trends = app_info.trends.lock().await;
-    let trend_data = TrendData {
-        timestamp: Utc::now().to_rfc3339(),
-        ingestion_rate,
-        queue_size,
-        avg_latency,
-    };
-    trends.push_back(trend_data);
-    let cutoff = Utc::now() - chrono::Duration::hours(1);
-    while trends.front().map_or(false, |t| chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap() < cutoff) {
-        trends.pop_front();
-    }
-    let trends_vec = if let (Some(start), Some(end)) = (start, end) {
-        trends
-            .iter()
-            .filter(|t| {
-                let ts = chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap();
-                ts >= start && ts <= end
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        trends.iter().cloned().collect::<Vec<_>>()
-    };
-
-    let data = DashboardData {
-        uptime,
-        http_requests,
-        queue_size,
-        queue_alert,
-        db_status: db_status.to_string(),
-        ingestion_rate,
-        avg_latency,
-        latency_alert,
-        recent_statuses,
-        status_counts,
-        recent_records,
-        trends: trends_vec,
-    };
-
-    let html = include_str!("dashboard/dashboard.html")
-        .replace("{{uptime}}", &format!("{:.0}", data.uptime))
-        .replace("{{http_requests}}", &format!("{:.0}", data.http_requests))
-        .replace("{{queue_size}}", &data.queue_size.to_string())
-        .replace("{{queue_alert}}", &data.queue_alert.to_string())
-        .replace("{{db_status}}", &data.db_status)
-        .replace("{{ingestion_rate}}", &format!("{:.2}", data.ingestion_rate))
-        .replace("{{avg_latency}}", &format!("{:.2}", data.avg_latency))
-        .replace("{{latency_alert}}", &data.latency_alert.to_string())
-        .replace("{{recent_statuses}}", &serde_json::to_string(&data.recent_statuses).unwrap())
-        .replace("{{recent_records}}", &serde_json::to_string(&data.recent_records).unwrap())
-        .replace("{{status_counts}}", &serde_json::to_string(&data.status_counts).unwrap())
-        .replace("{{trends}}", &serde_json::to_string(&data.trends).unwrap());
-    HttpResponse::Ok().content_type("text/html").body(html)
-}
-
-#[get("/export_records")]
-async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<String, String>>) -> impl Responder {
-    let project_id = query.get("project_id").unwrap_or(&"default".to_string()).clone();
-    let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
-    let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
-
-    let records_query = if let (Some(start), Some(end)) = (start, end) {
-        format!(
-            "SELECT traceId, spanId, startTimeUnixNano as timestamp \
-             FROM otel_logs_and_spans WHERE startTimeUnixNano >= '{}' AND startTimeUnixNano <= '{}'",
-            start.to_rfc3339(),
-            end.to_rfc3339()
-        )
-    } else {
-        "SELECT traceId, spanId, startTimeUnixNano as timestamp FROM otel_logs_and_spans".to_string()
-    };
-
-    let records = match db.query(&project_id, &records_query).await {
-        Ok(df) => df.collect().await.ok().map_or(vec![], |batches| record_batches_to_json_rows(&batches).unwrap_or_default()),
-        Err(_) => vec![],
-    };
-
-    let mut csv = String::from("Trace ID,Span ID,Timestamp\n");
-    for record in records {
-        csv.push_str(&format!(
-            "{},{},{}\n",
-            record["traceId"].as_str().unwrap_or("N/A"),
-            record["spanId"].as_str().unwrap_or("N/A"),
-            record["timestamp"].as_str().unwrap_or("N/A")
-        ));
-    }
-
-    HttpResponse::Ok()
-        .content_type("text/csv")
-        .append_header(("Content-Disposition", "attachment; filename=\"records.csv\""))
-        .body(csv)
-}
-
-#[get("/")]
-async fn landing() -> impl Responder {
-    HttpResponse::TemporaryRedirect().append_header(("Location", "/dashboard")).finish()
 }
 
 #[tokio::main]
@@ -393,10 +160,7 @@ async fn main() -> anyhow::Result<()> {
             ]));
             let test_batch = RecordBatch::try_new(
                 test_schema.clone(),
-                vec![
-                    Arc::new(Int32Array::from(vec![1, 2, 3])),
-                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
-                ],
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(StringArray::from(vec!["a", "b", "c"]))],
             )?;
             ctx.register_batch("test_table", test_batch)?;
             info!("Registered dummy table: test_table");
@@ -430,11 +194,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let status_store = Arc::new(IngestStatusStore::new());
-    let app_info = web::Data::new(AppInfo {
-        start_time: Utc::now(),
-        trends: Arc::new(TokioMutex::new(VecDeque::new())),
-    });
+    let app_info = web::Data::new(AppInfo {});
 
     let shutdown_token = CancellationToken::new();
     let queue_shutdown = shutdown_token.clone();
@@ -495,7 +255,6 @@ async fn main() -> anyhow::Result<()> {
     let flush_task = {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
-        let status_store_clone = status_store.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -526,17 +285,9 @@ async fn main() -> anyhow::Result<()> {
     let server = match HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
-            .wrap(metrics_middleware::MetricsMiddleware)
             .app_data(web::Data::new(db.clone()))
             .app_data(web::Data::new(queue.clone()))
-            .app_data(web::Data::new(status_store.clone()))
             .app_data(app_info.clone())
-            .service(landing)
-            .service(dashboard)
-            .service(export_records)
-            .service(get_status)
-            .service(get_all_data)
-            .service(get_data_by_id)
             .service(register_project)
     })
     .bind(&http_addr)
@@ -595,24 +346,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn process_record(
-    db: &Arc<Database>,
-    _queue: &Arc<PersistentQueue>,
-    status_store: &IngestStatusStore,
-    project_id: &str,
-    record: IngestRecord,
-) {
-    let id = record.traceId.clone();
-    status_store.set_status(id.clone(), "Processing".to_string());
+async fn process_record(db: &Arc<Database>, _queue: &Arc<PersistentQueue>, project_id: &str, record: IngestRecord) {
     match db.insert_record(project_id, &record).await {
-        Ok(()) => {
-            INGESTION_COUNTER.inc();
-            status_store.set_status(id.clone(), "Ingested".to_string());
-        }
+        Ok(()) => {}
         Err(e) => {
-            ERROR_COUNTER.inc();
             error!("Error writing record for project '{}': {:?}", project_id, e);
-            status_store.set_status(id, format!("Failed: {:?}", e));
         }
     }
 }

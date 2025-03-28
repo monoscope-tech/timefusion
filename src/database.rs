@@ -1,6 +1,4 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use datafusion::{
@@ -10,16 +8,15 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     execution::context::SessionContext,
-    prelude::*,
 };
-use deltalake::storage::StorageOptions;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
+use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
+use tokio::sync::RwLock;
 type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 
 pub struct Database {
-    pub ctx: SessionContext,
+    pub ctx:         SessionContext,
     project_configs: ProjectConfigs,
 }
 
@@ -34,14 +31,7 @@ impl Database {
             .with_storage_options(default_options.0.clone())
             .build()?;
         ctx.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
-        project_configs.insert(
-            "default".to_string(),
-            (
-                storage_uri.to_string(),
-                default_options,
-                Arc::new(RwLock::new(table)),
-            ),
-        );
+        project_configs.insert("default".to_string(), (storage_uri.to_string(), default_options, Arc::new(RwLock::new(table))));
 
         Ok(Self {
             ctx,
@@ -70,16 +60,8 @@ impl Database {
         Schema::new(vec![
             Field::new("traceId", DataType::Utf8, false),
             Field::new("spanId", DataType::Utf8, false),
-            Field::new(
-                "startTimeUnixNano",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
-                false,
-            ),
-            Field::new(
-                "endTimeUnixNano",
-                DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
-                true,
-            ),
+            Field::new("startTimeUnixNano", DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))), false),
+            Field::new("endTimeUnixNano", DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))), true),
             Field::new("name", DataType::Utf8, false),
         ])
     }
@@ -91,19 +73,15 @@ impl Database {
     ) -> Result<()> {
         let (_conn_str, _options, table_ref) = {
             let configs = self.project_configs.read().await;
-            configs
-                .get(project_id)
-                .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?
-                .clone()
+            configs.get(project_id).ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?.clone()
         };
 
         let arrays: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(vec![Some(&record.traceId[..])])),
-            Arc::new(StringArray::from(vec![Some(&record.spanId[..])])),
-            Arc::new(TimestampNanosecondArray::from(vec![record.startTimeUnixNano])),
-            Arc::new(TimestampNanosecondArray::from(vec![
-                record.endTimeUnixNano.unwrap_or(0)
-            ])),
+            Arc::new(StringArray::from(vec![Some(&record.context___trace_id[..])])),
+            Arc::new(StringArray::from(vec![Some(&record.context___span_id[..])])),
+            Arc::new(TimestampNanosecondArray::from(vec![record.timestamp])),
+            Arc::new(TimestampNanosecondArray::from(vec![record.start_time])),
+            Arc::new(TimestampNanosecondArray::from(vec![record.end_time.unwrap_or(0)])),
             Arc::new(StringArray::from(vec![Some(&record.name[..])])),
         ];
 
@@ -130,20 +108,16 @@ impl Database {
         storage_options.0.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_key.to_string());
         storage_options.0.insert("AWS_ENDPOINT".to_string(), endpoint.to_string());
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
-    
+
         let table = DeltaTableBuilder::from_uri(&conn_str)
             .with_storage_options(storage_options.0.clone())
             .with_allow_http(true)
             .build()?;
-    
-        self.ctx
-            .register_table(&format!("otel_logs_and_spans_{}", project_id), Arc::new(table.clone()))?;
-    
+
+        self.ctx.register_table(&format!("otel_logs_and_spans_{}", project_id), Arc::new(table.clone()))?;
+
         let mut configs = self.project_configs.write().await;
-        configs.insert(
-            project_id.to_string(),
-            (conn_str, storage_options, Arc::new(RwLock::new(table))),
-        );
+        configs.insert(project_id.to_string(), (conn_str, storage_options, Arc::new(RwLock::new(table))));
         Ok(())
     }
 }

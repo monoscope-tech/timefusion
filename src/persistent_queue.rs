@@ -1,254 +1,141 @@
-use std::path::PathBuf;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom};
-use tokio::sync::Mutex; // Use tokio's Mutex
-use serde::{Deserialize, Serialize};
-use anyhow::Result;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex; // Use tokio's Mutex
+use tokio::{
+    fs::{File, OpenOptions},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
+};
+
+#[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IngestRecord {
     // Top-level fields
-    pub traceId: String,
-    pub spanId: String,
-    pub traceState: Option<String>,
-    pub parentSpanId: Option<String>,
-    pub name: String,
-    pub kind: Option<String>,
-    pub startTimeUnixNano: i64,
-    pub endTimeUnixNano: Option<i64>,
+    pub timestamp:          i64,
+    pub observed_timestamp: i64,
 
-    // Attributes – HTTP
-    pub attributes____http___method: Option<String>,
-    pub attributes____http___url: Option<String>,
-    pub attributes____http___status___code: Option<i32>,
-    pub attributes____http___request___content___length: Option<i64>,
-    pub attributes____http___response___content___length: Option<i64>,
-    pub attributes____http___route: Option<String>,
-    pub attributes____http___scheme: Option<String>,
-    pub attributes____http___client___ip: Option<String>,
-    pub attributes____http___user___agent: Option<String>,
-    pub attributes____http___flavor: Option<String>,
-    pub attributes____http___target: Option<String>,
-    pub attributes____http___host: Option<String>,
+    // Logs
+    pub id:             String,
+    pub parent_id:      Option<String>,
+    pub name:           String,
+    pub kind:           Option<String>,
+    pub status_code:    Option<String>,
+    pub status_message: Option<String>,
 
-    // Attributes – RPC
-    pub attributes____rpc___system: Option<String>,
-    pub attributes____rpc___service: Option<String>,
-    pub attributes____rpc___method: Option<String>,
-    pub attributes____rpc___grpc___status___code: Option<i32>,
+    // Logs specific
+    pub level:                      Option<String>, // same as severity text
+    pub severity___severity_text:   Option<String>,
+    pub severity___severity_number: Option<String>,
 
-    // Attributes – Database
-    pub attributes____db___system: Option<String>,
-    pub attributes____db___connection___string: Option<String>,
-    pub attributes____db___user: Option<String>,
-    pub attributes____db___name: Option<String>,
-    pub attributes____db___statement: Option<String>,
-    pub attributes____db___operation: Option<String>,
-    pub attributes____db___sql___table: Option<String>,
+    pub duration:   u64, // nanoseconds
+    pub start_time: i64,
+    pub end_time:   Option<i64>,
 
-    // Attributes – Messaging
-    pub attributes____messaging___system: Option<String>,
-    pub attributes____messaging___destination: Option<String>,
-    pub attributes____messaging___destination___kind: Option<String>,
-    pub attributes____messaging___message___id: Option<String>,
-    pub attributes____messaging___operation: Option<String>,
-    pub attributes____messaging___url: Option<String>,
-    pub attributes____messaging___client___id: Option<String>,
-    pub attributes____messaging___kafka___partition: Option<i32>,
-    pub attributes____messaging___kafka___offset: Option<i64>,
-    pub attributes____messaging___kafka___consumer___group: Option<String>,
-    pub attributes____messaging___message___payload___size___bytes: Option<i64>,
-    pub attributes____messaging___protocol: Option<String>,
-    pub attributes____messaging___protocol___version: Option<String>,
-
-    // Attributes – Cache
-    pub attributes____cache___system: Option<String>,
-    pub attributes____cache___operation: Option<String>,
-    pub attributes____cache___key: Option<String>,
-    pub attributes____cache___hit: Option<bool>,
-
-    // Attributes – Network
-    pub attributes____net___peer___ip: Option<String>,
-    pub attributes____net___peer___port: Option<i32>,
-    pub attributes____net___host___ip: Option<String>,
-    pub attributes____net___host___port: Option<i32>,
-    pub attributes____net___transport: Option<String>,
-
-    // Attributes – Enduser
-    pub attributes____enduser___id: Option<String>,
-    pub attributes____enduser___role: Option<String>,
-    pub attributes____enduser___scope: Option<String>,
-
-    // Attributes – Exception
-    pub attributes____exception___type: Option<String>,
-    pub attributes____exception___message: Option<String>,
-    pub attributes____exception___stacktrace: Option<String>,
-    pub attributes____exception___escaped: Option<bool>,
-
-    // Attributes – Thread
-    pub attributes____thread___id: Option<i64>,
-    pub attributes____thread___name: Option<String>,
-
-    // Attributes – Code
-    pub attributes____code___function: Option<String>,
-    pub attributes____code___filepath: Option<String>,
-    pub attributes____code___namespace: Option<String>,
-    pub attributes____code___lineno: Option<i32>,
-
-    // Attributes – Deployment
-    pub attributes____deployment___environment: Option<String>,
-    pub attributes____deployment___version: Option<String>,
-
-    // Attributes – Service
-    pub attributes____service___name: Option<String>,
-    pub attributes____service___version: Option<String>,
-    pub attributes____service___instance___id: Option<String>,
-
-    // Attributes – OTel Library
-    pub attributes____otel___library___name: Option<String>,
-    pub attributes____otel___library___version: Option<String>,
-
-    // Attributes – Kubernetes
-    pub attributes____k8s___pod___name: Option<String>,
-    pub attributes____k8s___namespace___name: Option<String>,
-    pub attributes____k8s___deployment___name: Option<String>,
-
-    // Attributes – Container, Host, OS, Process
-    pub attributes____container___id: Option<String>,
-    pub attributes____host___name: Option<String>,
-    pub attributes____os___type: Option<String>,
-    pub attributes____os___version: Option<String>,
-    pub attributes____process___pid: Option<i64>,
-    pub attributes____process___command___line: Option<String>,
-    pub attributes____process___runtime___name: Option<String>,
-    pub attributes____process___runtime___version: Option<String>,
-
-    // Attributes – AWS
-    pub attributes____aws___region: Option<String>,
-    pub attributes____aws___account___id: Option<String>,
-    pub attributes____aws___dynamodb___table___name: Option<String>,
-    pub attributes____aws___dynamodb___operation: Option<String>,
-    pub attributes____aws___dynamodb___consumed___capacity___total: Option<f64>,
-    pub attributes____aws___sqs___queue___url: Option<String>,
-    pub attributes____aws___sqs___message___id: Option<String>,
-
-    // Attributes – Azure
-    pub attributes____azure___resource___id: Option<String>,
-    pub attributes____azure___storage___container___name: Option<String>,
-    pub attributes____azure___storage___blob___name: Option<String>,
-
-    // Attributes – GCP
-    pub attributes____gcp___project___id: Option<String>,
-    pub attributes____gcp___cloudsql___instance___id: Option<String>,
-    pub attributes____gcp___pubsub___message___id: Option<String>,
-
-    // Attributes – Custom
-    pub attributes____custom___attribute___1: Option<String>,
-    pub attributes____custom___attribute___2: Option<i64>,
-    pub attributes____custom___attribute___3: Option<bool>,
+    // Context
+    pub context___trace_id:    String,
+    pub context___span_id:     String,
+    pub context___trace_state: Option<String>,
+    pub context___trace_flags: Option<String>,
+    pub context___is_remote:   Option<String>,
 
     // Events
-    pub events____timeUnixNano: Option<i64>,
-    pub events____name: Option<String>,
-    pub events____attributes____db___statement: Option<String>,
-    pub events____attributes____db___rows___affected: Option<i64>,
-    pub events____attributes____messaging___message___id: Option<String>,
-    pub events____attributes____cache___key: Option<String>,
+    pub events: Option<String>, // events json
 
     // Links
-    pub links____traceId: Option<String>,
-    pub links____spanId: Option<String>,
-    pub links____traceState: Option<String>,
-    pub links____attributes____link___attribute: Option<String>,
+    pub links: Option<String>, // links json
 
-    // Status
-    pub status____code: Option<String>,
-    pub status____message: Option<String>,
+    // Attributes
 
-    // Resource Attributes (subset)
-    pub resource____attributes____service___name: Option<String>,
-    pub resource____attributes____service___version: Option<String>,
-    pub resource____attributes____service___instance___id: Option<String>,
-    pub resource____attributes____service___namespace: Option<String>,
-    pub resource____attributes____host___name: Option<String>,
-    pub resource____attributes____host___id: Option<String>,
-    pub resource____attributes____host___type: Option<String>,
-    pub resource____attributes____host___arch: Option<String>,
-    pub resource____attributes____os___type: Option<String>,
-    pub resource____attributes____os___version: Option<String>,
-    pub resource____attributes____process___pid: Option<i64>,
-    pub resource____attributes____process___executable___name: Option<String>,
-    pub resource____attributes____process___command___line: Option<String>,
-    pub resource____attributes____process___runtime___name: Option<String>,
-    pub resource____attributes____process___runtime___version: Option<String>,
-    pub resource____attributes____process___runtime___description: Option<String>,
-    pub resource____attributes____process___executable___path: Option<String>,
-    pub resource____attributes____k8s___cluster___name: Option<String>,
-    pub resource____attributes____k8s___namespace___name: Option<String>,
-    pub resource____attributes____k8s___deployment___name: Option<String>,
-    pub resource____attributes____k8s___pod___name: Option<String>,
-    pub resource____attributes____k8s___pod___uid: Option<String>,
-    pub resource____attributes____k8s___replicaset___name: Option<String>,
-    pub resource____attributes____k8s___deployment___strategy: Option<String>,
-    pub resource____attributes____k8s___container___name: Option<String>,
-    pub resource____attributes____k8s___node___name: Option<String>,
-    pub resource____attributes____container___id: Option<String>,
-    pub resource____attributes____container___image___name: Option<String>,
-    pub resource____attributes____container___image___tag: Option<String>,
-    pub resource____attributes____deployment___environment: Option<String>,
-    pub resource____attributes____deployment___version: Option<String>,
-    pub resource____attributes____cloud___provider: Option<String>,
-    pub resource____attributes____cloud___platform: Option<String>,
-    pub resource____attributes____cloud___region: Option<String>,
-    pub resource____attributes____cloud___availability___zone: Option<String>,
-    pub resource____attributes____cloud___account___id: Option<String>,
-    pub resource____attributes____cloud___resource___id: Option<String>,
-    pub resource____attributes____cloud___instance___type: Option<String>,
-    pub resource____attributes____telemetry___sdk___name: Option<String>,
-    pub resource____attributes____telemetry___sdk___language: Option<String>,
-    pub resource____attributes____telemetry___sdk___version: Option<String>,
-    pub resource____attributes____application___name: Option<String>,
-    pub resource____attributes____application___version: Option<String>,
-    pub resource____attributes____application___tier: Option<String>,
-    pub resource____attributes____application___owner: Option<String>,
-    pub resource____attributes____customer___id: Option<String>,
-    pub resource____attributes____tenant___id: Option<String>,
-    pub resource____attributes____feature___flag___enabled: Option<bool>,
-    pub resource____attributes____payment___gateway: Option<String>,
-    pub resource____attributes____database___type: Option<String>,
-    pub resource____attributes____database___instance: Option<String>,
-    pub resource____attributes____cache___provider: Option<String>,
-    pub resource____attributes____message___queue___type: Option<String>,
-    pub resource____attributes____http___route: Option<String>,
-    pub resource____attributes____aws___ecs___cluster___arn: Option<String>,
-    pub resource____attributes____aws___ecs___container___arn: Option<String>,
-    pub resource____attributes____aws___ecs___task___arn: Option<String>,
-    pub resource____attributes____aws___ecs___task___family: Option<String>,
-    pub resource____attributes____aws___ec2___instance___id: Option<String>,
-    pub resource____attributes____gcp___project___id: Option<String>,
-    pub resource____attributes____gcp___zone: Option<String>,
-    pub resource____attributes____azure___resource___id: Option<String>,
-    pub resource____attributes____dynatrace___entity___process___id: Option<String>,
-    pub resource____attributes____elastic___node___name: Option<String>,
-    pub resource____attributes____istio___mesh___id: Option<String>,
-    pub resource____attributes____cloudfoundry___application___id: Option<String>,
-    pub resource____attributes____cloudfoundry___space___id: Option<String>,
-    pub resource____attributes____opentelemetry___collector___name: Option<String>,
-    pub resource____attributes____instrumentation___name: Option<String>,
-    pub resource____attributes____instrumentation___version: Option<String>,
-    pub resource____attributes____log___source: Option<String>,
+    // Server and client
+    pub attributes___client___address: Option<String>,
+    pub attributes___client___port:    Option<u32>,
+    pub attributes___server___address: Option<String>,
+    pub attributes___server___port:    Option<u32>,
 
-    // Instrumentation Library
-    pub instrumentationLibrary____name: Option<String>,
-    pub instrumentationLibrary____version: Option<String>,
+    // network https://opentelemetry.io/docs/specs/semconv/attributes-registry/network/
+    pub attributes___network___local__address:     Option<String>,
+    pub attributes___network___local__port:        Option<u32>,
+    pub attributes___network___peer___address:     Option<String>,
+    pub attributes___network___peer__port:         Option<u32>,
+    pub attributes___network___protocol___name:    Option<String>,
+    pub attributes___network___protocol___version: Option<String>,
+    pub attributes___network___transport:          Option<String>,
+    pub attributes___network___type:               Option<String>,
+
+    // Source Code Attributes
+    pub attributes___code___number:          Option<u32>,
+    pub attributes___code___file___path:     Option<u32>,
+    pub attributes___code___function___name: Option<u32>,
+    pub attributes___code___line___number:   Option<u32>,
+    pub attributes___code___stacktrace:      Option<u32>,
+
+    // Log records. https://opentelemetry.io/docs/specs/semconv/general/logs/
+    pub attributes___log__record___original: Option<String>,
+    pub attributes___log__record___uid:      Option<String>,
+
+    // Exception https://opentelemetry.io/docs/specs/semconv/exceptions/exceptions-logs/
+    pub attributes___error___type:           Option<String>,
+    pub attributes___exception___type:       Option<String>,
+    pub attributes___exception___message:    Option<String>,
+    pub attributes___exception___stacktrace: Option<String>,
+
+    // URL https://opentelemetry.io/docs/specs/semconv/attributes-registry/url/
+    pub attributes___url___fragment: Option<String>,
+    pub attributes___url___full:     Option<String>,
+    pub attributes___url___path:     Option<String>,
+    pub attributes___url___query:    Option<String>,
+    pub attributes___url___scheme:   Option<String>,
+
+    // Useragent https://opentelemetry.io/docs/specs/semconv/attributes-registry/user-agent/
+    pub attributes___user_agent___original: Option<String>,
+
+    // HTTP https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+    pub attributes___http___request___method:          Option<String>,
+    pub attributes___http___request___method_original: Option<String>,
+    pub attributes___http___response___status_code:    Option<String>,
+    pub attributes___http___request___resend_count:    Option<String>,
+    pub attributes___http___request___body___size:     Option<String>,
+
+    // Session https://opentelemetry.io/docs/specs/semconv/general/session/
+    pub attributes___session___id:            Option<String>,
+    pub attributes___session___previous___id: Option<String>,
+
+    // Database https://opentelemetry.io/docs/specs/semconv/database/database-spans/
+    pub attributes___db___system___name:            Option<String>,
+    pub attributes___db___collection___name:        Option<String>,
+    pub attributes___db___namespace:                Option<String>,
+    pub attributes___db___operation___name:         Option<String>,
+    pub attributes___db___response___status_code:   Option<String>,
+    pub attributes___db___operation___batch___size: Option<u32>,
+    pub attributes___db___query___summary:          Option<String>,
+    pub attributes___db___query___text:             Option<String>,
+
+    // https://opentelemetry.io/docs/specs/semconv/attributes-registry/user/
+    pub attributes___user___id:        Option<String>,
+    pub attributes___user___email:     Option<String>,
+    pub attributes___user___full_name: Option<String>,
+    pub attributes___user___name:      Option<String>,
+    pub attributes___user___hash:      Option<String>,
+
+    // Resource Attributes (subset) https://opentelemetry.io/docs/specs/semconv/resource/
+    pub resource___attributes___service___name:          Option<String>,
+    pub resource___attributes___service___version:       Option<String>,
+    pub resource___attributes___service___instance___id: Option<String>,
+    pub resource___attributes___service___namespace:     Option<String>,
+
+    pub resource___attributes___telemetry___sdk___language: Option<String>,
+    pub resource___attributes___telemetry___sdk___name:     Option<String>,
+    pub resource___attributes___telemetry___sdk___version:  Option<String>,
+
+    pub resource___attributes___user_agent___original: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct PersistentQueue {
-    path: PathBuf,
-    file: Arc<Mutex<File>>,      // Using tokio::sync::Mutex
-    position: Arc<Mutex<u64>>,   // Using tokio::sync::Mutex
+    path:     PathBuf,
+    file:     Arc<Mutex<File>>, // Using tokio::sync::Mutex
+    position: Arc<Mutex<u64>>,  // Using tokio::sync::Mutex
 }
 
 impl PersistentQueue {
@@ -259,30 +146,12 @@ impl PersistentQueue {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .await?;
+        let file = OpenOptions::new().read(true).write(true).create(true).open(&path).await?;
         Ok(Self {
             path,
             file: Arc::new(Mutex::new(file)),
             position: Arc::new(Mutex::new(0)),
         })
-    }
-
-    pub async fn enqueue(&self, record: IngestRecord) -> Result<()> {
-        let mut file = self.file.lock().await; // Lock async
-        let serialized = serde_json::to_string(&record)?;
-        let len = serialized.len() as u64;
-        file.write_all(serialized.as_bytes()).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-
-        let mut pos = self.position.lock().await; // Lock async
-        *pos += len + 1; // +1 for newline
-        Ok(())
     }
 
     pub async fn dequeue(&self) -> Result<Option<IngestRecord>> {
@@ -322,25 +191,5 @@ impl PersistentQueue {
 
         Ok(Some(record))
     }
-
-    pub async fn len(&self) -> Result<usize> {
-        // Reopen the file to avoid borrowing issues with the locked file
-        let file = OpenOptions::new()
-            .read(true)
-            .open(&self.path)
-            .await?;
-        let mut reader = BufReader::new(file);
-        let mut count = 0;
-        let mut line = String::new();
-
-        reader.seek(SeekFrom::Start(0)).await?;
-        while reader.read_line(&mut line).await? > 0 {
-            if !line.trim().is_empty() {
-                count += 1;
-            }
-            line.clear();
-        }
-
-        Ok(count)
-    }
 }
+

@@ -1,206 +1,138 @@
-use std::sync::Arc;
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
-
+// Preference for stable attributes in the otel spec . With some exceptions
+//
 macro_rules! define_telemetry_fields {
     ($field_macro:ident) => {
         // Top-level fields
-        $field_macro!(traceId, DataType::Utf8, false, String);
-        $field_macro!(spanId, DataType::Utf8, false, String);
-        $field_macro!(traceState, DataType::Utf8, true, Option<String>);
-        $field_macro!(parentSpanId, DataType::Utf8, true, Option<String>);
+        $field_macro!(timestamp, DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))), false, i64);
+        $field_macro!(
+            observed_timestamp,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+            false,
+            i64
+        ); // Logs
+        $field_macro!(id, DataType::Utf8, false, String);
+
+        $field_macro!(parent_id, DataType::Utf8, true, Option<String>);
         $field_macro!(name, DataType::Utf8, false, String);
         $field_macro!(kind, DataType::Utf8, true, Option<String>);
-        $field_macro!(startTimeUnixNano, DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))), false, i64);
-        $field_macro!(endTimeUnixNano, DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))), true, Option<i64>);
+        $field_macro!(status_code, DataType::Utf8, true, Option<String>);
+        $field_macro!(status_message, DataType::Utf8, true, Option<String>);
 
-        // Attributes
-        $field_macro!(attributes____http___method, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____http___url, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____http___status___code, DataType::Int32, true, Option<i32>);
-        $field_macro!(attributes____http___request___content___length, DataType::Int64, true, Option<i64>);
-        $field_macro!(attributes____http___response___content___length, DataType::Int64, true, Option<i64>);
-        $field_macro!(attributes____http___route, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____http___scheme, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____http___client___ip, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____http___user___agent, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____http___flavor, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____http___target, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____http___host, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____rpc___system, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____rpc___service, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____rpc___method, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____rpc___grpc___status___code, DataType::Int32, true, Option<i32>);
-        $field_macro!(attributes____db___system, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____db___connection___string, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____db___user, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____db___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____db___statement, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____db___operation, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____db___sql___table, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___system, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___destination, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___destination___kind, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___message___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___operation, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___url, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___client___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___kafka___partition, DataType::Int32, true, Option<i32>);
-        $field_macro!(attributes____messaging___kafka___offset, DataType::Int64, true, Option<i64>);
-        $field_macro!(attributes____messaging___kafka___consumer___group, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___message___payload___size___bytes, DataType::Int64, true, Option<i64>);
-        $field_macro!(attributes____messaging___protocol, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____messaging___protocol___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____cache___system, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____cache___operation, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____cache___key, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____cache___hit, DataType::Boolean, true, Option<bool>);
-        $field_macro!(attributes____net___peer___ip, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____net___peer___port, DataType::Int32, true, Option<i32>);
-        $field_macro!(attributes____net___host___ip, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____net___host___port, DataType::Int32, true, Option<i32>);
-        $field_macro!(attributes____net___transport, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____enduser___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____enduser___role, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____enduser___scope, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____exception___type, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____exception___message, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____exception___stacktrace, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____exception___escaped, DataType::Boolean, true, Option<bool>);
-        $field_macro!(attributes____thread___id, DataType::Int64, true, Option<i64>);
-        $field_macro!(attributes____thread___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____code___function, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____code___filepath, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____code___namespace, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____code___lineno, DataType::Int32, true, Option<i32>);
-        $field_macro!(attributes____deployment___environment, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____deployment___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____service___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____service___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____service___instance___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____otel___library___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____otel___library___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____k8s___pod___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____k8s___namespace___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____k8s___deployment___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____container___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____host___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____os___type, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____os___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____process___pid, DataType::Int64, true, Option<i64>);
-        $field_macro!(attributes____process___command___line, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____process___runtime___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____process___runtime___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____aws___region, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____aws___account___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____aws___dynamodb___table___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____aws___dynamodb___operation, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____aws___dynamodb___consumed___capacity___total, DataType::Float64, true, Option<f64>);
-        $field_macro!(attributes____aws___sqs___queue___url, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____aws___sqs___message___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____azure___resource___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____azure___storage___container___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____azure___storage___blob___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____gcp___project___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____gcp___cloudsql___instance___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____gcp___pubsub___message___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____custom___attribute___1, DataType::Utf8, true, Option<String>);
-        $field_macro!(attributes____custom___attribute___2, DataType::Int64, true, Option<i64>);
-        $field_macro!(attributes____custom___attribute___3, DataType::Boolean, true, Option<bool>);
+        // Logs specific
+        $field_macro!(level, DataType::Utf8, true, Option<String>); // same as severity text
+        $field_macro!(severity___severity_text, DataType::Utf8, true, Option<String>);
+        $field_macro!(severity___severity_number, DataType::Utf8, true, Option<String>);
+
+        $field_macro!(duration, DataType::Duration(TimeUnit::Nanosecond), false, u64); // nanoseconds
+        $field_macro!(start_time, DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))), false, i64);
+        $field_macro!(
+            end_time,
+            DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+            true,
+            Option<i64>
+        );
+
+        // Context
+        $field_macro!(context___trace_id, DataType::Utf8, false, String);
+        $field_macro!(context___span_id, DataType::Utf8, false, String);
+        $field_macro!(context___trace_state, DataType::Utf8, true, Option<String>);
+        $field_macro!(context___trace_flags, DataType::Utf8, true, Option<String>);
+        $field_macro!(context___is_remote, DataType::Utf8, true, Option<String>);
 
         // Events
-        $field_macro!(events____timeUnixNano, DataType::Timestamp(TimeUnit::Nanosecond, Some(Arc::from("UTC"))), true, Option<i64>);
-        $field_macro!(events____name, DataType::Utf8, true, Option<String>);
-        $field_macro!(events____attributes____db___statement, DataType::Utf8, true, Option<String>);
-        $field_macro!(events____attributes____db___rows___affected, DataType::Int64, true, Option<i64>);
-        $field_macro!(events____attributes____messaging___message___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(events____attributes____cache___key, DataType::Utf8, true, Option<String>);
+        $field_macro!(events, DataType::Utf8, true, Option<String>); // events json
 
         // Links
-        $field_macro!(links____traceId, DataType::Utf8, true, Option<String>);
-        $field_macro!(links____spanId, DataType::Utf8, true, Option<String>);
-        $field_macro!(links____traceState, DataType::Utf8, true, Option<String>);
-        $field_macro!(links____attributes____link___attribute, DataType::Utf8, true, Option<String>);
+        $field_macro!(links, DataType::Utf8, true, Option<String>); // links json
 
-        // Status
-        $field_macro!(status____code, DataType::Utf8, true, Option<String>);
-        $field_macro!(status____message, DataType::Utf8, true, Option<String>);
+        // Attributes
 
-        // Resource Attributes (subset)
-        $field_macro!(resource____attributes____service___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____service___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____service___instance___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____service___namespace, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____host___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____host___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____host___type, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____host___arch, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____os___type, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____os___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____process___pid, DataType::Int64, true, Option<i64>);
-        $field_macro!(resource____attributes____process___executable___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____process___command___line, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____process___runtime___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____process___runtime___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____process___runtime___description, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____process___executable___path, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____k8s___cluster___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____k8s___namespace___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____k8s___deployment___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____k8s___pod___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____k8s___pod___uid, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____k8s___replicaset___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____k8s___deployment___strategy, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____k8s___container___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____k8s___node___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____container___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____container___image___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____container___image___tag, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____deployment___environment, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____deployment___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cloud___provider, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cloud___platform, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cloud___region, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cloud___availability___zone, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cloud___account___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cloud___resource___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cloud___instance___type, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____telemetry___sdk___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____telemetry___sdk___language, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____telemetry___sdk___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____application___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____application___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____application___tier, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____application___owner, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____customer___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____tenant___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____feature___flag___enabled, DataType::Boolean, true, Option<bool>);
-        $field_macro!(resource____attributes____payment___gateway, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____database___type, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____database___instance, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cache___provider, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____message___queue___type, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____http___route, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____aws___ecs___cluster___arn, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____aws___ecs___container___arn, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____aws___ecs___task___arn, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____aws___ecs___task___family, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____aws___ec2___instance___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____gcp___project___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____gcp___zone, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____azure___resource___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____dynatrace___entity___process___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____elastic___node___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____istio___mesh___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cloudfoundry___application___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____cloudfoundry___space___id, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____opentelemetry___collector___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____instrumentation___name, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____instrumentation___version, DataType::Utf8, true, Option<String>);
-        $field_macro!(resource____attributes____log___source, DataType::Utf8, true, Option<String>);
+        // Server and client
+        $field_macro!(attributes___client___address, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___client___port, DataType::UInt32, true, Option<u32>);
+        $field_macro!(attributes___server___address, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___server___port, DataType::UInt32, true, Option<u32>);
 
-        // Instrumentation Library
-        $field_macro!(instrumentationLibrary____name, DataType::Utf8, true, Option<String>);
-        $field_macro!(instrumentationLibrary____version, DataType::Utf8, true, Option<String>);
+        // network https://opentelemetry.io/docs/specs/semconv/attributes-registry/network/
+        $field_macro!(attributes___network___local__address, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___network___local__port, DataType::Utf8, true, Option<u32>);
+        $field_macro!(attributes___network___peer___address, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___network___peer__port, DataType::Utf8, true, Option<u32>);
+        $field_macro!(attributes___network___protocol___name, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___network___protocol___version, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___network___transport, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___network___type, DataType::Utf8, true, Option<String>);
+
+        // Source Code Attributes
+        $field_macro!(attributes___code___number, DataType::UInt32, true, Option<u32>);
+        $field_macro!(attributes___code___file___path, DataType::Utf8, true, Option<u32>);
+        $field_macro!(attributes___code___function___name, DataType::Utf8, true, Option<u32>);
+        $field_macro!(attributes___code___line___number, DataType::Utf8, true, Option<u32>);
+        $field_macro!(attributes___code___stacktrace, DataType::Utf8, true, Option<u32>);
+
+        // Log records. https://opentelemetry.io/docs/specs/semconv/general/logs/
+        $field_macro!(attributes___log__record___original, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___log__record___uid, DataType::Utf8, true, Option<String>);
+
+        // Exception https://opentelemetry.io/docs/specs/semconv/exceptions/exceptions-logs/
+        $field_macro!(attributes___error___type, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___exception___type, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___exception___message, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___exception___stacktrace, DataType::Utf8, true, Option<String>);
+
+        // URL https://opentelemetry.io/docs/specs/semconv/attributes-registry/url/
+        $field_macro!(attributes___url___fragment, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___url___full, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___url___path, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___url___query, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___url___scheme, DataType::Utf8, true, Option<String>);
+
+        // Useragent https://opentelemetry.io/docs/specs/semconv/attributes-registry/user-agent/
+        $field_macro!(attributes___user_agent___original, DataType::Utf8, true, Option<String>);
+
+        // HTTP https://opentelemetry.io/docs/specs/semconv/http/http-spans/
+        $field_macro!(attributes___http___request___method, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___http___request___method_original, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___http___response___status_code, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___http___request___resend_count, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___http___request___body___size, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___http___response___status_code, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___http___response___status_code, DataType::Utf8, true, Option<String>);
+
+        // Session https://opentelemetry.io/docs/specs/semconv/general/session/
+        $field_macro!(attributes___session___id, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___session___previous___id, DataType::Utf8, true, Option<String>);
+
+        // Database https://opentelemetry.io/docs/specs/semconv/database/database-spans/
+        $field_macro!(attributes___db___system___name, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___db___collection___name, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___db___namespace, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___db___operation___name, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___db___response___status_code, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___db___operation___batch___size, DataType::UInt32, true, Option<u32>);
+        $field_macro!(attributes___db___query___summary, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___db___query___text, DataType::Utf8, true, Option<String>);
+
+        // https://opentelemetry.io/docs/specs/semconv/attributes-registry/user/  in development but
+        // adopted.
+        $field_macro!(attributes___user___id, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___user___email, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___user___full_name, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___user___name, DataType::Utf8, true, Option<String>);
+        $field_macro!(attributes___user___hash, DataType::Utf8, true, Option<String>);
+
+        // Resource Attributes (subset) https://opentelemetry.io/docs/specs/semconv/resource/
+        $field_macro!(resource___attributes___service___name, DataType::Utf8, true, Option<String>);
+        $field_macro!(resource___attributes___service___version, DataType::Utf8, true, Option<String>);
+        $field_macro!(resource___attributes___service___instance___id, DataType::Utf8, true, Option<String>);
+        $field_macro!(resource___attributes___service___namespace, DataType::Utf8, true, Option<String>);
+
+        $field_macro!(resource___attributes___telemetry___sdk___language, DataType::Utf8, true, Option<String>);
+        $field_macro!(resource___attributes___telemetry___sdk___name, DataType::Utf8, true, Option<String>);
+        $field_macro!(resource___attributes___telemetry___sdk___version, DataType::Utf8, true, Option<String>);
+        $field_macro!(resource___attributes___telemetry___sdk___name, DataType::Utf8, true, Option<String>);
+
+        $field_macro!(resource___attributes___user_agent___original, DataType::Utf8, true, Option<String>);
     };
 }
 
