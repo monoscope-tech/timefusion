@@ -121,12 +121,12 @@ async fn main() -> anyhow::Result<()> {
             info!("Database initialized successfully");
             let mut options = ConfigOptions::new();
             let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
-            let ctx = SessionContext::new_with_config(options.into());
+            let session_context = SessionContext::new_with_config(options.into());
 
-            let initial_catalogs = db.get_session_context().catalog_names();
+            let initial_catalogs = db.session_context.catalog_names();
             info!("Initial catalogs: {:?}", initial_catalogs);
 
-            let catalog = db.get_session_context().catalog("datafusion");
+            let catalog = db.session_context.catalog("datafusion");
             if let Some(catalog) = catalog {
                 let schema_names = catalog.schema_names();
                 info!("Schemas in 'datafusion' catalog: {:?}", schema_names);
@@ -139,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
                             info!("Tables in schema '{}': {:?}", schema_name, table_names);
                             for table_name in table_names {
                                 if let Ok(Some(table_provider)) = schema.table(&table_name).await {
-                                    ctx.register_table(&table_name, table_provider)?;
+                                    session_context.register_table(&table_name, table_provider)?;
                                     info!("Registered table: {}", table_name);
                                 } else {
                                     warn!("Failed to load table provider for: {}", table_name);
@@ -154,13 +154,12 @@ async fn main() -> anyhow::Result<()> {
                 warn!("'datafusion' catalog not found; proceeding with empty context");
             }
 
-            register_pg_settings_table(&ctx)?;
-            register_set_config_udf(&ctx);
+            register_pg_settings_table(&session_context)?;
+            register_set_config_udf(&session_context);
 
-            let final_catalogs = ctx.catalog_names();
-            info!("Final catalogs: {:?}", final_catalogs);
+            info!("Final catalogs: {:?}", session_context.catalog_names());
 
-            db.ctx = ctx;
+            db.session_context = session_context;
             Arc::new(db)
         }
         Err(e) => {
@@ -190,7 +189,7 @@ async fn main() -> anyhow::Result<()> {
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
-    let pg_service = Arc::new(DfSessionService::new(db.get_session_context().clone()));
+    let pg_service = Arc::new(DfSessionService::new(db.session_context.clone()));
     let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
     let pg_addr = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
     let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", pg_addr)).await?;

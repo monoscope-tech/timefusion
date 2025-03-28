@@ -13,29 +13,24 @@ type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 
 pub struct Database {
-    pub ctx:         SessionContext,
-    project_configs: ProjectConfigs,
+    pub session_context: SessionContext,
+    project_configs:     ProjectConfigs,
 }
 
 impl Database {
     pub async fn new(storage_uri: &str) -> Result<Self> {
-        let ctx = SessionContext::new();
+        let session_context = SessionContext::new();
         let mut project_configs = HashMap::new();
 
         let default_options = StorageOptions::default();
         let table = DeltaTableBuilder::from_uri(storage_uri).with_allow_http(true).with_storage_options(default_options.0.clone()).build()?;
-        ctx.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
+        session_context.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
         project_configs.insert("default".to_string(), (storage_uri.to_string(), default_options, Arc::new(RwLock::new(table))));
 
         Ok(Self {
-            ctx,
+            session_context,
             project_configs: Arc::new(RwLock::new(project_configs)),
         })
-    }
-
-    /// Returns a reference to the SessionContext for querying.
-    pub fn get_session_context(&self) -> &SessionContext {
-        &self.ctx
     }
 
     pub async fn insert_records(&self, project_id: &str, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
@@ -63,7 +58,7 @@ impl Database {
 
         let table = DeltaTableBuilder::from_uri(&conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).build()?;
 
-        self.ctx.register_table(&format!("otel_logs_and_spans_{}", project_id), Arc::new(table.clone()))?;
+        self.session_context.register_table(&format!("otel_logs_and_spans_{}", project_id), Arc::new(table.clone()))?;
 
         let mut configs = self.project_configs.write().await;
         configs.insert(project_id.to_string(), (conn_str, storage_options, Arc::new(RwLock::new(table))));
