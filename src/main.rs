@@ -258,8 +258,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize persistent queue.
     let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "/app/queue_db".to_string());
-    info!("Using queue DB path: {}", queue_db_path);
-    let queue = match PersistentQueue::new(&queue_db_path).await {
+    let queue_file_path = format!("{}/queue.db", queue_db_path); // Ensure it’s a file
+    info!("Using queue DB path: {}", queue_file_path);
+    let queue = match PersistentQueue::new(&queue_file_path).await {
         Ok(q) => {
             info!("PersistentQueue initialized successfully");
             Arc::new(q)
@@ -311,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
                                 info!("PGWire: Accepted connection from {}", addr);
                                 let handler_factory = HandlerFactory(pg_service.clone());
                                 tokio::spawn(async move {
+                                    debug!("PGWire: Received connection from {}, preparing to process", addr);
                                     debug!("PGWire: Starting to process socket for {}", addr);
                                     match pgwire::tokio::process_socket(socket, None, handler_factory).await {
                                         Ok(_) => {
