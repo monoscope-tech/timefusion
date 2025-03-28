@@ -16,7 +16,6 @@ use deltalake::storage::StorageOptions;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
 
-// Corrected ProjectConfigs type definition using the type alias
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 
 pub struct Database {
@@ -25,13 +24,11 @@ pub struct Database {
 }
 
 impl Database {
-    /// Creates a new Database instance with a default table configuration.
     pub async fn new(storage_uri: &str) -> Result<Self> {
         let ctx = SessionContext::new();
         let mut project_configs = HashMap::new();
 
-        // Default table with environment credentials
-        let default_options = StorageOptions::default(); // Uses AWS_* env vars
+        let default_options = StorageOptions::default();
         let table = DeltaTableBuilder::from_uri(storage_uri)
             .with_allow_http(true)
             .with_storage_options(default_options.0.clone())
@@ -52,12 +49,11 @@ impl Database {
         })
     }
 
-    /// Returns a clone of the SessionContext for querying.
-    pub fn get_session_context(&self) -> SessionContext {
-        self.ctx.clone()
+    /// Returns a reference to the SessionContext for querying.
+    pub fn get_session_context(&self) -> &SessionContext {
+        &self.ctx
     }
 
-    /// Executes an SQL query for a specific project.
     pub async fn query(&self, project_id: &str, sql: &str) -> Result<DataFrame> {
         let configs = self.project_configs.read().await;
         if !configs.contains_key(project_id) {
@@ -70,7 +66,6 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("SQL query failed for project '{}': {:?}", project_id, e))
     }
 
-    /// Defines the schema for events stored in the database.
     fn event_schema() -> Schema {
         Schema::new(vec![
             Field::new("traceId", DataType::Utf8, false),
@@ -89,7 +84,6 @@ impl Database {
         ])
     }
 
-    /// Inserts a record into the database for a specific project.
     pub async fn insert_record(
         &self,
         project_id: &str,
@@ -122,7 +116,6 @@ impl Database {
         Ok(())
     }
 
-    /// Registers a new project with custom storage options.
     pub async fn register_project(
         &self,
         project_id: &str,
@@ -139,7 +132,7 @@ impl Database {
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
     
         let table = DeltaTableBuilder::from_uri(&conn_str)
-            .with_storage_options(storage_options.0.clone())  // Use storage_options instead
+            .with_storage_options(storage_options.0.clone())
             .with_allow_http(true)
             .build()?;
     

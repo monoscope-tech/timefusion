@@ -1,3 +1,4 @@
+// main.rs
 mod database;
 mod ingest;
 mod metrics;
@@ -14,7 +15,12 @@ use std::{
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, middleware::Logger, post, web};
 use chrono::Utc;
 use database::Database;
-use datafusion::arrow::array::Float64Array;
+use datafusion::arrow::array::{Array, Float64Array, Int32Array, StringArray, StringBuilder};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::config::ConfigOptions;
+use datafusion::execution::context::SessionContext;
+use datafusion::logical_expr::{create_udf, Volatility, ScalarFunctionImplementation, ColumnarValue};
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
 use ingest::{IngestStatusStore, get_all_data, get_data_by_id, get_status, record_batches_to_json_rows};
@@ -27,9 +33,177 @@ use tokio::{
     time::{Duration, sleep},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 use url::Url;
+
+// Imports for custom StartupHandler implementation
+use pgwire::api::auth::{AuthSource, StartupHandler};
+use pgwire::api::{ClientInfo, Type};
+use pgwire::error::{PgWireError, PgWireResult};
+use tokio::io::AsyncWrite;
+
+// Custom struct for trust authentication
+#[derive(Debug)]
+struct TrustAuthHandler;
+
+impl TrustAuthHandler {
+    fn new() -> Self {
+        TrustAuthHandler
+    }
+}
+
+impl<W: AsyncWrite + Send + Sync + Unpin> StartupHandler<W> for TrustAuthHandler {
+    fn on_startup(
+        &self,
+        client: &mut dyn ClientInfo<W>,
+        message: pgwire::api::startup::StartupMessage,
+    ) -> PgWireResult<()> {
+        // Log the startup message for debugging
+        debug!("Received startup message: {:?}", message);
+
+        // Send authentication OK message (trust authentication, no password required)
+        client
+            .send(pgwire::api::message::Message::AuthenticationOk)
+            .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        // Set default parameters (optional, but helps with compatibility)
+        client.set_parameter("server_version", "14.0"); // Mimic PostgreSQL 14.0
+        client.set_parameter("server_encoding", "UTF8");
+        client.set_parameter("client_encoding", "UTF8");
+        client.set_parameter("DateStyle", "ISO, MDY");
+
+        // Mark authentication as complete
+        client.set_auth_result(true);
+
+        // Send ParameterStatus messages to the client
+        for (key, value) in client.parameters() {
+            client
+                .send(pgwire::api::message::Message::ParameterStatus {
+                    name: key.to_string(),
+                    value: value.to_string(),
+                })
+                .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+        }
+
+        // Send BackendKeyData (required by some clients like psql)
+        client
+            .send(pgwire::api::message::Message::BackendKeyData {
+                process_id: 0,
+                secret_key: 0,
+            })
+            .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        // Send ReadyForQuery message to indicate the server is ready
+        client
+            .send(pgwire::api::message::Message::ReadyForQuery {
+                status: pgwire::api::message::TransactionStatus::Idle,
+            })
+            .map_err(|e| PgWireError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+
+        Ok(())
+    }
+}
+
+fn register_pg_settings_table(ctx: &SessionContext) -> datafusion::error::Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("setting", DataType::Utf8, false),
+    ]));
+
+    let names = vec![
+        "TimeZone".to_string(),
+        "client_encoding".to_string(),
+        "datestyle".to_string(),
+        "client_min_messages".to_string(),
+    ];
+    let settings = vec![
+        "UTC".to_string(),
+        "UTF8".to_string(),
+        "ISO, MDY".to_string(),
+        "notice".to_string(),
+    ];
+
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(settings)),
+        ],
+    )?;
+
+    ctx.register_batch("pg_settings", batch)?;
+    Ok(())
+}
+
+async fn register_pg_catalog_tables(ctx: &SessionContext) -> datafusion::error::Result<()> {
+    // Create pg_catalog schema if it doesn't exist
+    ctx.sql("CREATE SCHEMA IF NOT EXISTS pg_catalog").await?;
+
+    // Register pg_database table
+    let pg_database_schema = Arc::new(Schema::new(vec![
+        Field::new("oid", DataType::Int32, false),
+        Field::new("datname", DataType::Utf8, false),
+    ]));
+    let pg_database_batch = RecordBatch::try_new(
+        pg_database_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["timefusion"])),
+        ],
+    )?;
+    ctx.register_batch("pg_catalog.pg_database", pg_database_batch)?;
+
+    // Register pg_user table
+    let pg_user_schema = Arc::new(Schema::new(vec![
+        Field::new("oid", DataType::Int32, false),
+        Field::new("usename", DataType::Utf8, false),
+    ]));
+    let pg_user_batch = RecordBatch::try_new(
+        pg_user_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["timefusion_user"])),
+        ],
+    )?;
+    ctx.register_batch("pg_catalog.pg_user", pg_user_batch)?;
+
+    Ok(())
+}
+
+fn register_set_config_udf(ctx: &SessionContext) {
+    let set_config_fn: ScalarFunctionImplementation = Arc::new(
+        move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
+            let param_value_array = match &args[1] {
+                ColumnarValue::Array(array) => array
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("set_config second arg must be a StringArray"),
+                _ => panic!("set_config second arg must be an array"),
+            };
+            
+            let mut builder = StringBuilder::new();
+            for i in 0..param_value_array.len() {
+                if param_value_array.is_null(i) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(param_value_array.value(i));
+                }
+            }
+            Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        },
+    );
+
+    let set_config_udf = create_udf(
+        "set_config",
+        vec![DataType::Utf8, DataType::Utf8, DataType::Boolean],
+        DataType::Utf8,
+        Volatility::Volatile,
+        set_config_fn,
+    );
+
+    ctx.register_udf(set_config_udf);
+}
 
 #[derive(Clone)]
 struct AppInfo {
@@ -77,7 +251,9 @@ async fn register_project(
 ) -> impl Responder {
     match db
         .register_project(
-            &req.project_id,
+            &req.project
+
+_id,
             &req.bucket,
             &req.access_key,
             &req.secret_key,
@@ -262,7 +438,7 @@ async fn landing() -> impl Responder {
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug")))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("timefusion=debug,pgwire=trace,datafusion=debug")))
         .init();
 
     info!("Starting TimeFusion application");
@@ -279,8 +455,66 @@ async fn main() -> anyhow::Result<()> {
     info!("AWS handlers registered");
 
     let db = match Database::new(&storage_uri).await {
-        Ok(db) => {
+        Ok(mut db) => {
             info!("Database initialized successfully");
+            let mut options = ConfigOptions::new();
+            options.set("datafusion.sql_parser.enable_information_schema", "true");
+            let ctx = SessionContext::new_with_config(options.into());
+
+            let initial_catalogs = db.get_session_context().catalog_names();
+            info!("Initial catalogs: {:?}", initial_catalogs);
+
+            let catalog = db.get_session_context().catalog("datafusion");
+            if let Some(catalog) = catalog {
+                let schema_names = catalog.schema_names();
+                info!("Schemas in 'datafusion' catalog: {:?}", schema_names);
+                if schema_names.is_empty() {
+                    warn!("No schemas found in 'datafusion' catalog; proceeding with empty context");
+                } else {
+                    for schema_name in schema_names {
+                        if let Some(schema) = catalog.schema(&schema_name) {
+                            let table_names = schema.table_names();
+                            info!("Tables in schema '{}': {:?}", schema_name, table_names);
+                            for table_name in table_names {
+                                if let Ok(Some(table_provider)) = schema.table(&table_name).await {
+                                    ctx.register_table(&table_name, table_provider)?;
+                                    info!("Registered table: {}", table_name);
+                                } else {
+                                    warn!("Failed to load table provider for: {}", table_name);
+                                }
+                            }
+                        } else {
+                            warn!("Schema not found: {}", schema_name);
+                        }
+                    }
+                }
+            } else {
+                warn!("'datafusion' catalog not found; proceeding with empty context");
+            }
+
+            let test_schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, false),
+            ]));
+            let test_batch = RecordBatch::try_new(
+                test_schema.clone(),
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2, 3])),
+                    Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                ],
+            )?;
+            ctx.register_batch("test_table", test_batch)?;
+            info!("Registered dummy table: test_table");
+
+            // Register additional tables for PostgreSQL compatibility
+            register_pg_settings_table(&ctx)?;
+            register_set_config_udf(&ctx);
+            register_pg_catalog_tables(&ctx).await?;
+
+            let final_catalogs = ctx.catalog_names();
+            info!("Final catalogs: {:?}", final_catalogs);
+
+            db.ctx = ctx;
             Arc::new(db)
         }
         Err(e) => {
@@ -314,41 +548,47 @@ async fn main() -> anyhow::Result<()> {
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
-    let pg_service = Arc::new(DfSessionService::new(db.get_session_context()));
-    let handler_factory = HandlerFactory(pg_service.clone());
-    let pg_addr = format!("0.0.0.0:{}", env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()));
-    info!("Spawning PGWire server task on {}", pg_addr);
+    let pg_service = Arc::new(DfSessionService::new(db.get_session_context().clone()));
+    let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
+    let pg_addr = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
+    let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", pg_addr)).await?;
+    info!("PGWire server running on 0.0.0.0:{}", pg_addr);
 
     let pg_server = tokio::spawn({
-        let pg_addr = pg_addr.clone();
+        let handler_factory = handler_factory.clone();
         async move {
-            let listener = match TcpListener::bind(&pg_addr).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    error!("Failed to bind PGWire server to {}: {:?}", pg_addr, e);
-                    return;
-                }
-            };
-            info!("PGWire server running on {}", pg_addr);
-
             loop {
                 tokio::select! {
                     _ = pgwire_shutdown.cancelled() => {
                         info!("PGWire server shutting down.");
                         break;
                     }
-                    result = listener.accept() => {
+                    result = pg_listener.accept() => {
                         match result {
-                            Ok((socket, _addr)) => {
-                                let handler_factory = HandlerFactory(pg_service.clone());
+                            Ok((socket, addr)) => {
+                                info!("PGWire: Accepted connection from {}", addr);
+                                debug!("PGWire: Received connection from {}, preparing to process", addr);
+                                let handler_factory = handler_factory.clone();
                                 tokio::spawn(async move {
-                                    if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_factory).await {
-                                        error!("Error processing PGWire socket: {:?}", e);
+                                    debug!("PGWire: Starting to process socket for {}", addr);
+                                    // Use custom TrustAuthHandler for trust authentication
+                                    let auth = TrustAuthHandler::new();
+                                    match pgwire::tokio::process_socket(socket, Some(Box::new(auth)), handler_factory).await {
+                                        Ok(()) => {
+                                            info!("PGWire: Connection from {} processed successfully", addr);
+                                            debug!("PGWire: Socket processing completed for {}", addr);
+                                        }
+                                        Err(e) => {
+                                            error!("PGWire: Error processing connection from {}: {:?}", addr, e);
+                                            debug!("PGWire: Failed socket details: {:?}", e);
+                                            // Log the full error context for debugging
+                                            error!("PGWire: Full error context: {:#?}", e);
+                                        }
                                     }
                                 });
                             }
                             Err(e) => {
-                                error!("Error accepting connection: {:?}", e);
+                                error!("PGWire: Error accepting connection: {:?}", e);
                             }
                         }
                     }
@@ -383,7 +623,6 @@ async fn main() -> anyhow::Result<()> {
                         if !records.is_empty() {
                             info!("Flushing {} enqueued records", records.len());
                             for record in records {
-                                // Use "default" project_id for now; ideally, record should include project_id
                                 process_record(&db_clone, &queue_clone, &status_store_clone, "default", record).await;
                             }
                         }
