@@ -1,5 +1,4 @@
 mod database;
-mod fields;
 mod ingest;
 mod metrics;
 mod metrics_middleware;
@@ -10,7 +9,6 @@ use std::{
     collections::{HashMap, VecDeque},
     env,
     sync::Arc,
-    time::Duration as StdDuration,
 };
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, middleware::Logger, web};
@@ -19,14 +17,13 @@ use database::Database;
 use datafusion::arrow::array::Float64Array;
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
-use ingest::{get_all_data, get_data_by_id, get_status, record_batches_to_json_rows};
-use metrics::ERROR_COUNTER;
-use persistent_queue::PersistentQueue;
+use ingest::{IngestStatusStore, get_all_data, get_data_by_id, get_status, record_batches_to_json_rows};
+use metrics::{ERROR_COUNTER, INGESTION_COUNTER};
+use persistent_queue::{IngestRecord, PersistentQueue};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
     sync::Mutex as TokioMutex,
-    task::spawn_blocking,
     time::{Duration, sleep},
 };
 use tokio_util::sync::CancellationToken;
@@ -69,39 +66,42 @@ async fn dashboard(
     db: web::Data<Arc<Database>>,
     queue: web::Data<Arc<PersistentQueue>>,
     app_info: web::Data<AppInfo>,
-    status_store: web::Data<Arc<ingest::IngestStatusStore>>,
+    status_store: web::Data<Arc<IngestStatusStore>>,
     query: web::Query<HashMap<String, String>>,
 ) -> impl Responder {
     let uptime = Utc::now().signed_duration_since(app_info.start_time).num_seconds() as f64;
-    let http_requests = 0.0; // Placeholder
-    let queue_size = queue.get_ref().len().await.unwrap_or(0); // Fixed to use get_ref()
+    let http_requests = 0.0;
+    let queue_size = queue.len().await.unwrap_or(0);
     let db_status = match db.query("SELECT 1 AS test").await {
         Ok(_) => "success",
         Err(_) => "error",
     };
-    let ingestion_rate = 0.0; // Placeholder
+    let ingestion_rate = INGESTION_COUNTER.get() as f64 / 60.0;
 
     let start = query.get("start").and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
     let end = query.get("end").and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok());
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
-            "SELECT * FROM otel_logs_and_spans WHERE start_time_unix_nano >= {} AND start_time_unix_nano <= {} ORDER BY start_time_unix_nano DESC LIMIT 10",
-            start.timestamp_nanos_opt().unwrap_or(0),
-            end.timestamp_nanos_opt().unwrap_or(0)
+            "SELECT traceId, spanId, startTimeUnixNano as timestamp \
+             FROM otel_logs_and_spans WHERE startTimeUnixNano >= '{}' AND startTimeUnixNano <= '{}' ORDER BY startTimeUnixNano DESC LIMIT 10",
+            start.to_rfc3339(),
+            end.to_rfc3339()
         )
     } else {
-        "SELECT * FROM otel_logs_and_spans ORDER BY start_time_unix_nano DESC LIMIT 10".to_string()
+        "SELECT traceId, spanId, startTimeUnixNano as timestamp FROM otel_logs_and_spans ORDER BY startTimeUnixNano DESC LIMIT 10".to_string()
     };
 
-    let avg_latency = match db.query("SELECT AVG(end_time_unix_nano - start_time_unix_nano) AS avg_latency FROM otel_logs_and_spans WHERE end_time_unix_nano IS NOT NULL").await {
-        Ok(df) => df.collect().await.ok().and_then(|batches| {
-            batches.get(0).map(|b| {
-                b.column(0)
-                 .as_any()
-                 .downcast_ref::<Float64Array>()
-                 .map_or(0.0, |arr| arr.value(0) / 1_000_000.0)
+    let avg_latency = match db.query("SELECT AVG(endTimeUnixNano - startTimeUnixNano) AS avg_latency FROM otel_logs_and_spans WHERE endTimeUnixNano IS NOT NULL").await {
+        Ok(df) => df
+            .collect()
+            .await
+            .ok()
+            .and_then(|batches| {
+                batches
+                    .get(0)
+                    .map(|b| b.column(0).as_any().downcast_ref::<Float64Array>().map_or(0.0, |arr| arr.value(0) / 1_000_000.0))
             })
-        }).unwrap_or(0.0),
+            .unwrap_or(0.0),
         Err(_) => 0.0,
     };
 
@@ -138,10 +138,14 @@ async fn dashboard(
         trends.pop_front();
     }
     let trends_vec = if let (Some(start), Some(end)) = (start, end) {
-        trends.iter().filter(|t| {
-            let ts = chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap();
-            ts >= start && ts <= end
-        }).cloned().collect::<Vec<_>>()
+        trends
+            .iter()
+            .filter(|t| {
+                let ts = chrono::DateTime::parse_from_rfc3339(&t.timestamp).unwrap();
+                ts >= start && ts <= end
+            })
+            .cloned()
+            .collect::<Vec<_>>()
     } else {
         trends.iter().cloned().collect::<Vec<_>>()
     };
@@ -184,12 +188,13 @@ async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<
 
     let records_query = if let (Some(start), Some(end)) = (start, end) {
         format!(
-            "SELECT * FROM otel_logs_and_spans WHERE start_time_unix_nano >= {} AND start_time_unix_nano <= {}",
-            start.timestamp_nanos_opt().unwrap_or(0),
-            end.timestamp_nanos_opt().unwrap_or(0)
+            "SELECT traceId, spanId, startTimeUnixNano as timestamp \
+             FROM otel_logs_and_spans WHERE startTimeUnixNano >= '{}' AND startTimeUnixNano <= '{}'",
+            start.to_rfc3339(),
+            end.to_rfc3339()
         )
     } else {
-        "SELECT * FROM otel_logs_and_spans".to_string()
+        "SELECT traceId, spanId, startTimeUnixNano as timestamp FROM otel_logs_and_spans".to_string()
     };
 
     let records = match db.query(&records_query).await {
@@ -197,14 +202,13 @@ async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<
         Err(_) => vec![],
     };
 
-    let mut csv = String::from("Trace ID,Span ID,Timestamp,Name\n");
+    let mut csv = String::from("Trace ID,Span ID,Timestamp\n");
     for record in records {
         csv.push_str(&format!(
-            "{},{},{},{}\n",
+            "{},{},{}\n",
             record["traceId"].as_str().unwrap_or("N/A"),
             record["spanId"].as_str().unwrap_or("N/A"),
-            record["startTimeUnixNano"].as_i64().unwrap_or(0),
-            record["name"].as_str().unwrap_or("N/A")
+            record["timestamp"].as_str().unwrap_or("N/A")
         ));
     }
 
@@ -216,9 +220,7 @@ async fn export_records(db: web::Data<Arc<Database>>, query: web::Query<HashMap<
 
 #[get("/")]
 async fn landing() -> impl Responder {
-    HttpResponse::TemporaryRedirect()
-        .append_header(("Location", "/dashboard"))
-        .finish()
+    HttpResponse::TemporaryRedirect().append_header(("Location", "/dashboard")).finish()
 }
 
 #[tokio::main]
@@ -230,10 +232,10 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // AWS S3 Configuration
+    // Read AWS configuration from environment variables.
     let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
     let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-    let storage_uri = format!("s3://{}/otel_logs_and_spans?endpoint={}", bucket, aws_endpoint);
+    let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
     info!("Storage URI configured: {}", storage_uri);
     unsafe {
         env::set_var("AWS_ENDPOINT", &aws_endpoint);
@@ -242,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
     deltalake::aws::register_handlers(Some(aws_url));
     info!("AWS handlers registered");
 
-    // Database Initialization with S3
+    // Initialize the database with the storage URI.
     let db = match Database::new(&storage_uri).await {
         Ok(db) => {
             info!("Database initialized successfully");
@@ -254,9 +256,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "./queue_db/queue.log".to_string());
+    // Initialize persistent queue.
+    let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "/app/queue_db".to_string());
     info!("Using queue DB path: {}", queue_db_path);
-
     let queue = match PersistentQueue::new(&queue_db_path).await {
         Ok(q) => {
             info!("PersistentQueue initialized successfully");
@@ -264,11 +266,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             error!("Failed to initialize PersistentQueue: {:?}", e);
-            return Err(e);
+            return Err(e.into());
         }
     };
 
-    let status_store = Arc::new(ingest::IngestStatusStore::new());
+    let status_store = Arc::new(IngestStatusStore::new());
     let app_info = web::Data::new(AppInfo {
         start_time: Utc::now(),
         trends: Arc::new(TokioMutex::new(VecDeque::new())),
@@ -279,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
-    // DataFusion-Postgres Setup
+    // Set up datafusion-postgres PGWire server without authentication
     let pg_service = Arc::new(DfSessionService::new(db.get_session_context()));
     let handler_factory = HandlerFactory(pg_service.clone());
     let pg_addr = format!("0.0.0.0:{}", env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()));
@@ -305,16 +307,25 @@ async fn main() -> anyhow::Result<()> {
                     }
                     result = listener.accept() => {
                         match result {
-                            Ok((socket, _addr)) => {
+                            Ok((socket, addr)) => {
+                                info!("PGWire: Accepted connection from {}", addr);
                                 let handler_factory = HandlerFactory(pg_service.clone());
                                 tokio::spawn(async move {
-                                    if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_factory).await {
-                                        error!("Error processing PGWire socket: {:?}", e);
+                                    debug!("PGWire: Starting to process socket for {}", addr);
+                                    match pgwire::tokio::process_socket(socket, None, handler_factory).await {
+                                        Ok(_) => {
+                                            info!("PGWire: Connection from {} processed successfully", addr);
+                                            debug!("PGWire: Socket processing completed for {}", addr);
+                                        }
+                                        Err(e) => {
+                                            error!("PGWire: Error processing connection from {}: {:?}", addr, e);
+                                            debug!("PGWire: Failed socket details: {:?}", e);
+                                        }
                                     }
                                 });
                             }
                             Err(e) => {
-                                error!("Error accepting connection: {:?}", e);
+                                error!("PGWire: Error accepting connection: {:?}", e);
                             }
                         }
                     }
@@ -329,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("PGWire server failed to start"));
     }
 
+    // Queue flush task
     let flush_task = {
         let db_clone = db.clone();
         let queue_clone = queue.clone();
@@ -342,26 +354,14 @@ async fn main() -> anyhow::Result<()> {
                     }
                     _ = sleep(Duration::from_secs(5)) => {
                         debug!("Checking queue for records to flush");
-                        loop {
-                            let maybe_record = spawn_blocking({
-                                let queue_clone = queue_clone.clone();
-                                move || {
-                                    futures::executor::block_on(queue_clone.dequeue())
-                                }
-                            }).await;
-                            match maybe_record {
-                                Ok(Ok(Some(record))) => {
-                                    process_record(&db_clone, &status_store_clone, record).await;
-                                },
-                                Ok(Ok(None)) => break,
-                                Ok(Err(e)) => {
-                                    error!("Error in dequeue: {:?}", e);
-                                    break;
-                                }
-                                Err(e) => {
-                                    error!("Spawn blocking error: {:?}", e);
-                                    break;
-                                }
+                        let mut records = Vec::new();
+                        while let Ok(Some(record)) = queue_clone.dequeue().await {
+                            records.push(record);
+                        }
+                        if !records.is_empty() {
+                            info!("Flushing {} enqueued records", records.len());
+                            for record in records {
+                                process_record(&db_clone, &queue_clone, &status_store_clone, record).await;
                             }
                         }
                     }
@@ -370,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // HTTP server setup
     let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
     info!("Binding HTTP server to {}", http_addr);
     let server = match HttpServer::new(move || {
@@ -443,18 +444,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn process_record(db: &Arc<Database>, status_store: &Arc<ingest::IngestStatusStore>, record: persistent_queue::IngestRecord) {
-    let key = format!("{}_{}", record.traceId, record.spanId);
-    status_store.set_status(key.clone(), "Processing".to_string());
-
+async fn process_record(db: &Arc<Database>, _queue: &Arc<PersistentQueue>, status_store: &IngestStatusStore, record: IngestRecord) {
+    let id = record.traceId.clone(); // Use traceId as a simple ID
+    status_store.set_status(id.clone(), "Processing".to_string());
     match db.insert_record(&record).await {
         Ok(()) => {
-            status_store.set_status(key, "Ingested".to_string());
+            INGESTION_COUNTER.inc();
+            status_store.set_status(id.clone(), "Ingested".to_string());
         }
         Err(e) => {
             ERROR_COUNTER.inc();
             error!("Error writing record: {:?}", e);
-            status_store.set_status(key, format!("Failed: {:?}", e));
+            status_store.set_status(id, format!("Failed: {:?}", e));
         }
     }
 }

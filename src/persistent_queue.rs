@@ -1,9 +1,10 @@
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom};
+use tokio::sync::Mutex; // Use tokio's Mutex
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IngestRecord {
@@ -246,8 +247,8 @@ pub struct IngestRecord {
 #[derive(Clone)]
 pub struct PersistentQueue {
     path: PathBuf,
-    file: Arc<Mutex<File>>,
-    position: Arc<Mutex<u64>>,
+    file: Arc<Mutex<File>>,      // Using tokio::sync::Mutex
+    position: Arc<Mutex<u64>>,   // Using tokio::sync::Mutex
 }
 
 impl PersistentQueue {
@@ -272,21 +273,21 @@ impl PersistentQueue {
     }
 
     pub async fn enqueue(&self, record: IngestRecord) -> Result<()> {
-        let mut file = self.file.lock().unwrap();
+        let mut file = self.file.lock().await; // Lock async
         let serialized = serde_json::to_string(&record)?;
         let len = serialized.len() as u64;
         file.write_all(serialized.as_bytes()).await?;
         file.write_all(b"\n").await?;
         file.flush().await?;
 
-        let mut pos = self.position.lock().unwrap();
+        let mut pos = self.position.lock().await; // Lock async
         *pos += len + 1; // +1 for newline
         Ok(())
     }
 
     pub async fn dequeue(&self) -> Result<Option<IngestRecord>> {
-        let mut file = self.file.lock().unwrap();
-        let mut pos = self.position.lock().unwrap();
+        let mut file = self.file.lock().await; // Lock async
+        let mut pos = self.position.lock().await; // Lock async
 
         if *pos == 0 {
             return Ok(None);
@@ -303,7 +304,6 @@ impl PersistentQueue {
 
         let record: IngestRecord = serde_json::from_str(&line.trim_end())?;
         let consumed = bytes_read as u64;
-        drop(reader);
 
         *pos -= consumed;
         file.set_len(*pos).await?;
@@ -314,7 +314,6 @@ impl PersistentQueue {
             let mut new_reader = BufReader::new(&mut *file);
             new_reader.seek(SeekFrom::Start(consumed)).await?;
             new_reader.read_to_end(&mut remaining).await?;
-            drop(new_reader);
 
             file.seek(SeekFrom::Start(0)).await?;
             file.write_all(&remaining).await?;
