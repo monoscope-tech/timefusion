@@ -10,13 +10,12 @@ use tokio::{
 
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Clone)]
-pub struct IngestRecord {
+pub struct OtelLogsAndSpans {
     // Top-level fields
     pub project_id:         String,
-    pub timestamp:          i64,
-    pub observed_timestamp: i64,
+    pub timestamp:          chrono::DateTime<chrono::Utc>,
+    pub observed_timestamp: chrono::DateTime<chrono::Utc>,
 
-    // Logs
     pub id:             String,
     pub parent_id:      Option<String>,
     pub name:           String,
@@ -31,8 +30,8 @@ pub struct IngestRecord {
     pub body:                       Option<String>, // body as json json
 
     pub duration:   u64, // nanoseconds
-    pub start_time: i64,
-    pub end_time:   Option<i64>,
+    pub start_time: chrono::DateTime<chrono::Utc>,
+    pub end_time:   Option<chrono::DateTime<chrono::Utc>>,
 
     // Context
     pub context___trace_id:    String,
@@ -156,7 +155,7 @@ impl PersistentQueue {
         })
     }
 
-    pub async fn dequeue(&self) -> Result<Option<IngestRecord>> {
+    pub async fn dequeue(&self) -> Result<Option<OtelLogsAndSpans>> {
         let mut file = self.file.lock().await; // Lock async
         let mut pos = self.position.lock().await; // Lock async
 
@@ -173,7 +172,7 @@ impl PersistentQueue {
             return Ok(None);
         }
 
-        let record: IngestRecord = serde_json::from_str(&line.trim_end())?;
+        let record: OtelLogsAndSpans = serde_json::from_str(&line.trim_end())?;
         let consumed = bytes_read as u64;
 
         *pos -= consumed;

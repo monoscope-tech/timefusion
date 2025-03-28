@@ -7,7 +7,7 @@ use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Re
 use database::Database;
 use datafusion::{
     arrow::{
-        array::{Array, ArrayRef, Float64Array, Int32Array, StringArray, StringBuilder},
+        array::{Array, StringArray, StringBuilder},
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     },
@@ -17,7 +17,7 @@ use datafusion::{
 };
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
-use persistent_queue::{IngestRecord, PersistentQueue};
+use persistent_queue::PersistentQueue;
 use serde::Deserialize;
 use tokio::{
     net::TcpListener,
@@ -120,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(mut db) => {
             info!("Database initialized successfully");
             let mut options = ConfigOptions::new();
-            options.set("datafusion.sql_parser.enable_information_schema", "true");
+            let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
             let ctx = SessionContext::new_with_config(options.into());
 
             let initial_catalogs = db.get_session_context().catalog_names();
@@ -259,9 +259,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                         if !records.is_empty() {
                             info!("Flushing {} enqueued records", records.len());
-                            for record in records {
-                                process_record(&db_clone, &queue_clone, "default", record).await;
-                            }
+                            match db_clone.insert_records("default", &records).await {
+                                    Ok(_) => (),
+                                    Err (err) => error!("Error inserting records to delta table from flush_Task {:?}", err)
+                                }
                         }
                     }
                 }
@@ -333,13 +334,4 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Shutdown complete.");
     Ok(())
-}
-
-async fn process_record(db: &Arc<Database>, _queue: &Arc<PersistentQueue>, project_id: &str, record: IngestRecord) {
-    match db.insert_record(project_id, &record).await {
-        Ok(()) => {}
-        Err(e) => {
-            error!("Error writing record for project '{}': {:?}", project_id, e);
-        }
-    }
 }
