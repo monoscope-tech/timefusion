@@ -154,17 +154,6 @@ async fn main() -> anyhow::Result<()> {
                 warn!("'datafusion' catalog not found; proceeding with empty context");
             }
 
-            let test_schema = Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("name", DataType::Utf8, false),
-            ]));
-            let test_batch = RecordBatch::try_new(
-                test_schema.clone(),
-                vec![Arc::new(Int32Array::from(vec![1, 2, 3])), Arc::new(StringArray::from(vec!["a", "b", "c"]))],
-            )?;
-            ctx.register_batch("test_table", test_batch)?;
-            info!("Registered dummy table: test_table");
-
             register_pg_settings_table(&ctx)?;
             register_set_config_udf(&ctx);
 
@@ -271,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
                         if !records.is_empty() {
                             info!("Flushing {} enqueued records", records.len());
                             for record in records {
-                                process_record(&db_clone, &queue_clone, &status_store_clone, "default", record).await;
+                                process_record(&db_clone, &queue_clone, "default", record).await;
                             }
                         }
                     }

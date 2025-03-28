@@ -12,6 +12,7 @@ use tokio::{
 #[derive(Serialize, Deserialize, Clone)]
 pub struct IngestRecord {
     // Top-level fields
+    pub project_id:         String,
     pub timestamp:          i64,
     pub observed_timestamp: i64,
 
@@ -27,6 +28,7 @@ pub struct IngestRecord {
     pub level:                      Option<String>, // same as severity text
     pub severity___severity_text:   Option<String>,
     pub severity___severity_number: Option<String>,
+    pub body:                       Option<String>, // body as json json
 
     pub duration:   u64, // nanoseconds
     pub start_time: i64,
@@ -192,4 +194,3 @@ impl PersistentQueue {
         Ok(Some(record))
     }
 }
-

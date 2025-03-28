@@ -11,6 +11,8 @@ use datafusion::{
 };
 use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
 use tokio::sync::RwLock;
+use datafusion::prelude::DataFrame;
+
 type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
