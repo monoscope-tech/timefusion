@@ -339,26 +339,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                     result = listener.accept() => {
                         match result {
-                            Ok((socket, addr)) => {
-                                info!("PGWire: Accepted connection from {}", addr);
+                            Ok((socket, _addr)) => {
                                 let handler_factory = HandlerFactory(pg_service.clone());
                                 tokio::spawn(async move {
-                                    debug!("PGWire: Received connection from {}, preparing to process", addr);
-                                    debug!("PGWire: Starting to process socket for {}", addr);
-                                    match pgwire::tokio::process_socket(socket, None, handler_factory).await {
-                                        Ok(_) => {
-                                            info!("PGWire: Connection from {} processed successfully", addr);
-                                            debug!("PGWire: Socket processing completed for {}", addr);
-                                        }
-                                        Err(e) => {
-                                            error!("PGWire: Error processing connection from {}: {:?}", addr, e);
-                                            debug!("PGWire: Failed socket details: {:?}", e);
-                                        }
+                                    if let Err(e) = pgwire::tokio::process_socket(socket, None, handler_factory).await {
+                                        error!("Error processing PGWire socket: {:?}", e);
                                     }
                                 });
                             }
                             Err(e) => {
-                                error!("PGWire: Error accepting connection: {:?}", e);
+                                error!("Error accepting connection: {:?}", e);
                             }
                         }
                     }
