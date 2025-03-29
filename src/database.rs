@@ -23,17 +23,16 @@ pub struct Database {
 impl Database {
     pub async fn new(storage_uri: &str) -> Result<Self> {
         let session_context = SessionContext::new();
-        let mut project_configs = HashMap::new();
+        let project_configs = HashMap::new();
 
-        let default_options = StorageOptions::default();
-        let table = DeltaTableBuilder::from_uri(storage_uri).with_allow_http(true).with_storage_options(default_options.0.clone()).build()?;
-        session_context.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
-        project_configs.insert("default".to_string(), (storage_uri.to_string(), default_options, Arc::new(RwLock::new(table))));
-
-        Ok(Self {
+        let db = Self {
             session_context,
             project_configs: Arc::new(RwLock::new(project_configs)),
-        })
+        };
+
+        db.register_project("default", storage_uri, None, None, None).await?;
+
+        Ok(db)
     }
 
     pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
@@ -55,12 +54,23 @@ impl Database {
         Ok(())
     }
 
-    pub async fn register_project(&self, project_id: &str, bucket: &str, access_key: &str, secret_key: &str, endpoint: &str) -> Result<()> {
-        let conn_str = format!("s3://{}/otel_logs_and_spans", bucket);
+    pub async fn register_project(
+        &self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
+    ) -> Result<()> {
         let mut storage_options = StorageOptions::default();
-        storage_options.0.insert("AWS_ACCESS_KEY_ID".to_string(), access_key.to_string());
-        storage_options.0.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_key.to_string());
-        storage_options.0.insert("AWS_ENDPOINT".to_string(), endpoint.to_string());
+
+        if let Some(key) = access_key.filter(|k| !k.is_empty()) {
+            storage_options.0.insert("AWS_ACCESS_KEY_ID".to_string(), key.to_string());
+        }
+
+        if let Some(key) = secret_key.filter(|k| !k.is_empty()) {
+            storage_options.0.insert("AWS_SECRET_ACCESS_KEY".to_string(), key.to_string());
+        }
+
+        if let Some(ep) = endpoint.filter(|e| !e.is_empty()) {
+            storage_options.0.insert("AWS_ENDPOINT".to_string(), ep.to_string());
+        }
+
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
         let table = match DeltaTableBuilder::from_uri(&conn_str)
@@ -71,9 +81,10 @@ impl Database {
         {
             Ok(table) => table,
             Err(err) => {
-                warn!("table doesn't exist. creating new ond. err: {}", err);
+                warn!("table doesn't exist. creating new table. err: {:?}", err);
 
                 let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(TracingOptions::default())?;
+                warn!("22table doesn't exist. creating new table. err: {:?}", err);
                 let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
 
                 // Create the table with partitioning for project_id and timestamp
@@ -90,7 +101,7 @@ impl Database {
         self.session_context.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
 
         let mut configs = self.project_configs.write().await;
-        configs.insert(project_id.to_string(), (conn_str, storage_options, Arc::new(RwLock::new(table))));
+        configs.insert(project_id.to_string(), (conn_str.to_string(), storage_options, Arc::new(RwLock::new(table))));
         Ok(())
     }
 }

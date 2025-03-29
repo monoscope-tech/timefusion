@@ -81,12 +81,21 @@ struct RegisterProjectRequest {
     bucket:     String,
     access_key: String,
     secret_key: String,
-    endpoint:   String,
+    endpoint:   Option<String>,
 }
 
 #[post("/register_project")]
 async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<Arc<Database>>) -> impl Responder {
-    match db.register_project(&req.project_id, &req.bucket, &req.access_key, &req.secret_key, &req.endpoint).await {
+    match db
+        .register_project(
+            &req.project_id,
+            &req.bucket,
+            Some(&req.access_key),
+            Some(&req.secret_key),
+            req.endpoint.as_deref(),
+        )
+        .await
+    {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({
             "message": format!("Project '{}' registered successfully", req.project_id)
         })),
