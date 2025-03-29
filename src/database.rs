@@ -1,8 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
+use arrow_schema::Schema;
 use datafusion::execution::context::SessionContext;
+use delta_kernel::schema::StructField;
 use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
+use log::warn;
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 use tokio::sync::RwLock;
 
@@ -60,7 +63,29 @@ impl Database {
         storage_options.0.insert("AWS_ENDPOINT".to_string(), endpoint.to_string());
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let table = DeltaTableBuilder::from_uri(&conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).build()?;
+        let table = match DeltaTableBuilder::from_uri(&conn_str)
+            .with_storage_options(storage_options.0.clone())
+            .with_allow_http(true)
+            .load()
+            .await
+        {
+            Ok(table) => table,
+            Err(err) => {
+                warn!("table doesn't exist. creating new ond. err: {}", err);
+
+                let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(TracingOptions::default())?;
+                let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
+
+                // Create the table with partitioning for project_id and timestamp
+                let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
+                delta_ops
+                    .create()
+                    .with_columns(vec_refs)
+                    .with_partition_columns(vec!["project_id".to_string(), "timestamp".to_string()])
+                    .with_storage_options(storage_options.0.clone())
+                    .await?
+            }
+        };
 
         self.session_context.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
 
