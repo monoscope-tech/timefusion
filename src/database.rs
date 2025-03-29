@@ -33,10 +33,14 @@ impl Database {
         })
     }
 
-    pub async fn insert_records(&self, project_id: &str, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
+    pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
+        // TODO: insert records doesn't need to accept a project_id as they can be read from the
+        // record.
+        // Records should be grouped by span, and separated into groups then inserted into the
+        // correct table.
         let (_conn_str, _options, table_ref) = {
             let configs = self.project_configs.read().await;
-            configs.get(project_id).ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?.clone()
+            configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
         };
 
         let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(TracingOptions::default())?;
@@ -49,7 +53,7 @@ impl Database {
     }
 
     pub async fn register_project(&self, project_id: &str, bucket: &str, access_key: &str, secret_key: &str, endpoint: &str) -> Result<()> {
-        let conn_str = format!("s3://{}/otel_logs_and_spans_{}", bucket, project_id);
+        let conn_str = format!("s3://{}/otel_logs_and_spans", bucket);
         let mut storage_options = StorageOptions::default();
         storage_options.0.insert("AWS_ACCESS_KEY_ID".to_string(), access_key.to_string());
         storage_options.0.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_key.to_string());
@@ -58,7 +62,7 @@ impl Database {
 
         let table = DeltaTableBuilder::from_uri(&conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).build()?;
 
-        self.session_context.register_table(&format!("otel_logs_and_spans_{}", project_id), Arc::new(table.clone()))?;
+        self.session_context.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
 
         let mut configs = self.project_configs.write().await;
         configs.insert(project_id.to_string(), (conn_str, storage_options, Arc::new(RwLock::new(table))));

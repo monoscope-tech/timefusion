@@ -258,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         if !records.is_empty() {
                             info!("Flushing {} enqueued records", records.len());
-                            match db_clone.insert_records("default", &records).await {
+                            match db_clone.insert_records(&records).await {
                                     Ok(_) => (),
                                     Err (err) => error!("Error inserting records to delta table from flush_Task {:?}", err)
                                 }
