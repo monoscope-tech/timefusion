@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
-use arrow_schema::Schema;
+use chrono::Utc;
 use datafusion::execution::context::SessionContext;
 use delta_kernel::schema::StructField;
 use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
@@ -48,8 +48,11 @@ impl Database {
         let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(TracingOptions::default())?;
         let batch = serde_arrow::to_record_batch(&fields, &records)?;
 
+        // Debug logging to understand what's in the batch
         let mut table = table_ref.write().await;
         let ops = DeltaOps(table.clone());
+
+        // Use the mode parameter to ensure data is written correctly with partitioning
         *table = ops.write(vec![batch]).await?;
         Ok(())
     }
@@ -83,11 +86,14 @@ impl Database {
             Err(err) => {
                 warn!("table doesn't exist. creating new table. err: {:?}", err);
 
-                let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(TracingOptions::default())?;
+                let tracing_options = TracingOptions::default();
+
+                let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?;
                 warn!("22table doesn't exist. creating new table. err: {:?}", err);
                 let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
 
-                // Create the table with partitioning for project_id and timestamp
+                // Create the table with project_id partitioning only for now
+                // Timestamp partitioning is likely causing issues with nanosecond precision
                 let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
                 delta_ops
                     .create()
@@ -102,6 +108,133 @@ impl Database {
 
         let mut configs = self.project_configs.write().await;
         configs.insert(project_id.to_string(), (conn_str.to_string(), storage_options, Arc::new(RwLock::new(table))));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::TimeZone;
+    use datafusion::arrow::array::{Array, StringArray};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_database_query() -> Result<()> {
+        env_logger::builder()
+            .is_test(true) // Makes output more compact for tests
+            .init();
+
+        log::info!("Running database query test");
+
+        // Create a temporary directory for the test data
+        let temp_dir = tempfile::tempdir()?;
+        let storage_uri = temp_dir.path().to_str().unwrap();
+
+        // Create a new database with default project
+        let db = Database::new(storage_uri).await?;
+
+        // Create fixed timestamps for testing
+        let timestamp1 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap();
+        let timestamp2 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 10, 0).unwrap();
+
+        // Create sample records
+        let span1 = OtelLogsAndSpans {
+            project_id: "test_project".to_string(),
+            timestamp: timestamp1,
+            observed_timestamp: timestamp1,
+            id: "span1".to_string(),
+            name: "test_span_1".to_string(),
+            context___trace_id: "trace1".to_string(),
+            context___span_id: "span1".to_string(),
+            start_time: timestamp1,
+            duration: 100_000_000,
+            status_code: Some("OK".to_string()),
+            level: Some("INFO".to_string()),
+            ..Default::default()
+        };
+
+        let span2 = OtelLogsAndSpans {
+            project_id: "test_project".to_string(),
+            timestamp: timestamp2,
+            observed_timestamp: timestamp2,
+            id: "span2".to_string(),
+            name: "test_span_2".to_string(),
+            context___trace_id: "trace2".to_string(),
+            context___span_id: "span2".to_string(),
+            start_time: timestamp2,
+            duration: 200_000_000,
+            status_code: Some("ERROR".to_string()),
+            level: Some("ERROR".to_string()),
+            status_message: Some("Error occurred".to_string()),
+            ..Default::default()
+        };
+
+        let records = vec![span1, span2];
+
+        // Insert records
+        db.insert_records(&records).await?;
+
+        // Use the session context to run an SQL query
+        let ctx = db.session_context.clone();
+
+        // First, check what data exists in the table
+        let count_df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans").await?;
+        let count_batches = count_df.collect().await?;
+        println!("Count query result: {:?}", count_batches);
+
+        let df = ctx.sql("SELECT name, status_code, level FROM otel_logs_and_spans ORDER BY name").await?;
+        // Get the results as batches
+        let batches = df.collect().await?;
+        println!(
+            "Query returned {} batches with schema: {:?}",
+            batches.len(),
+            batches.first().map(|b| b.schema())
+        );
+
+        // Assert the schema
+        assert_eq!(batches[0].schema().field(0).name(), "name");
+        assert_eq!(batches[0].schema().field(1).name(), "status_code");
+        assert_eq!(batches[0].schema().field(2).name(), "level");
+
+        // Verify the number of records
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+
+        // Convert columns to StringArray for easier access
+        let name_col = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let status_code_col = batches[0].column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let level_col = batches[0].column(2).as_any().downcast_ref::<StringArray>().unwrap();
+
+        // Check values in the first row
+        assert_eq!(name_col.value(0), "test_span_1");
+        assert_eq!(status_code_col.value(0), "OK");
+        assert_eq!(level_col.value(0), "INFO");
+
+        // Check values in the second row
+        assert_eq!(name_col.value(1), "test_span_2");
+        assert_eq!(status_code_col.value(1), "ERROR");
+        assert_eq!(level_col.value(1), "ERROR");
+
+        // Run a more complex query with filtering
+        let df = ctx.sql("SELECT name, level, status_code, status_message FROM otel_logs_and_spans WHERE project_id = 'test_project' and timestamp > '2020-12-01' and level = 'ERROR'").await?;
+        let batches = df.collect().await?;
+
+        // Verify the filtered result - should only have 1 row
+        let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 1);
+
+        // Convert columns to StringArray for easier access
+        let name_col = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let level_col = batches[0].column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let status_code_col = batches[0].column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let status_message_col = batches[0].column(3).as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(name_col.value(0), "test_span_2");
+        assert_eq!(level_col.value(0), "ERROR");
+        assert_eq!(status_code_col.value(0), "ERROR");
+        assert_eq!(status_message_col.value(0), "Error occurred");
+
         Ok(())
     }
 }

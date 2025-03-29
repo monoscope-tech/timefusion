@@ -9,11 +9,14 @@ use tokio::{
 };
 
 #[allow(non_snake_case)]
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct OtelLogsAndSpans {
     // Top-level fields
-    pub project_id:         String,
+    pub project_id: String,
+
+    #[serde(with = "chrono::serde::ts_nanoseconds")]
     pub timestamp:          chrono::DateTime<chrono::Utc>,
+    #[serde(with = "chrono::serde::ts_nanoseconds")]
     pub observed_timestamp: chrono::DateTime<chrono::Utc>,
 
     pub id:             String,
@@ -29,8 +32,11 @@ pub struct OtelLogsAndSpans {
     pub severity___severity_number: Option<String>,
     pub body:                       Option<String>, // body as json json
 
-    pub duration:   u64, // nanoseconds
+    pub duration: u64, // nanoseconds
+
+    #[serde(with = "chrono::serde::ts_nanoseconds")]
     pub start_time: chrono::DateTime<chrono::Utc>,
+    #[serde(with = "chrono::serde::ts_nanoseconds_option")]
     pub end_time:   Option<chrono::DateTime<chrono::Utc>>,
 
     // Context
