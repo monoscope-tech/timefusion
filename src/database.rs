@@ -1,12 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, env, sync::Arc};
 use anyhow::Result;
 use chrono::Utc;
 use datafusion::execution::context::SessionContext;
 use delta_kernel::schema::StructField;
 use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
-use log::warn;
+use log::{info, warn};
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 use tokio::sync::RwLock;
+use url::Url;
 
 use crate::persistent_queue::OtelLogsAndSpans;
 
@@ -19,27 +20,48 @@ pub struct Database {
 }
 
 impl Database {
-    pub async fn new(storage_uri: &str) -> Result<Self> {
+    /// Create a new Database using environment variables for storage configuration.
+    pub async fn new() -> Result<Self> {
+        let bucket = env::var("AWS_S3_BUCKET")
+            .expect("AWS_S3_BUCKET environment variable not set");
+        let aws_endpoint = env::var("AWS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
+        let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
+        info!("Storage URI configured: {}", storage_uri);
+        // Set AWS endpoint for Delta Lake.
+        unsafe { env::set_var("AWS_ENDPOINT", &aws_endpoint); }
+        let aws_url = Url::parse(&aws_endpoint)
+            .expect("AWS endpoint must be a valid URL");
+        deltalake::aws::register_handlers(Some(aws_url));
+        info!("AWS handlers registered");
+
         let session_context = SessionContext::new();
         let project_configs = Arc::new(RwLock::new(HashMap::new()));
         let db = Self { session_context, project_configs };
         // Register a default project.
-        db.register_project("default", storage_uri, None, None, None).await?;
+        db.register_project("default", &storage_uri, None, None, None).await?;
         Ok(db)
     }
 
     /// Inserts records into the appropriate Delta tables.
+    ///
     /// Records are grouped first by project, then by span (using record.id as the span identifier)
     /// before insertion.
     pub async fn insert_records(&self, records: &Vec<OtelLogsAndSpans>) -> Result<()> {
         let mut groups: HashMap<String, HashMap<String, Vec<OtelLogsAndSpans>>> = HashMap::new();
         for record in records {
-            groups.entry(record.project_id.clone()).or_default().entry(record.id.clone()).or_default().push(record.clone());
+            groups.entry(record.project_id.clone())
+                  .or_default()
+                  .entry(record.id.clone())
+                  .or_default()
+                  .push(record.clone());
         }
         for (project_id, span_groups) in groups {
             let (_conn_str, _options, table_ref) = {
                 let configs = self.project_configs.read().await;
-                configs.get(&project_id).ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?.clone()
+                configs.get(&project_id)
+                       .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?
+                       .clone()
             };
             let mut table = table_ref.write().await;
             for (_span_id, span_records) in span_groups {
@@ -54,10 +76,15 @@ impl Database {
         Ok(())
     }
 
-    /// Registers a project by creating (or loading) its Delta table and registering it in the session context
-    /// under a unique name based on the project ID.
+    /// Registers a project by creating (or loading) its Delta table and registering it in the
+    /// session context under a unique name based on the project ID.
     pub async fn register_project(
-        &self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
+        &self,
+        project_id: &str,
+        conn_str: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        endpoint: Option<&str>,
     ) -> Result<()> {
         let mut storage_options = StorageOptions::default();
         if let Some(key) = access_key.filter(|k| !k.is_empty()) {
@@ -71,16 +98,27 @@ impl Database {
         }
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let table = match DeltaTableBuilder::from_uri(&conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
+        let table = match DeltaTableBuilder::from_uri(&conn_str)
+            .with_storage_options(storage_options.0.clone())
+            .with_allow_http(true)
+            .load()
+            .await {
                 Ok(table) => table,
                 Err(err) => {
                     warn!("Table doesn't exist. Creating new table. Err: {:?}", err);
                     let tracing_options = TracingOptions::default();
                     let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?;
                     warn!("Creating new table for project '{}'. Original error: {:?}", project_id, err);
-                    let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
+                    let vec_refs: Vec<StructField> = fields
+                        .iter()
+                        .map(|arc_field| arc_field.as_ref().try_into().unwrap())
+                        .collect();
                     let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
-                    delta_ops.create().with_columns(vec_refs).with_partition_columns(vec!["project_id".to_string(), "timestamp".to_string()]).with_storage_options(storage_options.0.clone()).await?
+                    delta_ops.create()
+                        .with_columns(vec_refs)
+                        .with_partition_columns(vec!["project_id".to_string(), "timestamp".to_string()])
+                        .with_storage_options(storage_options.0.clone())
+                        .await?
                 }
             };
 
@@ -94,13 +132,13 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Timelike};
+    use chrono::{TimeZone, Timelike, Utc};
     use datafusion::arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
     use datafusion::prelude::SessionContext;
     use tempfile::tempdir;
     use super::*;
 
-    // Helper: Refresh the session context with the latest tables.
+    // Refresh the session context with the latest tables.
     async fn refresh_session_context(db: &Database) -> Result<SessionContext> {
         let new_ctx = SessionContext::new();
         let configs = db.project_configs.read().await;
@@ -116,7 +154,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let temp_dir = tempdir()?;
         let storage_uri = temp_dir.path().to_str().unwrap();
-        let db = Database::new(storage_uri).await?;
+        let db = Database::new().await?;
         db.register_project("test_project", storage_uri, None, None, None).await?;
 
         let ts1 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap();
@@ -156,13 +194,18 @@ mod tests {
 
         let count_df = new_ctx.sql(&format!("SELECT COUNT(*) FROM {}", table_name)).await?;
         let count_batches = count_df.collect().await?;
-        let count_array = count_batches[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let count_array = count_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert!(count_array.value(0) > 0, "Expected at least one row inserted");
 
         let df = new_ctx.sql(&format!("SELECT name, status_code, level FROM {} ORDER BY name", table_name)).await?;
         let batches = df.collect().await?;
         let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(total_rows, 2);
+
         let name_col = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let status_code_col = batches[0].column(1).as_any().downcast_ref::<StringArray>().unwrap();
         let level_col = batches[0].column(2).as_any().downcast_ref::<StringArray>().unwrap();
@@ -197,10 +240,9 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let temp_dir = tempdir()?;
         let storage_uri = temp_dir.path().to_str().unwrap();
-        let db = Database::new(storage_uri).await?;
+        let db = Database::new().await?;
         db.register_project("ns_project", storage_uri, None, None, None).await?;
 
-        // Create a timestamp with non-zero nanosecond precision.
         let base = Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap();
         let ts = base.with_nanosecond(123456789).unwrap();
 
@@ -223,7 +265,6 @@ mod tests {
         let new_ctx = refresh_session_context(&db).await?;
         let table_name = "otel_logs_and_spans_ns_project";
 
-        // Query the timestamp column and check its raw integer value.
         let df = new_ctx.sql(&format!("SELECT timestamp FROM {}", table_name)).await?;
         let batches = df.collect().await?;
         assert!(!batches.is_empty(), "No batches returned for nanosecond test");
@@ -245,7 +286,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let temp_dir = tempdir()?;
         let storage_uri = temp_dir.path().to_str().unwrap();
-        let db = Database::new(storage_uri).await?;
+        let db = Database::new().await?;
         db.register_project("group_project", storage_uri, None, None, None).await?;
 
         let timestamp = Utc.with_ymd_and_hms(2023, 1, 1, 12, 0, 0).unwrap();

@@ -1,8 +1,6 @@
 // main.rs
 mod database;
 mod persistent_queue;
-use std::{env, sync::Arc};
-
 use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
 use database::Database;
 use datafusion::{
@@ -17,8 +15,10 @@ use datafusion::{
 };
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
-use persistent_queue::PersistentQueue;
+use futures::TryFutureExt;
+use persistent_queue::OtelLogsAndSpans;
 use serde::Deserialize;
+use std::{env, sync::Arc};
 use tokio::{
     net::TcpListener,
     time::{sleep, Duration},
@@ -26,7 +26,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
-use url::Url;
 
 fn register_pg_settings_table(ctx: &SessionContext) -> datafusion::error::Result<()> {
     let schema = Arc::new(Schema::new(vec![
@@ -78,10 +77,10 @@ struct AppInfo {}
 #[derive(Deserialize)]
 struct RegisterProjectRequest {
     project_id: String,
-    bucket:     String,
+    bucket: String,
     access_key: String,
     secret_key: String,
-    endpoint:   Option<String>,
+    endpoint: Option<String>,
 }
 
 #[post("/register_project")]
@@ -114,87 +113,57 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
-    let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-    let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
-    info!("Storage URI configured: {}", storage_uri);
-    unsafe {
-        env::set_var("AWS_ENDPOINT", &aws_endpoint);
-    }
-    let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
-    deltalake::aws::register_handlers(Some(aws_url));
-    info!("AWS handlers registered");
+    let mut db = Database::new().await?;
+    info!("Database initialized successfully");
+    let mut options = ConfigOptions::new();
+    let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
+    let session_context = SessionContext::new_with_config(options.into());
 
-    let db = match Database::new(&storage_uri).await {
-        Ok(mut db) => {
-            info!("Database initialized successfully");
-            let mut options = ConfigOptions::new();
-            let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
-            let session_context = SessionContext::new_with_config(options.into());
+    let initial_catalogs = db.session_context.catalog_names();
+    info!("Initial catalogs: {:?}", initial_catalogs);
 
-            let initial_catalogs = db.session_context.catalog_names();
-            info!("Initial catalogs: {:?}", initial_catalogs);
-
-            let catalog = db.session_context.catalog("datafusion");
-            if let Some(catalog) = catalog {
-                let schema_names = catalog.schema_names();
-                info!("Schemas in 'datafusion' catalog: {:?}", schema_names);
-                if schema_names.is_empty() {
-                    warn!("No schemas found in 'datafusion' catalog; proceeding with empty context");
-                } else {
-                    for schema_name in schema_names {
-                        if let Some(schema) = catalog.schema(&schema_name) {
-                            let table_names = schema.table_names();
-                            info!("Tables in schema '{}': {:?}", schema_name, table_names);
-                            for table_name in table_names {
-                                if let Ok(Some(table_provider)) = schema.table(&table_name).await {
-                                    session_context.register_table(&table_name, table_provider)?;
-                                    info!("Registered table: {}", table_name);
-                                } else {
-                                    warn!("Failed to load table provider for: {}", table_name);
-                                }
-                            }
+    let catalog = db.session_context.catalog("datafusion");
+    if let Some(catalog) = catalog {
+        let schema_names = catalog.schema_names();
+        info!("Schemas in 'datafusion' catalog: {:?}", schema_names);
+        if schema_names.is_empty() {
+            warn!("No schemas found in 'datafusion' catalog; proceeding with empty context");
+        } else {
+            for schema_name in schema_names {
+                if let Some(schema) = catalog.schema(&schema_name) {
+                    let table_names = schema.table_names();
+                    info!("Tables in schema '{}': {:?}", schema_name, table_names);
+                    for table_name in table_names {
+                        if let Ok(Some(table_provider)) = schema.table(&table_name).await {
+                            session_context.register_table(&table_name, table_provider)?;
+                            info!("Registered table: {}", table_name);
                         } else {
-                            warn!("Schema not found: {}", schema_name);
+                            warn!("Failed to load table provider for: {}", table_name);
                         }
                     }
+                } else {
+                    warn!("Schema not found: {}", schema_name);
                 }
-            } else {
-                warn!("'datafusion' catalog not found; proceeding with empty context");
             }
-
-            register_pg_settings_table(&session_context)?;
-            register_set_config_udf(&session_context);
-
-            info!("Final catalogs: {:?}", session_context.catalog_names());
-
-            db.session_context = session_context;
-            Arc::new(db)
         }
-        Err(e) => {
-            error!("Failed to initialize Database: {:?}", e);
-            return Err(e);
-        }
-    };
+    } else {
+        warn!("'datafusion' catalog not found; proceeding with empty context");
+    }
 
-    let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "/app/queue_db".to_string());
-    let queue_file_path = format!("{}/queue.db", queue_db_path);
-    info!("Using queue DB path: {}", queue_file_path);
-    let queue = match PersistentQueue::new(&queue_file_path).await {
-        Ok(q) => {
-            info!("PersistentQueue initialized successfully");
-            Arc::new(q)
-        }
-        Err(e) => {
-            error!("Failed to initialize PersistentQueue: {:?}", e);
-            return Err(e.into());
-        }
-    };
+    register_pg_settings_table(&session_context)?;
+    register_set_config_udf(&session_context);
+
+    info!("Final catalogs: {:?}", session_context.catalog_names());
+
+    db.session_context = session_context;
+    let db = Arc::new(db);
+
+    // Queue logic removed - writing directly to Delta Lake
 
     let app_info = web::Data::new(AppInfo {});
 
     let shutdown_token = CancellationToken::new();
-    let queue_shutdown = shutdown_token.clone();
+    // Queue shutdown token removed
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
@@ -216,19 +185,15 @@ async fn main() -> anyhow::Result<()> {
                     result = pg_listener.accept() => {
                         match result {
                             Ok((socket, addr)) => {
-                                info!("PGWire: Accepted connection from {}", addr);
                                 debug!("PGWire: Received connection from {}, preparing to process", addr);
                                 let handler_factory = handler_factory.clone();
                                 tokio::spawn(async move {
-                                    debug!("PGWire: Starting to process socket for {}", addr);
                                     match pgwire::tokio::process_socket(socket, None, handler_factory).await {
                                         Ok(()) => {
                                             info!("PGWire: Connection from {} processed successfully", addr);
-                                            debug!("PGWire: Socket processing completed for {}", addr);
                                         }
                                         Err(e) => {
                                             error!("PGWire: Error processing connection from {}: {:?}", addr, e);
-                                            debug!("PGWire: Failed socket details: {:?}", e);
                                         }
                                     }
                                 });
@@ -249,34 +214,7 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("PGWire server failed to start"));
     }
 
-    let flush_task = {
-        let db_clone = db.clone();
-        let queue_clone = queue.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = queue_shutdown.cancelled() => {
-                        info!("Queue flush task shutting down.");
-                        break;
-                    }
-                    _ = sleep(Duration::from_secs(5)) => {
-                        debug!("Checking queue for records to flush");
-                        let mut records = Vec::new();
-                        while let Ok(Some(record)) = queue_clone.dequeue().await {
-                            records.push(record);
-                        }
-                        if !records.is_empty() {
-                            info!("Flushing {} enqueued records", records.len());
-                            match db_clone.insert_records(&records).await {
-                                    Ok(_) => (),
-                                    Err (err) => error!("Error inserting records to delta table from flush_Task {:?}", err)
-                                }
-                        }
-                    }
-                }
-            }
-        })
-    };
+    // Removed queue flush task - now writing directly to Delta Lake
 
     let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
     info!("Binding HTTP server to {}", http_addr);
@@ -284,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(db.clone()))
-            .app_data(web::Data::new(queue.clone()))
+            // Queue removed, now writing directly to Delta Lake
             .app_data(app_info.clone())
             .service(register_project)
     })
@@ -299,39 +237,22 @@ async fn main() -> anyhow::Result<()> {
     .run();
 
     let http_server_handle = server.handle();
+
     let http_task = tokio::spawn(async move {
         tokio::select! {
-            _ = http_shutdown.cancelled() => {
-                info!("HTTP server shutting down.");
-            }
-            result = server => {
-                if let Err(e) = result {
-                    error!("HTTP server failed: {:?}", e);
-                } else {
-                    info!("HTTP server shut down gracefully");
-                }
-            }
+            _ = http_shutdown.cancelled() => info!("HTTP server shutting down."),
+            res = server => res.map_or_else(
+                |e| error!("HTTP server failed: {:?}", e),
+                |_| info!("HTTP server shut down gracefully")
+            ),
         }
     });
-
     info!("HTTP server running on http://{}", http_addr);
 
     tokio::select! {
-        res = pg_server => {
-            if let Err(e) = res {
-                error!("PGWire server task failed: {:?}", e);
-            }
-        },
-        res = http_task => {
-            if let Err(e) = res {
-                error!("HTTP server task failed: {:?}", e);
-            }
-        },
-        res = flush_task => {
-            if let Err(e) = res {
-                error!("Queue flush task failed: {:?}", e);
-            }
-        },
+        _ = pg_server.map_err(|e| error!("PGWire server task failed: {:?}", e)) => {},
+        _ = http_task.map_err(|e| error!("HTTP server task failed: {:?}", e)) => {},
+        // Queue flush task removed
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, initiating shutdown.");
             shutdown_token.cancel();
