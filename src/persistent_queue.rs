@@ -30,7 +30,7 @@ pub struct OtelLogsAndSpans {
     pub level:                      Option<String>, // same as severity text
     pub severity___severity_text:   Option<String>,
     pub severity___severity_number: Option<String>,
-    pub body:                       Option<String>, // body as json json
+    pub body:                       Option<String>, // body as json
 
     pub duration: u64, // nanoseconds
 
@@ -159,6 +159,22 @@ impl PersistentQueue {
             file: Arc::new(Mutex::new(file)),
             position: Arc::new(Mutex::new(0)),
         })
+    }
+
+    /// Enqueue a new record into the persistent queue.
+    pub async fn enqueue(&self, record: &OtelLogsAndSpans) -> Result<()> {
+        let mut file = self.file.lock().await;
+        let mut pos = self.position.lock().await;
+        // Serialize the record as a JSON string.
+        let serialized = serde_json::to_string(record)?;
+        // Append a newline so that each record occupies its own line.
+        let serialized_line = format!("{}\n", serialized);
+        // Seek to the end of the file before writing.
+        file.seek(SeekFrom::End(0)).await?;
+        file.write_all(serialized_line.as_bytes()).await?;
+        file.flush().await?;
+        *pos += serialized_line.len() as u64;
+        Ok(())
     }
 
     pub async fn dequeue(&self) -> Result<Option<OtelLogsAndSpans>> {
