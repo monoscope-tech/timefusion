@@ -16,7 +16,7 @@ use datafusion::{
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
 use futures::TryFutureExt;
-use persistent_queue::PersistentQueue;
+use persistent_queue::OtelLogsAndSpans;
 use serde::Deserialize;
 use std::{env, sync::Arc};
 use tokio::{
@@ -158,16 +158,12 @@ async fn main() -> anyhow::Result<()> {
     db.session_context = session_context;
     let db = Arc::new(db);
 
-    let queue_db_path = env::var("QUEUE_DB_PATH").unwrap_or_else(|_| "/app/queue_db".to_string());
-    let queue_file_path = format!("{}/queue.db", queue_db_path);
-    info!("Using queue DB path: {}", queue_file_path);
-    let queue = PersistentQueue::new(&queue_file_path).await?;
-    let queue = Arc::new(queue);
+    // Queue logic removed - writing directly to Delta Lake
 
     let app_info = web::Data::new(AppInfo {});
 
     let shutdown_token = CancellationToken::new();
-    let queue_shutdown = shutdown_token.clone();
+    // Queue shutdown token removed
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
@@ -218,31 +214,7 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("PGWire server failed to start"));
     }
 
-    let flush_task = {
-        let (db, queue) = (db.clone(), queue.clone());
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = queue_shutdown.cancelled() => {
-                        info!("Queue flush task shutting down.");
-                        break;
-                    },
-                    _ = sleep(Duration::from_secs(5)) => {
-                        debug!("Checking queue for records to flush");
-                        let mut records = vec![];
-                        while let Ok(Some(r)) = queue.dequeue().await {
-                            records.push(r);
-                        }
-                        if records.is_empty() { continue; }
-                        info!("Flushing {} enqueued records", records.len());
-                        if let Err(e) = db.insert_records(&records).await {
-                            error!("Error inserting records: {:?}", e);
-                        }
-                    }
-                }
-            }
-        })
-    };
+    // Removed queue flush task - now writing directly to Delta Lake
 
     let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
     info!("Binding HTTP server to {}", http_addr);
@@ -250,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(db.clone()))
-            .app_data(web::Data::new(queue.clone()))
+            // Queue removed, now writing directly to Delta Lake
             .app_data(app_info.clone())
             .service(register_project)
     })
@@ -280,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         _ = pg_server.map_err(|e| error!("PGWire server task failed: {:?}", e)) => {},
         _ = http_task.map_err(|e| error!("HTTP server task failed: {:?}", e)) => {},
-        _ = flush_task.map_err(|e| error!("Queue flush task failed: {:?}", e)) => {},
+        // Queue flush task removed
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, initiating shutdown.");
             shutdown_token.cancel();
