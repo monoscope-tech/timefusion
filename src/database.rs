@@ -50,22 +50,17 @@ impl Database {
     pub async fn insert_records(&self, records: &Vec<OtelLogsAndSpans>) -> Result<()> {
         let mut groups: HashMap<String, HashMap<String, Vec<OtelLogsAndSpans>>> = HashMap::new();
         for record in records {
-            groups.entry(record.project_id.clone())
-                  .or_default()
-                  .entry(record.id.clone())
-                  .or_default()
-                  .push(record.clone());
+            groups.entry(record.project_id.clone()).or_default().entry(record.id.clone()).or_default().push(record.clone());
         }
         for (project_id, span_groups) in groups {
             let (_conn_str, _options, table_ref) = {
                 let configs = self.project_configs.read().await;
-                configs.get(&project_id)
-                    .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?
-                    .clone()
+                configs.get(&project_id).ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?.clone()
             };
             let mut table = table_ref.write().await;
             for (_span_id, span_records) in span_groups {
-                use datafusion::arrow::array::Array; // For .len() and .is_null()
+                // Bring Arrow's Array trait into scope.
+                use datafusion::arrow::array::Array;
                 let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(
                     TracingOptions::default(),
                 )?;
@@ -79,13 +74,7 @@ impl Database {
 
     /// Registers a project by creating (or loading) its Delta table and registering it in the
     /// session context under a unique name based on the project ID.
-    pub async fn register_project(
-        &self,
-        project_id: &str,
-        conn_str: &str,
-        access_key: Option<&str>,
-        secret_key: Option<&str>,
-        endpoint: Option<&str>,
+    pub async fn register_project(&self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
     ) -> Result<()> {
         let mut storage_options = StorageOptions::default();
         if let Some(key) = access_key.filter(|k| !k.is_empty()) {
@@ -99,27 +88,16 @@ impl Database {
         }
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let table = match DeltaTableBuilder::from_uri(&conn_str)
-            .with_storage_options(storage_options.0.clone())
-            .with_allow_http(true)
-            .load()
-            .await {
+        let table = match DeltaTableBuilder::from_uri(&conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
                 Ok(table) => table,
                 Err(err) => {
                     warn!("Table doesn't exist. Creating new table. Err: {:?}", err);
                     let tracing_options = TracingOptions::default();
                     let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?;
                     warn!("Creating new table for project '{}'. Original error: {:?}", project_id, err);
-                    let vec_refs: Vec<StructField> = fields
-                        .iter()
-                        .map(|arc_field| arc_field.as_ref().try_into().unwrap())
-                        .collect();
+                    let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
                     let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
-                    delta_ops.create()
-                        .with_columns(vec_refs)
-                        .with_partition_columns(vec!["project_id".to_string(), "timestamp".to_string()])
-                        .with_storage_options(storage_options.0.clone())
-                        .await?
+                    delta_ops.create().with_columns(vec_refs).with_partition_columns(vec!["project_id".to_string(), "timestamp".to_string()]).with_storage_options(storage_options.0.clone()).await?
                 }
             };
 
@@ -142,7 +120,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use super::*;
-    // Import persistent_queue so we can refer to OtelLogsAndSpans.
     use crate::persistent_queue;
 
     // Helper: Refresh the session context with the latest registered tables.
@@ -201,11 +178,7 @@ mod tests {
 
         let count_df = new_ctx.sql(&format!("SELECT COUNT(*) FROM {}", table_name)).await?;
         let count_batches = count_df.collect().await?;
-        let count_array = count_batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
+        let count_array = count_batches[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         assert!(count_array.value(0) > 0, "Expected at least one row inserted");
 
         let df = new_ctx.sql(&format!("SELECT name, status_code, level FROM {} ORDER BY name", table_name)).await?;
@@ -334,18 +307,23 @@ mod tests {
         assert_eq!(total_rows, 2, "Grouping by span failed: expected 2 rows");
         Ok(())
     }
-
-    /// Concurrency test: Register two projects and run queries concurrently.
+    /// Concurrency test: Register two projects using actual AWS buckets and run queries concurrently.
     #[tokio::test]
     async fn test_concurrent_queries() -> anyhow::Result<()> {
+        use std::env;
         use datafusion::prelude::SessionContext;
         let _ = env_logger::builder().is_test(true).try_init();
 
-        // Instead of using fixed S3 URIs, we use temporary directories to simulate distinct storage.
-        let temp_dir1 = tempdir()?;
-        let temp_dir2 = tempdir()?;
-        let storage_uri1 = format!("file://{}", temp_dir1.path().to_str().unwrap());
-        let storage_uri2 = format!("file://{}", temp_dir2.path().to_str().unwrap());
+        // Use actual AWS buckets from environment variables.
+        let bucket1 = env::var("AWS_S3_BUCKET1")
+            .expect("AWS_S3_BUCKET1 environment variable not set");
+        let bucket2 = env::var("AWS_S3_BUCKET2")
+            .expect("AWS_S3_BUCKET2 environment variable not set");
+        let endpoint = env::var("AWS_S3_ENDPOINT")
+            .unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
+
+        let storage_uri1 = format!("s3://{}?endpoint={}", bucket1, endpoint);
+        let storage_uri2 = format!("s3://{}?endpoint={}", bucket2, endpoint);
 
         let db = Database::new().await?;
         db.register_project("project1", &storage_uri1, None, None, None).await?;
