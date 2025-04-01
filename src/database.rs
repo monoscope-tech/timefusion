@@ -16,7 +16,7 @@ pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 
 pub struct Database {
     pub session_context: SessionContext,
-    project_configs:     ProjectConfigs,
+    pub(crate) project_configs: ProjectConfigs,
 }
 
 impl Database {
@@ -60,11 +60,12 @@ impl Database {
             let (_conn_str, _options, table_ref) = {
                 let configs = self.project_configs.read().await;
                 configs.get(&project_id)
-                       .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?
-                       .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", project_id))?
+                    .clone()
             };
             let mut table = table_ref.write().await;
             for (_span_id, span_records) in span_groups {
+                use datafusion::arrow::array::Array; // For .len() and .is_null()
                 let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(
                     TracingOptions::default(),
                 )?;
@@ -125,7 +126,10 @@ impl Database {
         let table_name = format!("otel_logs_and_spans_{}", project_id);
         self.session_context.register_table(&table_name, Arc::new(table.clone()))?;
         let mut configs = self.project_configs.write().await;
-        configs.insert(project_id.to_string(), (conn_str.to_string(), storage_options, Arc::new(RwLock::new(table))));
+        configs.insert(
+            project_id.to_string(),
+            (conn_str.to_string(), storage_options, Arc::new(RwLock::new(table))),
+        );
         Ok(())
     }
 }
@@ -135,10 +139,13 @@ mod tests {
     use chrono::{TimeZone, Timelike, Utc};
     use datafusion::arrow::array::{Int64Array, StringArray, TimestampNanosecondArray};
     use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
     use tempfile::tempdir;
     use super::*;
+    // Import persistent_queue so we can refer to OtelLogsAndSpans.
+    use crate::persistent_queue;
 
-    // Refresh the session context with the latest tables.
+    // Helper: Refresh the session context with the latest registered tables.
     async fn refresh_session_context(db: &Database) -> Result<SessionContext> {
         let new_ctx = SessionContext::new();
         let configs = db.project_configs.read().await;
@@ -159,7 +166,7 @@ mod tests {
 
         let ts1 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 10, 0).unwrap();
-        let span1 = OtelLogsAndSpans {
+        let span1 = persistent_queue::OtelLogsAndSpans {
             project_id: "test_project".to_string(),
             timestamp: ts1,
             observed_timestamp: ts1,
@@ -173,7 +180,7 @@ mod tests {
             level: Some("INFO".to_string()),
             ..Default::default()
         };
-        let span2 = OtelLogsAndSpans {
+        let span2 = persistent_queue::OtelLogsAndSpans {
             project_id: "test_project".to_string(),
             timestamp: ts2,
             observed_timestamp: ts2,
@@ -325,6 +332,95 @@ mod tests {
         let batches = df.collect().await?;
         let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
         assert_eq!(total_rows, 2, "Grouping by span failed: expected 2 rows");
+        Ok(())
+    }
+
+    /// Concurrency test: Register two projects and run queries concurrently.
+    #[tokio::test]
+    async fn test_concurrent_queries() -> anyhow::Result<()> {
+        use datafusion::prelude::SessionContext;
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // Instead of using fixed S3 URIs, we use temporary directories to simulate distinct storage.
+        let temp_dir1 = tempdir()?;
+        let temp_dir2 = tempdir()?;
+        let storage_uri1 = format!("file://{}", temp_dir1.path().to_str().unwrap());
+        let storage_uri2 = format!("file://{}", temp_dir2.path().to_str().unwrap());
+
+        let db = Database::new().await?;
+        db.register_project("project1", &storage_uri1, None, None, None).await?;
+        db.register_project("project2", &storage_uri2, None, None, None).await?;
+
+        let now = Utc::now();
+        let record1 = persistent_queue::OtelLogsAndSpans {
+            project_id: "project1".to_string(),
+            timestamp: now,
+            observed_timestamp: now,
+            id: "span1".to_string(),
+            name: "record1_project1".to_string(),
+            context___trace_id: "trace1".to_string(),
+            context___span_id: "span1".to_string(),
+            start_time: now,
+            duration: 100,
+            status_code: Some("OK".to_string()),
+            level: Some("INFO".to_string()),
+            ..Default::default()
+        };
+        let record2 = persistent_queue::OtelLogsAndSpans {
+            project_id: "project2".to_string(),
+            timestamp: now,
+            observed_timestamp: now,
+            id: "span1".to_string(),
+            name: "record1_project2".to_string(),
+            context___trace_id: "trace2".to_string(),
+            context___span_id: "span1".to_string(),
+            start_time: now,
+            duration: 200,
+            status_code: Some("OK".to_string()),
+            level: Some("INFO".to_string()),
+            ..Default::default()
+        };
+
+        db.insert_records(&vec![record1]).await?;
+        db.insert_records(&vec![record2]).await?;
+
+        async fn refresh_ctx(db: &Database) -> anyhow::Result<SessionContext> {
+            let new_ctx = SessionContext::new();
+            let configs = db.project_configs.read().await;
+            for (project_id, (_, _, table_lock)) in configs.iter() {
+                let table_name = format!("otel_logs_and_spans_{}", project_id);
+                new_ctx.register_table(&table_name, Arc::new(table_lock.read().await.clone()))?;
+            }
+            Ok(new_ctx)
+        }
+        let new_ctx = refresh_ctx(&db).await?;
+
+        let query1 = {
+            let ctx = new_ctx.clone();
+            async move {
+                let table_name = "otel_logs_and_spans_project1";
+                let df = ctx.sql(&format!("SELECT name FROM {}", table_name)).await?;
+                df.collect().await
+            }
+        };
+        let query2 = {
+            let ctx = new_ctx.clone();
+            async move {
+                let table_name = "otel_logs_and_spans_project2";
+                let df = ctx.sql(&format!("SELECT name FROM {}", table_name)).await?;
+                df.collect().await
+            }
+        };
+
+        let (res1, res2) = tokio::join!(query1, query2);
+        let batches1 = res1?;
+        let batches2 = res2?;
+        let count1: usize = batches1.iter().map(|b| b.num_rows()).sum();
+        let count2: usize = batches2.iter().map(|b| b.num_rows()).sum();
+
+        assert!(count1 > 0, "project1 query returned no rows");
+        assert!(count2 > 0, "project2 query returned no rows");
+
         Ok(())
     }
 }
