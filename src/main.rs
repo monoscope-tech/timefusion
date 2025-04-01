@@ -15,9 +15,9 @@ use datafusion::{
     logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility},
 };
 use datafusion_postgres::{DfSessionService, HandlerFactory};
+use datafusion::arrow::array::Array;
 use dotenv::dotenv;
 use futures::TryFutureExt;
-use persistent_queue::OtelLogsAndSpans;
 use serde::Deserialize;
 use std::{env, sync::Arc};
 use tokio::{
@@ -27,10 +27,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
-use url::Url;
 
-/// Registers the PostgreSQL settings table in the DataFusion session context.
+/// Registers PostgreSQL settings table into the session context.
 fn register_pg_settings_table(ctx: &SessionContext) -> datafusion::error::Result<()> {
+    use datafusion::arrow::array::Array; // Import Array trait
     let schema = Arc::new(Schema::new(vec![
         Field::new("name", DataType::Utf8, false),
         Field::new("setting", DataType::Utf8, false),
@@ -58,14 +58,17 @@ fn register_pg_settings_table(ctx: &SessionContext) -> datafusion::error::Result
     Ok(())
 }
 
-/// Registers a simple UDF for setting configuration.
+/// Registers a UDF named set_config.
 fn register_set_config_udf(ctx: &SessionContext) {
     let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
         let param_value_array = match &args[1] {
-            ColumnarValue::Array(array) => array.as_any().downcast_ref::<StringArray>()
+            ColumnarValue::Array(array) => array
+                .as_any()
+                .downcast_ref::<StringArray>()
                 .expect("set_config second arg must be a StringArray"),
             _ => panic!("set_config second arg must be an array"),
         };
+
         let mut builder = StringBuilder::new();
         for i in 0..param_value_array.len() {
             if param_value_array.is_null(i) {
@@ -101,15 +104,20 @@ struct RegisterProjectRequest {
 
 /// Endpoint to register a new project.
 #[post("/register_project")]
-async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<Arc<Database>>) -> impl Responder {
-    match db.register_project(
+async fn register_project(
+    req: web::Json<RegisterProjectRequest>,
+    db: web::Data<Arc<Database>>,
+) -> impl Responder {
+    match db
+        .register_project(
             &req.project_id,
             &req.bucket,
             Some(&req.access_key),
             Some(&req.secret_key),
             req.endpoint.as_deref(),
         )
-        .await {
+        .await
+    {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({
             "message": format!("Project '{}' registered successfully", req.project_id)
         })),
@@ -119,9 +127,9 @@ async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<
     }
 }
 
-/// New endpoint: Execute a SQL query on a project's Delta table.
-/// The client sends a project_id and a SQL query.
-/// The application uses the project's Delta table (registered under a unique name) to run the query.
+/// Endpoint to query a project’s data.
+/// The client provides a project_id and a SQL query. The server uses the
+/// corresponding Delta table (registered in the session context) to run the query.
 #[derive(Deserialize)]
 struct QueryProjectRequest {
     project_id: String,
@@ -129,10 +137,18 @@ struct QueryProjectRequest {
 }
 
 #[post("/query_project")]
-async fn query_project(req: web::Json<QueryProjectRequest>, db: web::Data<Arc<Database>>) -> impl Responder {
-    let table_name = format!("otel_logs_and_spans_{}", req.project_id);
+async fn query_project(
+    req: web::Json<QueryProjectRequest>,
+    db: web::Data<Arc<Database>>,
+) -> impl Responder {
+    // We don't actually use this local variable.
+    let _ = format!("otel_logs_and_spans_{}", req.project_id);
     let ctx = db.session_context.clone();
-    match ctx.sql(&req.query).await.and_then(|df| df.collect().await) {
+    let df = match ctx.sql(&req.query).await {
+        Ok(df) => df,
+        Err(e) => return HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{:?}", e) })),
+    };
+    match df.collect().await {
         Ok(batches) => HttpResponse::Ok().json(serde_json::json!({ "batches": format!("{:?}", batches) })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{:?}", e) })),
     }
@@ -142,22 +158,25 @@ async fn query_project(req: web::Json<QueryProjectRequest>, db: web::Data<Arc<Da
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("timefusion=debug,pgwire=trace,datafusion=debug")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("timefusion=debug,pgwire=trace,datafusion=debug")),
+        )
         .init();
 
     info!("Starting TimeFusion application");
 
-    // Create database instance (reads S3 config from environment)
+    // Create a new database instance from environment variables.
     let mut db = Database::new().await?;
     info!("Database initialized successfully");
 
-    // Build a new DataFusion session context for query UDFs and settings.
+    // Create a new session context for additional configuration.
     let mut options = ConfigOptions::new();
     let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
     let session_context = SessionContext::new_with_config(options.into());
-    let catalogs = db.session_context.catalog_names();
-    info!("Initial catalogs: {:?}", catalogs);
+
+    let initial_catalogs = db.session_context.catalog_names();
+    info!("Initial catalogs: {:?}", initial_catalogs);
 
     if let Some(catalog) = db.session_context.catalog("datafusion") {
         for schema_name in catalog.schema_names() {
@@ -178,21 +197,20 @@ async fn main() -> anyhow::Result<()> {
         warn!("'datafusion' catalog not found; proceeding with empty context");
     }
 
-    register_pg_settings_table(&session_context)?;
-    register_set_config_udf(&session_context)?;
+    register_pg_settings_table(&session_context).unwrap();
+    register_set_config_udf(&session_context);
     info!("Final catalogs: {:?}", session_context.catalog_names());
 
-    // Switch database session context to the one with UDFs and settings.
+    // Replace the session context in our database with the updated one.
     db.session_context = session_context;
     let db = Arc::new(db);
-
     let app_info = web::Data::new(AppInfo {});
 
     let shutdown_token = CancellationToken::new();
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
-    // Start PGWire server for PostgreSQL protocol support.
+    // Start PGWire server.
     let pg_service = Arc::new(DfSessionService::new(db.session_context.clone()));
     let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
     let pg_addr = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
@@ -228,7 +246,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Give the PGWire server a moment to start.
     sleep(Duration::from_secs(1)).await;
     if pg_server.is_finished() {
         error!("PGWire server failed to start, aborting...");
@@ -262,7 +279,6 @@ async fn main() -> anyhow::Result<()> {
             ),
         }
     });
-
     info!("HTTP server running on http://{}", http_addr);
 
     tokio::select! {
@@ -279,3 +295,4 @@ async fn main() -> anyhow::Result<()> {
     info!("Shutdown complete.");
     Ok(())
 }
+
