@@ -1,7 +1,7 @@
 // main.rs
 mod database;
 mod persistent_queue;
-use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
 use database::Database;
 use datafusion::{
     arrow::{
@@ -11,7 +11,7 @@ use datafusion::{
     },
     config::ConfigOptions,
     execution::context::SessionContext,
-    logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility},
+    logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
 };
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
@@ -21,7 +21,7 @@ use serde::Deserialize;
 use std::{env, sync::Arc};
 use tokio::{
     net::TcpListener,
-    time::{sleep, Duration},
+    time::{Duration, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};

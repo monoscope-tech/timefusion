@@ -6,9 +6,9 @@ pub struct OtelLogsAndSpans {
     // Top-level fields
     pub project_id: String,
 
-    #[serde(with = "chrono::serde::ts_nanoseconds")]
+    #[serde(with = "chrono::serde::ts_microseconds")]
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    #[serde(with = "chrono::serde::ts_nanoseconds")]
+    #[serde(with = "chrono::serde::ts_microseconds")]
     pub observed_timestamp: chrono::DateTime<chrono::Utc>,
 
     pub id: String,
@@ -26,9 +26,9 @@ pub struct OtelLogsAndSpans {
 
     pub duration: u64, // nanoseconds
 
-    #[serde(with = "chrono::serde::ts_nanoseconds")]
+    #[serde(with = "chrono::serde::ts_microseconds")]
     pub start_time: chrono::DateTime<chrono::Utc>,
-    #[serde(with = "chrono::serde::ts_nanoseconds_option")]
+    #[serde(with = "chrono::serde::ts_microseconds_option")]
     pub end_time: Option<chrono::DateTime<chrono::Utc>>,
 
     // Context

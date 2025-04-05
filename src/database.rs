@@ -6,6 +6,7 @@ use delta_kernel::schema::StructField;
 use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
 use log::{info, warn};
 use serde_arrow::schema::{SchemaLike, TracingOptions};
+use serde_json::json;
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -17,18 +18,19 @@ pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 
 pub struct Database {
     pub session_context: SessionContext,
-    project_configs:     ProjectConfigs,
+    project_configs: ProjectConfigs,
 }
 
 impl Database {
     pub async fn new() -> Result<Self> {
         let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-        let storage_uri = format!("s3://{}/?endpoint={}", bucket, aws_endpoint);
+
+        // Generate a unique prefix for this run's data
+        let prefix = env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
+        let storage_uri = format!("s3://{}/{}/?endpoint={}", bucket, prefix, aws_endpoint);
         info!("Storage URI configured: {}", storage_uri);
-        unsafe {
-            env::set_var("AWS_ENDPOINT", &aws_endpoint);
-        }
+
         let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
@@ -44,10 +46,6 @@ impl Database {
         db.register_project("default", &storage_uri, None, None, None).await?;
 
         Ok(db)
-    }
-
-    pub async fn delete_all_data(&self) -> Result<()> {
-        Ok(())
     }
 
     pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
@@ -91,20 +89,26 @@ impl Database {
 
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let table = match DeltaTableBuilder::from_uri(&conn_str)
-            .with_storage_options(storage_options.0.clone())
-            .with_allow_http(true)
-            .load()
-            .await
-        {
+        let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
             Ok(table) => table,
             Err(err) => {
                 warn!("table doesn't exist. creating new table. err: {:?}", err);
 
-                let tracing_options = TracingOptions::default();
+                let tracing_options = TracingOptions::default()
+                    .overwrite("timestamp", json!({"name": "timestamp", "data_type": "Timestamp(Microsecond, None)"}))?
+                    .overwrite(
+                        "observed_timestamp",
+                        json!({"name": "observed_timestamp", "data_type": "Timestamp(Microsecond, None)"}),
+                    )?
+                    .overwrite("start_time", json!({"name": "start_time", "data_type": "Timestamp(Microsecond, None)"}))?
+                    .overwrite(
+                        "end_time",
+                        json!({"name": "end_time", "data_type": "Timestamp(Microsecond, None)", "nullable": true}),
+                    )?;
 
                 let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?;
                 let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
+                log::info!("vec_refs {:?}", vec_refs);
 
                 // Create the table with project_id partitioning only for now
                 // Timestamp partitioning is likely causing issues with nanosecond precision
@@ -128,128 +132,314 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use std::thread::sleep;
+
     use chrono::{TimeZone, Utc};
-    use datafusion::arrow::array::{Array, StringArray};
+    use datafusion::assert_batches_eq;
     use dotenv::dotenv;
+    use tokio::time;
+    use uuid::Uuid;
 
     use super::*;
 
-    #[tokio::test]
-    async fn test_database_query() -> Result<()> {
-        env_logger::builder()
-            .is_test(true) // Makes output more compact for tests
-            .init();
-
+    // Helper function to create a test database with a unique table prefix
+    async fn setup_test_database() -> Result<(Database, SessionContext, String)> {
+        // Initialize logger only once per test run
+        let _ = env_logger::builder().is_test(true).try_init();
         dotenv().ok();
-        log::info!("Running database query test");
+
+        // Set a unique test-specific prefix for a clean Delta table
+        let test_prefix = format!("test-data-{}", Uuid::new_v4());
+        unsafe {
+            env::set_var("TIMEFUSION_TABLE_PREFIX", &test_prefix);
+        }
 
         // Create a new database with default project
         let db = Database::new().await?;
         let ctx = db.session_context.clone();
-        log::info!("Database initialized");
 
-        // Create fixed timestamps for testing
+        Ok((db, ctx, test_prefix))
+    }
+
+    // Helper function to refresh the table after modifications
+    async fn refresh_table(db: &Database) -> Result<()> {
+        let table_ref = {
+            let configs = db.project_configs.read().await;
+            configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID 'default' not found"))?.2.clone()
+        };
+
+        let mut table = table_ref.write().await;
+        *table = deltalake::open_table(&table.table_uri()).await?;
+
+        db.session_context.deregister_table("otel_logs_and_spans")?;
+        db.session_context.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
+
+        // Add a small delay to ensure the changes propagate
+        sleep(time::Duration::from_millis(100));
+
+        Ok(())
+    }
+
+    // Helper function to create sample test records
+    fn create_test_records() -> Vec<OtelLogsAndSpans> {
         let timestamp1 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap();
         let timestamp2 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 10, 0).unwrap();
 
-        // Create sample records
-        let span1 = OtelLogsAndSpans {
-            project_id: "test_project".to_string(),
-            timestamp: timestamp1,
-            observed_timestamp: timestamp1,
-            id: "span1".to_string(),
-            name: "test_span_1".to_string(),
-            context___trace_id: "trace1".to_string(),
-            context___span_id: "span1".to_string(),
-            start_time: timestamp1,
-            duration: 100_000_000,
-            status_code: Some("OK".to_string()),
-            level: Some("INFO".to_string()),
-            ..Default::default()
+        vec![
+            OtelLogsAndSpans {
+                project_id: "test_project".to_string(),
+                timestamp: timestamp1,
+                observed_timestamp: timestamp1,
+                id: "span1".to_string(),
+                name: "test_span_1".to_string(),
+                context___trace_id: "trace1".to_string(),
+                context___span_id: "span1".to_string(),
+                start_time: timestamp1,
+                duration: 100_000_000,
+                status_code: Some("OK".to_string()),
+                level: Some("INFO".to_string()),
+                ..Default::default()
+            },
+            OtelLogsAndSpans {
+                project_id: "test_project".to_string(),
+                timestamp: timestamp2,
+                observed_timestamp: timestamp2,
+                id: "span2".to_string(),
+                name: "test_span_2".to_string(),
+                context___trace_id: "trace2".to_string(),
+                context___span_id: "span2".to_string(),
+                start_time: timestamp2,
+                duration: 200_000_000,
+                status_code: Some("ERROR".to_string()),
+                level: Some("ERROR".to_string()),
+                status_message: Some("Error occurred".to_string()),
+                ..Default::default()
+            },
+        ]
+    }
+
+    // Helper to create SQL INSERT statements
+    fn create_insert_sql(
+        timestamp: &str, id: &str, name: &str, trace_id: &str, span_id: &str, duration: u64, level: &str, status_code: &str, status_message: Option<&str>,
+    ) -> String {
+        let sql = if let Some(message) = status_message {
+            format!(
+                "INSERT INTO otel_logs_and_spans (
+                    project_id, timestamp, observed_timestamp, id, name, 
+                    context___trace_id, context___span_id,
+                    duration, start_time, level, status_code, status_message
+                ) VALUES (
+                    'test_project', '{}', '{}', '{}', '{}',
+                    '{}', '{}', 
+                    {}, '{}', '{}', '{}', '{}'
+                )",
+                timestamp, timestamp, id, name, trace_id, span_id, duration, timestamp, level, status_code, message
+            )
+        } else {
+            format!(
+                "INSERT INTO otel_logs_and_spans (
+                    project_id, timestamp, observed_timestamp, id, name, 
+                    context___trace_id, context___span_id,
+                    duration, start_time, level, status_code
+                ) VALUES (
+                    'test_project', '{}', '{}', '{}', '{}',
+                    '{}', '{}', 
+                    {}, '{}', '{}', '{}'
+                )",
+                timestamp, timestamp, id, name, trace_id, span_id, duration, timestamp, level, status_code
+            )
         };
 
-        let span2 = OtelLogsAndSpans {
-            project_id: "test_project".to_string(),
-            timestamp: timestamp2,
-            observed_timestamp: timestamp2,
-            id: "span2".to_string(),
-            name: "test_span_2".to_string(),
-            context___trace_id: "trace2".to_string(),
-            context___span_id: "span2".to_string(),
-            start_time: timestamp2,
-            duration: 200_000_000,
-            status_code: Some("ERROR".to_string()),
-            level: Some("ERROR".to_string()),
-            status_message: Some("Error occurred".to_string()),
-            ..Default::default()
-        };
+        sql
+    }
 
-        let records = vec![span1, span2];
-        let count_df = ctx.sql("DELETE FROM otel_logs_and_spans").await?;
+    #[tokio::test]
+    async fn test_database_query() -> Result<()> {
+        log::info!("Running database query test");
 
-        log::info!("insert record");
-        // Insert records
+        // Setup test database with helper function
+        let (db, ctx, test_prefix) = setup_test_database().await?;
+        log::info!("Using test-specific table prefix: {}", test_prefix);
+
+        // Create sample records with different timestamps and durations
+        let records = create_test_records();
+
+        log::info!("Inserting records");
         db.insert_records(&records).await?;
-        log::info!("after insert record");
+        log::info!("Records inserted");
 
-        // Use the session context to run an SQL query
+        // Refresh the table to ensure it sees the newly written data
+        log::info!("Refreshing table metadata");
+        refresh_table(&db).await?;
 
-        // First, check what data exists in the table
-        let count_df = ctx.sql("SELECT * FROM otel_logs_and_spans").await?;
-        let count_batches = count_df.collect().await?;
-        assert_eq!(count_batches.len(), 2);
+        // Add a small delay to ensure propagation
+        sleep(time::Duration::from_millis(100));
 
-        // let df = ctx.sql("SELECT name, status_code, level FROM otel_logs_and_spans ORDER BY name").await?;
-        // // Get the results as batches
-        // let batches = df.collect().await?;
-        // println!(
-        //     "Query returned {} batches with schema: {:?}",
-        //     batches.len(),
-        //     batches.first().map(|b| b.schema())
-        // );
-        //
-        // // Assert the schema
-        // assert_eq!(batches[0].schema().field(0).name(), "name");
-        // assert_eq!(batches[0].schema().field(1).name(), "status_code");
-        // assert_eq!(batches[0].schema().field(2).name(), "level");
-        //
-        // // Verify the number of records
-        // let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-        // assert_eq!(total_rows, 2);
-        //
-        // // Convert columns to StringArray for easier access
-        // let name_col = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        // let status_code_col = batches[0].column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        // let level_col = batches[0].column(2).as_any().downcast_ref::<StringArray>().unwrap();
-        //
-        // // Check values in the first row
-        // assert_eq!(name_col.value(0), "test_span_1");
-        // assert_eq!(status_code_col.value(0), "OK");
-        // assert_eq!(level_col.value(0), "INFO");
-        //
-        // // Check values in the second row
-        // assert_eq!(name_col.value(1), "test_span_2");
-        // assert_eq!(status_code_col.value(1), "ERROR");
-        // assert_eq!(level_col.value(1), "ERROR");
-        //
-        // // Run a more complex query with filtering
-        // let df = ctx.sql("SELECT name, level, status_code, status_message FROM otel_logs_and_spans WHERE project_id = 'test_project' and timestamp > '2020-12-01' and level = 'ERROR'").await?;
-        // let batches = df.collect().await?;
-        //
-        // // Verify the filtered result - should only have 1 row
-        // let total_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-        // assert_eq!(total_rows, 1);
-        //
-        // // Convert columns to StringArray for easier access
-        // let name_col = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        // let level_col = batches[0].column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        // let status_code_col = batches[0].column(2).as_any().downcast_ref::<StringArray>().unwrap();
-        // let status_message_col = batches[0].column(3).as_any().downcast_ref::<StringArray>().unwrap();
-        //
-        // assert_eq!(name_col.value(0), "test_span_2");
-        // assert_eq!(level_col.value(0), "ERROR");
-        // assert_eq!(status_code_col.value(0), "ERROR");
-        // assert_eq!(status_message_col.value(0), "Error occurred");
+        // Test 1: Basic count query to verify record insertion
+        let count_df = ctx.sql("SELECT COUNT(*) as count FROM otel_logs_and_spans").await?;
+        let result = count_df.collect().await?;
+
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            [
+                "+-------+", 
+                "| count |", 
+                "+-------+", 
+                "| 2     |", 
+                "+-------+",
+            ], &result);
+
+        // Test 2: Query with field selection and ordering
+        log::info!("Testing field selection and ordering");
+        let df = ctx.sql("SELECT timestamp, name, status_code, level FROM otel_logs_and_spans ORDER BY name").await?;
+        let result = df.collect().await?;
+
+        assert_batches_eq!(
+            [
+                "+---------------------+-------------+-------------+-------+",
+                "| timestamp           | name        | status_code | level |",
+                "+---------------------+-------------+-------------+-------+",
+                "| 2023-01-01T10:00:00 | test_span_1 | OK          | INFO  |",
+                "| 2023-01-01T10:10:00 | test_span_2 | ERROR       | ERROR |",
+                "+---------------------+-------------+-------------+-------+",
+            ],
+            &result
+        );
+
+        // Test 3: Filtering by project_id and level
+        log::info!("Testing filtering by project_id and level");
+        let df = ctx
+            .sql("SELECT name, level, status_code, status_message FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'")
+            .await?;
+        let result = df.collect().await?;
+
+        assert_batches_eq!(
+            [
+                "+-------------+-------+-------------+----------------+",
+                "| name        | level | status_code | status_message |",
+                "+-------------+-------+-------------+----------------+",
+                "| test_span_2 | ERROR | ERROR       | Error occurred |",
+                "+-------------+-------+-------------+----------------+",
+            ],
+            &result
+        );
+
+        // Test 4: Complex query with multiple data types (including timestamp and end_time)
+        // Note: For timestamp columns, we need to format them for the test to use assert_batches_eq
+        log::info!("Testing complex query with multiple data types");
+        let df = ctx
+            .sql(
+                "
+                SELECT 
+                    id,
+                    name,
+                    project_id,
+                    duration,
+                    CAST(duration / 1000000 AS INTEGER) as duration_ms,
+                    context___trace_id,
+                    status_code,
+                    level,
+                    to_char(timestamp, '%Y-%m-%d %H:%M') as formatted_timestamp,
+                    to_char(end_time, 'YYYY-MM-DD HH24:MI') as formatted_end_time,
+                    CASE WHEN status_code = 'ERROR' THEN status_message ELSE NULL END as conditional_message
+                FROM otel_logs_and_spans
+                ORDER BY id
+            ",
+            )
+            .await?;
+        let result = df.collect().await?;
+
+        assert_batches_eq!(
+            [
+                "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
+                "| id    | name        | project_id   | duration  | duration_ms | context___trace_id | status_code | level | formatted_timestamp | formatted_end_time | conditional_message |",
+                "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
+                "| span1 | test_span_1 | test_project | 100000000 | 100         | trace1             | OK          | INFO  | 2023-01-01 10:00    |                    |                     |",
+                "| span2 | test_span_2 | test_project | 200000000 | 200         | trace2             | ERROR       | ERROR | 2023-01-01 10:10    |                    | Error occurred      |",
+                "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
+            ],
+            &result
+        );
+
+        // Test 5: Timestamp filtering
+        log::info!("Testing timestamp filtering");
+        let df = ctx.sql("SELECT COUNT(*) as count FROM otel_logs_and_spans WHERE timestamp > '2023-01-01T10:05:00.000000Z'").await?;
+        let result = df.collect().await?;
+
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            [
+                "+-------+", 
+                "| count |", 
+                "+-------+", 
+                "| 1     |", 
+                "+-------+",
+            ], 
+            &result
+        );
+
+        // Test 6: Duration filtering
+        log::info!("Testing duration filtering");
+        let df = ctx.sql("SELECT name FROM otel_logs_and_spans WHERE duration > 150000000").await?;
+        let result = df.collect().await?;
+
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            [
+                "+-------------+", 
+                "| name        |", 
+                "+-------------+", 
+                "| test_span_2 |", 
+                "+-------------+",
+            ],
+            &result
+        );
+
+        // Test 7: Complex filtering with timestamp columns in ISO 8601 format
+        log::info!("Testing complex filtering with timestamp columns in ISO 8601 format");
+        let df = ctx
+            .sql(
+                "
+                WITH time_data AS (
+                    SELECT 
+                        name, 
+                        status_code, 
+                        level,
+                        CAST(duration / 1000000 AS INTEGER) as duration_ms,
+                        timestamp,
+                        to_char(timestamp, '%Y-%m-%d') as date_only,
+                        EXTRACT(HOUR FROM timestamp) as hour,
+                        to_char(timestamp, '%Y-%m-%dT%H:%M:%S%.6fZ') as iso_timestamp
+                    FROM otel_logs_and_spans 
+                    WHERE 
+                        project_id = 'test_project' 
+                        AND timestamp > '2023-01-01T10:05:00.000000Z'
+                )
+                SELECT 
+                    name, 
+                    status_code, 
+                    level, 
+                    duration_ms,
+                    date_only,
+                    hour,
+                    iso_timestamp
+                FROM time_data
+                ORDER BY name
+            ",
+            )
+            .await?;
+        let result = df.collect().await?;
+
+        assert_batches_eq!(
+            [
+                "+-------------+-------------+-------+-------------+------------+------+-----------------------------+",
+                "| name        | status_code | level | duration_ms | date_only  | hour | iso_timestamp               |",
+                "+-------------+-------------+-------+-------------+------------+------+-----------------------------+",
+                "| test_span_2 | ERROR       | ERROR | 200         | 2023-01-01 | 10   | 2023-01-01T10:10:00.000000Z |",
+                "+-------------+-------------+-------+-------------+------------+------+-----------------------------+",
+            ],
+            &result
+        );
 
         Ok(())
     }
