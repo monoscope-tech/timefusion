@@ -2,7 +2,7 @@
 mod database;
 mod persistent_queue;
 use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
-use database::Database;
+use database::{Database, ProjectRoutingTable}; 
 use datafusion::{
     arrow::{
         array::{Array, StringArray, StringBuilder},
@@ -113,16 +113,26 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    let mut db = Database::new().await?;
+    let db = Database::new().await?;
     info!("Database initialized successfully");
     let mut options = ConfigOptions::new();
     let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
-    let session_context = SessionContext::new_with_config(options.into());
+    let mut session_context = SessionContext::new_with_config(options.into());
 
-    let initial_catalogs = db.session_context.catalog_names();
+    // Create tables and register them with session context
+    let schema = OtelLogsAndSpans::schema_ref();
+    let routing_table = ProjectRoutingTable::new(
+        "default".to_string(),
+        Arc::new(db.clone()),
+        schema
+    );
+    session_context.register_table("otel_logs_and_spans", Arc::new(routing_table))?;
+    info!("Registered ProjectRoutingTable with SessionContext");
+
+    let initial_catalogs = session_context.catalog_names();
     info!("Initial catalogs: {:?}", initial_catalogs);
-
-    let catalog = db.session_context.catalog("datafusion");
+    
+    let catalog = session_context.catalog("datafusion");
     if let Some(catalog) = catalog {
         let schema_names = catalog.schema_names();
         info!("Schemas in 'datafusion' catalog: {:?}", schema_names);
@@ -133,16 +143,6 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(schema) = catalog.schema(&schema_name) {
                     let table_names = schema.table_names();
                     info!("Tables in schema '{}': {:?}", schema_name, table_names);
-                    for table_name in table_names {
-                        if let Ok(Some(table_provider)) = schema.table(&table_name).await {
-                            session_context.register_table(&table_name, table_provider)?;
-                            info!("Registered table: {}", table_name);
-                        } else {
-                            warn!("Failed to load table provider for: {}", table_name);
-                        }
-                    }
-                } else {
-                    warn!("Schema not found: {}", schema_name);
                 }
             }
         }
@@ -154,8 +154,6 @@ async fn main() -> anyhow::Result<()> {
     register_set_config_udf(&session_context);
 
     info!("Final catalogs: {:?}", session_context.catalog_names());
-
-    db.session_context = session_context;
     let db = Arc::new(db);
 
     // Queue logic removed - writing directly to Delta Lake
@@ -167,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     let http_shutdown = shutdown_token.clone();
     let pgwire_shutdown = shutdown_token.clone();
 
-    let pg_service = Arc::new(DfSessionService::new(db.session_context.clone()));
+    let pg_service = Arc::new(DfSessionService::new(session_context.clone()));
     let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
     let pg_addr = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
     let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", pg_addr)).await?;

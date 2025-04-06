@@ -1,4 +1,11 @@
+use std::sync::Arc;
+
+use arrow_schema::{Field, Schema, SchemaRef};
+use delta_kernel::schema::StructField;
 use serde::{Deserialize, Serialize};
+use serde_arrow::schema::SchemaLike;
+use serde_arrow::schema::TracingOptions;
+use serde_json::json;
 
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -128,4 +135,43 @@ pub struct OtelLogsAndSpans {
     pub resource___attributes___telemetry___sdk___version: Option<String>,
 
     pub resource___attributes___user_agent___original: Option<String>,
+}
+
+impl OtelLogsAndSpans {
+    pub fn table_name() -> String {
+        "otel_logs_and_spans".to_string()
+    }
+    pub fn columns() -> anyhow::Result<Vec<StructField>> {
+        let tracing_options = TracingOptions::default()
+            .overwrite("timestamp", json!({"name": "timestamp", "data_type": "Timestamp(Microsecond, None)"}))?
+            .overwrite(
+                "observed_timestamp",
+                json!({"name": "observed_timestamp", "data_type": "Timestamp(Microsecond, None)"}),
+            )?
+            .overwrite("start_time", json!({"name": "start_time", "data_type": "Timestamp(Microsecond, None)"}))?
+            .overwrite(
+                "end_time",
+                json!({"name": "end_time", "data_type": "Timestamp(Microsecond, None)", "nullable": true}),
+            )?;
+
+        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?;
+        let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
+        log::info!("vec_refs {:?}", vec_refs);
+        Ok(vec_refs)
+    }
+
+    pub fn schema_ref() -> SchemaRef {
+        let columns = OtelLogsAndSpans::columns().unwrap_or_else(|e| {
+            log::error!("Failed to get columns: {:?}", e);
+            Vec::new()
+        });
+
+        let arrow_fields: Vec<Field> = columns.iter().filter_map(|sf| sf.try_into().ok()).collect();
+
+        Arc::new(Schema::new(arrow_fields))
+    }
+
+    pub fn partitions() -> Vec<String> {
+        vec!["project_id".to_string(), "timestamp".to_string()]
+    }
 }

@@ -1,12 +1,29 @@
-use std::{collections::HashMap, env, sync::Arc};
+use std::{any::Any, collections::HashMap, env, sync::Arc};
 
 use anyhow::Result;
-use datafusion::execution::context::SessionContext;
-use delta_kernel::schema::StructField;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
+use datafusion::execution::TaskContext;
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
+use datafusion::physical_plan::DisplayAs;
+use datafusion::physical_plan::ExecutionPlanProperties;
+use datafusion::scalar::ScalarValue;
+
+use datafusion::{
+    catalog::Session,
+    datasource::{TableProvider, TableType},
+    error::{DataFusionError, Result as DFResult},
+    execution::context::SessionContext,
+    logical_expr::{dml::InsertOp, BinaryExpr},
+    physical_expr::EquivalenceProperties,
+    physical_plan::{DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream},
+};
+use delta_kernel::arrow::record_batch::RecordBatch;
+use deltalake::delta_datafusion::{DataFusionMixins, DeltaScanConfig, DeltaTableProvider};
 use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
+use futures::FutureExt;
 use log::{info, warn};
 use serde_arrow::schema::{SchemaLike, TracingOptions};
-use serde_json::json;
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -16,9 +33,17 @@ type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 
+#[derive(Debug)]
 pub struct Database {
-    pub session_context: SessionContext,
     project_configs: ProjectConfigs,
+}
+
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        Self {
+            project_configs: Arc::clone(&self.project_configs),
+        }
+    }
 }
 
 impl Database {
@@ -35,17 +60,52 @@ impl Database {
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
-        let session_context = SessionContext::new();
         let project_configs = HashMap::new();
 
         let db = Self {
-            session_context,
             project_configs: Arc::new(RwLock::new(project_configs)),
         };
 
         db.register_project("default", &storage_uri, None, None, None).await?;
 
         Ok(db)
+    }
+
+    pub async fn resolve_table(&self, project_id: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
+        let project_configs = self.project_configs.read().await;
+
+        // Try to get the requested project table first
+        if let Some((_, _, table)) = project_configs.get(project_id) {
+            return Ok(table.clone());
+        }
+
+        // If not found and project_id is not "default", try the default table
+        if project_id != "default" {
+            if let Some((_, _, table)) = project_configs.get("default") {
+                warn!("Project '{}' not found, falling back to default project", project_id);
+                return Ok(table.clone());
+            }
+        }
+
+        // If we get here, neither the requested project nor default exists
+        Err(DataFusionError::Execution(format!(
+            "Unknown project_id: {} and no default project found",
+            project_id
+        )))
+    }
+
+    pub async fn insert_records_batch(&self, _table: &str, batch: Vec<RecordBatch>) -> Result<()> {
+        let (_conn_str, _options, table_ref) = {
+            let configs = self.project_configs.read().await;
+            configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
+        };
+
+        let mut table = table_ref.write().await;
+        let ops = DeltaOps(table.clone());
+
+        // Use the mode parameter to ensure data is written correctly with partitioning
+        *table = ops.write(batch).await?;
+        Ok(())
     }
 
     pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
@@ -94,35 +154,19 @@ impl Database {
             Err(err) => {
                 warn!("table doesn't exist. creating new table. err: {:?}", err);
 
-                let tracing_options = TracingOptions::default()
-                    .overwrite("timestamp", json!({"name": "timestamp", "data_type": "Timestamp(Microsecond, None)"}))?
-                    .overwrite(
-                        "observed_timestamp",
-                        json!({"name": "observed_timestamp", "data_type": "Timestamp(Microsecond, None)"}),
-                    )?
-                    .overwrite("start_time", json!({"name": "start_time", "data_type": "Timestamp(Microsecond, None)"}))?
-                    .overwrite(
-                        "end_time",
-                        json!({"name": "end_time", "data_type": "Timestamp(Microsecond, None)", "nullable": true}),
-                    )?;
-
-                let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?;
-                let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
-                log::info!("vec_refs {:?}", vec_refs);
-
                 // Create the table with project_id partitioning only for now
                 // Timestamp partitioning is likely causing issues with nanosecond precision
                 let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
                 delta_ops
                     .create()
-                    .with_columns(vec_refs)
-                    .with_partition_columns(vec!["project_id".to_string(), "timestamp".to_string()])
+                    .with_columns(OtelLogsAndSpans::columns().unwrap_or_default())
+                    .with_partition_columns(OtelLogsAndSpans::partitions())
                     .with_storage_options(storage_options.0.clone())
                     .await?
             }
         };
 
-        self.session_context.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
+        // No need to create routing table here - it's done at the application level
 
         let mut configs = self.project_configs.write().await;
         configs.insert(project_id.to_string(), (conn_str.to_string(), storage_options, Arc::new(RwLock::new(table))));
@@ -130,6 +174,242 @@ impl Database {
     }
 }
 
+#[derive(Debug)]
+pub struct ProjectRoutingTable {
+    default_project: String,
+    database: Arc<Database>,
+    schema: SchemaRef,
+}
+
+impl ProjectRoutingTable {
+    pub fn new(default_project: String, database: Arc<Database>, schema: SchemaRef) -> Self {
+        Self {
+            default_project,
+            database,
+            schema,
+        }
+    }
+
+    async fn resolve_table(&self, project_id: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
+        self.database.resolve_table(project_id).await
+    }
+
+    fn extract_project_id_from_filters(&self, filters: &[Expr]) -> Option<String> {
+        // Look for expressions like "project_id = 'some_value'"
+        for filter in filters {
+            if let Some(project_id) = self.extract_project_id(filter) {
+                return Some(project_id);
+            }
+        }
+        None
+    }
+
+    fn extract_project_id(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            // Binary expression: "project_id = 'value'"
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                // Check if this is an equality operation
+                if *op == Operator::Eq {
+                    // Check if left side is a column reference to "project_id"
+                    if let Expr::Column(col) = left.as_ref() {
+                        if col.name == "project_id" {
+                            // Check if right side is a literal string
+                            if let Expr::Literal(lit) = right.as_ref() {
+                                if let ScalarValue::Utf8(Some(value)) = lit {
+                                    return Some(value.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    // Also check if right side is the column (order might be flipped)
+                    if let Expr::Column(col) = right.as_ref() {
+                        if col.name == "project_id" {
+                            // Check if left side is a literal string
+                            if let Expr::Literal(lit) = left.as_ref() {
+                                if let ScalarValue::Utf8(Some(value)) = lit {
+                                    return Some(value.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            // // Recursive: AND, OR expressions
+            // Expr::BooleanQuery { operands, .. } => {
+            //     for operand in operands {
+            //         if let Some(project_id) = self.extract_project_id(operand) {
+            //             return Some(project_id);
+            //         }
+            //     }
+            //     None
+            // }
+            // Look inside NOT expressions
+            Expr::Not(inner) => self.extract_project_id(inner),
+            _ => None,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for ProjectRoutingTable {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn schema(&self) -> SchemaRef {
+        // For example, assume that the default project’s table has the right schema.
+        // (You might need to cache this schema during initialization.)
+        let schema = match self.database.resolve_table(&self.default_project).now_or_never() {
+            Some(Ok(table_lock)) => match table_lock.read().now_or_never() {
+                Some(guard) => guard.snapshot().unwrap().arrow_schema().unwrap(),
+                None => panic!("Failed to acquire read lock immediately"),
+            },
+            Some(Err(err)) => panic!("Failed to resolve table: {}", err),
+            None => panic!("resolve_table did not complete immediately"),
+        };
+        schema.into()
+    }
+
+    // async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, _insert_op: InsertOp) -> DFResult<Arc<dyn ExecutionPlan>> {
+    //     Ok(Arc::new(DeltaInsertExec::new(input, self.default_project.clone(), Arc::clone(&self.database))))
+    // }
+
+    fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filter.iter().map(|_| TableProviderFilterPushDown::Inexact).collect())
+    }
+
+    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Log the projection indices for debugging
+        if let Some(proj) = projection {
+            info!("Scan projection indices: {:?}", proj);
+
+            // Log original schema field names
+            info!(
+                "Original schema fields: {:?}",
+                self.schema.fields().iter().enumerate().map(|(i, f)| format!("{}: {}", i, f.name())).collect::<Vec<_>>()
+            );
+
+            // Convert indices to field names for better logging
+            let field_names: Vec<String> = proj
+                .iter()
+                .map(|&idx| {
+                    if idx < self.schema.fields().len() {
+                        format!("{}: {}", idx, self.schema.field(idx).name())
+                    } else {
+                        format!("unknown_field_{}", idx)
+                    }
+                })
+                .collect();
+            info!("Projected fields by index: {:?}", field_names);
+        } else {
+            info!("Scan with no projection");
+        }
+
+        // Log filters
+        info!("Scan filters: {:?}", filters);
+
+        // Get project_id from filters if possible, otherwise use default
+        let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
+
+        info!("Routing query to project_id: {}", project_id);
+
+        let delta_table = self.database.resolve_table(&project_id).await?;
+        let table = delta_table.read().await;
+        table.scan(state, projection, filters, limit).await
+    }
+}
+
+// #[derive(Debug)]
+// pub struct DeltaInsertExec {
+//     input: Arc<dyn ExecutionPlan>,
+//     default_project: String,
+//     database: Arc<Database>,
+//     schema: SchemaRef,
+//     plan_properties: PlanProperties,
+// }
+//
+// impl DeltaInsertExec {
+//     pub fn new(input: Arc<dyn ExecutionPlan>, default_project: String, database: Arc<Database>) -> Self {
+//         let schema = OtelLogsAndSpans::schema_ref();
+//         let plan_properties = Self::create_schema(&input, DeltaInsertExec::make_count_schema());
+//         Self {
+//             input,
+//             default_project,
+//             database,
+//             schema,
+//             plan_properties,
+//         }
+//     }
+//
+//     fn create_schema(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
+//         let eq_properties = EquivalenceProperties::new(schema);
+//         PlanProperties::new(
+//             eq_properties,
+//             Partitioning::UnknownPartitioning(1),
+//             input.pipeline_behavior(),
+//             input.boundedness(),
+//         )
+//     }
+//
+//     fn make_count_schema() -> SchemaRef {
+//         // Define a schema.
+//         Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]))
+//     }
+// }
+//
+// impl ExecutionPlan for DeltaInsertExec {
+//     fn name(&self) -> &str {
+//         "delta_insert_exec"
+//     }
+//
+//     fn as_any(&self) -> &dyn Any {
+//         self
+//     }
+//
+//     fn schema(&self) -> SchemaRef {
+//         self.schema.clone()
+//     }
+//
+//     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+//         vec![&self.input]
+//     }
+//
+//     fn properties(&self) -> &PlanProperties {
+//         &self.plan_properties
+//     }
+//
+//     fn with_new_children(self: Arc<Self>, new_children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+//         Ok(Arc::new(Self::new(
+//             new_children[0].clone(),
+//             self.default_project.clone(),
+//             Arc::clone(&self.database),
+//         )))
+//     }
+//
+//     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+//         // Use a much simpler approach for now - just return an empty stream
+//         // In a real implementation, this would write batches to the delta table
+//
+//         // Create an empty execution plan with the right schema
+//         let empty_exec = datafusion::physical_plan::empty::EmptyExec::new(self.schema.clone());
+//
+//         // Execute the empty plan and return a stream of record batches
+//         empty_exec.execute(partition, context)
+//     }
+// }
+//
+// impl DisplayAs for DeltaInsertExec {
+//     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+//         write!(f, "DeltaInsertExec")
+//     }
+// }
+//
 #[cfg(test)]
 mod tests {
     use std::thread::sleep;
@@ -144,7 +424,6 @@ mod tests {
 
     // Helper function to create a test database with a unique table prefix
     async fn setup_test_database() -> Result<(Database, SessionContext, String)> {
-        // Initialize logger only once per test run
         let _ = env_logger::builder().is_test(true).try_init();
         dotenv().ok();
 
@@ -154,25 +433,35 @@ mod tests {
             env::set_var("TIMEFUSION_TABLE_PREFIX", &test_prefix);
         }
 
-        // Create a new database with default project
         let db = Database::new().await?;
-        let ctx = db.session_context.clone();
+        let session_context = SessionContext::new();
+        let schema = OtelLogsAndSpans::schema_ref();
 
-        Ok((db, ctx, test_prefix))
+        // Log schema fields for debugging
+        info!("Test schema fields: {:?}", schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
+
+        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
+        session_context.register_table("otel_logs_and_spans", Arc::new(routing_table))?;
+
+        Ok((db, session_context, test_prefix))
     }
 
     // Helper function to refresh the table after modifications
-    async fn refresh_table(db: &Database) -> Result<()> {
-        let table_ref = {
-            let configs = db.project_configs.read().await;
-            configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID 'default' not found"))?.2.clone()
-        };
+    async fn refresh_table(db: &Database, session_context: &SessionContext) -> Result<()> {
+        // Refresh the Delta table
+        // Get the delta table using our resolve_table method
+        let table_ref = db.resolve_table("default").await.map_err(|e| anyhow::anyhow!("Failed to resolve default table: {:?}", e))?;
 
         let mut table = table_ref.write().await;
         *table = deltalake::open_table(&table.table_uri()).await?;
 
-        db.session_context.deregister_table("otel_logs_and_spans")?;
-        db.session_context.register_table("otel_logs_and_spans", Arc::new(table.clone()))?;
+        // Create a new ProjectRoutingTable with the refreshed database
+        let schema = OtelLogsAndSpans::schema_ref();
+        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
+
+        // Re-register the table with the session context
+        session_context.deregister_table("otel_logs_and_spans")?;
+        session_context.register_table("otel_logs_and_spans", Arc::new(routing_table))?;
 
         // Add a small delay to ensure the changes propagate
         sleep(time::Duration::from_millis(100));
@@ -255,8 +544,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_database_query() -> Result<()> {
-        log::info!("Running database query test");
-
         // Setup test database with helper function
         let (db, ctx, test_prefix) = setup_test_database().await?;
         log::info!("Using test-specific table prefix: {}", test_prefix);
@@ -266,11 +553,10 @@ mod tests {
 
         log::info!("Inserting records");
         db.insert_records(&records).await?;
-        log::info!("Records inserted");
 
         // Refresh the table to ensure it sees the newly written data
         log::info!("Refreshing table metadata");
-        refresh_table(&db).await?;
+        refresh_table(&db, &ctx).await?;
 
         // Add a small delay to ensure propagation
         sleep(time::Duration::from_millis(100));
@@ -288,6 +574,9 @@ mod tests {
                 "| 2     |", 
                 "+-------+",
             ], &result);
+
+        // TODO: The current implementation has schema mapping issues that need to be resolved
+        // For now, we'll skip the detailed tests and just verify that we can retrieve records
 
         // Test 2: Query with field selection and ordering
         log::info!("Testing field selection and ordering");
@@ -330,36 +619,36 @@ mod tests {
         let df = ctx
             .sql(
                 "
-                SELECT 
-                    id,
-                    name,
-                    project_id,
-                    duration,
-                    CAST(duration / 1000000 AS INTEGER) as duration_ms,
-                    context___trace_id,
-                    status_code,
-                    level,
-                    to_char(timestamp, '%Y-%m-%d %H:%M') as formatted_timestamp,
-                    to_char(end_time, 'YYYY-MM-DD HH24:MI') as formatted_end_time,
-                    CASE WHEN status_code = 'ERROR' THEN status_message ELSE NULL END as conditional_message
-                FROM otel_logs_and_spans
-                ORDER BY id
-            ",
+                    SELECT
+                        id,
+                        name,
+                        project_id,
+                        duration,
+                        CAST(duration / 1000000 AS INTEGER) as duration_ms,
+                        context___trace_id,
+                        status_code,
+                        level,
+                        to_char(timestamp, '%Y-%m-%d %H:%M') as formatted_timestamp,
+                        to_char(end_time, 'YYYY-MM-DD HH24:MI') as formatted_end_time,
+                        CASE WHEN status_code = 'ERROR' THEN status_message ELSE NULL END as conditional_message
+                    FROM otel_logs_and_spans
+                    ORDER BY id
+                ",
             )
             .await?;
         let result = df.collect().await?;
 
         assert_batches_eq!(
-            [
-                "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
-                "| id    | name        | project_id   | duration  | duration_ms | context___trace_id | status_code | level | formatted_timestamp | formatted_end_time | conditional_message |",
-                "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
-                "| span1 | test_span_1 | test_project | 100000000 | 100         | trace1             | OK          | INFO  | 2023-01-01 10:00    |                    |                     |",
-                "| span2 | test_span_2 | test_project | 200000000 | 200         | trace2             | ERROR       | ERROR | 2023-01-01 10:10    |                    | Error occurred      |",
-                "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
-            ],
-            &result
-        );
+                [
+                    "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
+                    "| id    | name        | project_id   | duration  | duration_ms | context___trace_id | status_code | level | formatted_timestamp | formatted_end_time | conditional_message |",
+                    "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
+                    "| span1 | test_span_1 | test_project | 100000000 | 100         | trace1             | OK          | INFO  | 2023-01-01 10:00    |                    |                     |",
+                    "| span2 | test_span_2 | test_project | 200000000 | 200         | trace2             | ERROR       | ERROR | 2023-01-01 10:10    |                    | Error occurred      |",
+                    "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
+                ],
+                &result
+            );
 
         // Test 5: Timestamp filtering
         log::info!("Testing timestamp filtering");
@@ -367,16 +656,16 @@ mod tests {
         let result = df.collect().await?;
 
         #[rustfmt::skip]
-        assert_batches_eq!(
-            [
-                "+-------+", 
-                "| count |", 
-                "+-------+", 
-                "| 1     |", 
-                "+-------+",
-            ], 
-            &result
-        );
+            assert_batches_eq!(
+                [
+                    "+-------+",
+                    "| count |",
+                    "+-------+",
+                    "| 1     |",
+                    "+-------+",
+                ],
+                &result
+            );
 
         // Test 6: Duration filtering
         log::info!("Testing duration filtering");
@@ -384,48 +673,48 @@ mod tests {
         let result = df.collect().await?;
 
         #[rustfmt::skip]
-        assert_batches_eq!(
-            [
-                "+-------------+", 
-                "| name        |", 
-                "+-------------+", 
-                "| test_span_2 |", 
-                "+-------------+",
-            ],
-            &result
-        );
+            assert_batches_eq!(
+                [
+                    "+-------------+",
+                    "| name        |",
+                    "+-------------+",
+                    "| test_span_2 |",
+                    "+-------------+",
+                ],
+                &result
+            );
 
         // Test 7: Complex filtering with timestamp columns in ISO 8601 format
         log::info!("Testing complex filtering with timestamp columns in ISO 8601 format");
         let df = ctx
             .sql(
                 "
-                WITH time_data AS (
-                    SELECT 
-                        name, 
-                        status_code, 
+                    WITH time_data AS (
+                        SELECT
+                            name,
+                            status_code,
+                            level,
+                            CAST(duration / 1000000 AS INTEGER) as duration_ms,
+                            timestamp,
+                            to_char(timestamp, '%Y-%m-%d') as date_only,
+                            EXTRACT(HOUR FROM timestamp) as hour,
+                            to_char(timestamp, '%Y-%m-%dT%H:%M:%S%.6fZ') as iso_timestamp
+                        FROM otel_logs_and_spans
+                        WHERE
+                            project_id = 'test_project'
+                            AND timestamp > '2023-01-01T10:05:00.000000Z'
+                    )
+                    SELECT
+                        name,
+                        status_code,
                         level,
-                        CAST(duration / 1000000 AS INTEGER) as duration_ms,
-                        timestamp,
-                        to_char(timestamp, '%Y-%m-%d') as date_only,
-                        EXTRACT(HOUR FROM timestamp) as hour,
-                        to_char(timestamp, '%Y-%m-%dT%H:%M:%S%.6fZ') as iso_timestamp
-                    FROM otel_logs_and_spans 
-                    WHERE 
-                        project_id = 'test_project' 
-                        AND timestamp > '2023-01-01T10:05:00.000000Z'
-                )
-                SELECT 
-                    name, 
-                    status_code, 
-                    level, 
-                    duration_ms,
-                    date_only,
-                    hour,
-                    iso_timestamp
-                FROM time_data
-                ORDER BY name
-            ",
+                        duration_ms,
+                        date_only,
+                        hour,
+                        iso_timestamp
+                    FROM time_data
+                    ORDER BY name
+                ",
             )
             .await?;
         let result = df.collect().await?;
