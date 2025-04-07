@@ -1,24 +1,23 @@
+use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 
 use anyhow::Result;
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::common::SchemaExt;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_plan::collect;
+use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::DisplayAs;
-use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::scalar::ScalarValue;
 
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::common::not_impl_err;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    execution::context::SessionContext,
     logical_expr::{dml::InsertOp, BinaryExpr},
-    physical_expr::EquivalenceProperties,
-    physical_plan::{DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream},
+    physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::delta_datafusion::DataFusionMixins;
@@ -102,24 +101,18 @@ impl Database {
             let configs = self.project_configs.read().await;
             configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
         };
-        info!("execute insert_records_batch: getting table access");
 
         // Acquire write lock on the table
         let mut table = table_ref.write().await;
         let ops = DeltaOps(table.clone());
 
-        info!("execute insert_records_batch: preparing to write batch of size {:?}", batch.len());
-
         // For SQL INSERT operations, we need to make sure partitioning works correctly
         // by configuring the write operation with the correct partition columns
         let write_op = ops.write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
 
-        info!("execute insert_records_batch: writing batch with partitioning");
-
         // Execute the write operation with partitioning configuration
         *table = write_op.await?;
 
-        info!("execute insert_records_batch: write operation completed successfully");
         Ok(())
     }
 
@@ -132,8 +125,6 @@ impl Database {
         // Convert OtelLogsAndSpans records to Arrow RecordBatch format
         let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(TracingOptions::default())?;
         let batch = serde_arrow::to_record_batch(&fields, &records)?;
-
-        info!("Converting {} records to batch for insertion", records.len());
 
         // Call insert_records_batch with the converted batch to reuse common insertion logic
         self.insert_records_batch("default", vec![batch]).await
@@ -183,7 +174,7 @@ impl Database {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
     database: Arc<Database>,
@@ -211,6 +202,20 @@ impl ProjectRoutingTable {
             }
         }
         None
+    }
+
+    fn schema(&self) -> SchemaRef {
+        // For example, assume that the default project’s table has the right schema.
+        // (You might need to cache this schema during initialization.)
+        let schema = match self.database.resolve_table(&self.default_project).now_or_never() {
+            Some(Ok(table_lock)) => match table_lock.read().now_or_never() {
+                Some(guard) => guard.snapshot().unwrap().arrow_schema().unwrap(),
+                None => panic!("Failed to acquire read lock immediately"),
+            },
+            Some(Err(err)) => panic!("Failed to resolve table: {}", err),
+            None => panic!("resolve_table did not complete immediately"),
+        };
+        schema
     }
 
     fn extract_project_id(&self, expr: &Expr) -> Option<String> {
@@ -261,6 +266,46 @@ impl ProjectRoutingTable {
     }
 }
 
+// Needed by DataSink
+impl DisplayAs for ProjectRoutingTable {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "ProjectRoutingTable ")
+            } // DisplayFormatType::TreeRender => {
+              //     // TODO: collect info
+              //     write!(f, "")
+              // }
+        }
+    }
+}
+
+#[async_trait]
+impl DataSink for ProjectRoutingTable {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(&self, mut data: SendableRecordBatchStream, _context: &Arc<TaskContext>) -> DFResult<u64> {
+        let mut new_batches = vec![];
+        let mut row_count = 0;
+        while let Some(batch) = data.next().await.transpose()? {
+            row_count += batch.num_rows();
+            new_batches.push(batch);
+        }
+        // Convert anyhow::Error to DataFusionError
+        self.database
+            .insert_records_batch("", new_batches)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("Failed to insert records: {}", e)))?;
+        Ok(row_count as u64)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[async_trait]
 impl TableProvider for ProjectRoutingTable {
     fn as_any(&self) -> &dyn Any {
@@ -272,21 +317,19 @@ impl TableProvider for ProjectRoutingTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        // For example, assume that the default project’s table has the right schema.
-        // (You might need to cache this schema during initialization.)
-        let schema = match self.database.resolve_table(&self.default_project).now_or_never() {
-            Some(Ok(table_lock)) => match table_lock.read().now_or_never() {
-                Some(guard) => guard.snapshot().unwrap().arrow_schema().unwrap(),
-                None => panic!("Failed to acquire read lock immediately"),
-            },
-            Some(Err(err)) => panic!("Failed to resolve table: {}", err),
-            None => panic!("resolve_table did not complete immediately"),
-        };
-        schema.into()
+        self.schema()
     }
 
-    async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, _insert_op: InsertOp) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DeltaInsertExec::new(input, self.default_project.clone(), Arc::clone(&self.database))))
+    async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Create a physical plan from the logical plan.
+        // Check that the schema of the plan matches the schema of this table.
+        self.schema().logically_equivalent_names_and_types(&input.schema())?;
+
+        if insert_op != InsertOp::Append {
+            return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
+        }
+
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(self.clone()), None)))
     }
 
     fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
@@ -334,159 +377,13 @@ impl TableProvider for ProjectRoutingTable {
     }
 }
 
-#[derive(Debug)]
-pub struct DeltaInsertExec {
-    input: Arc<dyn ExecutionPlan>,
-    default_project: String,
-    database: Arc<Database>,
-    schema: SchemaRef,
-    plan_properties: PlanProperties,
-}
-
-impl DeltaInsertExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, default_project: String, database: Arc<Database>) -> Self {
-        // For inserts, we return a count schema
-        let schema = Self::make_count_schema();
-        let plan_properties = Self::create_schema(&input, schema.clone());
-        Self {
-            input,
-            default_project,
-            database,
-            schema,
-            plan_properties,
-        }
-    }
-
-    fn create_schema(input: &Arc<dyn ExecutionPlan>, schema: SchemaRef) -> PlanProperties {
-        let eq_properties = EquivalenceProperties::new(schema);
-        PlanProperties::new(
-            eq_properties,
-            Partitioning::UnknownPartitioning(1),
-            input.pipeline_behavior(),
-            input.boundedness(),
-        )
-    }
-
-    fn make_count_schema() -> SchemaRef {
-        // Define a schema with a single count column for INSERT results
-        Arc::new(Schema::new(vec![Field::new("count", DataType::UInt64, false)]))
-    }
-}
-
-impl ExecutionPlan for DeltaInsertExec {
-    fn name(&self) -> &str {
-        "delta_insert_exec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.plan_properties
-    }
-
-    fn with_new_children(self: Arc<Self>, new_children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self::new(
-            new_children[0].clone(),
-            self.default_project.clone(),
-            Arc::clone(&self.database),
-        )))
-    }
-
-    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        info!("in execute");
-        if partition != 0 {
-            return Err(DataFusionError::Internal("DeltaInsertExec can only be called on partition 0".to_string()));
-        }
-
-        // Clone values needed for the task
-        let db = self.database.clone();
-        let default_project = self.default_project.clone();
-        let input = self.input.clone();
-        let count_schema = self.schema.clone();
-
-        info!("input in execute {:?}", input);
-        // Create a stream that will execute this computation asynchronously
-        let stream = futures::stream::once(async move {
-            // Execute the input and collect all batches
-            let result = async {
-                // Execute the input plan
-                let input_stream = input.execute(0, context.clone())?;
-
-                // Collect all record batches from the stream
-                let mut batches = Vec::new();
-                let mut stream = input_stream;
-                let mut total_rows = 0;
-                info!("execute a");
-
-                while let Some(batch_result) = stream.next().await {
-                    info!("execute a.a.a. {:?}", batch_result);
-                    match batch_result {
-                        Ok(batch) => {
-                            total_rows += batch.num_rows();
-                            batches.push(batch);
-                        }
-                        Err(e) => return Err(DataFusionError::Execution(format!("Error fetching batch: {}", e))),
-                    }
-                }
-                info!("execute ab {:?}", batches);
-
-                if !batches.is_empty() {
-                    // Convert DataFusion record batches to Delta record batches
-                    let delta_batches: Vec<delta_kernel::arrow::record_batch::RecordBatch> = batches
-                        .into_iter()
-                        .map(|batch| delta_kernel::arrow::record_batch::RecordBatch::try_new(batch.schema().into(), batch.columns().to_vec()))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .map_err(|e| DataFusionError::Execution(format!("Failed to convert record batch: {}", e)))?;
-                    info!("execute ac ...");
-
-                    // Insert batches into the delta table
-                    db.insert_records_batch(&default_project, delta_batches)
-                        .await
-                        .map_err(|e| DataFusionError::Execution(format!("Failed to insert records: {}", e)))?;
-                }
-                info!("execute b");
-
-                // Create a record batch with the count of inserted rows
-                let array = arrow::array::UInt64Array::from(vec![total_rows as u64]);
-                let batch = datafusion::arrow::record_batch::RecordBatch::try_new(count_schema.clone(), vec![Arc::new(array)])
-                    .map_err(|e| DataFusionError::Execution(format!("Failed to create count batch: {}", e)))?;
-
-                info!("execute c {:?}", batch);
-                Ok(batch)
-            }
-            .await;
-
-            result
-        })
-        .boxed();
-
-        // Create a stream adapter to handle the async result
-        Ok(Box::pin(RecordBatchStreamAdapter::new(Self::make_count_schema(), stream)))
-    }
-}
-
-impl DisplayAs for DeltaInsertExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "DeltaInsertExec")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::thread::sleep;
 
     use chrono::{TimeZone, Utc};
     use datafusion::assert_batches_eq;
+    use datafusion::prelude::SessionContext;
     use dotenv::dotenv;
     use tokio::time;
     use uuid::Uuid;
@@ -549,13 +446,13 @@ mod tests {
             OtelLogsAndSpans {
                 project_id: "test_project".to_string(),
                 timestamp: timestamp1,
-                observed_timestamp: timestamp1,
+                observed_timestamp: Some(timestamp1),
                 id: "span1".to_string(),
-                name: "test_span_1".to_string(),
-                context___trace_id: "trace1".to_string(),
-                context___span_id: "span1".to_string(),
-                start_time: timestamp1,
-                duration: 100_000_000,
+                name: Some("test_span_1".to_string()),
+                context___trace_id: Some("trace1".to_string()),
+                context___span_id: Some("span1".to_string()),
+                start_time: Some(timestamp1),
+                duration: Some(100_000_000),
                 status_code: Some("OK".to_string()),
                 level: Some("INFO".to_string()),
                 ..Default::default()
@@ -563,13 +460,13 @@ mod tests {
             OtelLogsAndSpans {
                 project_id: "test_project".to_string(),
                 timestamp: timestamp2,
-                observed_timestamp: timestamp2,
+                observed_timestamp: Some(timestamp2),
                 id: "span2".to_string(),
-                name: "test_span_2".to_string(),
-                context___trace_id: "trace2".to_string(),
-                context___span_id: "span2".to_string(),
-                start_time: timestamp2,
-                duration: 200_000_000,
+                name: Some("test_span_2".to_string()),
+                context___trace_id: Some("trace2".to_string()),
+                context___span_id: Some("span2".to_string()),
+                start_time: Some(timestamp2),
+                duration: Some(200_000_000),
                 status_code: Some("ERROR".to_string()),
                 level: Some("ERROR".to_string()),
                 status_message: Some("Error occurred".to_string()),
@@ -580,18 +477,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_database_query() -> Result<()> {
-        // Setup test database with helper function
         let (db, ctx, test_prefix) = setup_test_database().await?;
         log::info!("Using test-specific table prefix: {}", test_prefix);
 
-        // Create sample records with different timestamps and durations
         let records = create_test_records();
-
-        log::info!("Inserting records");
         db.insert_records(&records).await?;
-
-        // Refresh the table to ensure it sees the newly written data
-        log::info!("Refreshing table metadata");
         refresh_table(&db, &ctx).await?;
 
         // Add a small delay to ensure propagation
@@ -610,9 +500,6 @@ mod tests {
                 "| 2     |", 
                 "+-------+",
             ], &result);
-
-        // TODO: The current implementation has schema mapping issues that need to be resolved
-        // For now, we'll skip the detailed tests and just verify that we can retrieve records
 
         // Test 2: Query with field selection and ordering
         log::info!("Testing field selection and ordering");
@@ -775,6 +662,13 @@ mod tests {
         let (db, ctx, test_prefix) = setup_test_database().await?;
         log::info!("Using test-specific table prefix for SQL INSERT test: {}", test_prefix);
 
+        // Print schema for debugging
+        let schema = OtelLogsAndSpans::schema_ref();
+        log::info!("Schema fields for debugging:");
+        for (i, field) in schema.fields().iter().enumerate() {
+            log::info!("Field {}: {} (type: {}, nullable: {})", i, field.name(), field.data_type(), field.is_nullable());
+        }
+
         // Test direct SQL INSERT using a simpler method
         log::info!("Testing direct SQL INSERT statement");
 
@@ -785,13 +679,13 @@ mod tests {
         let record = OtelLogsAndSpans {
             project_id: "test_project".to_string(),
             timestamp: datetime,
-            observed_timestamp: datetime,
+            observed_timestamp: Some(datetime),
             id: "sql_span1".to_string(),
-            name: "sql_test_span".to_string(),
-            duration: 150000000,
-            start_time: datetime,
-            context___trace_id: "sql_trace1".to_string(),
-            context___span_id: "sql_span1".to_string(),
+            name: Some("sql_test_span".to_string()),
+            duration: Some(150000000),
+            start_time: Some(datetime),
+            context___trace_id: Some("sql_trace1".to_string()),
+            context___span_id: Some("sql_span1".to_string()),
             status_code: Some("OK".to_string()),
             status_message: Some("SQL inserted successfully".to_string()),
             level: Some("INFO".to_string()),
@@ -802,10 +696,18 @@ mod tests {
         log::info!("Inserting record directly via API");
         db.insert_records(&vec![record]).await?;
 
-        // After inserting directly, we'll skip the SQL INSERT and just verify the results
+        refresh_table(&db, &ctx).await?;
+        let insert_result = ctx.sql("SELECT count(*) as count from otel_logs_and_spans").await?;
+        let result = insert_result.collect().await?;
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            ["+-------+", 
+            "| count |", 
+            "+-------+", 
+            "| 1     |", 
+            "+-------+",
+        ], &result);
 
-        // Create a dummy SQL query for validation and counting
-        let sql = "SELECT 1 as count";
         let insert_sql = format!(
             "INSERT INTO otel_logs_and_spans (
                 project_id, timestamp, observed_timestamp, id, parent_id, name, kind,
@@ -841,8 +743,8 @@ mod tests {
                 resource___attributes___telemetry___sdk___language, resource___attributes___telemetry___sdk___name,
                 resource___attributes___telemetry___sdk___version, resource___attributes___user_agent___original
             ) VALUES (
-                'test_project', TIMESTAMP '2023-01-01T10:00:00Z', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1', NULL, 'sql_test_span', NULL,
-                'OK', 'SQL inserted successfully', 'INFO', NULL, NULL,
+                'test_project', TIMESTAMP '2023-01-01T10:00:00Z', NULL, 'sql_span1', NULL, 'sql_test_span', NULL,
+                'OK', 'span inserted successfully', 'INFO', NULL, NULL,
                 NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL,
                 'sql_trace1', 'sql_span1', NULL, NULL,
                 NULL, NULL, NULL,
@@ -876,17 +778,17 @@ mod tests {
             )",
         );
 
-        // Log the SQL query for debugging
-        log::info!("Executing SQL INSERT statement");
+        refresh_table(&db, &ctx).await?;
         let insert_result = ctx.sql(&insert_sql).await?;
         let result = insert_result.collect().await?;
-
-        // The insert should return a count of 1 row inserted
-        assert_batches_eq!(["+-------+", "| count |", "+-------+", "| 1     |", "+-------+",], &result);
-
-        // Refresh the table to ensure it sees the newly inserted data
-        log::info!("Refreshing table metadata after SQL INSERT");
-        refresh_table(&db, &ctx).await?;
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            ["+-------+", 
+            "| count |", 
+            "+-------+", 
+            "| 1     |", 
+            "+-------+",
+        ], &result);
 
         // Add a small delay to ensure propagation
         sleep(time::Duration::from_millis(100));
@@ -898,11 +800,11 @@ mod tests {
         // Check that we can retrieve the inserted record
         assert_batches_eq!(
             [
-                "+----------+--------------+------------------------+",
-                "| id       | name         | status_message         |",
-                "+----------+--------------+------------------------+",
-                "| sql_span1| sql_test_span| SQL inserted successfully|",
-                "+----------+--------------+------------------------+",
+                "+-----------+---------------+----------------------------+",
+                "| id        | name          | status_message             |",
+                "+-----------+---------------+----------------------------+",
+                "| sql_span1 | sql_test_span | span inserted successfully |",
+                "+-----------+---------------+----------------------------+",
             ],
             &verify_result
         );
