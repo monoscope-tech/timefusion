@@ -1,12 +1,10 @@
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
-use anyhow::Result;
+use arrow_schema::{Field, Schema, SchemaRef};
+use delta_kernel::schema::StructField;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex; // Use tokio's Mutex
-use tokio::{
-    fs::{File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, SeekFrom},
-};
+use serde_arrow::schema::{SchemaLike, TracingOptions};
+use serde_json::json;
 
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -14,9 +12,9 @@ pub struct OtelLogsAndSpans {
     // Top-level fields
     pub project_id: String,
 
-    #[serde(with = "chrono::serde::ts_nanoseconds")]
+    #[serde(with = "chrono::serde::ts_microseconds")]
     pub timestamp:          chrono::DateTime<chrono::Utc>,
-    #[serde(with = "chrono::serde::ts_nanoseconds")]
+    #[serde(with = "chrono::serde::ts_microseconds")]
     pub observed_timestamp: chrono::DateTime<chrono::Utc>,
 
     pub id:             String,
@@ -30,13 +28,13 @@ pub struct OtelLogsAndSpans {
     pub level:                      Option<String>, // same as severity text
     pub severity___severity_text:   Option<String>,
     pub severity___severity_number: Option<String>,
-    pub body:                       Option<String>, // body as json
+    pub body:                       Option<String>, // body as json json
 
     pub duration: u64, // nanoseconds
 
-    #[serde(with = "chrono::serde::ts_nanoseconds")]
+    #[serde(with = "chrono::serde::ts_microseconds")]
     pub start_time: chrono::DateTime<chrono::Utc>,
-    #[serde(with = "chrono::serde::ts_nanoseconds_option")]
+    #[serde(with = "chrono::serde::ts_microseconds_option")]
     pub end_time:   Option<chrono::DateTime<chrono::Utc>>,
 
     // Context
@@ -138,80 +136,49 @@ pub struct OtelLogsAndSpans {
     pub resource___attributes___user_agent___original: Option<String>,
 }
 
-#[derive(Clone)]
-pub struct PersistentQueue {
-    path:     PathBuf,
-    file:     Arc<Mutex<File>>, // Using tokio::sync::Mutex
-    position: Arc<Mutex<u64>>,  // Using tokio::sync::Mutex
-}
+impl OtelLogsAndSpans {
+    pub fn table_name() -> String {
+        "otel_logs_and_spans".to_string()
+    }
+    pub fn columns() -> anyhow::Result<Vec<StructField>> {
+        let tracing_options = TracingOptions::default()
+            .overwrite("timestamp", json!({"name": "timestamp", "data_type": "Timestamp(Microsecond, None)"}))?
+            .overwrite(
+                "observed_timestamp",
+                json!({"name": "observed_timestamp", "data_type": "Timestamp(Microsecond, None)"}),
+            )?
+            .overwrite("start_time", json!({"name": "start_time", "data_type": "Timestamp(Microsecond, None)"}))?
+            .overwrite(
+                "end_time",
+                json!({"name": "end_time", "data_type": "Timestamp(Microsecond, None)", "nullable": true}),
+            )?;
 
-impl PersistentQueue {
-    pub async fn new(path: &str) -> Result<Self> {
-        let path = PathBuf::from(path);
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-        }
-        let file = OpenOptions::new().read(true).write(true).create(true).open(&path).await?;
-        Ok(Self {
-            path,
-            file: Arc::new(Mutex::new(file)),
-            position: Arc::new(Mutex::new(0)),
-        })
+        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?;
+        let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
+        log::info!("vec_refs {:?}", vec_refs);
+        Ok(vec_refs)
     }
 
-    /// Enqueue a new record into the persistent queue.
-    pub async fn enqueue(&self, record: &OtelLogsAndSpans) -> Result<()> {
-        let mut file = self.file.lock().await;
-        let mut pos = self.position.lock().await;
-        // Serialize the record as a JSON string.
-        let serialized = serde_json::to_string(record)?;
-        // Append a newline so that each record occupies its own line.
-        let serialized_line = format!("{}\n", serialized);
-        // Seek to the end of the file before writing.
-        file.seek(SeekFrom::End(0)).await?;
-        file.write_all(serialized_line.as_bytes()).await?;
-        file.flush().await?;
-        *pos += serialized_line.len() as u64;
-        Ok(())
+    pub fn schema_ref() -> SchemaRef {
+        let columns = OtelLogsAndSpans::columns().unwrap_or_else(|e| {
+            log::error!("Failed to get columns: {:?}", e);
+            Vec::new()
+        });
+
+        let arrow_fields: Vec<Field> = columns.iter().filter_map(|sf| sf.try_into().ok()).collect();
+
+        Arc::new(Schema::new(arrow_fields))
     }
 
-    pub async fn dequeue(&self) -> Result<Option<OtelLogsAndSpans>> {
-        let mut file = self.file.lock().await; // Lock async
-        let mut pos = self.position.lock().await; // Lock async
+    pub fn partitions() -> Vec<String> {
+        vec!["project_id".to_string(), "timestamp".to_string()]
+    }
 
-        if *pos == 0 {
-            return Ok(None);
-        }
+    pub fn partition_keys() -> Vec<String> {
+        vec!["project_id".to_string(), "timestamp".to_string()]
+    }
 
-        file.seek(SeekFrom::Start(0)).await?;
-        let mut reader = BufReader::new(&mut *file);
-        let mut line = String::new();
-        let bytes_read = reader.read_line(&mut line).await?;
-
-        if bytes_read == 0 {
-            return Ok(None);
-        }
-
-        let record: OtelLogsAndSpans = serde_json::from_str(&line.trim_end())?;
-        let consumed = bytes_read as u64;
-
-        *pos -= consumed;
-        file.set_len(*pos).await?;
-        file.seek(SeekFrom::Start(0)).await?;
-
-        if *pos > 0 {
-            let mut remaining = Vec::new();
-            let mut new_reader = BufReader::new(&mut *file);
-            new_reader.seek(SeekFrom::Start(consumed)).await?;
-            new_reader.read_to_end(&mut remaining).await?;
-
-            file.seek(SeekFrom::Start(0)).await?;
-            file.write_all(&remaining).await?;
-            file.flush().await?;
-        }
-
-        Ok(Some(record))
+    pub fn partition_values() -> Vec<String> {
+        vec!["project_id".to_string(), "timestamp".to_string()]
     }
 }
