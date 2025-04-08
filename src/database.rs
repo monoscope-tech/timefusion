@@ -1,17 +1,14 @@
-use std::fmt;
-use std::{any::Any, collections::HashMap, env, sync::Arc};
-
+use crate::persistent_queue::OtelLogsAndSpans;
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use datafusion::common::not_impl_err;
 use datafusion::common::SchemaExt;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::DisplayAs;
 use datafusion::scalar::ScalarValue;
-
-use datafusion::common::not_impl_err;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
@@ -20,15 +17,13 @@ use datafusion::{
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 use delta_kernel::arrow::record_batch::RecordBatch;
-use deltalake::delta_datafusion::DataFusionMixins;
 use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
-use futures::{FutureExt, StreamExt};
-use log::{info, warn};
-use serde_arrow::schema::{SchemaLike, TracingOptions};
+use futures::StreamExt;
+use log::info;
+use std::fmt;
+use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
 use url::Url;
-
-use crate::persistent_queue::OtelLogsAndSpans;
 
 type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
 
@@ -83,7 +78,7 @@ impl Database {
         // If not found and project_id is not "default", try the default table
         if project_id != "default" {
             if let Some((_, _, table)) = project_configs.get("default") {
-                warn!("Project '{}' not found, falling back to default project", project_id);
+                log::warn!("Project '{}' not found, falling back to default project", project_id);
                 return Ok(table.clone());
             }
         }
@@ -102,20 +97,16 @@ impl Database {
             configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
         };
 
-        // Acquire write lock on the table
         let mut table = table_ref.write().await;
         let ops = DeltaOps(table.clone());
 
-        // For SQL INSERT operations, we need to make sure partitioning works correctly
-        // by configuring the write operation with the correct partition columns
         let write_op = ops.write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
-
-        // Execute the write operation with partitioning configuration
         *table = write_op.await?;
 
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
         // TODO: insert records doesn't need to accept a project_id as they can be read from the
         // record.
@@ -123,7 +114,7 @@ impl Database {
         // correct table.
 
         // Convert OtelLogsAndSpans records to Arrow RecordBatch format
-        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(TracingOptions::default())?;
+        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(serde_arrow::schema::TracingOptions::default())?;
         let batch = serde_arrow::to_record_batch(&fields, &records)?;
 
         // Call insert_records_batch with the converted batch to reuse common insertion logic
@@ -152,7 +143,7 @@ impl Database {
         let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
             Ok(table) => table,
             Err(err) => {
-                warn!("table doesn't exist. creating new table. err: {:?}", err);
+                log::warn!("table doesn't exist. creating new table. err: {:?}", err);
 
                 // Create the table with project_id partitioning only for now
                 // Timestamp partitioning is likely causing issues with nanosecond precision
@@ -165,8 +156,6 @@ impl Database {
                     .await?
             }
         };
-
-        // No need to create routing table here - it's done at the application level
 
         let mut configs = self.project_configs.write().await;
         configs.insert(project_id.to_string(), (conn_str.to_string(), storage_options, Arc::new(RwLock::new(table))));
@@ -190,10 +179,6 @@ impl ProjectRoutingTable {
         }
     }
 
-    async fn resolve_table(&self, project_id: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
-        self.database.resolve_table(project_id).await
-    }
-
     fn extract_project_id_from_filters(&self, filters: &[Expr]) -> Option<String> {
         // Look for expressions like "project_id = 'some_value'"
         for filter in filters {
@@ -205,17 +190,7 @@ impl ProjectRoutingTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        // For example, assume that the default project’s table has the right schema.
-        // (You might need to cache this schema during initialization.)
-        let schema = match self.database.resolve_table(&self.default_project).now_or_never() {
-            Some(Ok(table_lock)) => match table_lock.read().now_or_never() {
-                Some(guard) => guard.snapshot().unwrap().arrow_schema().unwrap(),
-                None => panic!("Failed to acquire read lock immediately"),
-            },
-            Some(Err(err)) => panic!("Failed to resolve table: {}", err),
-            None => panic!("resolve_table did not complete immediately"),
-        };
-        schema
+        OtelLogsAndSpans::schema_ref()
     }
 
     fn extract_project_id(&self, expr: &Expr) -> Option<String> {
@@ -228,10 +203,8 @@ impl ProjectRoutingTable {
                     if let Expr::Column(col) = left.as_ref() {
                         if col.name == "project_id" {
                             // Check if right side is a literal string
-                            if let Expr::Literal(lit) = right.as_ref() {
-                                if let ScalarValue::Utf8(Some(value)) = lit {
-                                    return Some(value.clone());
-                                }
+                            if let Expr::Literal(ScalarValue::Utf8(Some(value))) = right.as_ref() {
+                                return Some(value.clone());
                             }
                         }
                     }
@@ -240,10 +213,8 @@ impl ProjectRoutingTable {
                     if let Expr::Column(col) = right.as_ref() {
                         if col.name == "project_id" {
                             // Check if left side is a literal string
-                            if let Expr::Literal(lit) = left.as_ref() {
-                                if let ScalarValue::Utf8(Some(value)) = lit {
-                                    return Some(value.clone());
-                                }
+                            if let Expr::Literal(ScalarValue::Utf8(Some(value))) = left.as_ref() {
+                                return Some(value.clone());
                             }
                         }
                     }
@@ -293,7 +264,6 @@ impl DataSink for ProjectRoutingTable {
             row_count += batch.num_rows();
             new_batches.push(batch);
         }
-        // Convert anyhow::Error to DataFusionError
         self.database
             .insert_records_batch("", new_batches)
             .await
@@ -337,39 +307,8 @@ impl TableProvider for ProjectRoutingTable {
     }
 
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Log the projection indices for debugging
-        if let Some(proj) = projection {
-            info!("Scan projection indices: {:?}", proj);
-
-            // Log original schema field names
-            info!(
-                "Original schema fields: {:?}",
-                self.schema.fields().iter().enumerate().map(|(i, f)| format!("{}: {}", i, f.name())).collect::<Vec<_>>()
-            );
-
-            // Convert indices to field names for better logging
-            let field_names: Vec<String> = proj
-                .iter()
-                .map(|&idx| {
-                    if idx < self.schema.fields().len() {
-                        format!("{}: {}", idx, self.schema.field(idx).name())
-                    } else {
-                        format!("unknown_field_{}", idx)
-                    }
-                })
-                .collect();
-            info!("Projected fields by index: {:?}", field_names);
-        } else {
-            info!("Scan with no projection");
-        }
-
-        // Log filters
-        info!("Scan filters: {:?}", filters);
-
         // Get project_id from filters if possible, otherwise use default
         let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
-
-        info!("Routing query to project_id: {}", project_id);
 
         let delta_table = self.database.resolve_table(&project_id).await?;
         let table = delta_table.read().await;
@@ -409,7 +348,7 @@ mod tests {
         info!("Test schema fields: {:?}", schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
 
         let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
-        session_context.register_table("otel_logs_and_spans", Arc::new(routing_table))?;
+        session_context.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
 
         Ok((db, session_context, test_prefix))
     }
@@ -428,8 +367,8 @@ mod tests {
         let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
 
         // Re-register the table with the session context
-        session_context.deregister_table("otel_logs_and_spans")?;
-        session_context.register_table("otel_logs_and_spans", Arc::new(routing_table))?;
+        session_context.deregister_table(OtelLogsAndSpans::table_name())?;
+        session_context.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
 
         // Add a small delay to ensure the changes propagate
         sleep(time::Duration::from_millis(100));
@@ -658,29 +597,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_sql_insert() -> Result<()> {
-        // Setup test database with helper function
         let (db, ctx, test_prefix) = setup_test_database().await?;
         log::info!("Using test-specific table prefix for SQL INSERT test: {}", test_prefix);
 
-        // Print schema for debugging
-        let schema = OtelLogsAndSpans::schema_ref();
-        log::info!("Schema fields for debugging:");
-        for (i, field) in schema.fields().iter().enumerate() {
-            log::info!("Field {}: {} (type: {}, nullable: {})", i, field.name(), field.data_type(), field.is_nullable());
-        }
-
-        // Test direct SQL INSERT using a simpler method
-        log::info!("Testing direct SQL INSERT statement");
-
-        // Create a datetime from the timestamp string
         let datetime = chrono::DateTime::parse_from_rfc3339("2023-02-01T15:30:00.000000Z").unwrap().with_timezone(&chrono::Utc);
-
-        // Create a record directly for insertion
         let record = OtelLogsAndSpans {
-            project_id: "test_project".to_string(),
+            project_id: "default".to_string(),
             timestamp: datetime,
             observed_timestamp: Some(datetime),
-            id: "sql_span1".to_string(),
+            id: "sql_span1a".to_string(),
             name: Some("sql_test_span".to_string()),
             duration: Some(150000000),
             start_time: Some(datetime),
@@ -691,107 +616,124 @@ mod tests {
             level: Some("INFO".to_string()),
             ..Default::default()
         };
-
-        // Insert the record using our insert_records method
-        log::info!("Inserting record directly via API");
         db.insert_records(&vec![record]).await?;
 
-        refresh_table(&db, &ctx).await?;
-        let insert_result = ctx.sql("SELECT count(*) as count from otel_logs_and_spans").await?;
-        let result = insert_result.collect().await?;
+        let verify_df = ctx.sql("SELECT id, name, timestamp from otel_logs_and_spans").await?.collect().await?;
         #[rustfmt::skip]
         assert_batches_eq!(
-            ["+-------+", 
-            "| count |", 
-            "+-------+", 
-            "| 1     |", 
-            "+-------+",
-        ], &result);
+            [
+                "+------------+---------------+---------------------+",
+                "| id         | name          | timestamp           |",
+                "+------------+---------------+---------------------+",
+                "| sql_span1a | sql_test_span | 2023-02-01T15:30:00 |",
+                "+------------+---------------+---------------------+",
+        ], &verify_df);
+        //
+        let insert_sql = "INSERT INTO otel_logs_and_spans (
+                project_id, timestamp, id,
+                parent_id, name, kind,
+                status_code, status_message, level, severity___severity_text, severity___severity_number,
+                body, duration, start_time, end_time
+            ) VALUES (
+                'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1',
+                NULL, 'sql_test_span', NULL,
+                'OK', 'span inserted successfully', 'INFO', 'INFORMATION', NULL,
+                NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL
+            )";
 
-        let insert_sql = format!(
-            "INSERT INTO otel_logs_and_spans (
-                project_id, timestamp, observed_timestamp, id, parent_id, name, kind,
+        let insert_result = ctx.sql(insert_sql).await?.collect().await?;
+        #[rustfmt::skip]
+        assert_batches_eq!(
+            ["+-------+",
+            "| count |",
+            "+-------+",
+            "| 1     |",
+            "+-------+",
+        ], &insert_result);
+
+        let verify_df = ctx
+            .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
+            .await?
+            .collect()
+            .await?;
+        #[rustfmt::skip]
+        assert_batches_eq!(
+        [
+            "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+            "| project_id   | id         | name          | timestamp           | kind | status_code | severity___severity_text | duration  | start_time          |",
+            "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+            "| default      | sql_span1a | sql_test_span | 2023-02-01T15:30:00 |      | OK          |                          | 150000000 | 2023-02-01T15:30:00 |",
+            "| test_project | sql_span1  | sql_test_span | 2023-01-01T10:00:00 |      | OK          | INFORMATION              | 150000000 | 2023-01-01T10:00:00 |",
+            "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+        ]
+        , &verify_df);
+
+        log::info!("Inserting record directly via insert statement");
+        let insert_sql = "INSERT INTO otel_logs_and_spans (
+                project_id, timestamp, observed_timestamp, id,
+                parent_id, name, kind,
                 status_code, status_message, level, severity___severity_text, severity___severity_number,
                 body, duration, start_time, end_time,
                 context___trace_id, context___span_id, context___trace_state, context___trace_flags,
                 context___is_remote, events, links,
                 attributes___client___address, attributes___client___port,
-                attributes___server___address, attributes___server___port,
-                attributes___network___local__address, attributes___network___local__port,
-                attributes___network___peer___address, attributes___network___peer__port,
-                attributes___network___protocol___name, attributes___network___protocol___version,
-                attributes___network___transport, attributes___network___type,
-                attributes___code___number, attributes___code___file___path,
-                attributes___code___function___name, attributes___code___line___number,
-                attributes___code___stacktrace, attributes___log__record___original,
-                attributes___log__record___uid, attributes___error___type,
-                attributes___exception___type, attributes___exception___message,
-                attributes___exception___stacktrace, attributes___url___fragment,
-                attributes___url___full, attributes___url___path, attributes___url___query,
-                attributes___url___scheme, attributes___user_agent___original,
-                attributes___http___request___method, attributes___http___request___method_original,
-                attributes___http___response___status_code, attributes___http___request___resend_count,
-                attributes___http___request___body___size, attributes___session___id,
-                attributes___session___previous___id, attributes___db___system___name,
-                attributes___db___collection___name, attributes___db___namespace,
-                attributes___db___operation___name, attributes___db___response___status_code,
-                attributes___db___operation___batch___size, attributes___db___query___summary,
-                attributes___db___query___text, attributes___user___id, attributes___user___email,
-                attributes___user___full_name, attributes___user___name, attributes___user___hash,
-                resource___attributes___service___name, resource___attributes___service___version,
-                resource___attributes___service___instance___id, resource___attributes___service___namespace,
-                resource___attributes___telemetry___sdk___language, resource___attributes___telemetry___sdk___name,
-                resource___attributes___telemetry___sdk___version, resource___attributes___user_agent___original
+
+                attributes___server___address, attributes___server___port, attributes___network___local__address, attributes___network___local__port,
+                attributes___network___peer___address, attributes___network___peer__port, attributes___network___protocol___name, attributes___network___protocol___version,
+                attributes___network___transport, attributes___network___type,attributes___code___number, attributes___code___file___path,
+                attributes___code___function___name, attributes___code___line___number, attributes___code___stacktrace, attributes___log__record___original,
+
+                attributes___log__record___uid, attributes___error___type, attributes___exception___type, attributes___exception___message,
+                attributes___exception___stacktrace, attributes___url___fragment, attributes___url___full, attributes___url___path,
+                attributes___url___query, attributes___url___scheme, attributes___user_agent___original, attributes___http___request___method,
+                attributes___http___request___method_original,attributes___http___response___status_code, attributes___http___request___resend_count, attributes___http___request___body___size,
+
+                attributes___session___id, attributes___session___previous___id, attributes___db___system___name, attributes___db___collection___name,
+                attributes___db___namespace, attributes___db___operation___name, attributes___db___response___status_code, attributes___db___operation___batch___size,
+                attributes___db___query___summary, attributes___db___query___text, attributes___user___id, attributes___user___email,
+                attributes___user___full_name, attributes___user___name, attributes___user___hash, resource___attributes___service___name,
+
+                resource___attributes___service___version, resource___attributes___service___instance___id, resource___attributes___service___namespace, resource___attributes___telemetry___sdk___language,
+                resource___attributes___telemetry___sdk___name, resource___attributes___telemetry___sdk___version, resource___attributes___user_agent___original
             ) VALUES (
-                'test_project', TIMESTAMP '2023-01-01T10:00:00Z', NULL, 'sql_span1', NULL, 'sql_test_span', NULL,
+                'test_project', TIMESTAMP '2023-01-02T10:00:00Z', NULL, 'sql_span2',
+                NULL, 'sql_test_span', NULL,
                 'OK', 'span inserted successfully', 'INFO', NULL, NULL,
                 NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL,
                 'sql_trace1', 'sql_span1', NULL, NULL,
                 NULL, NULL, NULL,
                 NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL,
-                NULL, NULL
-            )",
-        );
 
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL, NULL,
+
+                NULL, NULL, NULL, NULL,
+                NULL, NULL, NULL
+            )";
+
+        sleep(time::Duration::from_millis(100));
         refresh_table(&db, &ctx).await?;
-        let insert_result = ctx.sql(&insert_sql).await?;
-        let result = insert_result.collect().await?;
+        let insert_result = ctx.sql(insert_sql).await?.collect().await?;
         #[rustfmt::skip]
         assert_batches_eq!(
-            ["+-------+", 
-            "| count |", 
-            "+-------+", 
-            "| 1     |", 
+            ["+-------+",
+            "| count |",
             "+-------+",
-        ], &result);
-
-        // Add a small delay to ensure propagation
-        sleep(time::Duration::from_millis(100));
+            "| 1     |",
+            "+-------+",
+        ], &insert_result);
 
         // Verify that the SQL-inserted record exists
         let verify_df = ctx.sql("SELECT id, name, status_message FROM otel_logs_and_spans WHERE id = 'sql_span1'").await?;
@@ -809,36 +751,23 @@ mod tests {
             &verify_result
         );
 
-        // Test count to make sure we have 1 SQL-inserted record
-        let count_df = ctx.sql("SELECT COUNT(*) as count FROM otel_logs_and_spans WHERE id = 'sql_span1'").await?;
-        let count_result = count_df.collect().await?;
-
+        let verify_df = ctx
+            .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
+            .await?
+            .collect()
+            .await?;
         #[rustfmt::skip]
         assert_batches_eq!(
             [
-                "+-------+", 
-                "| count |", 
-                "+-------+", 
-                "| 1     |", 
-                "+-------+"
-            ], 
-            &count_result
-        );
-
-        // Test the total count (should be 1 since we're using a fresh database for this test)
-        let total_count_df = ctx.sql("SELECT COUNT(*) as count FROM otel_logs_and_spans").await?;
-        let total_count_result = total_count_df.collect().await?;
-
-        #[rustfmt::skip]
-        assert_batches_eq!(
-            [
-                "+-------+", 
-                "| count |", 
-                "+-------+", 
-                "| 1     |", 
-                "+-------+"
+                "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+                "| project_id   | id         | name          | timestamp           | kind | status_code | severity___severity_text | duration  | start_time          |",
+                "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+                "| default      | sql_span1a | sql_test_span | 2023-02-01T15:30:00 |      | OK          |                          | 150000000 | 2023-02-01T15:30:00 |",
+                "| test_project | sql_span2  | sql_test_span | 2023-01-02T10:00:00 |      | OK          |                          | 150000000 | 2023-01-01T10:00:00 |",
+                "| test_project | sql_span1  | sql_test_span | 2023-01-01T10:00:00 |      | OK          | INFORMATION              | 150000000 | 2023-01-01T10:00:00 |",
+                "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
             ],
-            &total_count_result
+            &verify_df
         );
 
         Ok(())

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use arrow_schema::{Field, Schema, SchemaRef};
 use delta_kernel::schema::StructField;
 use serde::{Deserialize, Serialize};
@@ -11,11 +11,6 @@ use serde_json::json;
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct OtelLogsAndSpans {
-    // Top-level fields
-    pub project_id: String,
-
-    #[serde(with = "chrono::serde::ts_microseconds")]
-    pub timestamp: chrono::DateTime<chrono::Utc>,
     #[serde(with = "chrono::serde::ts_microseconds_option")]
     pub observed_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 
@@ -136,9 +131,17 @@ pub struct OtelLogsAndSpans {
     pub resource___attributes___telemetry___sdk___version: Option<String>,
 
     pub resource___attributes___user_agent___original: Option<String>,
+    // Kept at the bottom to make delta-rs happy, so its schema matches datafusion.
+    // Seems delta removes the partition ids from the normal schema and moves them to the end.
+    // Top-level fields
+    pub project_id: String,
+
+    #[serde(with = "chrono::serde::ts_microseconds")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 impl OtelLogsAndSpans {
+    #[cfg(test)]
     pub fn table_name() -> String {
         "otel_logs_and_spans".to_string()
     }
@@ -165,7 +168,8 @@ impl OtelLogsAndSpans {
 
         let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?;
         let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
-        assert_eq!(fields[0].data_type(), &DataType::Utf8);
+        assert_eq!(fields[fields.len() - 2].data_type(), &DataType::Utf8);
+        assert_eq!(fields[fields.len() - 1].data_type(), &DataType::Timestamp(TimeUnit::Microsecond, None));
         Ok(vec_refs)
     }
 
