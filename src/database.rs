@@ -423,9 +423,6 @@ mod tests {
         let records = create_test_records();
         db.insert_records(&records).await?;
 
-        // Add a small delay to ensure propagation
-        sleep(time::Duration::from_millis(100));
-
         // Test 1: Basic count query to verify record insertion
         let count_df = ctx.sql("SELECT COUNT(*) as count FROM otel_logs_and_spans").await?;
         let result = count_df.collect().await?;
