@@ -113,6 +113,8 @@ impl Database {
         // Records should be grouped by span, and separated into groups then inserted into the
         // correct table.
 
+        use serde_arrow::schema::SchemaLike;
+
         // Convert OtelLogsAndSpans records to Arrow RecordBatch format
         let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(serde_arrow::schema::TracingOptions::default())?;
         let batch = serde_arrow::to_record_batch(&fields, &records)?;
@@ -324,18 +326,19 @@ mod tests {
     use datafusion::assert_batches_eq;
     use datafusion::prelude::SessionContext;
     use dotenv::dotenv;
+    use serial_test::serial;
     use tokio::time;
     use uuid::Uuid;
 
     use super::*;
 
     // Helper function to create a test database with a unique table prefix
-    async fn setup_test_database() -> Result<(Database, SessionContext, String)> {
+    async fn setup_test_database(prefix: String) -> Result<(Database, SessionContext, String)> {
         let _ = env_logger::builder().is_test(true).try_init();
         dotenv().ok();
 
         // Set a unique test-specific prefix for a clean Delta table
-        let test_prefix = format!("test-data-{}", Uuid::new_v4());
+        let test_prefix = format!("test-data-{}", prefix);
         unsafe {
             env::set_var("TIMEFUSION_TABLE_PREFIX", &test_prefix);
         }
@@ -343,9 +346,6 @@ mod tests {
         let db = Database::new().await?;
         let session_context = SessionContext::new();
         let schema = OtelLogsAndSpans::schema_ref();
-
-        // Log schema fields for debugging
-        info!("Test schema fields: {:?}", schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>());
 
         let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
         session_context.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
@@ -414,9 +414,10 @@ mod tests {
         ]
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_database_query() -> Result<()> {
-        let (db, ctx, test_prefix) = setup_test_database().await?;
+        let (db, ctx, test_prefix) = setup_test_database(Uuid::new_v4().to_string() + "query").await?;
         log::info!("Using test-specific table prefix: {}", test_prefix);
 
         let records = create_test_records();
@@ -595,11 +596,13 @@ mod tests {
         Ok(())
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_sql_insert() -> Result<()> {
-        let (db, ctx, test_prefix) = setup_test_database().await?;
+        let (db, ctx, test_prefix) = setup_test_database(Uuid::new_v4().to_string() + "insert").await?;
         log::info!("Using test-specific table prefix for SQL INSERT test: {}", test_prefix);
 
+        refresh_table(&db, &ctx).await?;
         let datetime = chrono::DateTime::parse_from_rfc3339("2023-02-01T15:30:00.000000Z").unwrap().with_timezone(&chrono::Utc);
         let record = OtelLogsAndSpans {
             project_id: "default".to_string(),
@@ -617,6 +620,7 @@ mod tests {
             ..Default::default()
         };
         db.insert_records(&vec![record]).await?;
+        refresh_table(&db, &ctx).await?;
 
         let verify_df = ctx.sql("SELECT id, name, timestamp from otel_logs_and_spans").await?.collect().await?;
         #[rustfmt::skip]
@@ -723,8 +727,6 @@ mod tests {
                 NULL, NULL, NULL
             )";
 
-        sleep(time::Duration::from_millis(100));
-        refresh_table(&db, &ctx).await?;
         let insert_result = ctx.sql(insert_sql).await?.collect().await?;
         #[rustfmt::skip]
         assert_batches_eq!(
@@ -750,6 +752,47 @@ mod tests {
             ],
             &verify_result
         );
+
+        // TODO: verify the correct copy to syntax
+        // let copy_sql = "COPY (VALUES (
+        //         NULL, 'sql_span2copy',
+        //         NULL, 'sql_test_span_copy', NULL,
+        //         'OK', 'span copied into successfully', 'INFO', NULL, NULL,
+        //         NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL,
+        //         'sql_trace1copy', 'sql_span1copy', NULL, NULL,
+        //         NULL, NULL, NULL,
+        //         NULL, NULL,
+        //
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL, NULL,
+        //
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL, NULL,
+        //
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL, NULL,
+        //
+        //         NULL, NULL, NULL, NULL,
+        //         NULL, NULL, NULL,
+        //
+        //         'test_project', TIMESTAMP '2023-01-02T10:00:00Z'
+        //     )) TO otel_logs_and_spans ";
+        //
+        // let insert_result = ctx.sql(copy_sql).await?.collect().await?;
+        // #[rustfmt::skip]
+        // assert_batches_eq!(
+        //     ["+-------+",
+        //     "| count |",
+        //     "+-------+",
+        //     "| 1     |",
+        //     "+-------+",
+        // ], &insert_result);
 
         let verify_df = ctx
             .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
