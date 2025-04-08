@@ -1,8 +1,8 @@
 // main.rs
 mod database;
 mod persistent_queue;
-use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
-use database::{Database, ProjectRoutingTable}; 
+use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
+use database::{Database, ProjectRoutingTable};
 use datafusion::{
     arrow::{
         array::{Array, StringArray, StringBuilder},
@@ -11,7 +11,7 @@ use datafusion::{
     },
     config::ConfigOptions,
     execution::context::SessionContext,
-    logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
+    logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility},
 };
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use dotenv::dotenv;
@@ -21,7 +21,7 @@ use serde::Deserialize;
 use std::{env, sync::Arc};
 use tokio::{
     net::TcpListener,
-    time::{Duration, sleep},
+    time::{sleep, Duration},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -117,21 +117,17 @@ async fn main() -> anyhow::Result<()> {
     info!("Database initialized successfully");
     let mut options = ConfigOptions::new();
     let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
-    let mut session_context = SessionContext::new_with_config(options.into());
+    let session_context = SessionContext::new_with_config(options.into());
 
     // Create tables and register them with session context
     let schema = OtelLogsAndSpans::schema_ref();
-    let routing_table = ProjectRoutingTable::new(
-        "default".to_string(),
-        Arc::new(db.clone()),
-        schema
-    );
+    let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
     session_context.register_table("otel_logs_and_spans", Arc::new(routing_table))?;
     info!("Registered ProjectRoutingTable with SessionContext");
 
     let initial_catalogs = session_context.catalog_names();
     info!("Initial catalogs: {:?}", initial_catalogs);
-    
+
     let catalog = session_context.catalog("datafusion");
     if let Some(catalog) = catalog {
         let schema_names = catalog.schema_names();
