@@ -422,7 +422,6 @@ mod tests {
 
         let records = create_test_records();
         db.insert_records(&records).await?;
-        refresh_table(&db, &ctx).await?;
 
         // Add a small delay to ensure propagation
         sleep(time::Duration::from_millis(100));
@@ -602,7 +601,6 @@ mod tests {
         let (db, ctx, test_prefix) = setup_test_database(Uuid::new_v4().to_string() + "insert").await?;
         log::info!("Using test-specific table prefix for SQL INSERT test: {}", test_prefix);
 
-        refresh_table(&db, &ctx).await?;
         let datetime = chrono::DateTime::parse_from_rfc3339("2023-02-01T15:30:00.000000Z").unwrap().with_timezone(&chrono::Utc);
         let record = OtelLogsAndSpans {
             project_id: "default".to_string(),
@@ -620,7 +618,6 @@ mod tests {
             ..Default::default()
         };
         db.insert_records(&vec![record]).await?;
-        refresh_table(&db, &ctx).await?;
 
         let verify_df = ctx.sql("SELECT id, name, timestamp from otel_logs_and_spans").await?.collect().await?;
         #[rustfmt::skip]
