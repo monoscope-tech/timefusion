@@ -64,6 +64,7 @@ datafusion-common = "46.0.0"
 [dev-dependencies]
 serial_test = "3.2.0"
 tokio-postgres = { version = "0.7.10", features = ["with-chrono-0_4"] }
+scopeguard = "1.2.0"
 
 [features]
 default = []

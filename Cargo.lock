@@ -6282,6 +6282,7 @@ dependencies = [
  "regex 1.11.1",
  "rustls 0.23.25",
  "rustls-pemfile 2.2.0",
+ "scopeguard",
  "serde",
  "serde_arrow",
  "serde_json",
