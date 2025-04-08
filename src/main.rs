@@ -122,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
     // Create tables and register them with session context
     let schema = OtelLogsAndSpans::schema_ref();
     let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
-    session_context.register_table("otel_logs_and_spans", Arc::new(routing_table))?;
+    session_context.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
     info!("Registered ProjectRoutingTable with SessionContext");
 
     let initial_catalogs = session_context.catalog_names();

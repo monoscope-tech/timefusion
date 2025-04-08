@@ -141,7 +141,6 @@ pub struct OtelLogsAndSpans {
 }
 
 impl OtelLogsAndSpans {
-    #[cfg(test)]
     pub fn table_name() -> String {
         "otel_logs_and_spans".to_string()
     }
