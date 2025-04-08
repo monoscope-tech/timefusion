@@ -48,8 +48,36 @@ mod integration {
             let _ = pg_server.await;
         });
 
-        // Give server time to start
-        sleep(Duration::from_secs(2)).await;
+        // Give server time to start with retry approach
+        let start_time = std::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        
+        // Try a test connection to make sure server is up
+        while start_time.elapsed() < timeout {
+            match tokio_postgres::connect(
+                "host=localhost port=5433 user=postgres password=postgres", 
+                NoTls
+            ).await {
+                Ok((_client, connection)) => {
+                    // Connection succeeded, spawn a task to drive it and return
+                    tokio::spawn(async move {
+                        if let Err(e) = connection.await {
+                            eprintln!("Test connection error: {}", e);
+                        }
+                    });
+                    
+                    // Small delay before we release the client
+                    sleep(Duration::from_millis(100)).await;
+                    
+                    // Server is ready
+                    break;
+                },
+                Err(_) => {
+                    // Small backoff between retry attempts
+                    sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
 
         Ok((shutdown_tx, test_id))
     }

@@ -1,17 +1,61 @@
+# Example SQLLogicTest for TimeFusion
+# This file contains SQL statements and expected results
+
+# Create a test timestamp value
+statement ok
+SELECT TIMESTAMP '2023-01-01T10:00:00Z' as test_timestamp;
+
+# Insert test span data
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id,
     parent_id, name, kind,
-    status_code, status_message, level, severity___severity_text, severity___severity_number,
-    body, duration, start_time, end_time
+    status_code, status_message, level
 ) VALUES (
     'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1',
     NULL, 'sql_test_span', NULL,
-    'OK', 'span inserted successfully', 'INFO', 'INFORMATION', NULL,
-    NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL
+    'OK', 'span inserted successfully', 'INFO'
 )
 
-query T
-SELECT projectid, id, timestamp FROM telemetry_events WHERE projectid = 'PROJECT_ID_PLACEHOLDER'
+# Query back the inserted data by ID without project_id
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE id = 'sql_span1'
 ----
-PROJECT_ID_PLACEHOLDER ID_PLACEHOLDER 2023-11-25T12:34:56.789Z
+sql_span1 sql_test_span
+
+# Insert a few more records with batch_spans
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id,
+    name, status_code, status_message, level
+) VALUES (
+    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span1',
+    'batch_test_1', 'OK', 'batch test 1', 'INFO'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id,
+    name, status_code, status_message, level
+) VALUES (
+    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span2',
+    'batch_test_2', 'OK', 'batch test 2', 'INFO'
+)
+
+# Query count of records for the test project
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'
+----
+3
+
+# Test filtering with LIKE
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE name LIKE 'batch%'
+----
+2
+
+# Test with aggregation on status_code
+query T rowsort
+SELECT status_code FROM otel_logs_and_spans WHERE id = 'sql_span1' GROUP BY status_code
+----
+OK
