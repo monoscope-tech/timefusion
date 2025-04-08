@@ -344,7 +344,8 @@ mod tests {
         }
 
         let db = Database::new().await?;
-        let session_context = SessionContext::new();
+        let mut session_context = SessionContext::new();
+        datafusion_functions_json::register_all(&session_context)?;
         let schema = OtelLogsAndSpans::schema_ref();
 
         let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
