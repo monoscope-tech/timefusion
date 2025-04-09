@@ -1,95 +1,17 @@
 // main.rs
-
 mod database;
 mod persistent_queue;
+use std::{env, sync::Arc};
 
-use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
-use database::{Database, ProjectRoutingTable};
-use datafusion::{
-    arrow::{
-        array::{Array, StringArray, StringBuilder},
-        datatypes::{DataType, Field, Schema},
-        record_batch::RecordBatch,
-    },
-    config::ConfigOptions,
-    execution::context::SessionContext,
-    logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
-};
-use datafusion_postgres::{DfSessionService, HandlerFactory};
+use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
+use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
-use persistent_queue::OtelLogsAndSpans;
 use serde::Deserialize;
-use std::{env, sync::Arc};
-use tokio::{
-    net::TcpListener,
-    time::{Duration, sleep},
-};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-
-fn register_pg_settings_table(ctx: &SessionContext) -> datafusion::error::Result<()> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("setting", DataType::Utf8, false),
-    ]));
-    let names = vec![
-        "TimeZone".to_string(),
-        "client_encoding".to_string(),
-        "datestyle".to_string(),
-        "client_min_messages".to_string(),
-        "time".to_string(),
-    ];
-    let settings = vec![
-        "UTC".to_string(),
-        "UTF8".to_string(),
-        "ISO, MDY".to_string(),
-        "notice".to_string(),
-        "UTC".to_string(),
-    ];
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(StringArray::from(names)),
-            Arc::new(StringArray::from(settings)),
-        ],
-    )?;
-    ctx.register_batch("pg_settings", batch)?;
-    Ok(())
-}
-
-fn register_set_config_udf(ctx: &SessionContext) {
-    let set_config_fn: ScalarFunctionImplementation =
-        Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
-            let param_value_array = match &args[1] {
-                ColumnarValue::Array(array) => array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("set_config second arg must be a StringArray"),
-                _ => panic!("set_config second arg must be an array"),
-            };
-
-            let mut builder = StringBuilder::new();
-            for i in 0..param_value_array.len() {
-                if param_value_array.is_null(i) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(param_value_array.value(i));
-                }
-            }
-            Ok(ColumnarValue::Array(Arc::new(builder.finish())))
-        });
-
-    let set_config_udf = create_udf(
-        "set_config",
-        vec![DataType::Utf8, DataType::Utf8, DataType::Boolean],
-        DataType::Utf8,
-        Volatility::Volatile,
-        set_config_fn,
-    );
-    ctx.register_udf(set_config_udf);
-}
 
 #[derive(Clone)]
 struct AppInfo {}
@@ -97,17 +19,14 @@ struct AppInfo {}
 #[derive(Deserialize)]
 struct RegisterProjectRequest {
     project_id: String,
-    bucket: String,
+    bucket:     String,
     access_key: String,
     secret_key: String,
-    endpoint: Option<String>,
+    endpoint:   Option<String>,
 }
 
 #[post("/register_project")]
-async fn register_project(
-    req: web::Json<RegisterProjectRequest>,
-    db: web::Data<Arc<Database>>,
-) -> impl Responder {
+async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<Arc<Database>>) -> impl Responder {
     match db
         .register_project(
             &req.project_id,
@@ -127,133 +46,64 @@ async fn register_project(
     }
 }
 
-#[derive(Deserialize)]
-struct QueryProjectRequest {
-    project_id: String,
-    query: String,
-}
-
-#[post("/query_project")]
-async fn query_project(
-    req: web::Json<QueryProjectRequest>,
-    session_ctx: web::Data<Arc<SessionContext>>,
-) -> impl Responder {
-    let df = match session_ctx.sql(&req.query).await {
-        Ok(df) => df,
-        Err(e) => {
-            return HttpResponse::InternalServerError()
-                .json(serde_json::json!({ "error": format!("{:?}", e) }))
-        }
-    };
-    match df.collect().await {
-        Ok(batches) => HttpResponse::Ok().json(serde_json::json!({ "batches": format!("{:?}", batches) })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({ "error": format!("{:?}", e) })),
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Initialize environment and logging
     dotenv().ok();
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("timefusion=debug,pgwire=trace,datafusion=debug")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("timefusion=debug,pgwire=trace,datafusion=debug")))
         .init();
 
     info!("Starting TimeFusion application");
 
-    // Create the Database.
+    // Initialize database
     let db = Database::new().await?;
     info!("Database initialized successfully");
 
-    // Create a DataFusion session context with custom configuration.
-    let mut options = ConfigOptions::new();
-    let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
-    let session_context = SessionContext::new_with_config(options.into());
+    // Create and setup session context
+    let session_context = db.create_session_context();
+    db.setup_session_context(&session_context)?;
+    info!("Session context setup complete");
 
-    // Create and register the routing table.
-    let schema = OtelLogsAndSpans::schema_ref();
-    let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
-    session_context.register_table("otel_logs_and_spans", Arc::new(routing_table))?;
-    info!("Registered ProjectRoutingTable with SessionContext");
-
-    // Register PG settings table and UDF.
-    register_pg_settings_table(&session_context);
-    register_set_config_udf(&session_context);
-    info!("Final catalogs: {:?}", session_context.catalog_names());
-
-    // Wrap session context and database in Arcs for sharing.
-    let session_context = Arc::new(session_context);
+    // Wrap database in Arc for sharing
     let db = Arc::new(db);
     let app_info = web::Data::new(AppInfo {});
 
-    // Setup shutdown token.
+    // Setup cancellation token for clean shutdown
     let shutdown_token = CancellationToken::new();
     let http_shutdown = shutdown_token.clone();
-    let pgwire_shutdown = shutdown_token.clone();
 
-    // Setup PGWire server.
-    // Pass the inner SessionContext by cloning it.
-    let pg_service = Arc::new(DfSessionService::new((*session_context).clone()));
-    let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
-    let pg_addr = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string());
-    let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", pg_addr)).await?;
-    info!("PGWire server running on 0.0.0.0:{}", pg_addr);
+    // Start PGWire server
+    let pg_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()).parse::<u16>().unwrap_or(5432);
+    let pg_server = db.start_pgwire_server(session_context, pg_port, shutdown_token.clone()).await?;
 
-    let pg_server = tokio::spawn({
-        let handler_factory = handler_factory.clone();
-        async move {
-            loop {
-                tokio::select! {
-                    _ = pgwire_shutdown.cancelled() => {
-                        info!("PGWire server shutting down.");
-                        break;
-                    }
-                    result = pg_listener.accept() => {
-                        match result {
-                            Ok((socket, addr)) => {
-                                debug!("PGWire: Accepted connection from {}.", addr);
-                                let handler_factory = handler_factory.clone();
-                                tokio::spawn(async move {
-                                    match pgwire::tokio::process_socket(socket, None, handler_factory).await {
-                                        Ok(()) => info!("PGWire: Connection from {} processed successfully.", addr),
-                                        Err(e) => error!("PGWire: Error processing connection from {}: {:?}", addr, e),
-                                    }
-                                });
-                            }
-                            Err(e) => error!("PGWire: Error accepting connection: {:?}", e),
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    sleep(Duration::from_secs(1)).await;
+    // Verify server started correctly
+    tokio::time::sleep(Duration::from_secs(1)).await;
     if pg_server.is_finished() {
         error!("PGWire server failed to start, aborting...");
         return Err(anyhow::anyhow!("PGWire server failed to start"));
     }
 
-    // Setup HTTP server.
+    // Start HTTP server
     let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
-    info!("Binding HTTP server to {}", http_addr);
-    let server = HttpServer::new(move || {
+    let http_server = HttpServer::new(move || {
         App::new()
             .wrap(Logger::default())
             .app_data(web::Data::new(db.clone()))
-            .app_data(web::Data::new(session_context.clone()))
             .app_data(app_info.clone())
             .service(register_project)
-            .service(query_project)
-    })
-    .bind(&http_addr)
-    .map_err(|e| {
-        error!("Failed to bind HTTP server to {}: {:?}", http_addr, e);
-        anyhow::anyhow!("Failed to bind HTTP server: {:?}", e)
-    })?
-    .run();
+    });
+
+    let server = match http_server.bind(&http_addr) {
+        Ok(s) => {
+            info!("HTTP server running on http://{}", http_addr);
+            s.run()
+        }
+        Err(e) => {
+            error!("Failed to bind HTTP server to {}: {:?}", http_addr, e);
+            return Err(anyhow::anyhow!("Failed to bind HTTP server: {:?}", e));
+        }
+    };
 
     let http_server_handle = server.handle();
     let http_task = tokio::spawn(async move {
@@ -265,8 +115,8 @@ async fn main() -> anyhow::Result<()> {
             ),
         }
     });
-    info!("HTTP server running on http://{}", http_addr);
 
+    // Wait for shutdown signal
     tokio::select! {
         _ = pg_server.map_err(|e| error!("PGWire server task failed: {:?}", e)) => {},
         _ = http_task.map_err(|e| error!("HTTP server task failed: {:?}", e)) => {},
