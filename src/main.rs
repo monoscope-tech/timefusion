@@ -1,13 +1,13 @@
 // main.rs
 mod database;
 mod persistent_queue;
-use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
 use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
 use serde::Deserialize;
 use std::{env, sync::Arc};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -58,12 +58,12 @@ async fn main() -> anyhow::Result<()> {
     // Initialize database
     let db = Database::new().await?;
     info!("Database initialized successfully");
-    
+
     // Create and setup session context
     let session_context = db.create_session_context();
     db.setup_session_context(&session_context)?;
     info!("Session context setup complete");
-    
+
     // Wrap database in Arc for sharing
     let db = Arc::new(db);
     let app_info = web::Data::new(AppInfo {});
@@ -71,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
     // Setup cancellation token for clean shutdown
     let shutdown_token = CancellationToken::new();
     let http_shutdown = shutdown_token.clone();
-    
+
     // Start PGWire server
     let pg_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()).parse::<u16>().unwrap_or(5432);
     let pg_server = db.start_pgwire_server(session_context, pg_port, shutdown_token.clone()).await?;
@@ -92,12 +92,12 @@ async fn main() -> anyhow::Result<()> {
             .app_data(app_info.clone())
             .service(register_project)
     });
-    
+
     let server = match http_server.bind(&http_addr) {
         Ok(s) => {
             info!("HTTP server running on http://{}", http_addr);
             s.run()
-        },
+        }
         Err(e) => {
             error!("Failed to bind HTTP server to {}: {:?}", http_addr, e);
             return Err(anyhow::anyhow!("Failed to bind HTTP server: {:?}", e));

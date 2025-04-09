@@ -3,23 +3,23 @@ use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::arrow::array::Array;
-use datafusion::common::not_impl_err;
 use datafusion::common::SchemaExt;
+use datafusion::common::not_impl_err;
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::DisplayAs;
+use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{dml::InsertOp, BinaryExpr},
+    logical_expr::{BinaryExpr, dml::InsertOp},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 use delta_kernel::arrow::record_batch::RecordBatch;
-use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
+use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, storage::StorageOptions};
 use futures::StreamExt;
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
@@ -69,19 +69,19 @@ impl Database {
 
         Ok(db)
     }
-    
+
     #[cfg(test)]
     pub async fn new_for_test() -> Result<Self> {
         // For tests, we directly configure all AWS env vars
         info!("Starting Database in test mode");
-        
+
         // Show all environment variables for debugging
         for (key, value) in env::vars() {
             if key.starts_with("AWS_") {
                 info!("ENV: {}={}", key, value);
             }
         }
-        
+
         let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
 
@@ -103,51 +103,45 @@ impl Database {
         // For tests, pass credentials explicitly
         let access_key = env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID not set");
         let secret_key = env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY not set");
-        
+
         info!("Registering project with explicit credentials");
-        db.register_project(
-            "default", 
-            &storage_uri, 
-            Some(&access_key), 
-            Some(&secret_key), 
-            Some(&aws_endpoint)
-        ).await?;
+        db.register_project("default", &storage_uri, Some(&access_key), Some(&secret_key), Some(&aws_endpoint)).await?;
 
         Ok(db)
     }
-    
+
     /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(&self) -> SessionContext {
         use datafusion::config::ConfigOptions;
         use datafusion::execution::context::SessionContext;
-        
+
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
         SessionContext::new_with_config(options.into())
     }
-    
+
     /// Setup the session context with tables and register DataFusion tables
     pub fn setup_session_context(&self, ctx: &SessionContext) -> DFResult<()> {
         use crate::persistent_queue::OtelLogsAndSpans;
-        
+
         // Create tables and register them with session context
         let schema = OtelLogsAndSpans::schema_ref();
         let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema);
         ctx.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
         info!("Registered ProjectRoutingTable with SessionContext");
-        
+
         self.register_pg_settings_table(ctx)?;
         self.register_set_config_udf(ctx);
-        
+
         Ok(())
     }
-    
+
     /// Register PostgreSQL settings table for compatibility
     pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
         use datafusion::arrow::array::StringArray;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::arrow::record_batch::RecordBatch;
-        
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
             Field::new("setting", DataType::Utf8, false),
@@ -161,13 +155,13 @@ impl Database {
         ctx.register_batch("pg_settings", batch)?;
         Ok(())
     }
-    
+
     /// Register set_config UDF for PostgreSQL compatibility
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
-        use datafusion::arrow::array::{StringBuilder, StringArray};
-        use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
+        use datafusion::arrow::array::{StringArray, StringBuilder};
         use datafusion::arrow::datatypes::DataType;
-        
+        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
+
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
                 ColumnarValue::Array(array) => array.as_any().downcast_ref::<StringArray>().expect("set_config second arg must be a StringArray"),
@@ -195,24 +189,21 @@ impl Database {
 
         ctx.register_udf(set_config_udf);
     }
-    
+
     /// Start a PGWire server with the given session context
     pub async fn start_pgwire_server(
-        &self,
-        session_context: SessionContext,
-        port: u16,
-        shutdown_token: CancellationToken,
+        &self, session_context: SessionContext, port: u16, shutdown_token: CancellationToken,
     ) -> Result<tokio::task::JoinHandle<()>> {
         use datafusion_postgres::{DfSessionService, HandlerFactory};
         use tokio::net::TcpListener;
-        
+
         let pg_service = Arc::new(DfSessionService::new(session_context));
         let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
         let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
         info!("PGWire server running on 0.0.0.0:{}", port);
 
         let pgwire_shutdown = shutdown_token.clone();
-        
+
         let pg_server = tokio::spawn({
             let handler_factory = handler_factory.clone();
             async move {
@@ -247,7 +238,7 @@ impl Database {
                 }
             }
         });
-        
+
         Ok(pg_server)
     }
 
@@ -683,16 +674,16 @@ mod tests {
         let result = df.collect().await?;
 
         assert_batches_eq!(
-                [
-                    "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
-                    "| id    | name        | project_id   | duration  | duration_ms | context___trace_id | status_code | level | formatted_timestamp | formatted_end_time | conditional_message |",
-                    "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
-                    "| span1 | test_span_1 | test_project | 100000000 | 100         | trace1             | OK          | INFO  | 2023-01-01 10:00    |                    |                     |",
-                    "| span2 | test_span_2 | test_project | 200000000 | 200         | trace2             | ERROR       | ERROR | 2023-01-01 10:10    |                    | Error occurred      |",
-                    "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
-                ],
-                &result
-            );
+            [
+                "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
+                "| id    | name        | project_id   | duration  | duration_ms | context___trace_id | status_code | level | formatted_timestamp | formatted_end_time | conditional_message |",
+                "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
+                "| span1 | test_span_1 | test_project | 100000000 | 100         | trace1             | OK          | INFO  | 2023-01-01 10:00    |                    |                     |",
+                "| span2 | test_span_2 | test_project | 200000000 | 200         | trace2             | ERROR       | ERROR | 2023-01-01 10:10    |                    | Error occurred      |",
+                "+-------+-------------+--------------+-----------+-------------+--------------------+-------------+-------+---------------------+--------------------+---------------------+",
+            ],
+            &result
+        );
 
         // Test 5: Timestamp filtering
         log::info!("Testing timestamp filtering");
