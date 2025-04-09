@@ -45,13 +45,11 @@ rustls = "0.23.23"
 actix-service = "2.0.2"
 lazy_static = "1.5.0"
 bcrypt = "0.17.0"
-opentelemetry = "0.28.0"
-opentelemetry-otlp = "0.28.0"
-tracing-opentelemetry = "0.29.0"
+opentelemetry_sdk = { version = "0.29.0", features = ["experimental_async_runtime", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.29.0", features = ["grpc-tonic"] }
+opentelemetry = "0.29.0"
+tracing-opentelemetry = "0.30.0"
 bincode = "1.3.3"
-opentelemetry_sdk = { version = "0.28.0", features = [
-  "experimental_async_runtime",
-] }
 actix-files = "0.6.6"
 datafusion-uwheel = { git = "https://github.com/apitoolkit/datafusion-uwheel.git", branch = "datafusion-46" }
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
@@ -62,6 +60,7 @@ aws-types = "1.3.6"
 aws-sdk-s3 = "1.3.0"
 url = "2.5.4"
 datafusion-common = "46.0.0"
+tracing-actix-web = "0.7.16"
 
 [dev-dependencies]
 serial_test = "3.2.0"

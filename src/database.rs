@@ -46,6 +46,7 @@ impl Clone for Database {
 }
 
 impl Database {
+    #[tracing::instrument(name = "db.new", skip())]
     pub async fn new() -> Result<Self> {
         let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
@@ -71,6 +72,7 @@ impl Database {
     }
 
     #[cfg(test)]
+    #[tracing::instrument(name = "db.new_for_test", skip())]
     pub async fn new_for_test() -> Result<Self> {
         // For tests, we directly configure all AWS env vars
         info!("Starting Database in test mode");
@@ -111,6 +113,7 @@ impl Database {
     }
 
     /// Create and configure a SessionContext with DataFusion settings
+    #[tracing::instrument(name = "db.create_session_context", skip(self))]
     pub fn create_session_context(&self) -> SessionContext {
         use datafusion::config::ConfigOptions;
         use datafusion::execution::context::SessionContext;
@@ -121,6 +124,7 @@ impl Database {
     }
 
     /// Setup the session context with tables and register DataFusion tables
+    #[tracing::instrument(name = "db.setup_session_context", skip(self, ctx))]
     pub fn setup_session_context(&self, ctx: &SessionContext) -> DFResult<()> {
         use crate::persistent_queue::OtelLogsAndSpans;
 
@@ -137,6 +141,7 @@ impl Database {
     }
 
     /// Register PostgreSQL settings table for compatibility
+    #[tracing::instrument(name = "db.register_pg_settings_table", skip(self, ctx))]
     pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
         use datafusion::arrow::array::StringArray;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -157,6 +162,7 @@ impl Database {
     }
 
     /// Register set_config UDF for PostgreSQL compatibility
+    #[tracing::instrument(name = "db.register_set_config_udf", skip(self, ctx))]
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
         use datafusion::arrow::array::{StringArray, StringBuilder};
         use datafusion::arrow::datatypes::DataType;
@@ -191,6 +197,7 @@ impl Database {
     }
 
     /// Start a PGWire server with the given session context
+    #[tracing::instrument(name = "db.start_pgwire_server", skip(self, session_context, shutdown_token), fields(port))]
     pub async fn start_pgwire_server(
         &self, session_context: SessionContext, port: u16, shutdown_token: CancellationToken,
     ) -> Result<tokio::task::JoinHandle<()>> {
@@ -242,6 +249,7 @@ impl Database {
         Ok(pg_server)
     }
 
+    #[tracing::instrument(name = "db.resolve_table", skip(self), fields(project_id))]
     pub async fn resolve_table(&self, project_id: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         let project_configs = self.project_configs.read().await;
 
@@ -265,6 +273,7 @@ impl Database {
         )))
     }
 
+    #[tracing::instrument(name = "db.insert_records_batch", skip(self, _table, batch), fields(batch_size = batch.len()))]
     pub async fn insert_records_batch(&self, _table: &str, batch: Vec<RecordBatch>) -> Result<()> {
         // Get the table reference for the default project
         let (_conn_str, _options, table_ref) = {
@@ -282,6 +291,8 @@ impl Database {
     }
 
     #[cfg(test)]
+
+    #[tracing::instrument(name = "db.insert_records", skip(self, records))]
     pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
         // TODO: insert records doesn't need to accept a project_id as they can be read from the
         // record.
@@ -298,6 +309,7 @@ impl Database {
         self.insert_records_batch("default", vec![batch]).await
     }
 
+    #[tracing::instrument(name = "db.register_project", skip(self, conn_str, access_key, secret_key, endpoint), fields(project_id))]
     pub async fn register_project(
         &self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
     ) -> Result<()> {
