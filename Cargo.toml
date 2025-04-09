@@ -29,7 +29,9 @@ bytes = "1.4"
 tokio-rustls = "0.26.1"
 sled = "0.34.7"
 actix-web = "4.9.0"
-datafusion-postgres = { git = "https://github.com/apitoolkit/FusionGate.git" }
+# datafusion-postgres = { git = "https://github.com/apitoolkit/FusionGate.git" }
+datafusion-postgres = { git = "https://github.com/apitoolkit/datafusion-postgres.git", branch = "interpret-dictionary-types" }
+# datafusion-postgres = { path = "../datafusion-projects/datafusion-postgres/datafusion-postgres/" }
 datafusion-functions-json = "0.46.0"
 anyhow = "1.0.95"
 tokio-util = "0.7.13"

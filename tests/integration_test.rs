@@ -147,8 +147,11 @@ mod integration {
             let count_rows = client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?;
             assert_eq!(count_rows[0].get::<_, i64>(0), 6, "Should have a total of 6 records (1 initial + 5 batch)");
 
+            let count_rows = client.query("SELECT project_id FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?;
+            assert_eq!(count_rows[0].get::<_, String>(0), "test_project", "project_id should match");
+
             let count_rows = client.query("SELECT * FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?;
-            assert_eq!(count_rows[0].get::<_, i64>(0), 6, "Should have a total of 6 records (1 initial + 5 batch)");
+            assert_eq!(count_rows[0].columns().len(), 80, "Should return all 80 columns");
 
             Ok::<_, tokio_postgres::Error>(())
         }
