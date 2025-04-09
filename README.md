@@ -16,5 +16,9 @@ Timefusion can be configured using the following environment variables:
 | `AWS_S3_BUCKET` | AWS S3 bucket name | Required |
 | `AWS_S3_ENDPOINT` | AWS S3 endpoint URL | `https://s3.amazonaws.com` |
 | `QUEUE_DB_PATH` | Path to the persistent queue database | `/app/queue_db` |
+| `OTEL_SERVICE_NAME` | The service name reported to OpenTelemetry | `timefusion` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP endpoint for sending traces & metrics | `hhttp://otelcol.apitoolkit.io:4317/` |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | (Optional) Separate OTLP endpoint for metrics | Same as `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `OTEL_RESOURCE_ATTRIBUTES` | Resource attributes for OTEL (set to your API Toolkit key) | `${APITOOLKIT_API_KEY}` |
 
 For local development, you can set `QUEUE_DB_PATH` to a location in your development environment.
