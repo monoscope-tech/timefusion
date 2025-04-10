@@ -4,7 +4,7 @@ use opentelemetry_sdk::{
     trace::SdkTracerProvider,
     Resource,
 };
-use opentelemetry::trace::TracerProvider; // for `.tracer()`
+use opentelemetry::trace::TracerProvider; 
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use std::{env, time::Duration};
 use opentelemetry::KeyValue;
@@ -14,7 +14,7 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 pub fn init_telemetry() {
     // Read configuration from environment variables.
     let otlp_trace_endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:4317".into());
+        .unwrap_or_else(|_| "http://otelcol.apitoolkit.io:4317".into());
     let otlp_metrics_endpoint = env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
         .unwrap_or_else(|_| otlp_trace_endpoint.clone());
     let service_name = env::var("OTEL_SERVICE_NAME")
