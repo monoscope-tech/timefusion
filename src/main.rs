@@ -1,19 +1,23 @@
 // src/main.rs
-mod telemetry;
 mod database;
-mod persistent_queue;
 mod error;
+mod persistent_queue;
+mod telemetry;
+use std::{env, sync::Arc};
+
 use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
 use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
 use serde::Deserialize;
-use std::{env, sync::Arc};
-use tokio::time::{Duration, sleep};
+use tokio::{
+    sync::mpsc,
+    time::{Duration, sleep},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_actix_web::TracingLogger;
-use tokio::sync::mpsc;
+
 use crate::error::{Result, TimeFusionError};
 
 struct AppState {
@@ -25,10 +29,10 @@ struct ShutdownSignal;
 #[derive(Deserialize)]
 struct RegisterProjectRequest {
     project_id: String,
-    bucket: String,
+    bucket:     String,
     access_key: String,
     secret_key: String,
-    endpoint: Option<String>,
+    endpoint:   Option<String>,
 }
 
 #[tracing::instrument(
@@ -37,11 +41,9 @@ struct RegisterProjectRequest {
     fields(project_id = %req.project_id)
 )]
 #[post("/register_project")]
-async fn register_project(
-    req: web::Json<RegisterProjectRequest>,
-    app_state: web::Data<AppState>,
-) -> Result<impl Responder> {
-    app_state.db
+async fn register_project(req: web::Json<RegisterProjectRequest>, app_state: web::Data<AppState>) -> Result<impl Responder> {
+    app_state
+        .db
         .register_project(
             &req.project_id,
             &req.bucket,
@@ -50,7 +52,7 @@ async fn register_project(
             req.endpoint.as_deref(),
         )
         .await?;
-    
+
     info!("Project registered successfully");
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "message": format!("Project '{}' registered successfully", req.project_id)
@@ -92,13 +94,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    let pg_port = env::var("PGWIRE_PORT")
-        .unwrap_or_else(|_| "5432".to_string())
-        .parse::<u16>()
-        .unwrap_or(5432);
-    let pg_server = db
-        .start_pgwire_server(session_context.clone(), pg_port, shutdown_token.clone())
-        .await?;
+    let pg_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()).parse::<u16>().unwrap_or(5432);
+    let pg_server = db.start_pgwire_server(session_context.clone(), pg_port, shutdown_token.clone()).await?;
 
     tokio::time::sleep(Duration::from_secs(1)).await;
     if pg_server.is_finished() {
@@ -106,17 +103,12 @@ async fn main() -> Result<()> {
         return Err(TimeFusionError::Generic(anyhow::anyhow!("PGWire server failed to start")));
     }
 
-    let http_addr = format!(
-        "0.0.0.0:{}",
-        env::var("PORT").unwrap_or_else(|_| "80".to_string())
-    );
+    let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
     let http_server = HttpServer::new(move || {
         App::new()
             .wrap(TracingLogger::default())
             .wrap(Logger::default())
-            .app_data(web::Data::new(AppState {
-                db: db.clone(),
-            }))
+            .app_data(web::Data::new(AppState { db: db.clone() }))
             .service(register_project)
     });
 

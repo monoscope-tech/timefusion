@@ -1,13 +1,16 @@
 #[cfg(test)]
 mod integration {
+    use std::{
+        collections::HashSet,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
     use anyhow::Result;
     use dotenv::dotenv;
     use rand::Rng;
     use scopeguard;
     use serial_test::serial;
-    use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{Client, NoTls};

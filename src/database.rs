@@ -1,32 +1,33 @@
-use crate::persistent_queue::OtelLogsAndSpans;
-use crate::error::{Result, TimeFusionError};
+use std::{any::Any, collections::HashMap, env, fmt, sync::Arc};
+
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::arrow::array::Array;
-use datafusion::common::SchemaExt;
-use datafusion::common::not_impl_err;
-use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_plan::DisplayAs;
-use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
-use datafusion::scalar::ScalarValue;
 use datafusion::{
+    arrow::array::Array,
     catalog::Session,
+    common::{SchemaExt, not_impl_err},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{BinaryExpr, dml::InsertOp},
-    physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, dml::InsertOp},
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+        insert::{DataSink, DataSinkExec},
+    },
+    scalar::ScalarValue,
 };
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, storage::StorageOptions};
 use futures::StreamExt;
-use std::fmt;
-use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use url::Url;
+
+use crate::{
+    error::{Result, TimeFusionError},
+    persistent_queue::OtelLogsAndSpans,
+};
 
 type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
 
@@ -48,8 +49,7 @@ impl Clone for Database {
 impl Database {
     #[tracing::instrument(name = "db.new", skip())]
     pub async fn new() -> Result<Self> {
-        let bucket = env::var("AWS_S3_BUCKET")
-            .map_err(|_| TimeFusionError::Config("AWS_S3_BUCKET environment variable not set".to_string()))?;
+        let bucket = env::var("AWS_S3_BUCKET").map_err(|_| TimeFusionError::Config("AWS_S3_BUCKET environment variable not set".to_string()))?;
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
 
         // Generate a unique prefix for this run's data
@@ -57,8 +57,7 @@ impl Database {
         let storage_uri = format!("s3://{}/{}/?endpoint={}", bucket, prefix, aws_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
-        let aws_url = Url::parse(&aws_endpoint)
-            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
+        let aws_url = Url::parse(&aws_endpoint).map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
@@ -86,8 +85,7 @@ impl Database {
             }
         }
 
-        let bucket = env::var("AWS_S3_BUCKET")
-            .map_err(|_| TimeFusionError::Config("AWS_S3_BUCKET environment variable not set".to_string()))?;
+        let bucket = env::var("AWS_S3_BUCKET").map_err(|_| TimeFusionError::Config("AWS_S3_BUCKET environment variable not set".to_string()))?;
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
 
         // Generate a unique prefix for this run's data
@@ -95,8 +93,7 @@ impl Database {
         let storage_uri = format!("s3://{}/{}/?endpoint={}", bucket, prefix, aws_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
-        let aws_url = Url::parse(&aws_endpoint)
-            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
+        let aws_url = Url::parse(&aws_endpoint).map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
@@ -107,10 +104,8 @@ impl Database {
         };
 
         // For tests, pass credentials explicitly
-        let access_key = env::var("AWS_ACCESS_KEY_ID")
-            .map_err(|_| TimeFusionError::Config("AWS_ACCESS_KEY_ID not set".to_string()))?;
-        let secret_key = env::var("AWS_SECRET_ACCESS_KEY")
-            .map_err(|_| TimeFusionError::Config("AWS_SECRET_ACCESS_KEY not set".to_string()))?;
+        let access_key = env::var("AWS_ACCESS_KEY_ID").map_err(|_| TimeFusionError::Config("AWS_ACCESS_KEY_ID not set".to_string()))?;
+        let secret_key = env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| TimeFusionError::Config("AWS_SECRET_ACCESS_KEY not set".to_string()))?;
 
         info!("Registering project with explicit credentials");
         db.register_project("default", &storage_uri, Some(&access_key), Some(&secret_key), Some(&aws_endpoint)).await?;
@@ -121,8 +116,7 @@ impl Database {
     /// Create and configure a SessionContext with DataFusion settings
     #[tracing::instrument(name = "db.create_session_context", skip(self))]
     pub fn create_session_context(&self) -> SessionContext {
-        use datafusion::config::ConfigOptions;
-        use datafusion::execution::context::SessionContext;
+        use datafusion::{config::ConfigOptions, execution::context::SessionContext};
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
@@ -149,9 +143,11 @@ impl Database {
     /// Register PostgreSQL settings table for compatibility
     #[tracing::instrument(name = "db.register_pg_settings_table", skip(self, ctx))]
     pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
-        use datafusion::arrow::array::StringArray;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::arrow::{
+            array::StringArray,
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
@@ -170,9 +166,13 @@ impl Database {
     /// Register set_config UDF for PostgreSQL compatibility
     #[tracing::instrument(name = "db.register_set_config_udf", skip(self, ctx))]
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
-        use datafusion::arrow::array::{StringArray, StringBuilder};
-        use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
+        use datafusion::{
+            arrow::{
+                array::{StringArray, StringBuilder},
+                datatypes::DataType,
+            },
+            logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
+        };
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
@@ -212,8 +212,7 @@ impl Database {
 
         let pg_service = Arc::new(DfSessionService::new(session_context));
         let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
-        let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await
-            .map_err(TimeFusionError::Io)?;
+        let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await.map_err(TimeFusionError::Io)?;
         info!("PGWire server running on 0.0.0.0:{}", port);
 
         let pgwire_shutdown = shutdown_token.clone();
@@ -285,7 +284,8 @@ impl Database {
         // Get the table reference for the default project
         let (_conn_str, _options, table_ref) = {
             let configs = self.project_configs.read().await;
-            configs.get("default")
+            configs
+                .get("default")
                 .ok_or_else(|| TimeFusionError::Generic(anyhow::anyhow!("Project ID 'default' not found")))?
                 .clone()
         };
@@ -294,8 +294,7 @@ impl Database {
         let ops = DeltaOps(table.clone());
 
         let write_op = ops.write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
-        *table = write_op.await
-            .map_err(TimeFusionError::Database)?;
+        *table = write_op.await.map_err(TimeFusionError::Database)?;
 
         Ok(())
     }
@@ -340,20 +339,14 @@ impl Database {
 
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let table = match DeltaTableBuilder::from_uri(conn_str)
-            .with_storage_options(storage_options.0.clone())
-            .with_allow_http(true)
-            .load()
-            .await
-        {
+        let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
             Ok(table) => table,
             Err(err) => {
                 log::warn!("table doesn't exist. creating new table. err: {:?}", err);
 
                 // Create the table with project_id partitioning only for now
                 // Timestamp partitioning is likely causing issues with nanosecond precision
-                let delta_ops = DeltaOps::try_from_uri(&conn_str).await
-                    .map_err(TimeFusionError::Database)?;
+                let delta_ops = DeltaOps::try_from_uri(&conn_str).await.map_err(TimeFusionError::Database)?;
                 delta_ops
                     .create()
                     .with_columns(OtelLogsAndSpans::columns().unwrap_or_default())
@@ -377,9 +370,7 @@ impl Database {
             let mut table = table.write().await;
             // Delta Lake doesn't have an explicit flush method, but we can ensure
             // the table is up-to-date by loading its latest state
-            *table = deltalake::open_table(&table.table_uri())
-                .await
-                .map_err(TimeFusionError::Database)?;
+            *table = deltalake::open_table(&table.table_uri()).await.map_err(TimeFusionError::Database)?;
             debug!("Flushed pending writes for project: {}", project_id);
         }
         Ok(())
@@ -389,8 +380,8 @@ impl Database {
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
-    database: Arc<Database>,
-    schema: SchemaRef,
+    database:        Arc<Database>,
+    schema:          SchemaRef,
 }
 
 impl ProjectRoutingTable {
@@ -531,8 +522,7 @@ mod tests {
     use std::thread::sleep;
 
     use chrono::{TimeZone, Utc};
-    use datafusion::assert_batches_eq;
-    use datafusion::prelude::SessionContext;
+    use datafusion::{assert_batches_eq, prelude::SessionContext};
     use dotenv::dotenv;
     use serial_test::serial;
     use tokio::time;

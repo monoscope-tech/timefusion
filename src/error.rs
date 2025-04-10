@@ -1,9 +1,10 @@
 // error.rs
-use thiserror::Error;
-use datafusion::error::DataFusionError;
-use actix_web::error::Error as ActixError;
-use deltalake::DeltaTableError;
 use std::io;
+
+use actix_web::error::Error as ActixError;
+use datafusion::error::DataFusionError;
+use deltalake::DeltaTableError;
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum TimeFusionError {
