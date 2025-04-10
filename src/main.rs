@@ -1,9 +1,10 @@
 // src/main.rs
+mod config;
 mod database;
 mod error;
 mod persistent_queue;
 mod telemetry;
-use std::{env, sync::Arc};
+use std::sync::Arc;
 
 use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
 use database::Database;
@@ -18,7 +19,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_actix_web::TracingLogger;
 
-use crate::error::{Result, TimeFusionError};
+use crate::{
+    config::Config,
+    error::{Result, TimeFusionError},
+};
 
 struct AppState {
     db: Arc<Database>,
@@ -63,12 +67,15 @@ async fn register_project(req: web::Json<RegisterProjectRequest>, app_state: web
 async fn main() -> Result<()> {
     dotenv().ok();
 
+    // Load configuration once at startup
+    let config = Config::from_env()?;
+
     // Initialize tracing & metrics
     telemetry::init_telemetry();
 
     info!("Starting TimeFusion application");
 
-    let db = Database::new().await?;
+    let db = Database::new(&config).await?; // Pass &config here
     info!("Database initialized successfully");
 
     let session_context = db.create_session_context();
@@ -80,7 +87,6 @@ async fn main() -> Result<()> {
     let shutdown_token = CancellationToken::new();
     let http_shutdown = shutdown_token.clone();
 
-    // Spawn database write monitor
     let db_clone = db.clone();
     let shutdown_monitor = shutdown_token.clone();
     tokio::spawn(async move {
@@ -94,8 +100,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let pg_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()).parse::<u16>().unwrap_or(5432);
-    let pg_server = db.start_pgwire_server(session_context.clone(), pg_port, shutdown_token.clone()).await?;
+    let pg_server = db.start_pgwire_server(session_context.clone(), config.pg_port, shutdown_token.clone()).await?;
 
     tokio::time::sleep(Duration::from_secs(1)).await;
     if pg_server.is_finished() {
@@ -103,7 +108,7 @@ async fn main() -> Result<()> {
         return Err(TimeFusionError::Generic(anyhow::anyhow!("PGWire server failed to start")));
     }
 
-    let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
+    let http_addr = format!("0.0.0.0:{}", config.http_port);
     let http_server = HttpServer::new(move || {
         App::new()
             .wrap(TracingLogger::default())

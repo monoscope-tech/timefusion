@@ -5,6 +5,7 @@ use delta_kernel::schema::StructField;
 use serde::{Deserialize, Serialize};
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 use serde_json::json;
+
 use crate::error::{Result, TimeFusionError};
 
 #[allow(non_snake_case)]
