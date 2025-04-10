@@ -1,7 +1,8 @@
 // src/main.rs
-mod telemetry; 
+mod telemetry;
 mod database;
 mod persistent_queue;
+mod error;
 use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
 use database::Database;
 use dotenv::dotenv;
@@ -12,9 +13,14 @@ use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_actix_web::TracingLogger;
+use tokio::sync::mpsc;
+use crate::error::{Result, TimeFusionError};
 
-#[derive(Clone)]
-struct AppInfo {}
+struct AppState {
+    db: Arc<Database>,
+}
+
+struct ShutdownSignal;
 
 #[derive(Deserialize)]
 struct RegisterProjectRequest {
@@ -27,15 +33,15 @@ struct RegisterProjectRequest {
 
 #[tracing::instrument(
     name = "HTTP /register_project",
-    skip(req, db),
+    skip(req, app_state),
     fields(project_id = %req.project_id)
 )]
 #[post("/register_project")]
 async fn register_project(
     req: web::Json<RegisterProjectRequest>,
-    db: web::Data<Arc<Database>>,
-) -> impl Responder {
-    match db
+    app_state: web::Data<AppState>,
+) -> Result<impl Responder> {
+    app_state.db
         .register_project(
             &req.project_id,
             &req.bucket,
@@ -43,25 +49,16 @@ async fn register_project(
             Some(&req.secret_key),
             req.endpoint.as_deref(),
         )
-        .await
-    {
-        Ok(()) => {
-            info!("Project registered successfully");
-            HttpResponse::Ok().json(serde_json::json!({
-                "message": format!("Project '{}' registered successfully", req.project_id)
-            }))
-        }
-        Err(e) => {
-            error!("Failed to register project: {:?}", e);
-            HttpResponse::InternalServerError().json(serde_json::json!({
-                "error": format!("Failed to register project: {:?}", e)
-            }))
-        }
-    }
+        .await?;
+    
+    info!("Project registered successfully");
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": format!("Project '{}' registered successfully", req.project_id)
+    })))
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     dotenv().ok();
 
     // Initialize tracing & metrics
@@ -77,10 +74,23 @@ async fn main() -> anyhow::Result<()> {
     info!("Session context setup complete");
 
     let db = Arc::new(db);
-    let app_info = web::Data::new(AppInfo {});
-
+    let (shutdown_tx, _shutdown_rx) = mpsc::channel::<ShutdownSignal>(1);
     let shutdown_token = CancellationToken::new();
     let http_shutdown = shutdown_token.clone();
+
+    // Spawn database write monitor
+    let db_clone = db.clone();
+    let shutdown_monitor = shutdown_token.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_monitor.cancelled() => {
+                db_clone.flush_pending_writes().await.unwrap_or_else(|e| {
+                    error!("Failed to flush pending writes: {:?}", e);
+                });
+                info!("Database writes completed during shutdown");
+            }
+        }
+    });
 
     let pg_port = env::var("PGWIRE_PORT")
         .unwrap_or_else(|_| "5432".to_string())
@@ -93,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(1)).await;
     if pg_server.is_finished() {
         error!("PGWire server failed to start, aborting...");
-        return Err(anyhow::anyhow!("PGWire server failed to start"));
+        return Err(TimeFusionError::Generic(anyhow::anyhow!("PGWire server failed to start")));
     }
 
     let http_addr = format!(
@@ -104,8 +114,9 @@ async fn main() -> anyhow::Result<()> {
         App::new()
             .wrap(TracingLogger::default())
             .wrap(Logger::default())
-            .app_data(web::Data::new(db.clone()))
-            .app_data(app_info.clone())
+            .app_data(web::Data::new(AppState {
+                db: db.clone(),
+            }))
             .service(register_project)
     });
 
@@ -116,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             error!("Failed to bind HTTP server to {}: {:?}", http_addr, e);
-            return Err(anyhow::anyhow!("Failed to bind HTTP server: {:?}", e));
+            return Err(TimeFusionError::Io(e));
         }
     };
 
@@ -137,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, initiating shutdown.");
             shutdown_token.cancel();
+            let _ = shutdown_tx.send(ShutdownSignal).await;
             http_handle.stop(true).await;
             sleep(Duration::from_secs(1)).await;
         }

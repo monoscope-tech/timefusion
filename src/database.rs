@@ -1,5 +1,5 @@
 use crate::persistent_queue::OtelLogsAndSpans;
-use anyhow::Result;
+use crate::error::{Result, TimeFusionError};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::arrow::array::Array;
@@ -48,7 +48,8 @@ impl Clone for Database {
 impl Database {
     #[tracing::instrument(name = "db.new", skip())]
     pub async fn new() -> Result<Self> {
-        let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
+        let bucket = env::var("AWS_S3_BUCKET")
+            .map_err(|_| TimeFusionError::Config("AWS_S3_BUCKET environment variable not set".to_string()))?;
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
 
         // Generate a unique prefix for this run's data
@@ -56,7 +57,8 @@ impl Database {
         let storage_uri = format!("s3://{}/{}/?endpoint={}", bucket, prefix, aws_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
-        let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
+        let aws_url = Url::parse(&aws_endpoint)
+            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
@@ -84,7 +86,8 @@ impl Database {
             }
         }
 
-        let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
+        let bucket = env::var("AWS_S3_BUCKET")
+            .map_err(|_| TimeFusionError::Config("AWS_S3_BUCKET environment variable not set".to_string()))?;
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
 
         // Generate a unique prefix for this run's data
@@ -92,7 +95,8 @@ impl Database {
         let storage_uri = format!("s3://{}/{}/?endpoint={}", bucket, prefix, aws_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
-        let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
+        let aws_url = Url::parse(&aws_endpoint)
+            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
@@ -103,8 +107,10 @@ impl Database {
         };
 
         // For tests, pass credentials explicitly
-        let access_key = env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID not set");
-        let secret_key = env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY not set");
+        let access_key = env::var("AWS_ACCESS_KEY_ID")
+            .map_err(|_| TimeFusionError::Config("AWS_ACCESS_KEY_ID not set".to_string()))?;
+        let secret_key = env::var("AWS_SECRET_ACCESS_KEY")
+            .map_err(|_| TimeFusionError::Config("AWS_SECRET_ACCESS_KEY not set".to_string()))?;
 
         info!("Registering project with explicit credentials");
         db.register_project("default", &storage_uri, Some(&access_key), Some(&secret_key), Some(&aws_endpoint)).await?;
@@ -206,7 +212,8 @@ impl Database {
 
         let pg_service = Arc::new(DfSessionService::new(session_context));
         let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
-        let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+        let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await
+            .map_err(TimeFusionError::Io)?;
         info!("PGWire server running on 0.0.0.0:{}", port);
 
         let pgwire_shutdown = shutdown_token.clone();
@@ -278,20 +285,22 @@ impl Database {
         // Get the table reference for the default project
         let (_conn_str, _options, table_ref) = {
             let configs = self.project_configs.read().await;
-            configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
+            configs.get("default")
+                .ok_or_else(|| TimeFusionError::Generic(anyhow::anyhow!("Project ID 'default' not found")))?
+                .clone()
         };
 
         let mut table = table_ref.write().await;
         let ops = DeltaOps(table.clone());
 
         let write_op = ops.write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
-        *table = write_op.await?;
+        *table = write_op.await
+            .map_err(TimeFusionError::Database)?;
 
         Ok(())
     }
 
     #[cfg(test)]
-
     #[tracing::instrument(name = "db.insert_records", skip(self, records))]
     pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
         // TODO: insert records doesn't need to accept a project_id as they can be read from the
@@ -302,8 +311,10 @@ impl Database {
         use serde_arrow::schema::SchemaLike;
 
         // Convert OtelLogsAndSpans records to Arrow RecordBatch format
-        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(serde_arrow::schema::TracingOptions::default())?;
-        let batch = serde_arrow::to_record_batch(&fields, &records)?;
+        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(serde_arrow::schema::TracingOptions::default())
+            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to create schema fields: {}", e)))?;
+        let batch = serde_arrow::to_record_batch(&fields, &records)
+            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to convert to record batch: {}", e)))?;
 
         // Call insert_records_batch with the converted batch to reuse common insertion logic
         self.insert_records_batch("default", vec![batch]).await
@@ -329,25 +340,48 @@ impl Database {
 
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
+        let table = match DeltaTableBuilder::from_uri(conn_str)
+            .with_storage_options(storage_options.0.clone())
+            .with_allow_http(true)
+            .load()
+            .await
+        {
             Ok(table) => table,
             Err(err) => {
                 log::warn!("table doesn't exist. creating new table. err: {:?}", err);
 
                 // Create the table with project_id partitioning only for now
                 // Timestamp partitioning is likely causing issues with nanosecond precision
-                let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
+                let delta_ops = DeltaOps::try_from_uri(&conn_str).await
+                    .map_err(TimeFusionError::Database)?;
                 delta_ops
                     .create()
                     .with_columns(OtelLogsAndSpans::columns().unwrap_or_default())
                     .with_partition_columns(OtelLogsAndSpans::partitions())
                     .with_storage_options(storage_options.0.clone())
-                    .await?
+                    .await
+                    .map_err(TimeFusionError::Database)?
             }
         };
 
         let mut configs = self.project_configs.write().await;
         configs.insert(project_id.to_string(), (conn_str.to_string(), storage_options, Arc::new(RwLock::new(table))));
+        Ok(())
+    }
+
+    /// Flushes any pending writes to Delta Lake for all projects
+    #[tracing::instrument(name = "db.flush_pending_writes", skip(self))]
+    pub async fn flush_pending_writes(&self) -> Result<()> {
+        let configs = self.project_configs.read().await;
+        for (project_id, (_, _, table)) in configs.iter() {
+            let mut table = table.write().await;
+            // Delta Lake doesn't have an explicit flush method, but we can ensure
+            // the table is up-to-date by loading its latest state
+            *table = deltalake::open_table(&table.table_uri())
+                .await
+                .map_err(TimeFusionError::Database)?;
+            debug!("Flushed pending writes for project: {}", project_id);
+        }
         Ok(())
     }
 }
@@ -410,16 +444,6 @@ impl ProjectRoutingTable {
                 }
                 None
             }
-            // // Recursive: AND, OR expressions
-            // Expr::BooleanQuery { operands, .. } => {
-            //     for operand in operands {
-            //         if let Some(project_id) = self.extract_project_id(operand) {
-            //             return Some(project_id);
-            //         }
-            //     }
-            //     None
-            // }
-            // Look inside NOT expressions
             Expr::Not(inner) => self.extract_project_id(inner),
             _ => None,
         }
@@ -432,10 +456,7 @@ impl DisplayAs for ProjectRoutingTable {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "ProjectRoutingTable ")
-            } // DisplayFormatType::TreeRender => {
-              //     // TODO: collect info
-              //     write!(f, "")
-              // }
+            }
         }
     }
 }

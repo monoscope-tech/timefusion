@@ -6322,6 +6322,7 @@ dependencies = [
  "sqlparser 0.55.0",
  "task",
  "tempfile",
+ "thiserror 2.0.12",
  "tokio",
  "tokio-postgres",
  "tokio-rustls 0.26.2",

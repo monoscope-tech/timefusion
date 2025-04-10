@@ -2,3 +2,4 @@
 pub mod database;
 pub mod persistent_queue;
 pub mod telemetry;
+pub mod error; 

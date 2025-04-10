@@ -1,4 +1,4 @@
-// src/telemetry.rs
+// telemetry.rs
 
 use opentelemetry_sdk::{
     trace::SdkTracerProvider,
