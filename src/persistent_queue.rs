@@ -17,14 +17,19 @@ pub struct OtelLogsAndSpans {
     pub id: String,
     pub parent_id: Option<String>,
     pub name: Option<String>,
-    pub kind: Option<String>,
+    pub kind: Option<String>, // logs, span, request
     pub status_code: Option<String>,
     pub status_message: Option<String>,
 
     // Logs specific
     pub level: Option<String>, // same as severity text
+
+    // Severity
+    pub severity: Option<String>, // severity as json
+
     pub severity___severity_text: Option<String>,
     pub severity___severity_number: Option<String>,
+
     pub body: Option<String>, // body as json json
 
     pub duration: Option<u64>, // nanoseconds
@@ -35,6 +40,8 @@ pub struct OtelLogsAndSpans {
     pub end_time: Option<chrono::DateTime<chrono::Utc>>,
 
     // Context
+    pub context: Option<String>, // context as json
+    //
     pub context___trace_id: Option<String>,
     pub context___span_id: Option<String>,
     pub context___trace_state: Option<String>,
@@ -48,7 +55,7 @@ pub struct OtelLogsAndSpans {
     pub links: Option<String>, // links json
 
     // Attributes
-
+    pub attributes: Option<String>, // attirbutes object as json
     // Server and client
     pub attributes___client___address: Option<String>,
     pub attributes___client___port: Option<u32>,
@@ -120,17 +127,20 @@ pub struct OtelLogsAndSpans {
     pub attributes___user___name: Option<String>,
     pub attributes___user___hash: Option<String>,
 
+    // Resource
+    pub resource: Option<String>, // resource as json
+
     // Resource Attributes (subset) https://opentelemetry.io/docs/specs/semconv/resource/
-    pub resource___attributes___service___name: Option<String>,
-    pub resource___attributes___service___version: Option<String>,
-    pub resource___attributes___service___instance___id: Option<String>,
-    pub resource___attributes___service___namespace: Option<String>,
+    pub resource___service___name: Option<String>,
+    pub resource___service___version: Option<String>,
+    pub resource___service___instance___id: Option<String>,
+    pub resource___service___namespace: Option<String>,
 
-    pub resource___attributes___telemetry___sdk___language: Option<String>,
-    pub resource___attributes___telemetry___sdk___name: Option<String>,
-    pub resource___attributes___telemetry___sdk___version: Option<String>,
+    pub resource___telemetry___sdk___language: Option<String>,
+    pub resource___telemetry___sdk___name: Option<String>,
+    pub resource___telemetry___sdk___version: Option<String>,
 
-    pub resource___attributes___user_agent___original: Option<String>,
+    pub resource___user_agent___original: Option<String>,
     // Kept at the bottom to make delta-rs happy, so its schema matches datafusion.
     // Seems delta removes the partition ids from the normal schema and moves them to the end.
     // Top-level fields
