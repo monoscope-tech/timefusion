@@ -25,6 +25,9 @@ pub enum TimeFusionError {
 
     #[error("Generic error: {0}")]
     Generic(#[from] anyhow::Error),
+
+    #[error("Validation error: {0}")]
+    Validation(String),
 }
 
 impl actix_web::ResponseError for TimeFusionError {

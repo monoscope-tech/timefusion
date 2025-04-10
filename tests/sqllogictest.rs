@@ -11,6 +11,7 @@ mod sqllogictest_tests {
     use dotenv::dotenv;
     use serial_test::serial;
     use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
+    use timefusion::config::Config; // Add this
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{NoTls, Row};
@@ -124,7 +125,6 @@ mod sqllogictest_tests {
             }
         }
 
-        // Final attempt
         let (client, connection) = tokio_postgres::connect(conn_string, NoTls).await?;
         let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -144,25 +144,23 @@ mod sqllogictest_tests {
             std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-slt-{}", test_id));
         }
 
-        // Use a shareable notification
         let shutdown_signal = Arc::new(Notify::new());
         let shutdown_signal_clone = shutdown_signal.clone();
 
         tokio::spawn(async move {
-            let db = Database::new().await.expect("Failed to create database");
+            let config = Config::from_env().expect("Failed to load config");
+            let db = Database::new(&config).await.expect("Failed to create database");
             let session_context = db.create_session_context();
             db.setup_session_context(&session_context).expect("Failed to setup session context");
 
             let shutdown_token = CancellationToken::new();
             let pg_server = db.start_pgwire_server(session_context, 5433, shutdown_token.clone()).await.expect("Failed to start PGWire server");
 
-            // Wait for shutdown signal
             shutdown_signal_clone.notified().await;
             shutdown_token.cancel();
             let _ = pg_server.await;
         });
 
-        // Wait for server to be ready
         let _ = connect_with_retry(Duration::from_secs(5)).await?;
 
         Ok(shutdown_signal)
@@ -181,7 +179,6 @@ mod sqllogictest_tests {
         let test_file = Path::new("tests/example.slt");
         let result = sqllogictest::Runner::new(factory).run_file_async(test_file).await;
 
-        // Always shut down the server
         shutdown_signal.notify_one();
 
         match result {
