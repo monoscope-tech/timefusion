@@ -269,9 +269,9 @@ impl Database {
             let records: Vec<OtelLogsAndSpans> = serde_arrow::from_record_batch(record_batch)
                 .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to deserialize record batch: {}", e)))?;
 
-            for record in records {
-                record.validate()?;
-            }
+            // for record in records {
+            //     record.validate()?;
+            // }
         }
 
         let (_conn_str, _options, table_ref) = {
@@ -296,9 +296,9 @@ impl Database {
     pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
         use serde_arrow::schema::SchemaLike; // Import here for from_type
 
-        for record in records {
-            record.validate()?;
-        }
+        // for record in records {
+        //     record.validate()?;
+        // }
 
         let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(serde_arrow::schema::TracingOptions::default())
             .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to create schema fields: {}", e)))?;
