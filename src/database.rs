@@ -49,6 +49,7 @@ impl Clone for Database {
 impl Database {
     #[tracing::instrument(name = "db.new", skip(config))]
     pub async fn new(config: &Config) -> Result<Self> {
+        // Construct the full storage URI for the default project using config values.
         let storage_uri = format!("s3://{}/{}/?endpoint={}", config.s3_bucket, config.table_prefix, config.s3_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
@@ -57,11 +58,11 @@ impl Database {
         info!("AWS handlers registered");
 
         let project_configs = HashMap::new();
-
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
         };
 
+        // Register the default project.
         db.register_project(
             "default",
             &storage_uri,
@@ -87,7 +88,6 @@ impl Database {
         info!("AWS handlers registered");
 
         let project_configs = HashMap::new();
-
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
         };
@@ -138,10 +138,8 @@ impl Database {
             Field::new("name", DataType::Utf8, false),
             Field::new("setting", DataType::Utf8, false),
         ]));
-
         let names = vec!["TimeZone".to_string(), "client_encoding".to_string(), "datestyle".to_string(), "client_min_messages".to_string()];
         let settings = vec!["UTC".to_string(), "UTF8".to_string(), "ISO, MDY".to_string(), "notice".to_string()];
-
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(names)), Arc::new(StringArray::from(settings))])?;
         ctx.register_batch("pg_settings", batch)?;
         Ok(())
@@ -156,13 +154,11 @@ impl Database {
             },
             logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
         };
-
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> DFResult<ColumnarValue> {
             let param_value_array = match &args[1] {
                 ColumnarValue::Array(array) => array.as_any().downcast_ref::<StringArray>().expect("set_config second arg must be a StringArray"),
                 _ => panic!("set_config second arg must be an array"),
             };
-
             let mut builder = StringBuilder::new();
             for i in 0..param_value_array.len() {
                 if param_value_array.is_null(i) {
@@ -173,7 +169,6 @@ impl Database {
             }
             Ok(ColumnarValue::Array(Arc::new(builder.finish())))
         });
-
         let set_config_udf = create_udf(
             "set_config",
             vec![DataType::Utf8, DataType::Utf8, DataType::Boolean],
@@ -190,14 +185,11 @@ impl Database {
     ) -> Result<tokio::task::JoinHandle<()>> {
         use datafusion_postgres::{DfSessionService, HandlerFactory};
         use tokio::net::TcpListener;
-
         let pg_service = Arc::new(DfSessionService::new(session_context));
         let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
         let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await.map_err(TimeFusionError::Io)?;
         info!("PGWire server running on 0.0.0.0:{}", port);
-
         let pgwire_shutdown = shutdown_token.clone();
-
         let pg_server = tokio::spawn({
             let handler_factory = handler_factory.clone();
             async move {
@@ -226,7 +218,6 @@ impl Database {
                 }
             }
         });
-
         Ok(pg_server)
     }
 
@@ -254,7 +245,6 @@ impl Database {
             let _records: Vec<OtelLogsAndSpans> = serde_arrow::from_record_batch(record_batch)
                 .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to deserialize record batch: {}", e)))?;
         }
-
         let (_conn_str, _options, table_ref) = {
             let configs = self.project_configs.read().await;
             configs
@@ -262,15 +252,14 @@ impl Database {
                 .ok_or_else(|| TimeFusionError::Generic(anyhow::anyhow!("Project ID 'default' not found")))?
                 .clone()
         };
-
         let mut table = table_ref.write().await;
         let ops = DeltaOps(table.clone());
         let write_op = ops.write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
         *table = write_op.await.map_err(TimeFusionError::Database)?;
-
         Ok(())
     }
 
+    // Public record insertion method.
     #[tracing::instrument(name = "db.insert_records", skip(self, records))]
     pub async fn insert_records(&self, records: &Vec<OtelLogsAndSpans>) -> Result<()> {
         use serde_arrow::schema::SchemaLike;
@@ -281,10 +270,47 @@ impl Database {
         self.insert_records_batch("default", vec![batch]).await
     }
 
-    #[tracing::instrument(name = "db.register_project", skip(self, conn_str, access_key, secret_key, endpoint), fields(project_id))]
+    // New: verify that storage is writable by performing a dummy write.
+    async fn verify_storage_write(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<()> {
+        // Create a dummy record with non-null default values.
+        let dummy = OtelLogsAndSpans {
+            project_id: "test".to_string(),
+            timestamp: chrono::Utc::now(),
+            observed_timestamp: Some(chrono::Utc::now()),
+            id: "dummy_test".to_string(),
+            name: Some("dummy".to_string()),
+            duration: Some(1),
+            start_time: Some(chrono::Utc::now()),
+            context___trace_id: Some("dummy_trace".to_string()),
+            context___span_id: Some("dummy_span".to_string()),
+            ..Default::default()
+        };
+        use serde_arrow::schema::SchemaLike;
+        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(serde_arrow::schema::TracingOptions::default())
+            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to create schema fields for dummy write: {}", e)))?;
+        let batch = serde_arrow::to_record_batch(&fields, &vec![dummy])
+            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Dummy write conversion failed: {}", e)))?;
+        let table = table_ref.read().await.clone();
+        let ops = DeltaOps(table);
+        // Attempt to write the dummy record.
+        ops.write(vec![batch]).await.map_err(TimeFusionError::Database)?;
+        info!("Storage write verification succeeded");
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "db.register_project", skip(self, bucket, access_key, secret_key, endpoint), fields(project_id))]
     pub async fn register_project(
-        &self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
+        &self, project_id: &str, bucket: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
     ) -> Result<()> {
+        // If the provided bucket string does not already contain a URI scheme, assume S3.
+        let full_uri = if bucket.starts_with("s3://") || bucket.starts_with("gs://") {
+            bucket.to_string()
+        } else {
+            // Use provided endpoint or default to AWS S3.
+            let ep = endpoint.unwrap_or("https://s3.amazonaws.com");
+            format!("s3://{}/{}/?endpoint={}", bucket, project_id, ep)
+        };
+
         let mut storage_options = StorageOptions::default();
         if let Some(key) = access_key.filter(|k| !k.is_empty()) {
             storage_options.0.insert("AWS_ACCESS_KEY_ID".to_string(), key.to_string());
@@ -297,11 +323,16 @@ impl Database {
         }
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
+        let table = match DeltaTableBuilder::from_uri(&full_uri)
+            .with_storage_options(storage_options.0.clone())
+            .with_allow_http(true)
+            .load()
+            .await
+        {
             Ok(table) => table,
             Err(err) => {
                 log::warn!("Table doesn't exist. Creating new table. Err: {:?}", err);
-                let delta_ops = DeltaOps::try_from_uri(&conn_str).await.map_err(TimeFusionError::Database)?;
+                let delta_ops = DeltaOps::try_from_uri(&full_uri).await.map_err(TimeFusionError::Database)?;
                 delta_ops
                     .create()
                     .with_columns(OtelLogsAndSpans::columns().unwrap_or_default())
@@ -312,8 +343,12 @@ impl Database {
             }
         };
 
+        let table_ref = Arc::new(RwLock::new(table));
+        // Verify that the object storage is writable.
+        self.verify_storage_write(&table_ref).await?;
+
         let mut configs = self.project_configs.write().await;
-        configs.insert(project_id.to_string(), (conn_str.to_string(), storage_options, Arc::new(RwLock::new(table))));
+        configs.insert(project_id.to_string(), (full_uri, storage_options, table_ref));
         Ok(())
     }
 
@@ -328,17 +363,16 @@ impl Database {
         Ok(())
     }
 
+    // Production-style periodic compaction method.
     #[tracing::instrument(name = "db.compact", skip(self, session_context))]
     pub async fn compact(&self, session_context: &SessionContext) -> Result<()> {
         let configs = self.project_configs.read().await;
         for (project_id, (_conn_str, _storage_options, table_lock)) in configs.iter() {
-            // Rename to _current_table to avoid unused warning.
-            let _current_table = {
+            let current_table = {
                 let table = table_lock.read().await;
                 table.clone()
             };
 
-            // Use DataFusion to read the entire table (assumed to be registered under "otel_logs_and_spans").
             let df = session_context
                 .table(OtelLogsAndSpans::table_name().as_str())
                 .await
@@ -347,13 +381,25 @@ impl Database {
 
             info!("Project {}: Collected {} record batch(es) for compaction", project_id, batches.len());
 
-            // TODO: Implement merging & replacement logic here.
-            info!("Compaction placeholder complete for project: {}", project_id);
+            // Merge the record batches into a new Delta version.
+            let new_table = merge_batches_into_new_version(current_table, batches, OtelLogsAndSpans::partitions()).await?;
+
+            {
+                let mut table_write = table_lock.write().await;
+                *table_write = new_table;
+            }
+            info!("Compaction completed for project: {}", project_id);
         }
         Ok(())
     }
 }
 
+// Helper merging function that writes out a new Delta version using DeltaOps.
+async fn merge_batches_into_new_version(table: DeltaTable, batches: Vec<RecordBatch>, partitions: Vec<String>) -> Result<DeltaTable> {
+    let ops = DeltaOps(table);
+    let new_table = ops.write(batches).with_partition_columns(partitions).await?;
+    Ok(new_table)
+}
 
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {

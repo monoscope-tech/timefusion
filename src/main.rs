@@ -23,12 +23,14 @@ use crate::{
     error::{Result, TimeFusionError},
 };
 
+/// Shared application state containing the database.
 struct AppState {
     db: Arc<Database>,
 }
 
 struct ShutdownSignal;
 
+/// Request payload for project registration.
 #[derive(Deserialize)]
 struct RegisterProjectRequest {
     project_id: String,
@@ -38,6 +40,12 @@ struct RegisterProjectRequest {
     endpoint:   Option<String>,
 }
 
+/// The /register_project endpoint.
+///
+/// When this endpoint is hit, the system calls `Database::register_project`.
+/// That method now constructs a full S3 URI (or other object storage URI) from the provided
+/// bucket name (if no scheme is provided) along with the credentials and endpoint, then verifies
+/// that storage is writable via a dummy write before registering the project.
 #[tracing::instrument(
     name = "HTTP /register_project",
     skip(req, app_state),
@@ -66,7 +74,7 @@ async fn register_project(req: web::Json<RegisterProjectRequest>, app_state: web
 async fn main() -> Result<()> {
     dotenv().ok();
 
-    // Load configuration.
+    // Load configuration from environment variables.
     let config = Config::from_env().expect("Failed to load config");
 
     // Initialize telemetry.
@@ -74,10 +82,13 @@ async fn main() -> Result<()> {
 
     info!("Starting TimeFusion application");
 
+    // Create the database. Note: The default project is registered during startup,
+    // but for user-initiated project registration the provided bucket value is used
+    // to construct a proper S3 URI (if needed) inside Database::register_project.
     let db = Database::new(&config).await?;
     info!("Database initialized successfully");
 
-    // Create a DataFusion session context to be used by both the HTTP server and compaction.
+    // Create a DataFusion session context for queries and compaction.
     let session_context = db.create_session_context();
     db.setup_session_context(&session_context).expect("Failed to setup session context");
 
@@ -86,7 +97,7 @@ async fn main() -> Result<()> {
     let shutdown_token = CancellationToken::new();
     let http_shutdown = shutdown_token.clone();
 
-    // Spawn shutdown monitor to flush pending writes.
+    // Spawn a shutdown monitor to flush pending writes.
     let db_clone = db.clone();
     let shutdown_monitor = shutdown_token.clone();
     tokio::spawn(async move {
@@ -109,7 +120,7 @@ async fn main() -> Result<()> {
     }
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);
-    // Clone the Arc for HTTP server.
+    // Clone the database for the HTTP server.
     let db_for_http = db.clone();
     let http_server = HttpServer::new(move || {
         App::new()
@@ -130,7 +141,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Spawn periodic compaction background task (every 24 hours).
+    // Spawn a periodic compaction task (every 24 hours).
     let db_compaction = db.clone();
     let compaction_shutdown = shutdown_token.clone();
     let compaction_session = session_context.clone();
