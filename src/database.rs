@@ -271,7 +271,6 @@ impl Database {
         Ok(())
     }
 
-    // Make insert_records public for external use.
     #[tracing::instrument(name = "db.insert_records", skip(self, records))]
     pub async fn insert_records(&self, records: &Vec<OtelLogsAndSpans>) -> Result<()> {
         use serde_arrow::schema::SchemaLike;
@@ -329,7 +328,6 @@ impl Database {
         Ok(())
     }
 
-    // Production-style periodic compaction method (placeholder).
     #[tracing::instrument(name = "db.compact", skip(self, session_context))]
     pub async fn compact(&self, session_context: &SessionContext) -> Result<()> {
         let configs = self.project_configs.read().await;
@@ -356,7 +354,6 @@ impl Database {
     }
 }
 
-// -- ProjectRoutingTable and its implementations --
 
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
