@@ -1,4 +1,3 @@
-// src/main.rs
 mod config;
 mod database;
 mod error;
@@ -67,26 +66,27 @@ async fn register_project(req: web::Json<RegisterProjectRequest>, app_state: web
 async fn main() -> Result<()> {
     dotenv().ok();
 
-    // Load configuration once at startup
-    let config = Config::from_env()?;
+    // Load configuration.
+    let config = Config::from_env().expect("Failed to load config");
 
-    // Initialize tracing & metrics
+    // Initialize telemetry.
     telemetry::init_telemetry();
 
     info!("Starting TimeFusion application");
 
-    let db = Database::new(&config).await?; // Pass &config here
+    let db = Database::new(&config).await?;
     info!("Database initialized successfully");
 
+    // Create a DataFusion session context to be used by both the HTTP server and compaction.
     let session_context = db.create_session_context();
-    db.setup_session_context(&session_context)?;
-    info!("Session context setup complete");
+    db.setup_session_context(&session_context).expect("Failed to setup session context");
 
     let db = Arc::new(db);
     let (shutdown_tx, _shutdown_rx) = mpsc::channel::<ShutdownSignal>(1);
     let shutdown_token = CancellationToken::new();
     let http_shutdown = shutdown_token.clone();
 
+    // Spawn shutdown monitor to flush pending writes.
     let db_clone = db.clone();
     let shutdown_monitor = shutdown_token.clone();
     tokio::spawn(async move {
@@ -100,20 +100,22 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Start the PGWire server.
     let pg_server = db.start_pgwire_server(session_context.clone(), config.pg_port, shutdown_token.clone()).await?;
-
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    sleep(Duration::from_secs(1)).await;
     if pg_server.is_finished() {
         error!("PGWire server failed to start, aborting...");
         return Err(TimeFusionError::Generic(anyhow::anyhow!("PGWire server failed to start")));
     }
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);
+    // Clone the Arc for HTTP server.
+    let db_for_http = db.clone();
     let http_server = HttpServer::new(move || {
         App::new()
             .wrap(TracingLogger::default())
             .wrap(Logger::default())
-            .app_data(web::Data::new(AppState { db: db.clone() }))
+            .app_data(web::Data::new(AppState { db: db_for_http.clone() }))
             .service(register_project)
     });
 
@@ -127,6 +129,29 @@ async fn main() -> Result<()> {
             return Err(TimeFusionError::Io(e));
         }
     };
+
+    // Spawn periodic compaction background task (every 24 hours).
+    let db_compaction = db.clone();
+    let compaction_shutdown = shutdown_token.clone();
+    let compaction_session = session_context.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = compaction_shutdown.cancelled() => {
+                    info!("Compaction background task shutting down");
+                    break;
+                }
+                _ = sleep(Duration::from_secs(24 * 3600)) => {
+                    info!("Starting periodic compaction");
+                    if let Err(e) = db_compaction.compact(&compaction_session).await {
+                        error!("Periodic compaction failed: {:?}", e);
+                    } else {
+                        info!("Periodic compaction completed successfully");
+                    }
+                }
+            }
+        }
+    });
 
     let http_handle = server.handle();
     let http_task = tokio::spawn(async move {

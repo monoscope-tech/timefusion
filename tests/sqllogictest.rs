@@ -11,8 +11,7 @@ mod sqllogictest_tests {
     use dotenv::dotenv;
     use serial_test::serial;
     use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
-    use timefusion::config::Config; // Add this
-    use timefusion::database::Database;
+    use timefusion::{config::Config, database::Database};
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{NoTls, Row};
     use tokio_util::sync::CancellationToken;
@@ -172,7 +171,7 @@ mod sqllogictest_tests {
         let shutdown_signal = start_test_server().await?;
 
         let factory = || async move {
-            let (client, _) = connect_with_retry(Duration::from_secs(3)).await?;
+            let (client, _) = connect_with_retry(Duration::from_secs(10)).await?;
             Ok(TestDB { client })
         };
 

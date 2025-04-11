@@ -31,12 +31,11 @@ use crate::{
 };
 
 type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
-
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 
 #[derive(Debug)]
 pub struct Database {
-    project_configs: ProjectConfigs,
+    pub project_configs: ProjectConfigs,
 }
 
 impl Clone for Database {
@@ -109,7 +108,6 @@ impl Database {
     #[tracing::instrument(name = "db.create_session_context", skip(self))]
     pub fn create_session_context(&self) -> SessionContext {
         use datafusion::config::ConfigOptions;
-
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
         SessionContext::new_with_config(options.into())
@@ -117,8 +115,6 @@ impl Database {
 
     #[tracing::instrument(name = "db.setup_session_context", skip(self, ctx))]
     pub fn setup_session_context(&self, ctx: &SessionContext) -> DFResult<()> {
-        use crate::persistent_queue::OtelLogsAndSpans;
-
         let schema = OtelLogsAndSpans::schema_ref();
         let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema);
         ctx.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
@@ -147,7 +143,6 @@ impl Database {
         let settings = vec!["UTC".to_string(), "UTF8".to_string(), "ISO, MDY".to_string(), "notice".to_string()];
 
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(names)), Arc::new(StringArray::from(settings))])?;
-
         ctx.register_batch("pg_settings", batch)?;
         Ok(())
     }
@@ -186,7 +181,6 @@ impl Database {
             Volatility::Volatile,
             set_config_fn,
         );
-
         ctx.register_udf(set_config_udf);
     }
 
@@ -220,18 +214,12 @@ impl Database {
                                     let handler_factory = handler_factory.clone();
                                     tokio::spawn(async move {
                                         match pgwire::tokio::process_socket(socket, None, handler_factory).await {
-                                            Ok(()) => {
-                                                info!("PGWire: Connection from {} processed successfully", addr);
-                                            }
-                                            Err(e) => {
-                                                error!("PGWire: Error processing connection from {}: {:?}", addr, e);
-                                            }
+                                            Ok(()) => info!("PGWire: Connection from {} processed successfully", addr),
+                                            Err(e) => error!("PGWire: Error processing connection from {}: {:?}", addr, e),
                                         }
                                     });
                                 }
-                                Err(e) => {
-                                    error!("PGWire: Error accepting connection: {:?}", e);
-                                }
+                                Err(e) => error!("PGWire: Error accepting connection: {:?}", e),
                             }
                         }
                     }
@@ -245,18 +233,15 @@ impl Database {
     #[tracing::instrument(name = "db.resolve_table", skip(self), fields(project_id))]
     pub async fn resolve_table(&self, project_id: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         let project_configs = self.project_configs.read().await;
-
         if let Some((_, _, table)) = project_configs.get(project_id) {
             return Ok(table.clone());
         }
-
         if project_id != "default" {
             if let Some((_, _, table)) = project_configs.get("default") {
                 log::warn!("Project '{}' not found, falling back to default project", project_id);
                 return Ok(table.clone());
             }
         }
-
         Err(DataFusionError::Execution(format!(
             "Unknown project_id: {} and no default project found",
             project_id
@@ -266,12 +251,8 @@ impl Database {
     #[tracing::instrument(name = "db.insert_records_batch", skip(self, _table, batch), fields(batch_size = batch.len()))]
     pub async fn insert_records_batch(&self, _table: &str, batch: Vec<RecordBatch>) -> Result<()> {
         for record_batch in &batch {
-            let records: Vec<OtelLogsAndSpans> = serde_arrow::from_record_batch(record_batch)
+            let _records: Vec<OtelLogsAndSpans> = serde_arrow::from_record_batch(record_batch)
                 .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to deserialize record batch: {}", e)))?;
-
-            // for record in records {
-            //     record.validate()?;
-            // }
         }
 
         let (_conn_str, _options, table_ref) = {
@@ -284,27 +265,20 @@ impl Database {
 
         let mut table = table_ref.write().await;
         let ops = DeltaOps(table.clone());
-
         let write_op = ops.write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
         *table = write_op.await.map_err(TimeFusionError::Database)?;
 
         Ok(())
     }
 
-    #[cfg(test)]
+    // Make insert_records public for external use.
     #[tracing::instrument(name = "db.insert_records", skip(self, records))]
-    pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
-        use serde_arrow::schema::SchemaLike; // Import here for from_type
-
-        // for record in records {
-        //     record.validate()?;
-        // }
-
+    pub async fn insert_records(&self, records: &Vec<OtelLogsAndSpans>) -> Result<()> {
+        use serde_arrow::schema::SchemaLike;
         let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(serde_arrow::schema::TracingOptions::default())
             .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to create schema fields: {}", e)))?;
         let batch = serde_arrow::to_record_batch(&fields, &records)
             .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to convert to record batch: {}", e)))?;
-
         self.insert_records_batch("default", vec![batch]).await
     }
 
@@ -313,26 +287,21 @@ impl Database {
         &self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
     ) -> Result<()> {
         let mut storage_options = StorageOptions::default();
-
         if let Some(key) = access_key.filter(|k| !k.is_empty()) {
             storage_options.0.insert("AWS_ACCESS_KEY_ID".to_string(), key.to_string());
         }
-
         if let Some(key) = secret_key.filter(|k| !k.is_empty()) {
             storage_options.0.insert("AWS_SECRET_ACCESS_KEY".to_string(), key.to_string());
         }
-
         if let Some(ep) = endpoint.filter(|e| !e.is_empty()) {
             storage_options.0.insert("AWS_ENDPOINT".to_string(), ep.to_string());
         }
-
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
         let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
             Ok(table) => table,
             Err(err) => {
-                log::warn!("table doesn't exist. creating new table. err: {:?}", err);
-
+                log::warn!("Table doesn't exist. Creating new table. Err: {:?}", err);
                 let delta_ops = DeltaOps::try_from_uri(&conn_str).await.map_err(TimeFusionError::Database)?;
                 delta_ops
                     .create()
@@ -359,7 +328,35 @@ impl Database {
         }
         Ok(())
     }
+
+    // Production-style periodic compaction method (placeholder).
+    #[tracing::instrument(name = "db.compact", skip(self, session_context))]
+    pub async fn compact(&self, session_context: &SessionContext) -> Result<()> {
+        let configs = self.project_configs.read().await;
+        for (project_id, (_conn_str, _storage_options, table_lock)) in configs.iter() {
+            // Rename to _current_table to avoid unused warning.
+            let _current_table = {
+                let table = table_lock.read().await;
+                table.clone()
+            };
+
+            // Use DataFusion to read the entire table (assumed to be registered under "otel_logs_and_spans").
+            let df = session_context
+                .table(OtelLogsAndSpans::table_name().as_str())
+                .await
+                .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to access table: {:?}", e)))?;
+            let batches = df.collect().await.map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to collect record batches: {:?}", e)))?;
+
+            info!("Project {}: Collected {} record batch(es) for compaction", project_id, batches.len());
+
+            // TODO: Implement merging & replacement logic here.
+            info!("Compaction placeholder complete for project: {}", project_id);
+        }
+        Ok(())
+    }
 }
+
+// -- ProjectRoutingTable and its implementations --
 
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
@@ -420,9 +417,7 @@ impl ProjectRoutingTable {
 impl DisplayAs for ProjectRoutingTable {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ProjectRoutingTable ")
-            }
+            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(f, "ProjectRoutingTable "),
         }
     }
 }
@@ -468,11 +463,9 @@ impl TableProvider for ProjectRoutingTable {
 
     async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> DFResult<Arc<dyn ExecutionPlan>> {
         self.schema().logically_equivalent_names_and_types(&input.schema())?;
-
         if insert_op != InsertOp::Append {
             return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
         }
-
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(self.clone()), None)))
     }
 
@@ -482,7 +475,6 @@ impl TableProvider for ProjectRoutingTable {
 
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
         let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
-
         let delta_table = self.database.resolve_table(&project_id).await?;
         let table = delta_table.read().await;
         table.scan(state, projection, filters, limit).await
