@@ -73,7 +73,18 @@ async fn main() -> anyhow::Result<()> {
     let http_shutdown = shutdown_token.clone();
 
     // Start PGWire server
-    let pg_port = env::var("PGWIRE_PORT").unwrap_or_else(|_| "5432".to_string()).parse::<u16>().unwrap_or(5432);
+    let pgwire_port_var = env::var("PGWIRE_PORT");
+    info!("PGWIRE_PORT environment variable: {:?}", pgwire_port_var);
+    
+    let pg_port = pgwire_port_var.unwrap_or_else(|_| {
+        info!("PGWIRE_PORT not set, using default port 5432");
+        "5432".to_string()
+    }).parse::<u16>().unwrap_or_else(|e| {
+        error!("Failed to parse PGWIRE_PORT value: {:?}, using default 5432", e);
+        5432
+    });
+    
+    info!("Starting PGWire server on port: {}", pg_port);
     let pg_server = db.start_pgwire_server(session_context, pg_port, shutdown_token.clone()).await?;
 
     // Verify server started correctly

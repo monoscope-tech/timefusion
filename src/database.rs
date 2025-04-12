@@ -147,8 +147,33 @@ impl Database {
             Field::new("setting", DataType::Utf8, false),
         ]));
 
-        let names = vec!["TimeZone".to_string(), "client_encoding".to_string(), "datestyle".to_string(), "client_min_messages".to_string()];
-        let settings = vec!["UTC".to_string(), "UTF8".to_string(), "ISO, MDY".to_string(), "notice".to_string()];
+        let names = vec![
+            "TimeZone".to_string(), 
+            "client_encoding".to_string(), 
+            "datestyle".to_string(), 
+            "client_min_messages".to_string(),
+            // Add more PostgreSQL settings that clients might try to set
+            "lc_monetary".to_string(),
+            "lc_numeric".to_string(),
+            "lc_time".to_string(),
+            "standard_conforming_strings".to_string(),
+            "application_name".to_string(),
+            "search_path".to_string(),
+        ];
+        
+        let settings = vec![
+            "UTC".to_string(), 
+            "UTF8".to_string(), 
+            "ISO, MDY".to_string(), 
+            "notice".to_string(),
+            // Default values for the additional settings
+            "C".to_string(),
+            "C".to_string(),
+            "C".to_string(),
+            "on".to_string(),
+            "TimeFusion".to_string(),
+            "public".to_string(),
+        ];
 
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(names)), Arc::new(StringArray::from(settings))])?;
 
@@ -199,8 +224,23 @@ impl Database {
 
         let pg_service = Arc::new(DfSessionService::new(session_context));
         let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
-        let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+        
+        info!("Attempting to bind PGWire server to 0.0.0.0:{}", port);
+        let bind_addr = format!("0.0.0.0:{}", port);
+        let pg_listener = match TcpListener::bind(&bind_addr).await {
+            Ok(listener) => {
+                info!("PGWire server successfully bound to {}", bind_addr);
+                listener
+            },
+            Err(e) => {
+                error!("Failed to bind PGWire server to {}: {:?}", bind_addr, e);
+                return Err(anyhow::anyhow!("Failed to bind PGWire server: {:?}", e));
+            }
+        };
+        
+        // Log all local addresses this process is listening on
         info!("PGWire server running on 0.0.0.0:{}", port);
+        info!("PGWire server local address: {:?}", pg_listener.local_addr());
 
         let pgwire_shutdown = shutdown_token.clone();
 
@@ -216,21 +256,29 @@ impl Database {
                         result = pg_listener.accept() => {
                             match result {
                                 Ok((socket, addr)) => {
-                                    debug!("PGWire: Received connection from {}, preparing to process", addr);
+                                    info!("PGWire: Received connection from {}, preparing to process", addr);
+                                    info!("PGWire: Socket details - local addr: {:?}, peer addr: {:?}", 
+                                        socket.local_addr().map_err(|e| debug!("Failed to get local addr: {:?}", e)),
+                                        socket.peer_addr().map_err(|e| debug!("Failed to get peer addr: {:?}", e))
+                                    );
+                                    
                                     let handler_factory = handler_factory.clone();
                                     tokio::spawn(async move {
+                                        info!("PGWire: Started processing connection from {}", addr);
                                         match pgwire::tokio::process_socket(socket, None, handler_factory).await {
                                             Ok(()) => {
                                                 info!("PGWire: Connection from {} processed successfully", addr);
                                             }
                                             Err(e) => {
                                                 error!("PGWire: Error processing connection from {}: {:?}", addr, e);
+                                                error!("PGWire: Error details - {}", e);
                                             }
                                         }
                                     });
                                 }
                                 Err(e) => {
                                     error!("PGWire: Error accepting connection: {:?}", e);
+                                    error!("PGWire: Connection accept error details - {}", e);
                                 }
                             }
                         }
@@ -520,7 +568,7 @@ mod tests {
 
         let db = Database::new().await?;
         let mut session_context = SessionContext::new();
-        datafusion_functions_json::register_all(&session_context)?;
+        datafusion_functions_json::register_all(&mut session_context)?;
         let schema = OtelLogsAndSpans::schema_ref();
 
         let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
@@ -865,10 +913,10 @@ mod tests {
                 attributes___session___id, attributes___session___previous___id, attributes___db___system___name, attributes___db___collection___name,
                 attributes___db___namespace, attributes___db___operation___name, attributes___db___response___status_code, attributes___db___operation___batch___size,
                 attributes___db___query___summary, attributes___db___query___text, attributes___user___id, attributes___user___email,
-                attributes___user___full_name, attributes___user___name, attributes___user___hash, resource___attributes___service___name,
+                attributes___user___full_name, attributes___user___name, attributes___user___hash, resource___service___name,
 
-                resource___attributes___service___version, resource___attributes___service___instance___id, resource___attributes___service___namespace, resource___attributes___telemetry___sdk___language,
-                resource___attributes___telemetry___sdk___name, resource___attributes___telemetry___sdk___version, resource___attributes___user_agent___original
+                resource___service___version, resource___service___instance___id, resource___service___namespace, resource___telemetry___sdk___language,
+                resource___telemetry___sdk___name, resource___telemetry___sdk___version, resource___user_agent___original
             ) VALUES (
                 'test_project', TIMESTAMP '2023-01-02T10:00:00Z', NULL, 'sql_span2',
                 NULL, 'sql_test_span', NULL,
