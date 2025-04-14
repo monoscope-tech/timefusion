@@ -1,13 +1,13 @@
 // main.rs
 mod database;
 mod persistent_queue;
-use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
+use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
 use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
 use serde::Deserialize;
 use std::{env, sync::Arc};
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -49,9 +49,7 @@ async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<
 async fn main() -> anyhow::Result<()> {
     // Initialize environment and logging
     dotenv().ok();
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("timefusion=debug,pgwire=trace,datafusion=debug")))
-        .init();
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
 
     info!("Starting TimeFusion application");
 
@@ -75,15 +73,18 @@ async fn main() -> anyhow::Result<()> {
     // Start PGWire server
     let pgwire_port_var = env::var("PGWIRE_PORT");
     info!("PGWIRE_PORT environment variable: {:?}", pgwire_port_var);
-    
-    let pg_port = pgwire_port_var.unwrap_or_else(|_| {
-        info!("PGWIRE_PORT not set, using default port 5432");
-        "5432".to_string()
-    }).parse::<u16>().unwrap_or_else(|e| {
-        error!("Failed to parse PGWIRE_PORT value: {:?}, using default 5432", e);
-        5432
-    });
-    
+
+    let pg_port = pgwire_port_var
+        .unwrap_or_else(|_| {
+            info!("PGWIRE_PORT not set, using default port 5432");
+            "5432".to_string()
+        })
+        .parse::<u16>()
+        .unwrap_or_else(|e| {
+            error!("Failed to parse PGWIRE_PORT value: {:?}, using default 5432", e);
+            5432
+        });
+
     info!("Starting PGWire server on port: {}", pg_port);
     let pg_server = db.start_pgwire_server(session_context, pg_port, shutdown_token.clone()).await?;
 
