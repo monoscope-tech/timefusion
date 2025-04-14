@@ -268,7 +268,8 @@ impl Database {
                 }
             }
 
-            return Ok(table.clone());
+            // Use Arc::clone instead of table.clone() to avoid deep copying
+            return Ok(Arc::clone(table));
         }
 
         // If not found and project_id is not "default", try the default table
@@ -286,7 +287,8 @@ impl Database {
                     }
                 }
 
-                return Ok(table.clone());
+                // Use Arc::clone instead of table.clone() to avoid deep copying
+                return Ok(Arc::clone(table));
             }
         }
 
@@ -303,15 +305,25 @@ impl Database {
             configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
         };
 
-        let mut table = table_ref.write().await;
-        let ops = DeltaOps(table.clone());
+        // Scope the write lock to minimize lock time
+        let should_checkpoint = {
+            let mut table = table_ref.write().await;
 
-        let write_op = ops.write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
-        *table = write_op.await?;
+            // Create the DeltaOps with a clone of the table
+            let write_op = DeltaOps(table.clone()).write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
 
-        // Checkpoint the table every 10 versions
-        let version = table.version();
-        if version > 0 && version % 10 == 0 {
+            let new_table = write_op.await?;
+            let version = new_table.version();
+            *table = new_table;
+
+            version > 0 && version % 40 == 0
+        };
+
+        // Checkpoint outside the write lock if needed
+        if should_checkpoint {
+            // Take a read lock for checkpointing
+            let table = table_ref.read().await;
+            let version = table.version();
             info!("Checkpointing Delta table at version {}", version);
             checkpoints::create_checkpoint(&table, None).await?;
         }
