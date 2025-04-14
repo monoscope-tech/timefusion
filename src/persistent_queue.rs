@@ -16,6 +16,7 @@ pub struct OtelLogsAndSpans {
 
     pub id: String,
     pub parent_id: Option<String>,
+    pub hashes: Vec<String>, // all relevant hashes can be stored here for item identification
     pub name: Option<String>,
     pub kind: Option<String>, // logs, span, request
     pub status_code: Option<String>,

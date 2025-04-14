@@ -3,23 +3,25 @@ use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::arrow::array::Array;
-use datafusion::common::SchemaExt;
 use datafusion::common::not_impl_err;
-use datafusion::execution::TaskContext;
+use datafusion::common::SchemaExt;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_plan::DisplayAs;
+use datafusion::physical_expr::intervals::utils::check_support;
 use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
+use datafusion::physical_plan::DisplayAs;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{BinaryExpr, dml::InsertOp},
+    logical_expr::{dml::InsertOp, BinaryExpr},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 use delta_kernel::arrow::record_batch::RecordBatch;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, storage::StorageOptions};
+use deltalake::checkpoints;
+use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
@@ -70,46 +72,6 @@ impl Database {
         Ok(db)
     }
 
-    #[cfg(test)]
-    pub async fn new_for_test() -> Result<Self> {
-        // For tests, we directly configure all AWS env vars
-        info!("Starting Database in test mode");
-
-        // Show all environment variables for debugging
-        for (key, value) in env::vars() {
-            if key.starts_with("AWS_") {
-                info!("ENV: {}={}", key, value);
-            }
-        }
-
-        let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
-        let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-
-        // Generate a unique prefix for this run's data
-        let prefix = env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
-        let storage_uri = format!("s3://{}/{}/?endpoint={}", bucket, prefix, aws_endpoint);
-        info!("Storage URI configured: {}", storage_uri);
-
-        let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
-        deltalake::aws::register_handlers(Some(aws_url));
-        info!("AWS handlers registered");
-
-        let project_configs = HashMap::new();
-
-        let db = Self {
-            project_configs: Arc::new(RwLock::new(project_configs)),
-        };
-
-        // For tests, pass credentials explicitly
-        let access_key = env::var("AWS_ACCESS_KEY_ID").expect("AWS_ACCESS_KEY_ID not set");
-        let secret_key = env::var("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY not set");
-
-        info!("Registering project with explicit credentials");
-        db.register_project("default", &storage_uri, Some(&access_key), Some(&secret_key), Some(&aws_endpoint)).await?;
-
-        Ok(db)
-    }
-
     /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(&self) -> SessionContext {
         use datafusion::config::ConfigOptions;
@@ -148,9 +110,9 @@ impl Database {
         ]));
 
         let names = vec![
-            "TimeZone".to_string(), 
-            "client_encoding".to_string(), 
-            "datestyle".to_string(), 
+            "TimeZone".to_string(),
+            "client_encoding".to_string(),
+            "datestyle".to_string(),
             "client_min_messages".to_string(),
             // Add more PostgreSQL settings that clients might try to set
             "lc_monetary".to_string(),
@@ -160,11 +122,11 @@ impl Database {
             "application_name".to_string(),
             "search_path".to_string(),
         ];
-        
+
         let settings = vec![
-            "UTC".to_string(), 
-            "UTF8".to_string(), 
-            "ISO, MDY".to_string(), 
+            "UTC".to_string(),
+            "UTF8".to_string(),
+            "ISO, MDY".to_string(),
             "notice".to_string(),
             // Default values for the additional settings
             "C".to_string(),
@@ -185,7 +147,7 @@ impl Database {
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
         use datafusion::arrow::array::{StringArray, StringBuilder};
         use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
+        use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
@@ -224,20 +186,20 @@ impl Database {
 
         let pg_service = Arc::new(DfSessionService::new(session_context));
         let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
-        
+
         info!("Attempting to bind PGWire server to 0.0.0.0:{}", port);
         let bind_addr = format!("0.0.0.0:{}", port);
         let pg_listener = match TcpListener::bind(&bind_addr).await {
             Ok(listener) => {
                 info!("PGWire server successfully bound to {}", bind_addr);
                 listener
-            },
+            }
             Err(e) => {
                 error!("Failed to bind PGWire server to {}: {:?}", bind_addr, e);
                 return Err(anyhow::anyhow!("Failed to bind PGWire server: {:?}", e));
             }
         };
-        
+
         // Log all local addresses this process is listening on
         info!("PGWire server running on 0.0.0.0:{}", port);
         info!("PGWire server local address: {:?}", pg_listener.local_addr());
@@ -257,11 +219,11 @@ impl Database {
                             match result {
                                 Ok((socket, addr)) => {
                                     info!("PGWire: Received connection from {}, preparing to process", addr);
-                                    info!("PGWire: Socket details - local addr: {:?}, peer addr: {:?}", 
+                                    info!("PGWire: Socket details - local addr: {:?}, peer addr: {:?}",
                                         socket.local_addr().map_err(|e| debug!("Failed to get local addr: {:?}", e)),
                                         socket.peer_addr().map_err(|e| debug!("Failed to get peer addr: {:?}", e))
                                     );
-                                    
+
                                     let handler_factory = handler_factory.clone();
                                     tokio::spawn(async move {
                                         info!("PGWire: Started processing connection from {}", addr);
@@ -295,6 +257,16 @@ impl Database {
 
         // Try to get the requested project table first
         if let Some((_, _, table)) = project_configs.get(project_id) {
+            // Update the table before returning to ensure we have the latest version
+            {
+                let mut table_write = table.write().await;
+                // Run update to load any new transactions
+                match table_write.update().await {
+                    Ok(_) => debug!("Updated table for project '{}' to latest version", project_id),
+                    Err(e) => error!("Failed to update table for project '{}': {}", project_id, e),
+                }
+            }
+
             return Ok(table.clone());
         }
 
@@ -302,6 +274,17 @@ impl Database {
         if project_id != "default" {
             if let Some((_, _, table)) = project_configs.get("default") {
                 log::warn!("Project '{}' not found, falling back to default project", project_id);
+
+                // Update the default table before returning
+                {
+                    let mut table_write = table.write().await;
+                    // Run update to load any new transactions
+                    match table_write.update().await {
+                        Ok(_) => debug!("Updated default table to latest version"),
+                        Err(e) => error!("Failed to update default table: {}", e),
+                    }
+                }
+
                 return Ok(table.clone());
             }
         }
@@ -314,7 +297,6 @@ impl Database {
     }
 
     pub async fn insert_records_batch(&self, _table: &str, batch: Vec<RecordBatch>) -> Result<()> {
-        // Get the table reference for the default project
         let (_conn_str, _options, table_ref) = {
             let configs = self.project_configs.read().await;
             configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
@@ -325,6 +307,13 @@ impl Database {
 
         let write_op = ops.write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
         *table = write_op.await?;
+
+        // Checkpoint the table every 10 versions
+        let version = table.version();
+        if version > 0 && version % 10 == 0 {
+            info!("Checkpointing Delta table at version {}", version);
+            checkpoints::create_checkpoint(&table, None).await?;
+        }
 
         Ok(())
     }
@@ -365,8 +354,17 @@ impl Database {
 
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
-            Ok(table) => table,
+        let mut table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
+            Ok(table) => {
+                // Check if table needs checkpointing - use same threshold as in insert_records_batch
+                let version = table.version();
+                // Only checkpoint if it's a multiple of 20 to be consistent with our write policy
+                if version > 0 && version % 20 == 0 {
+                    info!("Checkpointing table for project '{}' at initial load, version {}", project_id, version);
+                    checkpoints::create_checkpoint(&table, None).await?;
+                }
+                table
+            }
             Err(err) => {
                 log::warn!("table doesn't exist. creating new table. err: {:?}", err);
 
@@ -518,13 +516,23 @@ impl TableProvider for ProjectRoutingTable {
     async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Create a physical plan from the logical plan.
         // Check that the schema of the plan matches the schema of this table.
-        self.schema().logically_equivalent_names_and_types(&input.schema())?;
+        match self.schema().logically_equivalent_names_and_types(&input.schema()) {
+            Ok(_) => info!("Schema validation passed"),
+            Err(e) => {
+                error!("Schema validation failed: {}", e);
+                return Err(e);
+            }
+        }
 
         if insert_op != InsertOp::Append {
+            error!("Unsupported insert operation: {:?}", insert_op);
             return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
         }
 
-        Ok(Arc::new(DataSinkExec::new(input, Arc::new(self.clone()), None)))
+        // Create sink executor but with additional logging
+        let sink = DataSinkExec::new(input, Arc::new(self.clone()), None);
+
+        Ok(Arc::new(sink))
     }
 
     fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
@@ -543,14 +551,11 @@ impl TableProvider for ProjectRoutingTable {
 
 #[cfg(test)]
 mod tests {
-    use std::thread::sleep;
-
     use chrono::{TimeZone, Utc};
     use datafusion::assert_batches_eq;
     use datafusion::prelude::SessionContext;
     use dotenv::dotenv;
     use serial_test::serial;
-    use tokio::time;
     use uuid::Uuid;
 
     use super::*;
@@ -575,29 +580,6 @@ mod tests {
         session_context.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
 
         Ok((db, session_context, test_prefix))
-    }
-
-    // Helper function to refresh the table after modifications
-    async fn refresh_table(db: &Database, session_context: &SessionContext) -> Result<()> {
-        // Refresh the Delta table
-        // Get the delta table using our resolve_table method
-        let table_ref = db.resolve_table("default").await.map_err(|e| anyhow::anyhow!("Failed to resolve default table: {:?}", e))?;
-
-        let mut table = table_ref.write().await;
-        *table = deltalake::open_table(&table.table_uri()).await?;
-
-        // Create a new ProjectRoutingTable with the refreshed database
-        let schema = OtelLogsAndSpans::schema_ref();
-        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
-
-        // Re-register the table with the session context
-        session_context.deregister_table(OtelLogsAndSpans::table_name())?;
-        session_context.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
-
-        // Add a small delay to ensure the changes propagate
-        sleep(time::Duration::from_millis(100));
-
-        Ok(())
     }
 
     // Helper function to create sample test records

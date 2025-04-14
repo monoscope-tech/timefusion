@@ -2408,7 +2408,7 @@ dependencies = [
 [[package]]
 name = "datafusion-postgres"
 version = "0.3.0"
-source = "git+https://github.com/apitoolkit/datafusion-postgres.git?branch=interpret-dictionary-types#0de2318556bc246fab2069593962a3f762910402"
+source = "git+https://github.com/apitoolkit/datafusion-postgres.git?branch=insert-query-compliance#a5ad9c9fd523e6a52b3fabd0889e0d612b8e3cd3"
 dependencies = [
  "async-trait",
  "chrono",
