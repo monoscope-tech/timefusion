@@ -319,13 +319,28 @@ impl Database {
             version > 0 && version % 40 == 0
         };
 
-        // Checkpoint outside the write lock if needed
+        // Checkpoint in the background if needed
         if should_checkpoint {
-            // Take a read lock for checkpointing
-            let table = table_ref.read().await;
-            let version = table.version();
-            info!("Checkpointing Delta table at version {}", version);
-            checkpoints::create_checkpoint(&table, None).await?;
+            // Clone the necessary resources for the background task
+            let table_ref_clone = Arc::clone(&table_ref);
+            
+            // Spawn a background task to perform checkpointing
+            tokio::spawn(async move {
+                // Take a read lock for checkpointing
+                let result = async {
+                    let table = table_ref_clone.read().await;
+                    let version = table.version();
+                    info!("Starting background checkpointing for Delta table at version {}", version);
+                    checkpoints::create_checkpoint(&table, None).await
+                }.await;
+                
+                match result {
+                    Ok(_) => info!("Background checkpointing completed successfully"),
+                    Err(e) => error!("Background checkpointing failed: {}", e),
+                }
+            });
+            
+            info!("Checkpoint scheduled in background");
         }
 
         Ok(())
