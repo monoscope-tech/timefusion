@@ -54,7 +54,8 @@ impl Database {
 
         // Generate a unique prefix for this run's data
         let prefix = env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
-        let storage_uri = format!("s3://{}/{}/?endpoint={}", bucket, prefix, aws_endpoint);
+        let table_name = "otel_logs_and_spans";
+        let storage_uri = format!("s3://{}/{}/{}/?endpoint={}", bucket, prefix, table_name, aws_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
         let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
