@@ -5,6 +5,8 @@ A very specialized timeseries database created for events, logs, traces and metr
 Its designed to allow users plug in their own s3 storage and buckets and have their stored to their accounts.
 This way, timefusion is used as a compute and cache engine, not primary data storage.
 
+Timefusion speaks the postgres dialect, so you can insert and read from it using any postgres client or driver.
+
 ## Configuration
 
 Timefusion can be configured using the following environment variables:
