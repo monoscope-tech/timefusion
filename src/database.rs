@@ -8,7 +8,6 @@ use datafusion::common::SchemaExt;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_expr::intervals::utils::check_support;
 use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::DisplayAs;
 use datafusion::scalar::ScalarValue;
