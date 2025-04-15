@@ -2443,7 +2443,7 @@ dependencies = [
 [[package]]
 name = "datafusion-postgres"
 version = "0.3.0"
-source = "git+https://github.com/sunng87/datafusion-postgres.git#2cf58787a8bf3e12a82b836d7dbdc5f6aee9f5a6"
+source = "git+https://github.com/sunng87/datafusion-postgres.git?rev=2cf58787a8bf3e12a82b836d7dbdc5f6aee9f5a6#2cf58787a8bf3e12a82b836d7dbdc5f6aee9f5a6"
 dependencies = [
  "async-trait",
  "chrono",
