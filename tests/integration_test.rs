@@ -105,8 +105,9 @@ mod integration {
         // Insert test data
         let timestamp_str = format!("'{}'", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
         let insert_query = format!(
-            "INSERT INTO otel_logs_and_spans (project_id, timestamp, id, name, status_code, status_message, level) 
-             VALUES ($1, {}, $2, $3, $4, $5, $6)",
+            "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes) 
+             VALUES ($1, {}, {}, $2, $3, $4, $5, $6, ARRAY[])",
+            chrono::Utc::now().date_naive().to_string(),
             timestamp_str
         );
 
@@ -151,7 +152,7 @@ mod integration {
             assert_eq!(count_rows[0].get::<_, String>(0), "test_project", "project_id should match");
 
             let count_rows = client.query("SELECT * FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?;
-            assert_eq!(count_rows[0].columns().len(), 84, "Should return all 84 columns");
+            assert_eq!(count_rows[0].columns().len(), 86, "Should return all 84 columns");
 
             Ok::<_, tokio_postgres::Error>(())
         }
@@ -190,8 +191,9 @@ mod integration {
         // Create timestamp for the insert query
         let timestamp_str = format!("'{}'", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
         let insert_query = format!(
-            "INSERT INTO otel_logs_and_spans (project_id, timestamp, id, name, status_code, status_message, level) 
-             VALUES ($1, {}, $2, $3, $4, $5, $6)",
+            "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes) 
+             VALUES ($1, {}, {}, $2, $3, $4, $5, $6, ARRAY[])",
+            chrono::Utc::now().date_naive().to_string(),
             timestamp_str
         );
 

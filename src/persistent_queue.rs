@@ -1,16 +1,23 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::{DataType, FieldRef};
 use arrow_schema::{Field, Schema, SchemaRef};
 use delta_kernel::schema::StructField;
-use serde::{Deserialize, Serialize};
+use log::debug;
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_arrow::schema::SchemaLike;
 use serde_arrow::schema::TracingOptions;
 use serde_json::json;
+use serde_with::serde_as;
 
 #[allow(non_snake_case)]
+#[serde_as]
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct OtelLogsAndSpans {
+    #[serde(with = "chrono::serde::ts_microseconds")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+
     #[serde(with = "chrono::serde::ts_microseconds_option")]
     pub observed_timestamp: Option<chrono::DateTime<chrono::Utc>>,
 
@@ -147,17 +154,27 @@ pub struct OtelLogsAndSpans {
     // Top-level fields
     pub project_id: String,
 
-    #[serde(with = "chrono::serde::ts_microseconds")]
-    pub timestamp: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    #[serde(deserialize_with = "default_on_empty_string")]
+    pub date: chrono::NaiveDate,
 }
 
 impl OtelLogsAndSpans {
     pub fn table_name() -> String {
         "otel_logs_and_spans".to_string()
     }
-    pub fn columns() -> anyhow::Result<Vec<StructField>> {
+
+    pub fn fields() -> anyhow::Result<Vec<FieldRef>> {
         let tracing_options = TracingOptions::default()
+            .strings_as_large_utf8(false)
+            .sequence_as_large_list(false)
+            .sequence_as_large_list(false)
             .overwrite("project_id", json!({"name": "project_id", "data_type": "Utf8", "nullable": false}))?
+            .overwrite("date", json!({"name": "date", "data_type": "Date32", "nullable": false}))?
+            .overwrite("duration", json!({"name": "duration", "data_type": "UInt64", "nullable": true}))?
+            .overwrite("body", json!({"name":"body", "data_type": "Utf8", "nullable": true}))?
+            .overwrite("attributes", json!({"name":"attributes", "data_type": "Utf8", "nullable": true}))?
+            .overwrite("resource", json!({"name":"resource", "data_type": "Utf8", "nullable": true}))?
             .overwrite(
                 "timestamp",
                 json!({"name": "timestamp", "data_type": "Timestamp(Microsecond, None)", "nullable": false}),
@@ -176,10 +193,15 @@ impl OtelLogsAndSpans {
                 json!({"name": "end_time", "data_type": "Timestamp(Microsecond, None)", "nullable": true}),
             )?;
 
-        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?;
+        Ok(Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?)
+    }
+
+    pub fn columns() -> anyhow::Result<Vec<StructField>> {
+        let fields = OtelLogsAndSpans::fields()?;
         let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
         assert_eq!(fields[fields.len() - 2].data_type(), &DataType::Utf8);
-        assert_eq!(fields[fields.len() - 1].data_type(), &DataType::Timestamp(TimeUnit::Microsecond, None));
+        assert_eq!(fields[fields.len() - 1].data_type(), &DataType::Date32);
+        debug!("schema_field columns {:?}", vec_refs);
         Ok(vec_refs)
     }
 
@@ -195,6 +217,21 @@ impl OtelLogsAndSpans {
     }
 
     pub fn partitions() -> Vec<String> {
-        vec!["project_id".to_string(), "timestamp".to_string()]
+        vec!["project_id".to_string(), "date".to_string()]
+    }
+}
+
+pub fn default_on_empty_string<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default + FromStr,
+    <T as FromStr>::Err: std::fmt::Display,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(T::default()),
+        Some(s) if s.is_empty() => Ok(T::default()),
+        Some(s) => T::from_str(&s).map_err(DeError::custom),
     }
 }

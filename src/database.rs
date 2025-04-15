@@ -321,26 +321,19 @@ impl Database {
 
         // Checkpoint in the background if needed
         if should_checkpoint {
-            // Clone the necessary resources for the background task
-            let table_ref_clone = Arc::clone(&table_ref);
-            
-            // Spawn a background task to perform checkpointing
-            tokio::spawn(async move {
-                // Take a read lock for checkpointing
-                let result = async {
-                    let table = table_ref_clone.read().await;
-                    let version = table.version();
-                    info!("Starting background checkpointing for Delta table at version {}", version);
-                    checkpoints::create_checkpoint(&table, None).await
-                }.await;
-                
-                match result {
-                    Ok(_) => info!("Background checkpointing completed successfully"),
-                    Err(e) => error!("Background checkpointing failed: {}", e),
-                }
-            });
-            
-            info!("Checkpoint scheduled in background");
+            // Create a checkpoint immediately within the same function
+            // This avoids spawning separate tasks that hold onto table references
+            // which can cause memory leaks
+            let table = table_ref.read().await;
+            let version = table.version();
+            info!("Starting checkpointing for Delta table at version {}", version);
+
+            match checkpoints::create_checkpoint(&table, None).await {
+                Ok(_) => info!("Checkpointing completed successfully"),
+                Err(e) => error!("Checkpointing failed: {}", e),
+            }
+
+            info!("Checkpoint completed");
         }
 
         Ok(())
@@ -356,7 +349,7 @@ impl Database {
         use serde_arrow::schema::SchemaLike;
 
         // Convert OtelLogsAndSpans records to Arrow RecordBatch format
-        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(serde_arrow::schema::TracingOptions::default())?;
+        let fields = OtelLogsAndSpans::fields()?;
         let batch = serde_arrow::to_record_batch(&fields, &records)?;
 
         // Call insert_records_batch with the converted batch to reuse common insertion logic
@@ -618,6 +611,7 @@ mod tests {
         vec![
             OtelLogsAndSpans {
                 project_id: "test_project".to_string(),
+                // date: timestamp1.date_naive(),
                 timestamp: timestamp1,
                 observed_timestamp: Some(timestamp1),
                 id: "span1".to_string(),
@@ -632,6 +626,7 @@ mod tests {
             },
             OtelLogsAndSpans {
                 project_id: "test_project".to_string(),
+                // date: timestamp2.date_naive(),
                 timestamp: timestamp2,
                 observed_timestamp: Some(timestamp2),
                 id: "span2".to_string(),
@@ -860,28 +855,28 @@ mod tests {
                 "| sql_span1a | sql_test_span | 2023-02-01T15:30:00 |",
                 "+------------+---------------+---------------------+",
         ], &verify_df);
-        //
+
         let insert_sql = "INSERT INTO otel_logs_and_spans (
-                project_id, timestamp, id,
-                parent_id, name, kind,
-                status_code, status_message, level, severity___severity_text, severity___severity_number,
-                body, duration, start_time, end_time
-            ) VALUES (
-                'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1',
-                NULL, 'sql_test_span', NULL,
-                'OK', 'span inserted successfully', 'INFO', 'INFORMATION', NULL,
-                NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL
-            )";
+                 project_id, date, timestamp, id, hashes,
+                 parent_id, name, kind,
+                 status_code, status_message, level, severity___severity_text, severity___severity_number,
+                 body, duration, start_time, end_time
+             ) VALUES (
+                 'test_project', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1', ARRAY[],
+                 NULL, 'sql_test_span', NULL,
+                 'OK', 'span inserted successfully', 'INFO', 'INFORMATION', NULL,
+                 NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL
+             )";
 
         let insert_result = ctx.sql(insert_sql).await?.collect().await?;
         #[rustfmt::skip]
-        assert_batches_eq!(
-            ["+-------+",
-            "| count |",
-            "+-------+",
-            "| 1     |",
-            "+-------+",
-        ], &insert_result);
+         assert_batches_eq!(
+             ["+-------+",
+             "| count |",
+             "+-------+",
+             "| 1     |",
+             "+-------+",
+         ], &insert_result);
 
         let verify_df = ctx
             .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
@@ -902,7 +897,7 @@ mod tests {
 
         log::info!("Inserting record directly via insert statement");
         let insert_sql = "INSERT INTO otel_logs_and_spans (
-                project_id, timestamp, observed_timestamp, id,
+                project_id, date, timestamp, observed_timestamp, id, hashes,
                 parent_id, name, kind,
                 status_code, status_message, level, severity___severity_text, severity___severity_number,
                 body, duration, start_time, end_time,
@@ -928,7 +923,7 @@ mod tests {
                 resource___service___version, resource___service___instance___id, resource___service___namespace, resource___telemetry___sdk___language,
                 resource___telemetry___sdk___name, resource___telemetry___sdk___version, resource___user_agent___original
             ) VALUES (
-                'test_project', TIMESTAMP '2023-01-02T10:00:00Z', NULL, 'sql_span2',
+                'test_project','2023-01-02',  TIMESTAMP '2023-01-02T10:00:00Z', NULL, 'sql_span2', ARRAY[],
                 NULL, 'sql_test_span', NULL,
                 'OK', 'span inserted successfully', 'INFO', NULL, NULL,
                 NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL,
@@ -957,13 +952,13 @@ mod tests {
 
         let insert_result = ctx.sql(insert_sql).await?.collect().await?;
         #[rustfmt::skip]
-        assert_batches_eq!(
-            ["+-------+",
-            "| count |",
-            "+-------+",
-            "| 1     |",
-            "+-------+",
-        ], &insert_result);
+         assert_batches_eq!(
+             ["+-------+",
+             "| count |",
+             "+-------+",
+             "| 1     |",
+             "+-------+",
+         ], &insert_result);
 
         // Verify that the SQL-inserted record exists
         let verify_df = ctx.sql("SELECT id, name, status_message FROM otel_logs_and_spans WHERE id = 'sql_span1'").await?;
@@ -1023,23 +1018,23 @@ mod tests {
         // ], &insert_result);
 
         let verify_df = ctx
-            .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
-            .await?
-            .collect()
-            .await?;
+             .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
+             .await?
+             .collect()
+             .await?;
         #[rustfmt::skip]
-        assert_batches_eq!(
-            [
-                "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
-                "| project_id   | id         | name          | timestamp           | kind | status_code | severity___severity_text | duration  | start_time          |",
-                "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
-                "| default      | sql_span1a | sql_test_span | 2023-02-01T15:30:00 |      | OK          |                          | 150000000 | 2023-02-01T15:30:00 |",
-                "| test_project | sql_span2  | sql_test_span | 2023-01-02T10:00:00 |      | OK          |                          | 150000000 | 2023-01-01T10:00:00 |",
-                "| test_project | sql_span1  | sql_test_span | 2023-01-01T10:00:00 |      | OK          | INFORMATION              | 150000000 | 2023-01-01T10:00:00 |",
-                "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
-            ],
-            &verify_df
-        );
+         assert_batches_eq!(
+             [
+                 "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+                 "| project_id   | id         | name          | timestamp           | kind | status_code | severity___severity_text | duration  | start_time          |",
+                 "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+                 "| default      | sql_span1a | sql_test_span | 2023-02-01T15:30:00 |      | OK          |                          | 150000000 | 2023-02-01T15:30:00 |",
+                 "| test_project | sql_span2  | sql_test_span | 2023-01-02T10:00:00 |      | OK          |                          | 150000000 | 2023-01-01T10:00:00 |",
+                 "| test_project | sql_span1  | sql_test_span | 2023-01-01T10:00:00 |      | OK          | INFORMATION              | 150000000 | 2023-01-01T10:00:00 |",
+                 "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+             ],
+             &verify_df
+         );
 
         Ok(())
     }
