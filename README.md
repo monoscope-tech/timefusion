@@ -21,3 +21,32 @@ Timefusion can be configured using the following environment variables:
 | AWS_SECRET_ACCESS_KEY | AWS secret key                | -                          |
 
 For local development, you can set `QUEUE_DB_PATH` to a location in your development environment.
+
+## Usage
+
+There currently exists only 1 table. otel_logs_and_spans.
+You can access it via psql: eg if running locally:
+
+```
+$ psql "postgresql://postgres:postgres@localhost:12345/postgres"
+
+psql (16.8 (Homebrew), server 0.28.0)
+WARNING: psql major version 16, server major version 0.28.
+         Some psql features might not work.
+Type "help" for help.
+
+postgres=> insert into otel_logs_and_spans (name, id, project_id, hashes, timestamp, date) values ('name3', 'id2', 'pid3', ARRAY[], '2025-04-14 02:00:24.898000', '2025-04-14 02:00:24.898000');
+INSERT 0 1
+
+postgres=> select name, id, project_id,timestamp from otel_logs_and_spans limit 10;
+                            name                             |                  id                  |              project_id              |         timestamp
+-------------------------------------------------------------+--------------------------------------+--------------------------------------+----------------------------
+ GET api/v1/validations/profundity-interior/(?P<pk>[^/.]+)/$ | 00000000-09ab-47bc-b628-2554626d1261 | 00000000-876e-41fa-be63-52d5bcfc037e | 2025-04-14 20:45:08.713740
+ GET api/v1/validations/tire-pressure/(?P<pk>[^/.]+)/$       | 00000000-3d2a-445d-b7bf-3e56125b48d4 | 00000000-876e-41fa-be63-52d5bcfc037e | 2025-04-14 22:01:00.816390
+ POST api/v1/validations/warnings-of-wear/$                  | 00000000-4ced-48f4-830d-64d3531eb7f0 | 00000000-876e-41fa-be63-52d5bcfc037e | 2025-04-14 21:18:08.635637
+
+```
+
+```
+
+```
