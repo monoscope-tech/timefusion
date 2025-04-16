@@ -2,19 +2,20 @@ use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::arrow::array::Array;
-use datafusion::catalog::Session;
-use datafusion::common::{SchemaExt, not_impl_err};
-use datafusion::execution::{TaskContext, context::SessionContext};
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, dml::InsertOp};
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
-    insert::{DataSink, DataSinkExec},
+use datafusion::{
+    arrow::array::Array,
+    catalog::Session,
+    common::{SchemaExt, not_impl_err},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, dml::InsertOp},
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+        insert::{DataSink, DataSinkExec},
+    },
+    scalar::ScalarValue,
 };
-use datafusion::scalar::ScalarValue;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use deltalake::checkpoints;
-use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
+use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, checkpoints, storage::StorageOptions};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -50,8 +51,7 @@ impl Database {
         let storage_uri = format!("s3://{}/{}/?endpoint={}", config.s3_bucket, config.table_prefix, config.s3_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
-        let aws_url = Url::parse(&config.s3_endpoint)
-            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
+        let aws_url = Url::parse(&config.s3_endpoint).map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
@@ -81,8 +81,7 @@ impl Database {
         let storage_uri = format!("s3://{}/{}/?endpoint={}", config.s3_bucket, config.table_prefix, config.s3_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
-        let aws_url = Url::parse(&config.s3_endpoint)
-            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
+        let aws_url = Url::parse(&config.s3_endpoint).map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
@@ -165,42 +164,36 @@ impl Database {
             "public".to_string(),
         ];
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(StringArray::from(names)),
-                Arc::new(StringArray::from(settings)),
-            ],
-        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(names)), Arc::new(StringArray::from(settings))])?;
         ctx.register_batch("pg_settings", batch)?;
         Ok(())
     }
 
     #[tracing::instrument(name = "db.register_set_config_udf", skip(self, ctx))]
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
-        use datafusion::arrow::array::{StringArray, StringBuilder};
-        use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
+        use datafusion::{
+            arrow::{
+                array::{StringArray, StringBuilder},
+                datatypes::DataType,
+            },
+            logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
+        };
 
-        let set_config_fn: ScalarFunctionImplementation =
-            Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
-                let param_value_array = match &args[1] {
-                    ColumnarValue::Array(array) => array
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .expect("set_config second arg must be a StringArray"),
-                    _ => panic!("set_config second arg must be an array"),
-                };
-                let mut builder = StringBuilder::new();
-                for i in 0..param_value_array.len() {
-                    if param_value_array.is_null(i) {
-                        builder.append_null();
-                    } else {
-                        builder.append_value(param_value_array.value(i));
-                    }
+        let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
+            let param_value_array = match &args[1] {
+                ColumnarValue::Array(array) => array.as_any().downcast_ref::<StringArray>().expect("set_config second arg must be a StringArray"),
+                _ => panic!("set_config second arg must be an array"),
+            };
+            let mut builder = StringBuilder::new();
+            for i in 0..param_value_array.len() {
+                if param_value_array.is_null(i) {
+                    builder.append_null();
+                } else {
+                    builder.append_value(param_value_array.value(i));
                 }
-                Ok(ColumnarValue::Array(Arc::new(builder.finish())))
-            });
+            }
+            Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        });
         let set_config_udf = create_udf(
             "set_config",
             vec![DataType::Utf8, DataType::Utf8, DataType::Boolean],
@@ -213,10 +206,7 @@ impl Database {
 
     #[tracing::instrument(name = "db.start_pgwire_server", skip(self, session_context, shutdown_token), fields(port))]
     pub async fn start_pgwire_server(
-        &self,
-        session_context: SessionContext,
-        port: u16,
-        shutdown_token: CancellationToken,
+        &self, session_context: SessionContext, port: u16, shutdown_token: CancellationToken,
     ) -> Result<tokio::task::JoinHandle<()>> {
         use datafusion_postgres::{DfSessionService, HandlerFactory};
         use tokio::net::TcpListener;
@@ -385,12 +375,7 @@ impl Database {
 
     #[tracing::instrument(name = "db.register_project", skip(self, bucket, access_key, secret_key, endpoint), fields(project_id))]
     pub async fn register_project(
-        &self,
-        project_id: &str,
-        bucket: &str,
-        access_key: Option<&str>,
-        secret_key: Option<&str>,
-        endpoint: Option<&str>,
+        &self, project_id: &str, bucket: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
     ) -> Result<()> {
         let full_uri = if bucket.starts_with("s3://") || bucket.starts_with("gs://") {
             bucket.to_string()
@@ -489,8 +474,8 @@ async fn merge_batches_into_new_version(table: DeltaTable, batches: Vec<RecordBa
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
-    database: Arc<Database>,
-    schema: SchemaRef,
+    database:        Arc<Database>,
+    schema:          SchemaRef,
 }
 
 impl ProjectRoutingTable {
@@ -611,14 +596,15 @@ impl TableProvider for ProjectRoutingTable {
         Ok(filter.iter().map(|_| TableProviderFilterPushDown::Inexact).collect())
     }
 
-    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+    async fn scan(
+        &self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
         let delta_table = self.database.resolve_table(&project_id).await?;
         let table = delta_table.read().await;
         table.scan(state, projection, filters, limit).await
     }
 }
-
 
 #[cfg(test)]
 mod tests {

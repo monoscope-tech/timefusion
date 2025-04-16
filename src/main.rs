@@ -5,14 +5,14 @@ mod persistent_queue;
 mod telemetry;
 use std::{env, sync::Arc};
 
-use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
 use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
 use serde::Deserialize;
 use tokio::{
     sync::mpsc,
-    time::{sleep, Duration},
+    time::{Duration, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -53,10 +53,7 @@ struct RegisterProjectRequest {
     fields(project_id = %req.project_id)
 )]
 #[post("/register_project")]
-async fn register_project(
-    req: web::Json<RegisterProjectRequest>,
-    app_state: web::Data<AppState>
-) -> Result<impl Responder> {
+async fn register_project(req: web::Json<RegisterProjectRequest>, app_state: web::Data<AppState>) -> Result<impl Responder> {
     app_state
         .db
         .register_project(
@@ -97,8 +94,7 @@ async fn main() -> Result<()> {
 
     // Create a DataFusion session context for queries and compaction.
     let session_context = db.create_session_context();
-    db.setup_session_context(&session_context)
-        .expect("Failed to setup session context");
+    db.setup_session_context(&session_context).expect("Failed to setup session context");
 
     let db = Arc::new(db);
     let (shutdown_tx, _shutdown_rx) = mpsc::channel::<ShutdownSignal>(1);
@@ -121,22 +117,15 @@ async fn main() -> Result<()> {
 
     // Determine PGWire server port: check for a PGWIRE_PORT environment variable,
     // falling back to the port from the configuration.
-    let pgwire_port = env::var("PGWIRE_PORT")
-        .ok()
-        .and_then(|port_str| port_str.parse::<u16>().ok())
-        .unwrap_or(config.pg_port);
+    let pgwire_port = env::var("PGWIRE_PORT").ok().and_then(|port_str| port_str.parse::<u16>().ok()).unwrap_or(config.pg_port);
 
     info!("Starting PGWire server on port: {}", pgwire_port);
-    let pg_server = db
-        .start_pgwire_server(session_context.clone(), pgwire_port, shutdown_token.clone())
-        .await?;
-    
+    let pg_server = db.start_pgwire_server(session_context.clone(), pgwire_port, shutdown_token.clone()).await?;
+
     sleep(Duration::from_secs(1)).await;
     if pg_server.is_finished() {
         error!("PGWire server failed to start, aborting...");
-        return Err(TimeFusionError::Generic(anyhow::anyhow!(
-            "PGWire server failed to start"
-        )));
+        return Err(TimeFusionError::Generic(anyhow::anyhow!("PGWire server failed to start")));
     }
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);

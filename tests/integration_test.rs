@@ -68,16 +68,10 @@ async fn start_test_server() -> Result<(Arc<Notify>, String, u16)> {
         let session_context = db.create_session_context();
         db.setup_session_context(&session_context).expect("Failed to setup session context");
 
-        let port = std::env::var("PGWIRE_PORT")
-            .expect("PGWIRE_PORT not set")
-            .parse::<u16>()
-            .expect("Invalid PGWIRE_PORT");
+        let port = std::env::var("PGWIRE_PORT").expect("PGWIRE_PORT not set").parse::<u16>().expect("Invalid PGWIRE_PORT");
 
         let shutdown_token = CancellationToken::new();
-        let pg_server = db
-            .start_pgwire_server(session_context, port, shutdown_token.clone())
-            .await
-            .expect("Failed to start PGWire server");
+        let pg_server = db.start_pgwire_server(session_context, port, shutdown_token.clone()).await.expect("Failed to start PGWire server");
 
         shutdown_signal_clone.notified().await;
         shutdown_token.cancel();
@@ -85,10 +79,7 @@ async fn start_test_server() -> Result<(Arc<Notify>, String, u16)> {
     });
 
     // Increase retry timeout to 10 seconds.
-    let port = std::env::var("PGWIRE_PORT")
-        .expect("PGWIRE_PORT not set")
-        .parse::<u16>()
-        .expect("Invalid PGWIRE_PORT");
+    let port = std::env::var("PGWIRE_PORT").expect("PGWIRE_PORT not set").parse::<u16>().expect("Invalid PGWIRE_PORT");
     let _ = connect_with_retry(port, Duration::from_secs(10)).await?;
     Ok((shutdown_signal, test_id, port))
 }
@@ -153,9 +144,7 @@ async fn test_postgres_integration() -> Result<()> {
     let shutdown = || shutdown_signal.notify_one();
     let shutdown_guard = scopeguard::guard((), |_| shutdown());
 
-    let (client, _) = connect_with_retry(port, Duration::from_secs(3))
-        .await
-        .expect("Failed to connect to PostgreSQL");
+    let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await.expect("Failed to connect to PostgreSQL");
 
     // Use an insert query that includes extra columns ("date" and "hashes") as per the master branch.
     let timestamp_str = format!("'{}'", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
@@ -244,9 +233,7 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
 
     let mut handles = Vec::with_capacity(num_clients);
     for i in 0..num_clients {
-        let (client, _) = connect_with_retry(port, Duration::from_secs(3))
-            .await
-            .expect("Failed to connect to PostgreSQL");
+        let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await.expect("Failed to connect to PostgreSQL");
         let insert_query = insert_query.clone();
         let inserted_ids_clone = Arc::clone(&inserted_ids);
         let test_id_prefix = format!("{}-client-{}", test_id, i);
@@ -300,9 +287,7 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
         handle.await.expect("Task should complete successfully");
     }
 
-    let (client, _) = connect_with_retry(port, Duration::from_secs(3))
-        .await
-        .expect("Failed to connect to PostgreSQL");
+    let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await.expect("Failed to connect to PostgreSQL");
 
     let count_rows = client
         .query(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE id LIKE '{}%'", test_id), &[])
@@ -332,9 +317,7 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
     let mut query_handles = Vec::with_capacity(num_query_clients);
     let query_times = Arc::new(Mutex::new(Vec::new()));
     for _ in 0..num_query_clients {
-        let (client, _) = connect_with_retry(port, Duration::from_secs(3))
-            .await
-            .expect("Failed to connect to PostgreSQL");
+        let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await.expect("Failed to connect to PostgreSQL");
         let test_id = test_id.clone();
         let query_times = Arc::clone(&query_times);
         let handle = tokio::spawn(async move {
@@ -376,11 +359,7 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
     }
     let times = query_times.lock().unwrap();
     let total_time: Duration = times.iter().sum();
-    let avg_time = if times.is_empty() {
-        Duration::new(0, 0)
-    } else {
-        total_time / times.len() as u32
-    };
+    let avg_time = if times.is_empty() { Duration::new(0, 0) } else { total_time / times.len() as u32 };
     println!("Average query execution time per client: {:?}", avg_time);
 
     std::mem::drop(shutdown_guard);
