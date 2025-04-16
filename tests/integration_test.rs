@@ -50,6 +50,7 @@ async fn start_test_server() -> Result<(Arc<Notify>, String, u16)> {
     dotenv().ok();
 
     let mut rng = rand::thread_rng();
+    // Choose a port in a random range beyond the default 5433.
     let port = 5433 + (rng.gen_range(1..100) as u16);
 
     // Set test-specific environment variables.
@@ -67,10 +68,16 @@ async fn start_test_server() -> Result<(Arc<Notify>, String, u16)> {
         let session_context = db.create_session_context();
         db.setup_session_context(&session_context).expect("Failed to setup session context");
 
-        let port = std::env::var("PGWIRE_PORT").expect("PGWIRE_PORT not set").parse::<u16>().expect("Invalid PGWIRE_PORT");
+        let port = std::env::var("PGWIRE_PORT")
+            .expect("PGWIRE_PORT not set")
+            .parse::<u16>()
+            .expect("Invalid PGWIRE_PORT");
 
         let shutdown_token = CancellationToken::new();
-        let pg_server = db.start_pgwire_server(session_context, port, shutdown_token.clone()).await.expect("Failed to start PGWire server");
+        let pg_server = db
+            .start_pgwire_server(session_context, port, shutdown_token.clone())
+            .await
+            .expect("Failed to start PGWire server");
 
         shutdown_signal_clone.notified().await;
         shutdown_token.cancel();
@@ -78,7 +85,10 @@ async fn start_test_server() -> Result<(Arc<Notify>, String, u16)> {
     });
 
     // Increase retry timeout to 10 seconds.
-    let port = std::env::var("PGWIRE_PORT").expect("PGWIRE_PORT not set").parse::<u16>().expect("Invalid PGWIRE_PORT");
+    let port = std::env::var("PGWIRE_PORT")
+        .expect("PGWIRE_PORT not set")
+        .parse::<u16>()
+        .expect("Invalid PGWIRE_PORT");
     let _ = connect_with_retry(port, Duration::from_secs(10)).await?;
     Ok((shutdown_signal, test_id, port))
 }
@@ -117,7 +127,7 @@ async fn test_compaction() -> Result<()> {
     ];
     db.insert_records(&records).await.expect("Failed to insert records");
 
-    // Call compaction (placeholder).
+    // Call compaction.
     db.compact(&session_context).await.expect("Compaction failed");
 
     // Verify that data remains intact.
@@ -143,64 +153,67 @@ async fn test_postgres_integration() -> Result<()> {
     let shutdown = || shutdown_signal.notify_one();
     let shutdown_guard = scopeguard::guard((), |_| shutdown());
 
-    let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await.expect("Failed to connect to PostgreSQL");
+    let (client, _) = connect_with_retry(port, Duration::from_secs(3))
+        .await
+        .expect("Failed to connect to PostgreSQL");
 
-    let timestamp_str = format!("'{}'", Utc::now().format("%Y-%m-%d %H:%M:%S"));
+    // Use an insert query that includes extra columns ("date" and "hashes") as per the master branch.
+    let timestamp_str = format!("'{}'", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
     let insert_query = format!(
-        "INSERT INTO otel_logs_and_spans (project_id, timestamp, id, name, status_code, status_message, level)
-         VALUES ($1, {}, $2, $3, $4, $5, $6)",
+        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes) \
+         VALUES ($1, '{}', {}, $2, $3, $4, $5, $6, ARRAY[])",
+        chrono::Utc::now().date_naive().to_string(),
         timestamp_str
     );
 
-    {
+    // Insert an initial record using the test_id as the record's id.
+    client
+        .execute(
+            &insert_query,
+            &[&"test_project", &test_id, &"test_span_name", &"OK", &"Test integration", &"INFO"],
+        )
+        .await
+        .expect("Insert should succeed");
+
+    // Verify the inserted record details.
+    let detail_rows = client
+        .query("SELECT name, status_code FROM otel_logs_and_spans WHERE id = $1", &[&test_id])
+        .await
+        .expect("Query should succeed");
+    assert_eq!(detail_rows.len(), 1, "Should have found exactly one detailed row");
+    assert_eq!(detail_rows[0].get::<_, String>(0), "test_span_name", "Name should match");
+    assert_eq!(detail_rows[0].get::<_, String>(1), "OK", "Status code should match");
+
+    // Insert additional 5 records.
+    for i in 0..5 {
+        let span_id = Uuid::new_v4().to_string();
         client
             .execute(
                 &insert_query,
-                &[&"test_project", &test_id, &"test_span_name", &"OK", &"Test integration", &"INFO"],
+                &[&"test_project", &span_id, &format!("batch_span_{}", i), &"OK", &format!("Batch test {}", i), &"INFO"],
             )
             .await
-            .expect("Insert should succeed");
-
-        let rows = client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE id = $1", &[&test_id]).await.expect("Query should succeed");
-        assert_eq!(rows[0].get::<_, i64>(0), 1, "Should have found exactly one row");
-
-        let detail_rows = client
-            .query("SELECT name, status_code FROM otel_logs_and_spans WHERE id = $1", &[&test_id])
-            .await
-            .expect("Query should succeed");
-        assert_eq!(detail_rows.len(), 1, "Should have found exactly one detailed row");
-        assert_eq!(detail_rows[0].get::<_, String>(0), "test_span_name", "Name should match");
-        assert_eq!(detail_rows[0].get::<_, String>(1), "OK", "Status code should match");
-
-        for i in 0..5 {
-            let span_id = Uuid::new_v4().to_string();
-            client
-                .execute(
-                    &insert_query,
-                    &[&"test_project", &span_id, &format!("batch_span_{}", i), &"OK", &format!("Batch test {}", i), &"INFO"],
-                )
-                .await
-                .expect("Batch insert should succeed");
-        }
-
-        let count_rows = client
-            .query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"])
-            .await
-            .expect("Query should succeed");
-        assert_eq!(count_rows[0].get::<_, i64>(0), 6, "Should have a total of 6 records");
-
-        let count_rows = client
-            .query("SELECT project_id FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"])
-            .await
-            .expect("Query should succeed");
-        assert_eq!(count_rows[0].get::<_, String>(0), "test_project", "project_id should match");
-
-        let count_rows = client
-            .query("SELECT * FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"])
-            .await
-            .expect("Query should succeed");
-        assert_eq!(count_rows[0].columns().len(), 80, "Should return all 80 columns");
+            .expect("Batch insert should succeed");
     }
+
+    let count_rows = client
+        .query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"])
+        .await
+        .expect("Query should succeed");
+    assert_eq!(count_rows[0].get::<_, i64>(0), 6, "Should have a total of 6 records");
+
+    let proj_rows = client
+        .query("SELECT project_id FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"])
+        .await
+        .expect("Query should succeed");
+    assert_eq!(proj_rows[0].get::<_, String>(0), "test_project", "project_id should match");
+
+    let full_rows = client
+        .query("SELECT * FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"])
+        .await
+        .expect("Query should succeed");
+    // Expect 86 columns according to the new schema.
+    assert_eq!(full_rows[0].columns().len(), 86, "Should return all 86 columns");
 
     std::mem::drop(shutdown_guard);
     shutdown();
@@ -220,17 +233,20 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
     println!("Creating {} client connections", num_clients);
 
     let inserted_ids = Arc::new(Mutex::new(HashSet::new()));
-    let timestamp_str = format!("'{}'", Utc::now().format("%Y-%m-%d %H:%M:%S"));
+    // Use the same insert query as in test_postgres_integration.
+    let timestamp_str = format!("'{}'", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
     let insert_query = format!(
-        "INSERT INTO otel_logs_and_spans (project_id, timestamp, id, name, status_code, status_message, level)
-         VALUES ($1, {}, $2, $3, $4, $5, $6)",
+        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes) \
+         VALUES ($1, '{}', {}, $2, $3, $4, $5, $6, ARRAY[])",
+        chrono::Utc::now().date_naive().to_string(),
         timestamp_str
     );
 
     let mut handles = Vec::with_capacity(num_clients);
     for i in 0..num_clients {
-        let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await.expect("Failed to connect to PostgreSQL");
-
+        let (client, _) = connect_with_retry(port, Duration::from_secs(3))
+            .await
+            .expect("Failed to connect to PostgreSQL");
         let insert_query = insert_query.clone();
         let inserted_ids_clone = Arc::clone(&inserted_ids);
         let test_id_prefix = format!("{}-client-{}", test_id, i);
@@ -267,7 +283,7 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
                 if j % 5 == 0 {
                     let _ = client
                         .query(
-                            &format!("SELECT name, status_code FROM otel_logs_and_spans WHERE id LIKE '{test_id_prefix}%'"),
+                            &format!("SELECT name, status_code FROM otel_logs_and_spans WHERE id LIKE '{}%'", test_id_prefix),
                             &[],
                         )
                         .await
@@ -284,10 +300,12 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
         handle.await.expect("Task should complete successfully");
     }
 
-    let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await.expect("Failed to connect to PostgreSQL");
+    let (client, _) = connect_with_retry(port, Duration::from_secs(3))
+        .await
+        .expect("Failed to connect to PostgreSQL");
 
     let count_rows = client
-        .query(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE id LIKE '{test_id}%'"), &[])
+        .query(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE id LIKE '{}%'", test_id), &[])
         .await
         .expect("Query failed");
     let count = count_rows[0].get::<_, i64>(0);
@@ -296,7 +314,7 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
     assert_eq!(count, expected_count, "Should have inserted the expected number of records");
 
     let id_rows = client
-        .query(&format!("SELECT id FROM otel_logs_and_spans WHERE id LIKE '{test_id}%'"), &[])
+        .query(&format!("SELECT id FROM otel_logs_and_spans WHERE id LIKE '{}%'", test_id), &[])
         .await
         .expect("Query failed");
     let mut db_ids = HashSet::new();
@@ -313,8 +331,10 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
     let queries_per_client = 5;
     let mut query_handles = Vec::with_capacity(num_query_clients);
     let query_times = Arc::new(Mutex::new(Vec::new()));
-    for _i in 0..num_query_clients {
-        let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await.expect("Failed to connect to PostgreSQL");
+    for _ in 0..num_query_clients {
+        let (client, _) = connect_with_retry(port, Duration::from_secs(3))
+            .await
+            .expect("Failed to connect to PostgreSQL");
         let test_id = test_id.clone();
         let query_times = Arc::clone(&query_times);
         let handle = tokio::spawn(async move {
@@ -330,7 +350,7 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
                     1 => {
                         let _ = client
                             .query(
-                                &format!("SELECT name, status_code FROM otel_logs_and_spans WHERE id LIKE '{test_id}%' LIMIT 10"),
+                                &format!("SELECT name, status_code FROM otel_logs_and_spans WHERE id LIKE '{}%' LIMIT 10", test_id),
                                 &[],
                             )
                             .await
@@ -356,7 +376,11 @@ async fn test_concurrent_postgres_requests() -> Result<()> {
     }
     let times = query_times.lock().unwrap();
     let total_time: Duration = times.iter().sum();
-    let avg_time = if times.is_empty() { Duration::new(0, 0) } else { total_time / times.len() as u32 };
+    let avg_time = if times.is_empty() {
+        Duration::new(0, 0)
+    } else {
+        total_time / times.len() as u32
+    };
     println!("Average query execution time per client: {:?}", avg_time);
 
     std::mem::drop(shutdown_guard);

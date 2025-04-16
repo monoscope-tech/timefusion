@@ -3,20 +3,21 @@ mod database;
 mod error;
 mod persistent_queue;
 mod telemetry;
-use std::sync::Arc;
+use std::{env, sync::Arc};
 
-use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
+use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
 use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
 use serde::Deserialize;
 use tokio::{
     sync::mpsc,
-    time::{Duration, sleep},
+    time::{sleep, Duration},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_actix_web::TracingLogger;
+use tracing_subscriber::EnvFilter;
 
 use crate::{
     config::Config,
@@ -43,16 +44,19 @@ struct RegisterProjectRequest {
 /// The /register_project endpoint.
 ///
 /// When this endpoint is hit, the system calls `Database::register_project`.
-/// That method now constructs a full S3 URI (or other object storage URI) from the provided
-/// bucket name (if no scheme is provided) along with the credentials and endpoint, then verifies
-/// that storage is writable via a dummy write before registering the project.
+/// That method constructs a full S3 URI (or other object storage URI) from the provided
+/// bucket name (if no scheme is provided) along with the credentials and endpoint, then
+/// verifies that storage is writable via a dummy write before registering the project.
 #[tracing::instrument(
     name = "HTTP /register_project",
     skip(req, app_state),
     fields(project_id = %req.project_id)
 )]
 #[post("/register_project")]
-async fn register_project(req: web::Json<RegisterProjectRequest>, app_state: web::Data<AppState>) -> Result<impl Responder> {
+async fn register_project(
+    req: web::Json<RegisterProjectRequest>,
+    app_state: web::Data<AppState>
+) -> Result<impl Responder> {
     app_state
         .db
         .register_project(
@@ -80,17 +84,21 @@ async fn main() -> Result<()> {
     // Initialize telemetry.
     telemetry::init_telemetry();
 
+    // Initialize tracing subscriber.
+    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
+
     info!("Starting TimeFusion application");
 
-    // Create the database. Note: The default project is registered during startup,
-    // but for user-initiated project registration the provided bucket value is used
-    // to construct a proper S3 URI (if needed) inside Database::register_project.
+    // Create the database.
+    // The default project is registered during startup; for user-initiated project registration,
+    // the provided bucket value is used to construct a proper S3 URI inside Database::register_project.
     let db = Database::new(&config).await?;
     info!("Database initialized successfully");
 
     // Create a DataFusion session context for queries and compaction.
     let session_context = db.create_session_context();
-    db.setup_session_context(&session_context).expect("Failed to setup session context");
+    db.setup_session_context(&session_context)
+        .expect("Failed to setup session context");
 
     let db = Arc::new(db);
     let (shutdown_tx, _shutdown_rx) = mpsc::channel::<ShutdownSignal>(1);
@@ -111,12 +119,24 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start the PGWire server.
-    let pg_server = db.start_pgwire_server(session_context.clone(), config.pg_port, shutdown_token.clone()).await?;
+    // Determine PGWire server port: check for a PGWIRE_PORT environment variable,
+    // falling back to the port from the configuration.
+    let pgwire_port = env::var("PGWIRE_PORT")
+        .ok()
+        .and_then(|port_str| port_str.parse::<u16>().ok())
+        .unwrap_or(config.pg_port);
+
+    info!("Starting PGWire server on port: {}", pgwire_port);
+    let pg_server = db
+        .start_pgwire_server(session_context.clone(), pgwire_port, shutdown_token.clone())
+        .await?;
+    
     sleep(Duration::from_secs(1)).await;
     if pg_server.is_finished() {
         error!("PGWire server failed to start, aborting...");
-        return Err(TimeFusionError::Generic(anyhow::anyhow!("PGWire server failed to start")));
+        return Err(TimeFusionError::Generic(anyhow::anyhow!(
+            "PGWire server failed to start"
+        )));
     }
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);

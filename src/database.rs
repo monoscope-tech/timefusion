@@ -2,22 +2,19 @@ use std::{any::Any, collections::HashMap, fmt, sync::Arc};
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::{
-    arrow::array::Array,
-    catalog::Session,
-    common::{SchemaExt, not_impl_err},
-    datasource::{TableProvider, TableType},
-    error::{DataFusionError, Result as DFResult},
-    execution::{TaskContext, context::SessionContext},
-    logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, dml::InsertOp},
-    physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
-        insert::{DataSink, DataSinkExec},
-    },
-    scalar::ScalarValue,
+use datafusion::arrow::array::Array;
+use datafusion::catalog::Session;
+use datafusion::common::{SchemaExt, not_impl_err};
+use datafusion::execution::{TaskContext, context::SessionContext};
+use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, dml::InsertOp};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+    insert::{DataSink, DataSinkExec},
 };
+use datafusion::scalar::ScalarValue;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, storage::StorageOptions};
+use deltalake::checkpoints;
+use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -53,7 +50,8 @@ impl Database {
         let storage_uri = format!("s3://{}/{}/?endpoint={}", config.s3_bucket, config.table_prefix, config.s3_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
-        let aws_url = Url::parse(&config.s3_endpoint).map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
+        let aws_url = Url::parse(&config.s3_endpoint)
+            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
@@ -83,7 +81,8 @@ impl Database {
         let storage_uri = format!("s3://{}/{}/?endpoint={}", config.s3_bucket, config.table_prefix, config.s3_endpoint);
         info!("Storage URI configured: {}", storage_uri);
 
-        let aws_url = Url::parse(&config.s3_endpoint).map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
+        let aws_url = Url::parse(&config.s3_endpoint)
+            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Invalid AWS endpoint URL: {}", e)))?;
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
@@ -106,6 +105,7 @@ impl Database {
     }
 
     #[tracing::instrument(name = "db.create_session_context", skip(self))]
+    /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(&self) -> SessionContext {
         use datafusion::config::ConfigOptions;
         let mut options = ConfigOptions::new();
@@ -114,7 +114,7 @@ impl Database {
     }
 
     #[tracing::instrument(name = "db.setup_session_context", skip(self, ctx))]
-    pub fn setup_session_context(&self, ctx: &SessionContext) -> DFResult<()> {
+    pub fn setup_session_context(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
         let schema = OtelLogsAndSpans::schema_ref();
         let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema);
         ctx.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
@@ -127,7 +127,7 @@ impl Database {
     }
 
     #[tracing::instrument(name = "db.register_pg_settings_table", skip(self, ctx))]
-    pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> DFResult<()> {
+    pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
         use datafusion::arrow::{
             array::StringArray,
             datatypes::{DataType, Field, Schema},
@@ -138,37 +138,69 @@ impl Database {
             Field::new("name", DataType::Utf8, false),
             Field::new("setting", DataType::Utf8, false),
         ]));
-        let names = vec!["TimeZone".to_string(), "client_encoding".to_string(), "datestyle".to_string(), "client_min_messages".to_string()];
-        let settings = vec!["UTC".to_string(), "UTF8".to_string(), "ISO, MDY".to_string(), "notice".to_string()];
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(names)), Arc::new(StringArray::from(settings))])?;
+        #[allow(unused_variables)]
+        let names = vec![
+            "TimeZone".to_string(),
+            "client_encoding".to_string(),
+            "datestyle".to_string(),
+            "client_min_messages".to_string(),
+            "lc_monetary".to_string(),
+            "lc_numeric".to_string(),
+            "lc_time".to_string(),
+            "standard_conforming_strings".to_string(),
+            "application_name".to_string(),
+            "search_path".to_string(),
+        ];
+
+        let settings = vec![
+            "UTC".to_string(),
+            "UTF8".to_string(),
+            "ISO, MDY".to_string(),
+            "notice".to_string(),
+            "C".to_string(),
+            "C".to_string(),
+            "C".to_string(),
+            "on".to_string(),
+            "TimeFusion".to_string(),
+            "public".to_string(),
+        ];
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(settings)),
+            ],
+        )?;
         ctx.register_batch("pg_settings", batch)?;
         Ok(())
     }
 
     #[tracing::instrument(name = "db.register_set_config_udf", skip(self, ctx))]
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
-        use datafusion::{
-            arrow::{
-                array::{StringArray, StringBuilder},
-                datatypes::DataType,
-            },
-            logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
-        };
-        let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> DFResult<ColumnarValue> {
-            let param_value_array = match &args[1] {
-                ColumnarValue::Array(array) => array.as_any().downcast_ref::<StringArray>().expect("set_config second arg must be a StringArray"),
-                _ => panic!("set_config second arg must be an array"),
-            };
-            let mut builder = StringBuilder::new();
-            for i in 0..param_value_array.len() {
-                if param_value_array.is_null(i) {
-                    builder.append_null();
-                } else {
-                    builder.append_value(param_value_array.value(i));
+        use datafusion::arrow::array::{StringArray, StringBuilder};
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
+
+        let set_config_fn: ScalarFunctionImplementation =
+            Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
+                let param_value_array = match &args[1] {
+                    ColumnarValue::Array(array) => array
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("set_config second arg must be a StringArray"),
+                    _ => panic!("set_config second arg must be an array"),
+                };
+                let mut builder = StringBuilder::new();
+                for i in 0..param_value_array.len() {
+                    if param_value_array.is_null(i) {
+                        builder.append_null();
+                    } else {
+                        builder.append_value(param_value_array.value(i));
+                    }
                 }
-            }
-            Ok(ColumnarValue::Array(Arc::new(builder.finish())))
-        });
+                Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+            });
         let set_config_udf = create_udf(
             "set_config",
             vec![DataType::Utf8, DataType::Utf8, DataType::Boolean],
@@ -181,14 +213,30 @@ impl Database {
 
     #[tracing::instrument(name = "db.start_pgwire_server", skip(self, session_context, shutdown_token), fields(port))]
     pub async fn start_pgwire_server(
-        &self, session_context: SessionContext, port: u16, shutdown_token: CancellationToken,
+        &self,
+        session_context: SessionContext,
+        port: u16,
+        shutdown_token: CancellationToken,
     ) -> Result<tokio::task::JoinHandle<()>> {
         use datafusion_postgres::{DfSessionService, HandlerFactory};
         use tokio::net::TcpListener;
         let pg_service = Arc::new(DfSessionService::new(session_context));
         let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
-        let pg_listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await.map_err(TimeFusionError::Io)?;
-        info!("PGWire server running on 0.0.0.0:{}", port);
+
+        info!("Attempting to bind PGWire server to 0.0.0.0:{}", port);
+        let bind_addr = format!("0.0.0.0:{}", port);
+        let pg_listener = match TcpListener::bind(&bind_addr).await {
+            Ok(listener) => {
+                info!("PGWire server successfully bound to {}", bind_addr);
+                listener
+            }
+            Err(e) => {
+                error!("Failed to bind PGWire server to {}: {:?}", bind_addr, e);
+                return Err(anyhow::anyhow!("Failed to bind PGWire server: {:?}", e).into());
+            }
+        };
+
+        info!("PGWire server local address: {:?}", pg_listener.local_addr());
         let pgwire_shutdown = shutdown_token.clone();
         let pg_server = tokio::spawn({
             let handler_factory = handler_factory.clone();
@@ -202,9 +250,15 @@ impl Database {
                         result = pg_listener.accept() => {
                             match result {
                                 Ok((socket, addr)) => {
-                                    debug!("PGWire: Received connection from {}, preparing to process", addr);
+                                    info!("PGWire: Received connection from {}, preparing to process", addr);
+                                    info!("PGWire: Socket details - local addr: {:?}, peer addr: {:?}",
+                                        socket.local_addr().map_err(|e| debug!("Failed to get local addr: {:?}", e)),
+                                        socket.peer_addr().map_err(|e| debug!("Failed to get peer addr: {:?}", e))
+                                    );
+
                                     let handler_factory = handler_factory.clone();
                                     tokio::spawn(async move {
+                                        info!("PGWire: Started processing connection from {}", addr);
                                         match pgwire::tokio::process_socket(socket, None, handler_factory).await {
                                             Ok(()) => info!("PGWire: Connection from {} processed successfully", addr),
                                             Err(e) => error!("PGWire: Error processing connection from {}: {:?}", addr, e),
@@ -222,18 +276,32 @@ impl Database {
     }
 
     #[tracing::instrument(name = "db.resolve_table", skip(self), fields(project_id))]
-    pub async fn resolve_table(&self, project_id: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
+    pub async fn resolve_table(&self, project_id: &str) -> datafusion::error::Result<Arc<RwLock<DeltaTable>>> {
         let project_configs = self.project_configs.read().await;
         if let Some((_, _, table)) = project_configs.get(project_id) {
-            return Ok(table.clone());
+            {
+                let mut table_write = table.write().await;
+                match table_write.update().await {
+                    Ok(_) => debug!("Updated table for project '{}' to latest version", project_id),
+                    Err(e) => error!("Failed to update table for project '{}': {}", project_id, e),
+                }
+            }
+            return Ok(Arc::clone(table));
         }
         if project_id != "default" {
             if let Some((_, _, table)) = project_configs.get("default") {
                 log::warn!("Project '{}' not found, falling back to default project", project_id);
-                return Ok(table.clone());
+                {
+                    let mut table_write = table.write().await;
+                    match table_write.update().await {
+                        Ok(_) => debug!("Updated default table to latest version"),
+                        Err(e) => error!("Failed to update default table: {}", e),
+                    }
+                }
+                return Ok(Arc::clone(table));
             }
         }
-        Err(DataFusionError::Execution(format!(
+        Err(datafusion::error::DataFusionError::Execution(format!(
             "Unknown project_id: {} and no default project found",
             project_id
         )))
@@ -241,6 +309,7 @@ impl Database {
 
     #[tracing::instrument(name = "db.insert_records_batch", skip(self, _table, batch), fields(batch_size = batch.len()))]
     pub async fn insert_records_batch(&self, _table: &str, batch: Vec<RecordBatch>) -> Result<()> {
+        // Validate each record batch by attempting deserialization.
         for record_batch in &batch {
             let _records: Vec<OtelLogsAndSpans> = serde_arrow::from_record_batch(record_batch)
                 .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to deserialize record batch: {}", e)))?;
@@ -252,27 +321,44 @@ impl Database {
                 .ok_or_else(|| TimeFusionError::Generic(anyhow::anyhow!("Project ID 'default' not found")))?
                 .clone()
         };
-        let mut table = table_ref.write().await;
-        let ops = DeltaOps(table.clone());
-        let write_op = ops.write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
-        *table = write_op.await.map_err(TimeFusionError::Database)?;
+
+        // Scope the write lock to minimize lock time and include checkpointing.
+        let should_checkpoint = {
+            let mut table = table_ref.write().await;
+            let write_op = DeltaOps(table.clone()).write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
+            let new_table = write_op.await?;
+            let version = new_table.version();
+            *table = new_table;
+            version > 0 && version % 40 == 0
+        };
+
+        if should_checkpoint {
+            let table = table_ref.read().await;
+            let version = table.version();
+            info!("Starting checkpointing for Delta table at version {}", version);
+
+            match checkpoints::create_checkpoint(&table, None).await {
+                Ok(_) => info!("Checkpointing completed successfully"),
+                Err(e) => error!("Checkpointing failed: {}", e),
+            }
+
+            info!("Checkpoint completed");
+        }
+
         Ok(())
     }
 
-    // Public record insertion method.
     #[tracing::instrument(name = "db.insert_records", skip(self, records))]
     pub async fn insert_records(&self, records: &Vec<OtelLogsAndSpans>) -> Result<()> {
         use serde_arrow::schema::SchemaLike;
-        let fields = Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(serde_arrow::schema::TracingOptions::default())
-            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to create schema fields: {}", e)))?;
-        let batch = serde_arrow::to_record_batch(&fields, &records)
-            .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Failed to convert to record batch: {}", e)))?;
+        // Convert OtelLogsAndSpans records to Arrow RecordBatch format.
+        let fields = OtelLogsAndSpans::fields()?;
+        let batch = serde_arrow::to_record_batch(&fields, &records)?;
         self.insert_records_batch("default", vec![batch]).await
     }
 
-    // New: verify that storage is writable by performing a dummy write.
+    // Verify that storage is writable by performing a dummy write.
     async fn verify_storage_write(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<()> {
-        // Create a dummy record with non-null default values.
         let dummy = OtelLogsAndSpans {
             project_id: "test".to_string(),
             timestamp: chrono::Utc::now(),
@@ -292,7 +378,6 @@ impl Database {
             .map_err(|e| TimeFusionError::Generic(anyhow::anyhow!("Dummy write conversion failed: {}", e)))?;
         let table = table_ref.read().await.clone();
         let ops = DeltaOps(table);
-        // Attempt to write the dummy record.
         ops.write(vec![batch]).await.map_err(TimeFusionError::Database)?;
         info!("Storage write verification succeeded");
         Ok(())
@@ -300,13 +385,16 @@ impl Database {
 
     #[tracing::instrument(name = "db.register_project", skip(self, bucket, access_key, secret_key, endpoint), fields(project_id))]
     pub async fn register_project(
-        &self, project_id: &str, bucket: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
+        &self,
+        project_id: &str,
+        bucket: &str,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        endpoint: Option<&str>,
     ) -> Result<()> {
-        // If the provided bucket string does not already contain a URI scheme, assume S3.
         let full_uri = if bucket.starts_with("s3://") || bucket.starts_with("gs://") {
             bucket.to_string()
         } else {
-            // Use provided endpoint or default to AWS S3.
             let ep = endpoint.unwrap_or("https://s3.amazonaws.com");
             format!("s3://{}/{}/?endpoint={}", bucket, project_id, ep)
         };
@@ -344,7 +432,6 @@ impl Database {
         };
 
         let table_ref = Arc::new(RwLock::new(table));
-        // Verify that the object storage is writable.
         self.verify_storage_write(&table_ref).await?;
 
         let mut configs = self.project_configs.write().await;
@@ -363,7 +450,6 @@ impl Database {
         Ok(())
     }
 
-    // Production-style periodic compaction method.
     #[tracing::instrument(name = "db.compact", skip(self, session_context))]
     pub async fn compact(&self, session_context: &SessionContext) -> Result<()> {
         let configs = self.project_configs.read().await;
@@ -381,7 +467,6 @@ impl Database {
 
             info!("Project {}: Collected {} record batch(es) for compaction", project_id, batches.len());
 
-            // Merge the record batches into a new Delta version.
             let new_table = merge_batches_into_new_version(current_table, batches, OtelLogsAndSpans::partitions()).await?;
 
             {
@@ -404,8 +489,8 @@ async fn merge_batches_into_new_version(table: DeltaTable, batches: Vec<RecordBa
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
-    database:        Arc<Database>,
-    schema:          SchemaRef,
+    database: Arc<Database>,
+    schema: SchemaRef,
 }
 
 impl ProjectRoutingTable {
@@ -471,7 +556,7 @@ impl DataSink for ProjectRoutingTable {
         &self.schema
     }
 
-    async fn write_all(&self, mut data: SendableRecordBatchStream, _context: &Arc<TaskContext>) -> DFResult<u64> {
+    async fn write_all(&self, mut data: SendableRecordBatchStream, _context: &Arc<TaskContext>) -> datafusion::error::Result<u64> {
         let mut new_batches = vec![];
         let mut row_count = 0;
         while let Some(batch) = data.next().await.transpose()? {
@@ -481,7 +566,7 @@ impl DataSink for ProjectRoutingTable {
         self.database
             .insert_records_batch("", new_batches)
             .await
-            .map_err(|e| DataFusionError::Execution(format!("Failed to insert records: {}", e)))?;
+            .map_err(|e| datafusion::error::DataFusionError::Execution(format!("Failed to insert records: {}", e)))?;
         Ok(row_count as u64)
     }
 
@@ -496,27 +581,37 @@ impl TableProvider for ProjectRoutingTable {
         self
     }
 
-    fn table_type(&self) -> TableType {
-        TableType::Base
+    fn table_type(&self) -> datafusion::datasource::TableType {
+        datafusion::datasource::TableType::Base
     }
 
     fn schema(&self) -> SchemaRef {
         self.schema()
     }
 
-    async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> DFResult<Arc<dyn ExecutionPlan>> {
-        self.schema().logically_equivalent_names_and_types(&input.schema())?;
+    async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // Check that the schema of the plan matches the schema of this table.
+        match self.schema().logically_equivalent_names_and_types(&input.schema()) {
+            Ok(_) => info!("Schema validation passed"),
+            Err(e) => {
+                error!("Schema validation failed: {}", e);
+                return Err(e);
+            }
+        }
         if insert_op != InsertOp::Append {
+            error!("Unsupported insert operation: {:?}", insert_op);
             return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
         }
-        Ok(Arc::new(DataSinkExec::new(input, Arc::new(self.clone()), None)))
+
+        let sink = DataSinkExec::new(input, Arc::new(self.clone()), None);
+        Ok(Arc::new(sink))
     }
 
-    fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
+    fn supports_filters_pushdown(&self, filter: &[&Expr]) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
         Ok(filter.iter().map(|_| TableProviderFilterPushDown::Inexact).collect())
     }
 
-    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
+    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
         let delta_table = self.database.resolve_table(&project_id).await?;
         let table = delta_table.read().await;
@@ -524,15 +619,13 @@ impl TableProvider for ProjectRoutingTable {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
-    use std::thread::sleep;
-
     use chrono::{TimeZone, Utc};
     use datafusion::{assert_batches_eq, prelude::SessionContext};
     use dotenv::dotenv;
     use serial_test::serial;
-    use tokio::time;
     use uuid::Uuid;
 
     use super::*;
@@ -561,29 +654,6 @@ mod tests {
         Ok((db, session_context, test_prefix))
     }
 
-    // Helper function to refresh the table after modifications
-    async fn refresh_table(db: &Database, session_context: &SessionContext) -> Result<()> {
-        // Refresh the Delta table
-        // Get the delta table using our resolve_table method
-        let table_ref = db.resolve_table("default").await.map_err(|e| anyhow::anyhow!("Failed to resolve default table: {:?}", e))?;
-
-        let mut table = table_ref.write().await;
-        *table = deltalake::open_table(&table.table_uri()).await?;
-
-        // Create a new ProjectRoutingTable with the refreshed database
-        let schema = OtelLogsAndSpans::schema_ref();
-        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
-
-        // Re-register the table with the session context
-        session_context.deregister_table(OtelLogsAndSpans::table_name())?;
-        session_context.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
-
-        // Add a small delay to ensure the changes propagate
-        sleep(time::Duration::from_millis(100));
-
-        Ok(())
-    }
-
     // Helper function to create sample test records
     fn create_test_records() -> Vec<OtelLogsAndSpans> {
         let timestamp1 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap();
@@ -592,6 +662,7 @@ mod tests {
         vec![
             OtelLogsAndSpans {
                 project_id: "test_project".to_string(),
+                // date: timestamp1.date_naive(),
                 timestamp: timestamp1,
                 observed_timestamp: Some(timestamp1),
                 id: "span1".to_string(),
@@ -606,6 +677,7 @@ mod tests {
             },
             OtelLogsAndSpans {
                 project_id: "test_project".to_string(),
+                // date: timestamp2.date_naive(),
                 timestamp: timestamp2,
                 observed_timestamp: Some(timestamp2),
                 id: "span2".to_string(),
@@ -834,28 +906,28 @@ mod tests {
                 "| sql_span1a | sql_test_span | 2023-02-01T15:30:00 |",
                 "+------------+---------------+---------------------+",
         ], &verify_df);
-        //
+
         let insert_sql = "INSERT INTO otel_logs_and_spans (
-                project_id, timestamp, id,
-                parent_id, name, kind,
-                status_code, status_message, level, severity___severity_text, severity___severity_number,
-                body, duration, start_time, end_time
-            ) VALUES (
-                'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1',
-                NULL, 'sql_test_span', NULL,
-                'OK', 'span inserted successfully', 'INFO', 'INFORMATION', NULL,
-                NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL
-            )";
+                 project_id, date, timestamp, id, hashes,
+                 parent_id, name, kind,
+                 status_code, status_message, level, severity___severity_text, severity___severity_number,
+                 body, duration, start_time, end_time
+             ) VALUES (
+                 'test_project', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1', ARRAY[],
+                 NULL, 'sql_test_span', NULL,
+                 'OK', 'span inserted successfully', 'INFO', 'INFORMATION', NULL,
+                 NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL
+             )";
 
         let insert_result = ctx.sql(insert_sql).await?.collect().await?;
         #[rustfmt::skip]
-        assert_batches_eq!(
-            ["+-------+",
-            "| count |",
-            "+-------+",
-            "| 1     |",
-            "+-------+",
-        ], &insert_result);
+         assert_batches_eq!(
+             ["+-------+",
+             "| count |",
+             "+-------+",
+             "| 1     |",
+             "+-------+",
+         ], &insert_result);
 
         let verify_df = ctx
             .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
@@ -876,7 +948,7 @@ mod tests {
 
         log::info!("Inserting record directly via insert statement");
         let insert_sql = "INSERT INTO otel_logs_and_spans (
-                project_id, timestamp, observed_timestamp, id,
+                project_id, date, timestamp, observed_timestamp, id, hashes,
                 parent_id, name, kind,
                 status_code, status_message, level, severity___severity_text, severity___severity_number,
                 body, duration, start_time, end_time,
@@ -897,12 +969,12 @@ mod tests {
                 attributes___session___id, attributes___session___previous___id, attributes___db___system___name, attributes___db___collection___name,
                 attributes___db___namespace, attributes___db___operation___name, attributes___db___response___status_code, attributes___db___operation___batch___size,
                 attributes___db___query___summary, attributes___db___query___text, attributes___user___id, attributes___user___email,
-                attributes___user___full_name, attributes___user___name, attributes___user___hash, resource___attributes___service___name,
+                attributes___user___full_name, attributes___user___name, attributes___user___hash, resource___service___name,
 
-                resource___attributes___service___version, resource___attributes___service___instance___id, resource___attributes___service___namespace, resource___attributes___telemetry___sdk___language,
-                resource___attributes___telemetry___sdk___name, resource___attributes___telemetry___sdk___version, resource___attributes___user_agent___original
+                resource___service___version, resource___service___instance___id, resource___service___namespace, resource___telemetry___sdk___language,
+                resource___telemetry___sdk___name, resource___telemetry___sdk___version, resource___user_agent___original
             ) VALUES (
-                'test_project', TIMESTAMP '2023-01-02T10:00:00Z', NULL, 'sql_span2',
+                'test_project','2023-01-02',  TIMESTAMP '2023-01-02T10:00:00Z', NULL, 'sql_span2', ARRAY[],
                 NULL, 'sql_test_span', NULL,
                 'OK', 'span inserted successfully', 'INFO', NULL, NULL,
                 NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL,
@@ -931,13 +1003,13 @@ mod tests {
 
         let insert_result = ctx.sql(insert_sql).await?.collect().await?;
         #[rustfmt::skip]
-        assert_batches_eq!(
-            ["+-------+",
-            "| count |",
-            "+-------+",
-            "| 1     |",
-            "+-------+",
-        ], &insert_result);
+         assert_batches_eq!(
+             ["+-------+",
+             "| count |",
+             "+-------+",
+             "| 1     |",
+             "+-------+",
+         ], &insert_result);
 
         // Verify that the SQL-inserted record exists
         let verify_df = ctx.sql("SELECT id, name, status_message FROM otel_logs_and_spans WHERE id = 'sql_span1'").await?;
@@ -997,23 +1069,23 @@ mod tests {
         // ], &insert_result);
 
         let verify_df = ctx
-            .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
-            .await?
-            .collect()
-            .await?;
+             .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
+             .await?
+             .collect()
+             .await?;
         #[rustfmt::skip]
-        assert_batches_eq!(
-            [
-                "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
-                "| project_id   | id         | name          | timestamp           | kind | status_code | severity___severity_text | duration  | start_time          |",
-                "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
-                "| default      | sql_span1a | sql_test_span | 2023-02-01T15:30:00 |      | OK          |                          | 150000000 | 2023-02-01T15:30:00 |",
-                "| test_project | sql_span2  | sql_test_span | 2023-01-02T10:00:00 |      | OK          |                          | 150000000 | 2023-01-01T10:00:00 |",
-                "| test_project | sql_span1  | sql_test_span | 2023-01-01T10:00:00 |      | OK          | INFORMATION              | 150000000 | 2023-01-01T10:00:00 |",
-                "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
-            ],
-            &verify_df
-        );
+         assert_batches_eq!(
+             [
+                 "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+                 "| project_id   | id         | name          | timestamp           | kind | status_code | severity___severity_text | duration  | start_time          |",
+                 "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+                 "| default      | sql_span1a | sql_test_span | 2023-02-01T15:30:00 |      | OK          |                          | 150000000 | 2023-02-01T15:30:00 |",
+                 "| test_project | sql_span2  | sql_test_span | 2023-01-02T10:00:00 |      | OK          |                          | 150000000 | 2023-01-01T10:00:00 |",
+                 "| test_project | sql_span1  | sql_test_span | 2023-01-01T10:00:00 |      | OK          | INFORMATION              | 150000000 | 2023-01-01T10:00:00 |",
+                 "+--------------+------------+---------------+---------------------+------+-------------+--------------------------+-----------+---------------------+",
+             ],
+             &verify_df
+         );
 
         Ok(())
     }
