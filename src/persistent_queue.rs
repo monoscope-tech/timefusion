@@ -110,9 +110,9 @@ pub struct OtelLogsAndSpans {
     // HTTP https://opentelemetry.io/docs/specs/semconv/http/http-spans/
     pub attributes___http___request___method: Option<String>,
     pub attributes___http___request___method_original: Option<String>,
-    pub attributes___http___response___status_code: Option<String>,
-    pub attributes___http___request___resend_count: Option<String>,
-    pub attributes___http___request___body___size: Option<String>,
+    pub attributes___http___response___status_code: Option<u32>,
+    pub attributes___http___request___resend_count: Option<u32>,
+    pub attributes___http___request___body___size: Option<u32>,
 
     // Session https://opentelemetry.io/docs/specs/semconv/general/session/
     pub attributes___session___id: Option<String>,
