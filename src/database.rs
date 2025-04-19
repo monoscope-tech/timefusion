@@ -18,14 +18,21 @@ use datafusion::{
     logical_expr::{dml::InsertOp, BinaryExpr},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
+use datafusion_postgres::{DfSessionService, HandlerFactory};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::checkpoints;
 use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
+use std::{net::SocketAddr, time::Duration};
 use tokio::sync::RwLock;
+use tokio::{
+    net::TcpListener,
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
+use tokio_stream::wrappers::TcpListenerStream;
 use tracing::{debug, error, info};
 use url::Url;
 
@@ -36,12 +43,14 @@ pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 #[derive(Debug)]
 pub struct Database {
     project_configs: ProjectConfigs,
+    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
 }
 
 impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
             project_configs: Arc::clone(&self.project_configs),
+            batch_queue: self.batch_queue.clone(),
         }
     }
 }
@@ -65,11 +74,18 @@ impl Database {
 
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
+            batch_queue: None, // Batch queue is set later
         };
 
         db.register_project("default", &storage_uri, None, None, None).await?;
 
         Ok(db)
+    }
+
+    /// Set the batch queue to use for insert operations
+    pub fn with_batch_queue(mut self, batch_queue: Arc<crate::batch_queue::BatchQueue>) -> Self {
+        self.batch_queue = Some(batch_queue);
+        self
     }
 
     /// Create and configure a SessionContext with DataFusion settings
@@ -88,7 +104,12 @@ impl Database {
 
         // Create tables and register them with session context
         let schema = OtelLogsAndSpans::schema_ref();
-        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema);
+
+        // Get batch queue from the app state if available
+        let batch_queue = self.batch_queue.as_ref().map(Arc::clone);
+
+        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema, batch_queue);
+
         ctx.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
         info!("Registered ProjectRoutingTable with SessionContext");
 
@@ -177,79 +198,78 @@ impl Database {
         ctx.register_udf(set_config_udf);
     }
 
-    /// Start a PGWire server with the given session context
     pub async fn start_pgwire_server(
-        &self, session_context: SessionContext, port: u16, shutdown_token: CancellationToken,
-    ) -> Result<tokio::task::JoinHandle<()>> {
-        use datafusion_postgres::{DfSessionService, HandlerFactory};
-        use tokio::net::TcpListener;
+        &self, session_ctx: SessionContext, port: u16, shutdown: CancellationToken,
+    ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+        // 1) build listener
+        // Simple binding with clear logging
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        info!("Binding PGWire server to {}...", addr);
+        
+        // Use standard tokio TcpListener
+        let listener = TcpListener::bind(addr).await?;
+        
+        // Log successful binding
+        if let Ok(local_addr) = listener.local_addr() {
+            info!("PGWire server successfully bound to {}", local_addr);
+        }
 
-        let pg_service = Arc::new(DfSessionService::new(session_context));
-        let handler_factory = Arc::new(HandlerFactory(pg_service.clone()));
+        // 2) pgwire service + handler
+        let service = Arc::new(DfSessionService::new(session_ctx));
+        let factory = Arc::new(HandlerFactory(service));
 
-        info!("Attempting to bind PGWire server to 0.0.0.0:{}", port);
-        let bind_addr = format!("0.0.0.0:{}", port);
-        let pg_listener = match TcpListener::bind(&bind_addr).await {
-            Ok(listener) => {
-                info!("PGWire server successfully bound to {}", bind_addr);
-                listener
-            }
-            Err(e) => {
-                error!("Failed to bind PGWire server to {}: {:?}", bind_addr, e);
-                return Err(anyhow::anyhow!("Failed to bind PGWire server: {:?}", e));
-            }
-        };
+        // 3) concurrency + logging
+        let max_conn = std::env::var("MAX_PG_CONNECTIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(100) as usize;
+        info!("PGWire listening on 0.0.0.0:{} (limit {})", port, max_conn);
 
-        // Log all local addresses this process is listening on
-        info!("PGWire server running on 0.0.0.0:{}", port);
-        info!("PGWire server local address: {:?}", pg_listener.local_addr());
-
-        let pgwire_shutdown = shutdown_token.clone();
-
-        let pg_server = tokio::spawn({
-            let handler_factory = handler_factory.clone();
+        // 4) spawn the accept‐&‐process loop
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let stream = TcpListenerStream::new(listener);
             async move {
-                loop {
-                    tokio::select! {
-                        _ = pgwire_shutdown.cancelled() => {
-                            info!("PGWire server shutting down.");
-                            break;
-                        }
-                        result = pg_listener.accept() => {
-                            match result {
-                                Ok((socket, addr)) => {
-                                    info!("PGWire: Received connection from {}, preparing to process", addr);
-                                    info!("PGWire: Socket details - local addr: {:?}, peer addr: {:?}",
-                                        socket.local_addr().map_err(|e| debug!("Failed to get local addr: {:?}", e)),
-                                        socket.peer_addr().map_err(|e| debug!("Failed to get peer addr: {:?}", e))
-                                    );
-
-                                    let handler_factory = handler_factory.clone();
-                                    tokio::spawn(async move {
-                                        info!("PGWire: Started processing connection from {}", addr);
-                                        match pgwire::tokio::process_socket(socket, None, handler_factory).await {
-                                            Ok(()) => {
-                                                info!("PGWire: Connection from {} processed successfully", addr);
-                                            }
-                                            Err(e) => {
-                                                error!("PGWire: Error processing connection from {}: {:?}", addr, e);
-                                                error!("PGWire: Error details - {}", e);
-                                            }
-                                        }
-                                    });
+                stream
+                    .take_until(shutdown.cancelled())
+                    .for_each_concurrent(max_conn, |conn| async {
+                        match conn {
+                            Ok(sock) => {
+                                // Set TCP nodelay option for better performance
+                                if let Err(e) = sock.set_nodelay(true) {
+                                    error!("Failed to set TCP_NODELAY: {}", e);
                                 }
-                                Err(e) => {
-                                    error!("PGWire: Error accepting connection: {:?}", e);
-                                    error!("PGWire: Connection accept error details - {}", e);
+                                
+                                // Log client connection info
+                                if let Ok(peer_addr) = sock.peer_addr() {
+                                    info!("Client connected from {}", peer_addr);
+                                }
+                                
+                                // Use a longer timeout to prevent idle disconnections
+                                let timeout_duration = Duration::from_secs(3600); // 1 hour
+                                info!("Starting PGWire connection processing");
+                                let start_time = std::time::Instant::now();
+                                
+                                match timeout(timeout_duration, pgwire::tokio::process_socket(sock, None, factory.clone())).await {
+                                    Ok(Ok(_)) => {
+                                        let elapsed = start_time.elapsed();
+                                        info!("PGWire connection completed successfully (duration: {:?})", elapsed);
+                                    },
+                                    Ok(Err(e)) => {
+                                        let elapsed = start_time.elapsed();
+                                        error!("PGWire connection error after {:?}: {}", elapsed, e);
+                                    },
+                                    Err(_) => {
+                                        error!("PGWire connection timed out after 1 hour");
+                                    },
                                 }
                             }
+                            Err(e) => error!("TCP accept error: {}", e),
                         }
-                    }
-                }
+                    })
+                    .await;
+                info!("PGWire server shut down.");
             }
         });
 
-        Ok(pg_server)
+        Ok(handle)
     }
 
     pub async fn resolve_table(&self, project_id: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
@@ -298,7 +318,25 @@ impl Database {
         )))
     }
 
-    pub async fn insert_records_batch(&self, _table: &str, batch: Vec<RecordBatch>) -> Result<()> {
+    pub async fn insert_records_batch(&self, _table: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
+        // Check if we should use the batch queue based on:
+        // 1. skip_queue parameter (if true, always skip)
+        // 2. ENABLE_BATCH_QUEUE env var (if set to "true", allow queue usage)
+        // 3. batch_queue existence
+        let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
+        
+        if !skip_queue && enable_queue && self.batch_queue.is_some() {
+            let queue = self.batch_queue.as_ref().unwrap();
+            // Add to batch queue
+            for batch in batches {
+                if let Err(e) = queue.queue(batch) {
+                    return Err(anyhow::anyhow!("Queue error: {}", e));
+                }
+            }
+            return Ok(());
+        }
+        
+        // Direct insert logic if skip_queue=true, queue disabled, no batch queue, or when processing from batch queue
         let (_conn_str, _options, table_ref) = {
             let configs = self.project_configs.read().await;
             configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
@@ -309,7 +347,7 @@ impl Database {
             let mut table = table_ref.write().await;
 
             // Create the DeltaOps with a clone of the table
-            let write_op = DeltaOps(table.clone()).write(batch).with_partition_columns(OtelLogsAndSpans::partitions());
+            let write_op = DeltaOps(table.clone()).write(batches).with_partition_columns(OtelLogsAndSpans::partitions());
 
             let new_table = write_op.await?;
             let version = new_table.version();
@@ -352,7 +390,8 @@ impl Database {
         let batch = serde_arrow::to_record_batch(&fields, &records)?;
 
         // Call insert_records_batch with the converted batch to reuse common insertion logic
-        self.insert_records_batch("default", vec![batch]).await
+        // In tests we always skip the queue for direct insertion
+        self.insert_records_batch("default", vec![batch], true).await
     }
 
     pub async fn register_project(
@@ -374,7 +413,7 @@ impl Database {
 
         storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let mut table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
+        let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
             Ok(table) => {
                 // Check if table needs checkpointing - use same threshold as in insert_records_batch
                 let version = table.version();
@@ -411,14 +450,16 @@ pub struct ProjectRoutingTable {
     default_project: String,
     database: Arc<Database>,
     schema: SchemaRef,
+    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
 }
 
 impl ProjectRoutingTable {
-    pub fn new(default_project: String, database: Arc<Database>, schema: SchemaRef) -> Self {
+    pub fn new(default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>) -> Self {
         Self {
             default_project,
             database,
             schema,
+            batch_queue,
         }
     }
 
@@ -501,16 +542,26 @@ impl DataSink for ProjectRoutingTable {
     }
 
     async fn write_all(&self, mut data: SendableRecordBatchStream, _context: &Arc<TaskContext>) -> DFResult<u64> {
-        let mut new_batches = vec![];
         let mut row_count = 0;
+        let mut batches = Vec::new();
+
+        // Collect all batches from the stream
         while let Some(batch) = data.next().await.transpose()? {
             row_count += batch.num_rows();
-            new_batches.push(batch);
+            batches.push(batch);
         }
+
+        if batches.is_empty() {
+            return Ok(0);
+        }
+
+        // Let the database handle the queue decision with skip_queue=false
+        // This means it will use the queue if it's available and not disabled via env var
         self.database
-            .insert_records_batch("", new_batches)
+            .insert_records_batch("", batches, false)
             .await
-            .map_err(|e| DataFusionError::Execution(format!("Failed to insert records: {}", e)))?;
+            .map_err(|e| DataFusionError::Execution(format!("Insert error: {}", e)))?;
+
         Ok(row_count as u64)
     }
 
@@ -596,7 +647,12 @@ mod tests {
         datafusion_functions_json::register_all(&mut session_context)?;
         let schema = OtelLogsAndSpans::schema_ref();
 
-        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(db.clone()), schema);
+        let routing_table = ProjectRoutingTable::new(
+            "default".to_string(),
+            Arc::new(db.clone()),
+            schema,
+            None, // No batch queue in tests
+        );
         session_context.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
 
         Ok((db, session_context, test_prefix))
