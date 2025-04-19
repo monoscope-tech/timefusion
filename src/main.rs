@@ -1,7 +1,9 @@
 // main.rs
+mod batch_queue;
 mod database;
 mod persistent_queue;
 use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
+use batch_queue::BatchQueue;
 use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
@@ -54,15 +56,24 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting TimeFusion application");
 
     // Initialize database
-    let db = Database::new().await?;
+    let mut db = Database::new().await?;
     info!("Database initialized successfully");
 
-    // Create and setup session context
+    // Setup batch processing with configurable params
+    let interval_ms = env::var("BATCH_INTERVAL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let max_size = env::var("MAX_BATCH_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
+    let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
+
+    // Create batch queue
+    let batch_queue = Arc::new(BatchQueue::new(Arc::new(db.clone()), interval_ms, max_size));
+    info!("Batch queue configured (enabled={}, interval={}ms, max_size={})", enable_queue, interval_ms, max_size);
+
+    // Apply and setup
+    db = db.with_batch_queue(Arc::clone(&batch_queue));
     let session_context = db.create_session_context();
     db.setup_session_context(&session_context)?;
-    info!("Session context setup complete");
 
-    // Wrap database in Arc for sharing
+    // Wrap for sharing
     let db = Arc::new(db);
     let app_info = web::Data::new(AppInfo {});
 
@@ -132,7 +143,10 @@ async fn main() -> anyhow::Result<()> {
         _ = pg_server.map_err(|e| error!("PGWire server task failed: {:?}", e)) => {},
         _ = http_task.map_err(|e| error!("HTTP server task failed: {:?}", e)) => {},
         _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, initiating shutdown.");
+            info!("Received Ctrl+C, initiating shutdown");
+
+            // Shutdown in order: batch queue first to flush pending data
+            batch_queue.shutdown().await;
             shutdown_token.cancel();
             http_server_handle.stop(true).await;
             sleep(Duration::from_secs(1)).await;

@@ -11,14 +11,19 @@ Timefusion speaks the postgres dialect, so you can insert and read from it using
 
 Timefusion can be configured using the following environment variables:
 
-| Variable              | Description                   | Default                    |
-| --------------------- | ----------------------------- | -------------------------- |
-| `PORT`                | HTTP server port              | `80`                       |
-| `PGWIRE_PORT`         | PostgreSQL wire protocol port | `5432`                     |
-| `AWS_S3_BUCKET`       | AWS S3 bucket name            | Required                   |
-| `AWS_S3_ENDPOINT`     | AWS S3 endpoint URL           | `https://s3.amazonaws.com` |
-| AWS_ACCESS_KEY_ID     | AWS access key                | -                          |
-| AWS_SECRET_ACCESS_KEY | AWS secret key                | -                          |
+| Variable               | Description                                      | Default                     |
+| ---------------------- | ------------------------------------------------ | --------------------------- |
+| `PORT`                 | HTTP server port                                 | `80`                        |
+| `PGWIRE_PORT`          | PostgreSQL wire protocol port                    | `5432`                      |
+| `AWS_S3_BUCKET`        | AWS S3 bucket name                               | Required                    |
+| `AWS_S3_ENDPOINT`      | AWS S3 endpoint URL                              | `https://s3.amazonaws.com`  |
+| `AWS_ACCESS_KEY_ID`    | AWS access key                                   | -                           |
+| `AWS_SECRET_ACCESS_KEY`| AWS secret key                                   | -                           |
+| `TIMEFUSION_TABLE_PREFIX` | Prefix for Delta tables                       | `timefusion`                |
+| `BATCH_INTERVAL_MS`    | Interval between batch inserts in milliseconds   | `1000`                      |
+| `MAX_BATCH_SIZE`       | Maximum number of rows in a single batch         | `1000`                      |
+| `ENABLE_BATCH_QUEUE`   | Whether to use batch queue for inserts           | `false` (direct insertion)  |
+| `MAX_PG_CONNECTIONS`   | Maximum number of concurrent PostgreSQL connections | `100`                     |
 
 For local development, you can set `QUEUE_DB_PATH` to a location in your development environment.
 
