@@ -10,6 +10,7 @@ use serde_arrow::schema::SchemaLike;
 use serde_arrow::schema::TracingOptions;
 use serde_json::json;
 use serde_with::serde_as;
+use delta_kernel::parquet::format::SortingColumn;
 
 #[allow(non_snake_case)]
 #[serde_as]
@@ -218,6 +219,22 @@ impl OtelLogsAndSpans {
 
     pub fn partitions() -> Vec<String> {
         vec!["project_id".to_string(), "date".to_string()]
+    }
+
+    pub fn sorting_columns() -> Vec<SortingColumn> {
+        // Define sorting columns for the parquet files to improve query performance
+        vec![
+            SortingColumn {
+                column_idx: 0, // timestamp is likely first in the schema
+                descending: true, // newest first
+                nulls_first: false,
+            },
+            SortingColumn {
+                column_idx: 3, // id
+                descending: false,
+                nulls_first: false,
+            }
+        ]
     }
 }
 
