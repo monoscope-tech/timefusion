@@ -21,18 +21,18 @@ use datafusion::{
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::checkpoints;
+use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
+use deltalake::datafusion::parquet::file::properties::WriterProperties;
+use deltalake::operations::transaction::CommitProperties;
 use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use std::{net::SocketAddr, time::Duration};
 use tokio::sync::RwLock;
-use tokio::{
-    net::TcpListener,
-    time::timeout,
-};
-use tokio_util::sync::CancellationToken;
+use tokio::{net::TcpListener, time::timeout};
 use tokio_stream::wrappers::TcpListenerStream;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use url::Url;
 
@@ -205,10 +205,10 @@ impl Database {
         // Simple binding with clear logging
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         info!("Binding PGWire server to {}...", addr);
-        
+
         // Use standard tokio TcpListener
         let listener = TcpListener::bind(addr).await?;
-        
+
         // Log successful binding
         if let Ok(local_addr) = listener.local_addr() {
             info!("PGWire server successfully bound to {}", local_addr);
@@ -236,29 +236,29 @@ impl Database {
                                 if let Err(e) = sock.set_nodelay(true) {
                                     error!("Failed to set TCP_NODELAY: {}", e);
                                 }
-                                
+
                                 // Log client connection info
                                 if let Ok(peer_addr) = sock.peer_addr() {
                                     info!("Client connected from {}", peer_addr);
                                 }
-                                
+
                                 // Use a longer timeout to prevent idle disconnections
                                 let timeout_duration = Duration::from_secs(3600); // 1 hour
                                 info!("Starting PGWire connection processing");
                                 let start_time = std::time::Instant::now();
-                                
+
                                 match timeout(timeout_duration, pgwire::tokio::process_socket(sock, None, factory.clone())).await {
                                     Ok(Ok(_)) => {
                                         let elapsed = start_time.elapsed();
                                         info!("PGWire connection completed successfully (duration: {:?})", elapsed);
-                                    },
+                                    }
                                     Ok(Err(e)) => {
                                         let elapsed = start_time.elapsed();
                                         error!("PGWire connection error after {:?}: {}", elapsed, e);
-                                    },
+                                    }
                                     Err(_) => {
                                         error!("PGWire connection timed out after 1 hour");
-                                    },
+                                    }
                                 }
                             }
                             Err(e) => error!("TCP accept error: {}", e),
@@ -324,7 +324,7 @@ impl Database {
         // 2. ENABLE_BATCH_QUEUE env var (if set to "true", allow queue usage)
         // 3. batch_queue existence
         let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
-        
+
         if !skip_queue && enable_queue && self.batch_queue.is_some() {
             let queue = self.batch_queue.as_ref().unwrap();
             // Add to batch queue
@@ -335,7 +335,7 @@ impl Database {
             }
             return Ok(());
         }
-        
+
         // Direct insert logic if skip_queue=true, queue disabled, no batch queue, or when processing from batch queue
         let (_conn_str, _options, table_ref) = {
             let configs = self.project_configs.read().await;
@@ -346,8 +346,18 @@ impl Database {
         let should_checkpoint = {
             let mut table = table_ref.write().await;
 
-            // Create the DeltaOps with a clone of the table
-            let write_op = DeltaOps(table.clone()).write(batches).with_partition_columns(OtelLogsAndSpans::partitions());
+            // Create writer properties with ZSTD compression and bloom filters
+            let writer_properties = WriterProperties::builder()
+                .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                .set_bloom_filter_enabled(true)
+                .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
+                .build();
+
+            // Create the DeltaOps with a clone of the table and ZSTD compression
+            let write_op = DeltaOps(table.clone())
+                .write(batches)
+                .with_partition_columns(OtelLogsAndSpans::partitions())
+                .with_writer_properties(writer_properties);
 
             let new_table = write_op.await?;
             let version = new_table.version();
@@ -356,7 +366,7 @@ impl Database {
             version > 0 && version % 40 == 0
         };
 
-        // Checkpoint in the background if needed
+        // Checkpoint and vacuum in the background if needed
         if should_checkpoint {
             // Create a checkpoint immediately within the same function
             // This avoids spawning separate tasks that hold onto table references
@@ -366,11 +376,25 @@ impl Database {
             info!("Starting checkpointing for Delta table at version {}", version);
 
             match checkpoints::create_checkpoint(&table, None).await {
-                Ok(_) => info!("Checkpointing completed successfully"),
+                Ok(_) => {
+                    info!("Checkpointing completed successfully");
+                    
+                    // Get retention period from environment variable or use default (14 days)
+                    let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS")
+                        .unwrap_or_else(|_| "336".to_string()) // Default: 14 days (336 hours)
+                        .parse::<u64>()
+                        .unwrap_or(336); // Default to 14 days if parsing fails
+                    
+                    // Release the read lock
+                    drop(table);
+                    
+                    // Perform vacuum operation to clean up old files after checkpointing
+                    self.vacuum_table(&table_ref, retention_hours).await;
+                },
                 Err(e) => error!("Checkpointing failed: {}", e),
             }
 
-            info!("Checkpoint completed");
+            info!("Maintenance operations completed");
         }
 
         Ok(())
@@ -392,6 +416,58 @@ impl Database {
         // Call insert_records_batch with the converted batch to reuse common insertion logic
         // In tests we always skip the queue for direct insertion
         self.insert_records_batch("default", vec![batch], true).await
+    }
+
+    /// Vacuum the Delta table to clean up old files that are no longer needed
+    /// This reduces storage costs and improves query performance
+    async fn vacuum_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, retention_hours: u64) {
+        // Log the start of the vacuum operation
+        info!("Starting vacuum operation with retention period of {} hours", retention_hours);
+        
+        // Get a clone of the table to avoid holding the lock during the operation
+        let table_clone = {
+            let table = table_ref.read().await;
+            table.clone()
+        };
+        
+        info!("Starting vacuum operation with retention period of {} hours", retention_hours);
+        
+        // Perform dry run first to log what would be deleted
+        match DeltaOps(table_clone.clone())
+            .vacuum()
+            .with_retention_period(chrono::Duration::hours(retention_hours as i64))
+            .with_dry_run(true)
+            .await
+        {
+            Ok((_, metrics)) => {
+                let files_deleted = metrics.files_deleted.len();
+                info!("Vacuum dry run identified {} files for deletion", files_deleted);
+                
+                if files_deleted > 0 {
+                    // Only proceed with actual vacuum if there are files to delete
+                    match DeltaOps(table_clone)
+                        .vacuum()
+                        .with_retention_period(chrono::Duration::hours(retention_hours as i64))
+                        .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
+                        .await
+                    {
+                        Ok((_, metrics)) => {
+                            let actual_files_deleted = metrics.files_deleted.len();
+                            info!("Vacuum completed successfully, deleted {} files", actual_files_deleted);
+                            // Update the table reference with the vacuumed version
+                            let mut table = table_ref.write().await;
+                            if let Ok(()) = table.update().await {
+                                info!("Table updated after vacuum");
+                            } else {
+                                error!("Failed to update table after vacuum");
+                            }
+                        },
+                        Err(e) => error!("Vacuum operation failed: {}", e),
+                    }
+                }
+            },
+            Err(e) => error!("Vacuum dry run failed: {}", e),
+        }
     }
 
     pub async fn register_project(
@@ -430,11 +506,17 @@ impl Database {
                 // Create the table with project_id partitioning only for now
                 // Timestamp partitioning is likely causing issues with nanosecond precision
                 let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
+                let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
+
+                // Create table with ZSTD compression and auto-optimization
                 delta_ops
                     .create()
                     .with_columns(OtelLogsAndSpans::columns().unwrap_or_default())
                     .with_partition_columns(OtelLogsAndSpans::partitions())
                     .with_storage_options(storage_options.0.clone())
+                    .with_commit_properties(commit_properties)
+                    .with_configuration_property(deltalake::TableProperty::AutoOptimizeOptimizeWrite, Some("true"))
+                    .with_configuration_property(deltalake::TableProperty::AutoOptimizeAutoCompact, Some("true"))
                     .await?
             }
         };
