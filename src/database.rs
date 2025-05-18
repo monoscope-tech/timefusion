@@ -98,32 +98,6 @@ impl Database {
         let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
 
-        // Run immediate optimize and vacuum operations at startup
-        info!("Running immediate optimize and vacuum on startup");
-        let startup_db = db.clone();
-        tokio::spawn(async move {
-            info!("Starting immediate optimize operation on all tables");
-            
-            // Run optimize first
-            for (project_id, (_, _, table)) in startup_db.project_configs.read().await.iter() {
-                info!("Optimizing table for project '{}' on startup", project_id);
-                if let Err(e) = startup_db.optimize_table(table).await {
-                    error!("Startup optimize failed for {}: {}", project_id, e);
-                }
-            }
-            
-            // Then run vacuum on the optimized tables
-            let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS").unwrap_or_else(|_| "336".to_string()).parse::<u64>().unwrap_or(336);
-            info!("Starting immediate vacuum operation on all tables (retention: {}h)", retention_hours);
-            
-            for (project_id, (_, _, table)) in startup_db.project_configs.read().await.iter() {
-                info!("Vacuuming table for project '{}' on startup", project_id);
-                startup_db.vacuum_table(table, retention_hours).await;
-            }
-            
-            info!("Completed startup maintenance operations");
-        });
-
         // Optimize job - every 3 hours
         let optimize_job = Job::new_async("0 0 */3 * * *", {
             let db = db.clone();
