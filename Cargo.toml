@@ -66,6 +66,7 @@ aws-types = "1.3.6"
 aws-sdk-s3 = "1.3.0"
 url = "2.5.4"
 datafusion-common = "46.0.0"
+tokio-cron-scheduler = "0.10"
 
 [dev-dependencies]
 serial_test = "3.2.0"

@@ -44,6 +44,7 @@ pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 pub struct Database {
     project_configs: ProjectConfigs,
     batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    maintenance_shutdown: Arc<CancellationToken>,
 }
 
 impl Clone for Database {
@@ -51,6 +52,7 @@ impl Clone for Database {
         Self {
             project_configs: Arc::clone(&self.project_configs),
             batch_queue: self.batch_queue.clone(),
+            maintenance_shutdown: Arc::clone(&self.maintenance_shutdown),
         }
     }
 }
@@ -75,6 +77,7 @@ impl Database {
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
             batch_queue: None, // Batch queue is set later
+            maintenance_shutdown: Arc::new(CancellationToken::new()),
         };
 
         db.register_project("default", &storage_uri, None, None, None).await?;
@@ -86,6 +89,65 @@ impl Database {
     pub fn with_batch_queue(mut self, batch_queue: Arc<crate::batch_queue::BatchQueue>) -> Self {
         self.batch_queue = Some(batch_queue);
         self
+    }
+    
+    /// Start background maintenance schedulers for optimize and vacuum operations
+    pub async fn start_maintenance_schedulers(self) -> Result<Self> {
+        use tokio_cron_scheduler::{Job, JobScheduler};
+        
+        let scheduler = JobScheduler::new().await?;
+        let db = Arc::new(self.clone());
+        
+        // Optimize job - every 3 hours
+        let optimize_job = Job::new_async("0 0 */3 * * *", {
+            let db = db.clone();
+            move |_, _| {
+                let db = db.clone();
+                Box::pin(async move {
+                    info!("Running optimize on all tables");
+                    for (project_id, (_, _, table)) in db.project_configs.read().await.iter() {
+                        if let Err(e) = db.optimize_table(table).await {
+                            error!("Optimize failed for {}: {}", project_id, e);
+                        }
+                    }
+                })
+            }
+        })?;
+        
+        scheduler.add(optimize_job).await?;
+        
+        // Vacuum job - daily at 3AM
+        let vacuum_job = Job::new_async("0 0 3 * * *", {
+            let db = db.clone();
+            move |_, _| {
+                let db = db.clone();
+                Box::pin(async move {
+                    info!("Running vacuum on all tables");
+                    let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS")
+                        .unwrap_or_else(|_| "336".to_string())
+                        .parse::<u64>().unwrap_or(336);
+                    
+                    for (project_id, (_, _, table)) in db.project_configs.read().await.iter() {
+                        info!("Vacuuming {} (retention: {}h)", project_id, retention_hours);
+                        db.vacuum_table(table, retention_hours).await;
+                    }
+                })
+            }
+        })?;
+        
+        scheduler.add(vacuum_job).await?;
+        
+        // Start the scheduler
+        scheduler.start().await?;
+        
+        // Handle shutdown
+        let shutdown = self.maintenance_shutdown.clone();
+        tokio::spawn(async move {
+            shutdown.cancelled().await;
+            info!("Shutting down maintenance scheduler");
+        });
+        
+        Ok(self)
     }
 
     /// Create and configure a SessionContext with DataFusion settings
@@ -342,66 +404,27 @@ impl Database {
             configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
         };
 
+        // Create writer properties with ZSTD compression and bloom filters
+        let writer_properties = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_bloom_filter_enabled(true)
+            .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
+            .build();
+
         // Scope the write lock to minimize lock time
-        let should_checkpoint = {
+        {
             let mut table = table_ref.write().await;
 
-            // Create writer properties with ZSTD compression and bloom filters
-            let writer_properties = WriterProperties::builder()
-                .set_compression(Compression::ZSTD(ZstdLevel::default()))
-                .set_bloom_filter_enabled(true)
-                .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
-                .build();
-
-            // Create the DeltaOps with a clone of the table, ZSTD compression, and z-ordering
+            // Create the DeltaOps with a clone of the table
             let write_op = DeltaOps(table.clone())
                 .write(batches)
                 .with_partition_columns(OtelLogsAndSpans::partitions())
                 .with_writer_properties(writer_properties);
 
             let new_table = write_op.await?;
-            let version = new_table.version();
             *table = new_table;
-
-            version > 0 && version % 40 == 0
-        };
-
-        // Checkpoint and vacuum in the background if needed
-        if should_checkpoint {
-            // Create a checkpoint immediately within the same function
-            // This avoids spawning separate tasks that hold onto table references
-            // which can cause memory leaks
-            let table = table_ref.read().await;
-            let version = table.version();
-            info!("Starting checkpointing for Delta table at version {}", version);
-
-            match checkpoints::create_checkpoint(&table, None).await {
-                Ok(_) => {
-                    info!("Checkpointing completed successfully");
-
-                    // Get retention period from environment variable or use default (14 days)
-                    let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS")
-                        .unwrap_or_else(|_| "336".to_string()) // Default: 14 days (336 hours)
-                        .parse::<u64>()
-                        .unwrap_or(336); // Default to 14 days if parsing fails
-
-                    // Release the read lock
-                    drop(table);
-
-                    // Optimize the table with z-ordering
-                    match self.optimize_table(&table_ref).await {
-                        Ok(_) => {
-                            info!("Table optimization completed successfully");
-                            // Perform vacuum operation to clean up old files after optimization
-                            self.vacuum_table(&table_ref, retention_hours).await;
-                        }
-                        Err(e) => error!("Table optimization failed: {}", e),
-                    }
-                }
-                Err(e) => error!("Checkpointing failed: {}", e),
-            }
-
-            info!("Maintenance operations completed");
+            
+            // Note: Checkpointing, optimization, and vacuum are now managed by scheduled jobs
         }
 
         Ok(())
