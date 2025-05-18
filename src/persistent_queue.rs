@@ -236,6 +236,14 @@ impl OtelLogsAndSpans {
             }
         ]
     }
+
+    pub fn z_order_columns() -> Vec<String> {
+        // Define z-order columns for efficient time-series range queries
+        vec![
+            "timestamp".to_string(),
+            "id".to_string()
+        ]
+    }
 }
 
 pub fn default_on_empty_string<'de, D, T>(deserializer: D) -> Result<T, D::Error>

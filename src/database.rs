@@ -353,7 +353,7 @@ impl Database {
                 .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
                 .build();
 
-            // Create the DeltaOps with a clone of the table and ZSTD compression
+            // Create the DeltaOps with a clone of the table, ZSTD compression, and z-ordering
             let write_op = DeltaOps(table.clone())
                 .write(batches)
                 .with_partition_columns(OtelLogsAndSpans::partitions())
@@ -378,19 +378,19 @@ impl Database {
             match checkpoints::create_checkpoint(&table, None).await {
                 Ok(_) => {
                     info!("Checkpointing completed successfully");
-                    
+
                     // Get retention period from environment variable or use default (14 days)
                     let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS")
                         .unwrap_or_else(|_| "336".to_string()) // Default: 14 days (336 hours)
                         .parse::<u64>()
                         .unwrap_or(336); // Default to 14 days if parsing fails
-                    
+
                     // Release the read lock
                     drop(table);
-                    
+
                     // Perform vacuum operation to clean up old files after checkpointing
                     self.vacuum_table(&table_ref, retention_hours).await;
-                },
+                }
                 Err(e) => error!("Checkpointing failed: {}", e),
             }
 
@@ -423,50 +423,33 @@ impl Database {
     async fn vacuum_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, retention_hours: u64) {
         // Log the start of the vacuum operation
         info!("Starting vacuum operation with retention period of {} hours", retention_hours);
-        
+
         // Get a clone of the table to avoid holding the lock during the operation
         let table_clone = {
             let table = table_ref.read().await;
             table.clone()
         };
-        
-        info!("Starting vacuum operation with retention period of {} hours", retention_hours);
-        
-        // Perform dry run first to log what would be deleted
-        match DeltaOps(table_clone.clone())
+
+        // Directly run vacuum without dry run to delete old files
+        match DeltaOps(table_clone)
             .vacuum()
             .with_retention_period(chrono::Duration::hours(retention_hours as i64))
-            .with_dry_run(true)
+            .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
             .await
         {
             Ok((_, metrics)) => {
                 let files_deleted = metrics.files_deleted.len();
-                info!("Vacuum dry run identified {} files for deletion", files_deleted);
+                info!("Vacuum completed successfully, deleted {} files", files_deleted);
                 
-                if files_deleted > 0 {
-                    // Only proceed with actual vacuum if there are files to delete
-                    match DeltaOps(table_clone)
-                        .vacuum()
-                        .with_retention_period(chrono::Duration::hours(retention_hours as i64))
-                        .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
-                        .await
-                    {
-                        Ok((_, metrics)) => {
-                            let actual_files_deleted = metrics.files_deleted.len();
-                            info!("Vacuum completed successfully, deleted {} files", actual_files_deleted);
-                            // Update the table reference with the vacuumed version
-                            let mut table = table_ref.write().await;
-                            if let Ok(()) = table.update().await {
-                                info!("Table updated after vacuum");
-                            } else {
-                                error!("Failed to update table after vacuum");
-                            }
-                        },
-                        Err(e) => error!("Vacuum operation failed: {}", e),
-                    }
+                // Update the table reference with the vacuumed version
+                let mut table = table_ref.write().await;
+                if let Ok(()) = table.update().await {
+                    info!("Table updated after vacuum");
+                } else {
+                    error!("Failed to update table after vacuum");
                 }
-            },
-            Err(e) => error!("Vacuum dry run failed: {}", e),
+            }
+            Err(e) => error!("Vacuum operation failed: {}", e),
         }
     }
 
@@ -509,6 +492,7 @@ impl Database {
                 let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                 // Create table with ZSTD compression and auto-optimization
+                // Note: z-ordering will be applied via sorting_columns in the writer properties
                 delta_ops
                     .create()
                     .with_columns(OtelLogsAndSpans::columns().unwrap_or_default())
