@@ -388,8 +388,15 @@ impl Database {
                     // Release the read lock
                     drop(table);
 
-                    // Perform vacuum operation to clean up old files after checkpointing
-                    self.vacuum_table(&table_ref, retention_hours).await;
+                    // Optimize the table with z-ordering
+                    match self.optimize_table(&table_ref).await {
+                        Ok(_) => {
+                            info!("Table optimization completed successfully");
+                            // Perform vacuum operation to clean up old files after optimization
+                            self.vacuum_table(&table_ref, retention_hours).await;
+                        }
+                        Err(e) => error!("Table optimization failed: {}", e),
+                    }
                 }
                 Err(e) => error!("Checkpointing failed: {}", e),
             }
@@ -418,6 +425,58 @@ impl Database {
         self.insert_records_batch("default", vec![batch], true).await
     }
 
+    /// Optimize the Delta table using Z-ordering on timestamp and id columns
+    /// This improves query performance for time-based queries
+    async fn optimize_table(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<()> {
+        // Log the start of the optimization operation
+        info!("Starting Delta table optimization with Z-ordering");
+
+        // Get a clone of the table to avoid holding the lock during the operation
+        let table_clone = {
+            let table = table_ref.read().await;
+            table.clone()
+        };
+
+        // Run optimize operation with Z-order on the timestamp and id columns
+        // and a target size of 256MB for optimal file size
+        let writer_properties = WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_bloom_filter_enabled(true)
+            .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
+            .build();
+
+        // Note: Z-order functionality is achieved through sorting_columns in writer_properties
+        let optimize_result = DeltaOps(table_clone)
+            .optimize()
+            .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(OtelLogsAndSpans::z_order_columns()))
+            .with_target_size(268435456) // 256MB
+            .with_writer_properties(writer_properties)
+            .await;
+
+        match optimize_result {
+            Ok((new_table, metrics)) => {
+                info!(
+                    "Optimization with sorted columns completed: {} files removed, {} files added, {} partitions optimized, {} total files considered, {} files skipped",
+                    metrics.num_files_removed,
+                    metrics.num_files_added,
+                    metrics.partitions_optimized,
+                    metrics.total_considered_files,
+                    metrics.total_files_skipped
+                );
+
+                // Update the table reference with the optimized version
+                let mut table = table_ref.write().await;
+                *table = new_table;
+
+                Ok(())
+            }
+            Err(e) => {
+                error!("Optimization operation failed: {}", e);
+                Err(anyhow::anyhow!("Table optimization failed: {}", e))
+            }
+        }
+    }
+
     /// Vacuum the Delta table to clean up old files that are no longer needed
     /// This reduces storage costs and improves query performance
     async fn vacuum_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, retention_hours: u64) {
@@ -440,7 +499,7 @@ impl Database {
             Ok((_, metrics)) => {
                 let files_deleted = metrics.files_deleted.len();
                 info!("Vacuum completed successfully, deleted {} files", files_deleted);
-                
+
                 // Update the table reference with the vacuumed version
                 let mut table = table_ref.write().await;
                 if let Ok(()) = table.update().await {

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use arrow_schema::{DataType, FieldRef};
 use arrow_schema::{Field, Schema, SchemaRef};
+use delta_kernel::parquet::format::SortingColumn;
 use delta_kernel::schema::StructField;
 use log::debug;
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
@@ -10,7 +11,6 @@ use serde_arrow::schema::SchemaLike;
 use serde_arrow::schema::TracingOptions;
 use serde_json::json;
 use serde_with::serde_as;
-use delta_kernel::parquet::format::SortingColumn;
 
 #[allow(non_snake_case)]
 #[serde_as]
@@ -225,7 +225,7 @@ impl OtelLogsAndSpans {
         // Define sorting columns for the parquet files to improve query performance
         vec![
             SortingColumn {
-                column_idx: 0, // timestamp is likely first in the schema
+                column_idx: 0,    // timestamp is likely first in the schema
                 descending: true, // newest first
                 nulls_first: false,
             },
@@ -233,16 +233,13 @@ impl OtelLogsAndSpans {
                 column_idx: 3, // id
                 descending: false,
                 nulls_first: false,
-            }
+            },
         ]
     }
 
     pub fn z_order_columns() -> Vec<String> {
         // Define z-order columns for efficient time-series range queries
-        vec![
-            "timestamp".to_string(),
-            "id".to_string()
-        ]
+        vec!["timestamp".to_string()]
     }
 }
 
