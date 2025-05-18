@@ -90,21 +90,47 @@ impl Database {
         self.batch_queue = Some(batch_queue);
         self
     }
-    
+
     /// Start background maintenance schedulers for optimize and vacuum operations
     pub async fn start_maintenance_schedulers(self) -> Result<Self> {
         use tokio_cron_scheduler::{Job, JobScheduler};
-        
+
         let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
-        
+
+        // Run immediate optimize and vacuum operations at startup
+        info!("Running immediate optimize and vacuum on startup");
+        let startup_db = db.clone();
+        tokio::spawn(async move {
+            info!("Starting immediate optimize operation on all tables");
+            
+            // Run optimize first
+            for (project_id, (_, _, table)) in startup_db.project_configs.read().await.iter() {
+                info!("Optimizing table for project '{}' on startup", project_id);
+                if let Err(e) = startup_db.optimize_table(table).await {
+                    error!("Startup optimize failed for {}: {}", project_id, e);
+                }
+            }
+            
+            // Then run vacuum on the optimized tables
+            let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS").unwrap_or_else(|_| "336".to_string()).parse::<u64>().unwrap_or(336);
+            info!("Starting immediate vacuum operation on all tables (retention: {}h)", retention_hours);
+            
+            for (project_id, (_, _, table)) in startup_db.project_configs.read().await.iter() {
+                info!("Vacuuming table for project '{}' on startup", project_id);
+                startup_db.vacuum_table(table, retention_hours).await;
+            }
+            
+            info!("Completed startup maintenance operations");
+        });
+
         // Optimize job - every 3 hours
         let optimize_job = Job::new_async("0 0 */3 * * *", {
             let db = db.clone();
             move |_, _| {
                 let db = db.clone();
                 Box::pin(async move {
-                    info!("Running optimize on all tables");
+                    info!("Running scheduled optimize on all tables");
                     for (project_id, (_, _, table)) in db.project_configs.read().await.iter() {
                         if let Err(e) = db.optimize_table(table).await {
                             error!("Optimize failed for {}: {}", project_id, e);
@@ -113,20 +139,18 @@ impl Database {
                 })
             }
         })?;
-        
+
         scheduler.add(optimize_job).await?;
-        
+
         // Vacuum job - daily at 3AM
         let vacuum_job = Job::new_async("0 0 3 * * *", {
             let db = db.clone();
             move |_, _| {
                 let db = db.clone();
                 Box::pin(async move {
-                    info!("Running vacuum on all tables");
-                    let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS")
-                        .unwrap_or_else(|_| "336".to_string())
-                        .parse::<u64>().unwrap_or(336);
-                    
+                    info!("Running scheduled vacuum on all tables");
+                    let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS").unwrap_or_else(|_| "336".to_string()).parse::<u64>().unwrap_or(336);
+
                     for (project_id, (_, _, table)) in db.project_configs.read().await.iter() {
                         info!("Vacuuming {} (retention: {}h)", project_id, retention_hours);
                         db.vacuum_table(table, retention_hours).await;
@@ -134,19 +158,19 @@ impl Database {
                 })
             }
         })?;
-        
+
         scheduler.add(vacuum_job).await?;
-        
+
         // Start the scheduler
         scheduler.start().await?;
-        
+
         // Handle shutdown
         let shutdown = self.maintenance_shutdown.clone();
         tokio::spawn(async move {
             shutdown.cancelled().await;
             info!("Shutting down maintenance scheduler");
         });
-        
+
         Ok(self)
     }
 
@@ -423,7 +447,7 @@ impl Database {
 
             let new_table = write_op.await?;
             *table = new_table;
-            
+
             // Note: Checkpointing, optimization, and vacuum are now managed by scheduled jobs
         }
 
@@ -736,7 +760,7 @@ impl TableProvider for ProjectRoutingTable {
         // Create a physical plan from the logical plan.
         // Check that the schema of the plan matches the schema of this table.
         match self.schema().logically_equivalent_names_and_types(&input.schema()) {
-            Ok(_) => info!("Schema validation passed"),
+            Ok(_) => debug!("insert_into; Schema validation passed"),
             Err(e) => {
                 error!("Schema validation failed: {}", e);
                 return Err(e);
