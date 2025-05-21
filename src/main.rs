@@ -2,14 +2,14 @@
 mod batch_queue;
 mod database;
 mod persistent_queue;
-use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
 use batch_queue::BatchQueue;
 use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
 use serde::Deserialize;
 use std::{env, sync::Arc};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -66,7 +66,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Create batch queue
     let batch_queue = Arc::new(BatchQueue::new(Arc::new(db.clone()), interval_ms, max_size));
-    info!("Batch queue configured (enabled={}, interval={}ms, max_size={})", enable_queue, interval_ms, max_size);
+    info!(
+        "Batch queue configured (enabled={}, interval={}ms, max_size={})",
+        enable_queue, interval_ms, max_size
+    );
 
     // Apply and setup
     db = db.with_batch_queue(Arc::clone(&batch_queue));
