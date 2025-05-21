@@ -6,7 +6,7 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use delta_kernel::parquet::format::SortingColumn;
 use delta_kernel::schema::StructField;
 use log::debug;
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
 use serde_arrow::schema::SchemaLike;
 use serde_arrow::schema::TracingOptions;
 use serde_json::json;

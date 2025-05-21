@@ -3,19 +3,19 @@ use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::arrow::array::Array;
-use datafusion::common::not_impl_err;
 use datafusion::common::SchemaExt;
-use datafusion::execution::context::SessionContext;
+use datafusion::common::not_impl_err;
 use datafusion::execution::TaskContext;
+use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::DisplayAs;
+use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{dml::InsertOp, BinaryExpr},
+    logical_expr::{BinaryExpr, dml::InsertOp},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 use datafusion_postgres::{DfSessionService, HandlerFactory};
@@ -24,7 +24,7 @@ use deltalake::checkpoints;
 use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::operations::transaction::CommitProperties;
-use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
+use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, storage::StorageOptions};
 use futures::StreamExt;
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
@@ -228,7 +228,7 @@ impl Database {
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
         use datafusion::arrow::array::{StringArray, StringBuilder};
         use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
+        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
@@ -402,9 +402,9 @@ impl Database {
             configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
         };
 
-        // Create writer properties with ZSTD compression and bloom filters
+        // Create writer properties with ZSTD compression level 6 and bloom filters
         let writer_properties = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
             .set_bloom_filter_enabled(true)
             .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
             .build();
@@ -461,7 +461,7 @@ impl Database {
         // Run optimize operation with Z-order on the timestamp and id columns
         // and a target size of 256MB for optimal file size
         let writer_properties = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::default()))
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
             .set_bloom_filter_enabled(true)
             .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
             .build();
