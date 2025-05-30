@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
+foyer = "0.17.0"
+object_store = "0.12.1"
 datafusion = "46.0.0"
 arrow = "54.2.0"
 uuid = { version = "1.13", features = ["v4", "serde"] }
