@@ -1,4 +1,5 @@
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::fmt::{Debug, Formatter};
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -6,12 +7,15 @@ use std::fs::remove_dir_all;
 use std::io;
 
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
+use bytes::{Bytes, BytesMut, Buf};
 use foyer::{Cache, CacheBuilder};
-use object_store::{ObjectStore, path::Path, PutPayload};
+use object_store::{ObjectStore, path::Path};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
-use metrics::{counter, describe_counter, describe_histogram, gauge, histogram, Counter, Gauge};
+use metrics::{
+    counter, describe_counter, describe_histogram, gauge, describe_gauge,
+    Counter, Gauge, Histogram,
+};
 
 /// Constants for cache configuration
 pub const DEFAULT_MIN_FETCH_SIZE: u64 = 1024 * 1024; // 1 MiB
@@ -22,7 +26,7 @@ pub const DEFAULT_CACHE_ENTRY_TTL: Duration = Duration::from_secs(3 * 60);
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub struct CacheKey {
     path: Path,
-    range: Range<usize>,
+    range: Range<u64>,
 }
 
 impl Debug for CacheKey {
@@ -50,8 +54,8 @@ pub struct ObjectStoreCacheMetrics {
     cache_evictions: Counter,
     cache_size: Gauge,
     cache_capacity: Gauge,
-    cache_read_latency: Counter,
-    cache_write_latency: Counter,
+    cache_read_latency: Histogram,
+    cache_write_latency: Histogram,
 }
 
 impl ObjectStoreCacheMetrics {
@@ -70,8 +74,8 @@ impl ObjectStoreCacheMetrics {
             cache_evictions: counter!("object_store_cache_evictions"),
             cache_size: gauge!("object_store_cache_size"),
             cache_capacity: gauge!("object_store_cache_capacity"),
-            cache_read_latency: counter!("object_store_cache_read_latency"),
-            cache_write_latency: counter!("object_store_cache_write_latency"),
+            cache_read_latency: metrics::histogram!("object_store_cache_read_latency"),
+            cache_write_latency: metrics::histogram!("object_store_cache_write_latency"),
         }
     }
 }
@@ -99,8 +103,7 @@ impl ObjectStoreCache {
         metrics.cache_capacity.set(max_cache_size as f64);
         metrics.cache_size.set(0.0);
 
-        let cache = CacheBuilder::new(max_cache_size)
-            .time_to_live(ttl)
+        let cache = CacheBuilder::new(max_cache_size.try_into().unwrap())
             .build();
 
         Self {
@@ -117,21 +120,21 @@ impl ObjectStoreCache {
     pub async fn get_range(
         &self,
         location: &Path,
-        range: Range<usize>,
+        range: Range<u64>,
     ) -> Result<Bytes> {
         debug!("{location}-{range:?} get_range");
         
         // Expand the range to the next min_fetch_size (+ alignment)
-        let start_chunk = range.start / self.min_fetch_size as usize;
-        let end_chunk = (range.end - 1) / self.min_fetch_size as usize;
+        let start_chunk = (range.start / self.min_fetch_size) as usize;
+        let end_chunk = ((range.end - 1) / self.min_fetch_size) as usize;
 
         let mut result = BytesMut::with_capacity(
             (end_chunk.saturating_sub(start_chunk) + 1) * self.min_fetch_size as usize,
         );
 
         for chunk in start_chunk..=end_chunk {
-            let chunk_range = (chunk * self.min_fetch_size as usize)
-                ..((chunk + 1) * self.min_fetch_size as usize);
+            let chunk_range = (chunk as u64 * self.min_fetch_size)
+                ..((chunk as u64 + 1) * self.min_fetch_size);
 
             let key = CacheKey {
                 path: location.to_owned(),
@@ -139,17 +142,17 @@ impl ObjectStoreCache {
             };
 
             let chunk_data = match self.cache.read().await.get(&key) {
-                Some(data) => {
+                Some(entry) => {
                     debug!("Cache hit for {key:?}");
                     self.metrics.cache_hits.increment(1);
-                    data.clone()
+                    entry.value().clone()
                 }
                 None => {
                     debug!("Cache miss for {key:?}, fetching from object store");
                     self.metrics.cache_misses.increment(1);
                     let start = Instant::now();
                     let data = self.object_store.get_range(location, chunk_range.clone()).await?;
-                    self.metrics.cache_read_latency.increment(start.elapsed().as_secs_f64());
+                    self.metrics.cache_read_latency.record(start.elapsed().as_secs_f64());
                     self.cache.write().await.insert(key, data.clone());
                     data
                 }
@@ -159,9 +162,9 @@ impl ObjectStoreCache {
         }
 
         // Trim the result to match the requested range
-        let offset = range.start - start_chunk * self.min_fetch_size as usize;
+        let offset = (range.start - start_chunk as u64 * self.min_fetch_size) as usize;
         result.advance(offset);
-        result.truncate(range.end - range.start);
+        result.truncate((range.end - range.start) as usize);
 
         debug!("{location}-{range:?} return");
         Ok(result.into())
@@ -175,7 +178,7 @@ impl ObjectStoreCache {
         // Store in cache
         let key = CacheKey {
             path: location.to_owned(),
-            range: 0..bytes.len(),
+            range: 0..bytes.len() as u64,
         };
         self.cache.write().await.insert(key, bytes);
         
@@ -190,7 +193,7 @@ impl ObjectStoreCache {
         // Remove from cache
         let key = CacheKey {
             path: location.to_owned(),
-            range: 0..usize::MAX,
+            range: 0..u64::MAX,
         };
         self.cache.write().await.remove(&key);
         
@@ -231,12 +234,12 @@ mod tests {
 
         // Test put and get_range
         cache.put(&path, data.clone()).await?;
-        let retrieved = cache.get_range(&path, 0..data.len()).await?;
+        let retrieved = cache.get_range(&path, 0..data.len() as u64).await?;
         assert_eq!(retrieved, data);
 
         // Test remove
         cache.remove(&path).await?;
-        assert!(cache.get_range(&path, 0..data.len()).await.is_err());
+        assert!(cache.get_range(&path, 0..data.len() as u64).await.is_err());
 
         Ok(())
     }

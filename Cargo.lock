@@ -4552,6 +4552,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "25dea7ac8057892855ec285c440160265225438c3c45072613c25a4b26e98ef5"
+dependencies = [
+ "ahash 0.8.11",
+ "portable-atomic",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6886,6 +6896,7 @@ dependencies = [
  "futures",
  "lazy_static",
  "log 0.4.27",
+ "metrics",
  "object_store 0.12.1",
  "opentelemetry",
  "opentelemetry-otlp",
