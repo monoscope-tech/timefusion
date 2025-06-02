@@ -6,7 +6,7 @@ use foyer::{Cache, CacheBuilder};
 use object_store::{ObjectStore, path::Path};
 use tokio::sync::RwLock;
 
-/// A hybrid cache implementation for object store using foyer
+/// A hybrid cache implementation for object store 
 pub struct ObjectStoreCache {
     cache:        Arc<RwLock<Cache<Path, Bytes>>>,
     object_store: Arc<dyn ObjectStore>,
@@ -14,10 +14,7 @@ pub struct ObjectStoreCache {
 
 impl ObjectStoreCache {
     /// Create a new ObjectStoreCache instance (in-memory cache)
-    pub fn new(
-        object_store: Arc<dyn ObjectStore>,
-        capacity: usize,
-    ) -> Result<Self> {
+    pub fn new(object_store: Arc<dyn ObjectStore>, capacity: usize) -> Result<Self> {
         let cache = CacheBuilder::new(capacity).build();
         Ok(Self {
             cache: Arc::new(RwLock::new(cache)),
