@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.43", features = ["full"] }
-foyer = "0.17.0"
-object_store = "0.12.1"
+foyer = {version ="0.17.0",features=["serde"]}
+object_store = { version = "0.11.2", features = ["aws", "azure", "gcp"] }
 datafusion = "46.0.0"
 arrow = "54.2.0"
 uuid = { version = "1.13", features = ["v4", "serde"] }
@@ -20,7 +20,7 @@ log = "0.4.25"
 color-eyre = "0.6.3"
 arrow-schema = "54.1.0"
 regex = "1.11.1"
-deltalake = { version = "0.25.0", features = ["datafusion", "s3"] }
+deltalake = { version = "0.25.0", features = ["datafusion", "s3","azure", "gcs",] }
 delta_kernel = { version = "0.8.0", features = [
   "arrow-conversion",
   "default-engine",
@@ -70,6 +70,7 @@ url = "2.5.4"
 datafusion-common = "46.0.0"
 tokio-cron-scheduler = "0.10"
 metrics = "0.24.2"
+flate2 = "1.1.1"
 
 [dev-dependencies]
 serial_test = "3.2.0"
@@ -78,5 +79,9 @@ scopeguard = "1.2.0"
 rand = "0.8.5"
 
 [features]
-default = []
+default = ["s3", "azure", "gcs"]
+s3 = ["deltalake/s3", "object_store/aws"]
+azure = ["deltalake/azure", "object_store/azure"] 
+gcs = ["deltalake/gcs", "object_store/gcp"]
 test = []
+
