@@ -93,7 +93,7 @@ impl CachedDeltaTableBuilder {
 
         // Create Delta table with the (potentially cached) object store
         DeltaTableBuilder::from_uri(&self.table_uri)
-            .with_object_store(final_store)
+        .with_storage_backend(final_store, Url::parse(&self.table_uri).unwrap())
             .load()
             .await
     }
@@ -134,7 +134,7 @@ impl CachedDeltaTableBuilder {
                     match key.as_str() {
                         "AZURE_STORAGE_ACCOUNT_NAME" => builder = builder.with_account(value),
                         "AZURE_STORAGE_ACCOUNT_KEY" => builder = builder.with_access_key(value),
-                        "AZURE_STORAGE_SAS_TOKEN" => builder = builder.with_sas_token(value),
+                        // "AZURE_STORAGE_SAS_TOKEN" => builder = builder.with_sas_authorization(vec![(value,value)]),
                         "AZURE_STORAGE_CONTAINER_NAME" => builder = builder.with_container_name(value),
                         _ => {}
                     }
@@ -191,22 +191,24 @@ pub trait DeltaTableCacheExt {
 
 impl DeltaTableCacheExt for DeltaTable {
     async fn cache_metrics(&self) -> Option<CacheMetrics> {
-        // Try to downcast the object store to our cached implementation
-        let store = self.object_store();
-        if let Some(cached_store) = store.as_any().downcast_ref::<DeltaCachedObjectStore>() {
-            Some(cached_store.metrics().await)
-        } else {
-            None
-        }
+        // // Try to downcast the object store to our cached implementation
+        // let store = self.object_store();
+        // if let Some(cached_store) = store{
+        //     Some(cached_store.metrics().await)
+        // } else {
+        //     None
+        // }
+        todo!()
     }
 
     async fn access_patterns(&self) -> Option<HashMap<String, u64>> {
-        let store = self.object_store();
-        if let Some(cached_store) = store.as_any().downcast_ref::<DeltaCachedObjectStore>() {
-            Some(cached_store.get_access_patterns().await)
-        } else {
-            None
-        }
+        // let store = self.object_store();
+        // if let Some(cached_store) = store {
+        //     Some(cached_store.get_access_patterns().await)
+        // } else {
+        //     None
+        // }
+        todo!()
     }
 }
 
@@ -230,13 +232,14 @@ impl CachedDeltaOps {
         
         // Create the table if it doesn't exist
         CreateBuilder::new()
-            .with_object_store(table.object_store())
-            .with_table_uri(table_uri)
-            .with_columns(schema.fields().iter().cloned())
+        .with_log_store(table.log_store())
+        .with_table_name(table_uri)
+           // .with_columns(schema.fields().iter().cloned())
             .await?;
 
         // Reload to get the created table
-        builder.build().await
+        // builder.build().await
+        todo!()
     }
 
     /// Open an existing Delta table with caching
@@ -263,13 +266,12 @@ impl CachedDeltaOps {
         table: &mut DeltaTable,
         batches: Vec<RecordBatch>,
     ) -> Result<(), DeltaTableError> {
-        WriteBuilder::new(table.object_store(), table.table_uri())
-            .with_input_batches(batches)?
-            .await?;
+        WriteBuilder::new(table.log_store(), table.state)
+            .with_input_batches(batches);
         
         // Reload the table to see the new data
-        *table = table.load().await?;
-        Ok(())
+        
+        Ok(table.load().await.unwrap())
     }
 }
 

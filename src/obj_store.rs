@@ -114,7 +114,7 @@ impl CachedObject {
             original_size,
             is_compressed,
             etag: meta.e_tag.clone(),
-            last_modified: meta.last_modified.map(|t| t.timestamp()),
+            last_modified: Some(meta.last_modified.timestamp()),
         }
     }
 
@@ -161,7 +161,7 @@ impl CachedObject {
         }
         
         // Fallback to last modified time
-        if let (Some(cached_modified), Some(meta_modified)) = (self.last_modified, meta.last_modified) {
+        if let (Some(cached_modified),meta_modified) = (self.last_modified, meta.last_modified) {
             return cached_modified == meta_modified.timestamp();
         }
         
@@ -260,7 +260,7 @@ impl DeltaCachedObjectStore {
                                 self.config.compression_level
                             );
                             
-                            if self.cache.insert(cache_key, cached_obj).await.is_ok() {
+                            if self.cache.insert(cache_key, cached_obj).get_data().is_ok() {
                                 warmed_count += 1;
                             }
                         }
@@ -406,12 +406,12 @@ impl DeltaCachedObjectStore {
                                 ),
                                 meta: ObjectMeta {
                                     location: location.clone(),
-                                    last_modified: None,
-                                    size: cached_obj.original_size as u64,
+                                    last_modified: chrono::MIN_DATETIME,
+                                    size: cached_obj.original_size ,
                                     e_tag: cached_obj.etag.clone(),
                                     version: None,
                                 },
-                                range: 0..cached_obj.original_size as u64,
+                                range: 0..cached_obj.original_size ,
                                 attributes: Default::default(),
                             });
                         }
@@ -431,7 +431,7 @@ impl DeltaCachedObjectStore {
         let meta = result.meta.clone();
         
         // Only cache if object size is within limits
-        if meta.size <= self.config.max_object_size as u64 {
+        if meta.size <= self.config.max_object_size  {
             // Read the entire payload for caching
             let bytes = result.bytes().await?;
             
@@ -446,7 +446,7 @@ impl DeltaCachedObjectStore {
             let cache_clone = self.cache.clone();
             let key_clone = cache_key.clone();
             tokio::spawn(async move {
-                if let Err(e) = cache_clone.insert(key_clone, cached_obj).await {
+                if let Err(e) = cache_clone.insert(key_clone, cached_obj).get_data() {
                     debug!("Failed to insert into cache: {}", e);
                 }
             });
@@ -548,7 +548,7 @@ impl ObjectStore for DeltaCachedObjectStore {
         self.get_with_cache(location, options).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<usize>) -> ObjectStoreResult<Bytes> {
         let options = GetOptions {
             range: Some(GetRange::Bounded(range)),
             ..Default::default()
@@ -577,7 +577,9 @@ impl ObjectStore for DeltaCachedObjectStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         // List operations are passed through without caching
-        self.inner.list(prefix)
+    //    let r = self.inner.list(prefix);
+    //    r
+    todo!()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
