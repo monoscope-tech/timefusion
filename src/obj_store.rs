@@ -5,8 +5,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::DateTime;
 use foyer::{DirectFsDeviceOptions, Engine, HybridCache, HybridCacheBuilder};
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use object_store::{
     path::Path, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
@@ -82,7 +84,7 @@ impl CacheMetrics {
     }
 }
 
-/// Enhanced cached object with metadata and compression
+/// cached object with metadata and compression
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedObject {
     data: Vec<u8>,
@@ -293,13 +295,12 @@ impl DeltaCachedObjectStore {
         }
         
         // Parquet metadata files
-        if self.config.cache_parquet_metadata {
-            if path_str.ends_with(".parquet") 
+        if self.config.cache_parquet_metadata
+            && (path_str.ends_with(".parquet") 
                 || path_str.contains("_metadata")
-                || path_str.ends_with("_common_metadata") {
+                || path_str.ends_with("_common_metadata")) {
                 return true;
             }
-        }
         
         false
     }
@@ -327,7 +328,7 @@ impl DeltaCachedObjectStore {
     {
         if self.config.enable_metrics {
             let mut metrics = self.metrics.write().await;
-            update_fn(&mut *metrics);
+            update_fn(&mut metrics);
         }
     }
 
@@ -406,7 +407,7 @@ impl DeltaCachedObjectStore {
                                 ),
                                 meta: ObjectMeta {
                                     location: location.clone(),
-                                    last_modified: chrono::MIN_DATETIME,
+                                    last_modified:  DateTime::<chrono::Utc>::MIN_UTC,
                                     size: cached_obj.original_size ,
                                     e_tag: cached_obj.etag.clone(),
                                     version: None,
@@ -419,7 +420,7 @@ impl DeltaCachedObjectStore {
                 }
             } else {
                 debug!("Cache entry expired: {}", location);
-                let _ = self.cache.remove(&cache_key);
+                self.cache.remove(&cache_key);
             }
         }
 
@@ -577,9 +578,8 @@ impl ObjectStore for DeltaCachedObjectStore {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         // List operations are passed through without caching
-    //    let r = self.inner.list(prefix);
-    //    r
-    todo!()
+    self.inner.clone().list(prefix)
+ 
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {

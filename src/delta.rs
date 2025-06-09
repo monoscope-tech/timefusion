@@ -370,7 +370,7 @@ mod tests {
     }
 }
 
-// Example usage in your application
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 1: Simple cached Delta table
