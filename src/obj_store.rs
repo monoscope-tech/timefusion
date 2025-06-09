@@ -1,17 +1,17 @@
 use std::{
     collections::HashMap,
-    fmt::{Debug, Display},
+    fmt::Debug,
     ops::Range,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use async_stream::{stream, try_stream};
+use async_stream::stream;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::DateTime;
 use foyer::{DirectFsDeviceOptions, Engine, HybridCache, HybridCacheBuilder};
-use futures::stream::{self, BoxStream, Once, StreamExt, TryStreamExt};
+use futures::stream::{BoxStream, StreamExt, TryStreamExt};
 use object_store::{
     GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload,
     PutResult, Result as ObjectStoreResult, path::Path,

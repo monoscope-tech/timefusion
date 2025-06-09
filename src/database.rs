@@ -441,8 +441,6 @@ impl Database {
         // Records should be grouped by span, and separated into groups then inserted into the
         // correct table.
 
-        use serde_arrow::schema::SchemaLike;
-
         // Convert OtelLogsAndSpans records to Arrow RecordBatch format
         let fields = OtelLogsAndSpans::fields()?;
         let batch = serde_arrow::to_record_batch(&fields, &records)?;

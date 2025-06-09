@@ -3,15 +3,14 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use deltalake::{
     DeltaTable, DeltaTableBuilder, DeltaTableError,
     arrow::record_batch::RecordBatch,
-    logstore::LogStore,
     operations::{create::CreateBuilder, write::WriteBuilder},
     storage::ObjectStoreRef,
 };
-use object_store::{ObjectStore, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory};
+use object_store::{aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory};
 use tokio;
 use url::Url;
 
-use crate::obj_store::{CacheMetrics, DeltaCacheBuilder, DeltaCacheConfig, DeltaCachedObjectStore};
+use crate::obj_store::{CacheMetrics, DeltaCacheBuilder, DeltaCacheConfig};
 
 /// Helper struct for creating Delta tables with caching
 pub struct CachedDeltaTableBuilder {

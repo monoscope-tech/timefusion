@@ -109,7 +109,6 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Utc;
-    use serde_arrow::schema::SchemaLike;
     use tokio::time::sleep;
 
     use super::*;
