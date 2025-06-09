@@ -7,8 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::DateTime;
 use foyer::{DirectFsDeviceOptions, Engine, HybridCache, HybridCacheBuilder};
-use futures::stream::BoxStream;
-use futures::StreamExt;
+use futures::stream::{self, StreamExt, TryStreamExt, BoxStream, Once};
 use object_store::{
     path::Path, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOpts, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult,
@@ -17,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn, error};
 use tokio::sync::RwLock;
 use std::collections::HashMap;
+use async_stream::try_stream;
+use async_stream::stream;
 
 /// Configuration for the Delta cache
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,9 +578,15 @@ impl ObjectStore for DeltaCachedObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        // List operations are passed through without caching
-    self.inner.clone().list(prefix)
- 
+        let inner = self.inner.clone();
+        let prefix = prefix.map(|p| p.to_owned());
+        Box::pin(stream! {
+            let mut stream = inner.list(prefix.as_ref());
+            use futures::StreamExt;
+            while let Some(item) = stream.next().await {
+                yield item;
+            }
+        })
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
