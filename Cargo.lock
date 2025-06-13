@@ -6744,7 +6744,7 @@ source = "git+https://github.com/mahmudsudo/tantivy-object-store.git?branch=patc
 dependencies = [
  "async-trait",
  "bytes",
- "log 0.3.9",
+ "log 0.4.27",
  "object_store 0.9.1",
  "tantivy 0.20.2",
  "tempfile",
@@ -7029,6 +7029,7 @@ dependencies = [
  "futures",
  "lazy_static",
  "log 0.4.27",
+ "object_store 0.11.2",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -7062,6 +7063,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zstd-safe 5.0.2+zstd.1.5.2",
 ]
 
 [[package]]
@@ -8280,6 +8282,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
 dependencies = [
  "zstd-safe 7.2.1",
+]
+
+[[package]]
+name = "zstd-safe"
+version = "5.0.2+zstd.1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d2a5585e04f9eea4b2a3d1eca508c4dee9592a89ef6f450c11719da0726f4db"
+dependencies = [
+ "libc",
+ "zstd-sys",
 ]
 
 [[package]]

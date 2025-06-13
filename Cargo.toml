@@ -69,6 +69,7 @@ datafusion-common = "46.0.0"
 tokio-cron-scheduler = "0.10"
 tantivy = "0.24.1"
 tantivy-object-store = {git="https://github.com/mahmudsudo/tantivy-object-store.git",branch = "patch-1"}
+object_store = { version = "0.11.2", features = ["aws"] }
 
 [dev-dependencies]
 serial_test = "3.2.0"
@@ -79,3 +80,6 @@ rand = "0.8.5"
 [features]
 default = []
 test = []
+
+[dependencies.zstd-safe]
+version = "5.0.2"
