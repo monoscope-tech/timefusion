@@ -70,7 +70,7 @@ datafusion-common = "46.0.0"
 tokio-cron-scheduler = "0.10"
 tantivy = { version = "0.24.1 ", default-features = false, features = ["mmap"] }
 tantivy-object-store = {git="https://github.com/mahmudsudo/tantivy-object-store.git",branch = "patch-1"}
-zstd-safe = "7.2.1"
+
 
 [dev-dependencies]
 serial_test = "3.2.0"

@@ -7040,7 +7040,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "zstd-safe 7.2.1",
 ]
 
 [[package]]
