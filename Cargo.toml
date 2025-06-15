@@ -20,7 +20,7 @@ log = "0.4.25"
 color-eyre = "0.6.3"
 arrow-schema = "54.1.0"
 regex = "1.11.1"
-deltalake = { version = "0.25.0", features = ["datafusion", "s3","azure", "gcs",] }
+deltalake = { version = "0.26.2", features = ["datafusion", "s3","azure", "gcs",] }
 delta_kernel = { version = "0.8.0", features = [
   "arrow-conversion",
   "default-engine",

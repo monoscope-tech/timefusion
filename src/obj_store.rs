@@ -364,7 +364,7 @@ impl DeltaCachedObjectStore {
                         } else {
                             debug!("Cache invalidated due to metadata mismatch: {}", location);
                             // Remove stale entry
-                            let _ = self.cache.remove(&cache_key);
+                            self.cache.remove(&cache_key);
                         }
                     }
                     Err(e) => {
@@ -378,11 +378,11 @@ impl DeltaCachedObjectStore {
                                 meta:       ObjectMeta {
                                     location:      location.clone(),
                                     last_modified: DateTime::<chrono::Utc>::MIN_UTC,
-                                    size:          cached_obj.original_size,
+                                    size:          cached_obj.original_size as u64,
                                     e_tag:         cached_obj.etag.clone(),
                                     version:       None,
                                 },
-                                range:      0..cached_obj.original_size,
+                                range:      0..cached_obj.original_size as u64,
                                 attributes: Default::default(),
                             });
                         }
@@ -402,7 +402,7 @@ impl DeltaCachedObjectStore {
         let meta = result.meta.clone();
 
         // Only cache if object size is within limits
-        if meta.size <= self.config.max_object_size {
+        if meta.size <= self.config.max_object_size as u64 {
             // Read the entire payload for caching
             let bytes = result.bytes().await?;
 
@@ -501,7 +501,7 @@ impl ObjectStore for DeltaCachedObjectStore {
         self.get_with_cache(location, options).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> ObjectStoreResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let options = GetOptions {
             range: Some(GetRange::Bounded(range)),
             ..Default::default()
