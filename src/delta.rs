@@ -4,8 +4,9 @@ use deltalake::{
     DeltaTable, DeltaTableBuilder, DeltaTableError,
     arrow::record_batch::RecordBatch,
     operations::{create::CreateBuilder, write::WriteBuilder},
-    logstore::ObjectStoreRef,
+    
 };
+use deltalake_core::storage::ObjectStoreRef;
 use object_store::{aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory};
 use tokio;
 use url::Url;
