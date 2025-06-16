@@ -21,12 +21,11 @@ color-eyre = "0.6.3"
 arrow-schema = "54.1.0"
 regex = "1.11.1"
 deltalake = { version = "0.26.2", features = ["datafusion", "s3","azure", "gcs",] }
-delta_kernel = { version = "0.12.1", features = [
+delta_kernel = { version = "0.8.0", features = [
   "arrow-conversion",
   "default-engine",
-  "arrow-55"
 ] }
-chrono = { version = "0.4.41", features = ["serde"] }
+chrono = { version = "0.4.39", features = ["serde"] }
 pgwire = "0.28.0"
 futures = "0.3.31"
 bytes = "1.4"
