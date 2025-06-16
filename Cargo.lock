@@ -3524,12 +3524,15 @@ version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "de0b553d03fce69da6bedd91ec7e2348d52af2783a95d2dc91970df0cb614783"
 dependencies = [
+ "arrow 55.0.0",
  "bytes",
  "chrono",
  "delta_kernel_derive 0.12.1",
  "futures",
  "indexmap 2.9.0",
  "itertools 0.14.0",
+ "object_store 0.12.2",
+ "parquet 55.0.0",
  "reqwest",
  "roaring",
  "rustc_version",

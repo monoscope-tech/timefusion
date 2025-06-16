@@ -24,6 +24,7 @@ deltalake = { version = "0.26.2", features = ["datafusion", "s3","azure", "gcs",
 delta_kernel = { version = "0.12.1", features = [
   "arrow-conversion",
   "default-engine",
+  "arrow-55"
 ] }
 chrono = { version = "0.4.41", features = ["serde"] }
 pgwire = "0.28.0"
