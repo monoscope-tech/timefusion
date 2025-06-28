@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::DateTime;
 use foyer::{DirectFsDeviceOptions, Engine, HybridCache, HybridCacheBuilder};
-use futures::stream::{BoxStream, StreamExt, TryStreamExt};
+use futures::stream::{BoxStream, StreamExt};
 use object_store::{
     GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts, PutOptions, PutPayload,
     PutResult, Result as ObjectStoreResult, path::Path,
@@ -176,11 +176,18 @@ impl DeltaCachedObjectStore {
     /// Create a new cached object store
     pub async fn new(inner: Arc<dyn ObjectStore>, config: DeltaCacheConfig) -> ObjectStoreResult<Self> {
         // Build the hybrid cache
-        let cache = HybridCacheBuilder::new()
+        let mut builder = HybridCacheBuilder::new()
             .memory(config.memory_capacity)
-            .storage(Engine::Large)
-            .with_device_options(DirectFsDeviceOptions::new(&config.disk_cache_dir).with_capacity(config.disk_capacity))
-            .build()
+            .storage(Engine::Large);
+
+        if config.disk_capacity > 0 {
+            builder = builder.with_device_options(
+                DirectFsDeviceOptions::new(&config.disk_cache_dir)
+                    .with_capacity(config.disk_capacity),
+            );
+        }
+
+        let cache = builder.build()
             .await
             .map_err(|e| object_store::Error::Generic {
                 store:  "DeltaCache",
@@ -378,11 +385,11 @@ impl DeltaCachedObjectStore {
                                 meta:       ObjectMeta {
                                     location:      location.clone(),
                                     last_modified: DateTime::<chrono::Utc>::MIN_UTC,
-                                    size:          cached_obj.original_size ,
+                                    size:          cached_obj.original_size as u64,
                                     e_tag:         cached_obj.etag.clone(),
                                     version:       None,
                                 },
-                                range:      0..cached_obj.original_size ,
+                                range:      0..cached_obj.original_size as u64,
                                 attributes: Default::default(),
                             });
                         }
@@ -402,7 +409,7 @@ impl DeltaCachedObjectStore {
         let meta = result.meta.clone();
 
         // Only cache if object size is within limits
-        if meta.size <= self.config.max_object_size  {
+        if meta.size <= self.config.max_object_size as u64 {
             // Read the entire payload for caching
             let bytes = result.bytes().await?;
 
@@ -501,7 +508,7 @@ impl ObjectStore for DeltaCachedObjectStore {
         self.get_with_cache(location, options).await
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> ObjectStoreResult<Bytes> {
+    async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let options = GetOptions {
             range: Some(GetRange::Bounded(range)),
             ..Default::default()
@@ -533,7 +540,6 @@ impl ObjectStore for DeltaCachedObjectStore {
         let prefix = prefix.map(|p| p.to_owned());
         Box::pin(stream! {
             let mut stream = inner.list(prefix.as_ref());
-            use futures::StreamExt;
             while let Some(item) = stream.next().await {
                 yield item;
             }

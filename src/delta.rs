@@ -3,15 +3,16 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use deltalake::{
     DeltaTable, DeltaTableBuilder, DeltaTableError,
     arrow::record_batch::RecordBatch,
-    operations::{create::CreateBuilder, write::WriteBuilder},
-    storage::ObjectStoreRef,
+    operations::write::WriteBuilder,
+    logstore::{default_logstore, ObjectStoreRef},
+    operations::create::{CreateBuilder},
+    kernel::StructField,
 };
-
 use object_store::{aws::AmazonS3Builder, azure::MicrosoftAzureBuilder, gcp::GoogleCloudStorageBuilder, local::LocalFileSystem, memory::InMemory};
 use tokio;
 use url::Url;
 
-use crate::obj_store::{CacheMetrics, DeltaCacheBuilder, DeltaCacheConfig};
+use crate::store::{DeltaCacheBuilder, DeltaCacheConfig};
 
 /// Helper struct for creating Delta tables with caching
 pub struct CachedDeltaTableBuilder {
@@ -164,15 +165,15 @@ impl CachedDeltaTableBuilder {
     }
 }
 
-
-
 /// Convenience functions for common Delta operations with caching
 pub struct CachedDeltaOps;
 
 impl CachedDeltaOps {
     /// Create a new Delta table with caching enabled
     pub async fn create_table(
-        table_uri: &str, cache_config: Option<DeltaCacheConfig>,
+        table_uri: &str,
+        schema: Arc<deltalake::arrow::datatypes::Schema>,
+        cache_config: Option<DeltaCacheConfig>,
     ) -> Result<DeltaTable, DeltaTableError> {
         let mut builder = CachedDeltaTableBuilder::new(table_uri);
 
@@ -180,15 +181,21 @@ impl CachedDeltaOps {
             builder = builder.with_cache_config(config);
         }
 
-        let table = builder.build().await?;
+        let store = builder.create_base_object_store().await?;
+        let url = Url::parse(table_uri).map_err(|e| DeltaTableError::Generic(e.to_string()))?;
+        let log_store = default_logstore(store, &url, &Default::default());
 
-   CreateBuilder::new()
-            .with_log_store(table.log_store())
+        let columns: Vec<StructField> = schema
+            .fields()
+            .iter()
+            .map(|f| StructField::try_from(f.as_ref()).unwrap())
+            .collect();
+
+        CreateBuilder::new()
+            .with_log_store(log_store)
             .with_table_name(table_uri)
-           
+            .with_columns(columns)
             .await
-
-        
     }
 
     /// Open an existing Delta table with caching
@@ -219,81 +226,54 @@ impl CachedDeltaOps {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Example 1: Simple cached Delta table
-    let cache_config = DeltaCacheConfig {
-        memory_capacity: 256 * 1024 * 1024, // 256MB
-        disk_capacity: 1024 * 1024 * 1024,  // 1GB
-        disk_cache_dir: "/tmp/delta_cache".to_string(),
-        ttl_seconds: 3600, // 1 hour
-        enable_metrics: true,
-        enable_cache_warming: true,
-        ..Default::default()
-    };
 
-    let table = CachedDeltaTableBuilder::new("s3://my-bucket/my-table")
-        .with_cache_config(cache_config)
-        .with_storage_option("AWS_REGION", "us-west-2")
-        .with_storage_option("AWS_ACCESS_KEY_ID", "your-access-key")
-        .with_storage_option("AWS_SECRET_ACCESS_KEY", "your-secret-key")
-        .build()
-        .await?;
 
-    println!("Table loaded with {} files", table.get_files_count());
 
-   
-   
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fmt::Error, sync::Arc};
 
     use arrow::{
         array::{Int32Array, StringArray},
         datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
     };
-    use tempfile::TempDir;
+    use tempfile::{tempdir, TempDir};
 
     use super::*;
 
     #[tokio::test]
     async fn test_cached_delta_table_creation() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_uri = format!("file://{}", temp_dir.path().to_str().unwrap());
+        let dir = tempdir().unwrap();
+        let table_uri = format!("file://{}/", dir.path().to_str().unwrap());
 
-        // Create schema
-        let schema = Arc::new(Schema::new(vec![
+        let _schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
         ]));
 
-        // Create cache config
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir(&cache_dir).unwrap();
+
         let cache_config = DeltaCacheConfig {
-            memory_capacity: 64 * 1024 * 1024, // 64MB
-            disk_capacity: 128 * 1024 * 1024,  // 128MB
-            disk_cache_dir: temp_dir.path().join("cache").to_str().unwrap().to_string(),
-            ttl_seconds: 300, // 5 minutes
-            enable_metrics: true,
+            disk_cache_dir: cache_dir.to_str().unwrap().to_string(),
+            disk_capacity: 0, // Set to 0 to avoid using disk, but provide a valid path
             ..Default::default()
         };
 
-        // Create table with caching
-        let table = CachedDeltaOps::create_table(&table_uri, Some(cache_config)).await.unwrap();
+        // Create the table
+        let result = CachedDeltaOps::create_table(&table_uri, _schema.clone(), Some(cache_config.clone())).await;
 
-        // Verify the table was created
-        assert!(table.get_files_count() == 0); // New table, no data files yet
+        let table = result.unwrap();
 
-       
+        assert_eq!( format!("file://{}", table.table_uri()), table_uri);
     }
 
     #[tokio::test]
     async fn test_write_and_read_with_cache() {
         let temp_dir = TempDir::new().unwrap();
-        let table_uri = format!("file://{}", temp_dir.path().to_str().unwrap());
+        let table_uri = format!("file://{}/", temp_dir.path().to_str().unwrap());
 
         // Create schema
         let schema = Arc::new(Schema::new(vec![
@@ -302,7 +282,9 @@ mod tests {
         ]));
 
         // Create table with cache
-        let mut table = CachedDeltaOps::create_table(&table_uri, Some(DeltaCacheConfig::default())).await.unwrap();
+        let mut table = CachedDeltaOps::create_table(&table_uri, schema.clone(), Some(DeltaCacheConfig::default()))
+            .await
+            .unwrap();
 
         // Create some test data
         let batch = RecordBatch::try_new(
@@ -327,7 +309,31 @@ mod tests {
     }
 
      #[tokio::test]
-    async fn test_write_and_read_with_caches3() {
-       let _s= main();
+    async fn test_write_and_read_with_caches3() -> Result<(),deltalake::DeltaTableError> {
+       // Example 1: Simple cached Delta table
+    let cache_config = DeltaCacheConfig {
+        memory_capacity: 256 * 1024 * 1024, // 256MB
+        disk_capacity: 0, // Use memory-only cache
+        disk_cache_dir: "".to_string(), // Empty string for memory-only
+        ttl_seconds: 3600, // 1 hour
+        enable_metrics: true,
+        enable_cache_warming: true,
+        ..Default::default()
+    };
+
+    let table = CachedDeltaTableBuilder::new("s3://my-bucket/my-table")
+        .with_cache_config(cache_config)
+        .with_storage_option("AWS_REGION", "us-west-2")
+        .with_storage_option("AWS_ACCESS_KEY_ID", "your-access-key")
+        .with_storage_option("AWS_SECRET_ACCESS_KEY", "your-secret-key")
+        .build()
+        .await?;
+
+    println!("Table loaded with {} files", table.get_files_count());
+
+   
+   
+
+    Ok(())
     }
 }
