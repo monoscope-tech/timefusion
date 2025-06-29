@@ -1,17 +1,18 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
 use crossbeam::queue::SegQueue;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use tokio::sync::RwLock;
-use tokio::time::interval;
+use tokio::{sync::RwLock, time::interval};
 use tracing::{error, info};
 
 /// BatchQueue collects RecordBatches and processes them at intervals
 #[derive(Debug)]
 pub struct BatchQueue {
-    queue: Arc<SegQueue<RecordBatch>>,
+    queue:            Arc<SegQueue<RecordBatch>>,
     is_shutting_down: Arc<RwLock<bool>>,
 }
 
@@ -105,13 +106,13 @@ async fn process_batches(db: &Arc<crate::database::Database>, queue: &Arc<SegQue
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::database::Database;
-    use crate::persistent_queue::OtelLogsAndSpans;
-    use chrono::Utc;
-    use serde_arrow::schema::SchemaLike;
     use std::sync::Arc;
+
+    use chrono::Utc;
     use tokio::time::sleep;
+
+    use super::*;
+    use crate::{database::Database, persistent_queue::OtelLogsAndSpans};
 
     #[tokio::test]
     async fn test_batch_queue() -> Result<()> {

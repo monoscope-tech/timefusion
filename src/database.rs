@@ -1,40 +1,41 @@
-use crate::persistent_queue::OtelLogsAndSpans;
+use std::{any::Any, collections::HashMap, env, fmt, net::SocketAddr, sync::Arc, time::Duration};
+
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::arrow::array::Array;
-use datafusion::common::SchemaExt;
-use datafusion::common::not_impl_err;
-use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_plan::DisplayAs;
-use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
-use datafusion::scalar::ScalarValue;
 use datafusion::{
+    arrow::array::Array,
     catalog::Session,
+    common::{SchemaExt, not_impl_err},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{BinaryExpr, dml::InsertOp},
-    physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, dml::InsertOp},
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+        insert::{DataSink, DataSinkExec},
+    },
+    scalar::ScalarValue,
 };
 use datafusion_postgres::{DfSessionService, HandlerFactory};
 use delta_kernel::arrow::record_batch::RecordBatch;
-use deltalake::checkpoints;
-use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
-use deltalake::datafusion::parquet::file::properties::WriterProperties;
-use deltalake::operations::transaction::CommitProperties;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, storage::StorageOptions};
+use deltalake::{
+    DeltaOps, DeltaTable, DeltaTableBuilder, checkpoints,
+    datafusion::parquet::{
+        basic::{Compression, ZstdLevel},
+        file::properties::WriterProperties,
+    },
+    operations::transaction::CommitProperties,
+    storage::StorageOptions,
+};
 use futures::StreamExt;
-use std::fmt;
-use std::{any::Any, collections::HashMap, env, sync::Arc};
-use std::{net::SocketAddr, time::Duration};
-use tokio::sync::RwLock;
-use tokio::{net::TcpListener, time::timeout};
+use tokio::{net::TcpListener, sync::RwLock, time::timeout};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use url::Url;
+
+use crate::persistent_queue::OtelLogsAndSpans;
 
 type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
 
@@ -42,16 +43,16 @@ pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 
 #[derive(Debug)]
 pub struct Database {
-    project_configs: ProjectConfigs,
-    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    project_configs:      ProjectConfigs,
+    batch_queue:          Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
 }
 
 impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
-            project_configs: Arc::clone(&self.project_configs),
-            batch_queue: self.batch_queue.clone(),
+            project_configs:      Arc::clone(&self.project_configs),
+            batch_queue:          self.batch_queue.clone(),
             maintenance_shutdown: Arc::clone(&self.maintenance_shutdown),
         }
     }
@@ -75,8 +76,8 @@ impl Database {
         let project_configs = HashMap::new();
 
         let db = Self {
-            project_configs: Arc::new(RwLock::new(project_configs)),
-            batch_queue: None, // Batch queue is set later
+            project_configs:      Arc::new(RwLock::new(project_configs)),
+            batch_queue:          None, // Batch queue is set later
             maintenance_shutdown: Arc::new(CancellationToken::new()),
         };
 
@@ -150,8 +151,7 @@ impl Database {
 
     /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(&self) -> SessionContext {
-        use datafusion::config::ConfigOptions;
-        use datafusion::execution::context::SessionContext;
+        use datafusion::{config::ConfigOptions, execution::context::SessionContext};
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
@@ -181,9 +181,11 @@ impl Database {
 
     /// Register PostgreSQL settings table for compatibility
     pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
-        use datafusion::arrow::array::StringArray;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::arrow::{
+            array::StringArray,
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
@@ -226,9 +228,13 @@ impl Database {
 
     /// Register set_config UDF for PostgreSQL compatibility
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
-        use datafusion::arrow::array::{StringArray, StringBuilder};
-        use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
+        use datafusion::{
+            arrow::{
+                array::{StringArray, StringBuilder},
+                datatypes::DataType,
+            },
+            logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
+        };
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
@@ -435,8 +441,6 @@ impl Database {
         // Records should be grouped by span, and separated into groups then inserted into the
         // correct table.
 
-        use serde_arrow::schema::SchemaLike;
-
         // Convert OtelLogsAndSpans records to Arrow RecordBatch format
         let fields = OtelLogsAndSpans::fields()?;
         let batch = serde_arrow::to_record_batch(&fields, &records)?;
@@ -594,9 +598,9 @@ impl Database {
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
-    database: Arc<Database>,
-    schema: SchemaRef,
-    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    database:        Arc<Database>,
+    schema:          SchemaRef,
+    batch_queue:     Option<Arc<crate::batch_queue::BatchQueue>>,
 }
 
 impl ProjectRoutingTable {
@@ -769,8 +773,7 @@ impl TableProvider for ProjectRoutingTable {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use datafusion::assert_batches_eq;
-    use datafusion::prelude::SessionContext;
+    use datafusion::{assert_batches_eq, prelude::SessionContext};
     use dotenv::dotenv;
     use serial_test::serial;
     use uuid::Uuid;

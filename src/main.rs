@@ -2,13 +2,14 @@
 mod batch_queue;
 mod database;
 mod persistent_queue;
+use std::{env, sync::Arc};
+
 use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
 use batch_queue::BatchQueue;
 use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
 use serde::Deserialize;
-use std::{env, sync::Arc};
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -20,10 +21,10 @@ struct AppInfo {}
 #[derive(Deserialize)]
 struct RegisterProjectRequest {
     project_id: String,
-    bucket: String,
+    bucket:     String,
     access_key: String,
     secret_key: String,
-    endpoint: Option<String>,
+    endpoint:   Option<String>,
 }
 
 #[post("/register_project")]
