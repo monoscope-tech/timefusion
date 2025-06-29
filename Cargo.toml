@@ -24,7 +24,7 @@ delta_kernel = { version = "0.8.0", features = [
   "arrow-conversion",
   "default-engine",
 ] }
-chrono = { version = "0.4.39", features = ["serde"] }
+chrono = { version = "0.4.41", features = ["serde"] }
 pgwire = "0.28.0"
 futures = "0.3.31"
 bytes = "1.4"
