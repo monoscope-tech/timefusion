@@ -1,4 +1,5 @@
 use crate::persistent_queue::OtelLogsAndSpans;
+use crate::query_cache::{QueryCache, QueryCacheConfig};
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -45,6 +46,7 @@ pub struct Database {
     project_configs: ProjectConfigs,
     batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
+    query_cache: Arc<QueryCache>,
 }
 
 impl Clone for Database {
@@ -53,6 +55,7 @@ impl Clone for Database {
             project_configs: Arc::clone(&self.project_configs),
             batch_queue: self.batch_queue.clone(),
             maintenance_shutdown: Arc::clone(&self.maintenance_shutdown),
+            query_cache: Arc::clone(&self.query_cache),
         }
     }
 }
@@ -74,10 +77,19 @@ impl Database {
 
         let project_configs = HashMap::new();
 
+        // Configure query cache from environment variables
+        let cache_config = QueryCacheConfig {
+            max_entries: env::var("QUERY_CACHE_MAX_ENTRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(1000),
+            ttl: Duration::from_secs(env::var("QUERY_CACHE_TTL_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(300)),
+            max_result_size_mb: env::var("QUERY_CACHE_MAX_SIZE_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(50),
+            enable_cache: env::var("ENABLE_QUERY_CACHE").unwrap_or_else(|_| "true".to_string()) == "true",
+        };
+
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
             batch_queue: None, // Batch queue is set later
             maintenance_shutdown: Arc::new(CancellationToken::new()),
+            query_cache: Arc::new(QueryCache::new(cache_config)),
         };
 
         db.register_project("default", &storage_uri, None, None, None).await?;
@@ -444,6 +456,21 @@ impl Database {
         // Call insert_records_batch with the converted batch to reuse common insertion logic
         // In tests we always skip the queue for direct insertion
         self.insert_records_batch("default", vec![batch], true).await
+    }
+
+    /// Get cache statistics for monitoring
+    pub async fn get_cache_stats(&self) -> crate::query_cache::QueryCacheStats {
+        self.query_cache.get_stats().await
+    }
+
+    /// Get the number of registered projects
+    pub async fn get_project_count(&self) -> usize {
+        self.project_configs.read().await.len()
+    }
+
+    /// Clear the query cache
+    pub async fn clear_cache(&self) {
+        self.query_cache.clear().await;
     }
 
     /// Optimize the Delta table using Z-ordering on timestamp and id columns

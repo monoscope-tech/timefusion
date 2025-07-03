@@ -24,6 +24,10 @@ Timefusion can be configured using the following environment variables:
 | `MAX_BATCH_SIZE`       | Maximum number of rows in a single batch         | `1000`                      |
 | `ENABLE_BATCH_QUEUE`   | Whether to use batch queue for inserts           | `false` (direct insertion)  |
 | `MAX_PG_CONNECTIONS`   | Maximum number of concurrent PostgreSQL connections | `100`                     |
+| `ENABLE_QUERY_CACHE`   | Whether to enable query result caching           | `true`                      |
+| `QUERY_CACHE_MAX_ENTRIES` | Maximum number of cached query results        | `1000`                      |
+| `QUERY_CACHE_TTL_SECONDS` | Cache time-to-live in seconds                 | `300` (5 minutes)          |
+| `QUERY_CACHE_MAX_SIZE_MB` | Maximum cache size per result in MB            | `50`                        |
 
 For local development, you can set `QUEUE_DB_PATH` to a location in your development environment.
 
@@ -52,6 +56,26 @@ postgres=> select name, id, project_id,timestamp from otel_logs_and_spans limit 
 
 ```
 
+## HTTP API Endpoints
+
+TimeFusion exposes several HTTP endpoints for management and monitoring:
+
+### Project Management
+- `POST /register_project` - Register a new project with S3 credentials
+
+### Health & Monitoring
+- `GET /health` - Health check endpoint
+- `GET /metrics` - Query cache metrics and performance statistics
+- `GET /status` - Overall system status including project count and cache info
+
+Example health check:
+```bash
+curl http://localhost:80/health
+```
+
+Example metrics:
+```bash
+curl http://localhost:80/metrics
 ```
 
 ```

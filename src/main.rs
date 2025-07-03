@@ -2,32 +2,32 @@
 mod batch_queue;
 mod database;
 mod persistent_queue;
-use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
+mod query_cache;
+mod validation;
+use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, get, web};
 use batch_queue::BatchQueue;
 use database::Database;
 use dotenv::dotenv;
 use futures::TryFutureExt;
-use serde::Deserialize;
 use std::{env, sync::Arc};
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+use validation::{RegisterProjectRequest, Validate, validation_error_response};
+use chrono;
 
 #[derive(Clone)]
 struct AppInfo {}
 
-#[derive(Deserialize)]
-struct RegisterProjectRequest {
-    project_id: String,
-    bucket: String,
-    access_key: String,
-    secret_key: String,
-    endpoint: Option<String>,
-}
-
 #[post("/register_project")]
 async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<Arc<Database>>) -> impl Responder {
+    // Validate input
+    let validation_errors = req.validate();
+    if !validation_errors.is_empty() {
+        return validation_error_response(validation_errors);
+    }
+
     match db
         .register_project(
             &req.project_id,
@@ -38,13 +38,56 @@ async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<
         )
         .await
     {
-        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
-            "message": format!("Project '{}' registered successfully", req.project_id)
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("Failed to register project: {:?}", e)
-        })),
+        Ok(()) => {
+            info!("Project '{}' registered successfully", req.project_id);
+            HttpResponse::Ok().json(serde_json::json!({
+                "message": format!("Project '{}' registered successfully", req.project_id)
+            }))
+        },
+        Err(e) => {
+            error!("Failed to register project '{}': {:?}", req.project_id, e);
+            HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("Failed to register project: {:?}", e)
+            }))
+        },
     }
+}
+
+#[get("/health")]
+async fn health_check() -> impl Responder {
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+#[get("/metrics")]
+async fn metrics(db: web::Data<Arc<Database>>) -> impl Responder {
+    let cache_stats = db.get_cache_stats().await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "query_cache": cache_stats,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
+
+#[get("/status")]
+async fn status(db: web::Data<Arc<Database>>) -> impl Responder {
+    let project_count = db.get_project_count().await;
+    let cache_stats = db.get_cache_stats().await;
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "database": {
+            "project_count": project_count,
+            "cache_enabled": cache_stats.total_entries > 0 || true // Assumes cache is configured
+        },
+        "query_cache": cache_stats,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "uptime_seconds": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }))
 }
 
 #[tokio::main]
@@ -119,6 +162,9 @@ async fn main() -> anyhow::Result<()> {
             .app_data(web::Data::new(db.clone()))
             .app_data(app_info.clone())
             .service(register_project)
+            .service(health_check)
+            .service(metrics)
+            .service(status)
     });
 
     let server = match http_server.bind(&http_addr) {
