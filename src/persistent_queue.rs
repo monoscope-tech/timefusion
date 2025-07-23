@@ -6,7 +6,7 @@ use arrow_schema::{Field, Schema, SchemaRef};
 use delta_kernel::parquet::format::SortingColumn;
 use delta_kernel::schema::StructField;
 use log::debug;
-use serde::{Deserialize, Deserializer, Serialize, de::Error as DeError};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_arrow::schema::SchemaLike;
 use serde_arrow::schema::TracingOptions;
 use serde_json::json;
@@ -223,23 +223,27 @@ impl OtelLogsAndSpans {
 
     pub fn sorting_columns() -> Vec<SortingColumn> {
         // Define sorting columns for the parquet files to improve query performance
+        // Note: column indices need to match the actual schema order
         vec![
             SortingColumn {
-                column_idx: 0,    // timestamp is likely first in the schema
-                descending: true, // newest first
+                column_idx: 0,    // timestamp is first in the schema
+                descending: true, // newest first for time-series queries
                 nulls_first: false,
             },
             SortingColumn {
-                column_idx: 3, // id
+                column_idx: 3, // id column
                 descending: false,
                 nulls_first: false,
             },
+            // Could add service name for better data locality in multi-tenant scenarios
         ]
     }
 
     pub fn z_order_columns() -> Vec<String> {
         // Define z-order columns for efficient time-series range queries
-        vec!["timestamp".to_string()]
+        // Z-ordering on timestamp and service name improves query performance
+        // for time-range queries filtered by service
+        vec!["timestamp".to_string(), "resource___service___name".to_string()]
     }
 }
 
