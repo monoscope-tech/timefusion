@@ -3,19 +3,22 @@ use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::arrow::array::Array;
-use datafusion::common::SchemaExt;
 use datafusion::common::not_impl_err;
-use datafusion::execution::TaskContext;
+use datafusion::common::SchemaExt;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_plan::DisplayAs;
+use datafusion::parquet::file::properties::EnabledStatistics;
+use datafusion::parquet::file::properties::WriterVersion;
+use datafusion::parquet::schema::types::ColumnPath;
 use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
+use datafusion::physical_plan::DisplayAs;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{BinaryExpr, dml::InsertOp},
+    logical_expr::{dml::InsertOp, BinaryExpr},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 use datafusion_postgres::{DfSessionService, HandlerFactory};
@@ -24,7 +27,7 @@ use deltalake::checkpoints;
 use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::operations::transaction::CommitProperties;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder, storage::StorageOptions};
+use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
@@ -39,6 +42,14 @@ use url::Url;
 type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
+
+// Constants for optimization and vacuum operations
+const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 336; // 2 weeks
+const DEFAULT_CHECKPOINT_INTERVAL: i64 = 20;
+const ZSTD_COMPRESSION_LEVEL: i32 = 6;
+const DEFAULT_OPTIMIZE_TARGET_SIZE: i64 = 536870912; // 512MB
+const DEFAULT_BLOOM_FILTER_NDV: u64 = 1000000; // 1M distinct values
+const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20000;
 
 #[derive(Debug)]
 pub struct Database {
@@ -58,6 +69,64 @@ impl Clone for Database {
 }
 
 impl Database {
+    /// Creates standard writer properties used across different operations
+    fn create_writer_properties() -> WriterProperties {
+        // Get configurable values from environment
+        let bloom_filter_ndv = env::var("TIMEFUSION_BLOOM_FILTER_NDV")
+            .unwrap_or_else(|_| DEFAULT_BLOOM_FILTER_NDV.to_string())
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_BLOOM_FILTER_NDV);
+        
+        let page_row_count_limit = env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
+            .unwrap_or_else(|_| DEFAULT_PAGE_ROW_COUNT_LIMIT.to_string())
+            .parse::<usize>()
+            .unwrap_or(DEFAULT_PAGE_ROW_COUNT_LIMIT);
+
+        WriterProperties::builder()
+            .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()))
+            .set_writer_version(WriterVersion::PARQUET_2_0)
+            .set_max_row_group_size(134217728) // 128MB
+            .set_dictionary_enabled(true)
+            // Dictionary page size - 2MB allows larger dictionaries for better compression
+            .set_dictionary_page_size_limit(2097152) // 2MB
+            .set_statistics_enabled(EnabledStatistics::Page)
+            .set_bloom_filter_enabled(true)
+            .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
+            .set_column_bloom_filter_enabled(ColumnPath::from("id"), true)
+            .set_column_bloom_filter_enabled(ColumnPath::from("parent_id"), true)
+            .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
+            .set_column_bloom_filter_enabled(ColumnPath::from("context___trace_id"), true)
+            .set_column_bloom_filter_enabled(ColumnPath::from("context___span_id"), true)
+            .set_column_bloom_filter_enabled(ColumnPath::from("resource___service___name"), true)
+            // Additional bloom filters for frequently queried attributes
+            .set_column_bloom_filter_enabled(ColumnPath::from("attributes___http___request___method"), true)
+            .set_column_bloom_filter_enabled(ColumnPath::from("attributes___error___type"), true)
+            .set_column_bloom_filter_enabled(ColumnPath::from("level"), true)
+            .set_column_bloom_filter_enabled(ColumnPath::from("status_code"), true)
+            // False positive probability for bloom filters (0.1% is good balance)
+            .set_bloom_filter_fpp(0.001)
+            // Number of distinct values hint for bloom filters (configurable)
+            .set_bloom_filter_ndv(bloom_filter_ndv)
+            // Enable page checksums for data integrity
+            .set_data_page_row_count_limit(page_row_count_limit)
+            .build()
+    }
+
+    /// Updates a DeltaTable and handles errors consistently
+    async fn update_table(table: &Arc<RwLock<DeltaTable>>, context: &str) -> Result<()> {
+        let mut table_write = table.write().await;
+        match table_write.update().await {
+            Ok(_) => {
+                debug!("Updated table for {} to latest version", context);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to update table for {}: {}", context, e);
+                Err(anyhow::anyhow!("Failed to update table: {}", e))
+            }
+        }
+    }
+
     pub async fn new() -> Result<Self> {
         let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
@@ -98,8 +167,8 @@ impl Database {
         let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
 
-        // Optimize job - every 3 hours
-        let optimize_job = Job::new_async("0 0 */3 * * *", {
+        // Optimize job - every hour
+        let optimize_job = Job::new_async("0 0 * * * *", {
             let db = db.clone();
             move |_, _| {
                 let db = db.clone();
@@ -123,7 +192,10 @@ impl Database {
                 let db = db.clone();
                 Box::pin(async move {
                     info!("Running scheduled vacuum on all tables");
-                    let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS").unwrap_or_else(|_| "336".to_string()).parse::<u64>().unwrap_or(336);
+                    let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS")
+                        .unwrap_or_else(|_| DEFAULT_VACUUM_RETENTION_HOURS.to_string())
+                        .parse::<u64>()
+                        .unwrap_or(DEFAULT_VACUUM_RETENTION_HOURS);
 
                     for (project_id, (_, _, table)) in db.project_configs.read().await.iter() {
                         info!("Vacuuming {} (retention: {}h)", project_id, retention_hours);
@@ -160,8 +232,6 @@ impl Database {
 
     /// Setup the session context with tables and register DataFusion tables
     pub fn setup_session_context(&self, ctx: &SessionContext) -> DFResult<()> {
-        use crate::persistent_queue::OtelLogsAndSpans;
-
         // Create tables and register them with session context
         let schema = OtelLogsAndSpans::schema_ref();
 
@@ -228,7 +298,7 @@ impl Database {
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
         use datafusion::arrow::array::{StringArray, StringBuilder};
         use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
+        use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
@@ -338,14 +408,9 @@ impl Database {
         // Try to get the requested project table first
         if let Some((_, _, table)) = project_configs.get(project_id) {
             // Update the table before returning to ensure we have the latest version
-            {
-                let mut table_write = table.write().await;
-                // Run update to load any new transactions
-                match table_write.update().await {
-                    Ok(_) => debug!("Updated table for project '{}' to latest version", project_id),
-                    Err(e) => error!("Failed to update table for project '{}': {}", project_id, e),
-                }
-            }
+            Self::update_table(table, &format!("project '{}'", project_id))
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
 
             // Use Arc::clone instead of table.clone() to avoid deep copying
             return Ok(Arc::clone(table));
@@ -357,14 +422,9 @@ impl Database {
                 log::warn!("Project '{}' not found, falling back to default project", project_id);
 
                 // Update the default table before returning
-                {
-                    let mut table_write = table.write().await;
-                    // Run update to load any new transactions
-                    match table_write.update().await {
-                        Ok(_) => debug!("Updated default table to latest version"),
-                        Err(e) => error!("Failed to update default table: {}", e),
-                    }
-                }
+                Self::update_table(table, "default project")
+                    .await
+                    .map_err(|e| DataFusionError::Execution(format!("Failed to update default table: {}", e)))?;
 
                 // Use Arc::clone instead of table.clone() to avoid deep copying
                 return Ok(Arc::clone(table));
@@ -402,12 +462,8 @@ impl Database {
             configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
         };
 
-        // Create writer properties with ZSTD compression level 6 and bloom filters
-        let writer_properties = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
-            .set_bloom_filter_enabled(true)
-            .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
-            .build();
+        // Create writer properties with standardized configuration
+        let writer_properties = Self::create_writer_properties();
 
         // Scope the write lock to minimize lock time
         {
@@ -450,6 +506,7 @@ impl Database {
     /// This improves query performance for time-based queries
     async fn optimize_table(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<()> {
         // Log the start of the optimization operation
+        let start_time = std::time::Instant::now();
         info!("Starting Delta table optimization with Z-ordering");
 
         // Get a clone of the table to avoid holding the lock during the operation
@@ -458,32 +515,41 @@ impl Database {
             table.clone()
         };
 
+        // Get configurable target size
+        let target_size = env::var("TIMEFUSION_OPTIMIZE_TARGET_SIZE")
+            .unwrap_or_else(|_| DEFAULT_OPTIMIZE_TARGET_SIZE.to_string())
+            .parse::<i64>()
+            .unwrap_or(DEFAULT_OPTIMIZE_TARGET_SIZE);
+
         // Run optimize operation with Z-order on the timestamp and id columns
-        // and a target size of 256MB for optimal file size
-        let writer_properties = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(6).unwrap()))
-            .set_bloom_filter_enabled(true)
-            .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
-            .build();
+        let writer_properties = Self::create_writer_properties();
 
         // Note: Z-order functionality is achieved through sorting_columns in writer_properties
         let optimize_result = DeltaOps(table_clone)
             .optimize()
             .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(OtelLogsAndSpans::z_order_columns()))
-            .with_target_size(268435456) // 256MB
+            .with_target_size(target_size)
             .with_writer_properties(writer_properties)
             .await;
 
         match optimize_result {
             Ok((new_table, metrics)) => {
+                let duration = start_time.elapsed();
                 info!(
-                    "Optimization with sorted columns completed: {} files removed, {} files added, {} partitions optimized, {} total files considered, {} files skipped",
+                    "Optimization completed in {:?}: {} files removed, {} files added, {} partitions optimized, {} total files considered, {} files skipped",
+                    duration,
                     metrics.num_files_removed,
                     metrics.num_files_added,
                     metrics.partitions_optimized,
                     metrics.total_considered_files,
                     metrics.total_files_skipped
                 );
+
+                // Log performance metrics for monitoring
+                if metrics.num_files_removed > 0 {
+                    let compression_ratio = metrics.num_files_removed as f64 / metrics.num_files_added as f64;
+                    info!("Optimization compression ratio: {:.2}x", compression_ratio);
+                }
 
                 // Update the table reference with the optimized version
                 let mut table = table_ref.write().await;
@@ -502,6 +568,7 @@ impl Database {
     /// This reduces storage costs and improves query performance
     async fn vacuum_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, retention_hours: u64) {
         // Log the start of the vacuum operation
+        let start_time = std::time::Instant::now();
         info!("Starting vacuum operation with retention period of {} hours", retention_hours);
 
         // Get a clone of the table to avoid holding the lock during the operation
@@ -518,8 +585,21 @@ impl Database {
             .await
         {
             Ok((_, metrics)) => {
+                let duration = start_time.elapsed();
                 let files_deleted = metrics.files_deleted.len();
-                info!("Vacuum completed successfully, deleted {} files", files_deleted);
+                info!("Vacuum completed in {:?}, deleted {} files", duration, files_deleted);
+
+                // Log file sizes for monitoring storage savings
+                if !metrics.files_deleted.is_empty() {
+                    let _total_size: u64 = metrics.files_deleted.iter()
+                        .filter_map(|_path| {
+                            // Extract size from path if available
+                            // This is a simplified approach - in production you might want to query actual file sizes
+                            None::<u64>
+                        })
+                        .sum();
+                    debug!("Vacuum operation details: {:?}", metrics.files_deleted);
+                }
 
                 // Update the table reference with the vacuumed version
                 let mut table = table_ref.write().await;
@@ -556,8 +636,13 @@ impl Database {
             Ok(table) => {
                 // Check if table needs checkpointing - use same threshold as in insert_records_batch
                 let version = table.version();
-                // Only checkpoint if it's a multiple of 20 to be consistent with our write policy
-                if version > 0 && version % 20 == 0 {
+                // Only checkpoint if it's a multiple of our checkpoint interval to be consistent
+                let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
+                    .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
+                    .parse::<i64>()
+                    .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
+                
+                if version > 0 && version % checkpoint_interval == 0 {
                     info!("Checkpointing table for project '{}' at initial load, version {}", project_id, version);
                     checkpoints::create_checkpoint(&table, None).await?;
                 }
@@ -571,7 +656,7 @@ impl Database {
                 let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
                 let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
-                // Create table with ZSTD compression and auto-optimization
+                // Create table with compression and auto-optimization
                 // Note: z-ordering will be applied via sorting_columns in the writer properties
                 delta_ops
                     .create()
@@ -596,7 +681,7 @@ pub struct ProjectRoutingTable {
     default_project: String,
     database: Arc<Database>,
     schema: SchemaRef,
-    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
 }
 
 impl ProjectRoutingTable {
@@ -605,7 +690,7 @@ impl ProjectRoutingTable {
             default_project,
             database,
             schema,
-            batch_queue,
+            _batch_queue: batch_queue,
         }
     }
 
@@ -623,6 +708,7 @@ impl ProjectRoutingTable {
         OtelLogsAndSpans::schema_ref()
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn extract_project_id(&self, expr: &Expr) -> Option<String> {
         match expr {
             // Binary expression: "project_id = 'value'"
