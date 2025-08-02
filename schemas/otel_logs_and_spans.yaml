@@ -1,0 +1,273 @@
+table_name: otel_logs_and_spans
+partitions:
+  - project_id
+  - date
+sorting_columns:
+  - name: timestamp
+    descending: true
+    nulls_first: false
+  - name: id
+    descending: false
+    nulls_first: false
+z_order_columns:
+  - timestamp
+  - resource___service___name
+fields:
+  - name: timestamp
+    data_type: "Timestamp(Microsecond, None)"
+    nullable: false
+  - name: observed_timestamp
+    data_type: "Timestamp(Microsecond, None)"
+    nullable: true
+  - name: id
+    data_type: Utf8
+    nullable: false
+  - name: parent_id
+    data_type: Utf8
+    nullable: true
+  - name: hashes
+    data_type: "List(Utf8)"
+    nullable: false
+  - name: name
+    data_type: Utf8
+    nullable: true
+  - name: kind
+    data_type: Utf8
+    nullable: true
+  - name: status_code
+    data_type: Utf8
+    nullable: true
+  - name: status_message
+    data_type: Utf8
+    nullable: true
+  - name: level
+    data_type: Utf8
+    nullable: true
+  - name: severity
+    data_type: Utf8
+    nullable: true
+  - name: severity___severity_text
+    data_type: Utf8
+    nullable: true
+  - name: severity___severity_number
+    data_type: Utf8
+    nullable: true
+  - name: body
+    data_type: Utf8
+    nullable: true
+  - name: duration
+    data_type: UInt64
+    nullable: true
+  - name: start_time
+    data_type: "Timestamp(Microsecond, None)"
+    nullable: true
+  - name: end_time
+    data_type: "Timestamp(Microsecond, None)"
+    nullable: true
+  - name: context
+    data_type: Utf8
+    nullable: true
+  - name: context___trace_id
+    data_type: Utf8
+    nullable: true
+  - name: context___span_id
+    data_type: Utf8
+    nullable: true
+  - name: context___trace_state
+    data_type: Utf8
+    nullable: true
+  - name: context___trace_flags
+    data_type: Utf8
+    nullable: true
+  - name: context___is_remote
+    data_type: Utf8
+    nullable: true
+  - name: events
+    data_type: Utf8
+    nullable: true
+  - name: links
+    data_type: Utf8
+    nullable: true
+  - name: attributes
+    data_type: Utf8
+    nullable: true
+  - name: attributes___client___address
+    data_type: Utf8
+    nullable: true
+  - name: attributes___client___port
+    data_type: UInt32
+    nullable: true
+  - name: attributes___server___address
+    data_type: Utf8
+    nullable: true
+  - name: attributes___server___port
+    data_type: UInt32
+    nullable: true
+  - name: attributes___network___local__address
+    data_type: Utf8
+    nullable: true
+  - name: attributes___network___local__port
+    data_type: UInt32
+    nullable: true
+  - name: attributes___network___peer___address
+    data_type: Utf8
+    nullable: true
+  - name: attributes___network___peer__port
+    data_type: UInt32
+    nullable: true
+  - name: attributes___network___protocol___name
+    data_type: Utf8
+    nullable: true
+  - name: attributes___network___protocol___version
+    data_type: Utf8
+    nullable: true
+  - name: attributes___network___transport
+    data_type: Utf8
+    nullable: true
+  - name: attributes___network___type
+    data_type: Utf8
+    nullable: true
+  - name: attributes___code___number
+    data_type: UInt32
+    nullable: true
+  - name: attributes___code___file___path
+    data_type: UInt32
+    nullable: true
+  - name: attributes___code___function___name
+    data_type: UInt32
+    nullable: true
+  - name: attributes___code___line___number
+    data_type: UInt32
+    nullable: true
+  - name: attributes___code___stacktrace
+    data_type: UInt32
+    nullable: true
+  - name: attributes___log__record___original
+    data_type: Utf8
+    nullable: true
+  - name: attributes___log__record___uid
+    data_type: Utf8
+    nullable: true
+  - name: attributes___error___type
+    data_type: Utf8
+    nullable: true
+  - name: attributes___exception___type
+    data_type: Utf8
+    nullable: true
+  - name: attributes___exception___message
+    data_type: Utf8
+    nullable: true
+  - name: attributes___exception___stacktrace
+    data_type: Utf8
+    nullable: true
+  - name: attributes___url___fragment
+    data_type: Utf8
+    nullable: true
+  - name: attributes___url___full
+    data_type: Utf8
+    nullable: true
+  - name: attributes___url___path
+    data_type: Utf8
+    nullable: true
+  - name: attributes___url___query
+    data_type: Utf8
+    nullable: true
+  - name: attributes___url___scheme
+    data_type: Utf8
+    nullable: true
+  - name: attributes___user_agent___original
+    data_type: Utf8
+    nullable: true
+  - name: attributes___http___request___method
+    data_type: Utf8
+    nullable: true
+  - name: attributes___http___request___method_original
+    data_type: Utf8
+    nullable: true
+  - name: attributes___http___response___status_code
+    data_type: UInt32
+    nullable: true
+  - name: attributes___http___request___resend_count
+    data_type: UInt32
+    nullable: true
+  - name: attributes___http___request___body___size
+    data_type: UInt32
+    nullable: true
+  - name: attributes___session___id
+    data_type: Utf8
+    nullable: true
+  - name: attributes___session___previous___id
+    data_type: Utf8
+    nullable: true
+  - name: attributes___db___system___name
+    data_type: Utf8
+    nullable: true
+  - name: attributes___db___collection___name
+    data_type: Utf8
+    nullable: true
+  - name: attributes___db___namespace
+    data_type: Utf8
+    nullable: true
+  - name: attributes___db___operation___name
+    data_type: Utf8
+    nullable: true
+  - name: attributes___db___response___status_code
+    data_type: Utf8
+    nullable: true
+  - name: attributes___db___operation___batch___size
+    data_type: UInt32
+    nullable: true
+  - name: attributes___db___query___summary
+    data_type: Utf8
+    nullable: true
+  - name: attributes___db___query___text
+    data_type: Utf8
+    nullable: true
+  - name: attributes___user___id
+    data_type: Utf8
+    nullable: true
+  - name: attributes___user___email
+    data_type: Utf8
+    nullable: true
+  - name: attributes___user___full_name
+    data_type: Utf8
+    nullable: true
+  - name: attributes___user___name
+    data_type: Utf8
+    nullable: true
+  - name: attributes___user___hash
+    data_type: Utf8
+    nullable: true
+  - name: resource
+    data_type: Utf8
+    nullable: true
+  - name: resource___service___name
+    data_type: Utf8
+    nullable: true
+  - name: resource___service___version
+    data_type: Utf8
+    nullable: true
+  - name: resource___service___instance___id
+    data_type: Utf8
+    nullable: true
+  - name: resource___service___namespace
+    data_type: Utf8
+    nullable: true
+  - name: resource___telemetry___sdk___language
+    data_type: Utf8
+    nullable: true
+  - name: resource___telemetry___sdk___name
+    data_type: Utf8
+    nullable: true
+  - name: resource___telemetry___sdk___version
+    data_type: Utf8
+    nullable: true
+  - name: resource___user_agent___original
+    data_type: Utf8
+    nullable: true
+  - name: project_id
+    data_type: Utf8
+    nullable: false
+  - name: date
+    data_type: Date32
+    nullable: false

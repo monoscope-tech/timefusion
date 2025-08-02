@@ -1,16 +1,22 @@
 use std::str::FromStr;
-use std::sync::Arc;
 
 use arrow::datatypes::FieldRef;
-use arrow_schema::{DataType, Field};
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use delta_kernel::parquet::format::SortingColumn;
 use deltalake::kernel::StructField;
 use log::debug;
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
-use serde_arrow::schema::{SchemaLike, TracingOptions};
-use serde_json::json;
 use serde_with::serde_as;
+use std::sync::OnceLock;
+
+use crate::schema_loader::TableSchema;
+use crate::load_schema;
+
+static OTEL_SCHEMA: OnceLock<TableSchema> = OnceLock::new();
+
+fn get_otel_schema() -> &'static TableSchema {
+    OTEL_SCHEMA.get_or_init(|| load_schema!("../schemas/otel_logs_and_spans.yaml"))
+}
 
 #[allow(non_snake_case)]
 #[serde_as]
@@ -162,86 +168,34 @@ pub struct OtelLogsAndSpans {
 
 impl OtelLogsAndSpans {
     pub fn table_name() -> String {
-        "otel_logs_and_spans".to_string()
+        get_otel_schema().table_name.clone()
     }
 
+    #[allow(dead_code)]
     pub fn fields() -> anyhow::Result<Vec<FieldRef>> {
-        let tracing_options = TracingOptions::default()
-            .strings_as_large_utf8(false)
-            .sequence_as_large_list(false)
-            .sequence_as_large_list(false)
-            .overwrite("project_id", json!({"name": "project_id", "data_type": "Utf8", "nullable": false}))?
-            .overwrite("date", json!({"name": "date", "data_type": "Date32", "nullable": false}))?
-            .overwrite("duration", json!({"name": "duration", "data_type": "UInt64", "nullable": true}))?
-            .overwrite("body", json!({"name":"body", "data_type": "Utf8", "nullable": true}))?
-            .overwrite("attributes", json!({"name":"attributes", "data_type": "Utf8", "nullable": true}))?
-            .overwrite("resource", json!({"name":"resource", "data_type": "Utf8", "nullable": true}))?
-            .overwrite(
-                "timestamp",
-                json!({"name": "timestamp", "data_type": "Timestamp(Microsecond, None)", "nullable": false}),
-            )?
-            .overwrite("id", json!({"name": "id", "data_type": "Utf8", "nullable": false}))?
-            .overwrite(
-                "observed_timestamp",
-                json!({"name": "observed_timestamp", "data_type": "Timestamp(Microsecond, None)", "nullable": true}),
-            )?
-            .overwrite(
-                "start_time",
-                json!({"name": "start_time", "data_type": "Timestamp(Microsecond, None)", "nullable": true}),
-            )?
-            .overwrite(
-                "end_time",
-                json!({"name": "end_time", "data_type": "Timestamp(Microsecond, None)", "nullable": true}),
-            )?;
-
-        Ok(Vec::<FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?)
+        get_otel_schema().fields()
     }
 
     pub fn columns() -> anyhow::Result<Vec<StructField>> {
-        let fields = OtelLogsAndSpans::fields()?;
-        let vec_refs: Vec<StructField> = fields.iter().map(|arc_field| arc_field.as_ref().try_into().unwrap()).collect();
-        assert_eq!(fields[fields.len() - 2].data_type(), &DataType::Utf8);
-        assert_eq!(fields[fields.len() - 1].data_type(), &DataType::Date32);
-        debug!("schema_field columns {:?}", vec_refs);
-        Ok(vec_refs)
+        let columns = get_otel_schema().columns()?;
+        debug!("schema_field columns {:?}", columns);
+        Ok(columns)
     }
 
     pub fn schema_ref() -> SchemaRef {
-        let fields = OtelLogsAndSpans::fields().unwrap_or_else(|e| {
-            log::error!("Failed to get fields: {:?}", e);
-            Vec::new()
-        });
-
-        Arc::new(Schema::new(fields))
+        get_otel_schema().schema_ref()
     }
 
     pub fn partitions() -> Vec<String> {
-        vec!["project_id".to_string(), "date".to_string()]
+        get_otel_schema().partitions.clone()
     }
 
     pub fn sorting_columns() -> Vec<SortingColumn> {
-        // Define sorting columns for the parquet files to improve query performance
-        // Note: column indices need to match the actual schema order
-        vec![
-            SortingColumn {
-                column_idx: 0,    // timestamp is first in the schema
-                descending: true, // newest first for time-series queries
-                nulls_first: false,
-            },
-            SortingColumn {
-                column_idx: 3, // id column
-                descending: false,
-                nulls_first: false,
-            },
-            // Could add service name for better data locality in multi-tenant scenarios
-        ]
+        get_otel_schema().sorting_columns()
     }
 
     pub fn z_order_columns() -> Vec<String> {
-        // Define z-order columns for efficient time-series range queries
-        // Z-ordering on timestamp and service name improves query performance
-        // for time-range queries filtered by service
-        vec!["timestamp".to_string(), "resource___service___name".to_string()]
+        get_otel_schema().z_order_columns.clone()
     }
 }
 
