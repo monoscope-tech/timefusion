@@ -2,3 +2,4 @@
 pub mod batch_queue;
 pub mod database;
 pub mod persistent_queue;
+pub mod schema_loader;

@@ -2,14 +2,16 @@
 mod batch_queue;
 mod database;
 mod persistent_queue;
-use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
+mod schema_loader;
+use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
 use batch_queue::BatchQueue;
 use database::Database;
+use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use futures::TryFutureExt;
 use serde::Deserialize;
 use std::{env, sync::Arc};
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -103,12 +105,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting PGWire server on port: {}", pg_port);
 
-    // Verify server started correctly
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    if pg_server.is_finished() {
-        error!("PGWire server failed to start, aborting...");
-        return Err(anyhow::anyhow!("PGWire server failed to start"));
-    }
 
     // Start HTTP server
     let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
@@ -142,13 +138,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let pg_task = tokio::spawn(move || {
-        let opts=&ServerOptions{
-                ..Default::default(),
-                port: pg_port,
-            };
+    let pg_task = tokio::spawn(async move {
+        let opts = ServerOptions::new()
+            .with_port(pg_port)
+            .with_host("0.0.0.0".to_string());
 
-        datafusion_postgres::serve(session_context, opts)
+        datafusion_postgres::serve(Arc::new(session_context), &opts).await
     });
 
     // Wait for shutdown signal
