@@ -102,7 +102,6 @@ async fn main() -> anyhow::Result<()> {
         });
 
     info!("Starting PGWire server on port: {}", pg_port);
-    let pg_server = db.start_pgwire_server(session_context, pg_port, shutdown_token.clone()).await?;
 
     // Verify server started correctly
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -143,9 +142,18 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let pg_task = tokio::spawn(move || {
+        let opts=&ServerOptions{
+                ..Default::default(),
+                port: pg_port,
+            };
+
+        datafusion_postgres::serve(session_context, opts)
+    });
+
     // Wait for shutdown signal
     tokio::select! {
-        _ = pg_server.map_err(|e| error!("PGWire server task failed: {:?}", e)) => {},
+        _ = pg_task => {error!("PGWire server task failed")},
         _ = http_task.map_err(|e| error!("HTTP server task failed: {:?}", e)) => {},
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, initiating shutdown");

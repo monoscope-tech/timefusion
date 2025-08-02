@@ -1,14 +1,14 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, FieldRef};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow::datatypes::FieldRef;
+use arrow_schema::{DataType, Field};
+use arrow_schema::{Schema, SchemaRef};
 use delta_kernel::parquet::format::SortingColumn;
-use delta_kernel::schema::StructField;
+use deltalake::kernel::StructField;
 use log::debug;
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
-use serde_arrow::schema::SchemaLike;
-use serde_arrow::schema::TracingOptions;
+use serde_arrow::schema::{SchemaLike, TracingOptions};
 use serde_json::json;
 use serde_with::serde_as;
 
@@ -194,7 +194,7 @@ impl OtelLogsAndSpans {
                 json!({"name": "end_time", "data_type": "Timestamp(Microsecond, None)", "nullable": true}),
             )?;
 
-        Ok(Vec::<arrow_schema::FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?)
+        Ok(Vec::<FieldRef>::from_type::<OtelLogsAndSpans>(tracing_options)?)
     }
 
     pub fn columns() -> anyhow::Result<Vec<StructField>> {
@@ -207,14 +207,12 @@ impl OtelLogsAndSpans {
     }
 
     pub fn schema_ref() -> SchemaRef {
-        let columns = OtelLogsAndSpans::columns().unwrap_or_else(|e| {
-            log::error!("Failed to get columns: {:?}", e);
+        let fields = OtelLogsAndSpans::fields().unwrap_or_else(|e| {
+            log::error!("Failed to get fields: {:?}", e);
             Vec::new()
         });
 
-        let arrow_fields: Vec<Field> = columns.iter().filter_map(|sf| sf.try_into().ok()).collect();
-
-        Arc::new(Schema::new(arrow_fields))
+        Arc::new(Schema::new(fields))
     }
 
     pub fn partitions() -> Vec<String> {

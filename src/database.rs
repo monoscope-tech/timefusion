@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use datafusion::arrow::array::Array;
 use datafusion::common::not_impl_err;
 use datafusion::common::SchemaExt;
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::parquet::file::properties::EnabledStatistics;
 use datafusion::parquet::file::properties::WriterVersion;
 use datafusion::parquet::schema::types::ColumnPath;
-use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
 use datafusion::physical_plan::DisplayAs;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
@@ -21,25 +21,21 @@ use datafusion::{
     logical_expr::{dml::InsertOp, BinaryExpr},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
-use datafusion_postgres::{DfSessionService, HandlerFactory};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::checkpoints;
 use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
-use deltalake::operations::transaction::CommitProperties;
-use deltalake::{storage::StorageOptions, DeltaOps, DeltaTable, DeltaTableBuilder};
+use deltalake::kernel::transaction::CommitProperties;
+use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
-use std::{net::SocketAddr, time::Duration};
 use tokio::sync::RwLock;
-use tokio::{net::TcpListener, time::timeout};
-use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use url::Url;
 
-type ProjectConfig = (String, StorageOptions, Arc<RwLock<DeltaTable>>);
+type ProjectConfig = (String, HashMap<String, String>, Arc<RwLock<DeltaTable>>);
 
 pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
 
@@ -76,7 +72,7 @@ impl Database {
             .unwrap_or_else(|_| DEFAULT_BLOOM_FILTER_NDV.to_string())
             .parse::<u64>()
             .unwrap_or(DEFAULT_BLOOM_FILTER_NDV);
-        
+
         let page_row_count_limit = env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
             .unwrap_or_else(|_| DEFAULT_PAGE_ROW_COUNT_LIMIT.to_string())
             .parse::<usize>()
@@ -328,80 +324,6 @@ impl Database {
         ctx.register_udf(set_config_udf);
     }
 
-    pub async fn start_pgwire_server(
-        &self, session_ctx: SessionContext, port: u16, shutdown: CancellationToken,
-    ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-        // 1) build listener
-        // Simple binding with clear logging
-        let addr = SocketAddr::from(([0, 0, 0, 0], port));
-        info!("Binding PGWire server to {}...", addr);
-
-        // Use standard tokio TcpListener
-        let listener = TcpListener::bind(addr).await?;
-
-        // Log successful binding
-        if let Ok(local_addr) = listener.local_addr() {
-            info!("PGWire server successfully bound to {}", local_addr);
-        }
-
-        // 2) pgwire service + handler
-        let service = Arc::new(DfSessionService::new(session_ctx));
-        let factory = Arc::new(HandlerFactory(service));
-
-        // 3) concurrency + logging
-        let max_conn = std::env::var("MAX_PG_CONNECTIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(100) as usize;
-        info!("PGWire listening on 0.0.0.0:{} (limit {})", port, max_conn);
-
-        // 4) spawn the accept‐&‐process loop
-        let handle = tokio::spawn({
-            let shutdown = shutdown.clone();
-            let stream = TcpListenerStream::new(listener);
-            async move {
-                stream
-                    .take_until(shutdown.cancelled())
-                    .for_each_concurrent(max_conn, |conn| async {
-                        match conn {
-                            Ok(sock) => {
-                                // Set TCP nodelay option for better performance
-                                if let Err(e) = sock.set_nodelay(true) {
-                                    error!("Failed to set TCP_NODELAY: {}", e);
-                                }
-
-                                // Log client connection info
-                                if let Ok(peer_addr) = sock.peer_addr() {
-                                    info!("Client connected from {}", peer_addr);
-                                }
-
-                                // Use a longer timeout to prevent idle disconnections
-                                let timeout_duration = Duration::from_secs(3600); // 1 hour
-                                info!("Starting PGWire connection processing");
-                                let start_time = std::time::Instant::now();
-
-                                match timeout(timeout_duration, pgwire::tokio::process_socket(sock, None, factory.clone())).await {
-                                    Ok(Ok(_)) => {
-                                        let elapsed = start_time.elapsed();
-                                        info!("PGWire connection completed successfully (duration: {:?})", elapsed);
-                                    }
-                                    Ok(Err(e)) => {
-                                        let elapsed = start_time.elapsed();
-                                        error!("PGWire connection error after {:?}: {}", elapsed, e);
-                                    }
-                                    Err(_) => {
-                                        error!("PGWire connection timed out after 1 hour");
-                                    }
-                                }
-                            }
-                            Err(e) => error!("TCP accept error: {}", e),
-                        }
-                    })
-                    .await;
-                info!("PGWire server shut down.");
-            }
-        });
-
-        Ok(handle)
-    }
-
     pub async fn resolve_table(&self, project_id: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         let project_configs = self.project_configs.read().await;
 
@@ -591,7 +513,9 @@ impl Database {
 
                 // Log file sizes for monitoring storage savings
                 if !metrics.files_deleted.is_empty() {
-                    let _total_size: u64 = metrics.files_deleted.iter()
+                    let _total_size: u64 = metrics
+                        .files_deleted
+                        .iter()
                         .filter_map(|_path| {
                             // Extract size from path if available
                             // This is a simplified approach - in production you might want to query actual file sizes
@@ -616,32 +540,32 @@ impl Database {
     pub async fn register_project(
         &self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
     ) -> Result<()> {
-        let mut storage_options = StorageOptions::default();
+        let mut storage_options = HashMap::new();
 
         if let Some(key) = access_key.filter(|k| !k.is_empty()) {
-            storage_options.0.insert("AWS_ACCESS_KEY_ID".to_string(), key.to_string());
+            storage_options.insert("AWS_ACCESS_KEY_ID".to_string(), key.to_string());
         }
 
         if let Some(key) = secret_key.filter(|k| !k.is_empty()) {
-            storage_options.0.insert("AWS_SECRET_ACCESS_KEY".to_string(), key.to_string());
+            storage_options.insert("AWS_SECRET_ACCESS_KEY".to_string(), key.to_string());
         }
 
         if let Some(ep) = endpoint.filter(|e| !e.is_empty()) {
-            storage_options.0.insert("AWS_ENDPOINT".to_string(), ep.to_string());
+            storage_options.insert("AWS_ENDPOINT".to_string(), ep.to_string());
         }
 
-        storage_options.0.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
+        storage_options.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
 
-        let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.0.clone()).with_allow_http(true).load().await {
+        let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.clone()).with_allow_http(true).load().await {
             Ok(table) => {
                 // Check if table needs checkpointing - use same threshold as in insert_records_batch
-                let version = table.version();
+                let version = table.version().unwrap_or(0);
                 // Only checkpoint if it's a multiple of our checkpoint interval to be consistent
                 let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
                     .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
                     .parse::<i64>()
                     .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
-                
+
                 if version > 0 && version % checkpoint_interval == 0 {
                     info!("Checkpointing table for project '{}' at initial load, version {}", project_id, version);
                     checkpoints::create_checkpoint(&table, None).await?;
@@ -662,7 +586,7 @@ impl Database {
                     .create()
                     .with_columns(OtelLogsAndSpans::columns().unwrap_or_default())
                     .with_partition_columns(OtelLogsAndSpans::partitions())
-                    .with_storage_options(storage_options.0.clone())
+                    .with_storage_options(storage_options.clone())
                     .with_commit_properties(commit_properties)
                     .with_configuration_property(deltalake::TableProperty::AutoOptimizeOptimizeWrite, Some("true"))
                     .with_configuration_property(deltalake::TableProperty::AutoOptimizeAutoCompact, Some("true"))
@@ -719,7 +643,7 @@ impl ProjectRoutingTable {
                     if let Expr::Column(col) = left.as_ref() {
                         if col.name == "project_id" {
                             // Check if right side is a literal string
-                            if let Expr::Literal(ScalarValue::Utf8(Some(value))) = right.as_ref() {
+                            if let Expr::Literal(ScalarValue::Utf8(Some(value)), None) = right.as_ref() {
                                 return Some(value.clone());
                             }
                         }
@@ -729,7 +653,7 @@ impl ProjectRoutingTable {
                     if let Expr::Column(col) = right.as_ref() {
                         if col.name == "project_id" {
                             // Check if left side is a literal string
-                            if let Expr::Literal(ScalarValue::Utf8(Some(value))) = left.as_ref() {
+                            if let Expr::Literal(ScalarValue::Utf8(Some(value)), None) = left.as_ref() {
                                 return Some(value.clone());
                             }
                         }
@@ -759,10 +683,10 @@ impl DisplayAs for ProjectRoutingTable {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "ProjectRoutingTable ")
-            } // DisplayFormatType::TreeRender => {
-              //     // TODO: collect info
-              //     write!(f, "")
-              // }
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "ProjectRoutingTable ")
+            }
         }
     }
 }
