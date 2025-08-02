@@ -109,7 +109,6 @@ mod tests {
     use crate::database::Database;
     use crate::persistent_queue::OtelLogsAndSpans;
     use chrono::Utc;
-    use serde_arrow::schema::SchemaLike;
     use std::sync::Arc;
     use tokio::time::sleep;
 

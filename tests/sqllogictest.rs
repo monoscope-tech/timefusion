@@ -2,6 +2,7 @@
 mod sqllogictest_tests {
     use anyhow::Result;
     use async_trait::async_trait;
+    use datafusion_postgres::ServerOptions;
     use dotenv::dotenv;
     use serial_test::serial;
     use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
@@ -13,7 +14,6 @@ mod sqllogictest_tests {
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{NoTls, Row};
-    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     struct TestDB {
@@ -152,13 +152,19 @@ mod sqllogictest_tests {
             let session_context = db.create_session_context();
             db.setup_session_context(&session_context).expect("Failed to setup session context");
 
-            let shutdown_token = CancellationToken::new();
-            let pg_server = db.start_pgwire_server(session_context, 5433, shutdown_token.clone()).await.expect("Failed to start PGWire server");
+            let opts = ServerOptions::new()
+                .with_port(5433)
+                .with_host("0.0.0.0".to_string());
 
-            // Wait for shutdown signal
-            shutdown_signal_clone.notified().await;
-            shutdown_token.cancel();
-            let _ = pg_server.await;
+            // Wait for shutdown signal or server termination
+            tokio::select! {
+                _ = shutdown_signal_clone.notified() => {},
+                res = datafusion_postgres::serve(Arc::new(session_context), &opts) => {
+                    if let Err(e) = res {
+                        eprintln!("PGWire server error: {:?}", e);
+                    }
+                }
+            }
         });
 
         // Wait for server to be ready

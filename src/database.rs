@@ -10,7 +10,6 @@ use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::parquet::file::properties::EnabledStatistics;
-use datafusion::parquet::file::properties::WriterVersion;
 use datafusion::parquet::schema::types::ColumnPath;
 use datafusion::physical_plan::DisplayAs;
 use datafusion::scalar::ScalarValue;
@@ -80,14 +79,15 @@ impl Database {
 
         WriterProperties::builder()
             .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()))
-            .set_writer_version(WriterVersion::PARQUET_2_0)
-            .set_max_row_group_size(134217728) // 128MB
+            // .set_writer_version(WriterVersion::PARQUET_2_0)
+            // .set_max_row_group_size(134217728) // 128MB
             .set_dictionary_enabled(true)
             // Dictionary page size - 2MB allows larger dictionaries for better compression
             .set_dictionary_page_size_limit(2097152) // 2MB
             .set_statistics_enabled(EnabledStatistics::Page)
             .set_bloom_filter_enabled(true)
-            .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
+            // Note: Sorting columns removed as they require writer version 7 with specific writer features
+            // .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
             .set_column_bloom_filter_enabled(ColumnPath::from("id"), true)
             .set_column_bloom_filter_enabled(ColumnPath::from("parent_id"), true)
             .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
@@ -100,7 +100,7 @@ impl Database {
             .set_column_bloom_filter_enabled(ColumnPath::from("level"), true)
             .set_column_bloom_filter_enabled(ColumnPath::from("status_code"), true)
             // False positive probability for bloom filters (0.1% is good balance)
-            .set_bloom_filter_fpp(0.001)
+            .set_bloom_filter_fpp(0.01)
             // Number of distinct values hint for bloom filters (configurable)
             .set_bloom_filter_ndv(bloom_filter_ndv)
             // Enable page checksums for data integrity
@@ -413,8 +413,6 @@ impl Database {
         // Records should be grouped by span, and separated into groups then inserted into the
         // correct table.
 
-        use serde_arrow::schema::SchemaLike;
-
         // Convert OtelLogsAndSpans records to Arrow RecordBatch format
         let fields = OtelLogsAndSpans::fields()?;
         let batch = serde_arrow::to_record_batch(&fields, &records)?;
@@ -581,15 +579,17 @@ impl Database {
                 let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                 // Create table with compression and auto-optimization
-                // Note: z-ordering will be applied via sorting_columns in the writer properties
+                // Note: z-ordering will be applied during optimize operations
+                // Use writer version 7 to support advanced features
                 delta_ops
                     .create()
                     .with_columns(OtelLogsAndSpans::columns().unwrap_or_default())
                     .with_partition_columns(OtelLogsAndSpans::partitions())
                     .with_storage_options(storage_options.clone())
                     .with_commit_properties(commit_properties)
-                    .with_configuration_property(deltalake::TableProperty::AutoOptimizeOptimizeWrite, Some("true"))
-                    .with_configuration_property(deltalake::TableProperty::AutoOptimizeAutoCompact, Some("true"))
+                    // Temporarily disable writer version 7 until we fix the timestamp issue
+                    // .with_configuration_property(deltalake::TableProperty::MinWriterVersion, Some("7"))
+                    // .with_configuration_property(deltalake::TableProperty::MinReaderVersion, Some("3"))
                     .await?
             }
         };
@@ -822,7 +822,7 @@ mod tests {
         vec![
             OtelLogsAndSpans {
                 project_id: "test_project".to_string(),
-                // date: timestamp1.date_naive(),
+                date: timestamp1.date_naive(),
                 timestamp: timestamp1,
                 observed_timestamp: Some(timestamp1),
                 id: "span1".to_string(),
@@ -837,7 +837,7 @@ mod tests {
             },
             OtelLogsAndSpans {
                 project_id: "test_project".to_string(),
-                // date: timestamp2.date_naive(),
+                date: timestamp2.date_naive(),
                 timestamp: timestamp2,
                 observed_timestamp: Some(timestamp2),
                 id: "span2".to_string(),
@@ -1041,6 +1041,7 @@ mod tests {
         let datetime = chrono::DateTime::parse_from_rfc3339("2023-02-01T15:30:00.000000Z").unwrap().with_timezone(&chrono::Utc);
         let record = OtelLogsAndSpans {
             project_id: "default".to_string(),
+            date: datetime.date_naive(),
             timestamp: datetime,
             observed_timestamp: Some(datetime),
             id: "sql_span1a".to_string(),
