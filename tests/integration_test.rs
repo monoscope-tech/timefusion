@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod integration {
     use anyhow::Result;
+    use datafusion_postgres::ServerOptions;
     use dotenv::dotenv;
     use rand::Rng;
     use scopeguard;
@@ -11,7 +12,6 @@ mod integration {
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{Client, NoTls};
-    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     async fn connect_with_retry(port: u16, timeout: Duration) -> Result<(Client, tokio::task::JoinHandle<()>), tokio_postgres::Error> {
@@ -49,8 +49,8 @@ mod integration {
         dotenv().ok();
 
         // Use a different port for each test to avoid conflicts
-        let mut rng = rand::thread_rng();
-        let port = 5433 + (rng.gen_range(1..100) as u16);
+        let mut rng = rand::rng();
+        let port = 5433 + (rng.random_range(1..100) as u16);
 
         unsafe {
             std::env::set_var("PGWIRE_PORT", &port.to_string());
@@ -68,13 +68,19 @@ mod integration {
 
             let port = std::env::var("PGWIRE_PORT").expect("PGWIRE_PORT not set").parse::<u16>().expect("Invalid PGWIRE_PORT");
 
-            let shutdown_token = CancellationToken::new();
-            let pg_server = db.start_pgwire_server(session_context, port, shutdown_token.clone()).await.expect("Failed to start PGWire server");
+            let opts = ServerOptions::new()
+                .with_port(port)
+                .with_host("0.0.0.0".to_string());
 
-            // Wait for shutdown signal
-            shutdown_signal_clone.notified().await;
-            shutdown_token.cancel();
-            let _ = pg_server.await;
+            // Wait for shutdown signal or server termination
+            tokio::select! {
+                _ = shutdown_signal_clone.notified() => {},
+                res = datafusion_postgres::serve(Arc::new(session_context), &opts) => {
+                    if let Err(e) = res {
+                        eprintln!("PGWire server error: {:?}", e);
+                    }
+                }
+            }
         });
 
         // Get the port number we set
