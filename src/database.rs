@@ -78,33 +78,33 @@ impl Database {
             .unwrap_or(DEFAULT_PAGE_ROW_COUNT_LIMIT);
 
         WriterProperties::builder()
-            .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()))
-            // .set_writer_version(WriterVersion::PARQUET_2_0)
-            // .set_max_row_group_size(134217728) // 128MB
-            .set_dictionary_enabled(true)
-            // Dictionary page size - 2MB allows larger dictionaries for better compression
-            .set_dictionary_page_size_limit(2097152) // 2MB
-            .set_statistics_enabled(EnabledStatistics::Page)
-            .set_bloom_filter_enabled(true)
-            // Note: Sorting columns removed as they require writer version 7 with specific writer features
-            // .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
-            .set_column_bloom_filter_enabled(ColumnPath::from("id"), true)
-            .set_column_bloom_filter_enabled(ColumnPath::from("parent_id"), true)
-            .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
-            .set_column_bloom_filter_enabled(ColumnPath::from("context___trace_id"), true)
-            .set_column_bloom_filter_enabled(ColumnPath::from("context___span_id"), true)
-            .set_column_bloom_filter_enabled(ColumnPath::from("resource___service___name"), true)
-            // Additional bloom filters for frequently queried attributes
-            .set_column_bloom_filter_enabled(ColumnPath::from("attributes___http___request___method"), true)
-            .set_column_bloom_filter_enabled(ColumnPath::from("attributes___error___type"), true)
-            .set_column_bloom_filter_enabled(ColumnPath::from("level"), true)
-            .set_column_bloom_filter_enabled(ColumnPath::from("status_code"), true)
-            // False positive probability for bloom filters (0.1% is good balance)
-            .set_bloom_filter_fpp(0.01)
-            // Number of distinct values hint for bloom filters (configurable)
-            .set_bloom_filter_ndv(bloom_filter_ndv)
-            // Enable page checksums for data integrity
-            .set_data_page_row_count_limit(page_row_count_limit)
+            // .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()))
+            // // .set_writer_version(WriterVersion::PARQUET_2_0)
+            // // .set_max_row_group_size(134217728) // 128MB
+            // .set_dictionary_enabled(true)
+            // // Dictionary page size - 2MB allows larger dictionaries for better compression
+            // .set_dictionary_page_size_limit(2097152) // 2MB
+            // .set_statistics_enabled(EnabledStatistics::Page)
+            // .set_bloom_filter_enabled(true)
+            // // Note: Sorting columns removed as they require writer version 7 with specific writer features
+            // // .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
+            // .set_column_bloom_filter_enabled(ColumnPath::from("id"), true)
+            // .set_column_bloom_filter_enabled(ColumnPath::from("parent_id"), true)
+            // .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
+            // .set_column_bloom_filter_enabled(ColumnPath::from("context___trace_id"), true)
+            // .set_column_bloom_filter_enabled(ColumnPath::from("context___span_id"), true)
+            // .set_column_bloom_filter_enabled(ColumnPath::from("resource___service___name"), true)
+            // // Additional bloom filters for frequently queried attributes
+            // .set_column_bloom_filter_enabled(ColumnPath::from("attributes___http___request___method"), true)
+            // .set_column_bloom_filter_enabled(ColumnPath::from("attributes___error___type"), true)
+            // .set_column_bloom_filter_enabled(ColumnPath::from("level"), true)
+            // .set_column_bloom_filter_enabled(ColumnPath::from("status_code"), true)
+            // // False positive probability for bloom filters (0.1% is good balance)
+            // .set_bloom_filter_fpp(0.01)
+            // // Number of distinct values hint for bloom filters (configurable)
+            // .set_bloom_filter_ndv(bloom_filter_ndv)
+            // // Enable page checksums for data integrity
+            // .set_data_page_row_count_limit(page_row_count_limit)
             .build()
     }
 
@@ -795,6 +795,7 @@ mod tests {
         // Set a unique test-specific prefix for a clean Delta table
         let test_prefix = format!("test-data-{}", prefix);
         unsafe {
+            env::set_var("AWS_S3_BUCKET", "timefusion-tests");
             env::set_var("TIMEFUSION_TABLE_PREFIX", &test_prefix);
         }
 
