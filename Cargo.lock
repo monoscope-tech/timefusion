@@ -6651,6 +6651,7 @@ dependencies = [
  "actix-web",
  "anyhow",
  "arrow",
+ "arrow-json",
  "arrow-schema",
  "async-trait",
  "aws-config",

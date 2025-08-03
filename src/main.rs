@@ -1,8 +1,8 @@
 // main.rs
-mod batch_queue;
-mod database;
-mod persistent_queue;
-mod schema_loader;
+use timefusion::batch_queue;
+use timefusion::database;
+use timefusion::persistent_queue;
+use timefusion::schema_loader;
 use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
 use batch_queue::BatchQueue;
 use database::Database;
