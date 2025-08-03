@@ -404,21 +404,6 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub async fn insert_records(&self, records: &Vec<crate::persistent_queue::OtelLogsAndSpans>) -> Result<()> {
-        // TODO: insert records doesn't need to accept a project_id as they can be read from the
-        // record.
-        // Records should be grouped by span, and separated into groups then inserted into the
-        // correct table.
-
-        // Convert OtelLogsAndSpans records to Arrow RecordBatch format
-        let fields = OtelLogsAndSpans::fields()?;
-        let batch = serde_arrow::to_record_batch(&fields, &records)?;
-
-        // Call insert_records_batch with the converted batch to reuse common insertion logic
-        // In tests we always skip the queue for direct insertion
-        self.insert_records_batch("default", vec![batch], true).await
-    }
 
     /// Optimize the Delta table using Z-ordering on timestamp and id columns
     /// This improves query performance for time-based queries
@@ -782,6 +767,8 @@ mod tests {
     use dotenv::dotenv;
     use serial_test::serial;
     use uuid::Uuid;
+    use serde_json::json;
+    use crate::test_helpers::test_helpers::*;
 
     use super::*;
 
@@ -814,43 +801,53 @@ mod tests {
     }
 
     // Helper function to create sample test records
-    fn create_test_records() -> Vec<OtelLogsAndSpans> {
+    fn create_test_records() -> Result<RecordBatch> {
         let timestamp1 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 0, 0).unwrap();
         let timestamp2 = Utc.with_ymd_and_hms(2023, 1, 1, 10, 10, 0).unwrap();
 
-        vec![
-            OtelLogsAndSpans {
-                project_id: "test_project".to_string(),
-                date: timestamp1.date_naive(),
-                timestamp: timestamp1,
-                observed_timestamp: Some(timestamp1),
-                id: "span1".to_string(),
-                name: Some("test_span_1".to_string()),
-                context___trace_id: Some("trace1".to_string()),
-                context___span_id: Some("span1".to_string()),
-                start_time: Some(timestamp1),
-                duration: Some(100_000_000),
-                status_code: Some("OK".to_string()),
-                level: Some("INFO".to_string()),
-                ..Default::default()
-            },
-            OtelLogsAndSpans {
-                project_id: "test_project".to_string(),
-                date: timestamp2.date_naive(),
-                timestamp: timestamp2,
-                observed_timestamp: Some(timestamp2),
-                id: "span2".to_string(),
-                name: Some("test_span_2".to_string()),
-                context___trace_id: Some("trace2".to_string()),
-                context___span_id: Some("span2".to_string()),
-                start_time: Some(timestamp2),
-                duration: Some(200_000_000),
-                status_code: Some("ERROR".to_string()),
-                level: Some("ERROR".to_string()),
-                status_message: Some("Error occurred".to_string()),
-                ..Default::default()
-            },
-        ]
+        // Create records as JSON objects
+        let records = vec![
+            json!({
+                "timestamp": timestamp1.timestamp_micros(),
+                "observed_timestamp": timestamp1.timestamp_micros(),
+                "id": "span1",
+                "parent_id": null,
+                "hashes": [],
+                "name": "test_span_1",
+                "kind": null,
+                "status_code": "OK",
+                "status_message": null,
+                "level": "INFO",
+                "duration": 100_000_000,
+                "start_time": timestamp1.timestamp_micros(),
+                "end_time": null,
+                "context___trace_id": "trace1",
+                "context___span_id": "span1",
+                "project_id": "test_project",
+                "date": timestamp1.date_naive().to_string(),
+            }),
+            json!({
+                "timestamp": timestamp2.timestamp_micros(),
+                "observed_timestamp": timestamp2.timestamp_micros(),
+                "id": "span2",
+                "parent_id": null,
+                "hashes": [],
+                "name": "test_span_2",
+                "kind": null,
+                "status_code": "ERROR",
+                "status_message": "Error occurred",
+                "level": "ERROR",
+                "duration": 200_000_000,
+                "start_time": timestamp2.timestamp_micros(),
+                "end_time": null,
+                "context___trace_id": "trace2",
+                "context___span_id": "span2",
+                "project_id": "test_project",
+                "date": timestamp2.date_naive().to_string(),
+            }),
+        ];
+
+        json_to_batch(records)
     }
 
     #[serial]
@@ -863,9 +860,9 @@ mod tests {
         let (db, ctx, test_prefix) = setup_test_database(Uuid::new_v4().to_string() + "query").await?;
         log::info!("Using test-specific table prefix: {}", test_prefix);
 
-        let records = create_test_records();
+        let batch = create_test_records()?;
         println!("Created test records, inserting...");
-        db.insert_records(&records).await?;
+        db.insert_records_batch("default", vec![batch], true).await?;
         println!("Records inserted successfully");
 
         // Test 1: Basic count query to verify record insertion
@@ -1059,8 +1056,8 @@ mod tests {
 
         let (db, ctx, _) = setup_test_database(Uuid::new_v4().to_string() + "bug").await?;
 
-        let records = create_test_records();
-        db.insert_records(&records).await?;
+        let batch = create_test_records()?;
+        db.insert_records_batch("default", vec![batch], true).await?;
 
         // This query works fine
         let df = ctx.sql("SELECT COUNT(*) as count FROM otel_logs_and_spans").await?;
@@ -1092,23 +1089,30 @@ mod tests {
         log::info!("Using test-specific table prefix for SQL INSERT test: {}", test_prefix);
 
         let datetime = chrono::DateTime::parse_from_rfc3339("2023-02-01T15:30:00.000000Z").unwrap().with_timezone(&chrono::Utc);
-        let record = OtelLogsAndSpans {
-            project_id: "default".to_string(),
-            date: datetime.date_naive(),
-            timestamp: datetime,
-            observed_timestamp: Some(datetime),
-            id: "sql_span1a".to_string(),
-            name: Some("sql_test_span".to_string()),
-            duration: Some(150000000),
-            start_time: Some(datetime),
-            context___trace_id: Some("sql_trace1".to_string()),
-            context___span_id: Some("sql_span1".to_string()),
-            status_code: Some("OK".to_string()),
-            status_message: Some("SQL inserted successfully".to_string()),
-            level: Some("INFO".to_string()),
-            ..Default::default()
-        };
-        db.insert_records(&vec![record]).await?;
+        
+        // Create a single record using JSON
+        let record = json!({
+            "timestamp": datetime.timestamp_micros(),
+            "observed_timestamp": datetime.timestamp_micros(),
+            "id": "sql_span1a",
+            "parent_id": null,
+            "hashes": [],
+            "name": "sql_test_span",
+            "kind": null,
+            "status_code": "OK",
+            "status_message": "SQL inserted successfully",
+            "level": "INFO",
+            "duration": 150000000,
+            "start_time": datetime.timestamp_micros(),
+            "end_time": null,
+            "context___trace_id": "sql_trace1",
+            "context___span_id": "sql_span1",
+            "project_id": "default",
+            "date": datetime.date_naive().to_string(),
+        });
+        
+        let batch = json_to_batch(vec![record])?;
+        db.insert_records_batch("default", vec![batch], true).await?;
 
         let verify_df = ctx.sql("SELECT id, name, timestamp from otel_logs_and_spans").await?.collect().await?;
         #[rustfmt::skip]
