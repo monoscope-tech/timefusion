@@ -25,6 +25,8 @@ use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
@@ -57,11 +59,31 @@ const DEFAULT_OPTIMIZE_TARGET_SIZE: i64 = 536870912; // 512MB
 const DEFAULT_BLOOM_FILTER_NDV: u64 = 1000000; // 1M distinct values
 const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20000;
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+struct StorageConfig {
+    project_id: String,
+    table_name: String,
+    s3_bucket: String,
+    s3_prefix: String,
+    s3_region: String,
+    s3_access_key_id: String,
+    s3_secret_access_key: String,
+    s3_endpoint: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct Database {
     project_configs: ProjectConfigs,
     batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
+    // PostgreSQL pool for configuration (optional)
+    config_pool: Option<PgPool>,
+    // Cached storage configurations
+    storage_configs: Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
+    // Default S3 settings for unconfigured mode
+    default_s3_bucket: Option<String>,
+    default_s3_prefix: Option<String>,
+    default_s3_endpoint: Option<String>,
 }
 
 impl Clone for Database {
@@ -70,6 +92,11 @@ impl Clone for Database {
             project_configs: Arc::clone(&self.project_configs),
             batch_queue: self.batch_queue.clone(),
             maintenance_shutdown: Arc::clone(&self.maintenance_shutdown),
+            config_pool: self.config_pool.clone(),
+            storage_configs: Arc::clone(&self.storage_configs),
+            default_s3_bucket: self.default_s3_bucket.clone(),
+            default_s3_prefix: self.default_s3_prefix.clone(),
+            default_s3_endpoint: self.default_s3_endpoint.clone(),
         }
     }
 }
@@ -134,25 +161,137 @@ impl Database {
         }
     }
 
+    /// Load storage configurations from PostgreSQL
+    async fn load_storage_configs(pool: &PgPool) -> Result<HashMap<(String, String), StorageConfig>> {
+        // Ensure table exists
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS timefusion_projects (
+                project_id VARCHAR(255) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                s3_bucket VARCHAR(255) NOT NULL,
+                s3_prefix VARCHAR(500) NOT NULL,
+                s3_region VARCHAR(100) NOT NULL,
+                s3_access_key_id VARCHAR(500) NOT NULL,
+                s3_secret_access_key VARCHAR(500) NOT NULL,
+                s3_endpoint VARCHAR(500),
+                is_active BOOLEAN NOT NULL DEFAULT true,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (project_id, table_name)
+            )
+            "#,
+        )
+        .execute(pool)
+        .await?;
+
+        let configs: Vec<StorageConfig> = sqlx::query_as(
+            "SELECT project_id, table_name, s3_bucket, s3_prefix, s3_region, 
+             s3_access_key_id, s3_secret_access_key, s3_endpoint 
+             FROM timefusion_projects WHERE is_active = true"
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let mut map = HashMap::new();
+        for config in configs {
+            info!("Loaded config: {}/{}", config.project_id, config.table_name);
+            map.insert((config.project_id.clone(), config.table_name.clone()), config);
+        }
+        Ok(map)
+    }
+
     pub async fn new() -> Result<Self> {
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
         let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
+        // Store default S3 settings for unconfigured mode
+        let default_s3_bucket = env::var("AWS_S3_BUCKET").ok();
+        let default_s3_prefix = env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
+        let default_s3_endpoint = Some(aws_endpoint.clone());
+
+        // Try to connect to config database if URL is provided
+        let (config_pool, storage_configs) = if let Ok(db_url) = env::var("TIMEFUSION_CONFIG_DATABASE_URL") {
+            let pool = PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&db_url)
+                .await
+                .ok();
+            
+            if let Some(ref p) = pool {
+                let configs = Self::load_storage_configs(p).await.unwrap_or_default();
+                (pool, configs)
+            } else {
+                info!("Could not connect to config database, using default mode");
+                (None, HashMap::new())
+            }
+        } else {
+            (None, HashMap::new())
+        };
+
         let project_configs = HashMap::new();
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
+            config_pool,
+            storage_configs: Arc::new(RwLock::new(storage_configs)),
+            default_s3_bucket: default_s3_bucket.clone(),
+            default_s3_prefix: Some(default_s3_prefix.clone()),
+            default_s3_endpoint,
         };
 
-        // Register default project with otel_logs_and_spans table if AWS_S3_BUCKET is set
-        if let Ok(bucket) = env::var("AWS_S3_BUCKET") {
-            let prefix = env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
-            let storage_uri = format!("s3://{}/{}/projects/default/otel_logs_and_spans/?endpoint={}", bucket, prefix, aws_endpoint);
+        // Initialize default project with otel_logs_and_spans table if AWS_S3_BUCKET is set
+        if let Some(ref bucket) = default_s3_bucket {
+            let storage_uri = format!("s3://{}/{}/projects/default/otel_logs_and_spans/?endpoint={}", 
+                bucket, default_s3_prefix, aws_endpoint);
             info!("Default project storage URI: {}", storage_uri);
-            db.register_project("default", "otel_logs_and_spans", &storage_uri, None, None, None).await?;
+            
+            // Initialize table for default project
+            let storage_options = HashMap::new();
+            let table = match DeltaTableBuilder::from_uri(&storage_uri)
+                .with_storage_options(storage_options.clone())
+                .with_allow_http(true)
+                .load()
+                .await 
+            {
+                Ok(table) => {
+                    let version = table.version().unwrap_or(0);
+                    let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
+                        .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
+                        .parse::<i64>()
+                        .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
+
+                    if version > 0 && version % checkpoint_interval == 0 {
+                        info!("Checkpointing table for default project at initial load, version {}", version);
+                        checkpoints::create_checkpoint(&table, None).await?;
+                    }
+                    table
+                }
+                Err(err) => {
+                    log::warn!("Table doesn't exist for default project. Creating new table. err: {:?}", err);
+
+                    let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
+                    let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
+                    let commit_properties = CommitProperties::default()
+                        .with_create_checkpoint(true)
+                        .with_cleanup_expired_logs(Some(true));
+
+                    delta_ops
+                        .create()
+                        .with_columns(schema.columns().unwrap_or_default())
+                        .with_partition_columns(schema.partitions.clone())
+                        .with_storage_options(storage_options.clone())
+                        .with_commit_properties(commit_properties)
+                        .await?
+                }
+            };
+
+            let mut configs = db.project_configs.write().await;
+            configs.insert(("default".to_string(), "otel_logs_and_spans".to_string()), Arc::new(RwLock::new(table)));
+            info!("Initialized default project table at: {}", storage_uri);
         }
 
         Ok(db)
@@ -344,27 +483,101 @@ impl Database {
     }
 
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
-        let project_configs = self.project_configs.read().await;
-        
-        let table = project_configs
-            .get(&(project_id.to_string(), table_name.to_string()))
-            .or_else(|| {
-                if project_id != "default" {
-                    log::warn!("Project '{}' table '{}' not found, falling back to default", project_id, table_name);
-                    project_configs.get(&("default".to_string(), table_name.to_string()))
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!("Project '{}' table '{}' not found", project_id, table_name))
-            })?;
+        // First check if table already exists
+        {
+            let project_configs = self.project_configs.read().await;
+            if let Some(table) = project_configs.get(&(project_id.to_string(), table_name.to_string())) {
+                Self::update_table(table, &format!("project '{}' table '{}'", project_id, table_name))
+                    .await
+                    .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
+                return Ok(Arc::clone(table));
+            }
+        }
 
-        Self::update_table(table, &format!("project '{}' table '{}'", project_id, table_name))
+        // Table doesn't exist, try to create it
+        self.get_or_create_table(project_id, table_name)
             .await
-            .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
+            .map_err(|e| DataFusionError::Execution(format!("Failed to get or create table: {}", e)))
+    }
 
-        Ok(Arc::clone(table))
+    async fn get_or_create_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
+        // Try to reload configs from database if we have a pool (lazy loading)
+        if let Some(ref pool) = self.config_pool {
+            if let Ok(new_configs) = Self::load_storage_configs(pool).await {
+                let mut configs = self.storage_configs.write().await;
+                *configs = new_configs;
+            }
+        }
+
+        // Check if we have specific config for this project
+        let configs = self.storage_configs.read().await;
+        let (storage_uri, storage_options) = if let Some(config) = configs.get(&(project_id.to_string(), table_name.to_string())) {
+            // Use project-specific S3 settings
+            let storage_uri = format!(
+                "s3://{}/{}/?endpoint={}",
+                config.s3_bucket,
+                config.s3_prefix,
+                config.s3_endpoint.as_ref().unwrap_or(&self.default_s3_endpoint.clone().unwrap_or_else(|| "https://s3.amazonaws.com".to_string()))
+            );
+            
+            let mut storage_options = HashMap::new();
+            storage_options.insert("aws_access_key_id".to_string(), config.s3_access_key_id.clone());
+            storage_options.insert("aws_secret_access_key".to_string(), config.s3_secret_access_key.clone());
+            storage_options.insert("aws_region".to_string(), config.s3_region.clone());
+            if let Some(ref endpoint) = config.s3_endpoint {
+                storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
+            }
+            
+            (storage_uri, storage_options)
+        } else if let Some(ref bucket) = self.default_s3_bucket {
+            // No specific config, use default bucket
+            let prefix = self.default_s3_prefix.as_ref().unwrap();
+            let endpoint = self.default_s3_endpoint.as_ref().unwrap();
+            let storage_uri = format!("s3://{}/{}/projects/{}/{}/?endpoint={}", bucket, prefix, project_id, table_name, endpoint);
+            (storage_uri, HashMap::new())
+        } else {
+            return Err(anyhow::anyhow!("No configuration for project '{}' table '{}' and no default S3 bucket set", project_id, table_name));
+        };
+
+        info!("Creating or loading table for project '{}' table '{}' at: {}", project_id, table_name, storage_uri);
+
+        // Try to load or create the table
+        let table = match DeltaTableBuilder::from_uri(&storage_uri)
+            .with_storage_options(storage_options.clone())
+            .with_allow_http(true)
+            .load()
+            .await 
+        {
+            Ok(table) => {
+                info!("Loaded existing table for project '{}' table '{}'" , project_id, table_name);
+                table
+            }
+            Err(err) => {
+                info!("Table doesn't exist for project '{}' table '{}', creating new table. err: {:?}", project_id, table_name, err);
+                
+                let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+                let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
+                let commit_properties = CommitProperties::default()
+                    .with_create_checkpoint(true)
+                    .with_cleanup_expired_logs(Some(true));
+
+                delta_ops
+                    .create()
+                    .with_columns(schema.columns().unwrap_or_default())
+                    .with_partition_columns(schema.partitions.clone())
+                    .with_storage_options(storage_options)
+                    .with_commit_properties(commit_properties)
+                    .await?
+            }
+        };
+
+        let table_arc = Arc::new(RwLock::new(table));
+        
+        // Store in cache
+        let mut configs = self.project_configs.write().await;
+        configs.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
+        
+        Ok(table_arc)
     }
 
     pub async fn insert_records_batch(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
@@ -396,13 +609,8 @@ impl Database {
             table_name.to_string()
         };
 
-        let table_ref = {
-            let configs = self.project_configs.read().await;
-            configs.get(&(project_id.clone(), table_name.clone()))
-                .or_else(|| configs.get(&("default".to_string(), table_name.clone())))
-                .ok_or_else(|| anyhow::anyhow!("Project '{}' table '{}' not found", project_id, table_name))?
-                .clone()
-        };
+        // Get or create the table
+        let table_ref = self.get_or_create_table(&project_id, &table_name).await?;
 
         // Get the appropriate schema for this table
         let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
@@ -532,68 +740,6 @@ impl Database {
             }
             Err(e) => error!("Vacuum operation failed: {}", e),
         }
-    }
-
-    pub async fn register_project(
-        &self, project_id: &str, table_name: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
-    ) -> Result<()> {
-        let mut storage_options = HashMap::new();
-
-        if let Some(key) = access_key.filter(|k| !k.is_empty()) {
-            storage_options.insert("AWS_ACCESS_KEY_ID".to_string(), key.to_string());
-        }
-
-        if let Some(key) = secret_key.filter(|k| !k.is_empty()) {
-            storage_options.insert("AWS_SECRET_ACCESS_KEY".to_string(), key.to_string());
-        }
-
-        if let Some(ep) = endpoint.filter(|e| !e.is_empty()) {
-            storage_options.insert("AWS_ENDPOINT".to_string(), ep.to_string());
-        }
-
-        storage_options.insert("AWS_ALLOW_HTTP".to_string(), "true".to_string());
-
-        let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.clone()).with_allow_http(true).load().await {
-            Ok(table) => {
-                let version = table.version().unwrap_or(0);
-                let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
-                    .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
-                    .parse::<i64>()
-                    .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
-
-                if version > 0 && version % checkpoint_interval == 0 {
-                    info!("Checkpointing table for project '{}' at initial load, version {}", project_id, version);
-                    checkpoints::create_checkpoint(&table, None).await?;
-                }
-                table
-            }
-            Err(err) => {
-                log::warn!("Table doesn't exist for project '{}'. Creating new table. err: {:?}", project_id, err);
-
-                let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-                let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
-                let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
-
-                delta_ops
-                    .create()
-                    .with_columns(schema.columns().unwrap_or_default())
-                    .with_partition_columns(schema.partitions.clone())
-                    .with_storage_options(storage_options.clone())
-                    .with_commit_properties(commit_properties)
-                    .await?
-            }
-        };
-
-        let mut configs = self.project_configs.write().await;
-        configs.insert((project_id.to_string(), table_name.to_string()), Arc::new(RwLock::new(table)));
-        info!("Registered project '{}' table '{}' at: {}", project_id, table_name, conn_str);
-        Ok(())
-    }
-    
-    /// Get a list of all registered project-table combinations
-    pub async fn list_registered_tables(&self) -> Vec<(String, String)> {
-        let configs = self.project_configs.read().await;
-        configs.keys().cloned().collect()
     }
 }
 
@@ -765,6 +911,53 @@ mod tests {
     use crate::batch_queue::tests::json_to_batch;
 
     use super::*;
+
+    // Helper function to initialize a project table for testing
+    async fn init_test_project(db: &Database, project_id: &str, table_name: &str, storage_uri: &str) -> Result<()> {
+        let storage_options = HashMap::new();
+        let table = match DeltaTableBuilder::from_uri(storage_uri)
+            .with_storage_options(storage_options.clone())
+            .with_allow_http(true)
+            .load()
+            .await 
+        {
+            Ok(table) => {
+                let version = table.version().unwrap_or(0);
+                let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
+                    .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
+                    .parse::<i64>()
+                    .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
+
+                if version > 0 && version % checkpoint_interval == 0 {
+                    info!("Checkpointing table for project '{}' at initial load, version {}", project_id, version);
+                    checkpoints::create_checkpoint(&table, None).await?;
+                }
+                table
+            }
+            Err(err) => {
+                log::warn!("Table doesn't exist for project '{}'. Creating new table. err: {:?}", project_id, err);
+
+                let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+                let delta_ops = DeltaOps::try_from_uri(storage_uri).await?;
+                let commit_properties = CommitProperties::default()
+                    .with_create_checkpoint(true)
+                    .with_cleanup_expired_logs(Some(true));
+
+                delta_ops
+                    .create()
+                    .with_columns(schema.columns().unwrap_or_default())
+                    .with_partition_columns(schema.partitions.clone())
+                    .with_storage_options(storage_options.clone())
+                    .with_commit_properties(commit_properties)
+                    .await?
+            }
+        };
+
+        let mut configs = db.project_configs.write().await;
+        configs.insert((project_id.to_string(), table_name.to_string()), Arc::new(RwLock::new(table)));
+        info!("Initialized project '{}' table '{}' at: {}", project_id, table_name, storage_uri);
+        Ok(())
+    }
 
     // Helper function to create a test database with a unique table prefix
     async fn setup_test_database(prefix: String) -> Result<(Database, SessionContext, String)> {
@@ -1083,7 +1276,7 @@ mod tests {
         // Register and insert data for multiple projects
         for (i, project) in ["project1", "project2"].iter().enumerate() {
             let uri = format!("s3://timefusion-tests/{}/projects/{}/otel_logs_and_spans/", prefix, project);
-            db.register_project(project, "otel_logs_and_spans", &uri, None, None, None).await?;
+            init_test_project(&db, project, "otel_logs_and_spans", &uri).await?;
             
             let batch = json_to_batch(vec![test_span(
                 &format!("span_p{}", i+1),
@@ -1130,14 +1323,14 @@ mod tests {
         
         // Register project and insert data
         let uri = format!("s3://{}/{}/projects/myproject/otel_logs_and_spans/?endpoint={}", bucket, prefix, endpoint);
-        db.register_project("myproject", "otel_logs_and_spans", &uri, None, None, None).await?;
+        init_test_project(&db, "myproject", "otel_logs_and_spans", &uri).await?;
         
         let batch = json_to_batch(vec![test_span("test_span", "isolated_span", "myproject")])?;
         db.insert_records_batch("myproject", "otel_logs_and_spans", vec![batch], true).await?;
         
-        // Verify registration
-        let tables = db.list_registered_tables().await;
-        assert!(tables.contains(&("myproject".to_string(), "otel_logs_and_spans".to_string())));
+        // Verify registration by checking that the project exists in configs
+        let configs = db.project_configs.read().await;
+        assert!(configs.contains_key(&("myproject".to_string(), "otel_logs_and_spans".to_string())));
         
         // Verify isolation
         let ctx = db.create_session_context();
