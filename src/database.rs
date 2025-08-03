@@ -915,13 +915,13 @@ mod tests {
         assert_eq!(result.len(), 1);
         let batch = &result[0];
         assert_eq!(batch.num_rows(), 1);
-        
+
         // Verify the values
         let name_array = batch.column(0).as_string::<i32>();
         let level_array = batch.column(1).as_string::<i32>();
         let status_code_array = batch.column(2).as_string::<i32>();
         let status_message_array = batch.column(3).as_string::<i32>();
-        
+
         assert_eq!(name_array.value(0), "test_span_2");
         assert_eq!(level_array.value(0), "ERROR");
         assert_eq!(status_code_array.value(0), "ERROR");
@@ -1035,6 +1035,7 @@ mod tests {
             .await?;
         let result = df.collect().await?;
 
+        #[rustfmt::skip]
         assert_batches_eq!(
             [
                 "+-------------+-------------+-------+-------------+------------+------+-----------------------------+",
@@ -1050,29 +1051,26 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test] 
+    #[tokio::test]
     async fn test_datafusion48_assert_batches_eq_bug() -> Result<()> {
         // This test demonstrates a bug in DataFusion 48's assert_batches_eq macro
         // where it fails with "Only intervals with the same data type are comparable"
         // even though the query executes successfully
-        
+
         let (db, ctx, _) = setup_test_database(Uuid::new_v4().to_string() + "bug").await?;
-        
+
         let records = create_test_records();
         db.insert_records(&records).await?;
-        
+
         // This query works fine
         let df = ctx.sql("SELECT COUNT(*) as count FROM otel_logs_and_spans").await?;
         let result = df.collect().await?;
-        
+
         // The data is correct
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
-        
-        // But assert_batches_eq fails with type comparison error
-        // Uncommenting this line will cause: 
-        // "Error: Internal error: Only intervals with the same data type are comparable, lhs:Int64, rhs:UInt64"
-        /*
+
+        #[rustfmt::skip]
         assert_batches_eq!(
             [
                 "+-------+",
@@ -1080,11 +1078,10 @@ mod tests {
                 "+-------+",
                 "| 2     |",
                 "+-------+",
-            ], 
+            ],
             &result
         );
-        */
-        
+
         Ok(())
     }
 
@@ -1243,47 +1240,6 @@ mod tests {
             ],
             &verify_result
         );
-
-        // TODO: verify the correct copy to syntax
-        // let copy_sql = "COPY (VALUES (
-        //         NULL, 'sql_span2copy',
-        //         NULL, 'sql_test_span_copy', NULL,
-        //         'OK', 'span copied into successfully', 'INFO', NULL, NULL,
-        //         NULL, 150000000, TIMESTAMP '2023-01-01T10:00:00Z', NULL,
-        //         'sql_trace1copy', 'sql_span1copy', NULL, NULL,
-        //         NULL, NULL, NULL,
-        //         NULL, NULL,
-        //
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL, NULL,
-        //
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL, NULL,
-        //
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL, NULL,
-        //
-        //         NULL, NULL, NULL, NULL,
-        //         NULL, NULL, NULL,
-        //
-        //         'test_project', TIMESTAMP '2023-01-02T10:00:00Z'
-        //     )) TO otel_logs_and_spans ";
-        //
-        // let insert_result = ctx.sql(copy_sql).await?.collect().await?;
-        // #[rustfmt::skip]
-        // assert_batches_eq!(
-        //     ["+-------+",
-        //     "| count |",
-        //     "+-------+",
-        //     "| 1     |",
-        //     "+-------+",
-        // ], &insert_result);
 
         let verify_df = ctx
              .sql("SELECT project_id, id, name, timestamp, kind, status_code, severity___severity_text, duration, start_time from otel_logs_and_spans order by timestamp desc")
