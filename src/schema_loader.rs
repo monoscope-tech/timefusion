@@ -75,10 +75,13 @@ fn parse_arrow_data_type(type_str: &str) -> anyhow::Result<ArrowDataType> {
     match type_str {
         "Utf8" => Ok(ArrowDataType::Utf8),
         "Date32" => Ok(ArrowDataType::Date32),
+        "Int32" => Ok(ArrowDataType::Int32),
+        "Int64" => Ok(ArrowDataType::Int64),
         "UInt32" => Ok(ArrowDataType::UInt32),
         "UInt64" => Ok(ArrowDataType::UInt64),
         "List(Utf8)" => Ok(ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8, true)))),
         "Timestamp(Microsecond, None)" => Ok(ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)),
+        "Timestamp(Microsecond, Some(\"UTC\"))" => Ok(ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))),
         _ => Err(anyhow::anyhow!("Unknown data type: {}", type_str)),
     }
 }
@@ -87,6 +90,8 @@ fn parse_delta_data_type(type_str: &str) -> anyhow::Result<DeltaDataType> {
     match type_str {
         "Utf8" => Ok(DeltaDataType::Primitive(PrimitiveType::String)),
         "Date32" => Ok(DeltaDataType::Primitive(PrimitiveType::Date)),
+        "Int32" => Ok(DeltaDataType::Primitive(PrimitiveType::Integer)),
+        "Int64" => Ok(DeltaDataType::Primitive(PrimitiveType::Long)),
         "UInt32" => Ok(DeltaDataType::Primitive(PrimitiveType::Integer)),
         "UInt64" => Ok(DeltaDataType::Primitive(PrimitiveType::Long)),
         "List(Utf8)" => Ok(DeltaDataType::Array(Box::new(ArrayType::new(
@@ -94,6 +99,7 @@ fn parse_delta_data_type(type_str: &str) -> anyhow::Result<DeltaDataType> {
             true,
         )))),
         "Timestamp(Microsecond, None)" => Ok(DeltaDataType::Primitive(PrimitiveType::Timestamp)),
+        "Timestamp(Microsecond, Some(\"UTC\"))" => Ok(DeltaDataType::Primitive(PrimitiveType::Timestamp)),
         _ => Err(anyhow::anyhow!("Unknown data type: {}", type_str)),
     }
 }

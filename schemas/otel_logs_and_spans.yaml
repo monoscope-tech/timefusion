@@ -14,10 +14,10 @@ z_order_columns:
   - resource___service___name
 fields:
   - name: timestamp
-    data_type: "Timestamp(Microsecond, None)"
+    data_type: "Timestamp(Microsecond, Some(\"UTC\"))"
     nullable: false
   - name: observed_timestamp
-    data_type: "Timestamp(Microsecond, None)"
+    data_type: "Timestamp(Microsecond, Some(\"UTC\"))"
     nullable: true
   - name: id
     data_type: Utf8
@@ -56,13 +56,13 @@ fields:
     data_type: Utf8
     nullable: true
   - name: duration
-    data_type: UInt64
+    data_type: Int64
     nullable: true
   - name: start_time
-    data_type: "Timestamp(Microsecond, None)"
+    data_type: "Timestamp(Microsecond, Some(\"UTC\"))"
     nullable: true
   - name: end_time
-    data_type: "Timestamp(Microsecond, None)"
+    data_type: "Timestamp(Microsecond, Some(\"UTC\"))"
     nullable: true
   - name: context
     data_type: Utf8
@@ -95,25 +95,25 @@ fields:
     data_type: Utf8
     nullable: true
   - name: attributes___client___port
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___server___address
     data_type: Utf8
     nullable: true
   - name: attributes___server___port
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___network___local__address
     data_type: Utf8
     nullable: true
   - name: attributes___network___local__port
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___network___peer___address
     data_type: Utf8
     nullable: true
   - name: attributes___network___peer__port
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___network___protocol___name
     data_type: Utf8
@@ -128,19 +128,19 @@ fields:
     data_type: Utf8
     nullable: true
   - name: attributes___code___number
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___code___file___path
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___code___function___name
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___code___line___number
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___code___stacktrace
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___log__record___original
     data_type: Utf8
@@ -185,13 +185,13 @@ fields:
     data_type: Utf8
     nullable: true
   - name: attributes___http___response___status_code
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___http___request___resend_count
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___http___request___body___size
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___session___id
     data_type: Utf8
@@ -215,7 +215,7 @@ fields:
     data_type: Utf8
     nullable: true
   - name: attributes___db___operation___batch___size
-    data_type: UInt32
+    data_type: Int32
     nullable: true
   - name: attributes___db___query___summary
     data_type: Utf8
