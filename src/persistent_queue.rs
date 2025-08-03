@@ -47,7 +47,7 @@ pub struct OtelLogsAndSpans {
 
     pub body: Option<String>, // body as json json
 
-    pub duration: Option<u64>, // nanoseconds
+    pub duration: Option<i64>, // nanoseconds
 
     #[serde(with = "chrono::serde::ts_microseconds_option")]
     pub start_time: Option<chrono::DateTime<chrono::Utc>>,
@@ -73,26 +73,26 @@ pub struct OtelLogsAndSpans {
     pub attributes: Option<String>, // attirbutes object as json
     // Server and client
     pub attributes___client___address: Option<String>,
-    pub attributes___client___port: Option<u32>,
+    pub attributes___client___port: Option<i32>,
     pub attributes___server___address: Option<String>,
-    pub attributes___server___port: Option<u32>,
+    pub attributes___server___port: Option<i32>,
 
     // network https://opentelemetry.io/docs/specs/semconv/attributes-registry/network/
     pub attributes___network___local__address: Option<String>,
-    pub attributes___network___local__port: Option<u32>,
+    pub attributes___network___local__port: Option<i32>,
     pub attributes___network___peer___address: Option<String>,
-    pub attributes___network___peer__port: Option<u32>,
+    pub attributes___network___peer__port: Option<i32>,
     pub attributes___network___protocol___name: Option<String>,
     pub attributes___network___protocol___version: Option<String>,
     pub attributes___network___transport: Option<String>,
     pub attributes___network___type: Option<String>,
 
     // Source Code Attributes
-    pub attributes___code___number: Option<u32>,
-    pub attributes___code___file___path: Option<u32>,
-    pub attributes___code___function___name: Option<u32>,
-    pub attributes___code___line___number: Option<u32>,
-    pub attributes___code___stacktrace: Option<u32>,
+    pub attributes___code___number: Option<i32>,
+    pub attributes___code___file___path: Option<i32>,
+    pub attributes___code___function___name: Option<i32>,
+    pub attributes___code___line___number: Option<i32>,
+    pub attributes___code___stacktrace: Option<i32>,
 
     // Log records. https://opentelemetry.io/docs/specs/semconv/general/logs/
     pub attributes___log__record___original: Option<String>,
@@ -117,9 +117,9 @@ pub struct OtelLogsAndSpans {
     // HTTP https://opentelemetry.io/docs/specs/semconv/http/http-spans/
     pub attributes___http___request___method: Option<String>,
     pub attributes___http___request___method_original: Option<String>,
-    pub attributes___http___response___status_code: Option<u32>,
-    pub attributes___http___request___resend_count: Option<u32>,
-    pub attributes___http___request___body___size: Option<u32>,
+    pub attributes___http___response___status_code: Option<i32>,
+    pub attributes___http___request___resend_count: Option<i32>,
+    pub attributes___http___request___body___size: Option<i32>,
 
     // Session https://opentelemetry.io/docs/specs/semconv/general/session/
     pub attributes___session___id: Option<String>,
@@ -131,7 +131,7 @@ pub struct OtelLogsAndSpans {
     pub attributes___db___namespace: Option<String>,
     pub attributes___db___operation___name: Option<String>,
     pub attributes___db___response___status_code: Option<String>,
-    pub attributes___db___operation___batch___size: Option<u32>,
+    pub attributes___db___operation___batch___size: Option<i32>,
     pub attributes___db___query___summary: Option<String>,
     pub attributes___db___query___text: Option<String>,
 
