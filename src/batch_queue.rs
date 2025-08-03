@@ -3,10 +3,25 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam::queue::SegQueue;
+use datafusion::arrow::array::{Array, AsArray};
 use delta_kernel::arrow::record_batch::RecordBatch;
 use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{error, info};
+
+// Helper to extract project_id from a batch
+fn extract_project_id_from_batch(batch: &RecordBatch) -> Option<String> {
+    batch.schema().fields().iter().position(|f| f.name() == "project_id")
+        .and_then(|idx| {
+            let column = batch.column(idx);
+            let string_array = column.as_string::<i32>();
+            if string_array.len() > 0 && !string_array.is_null(0) {
+                Some(string_array.value(0).to_string())
+            } else {
+                None
+            }
+        })
+}
 
 /// BatchQueue collects RecordBatches and processes them at intervals
 #[derive(Debug)]
@@ -66,39 +81,46 @@ async fn process_batches(db: &Arc<crate::database::Database>, queue: &Arc<SegQue
         return;
     }
 
-    let mut batches = Vec::new();
+    let mut project_batches: std::collections::HashMap<String, Vec<RecordBatch>> = std::collections::HashMap::new();
     let mut total_rows = 0;
 
-    // Take batches up to max_rows
+    // Take batches up to max_rows and group by project_id
     while !queue.is_empty() && total_rows < max_rows {
         if let Some(batch) = queue.pop() {
             total_rows += batch.num_rows();
-            batches.push(batch);
+            // Extract project_id from batch, default to "default"
+            let project_id = extract_project_id_from_batch(&batch).unwrap_or_else(|| "default".to_string());
+            project_batches.entry(project_id).or_default().push(batch);
         } else {
             break;
         }
     }
 
-    if batches.is_empty() {
+    if project_batches.is_empty() {
         return;
     }
 
-    // Measure and log the insertion performance
     let start = Instant::now();
 
-    // Use skip_queue=true to force direct insertion and avoid infinite loop
-    match db.insert_records_batch("", batches.clone(), true).await {
-        Ok(_) => {
-            let elapsed = start.elapsed();
-            info!(
-                batches_count = batches.len(),
-                rows_count = total_rows,
-                duration_ms = elapsed.as_millis(),
-                "Batch insert completed"
-            );
-        }
-        Err(e) => {
-            error!("Failed to insert batches: {}", e);
+    // Process batches for each project
+    for (project_id, batches) in project_batches {
+        let batch_count = batches.len();
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        
+        match db.insert_records_batch(&project_id, batches, true).await {
+            Ok(_) => {
+                let elapsed = start.elapsed();
+                info!(
+                    project_id = project_id,
+                    batches_count = batch_count,
+                    rows_count = row_count,
+                    duration_ms = elapsed.as_millis(),
+                    "Batch insert completed for project"
+                );
+            }
+            Err(e) => {
+                error!("Failed to insert batches for project {}: {}", project_id, e);
+            }
         }
     }
 }
@@ -107,7 +129,7 @@ async fn process_batches(db: &Arc<crate::database::Database>, queue: &Arc<SegQue
 pub mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::persistent_queue::get_otel_schema;
+    use crate::schema_loader::get_default_schema;
     use chrono::Utc;
     use std::sync::Arc;
     use tokio::time::sleep;
@@ -115,13 +137,14 @@ pub mod tests {
     use std::collections::HashMap;
     use arrow_json::ReaderBuilder;
     use datafusion::arrow::record_batch::RecordBatch;
+    use serial_test::serial;
 
     pub fn json_to_batch(records: Vec<Value>) -> anyhow::Result<RecordBatch> {
         if records.is_empty() {
             return Err(anyhow::anyhow!("Cannot create batch from empty records"));
         }
         
-        let schema = get_otel_schema().schema_ref();
+        let schema = get_default_schema().schema_ref();
         let json_data = records.into_iter()
             .map(|v| v.to_string())
             .collect::<Vec<_>>()
@@ -136,7 +159,7 @@ pub mod tests {
     }
 
     pub fn create_default_record() -> HashMap<String, Value> {
-        get_otel_schema().fields
+        get_default_schema().fields
             .iter()
             .map(|field| {
                 let value = if field.data_type == "List(Utf8)" {
@@ -149,10 +172,11 @@ pub mod tests {
             .collect()
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_batch_queue() -> Result<()> {
         dotenv::dotenv().ok();
-        let test_prefix = format!("test-batch-{}", uuid::Uuid::new_v4());
+        let test_prefix = format!("test-batch-{}-{}", uuid::Uuid::new_v4(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
         unsafe {
             std::env::set_var("TIMEFUSION_TABLE_PREFIX", &test_prefix);
         }

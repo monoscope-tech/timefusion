@@ -1,11 +1,13 @@
 use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
 use arrow::datatypes::DataType as ArrowDataType;
 use delta_kernel::parquet::format::SortingColumn;
 use deltalake::kernel::{StructField, DataType as DeltaDataType, PrimitiveType, ArrayType};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSchema {
     pub table_name: String,
     pub partitions: Vec<String>,
@@ -14,14 +16,14 @@ pub struct TableSchema {
     pub fields: Vec<FieldDef>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SortingColumnDef {
     pub name: String,
     pub descending: bool,
     pub nulls_first: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FieldDef {
     pub name: String,
     pub data_type: String,
@@ -104,10 +106,68 @@ fn parse_delta_data_type(type_str: &str) -> anyhow::Result<DeltaDataType> {
     }
 }
 
-#[macro_export]
-macro_rules! load_schema {
-    ($path:literal) => {{
-        const YAML_CONTENT: &str = include_str!($path);
-        serde_yaml::from_str::<$crate::schema_loader::TableSchema>(YAML_CONTENT).expect("Failed to parse schema YAML")
+// Include all schema YAML files at compile time
+macro_rules! include_schemas {
+    () => {{
+        vec![
+            ("otel_logs_and_spans", include_str!("../schemas/otel_logs_and_spans.yaml")),
+            // Add more schemas here as they are added to the schemas directory
+        ]
     }};
+}
+
+pub struct SchemaRegistry {
+    schemas: HashMap<String, TableSchema>,
+}
+
+impl SchemaRegistry {
+    fn new() -> Self {
+        let mut schemas = HashMap::new();
+        
+        // Load all schemas at compile time
+        for (name, yaml_content) in include_schemas!() {
+            match serde_yaml::from_str::<TableSchema>(yaml_content) {
+                Ok(schema) => {
+                    schemas.insert(schema.table_name.clone(), schema);
+                }
+                Err(e) => {
+                    panic!("Failed to parse schema {}: {}", name, e);
+                }
+            }
+        }
+        
+        Self { schemas }
+    }
+    
+    pub fn get(&self, table_name: &str) -> Option<&TableSchema> {
+        self.schemas.get(table_name)
+    }
+    
+    pub fn get_default(&self) -> Option<&TableSchema> {
+        // Return the first schema as default (for backward compatibility)
+        self.schemas.get("otel_logs_and_spans")
+            .or_else(|| self.schemas.values().next())
+    }
+    
+    pub fn list_tables(&self) -> Vec<String> {
+        self.schemas.keys().cloned().collect()
+    }
+}
+
+// Global registry instance
+static SCHEMA_REGISTRY: OnceLock<SchemaRegistry> = OnceLock::new();
+
+pub fn registry() -> &'static SchemaRegistry {
+    SCHEMA_REGISTRY.get_or_init(SchemaRegistry::new)
+}
+
+// Convenience function to get a schema by name
+pub fn get_schema(table_name: &str) -> Option<&'static TableSchema> {
+    registry().get(table_name)
+}
+
+// Get the default schema (for backward compatibility)
+pub fn get_default_schema() -> &'static TableSchema {
+    registry().get_default()
+        .expect("No schemas available in registry")
 }
