@@ -1,11 +1,7 @@
 // main.rs
-use timefusion::batch_queue;
-use timefusion::database;
-use timefusion::persistent_queue;
-use timefusion::schema_loader;
+use timefusion::batch_queue::{BatchQueue};
+use timefusion::database::{Database};
 use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
-use batch_queue::BatchQueue;
-use database::Database;
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use futures::TryFutureExt;
@@ -26,22 +22,30 @@ struct RegisterProjectRequest {
     access_key: String,
     secret_key: String,
     endpoint: Option<String>,
+    table_name: Option<String>,
 }
 
 #[post("/register_project")]
 async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<Arc<Database>>) -> impl Responder {
+    // Build the full S3 path for the project-specific table
+    let prefix = std::env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
+    let endpoint = req.endpoint.as_deref().unwrap_or("https://s3.amazonaws.com");
+    let storage_uri = format!("s3://{}/{}/projects/{}/?endpoint={}", req.bucket, prefix, req.project_id, endpoint);
+    
     match db
         .register_project(
             &req.project_id,
-            &req.bucket,
+            &storage_uri,
             Some(&req.access_key),
             Some(&req.secret_key),
-            req.endpoint.as_deref(),
+            Some(endpoint),
+            req.table_name.as_deref(),
         )
         .await
     {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({
-            "message": format!("Project '{}' registered successfully", req.project_id)
+            "message": format!("Project '{}' registered successfully", req.project_id),
+            "table_path": storage_uri
         })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
             "error": format!("Failed to register project: {:?}", e)

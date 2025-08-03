@@ -1,8 +1,8 @@
-use crate::persistent_queue::OtelLogsAndSpans;
+use crate::schema_loader::{get_default_schema, get_schema};
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use datafusion::arrow::array::Array;
+use datafusion::arrow::array::{Array, AsArray};
 use datafusion::common::not_impl_err;
 use datafusion::common::SchemaExt;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
@@ -32,9 +32,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 use url::Url;
 
-type ProjectConfig = (String, HashMap<String, String>, Arc<RwLock<DeltaTable>>);
+// Changed to support multiple tables per project: (project_id, table_name) -> DeltaTable
+pub type ProjectConfigs = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
 
-pub type ProjectConfigs = Arc<RwLock<HashMap<String, ProjectConfig>>>;
+// Helper function to extract project_id from a batch
+fn extract_project_id_from_batch(batch: &RecordBatch) -> Option<String> {
+    batch.schema().fields().iter().position(|f| f.name() == "project_id")
+        .and_then(|idx| {
+            let column = batch.column(idx);
+            let string_array = column.as_string::<i32>();
+            if string_array.len() > 0 && !string_array.is_null(0) {
+                Some(string_array.value(0).to_string())
+            } else {
+                None
+            }
+        })
+}
 
 // Constants for optimization and vacuum operations
 const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 336; // 2 weeks
@@ -85,7 +98,7 @@ impl Database {
             // .set_statistics_enabled(EnabledStatistics::Page)
             // .set_bloom_filter_enabled(true)
             // // Note: Sorting columns removed as they require writer version 7 with specific writer features
-            // // .set_sorting_columns(Some(OtelLogsAndSpans::sorting_columns()))
+            // // .set_sorting_columns(Some(get_default_schema().sorting_columns()))
             // .set_column_bloom_filter_enabled(ColumnPath::from("id"), true)
             // .set_column_bloom_filter_enabled(ColumnPath::from("parent_id"), true)
             // .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
@@ -122,28 +135,25 @@ impl Database {
     }
 
     pub async fn new() -> Result<Self> {
-        let bucket = env::var("AWS_S3_BUCKET").expect("AWS_S3_BUCKET environment variable not set");
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-
-        // Generate a unique prefix for this run's data
-        let prefix = env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
-        let table_name = "otel_logs_and_spans";
-        let storage_uri = format!("s3://{}/{}/{}/?endpoint={}", bucket, prefix, table_name, aws_endpoint);
-        info!("Storage URI configured: {}", storage_uri);
-
         let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
         let project_configs = HashMap::new();
-
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
-            batch_queue: None, // Batch queue is set later
+            batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
         };
 
-        db.register_project("default", &storage_uri, None, None, None).await?;
+        // Register default project if AWS_S3_BUCKET is set
+        if let Ok(bucket) = env::var("AWS_S3_BUCKET") {
+            let prefix = env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
+            let storage_uri = format!("s3://{}/{}/projects/default/?endpoint={}", bucket, prefix, aws_endpoint);
+            info!("Default project storage URI: {}", storage_uri);
+            db.register_project("default", &storage_uri, None, None, None, None).await?;
+        }
 
         Ok(db)
     }
@@ -168,7 +178,7 @@ impl Database {
                 let db = db.clone();
                 Box::pin(async move {
                     info!("Running scheduled optimize on all tables");
-                    for (project_id, (_, _, table)) in db.project_configs.read().await.iter() {
+                    for (project_id, table) in db.project_configs.read().await.iter() {
                         if let Err(e) = db.optimize_table(table).await {
                             error!("Optimize failed for {}: {}", project_id, e);
                         }
@@ -191,7 +201,7 @@ impl Database {
                         .parse::<u64>()
                         .unwrap_or(DEFAULT_VACUUM_RETENTION_HOURS);
 
-                    for (project_id, (_, _, table)) in db.project_configs.read().await.iter() {
+                    for (project_id, table) in db.project_configs.read().await.iter() {
                         info!("Vacuuming {} (retention: {}h)", project_id, retention_hours);
                         db.vacuum_table(table, retention_hours).await;
                     }
@@ -227,14 +237,15 @@ impl Database {
     /// Setup the session context with tables and register DataFusion tables
     pub fn setup_session_context(&self, ctx: &SessionContext) -> DFResult<()> {
         // Create tables and register them with session context
-        let schema = OtelLogsAndSpans::schema_ref();
+        let schema = get_default_schema().schema_ref();
 
         // Get batch queue from the app state if available
         let batch_queue = self.batch_queue.as_ref().map(Arc::clone);
 
-        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema, batch_queue);
+        let default_schema = get_default_schema();
+        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema, batch_queue, default_schema.table_name.clone());
 
-        ctx.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
+        ctx.register_table(&default_schema.table_name, Arc::new(routing_table))?;
         info!("Registered ProjectRoutingTable with SessionContext");
 
         self.register_pg_settings_table(ctx)?;
@@ -322,52 +333,35 @@ impl Database {
         ctx.register_udf(set_config_udf);
     }
 
-    pub async fn resolve_table(&self, project_id: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
+    pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         let project_configs = self.project_configs.read().await;
+        
+        let table = project_configs
+            .get(&(project_id.to_string(), table_name.to_string()))
+            .or_else(|| {
+                if project_id != "default" {
+                    log::warn!("Project '{}' table '{}' not found, falling back to default", project_id, table_name);
+                    project_configs.get(&("default".to_string(), table_name.to_string()))
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!("Project '{}' table '{}' not found", project_id, table_name))
+            })?;
 
-        // Try to get the requested project table first
-        if let Some((_, _, table)) = project_configs.get(project_id) {
-            // Update the table before returning to ensure we have the latest version
-            Self::update_table(table, &format!("project '{}'", project_id))
-                .await
-                .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
+        Self::update_table(table, &format!("project '{}' table '{}'", project_id, table_name))
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
 
-            // Use Arc::clone instead of table.clone() to avoid deep copying
-            return Ok(Arc::clone(table));
-        }
-
-        // If not found and project_id is not "default", try the default table
-        if project_id != "default" {
-            if let Some((_, _, table)) = project_configs.get("default") {
-                log::warn!("Project '{}' not found, falling back to default project", project_id);
-
-                // Update the default table before returning
-                Self::update_table(table, "default project")
-                    .await
-                    .map_err(|e| DataFusionError::Execution(format!("Failed to update default table: {}", e)))?;
-
-                // Use Arc::clone instead of table.clone() to avoid deep copying
-                return Ok(Arc::clone(table));
-            }
-        }
-
-        // If we get here, neither the requested project nor default exists
-        Err(DataFusionError::Execution(format!(
-            "Unknown project_id: {} and no default project found",
-            project_id
-        )))
+        Ok(Arc::clone(table))
     }
 
-    pub async fn insert_records_batch(&self, _table: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
-        // Check if we should use the batch queue based on:
-        // 1. skip_queue parameter (if true, always skip)
-        // 2. ENABLE_BATCH_QUEUE env var (if set to "true", allow queue usage)
-        // 3. batch_queue existence
+    pub async fn insert_records_batch(&self, project_id: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
         let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
 
         if !skip_queue && enable_queue && self.batch_queue.is_some() {
             let queue = self.batch_queue.as_ref().unwrap();
-            // Add to batch queue
             for batch in batches {
                 if let Err(e) = queue.queue(batch) {
                     return Err(anyhow::anyhow!("Queue error: {}", e));
@@ -376,29 +370,31 @@ impl Database {
             return Ok(());
         }
 
-        // Direct insert logic if skip_queue=true, queue disabled, no batch queue, or when processing from batch queue
-        let (_conn_str, _options, table_ref) = {
-            let configs = self.project_configs.read().await;
-            configs.get("default").ok_or_else(|| anyhow::anyhow!("Project ID '{}' not found", "default"))?.clone()
+        // Extract project_id from first batch if not provided
+        let project_id = if project_id.is_empty() && !batches.is_empty() {
+            extract_project_id_from_batch(&batches[0]).unwrap_or_else(|| "default".to_string())
+        } else if project_id.is_empty() {
+            "default".to_string()
+        } else {
+            project_id.to_string()
         };
 
-        // Create writer properties with standardized configuration
-        let writer_properties = Self::create_writer_properties();
+        let table_ref = {
+            let configs = self.project_configs.read().await;
+            configs.get(&project_id)
+                .or_else(|| configs.get("default"))
+                .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", project_id))?
+                .clone()
+        };
 
-        // Scope the write lock to minimize lock time
+        let writer_properties = Self::create_writer_properties();
         {
             let mut table = table_ref.write().await;
-
-            // Create the DeltaOps with a clone of the table
             let write_op = DeltaOps(table.clone())
                 .write(batches)
-                .with_partition_columns(OtelLogsAndSpans::partitions())
+                .with_partition_columns(get_default_schema().partitions.clone())
                 .with_writer_properties(writer_properties);
-
-            let new_table = write_op.await?;
-            *table = new_table;
-
-            // Note: Checkpointing, optimization, and vacuum are now managed by scheduled jobs
+            *table = write_op.await?;
         }
 
         Ok(())
@@ -430,7 +426,7 @@ impl Database {
         // Note: Z-order functionality is achieved through sorting_columns in writer_properties
         let optimize_result = DeltaOps(table_clone)
             .optimize()
-            .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(OtelLogsAndSpans::z_order_columns()))
+            .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(get_default_schema().z_order_columns.clone()))
             .with_target_size(target_size)
             .with_writer_properties(writer_properties)
             .await;
@@ -519,7 +515,7 @@ impl Database {
     }
 
     pub async fn register_project(
-        &self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
+        &self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>, table_name: Option<&str>,
     ) -> Result<()> {
         let mut storage_options = HashMap::new();
 
@@ -539,46 +535,38 @@ impl Database {
 
         let table = match DeltaTableBuilder::from_uri(conn_str).with_storage_options(storage_options.clone()).with_allow_http(true).load().await {
             Ok(table) => {
-                // Check if table needs checkpointing - use same threshold as in insert_records_batch
                 let version = table.version().unwrap_or(0);
-                // Only checkpoint if it's a multiple of our checkpoint interval to be consistent
                 let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
                     .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
                     .parse::<i64>()
                     .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
 
-                if version > 0 && (version as i64) % checkpoint_interval == 0 {
+                if version > 0 && version % checkpoint_interval == 0 {
                     info!("Checkpointing table for project '{}' at initial load, version {}", project_id, version);
                     checkpoints::create_checkpoint(&table, None).await?;
                 }
                 table
             }
             Err(err) => {
-                log::warn!("table doesn't exist. creating new table. err: {:?}", err);
+                log::warn!("Table doesn't exist for project '{}'. Creating new table. err: {:?}", project_id, err);
 
-                // Create the table with project_id partitioning only for now
-                // Timestamp partitioning is likely causing issues with nanosecond precision
+                let schema = table_name.and_then(get_schema).unwrap_or_else(get_default_schema);
                 let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
                 let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
-                // Create table with compression and auto-optimization
-                // Note: z-ordering will be applied during optimize operations
-                // Use writer version 7 to support advanced features
                 delta_ops
                     .create()
-                    .with_columns(OtelLogsAndSpans::columns().unwrap_or_default())
-                    .with_partition_columns(OtelLogsAndSpans::partitions())
+                    .with_columns(schema.columns().unwrap_or_default())
+                    .with_partition_columns(schema.partitions.clone())
                     .with_storage_options(storage_options.clone())
                     .with_commit_properties(commit_properties)
-                    // Temporarily disable writer version 7 until we fix the timestamp issue
-                    // .with_configuration_property(deltalake::TableProperty::MinWriterVersion, Some("7"))
-                    // .with_configuration_property(deltalake::TableProperty::MinReaderVersion, Some("3"))
                     .await?
             }
         };
 
         let mut configs = self.project_configs.write().await;
-        configs.insert(project_id.to_string(), (conn_str.to_string(), storage_options, Arc::new(RwLock::new(table))));
+        configs.insert(project_id.to_string(), Arc::new(RwLock::new(table)));
+        info!("Registered project '{}' with table at: {}", project_id, conn_str);
         Ok(())
     }
 }
@@ -589,20 +577,21 @@ pub struct ProjectRoutingTable {
     database: Arc<Database>,
     schema: SchemaRef,
     _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    _table_name: String,
 }
 
 impl ProjectRoutingTable {
-    pub fn new(default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>) -> Self {
+    pub fn new(default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>, table_name: String) -> Self {
         Self {
             default_project,
             database,
             schema,
             _batch_queue: batch_queue,
+            _table_name: table_name,
         }
     }
 
     fn extract_project_id_from_filters(&self, filters: &[Expr]) -> Option<String> {
-        // Look for expressions like "project_id = 'some_value'"
         for filter in filters {
             if let Some(project_id) = self.extract_project_id(filter) {
                 return Some(project_id);
@@ -612,48 +601,25 @@ impl ProjectRoutingTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        OtelLogsAndSpans::schema_ref()
+        self.schema.clone()
     }
 
     #[allow(clippy::only_used_in_recursion)]
     fn extract_project_id(&self, expr: &Expr) -> Option<String> {
         match expr {
-            // Binary expression: "project_id = 'value'"
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                // Check if this is an equality operation
-                if *op == Operator::Eq {
-                    // Check if left side is a column reference to "project_id"
-                    if let Expr::Column(col) = left.as_ref() {
-                        if col.name == "project_id" {
-                            // Check if right side is a literal string
-                            if let Expr::Literal(ScalarValue::Utf8(Some(value)), None) = right.as_ref() {
-                                return Some(value.clone());
-                            }
-                        }
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
+                if let (Expr::Column(col), Expr::Literal(ScalarValue::Utf8(Some(value)), None)) = (left.as_ref(), right.as_ref()) {
+                    if col.name == "project_id" {
+                        return Some(value.clone());
                     }
-
-                    // Also check if right side is the column (order might be flipped)
-                    if let Expr::Column(col) = right.as_ref() {
-                        if col.name == "project_id" {
-                            // Check if left side is a literal string
-                            if let Expr::Literal(ScalarValue::Utf8(Some(value)), None) = left.as_ref() {
-                                return Some(value.clone());
-                            }
-                        }
+                }
+                if let (Expr::Literal(ScalarValue::Utf8(Some(value)), None), Expr::Column(col)) = (left.as_ref(), right.as_ref()) {
+                    if col.name == "project_id" {
+                        return Some(value.clone());
                     }
                 }
                 None
             }
-            // // Recursive: AND, OR expressions
-            // Expr::BooleanQuery { operands, .. } => {
-            //     for operand in operands {
-            //         if let Some(project_id) = self.extract_project_id(operand) {
-            //             return Some(project_id);
-            //         }
-            //     }
-            //     None
-            // }
-            // Look inside NOT expressions
             Expr::Not(inner) => self.extract_project_id(inner),
             _ => None,
         }
@@ -682,24 +648,26 @@ impl DataSink for ProjectRoutingTable {
 
     async fn write_all(&self, mut data: SendableRecordBatchStream, _context: &Arc<TaskContext>) -> DFResult<u64> {
         let mut row_count = 0;
-        let mut batches = Vec::new();
+        let mut project_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
 
-        // Collect all batches from the stream
+        // Collect and group batches by project_id
         while let Some(batch) = data.next().await.transpose()? {
             row_count += batch.num_rows();
-            batches.push(batch);
+            let project_id = extract_project_id_from_batch(&batch).unwrap_or_else(|| self.default_project.clone());
+            project_batches.entry(project_id).or_default().push(batch);
         }
 
-        if batches.is_empty() {
+        if project_batches.is_empty() {
             return Ok(0);
         }
 
-        // Let the database handle the queue decision with skip_queue=false
-        // This means it will use the queue if it's available and not disabled via env var
-        self.database
-            .insert_records_batch("", batches, false)
-            .await
-            .map_err(|e| DataFusionError::Execution(format!("Insert error: {}", e)))?;
+        // Insert batches for each project
+        for (project_id, batches) in project_batches {
+            self.database
+                .insert_records_batch(&project_id, batches, false)
+                .await
+                .map_err(|e| DataFusionError::Execution(format!("Insert error for project {}: {}", project_id, e)))?;
+        }
 
         Ok(row_count as u64)
     }
@@ -778,7 +746,8 @@ mod tests {
         dotenv().ok();
 
         // Set a unique test-specific prefix for a clean Delta table
-        let test_prefix = format!("test-data-{}", prefix);
+        // Add timestamp to ensure uniqueness even when tests run in parallel
+        let test_prefix = format!("test-data-{}-{}", prefix, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
         unsafe {
             env::set_var("AWS_S3_BUCKET", "timefusion-tests");
             env::set_var("TIMEFUSION_TABLE_PREFIX", &test_prefix);
@@ -787,15 +756,17 @@ mod tests {
         let db = Database::new().await?;
         let mut session_context = SessionContext::new();
         datafusion_functions_json::register_all(&mut session_context)?;
-        let schema = OtelLogsAndSpans::schema_ref();
+        let schema = get_default_schema().schema_ref();
 
         let routing_table = ProjectRoutingTable::new(
             "default".to_string(),
             Arc::new(db.clone()),
             schema,
             None, // No batch queue in tests
+            get_default_schema().table_name.clone(),
         );
-        session_context.register_table(OtelLogsAndSpans::table_name(), Arc::new(routing_table))?;
+        let default_schema = get_default_schema();
+        session_context.register_table(&default_schema.table_name, Arc::new(routing_table))?;
 
         Ok((db, session_context, test_prefix))
     }
