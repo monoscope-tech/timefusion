@@ -111,6 +111,8 @@ macro_rules! include_schemas {
     () => {{
         vec![
             ("otel_logs_and_spans", include_str!("../schemas/otel_logs_and_spans.yaml")),
+            ("metrics", include_str!("../schemas/metrics.yaml")),
+            ("events", include_str!("../schemas/events.yaml")),
             // Add more schemas here as they are added to the schemas directory
         ]
     }};

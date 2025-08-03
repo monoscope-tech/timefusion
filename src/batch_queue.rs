@@ -107,7 +107,9 @@ async fn process_batches(db: &Arc<crate::database::Database>, queue: &Arc<SegQue
         let batch_count = batches.len();
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
         
-        match db.insert_records_batch(&project_id, batches, true).await {
+        // For batch queue, default to otel_logs_and_spans table
+        // TODO: Consider adding table_name extraction from batch metadata
+        match db.insert_records_batch(&project_id, "otel_logs_and_spans", batches, true).await {
             Ok(_) => {
                 let elapsed = start.elapsed();
                 info!(
