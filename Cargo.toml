@@ -7,6 +7,7 @@ edition = "2024"
 tokio = { version = "1.43", features = ["full"] }
 datafusion = "48.0.1"
 arrow = "55.0.0"
+arrow-json = "55.0.0"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_arrow = { version = "0.13.4", features = ["arrow-55"] }

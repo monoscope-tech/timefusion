@@ -768,7 +768,7 @@ mod tests {
     use serial_test::serial;
     use uuid::Uuid;
     use serde_json::json;
-    use crate::test_helpers::test_helpers::*;
+    use crate::batch_queue::tests::json_to_batch;
 
     use super::*;
 

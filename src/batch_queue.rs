@@ -104,14 +104,50 @@ async fn process_batches(db: &Arc<crate::database::Database>, queue: &Arc<SegQue
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::test_helpers::test_helpers::*;
+    use crate::persistent_queue::get_otel_schema;
     use chrono::Utc;
     use std::sync::Arc;
     use tokio::time::sleep;
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use arrow_json::ReaderBuilder;
+    use datafusion::arrow::record_batch::RecordBatch;
+
+    pub fn json_to_batch(records: Vec<Value>) -> anyhow::Result<RecordBatch> {
+        if records.is_empty() {
+            return Err(anyhow::anyhow!("Cannot create batch from empty records"));
+        }
+        
+        let schema = get_otel_schema().schema_ref();
+        let json_data = records.into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        
+        let mut reader = ReaderBuilder::new(schema.clone())
+            .build(std::io::Cursor::new(json_data.as_bytes()))?;
+        
+        reader.next()
+            .ok_or_else(|| anyhow::anyhow!("Failed to read batch"))?
+            .map_err(Into::into)
+    }
+
+    pub fn create_default_record() -> HashMap<String, Value> {
+        get_otel_schema().fields
+            .iter()
+            .map(|field| {
+                let value = if field.data_type == "List(Utf8)" {
+                    json!([])
+                } else {
+                    Value::Null
+                };
+                (field.name.clone(), value)
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_batch_queue() -> Result<()> {
