@@ -107,10 +107,11 @@ async fn process_batches(db: &Arc<crate::database::Database>, queue: &Arc<SegQue
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::persistent_queue::OtelLogsAndSpans;
+    use crate::test_helpers::test_helpers::*;
     use chrono::Utc;
     use std::sync::Arc;
     use tokio::time::sleep;
+    use serde_json::json;
 
     #[tokio::test]
     async fn test_batch_queue() -> Result<()> {
@@ -126,21 +127,22 @@ mod tests {
         // Create batch queue with short interval for testing
         let batch_queue = BatchQueue::new(Arc::clone(&db), 100, 10);
 
-        // Create test records and convert to RecordBatch
+        // Create test records using JSON
         let now = Utc::now();
-        let records = (0..5)
-            .map(|i| OtelLogsAndSpans {
-                project_id: "default".to_string(),
-                timestamp: now,
-                id: format!("test-{}", i),
-                hashes: vec![],
-                date: now.date_naive(),
-                ..Default::default()
+        let records: Vec<serde_json::Value> = (0..5)
+            .map(|i| {
+                // Start with a default record and set only needed fields
+                let mut record = create_default_record();
+                record.insert("timestamp".to_string(), json!(now.timestamp_micros()));
+                record.insert("id".to_string(), json!(format!("test-{}", i)));
+                record.insert("project_id".to_string(), json!("default"));
+                record.insert("date".to_string(), json!(now.date_naive().to_string()));
+                record.insert("hashes".to_string(), json!([]));
+                serde_json::Value::Object(record.into_iter().collect())
             })
-            .collect::<Vec<_>>();
+            .collect();
 
-        let fields = OtelLogsAndSpans::fields()?;
-        let batch = serde_arrow::to_record_batch(&fields, &records)?;
+        let batch = json_to_batch(records)?;
 
         // Queue and process the batch
         batch_queue.queue(batch)?;
