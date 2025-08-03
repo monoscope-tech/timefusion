@@ -8,11 +8,11 @@ SELECT TIMESTAMP '2023-01-01T10:00:00Z' as test_timestamp;
 # Insert test span data
 statement ok
 INSERT INTO otel_logs_and_spans (
-    project_id, timestamp, id,
+    project_id, timestamp, id, hashes, date,
     parent_id, name, kind,
     status_code, status_message, level
 ) VALUES (
-    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1',
+    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
     NULL, 'sql_test_span', NULL,
     'OK', 'span inserted successfully', 'INFO'
 )
@@ -26,19 +26,19 @@ sql_span1 sql_test_span
 # Insert a few more records with batch_spans
 statement ok
 INSERT INTO otel_logs_and_spans (
-    project_id, timestamp, id,
+    project_id, timestamp, id, hashes, date,
     name, status_code, status_message, level
 ) VALUES (
-    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span1',
+    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
     'batch_test_1', 'OK', 'batch test 1', 'INFO'
 )
 
 statement ok
 INSERT INTO otel_logs_and_spans (
-    project_id, timestamp, id,
+    project_id, timestamp, id, hashes, date,
     name, status_code, status_message, level
 ) VALUES (
-    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span2',
+    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
     'batch_test_2', 'OK', 'batch test 2', 'INFO'
 )
 
