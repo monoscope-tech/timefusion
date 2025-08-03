@@ -1,0 +1,80 @@
+table_name: events
+partitions:
+  - date
+sorting_columns:
+  - name: timestamp
+    descending: true
+    nulls_first: false
+  - name: event_id
+    descending: false
+    nulls_first: false
+z_order_columns:
+  - timestamp
+  - event_type
+fields:
+  - name: timestamp
+    data_type: "Timestamp(Microsecond, Some(\"UTC\"))"
+    nullable: false
+  - name: event_id
+    data_type: Utf8
+    nullable: false
+  - name: event_type
+    data_type: Utf8
+    nullable: false
+  - name: event_name
+    data_type: Utf8
+    nullable: false
+  - name: severity
+    data_type: Utf8
+    nullable: true
+  - name: message
+    data_type: Utf8
+    nullable: true
+  - name: source
+    data_type: Utf8
+    nullable: true
+  - name: user_id
+    data_type: Utf8
+    nullable: true
+  - name: session_id
+    data_type: Utf8
+    nullable: true
+  - name: trace_id
+    data_type: Utf8
+    nullable: true
+  - name: span_id
+    data_type: Utf8
+    nullable: true
+  - name: attributes
+    data_type: Utf8
+    nullable: true
+  - name: attributes___action
+    data_type: Utf8
+    nullable: true
+  - name: attributes___category
+    data_type: Utf8
+    nullable: true
+  - name: attributes___outcome
+    data_type: Utf8
+    nullable: true
+  - name: attributes___duration_ms
+    data_type: Int64
+    nullable: true
+  - name: resource
+    data_type: Utf8
+    nullable: true
+  - name: resource___service___name
+    data_type: Utf8
+    nullable: true
+  - name: resource___service___version
+    data_type: Utf8
+    nullable: true
+  - name: resource___service___instance___id
+    data_type: Utf8
+    nullable: true
+  - name: project_id
+    data_type: Utf8
+    nullable: false
+  - name: date
+    data_type: Date32
+    nullable: false

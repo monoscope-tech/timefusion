@@ -1112,11 +1112,24 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn test_table_isolation() -> Result<()> {
-        let db = Database::new().await?;
+        let _ = env_logger::builder().is_test(true).try_init();
+        dotenv().ok();
+        
+        // Set test environment
         let prefix = Uuid::new_v4().to_string();
+        unsafe {
+            env::set_var("AWS_S3_BUCKET", "timefusion-tests");
+            env::set_var("TIMEFUSION_TABLE_PREFIX", &prefix);
+        }
+        
+        let db = Database::new().await?;
+        
+        // Get the bucket from environment for consistency
+        let bucket = env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "timefusion-tests".to_string());
+        let endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
         
         // Register project and insert data
-        let uri = format!("s3://timefusion-tests/{}/projects/myproject/otel_logs_and_spans/", prefix);
+        let uri = format!("s3://{}/{}/projects/myproject/otel_logs_and_spans/?endpoint={}", bucket, prefix, endpoint);
         db.register_project("myproject", "otel_logs_and_spans", &uri, None, None, None).await?;
         
         let batch = json_to_batch(vec![test_span("test_span", "isolated_span", "myproject")])?;
