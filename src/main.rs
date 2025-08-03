@@ -1,7 +1,7 @@
 // main.rs
 use timefusion::batch_queue::{BatchQueue};
 use timefusion::database::{Database};
-use actix_web::{middleware::Logger, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{middleware::Logger, get, post, web, App, HttpResponse, HttpServer, Responder};
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use futures::TryFutureExt;
@@ -25,26 +25,42 @@ struct RegisterProjectRequest {
     table_name: Option<String>,
 }
 
+#[get("/list_tables")]
+async fn list_tables(db: web::Data<Arc<Database>>) -> impl Responder {
+    let tables = db.list_registered_tables().await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "tables": tables.into_iter().map(|(project_id, table_name)| {
+            serde_json::json!({
+                "project_id": project_id,
+                "table_name": table_name
+            })
+        }).collect::<Vec<_>>()
+    }))
+}
+
 #[post("/register_project")]
 async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<Arc<Database>>) -> impl Responder {
+    // Use provided table_name or default to otel_logs_and_spans
+    let table_name = req.table_name.as_deref().unwrap_or("otel_logs_and_spans");
+    
     // Build the full S3 path for the project-specific table
     let prefix = std::env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
     let endpoint = req.endpoint.as_deref().unwrap_or("https://s3.amazonaws.com");
-    let storage_uri = format!("s3://{}/{}/projects/{}/?endpoint={}", req.bucket, prefix, req.project_id, endpoint);
+    let storage_uri = format!("s3://{}/{}/projects/{}/{}/?endpoint={}", req.bucket, prefix, req.project_id, table_name, endpoint);
     
     match db
         .register_project(
             &req.project_id,
+            table_name,
             &storage_uri,
             Some(&req.access_key),
             Some(&req.secret_key),
             Some(endpoint),
-            req.table_name.as_deref(),
         )
         .await
     {
         Ok(()) => HttpResponse::Ok().json(serde_json::json!({
-            "message": format!("Project '{}' registered successfully", req.project_id),
+            "message": format!("Project '{}' table '{}' registered successfully", req.project_id, table_name),
             "table_path": storage_uri
         })),
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
@@ -118,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
             .app_data(web::Data::new(db.clone()))
             .app_data(app_info.clone())
             .service(register_project)
+            .service(list_tables)
     });
 
     let server = match http_server.bind(&http_addr) {

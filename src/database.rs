@@ -147,12 +147,12 @@ impl Database {
             maintenance_shutdown: Arc::new(CancellationToken::new()),
         };
 
-        // Register default project if AWS_S3_BUCKET is set
+        // Register default project with otel_logs_and_spans table if AWS_S3_BUCKET is set
         if let Ok(bucket) = env::var("AWS_S3_BUCKET") {
             let prefix = env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
-            let storage_uri = format!("s3://{}/{}/projects/default/?endpoint={}", bucket, prefix, aws_endpoint);
+            let storage_uri = format!("s3://{}/{}/projects/default/otel_logs_and_spans/?endpoint={}", bucket, prefix, aws_endpoint);
             info!("Default project storage URI: {}", storage_uri);
-            db.register_project("default", &storage_uri, None, None, None, None).await?;
+            db.register_project("default", "otel_logs_and_spans", &storage_uri, None, None, None).await?;
         }
 
         Ok(db)
@@ -178,9 +178,9 @@ impl Database {
                 let db = db.clone();
                 Box::pin(async move {
                     info!("Running scheduled optimize on all tables");
-                    for (project_id, table) in db.project_configs.read().await.iter() {
+                    for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
                         if let Err(e) = db.optimize_table(table).await {
-                            error!("Optimize failed for {}: {}", project_id, e);
+                            error!("Optimize failed for project '{}' table '{}': {}", project_id, table_name, e);
                         }
                     }
                 })
@@ -201,8 +201,8 @@ impl Database {
                         .parse::<u64>()
                         .unwrap_or(DEFAULT_VACUUM_RETENTION_HOURS);
 
-                    for (project_id, table) in db.project_configs.read().await.iter() {
-                        info!("Vacuuming {} (retention: {}h)", project_id, retention_hours);
+                    for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
+                        info!("Vacuuming project '{}' table '{}' (retention: {}h)", project_id, table_name, retention_hours);
                         db.vacuum_table(table, retention_hours).await;
                     }
                 })
@@ -236,17 +236,27 @@ impl Database {
 
     /// Setup the session context with tables and register DataFusion tables
     pub fn setup_session_context(&self, ctx: &SessionContext) -> DFResult<()> {
-        // Create tables and register them with session context
-        let schema = get_default_schema().schema_ref();
-
+        use crate::schema_loader::registry;
+        
         // Get batch queue from the app state if available
         let batch_queue = self.batch_queue.as_ref().map(Arc::clone);
 
-        let default_schema = get_default_schema();
-        let routing_table = ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema, batch_queue, default_schema.table_name.clone());
-
-        ctx.register_table(&default_schema.table_name, Arc::new(routing_table))?;
-        info!("Registered ProjectRoutingTable with SessionContext");
+        // Register a routing table for each schema in the registry
+        let registry = registry();
+        for table_name in registry.list_tables() {
+            if let Some(schema) = registry.get(&table_name) {
+                let routing_table = ProjectRoutingTable::new(
+                    "default".to_string(), 
+                    Arc::new(self.clone()), 
+                    schema.schema_ref(), 
+                    batch_queue.clone(), 
+                    table_name.clone()
+                );
+                
+                ctx.register_table(&table_name, Arc::new(routing_table))?;
+                info!("Registered ProjectRoutingTable for table '{}' with SessionContext", table_name);
+            }
+        }
 
         self.register_pg_settings_table(ctx)?;
         self.register_set_config_udf(ctx);
@@ -357,7 +367,7 @@ impl Database {
         Ok(Arc::clone(table))
     }
 
-    pub async fn insert_records_batch(&self, project_id: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
+    pub async fn insert_records_batch(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
         let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
 
         if !skip_queue && enable_queue && self.batch_queue.is_some() {
@@ -379,20 +389,30 @@ impl Database {
             project_id.to_string()
         };
 
+        // Use provided table_name or default to otel_logs_and_spans
+        let table_name = if table_name.is_empty() {
+            "otel_logs_and_spans".to_string()
+        } else {
+            table_name.to_string()
+        };
+
         let table_ref = {
             let configs = self.project_configs.read().await;
-            configs.get(&project_id)
-                .or_else(|| configs.get("default"))
-                .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", project_id))?
+            configs.get(&(project_id.clone(), table_name.clone()))
+                .or_else(|| configs.get(&("default".to_string(), table_name.clone())))
+                .ok_or_else(|| anyhow::anyhow!("Project '{}' table '{}' not found", project_id, table_name))?
                 .clone()
         };
 
+        // Get the appropriate schema for this table
+        let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
+        
         let writer_properties = Self::create_writer_properties();
         {
             let mut table = table_ref.write().await;
             let write_op = DeltaOps(table.clone())
                 .write(batches)
-                .with_partition_columns(get_default_schema().partitions.clone())
+                .with_partition_columns(schema.partitions.clone())
                 .with_writer_properties(writer_properties);
             *table = write_op.await?;
         }
@@ -515,7 +535,7 @@ impl Database {
     }
 
     pub async fn register_project(
-        &self, project_id: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>, table_name: Option<&str>,
+        &self, project_id: &str, table_name: &str, conn_str: &str, access_key: Option<&str>, secret_key: Option<&str>, endpoint: Option<&str>,
     ) -> Result<()> {
         let mut storage_options = HashMap::new();
 
@@ -550,7 +570,7 @@ impl Database {
             Err(err) => {
                 log::warn!("Table doesn't exist for project '{}'. Creating new table. err: {:?}", project_id, err);
 
-                let schema = table_name.and_then(get_schema).unwrap_or_else(get_default_schema);
+                let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
                 let delta_ops = DeltaOps::try_from_uri(&conn_str).await?;
                 let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
@@ -565,9 +585,15 @@ impl Database {
         };
 
         let mut configs = self.project_configs.write().await;
-        configs.insert(project_id.to_string(), Arc::new(RwLock::new(table)));
-        info!("Registered project '{}' with table at: {}", project_id, conn_str);
+        configs.insert((project_id.to_string(), table_name.to_string()), Arc::new(RwLock::new(table)));
+        info!("Registered project '{}' table '{}' at: {}", project_id, table_name, conn_str);
         Ok(())
+    }
+    
+    /// Get a list of all registered project-table combinations
+    pub async fn list_registered_tables(&self) -> Vec<(String, String)> {
+        let configs = self.project_configs.read().await;
+        configs.keys().cloned().collect()
     }
 }
 
@@ -577,7 +603,7 @@ pub struct ProjectRoutingTable {
     database: Arc<Database>,
     schema: SchemaRef,
     _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
-    _table_name: String,
+    table_name: String,
 }
 
 impl ProjectRoutingTable {
@@ -587,7 +613,7 @@ impl ProjectRoutingTable {
             database,
             schema,
             _batch_queue: batch_queue,
-            _table_name: table_name,
+            table_name,
         }
     }
 
@@ -664,9 +690,9 @@ impl DataSink for ProjectRoutingTable {
         // Insert batches for each project
         for (project_id, batches) in project_batches {
             self.database
-                .insert_records_batch(&project_id, batches, false)
+                .insert_records_batch(&project_id, &self.table_name, batches, false)
                 .await
-                .map_err(|e| DataFusionError::Execution(format!("Insert error for project {}: {}", project_id, e)))?;
+                .map_err(|e| DataFusionError::Execution(format!("Insert error for project {} table {}: {}", project_id, self.table_name, e)))?;
         }
 
         Ok(row_count as u64)
@@ -721,7 +747,7 @@ impl TableProvider for ProjectRoutingTable {
         // Get project_id from filters if possible, otherwise use default
         let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
 
-        let delta_table = self.database.resolve_table(&project_id).await?;
+        let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
         let table = delta_table.read().await;
         table.scan(state, projection, filters, limit).await
     }
@@ -833,7 +859,7 @@ mod tests {
 
         let batch = create_test_records()?;
         println!("Created test records, inserting...");
-        db.insert_records_batch("default", vec![batch], true).await?;
+        db.insert_records_batch("default", "otel_logs_and_spans", vec![batch], true).await?;
         println!("Records inserted successfully");
 
         // Test 1: Basic count query to verify record insertion
@@ -1018,6 +1044,104 @@ mod tests {
         Ok(())
     }
 
+    // Helper to create test span with minimal fields
+    fn test_span(id: &str, name: &str, project_id: &str) -> serde_json::Value {
+        json!({
+            "timestamp": Utc::now().timestamp_micros(),
+            "id": id,
+            "name": name,
+            "project_id": project_id,
+            "date": Utc::now().date_naive().to_string(),
+            "hashes": []
+        })
+    }
+    
+    // Helper to query and get first column as string
+    async fn query_first_string(ctx: &SessionContext, sql: &str) -> Result<Vec<String>> {
+        let df = ctx.sql(sql).await?;
+        let batches = df.collect().await?;
+        if batches.is_empty() || batches[0].num_rows() == 0 {
+            return Ok(vec![]);
+        }
+        let col = batches[0].column(0).as_string::<i32>();
+        Ok((0..col.len()).map(|i| col.value(i).to_string()).collect())
+    }
+    
+    // Helper to query and get count
+    async fn query_count(ctx: &SessionContext, sql: &str) -> Result<i64> {
+        let df = ctx.sql(sql).await?;
+        let batches = df.collect().await?;
+        Ok(batches[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn test_multi_table_support() -> Result<()> {
+        let prefix = Uuid::new_v4().to_string();
+        let db = Database::new().await?;
+        
+        // Register and insert data for multiple projects
+        for (i, project) in ["project1", "project2"].iter().enumerate() {
+            let uri = format!("s3://timefusion-tests/{}/projects/{}/otel_logs_and_spans/", prefix, project);
+            db.register_project(project, "otel_logs_and_spans", &uri, None, None, None).await?;
+            
+            let batch = json_to_batch(vec![test_span(
+                &format!("span_p{}", i+1),
+                &format!("{}_span", project),
+                project
+            )])?;
+            db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true).await?;
+        }
+        
+        let ctx = db.create_session_context();
+        db.setup_session_context(&ctx)?;
+        
+        // Verify each project sees only its data
+        assert_eq!(
+            query_first_string(&ctx, "SELECT name FROM otel_logs_and_spans WHERE project_id = 'project1'").await?,
+            vec!["project1_span"]
+        );
+        assert_eq!(
+            query_first_string(&ctx, "SELECT name FROM otel_logs_and_spans WHERE project_id = 'project2'").await?,
+            vec!["project2_span"]
+        );
+        
+        Ok(())
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn test_table_isolation() -> Result<()> {
+        let db = Database::new().await?;
+        let prefix = Uuid::new_v4().to_string();
+        
+        // Register project and insert data
+        let uri = format!("s3://timefusion-tests/{}/projects/myproject/otel_logs_and_spans/", prefix);
+        db.register_project("myproject", "otel_logs_and_spans", &uri, None, None, None).await?;
+        
+        let batch = json_to_batch(vec![test_span("test_span", "isolated_span", "myproject")])?;
+        db.insert_records_batch("myproject", "otel_logs_and_spans", vec![batch], true).await?;
+        
+        // Verify registration
+        let tables = db.list_registered_tables().await;
+        assert!(tables.contains(&("myproject".to_string(), "otel_logs_and_spans".to_string())));
+        
+        // Verify isolation
+        let ctx = db.create_session_context();
+        db.setup_session_context(&ctx)?;
+        
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'myproject'").await?,
+            1
+        );
+        assert_eq!(
+            query_count(&ctx, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'nonexistent'").await?,
+            0
+        );
+        
+        Ok(())
+    }
+
     #[serial]
     #[tokio::test]
     async fn test_datafusion48_assert_batches_eq_bug() -> Result<()> {
@@ -1028,7 +1152,7 @@ mod tests {
         let (db, ctx, _) = setup_test_database(Uuid::new_v4().to_string() + "bug").await?;
 
         let batch = create_test_records()?;
-        db.insert_records_batch("default", vec![batch], true).await?;
+        db.insert_records_batch("default", "otel_logs_and_spans", vec![batch], true).await?;
 
         // This query works fine
         let df = ctx.sql("SELECT COUNT(*) as count FROM otel_logs_and_spans").await?;
@@ -1083,7 +1207,7 @@ mod tests {
         });
         
         let batch = json_to_batch(vec![record])?;
-        db.insert_records_batch("default", vec![batch], true).await?;
+        db.insert_records_batch("default", "otel_logs_and_spans", vec![batch], true).await?;
 
         let verify_df = ctx.sql("SELECT id, name, timestamp from otel_logs_and_spans").await?.collect().await?;
         #[rustfmt::skip]
