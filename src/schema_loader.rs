@@ -1,11 +1,12 @@
-use std::sync::Arc;
-use std::collections::HashMap;
-use std::sync::OnceLock;
-use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
 use arrow::datatypes::DataType as ArrowDataType;
+use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
 use delta_kernel::parquet::format::SortingColumn;
-use deltalake::kernel::{StructField, DataType as DeltaDataType, PrimitiveType, ArrayType};
+use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
+use include_dir::{include_dir, Dir};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSchema {
@@ -101,17 +102,8 @@ fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
     })
 }
 
-// Include all schema YAML files at compile time
-macro_rules! include_schemas {
-    () => {{
-        vec![
-            ("otel_logs_and_spans", include_str!("../schemas/otel_logs_and_spans.yaml")),
-            ("metrics", include_str!("../schemas/metrics.yaml")),
-            ("events", include_str!("../schemas/events.yaml")),
-            // Add more schemas here as they are added to the schemas directory
-        ]
-    }};
-}
+// Include all YAML files from schemas directory at compile time
+static SCHEMAS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/schemas");
 
 pub struct SchemaRegistry {
     schemas: HashMap<String, TableSchema>,
@@ -120,32 +112,34 @@ pub struct SchemaRegistry {
 impl SchemaRegistry {
     fn new() -> Self {
         let mut schemas = HashMap::new();
-        
-        // Load all schemas at compile time
-        for (name, yaml_content) in include_schemas!() {
-            match serde_yaml::from_str::<TableSchema>(yaml_content) {
-                Ok(schema) => {
-                    schemas.insert(schema.table_name.clone(), schema);
-                }
-                Err(e) => {
-                    panic!("Failed to parse schema {}: {}", name, e);
+
+        // Load all YAML schemas from the directory
+        for file in SCHEMAS_DIR.files() {
+            if file.path().extension().and_then(|s| s.to_str()) == Some("yaml") {
+                let content = file.contents_utf8().expect("Schema file should be UTF-8");
+                match serde_yaml::from_str::<TableSchema>(content) {
+                    Ok(schema) => {
+                        schemas.insert(schema.table_name.clone(), schema);
+                    }
+                    Err(e) => {
+                        panic!("Failed to parse schema {:?}: {}", file.path(), e);
+                    }
                 }
             }
         }
-        
+
         Self { schemas }
     }
-    
+
     pub fn get(&self, table_name: &str) -> Option<&TableSchema> {
         self.schemas.get(table_name)
     }
-    
+
     pub fn get_default(&self) -> Option<&TableSchema> {
         // Return the first schema as default (for backward compatibility)
-        self.schemas.get("otel_logs_and_spans")
-            .or_else(|| self.schemas.values().next())
+        self.schemas.get("otel_logs_and_spans").or_else(|| self.schemas.values().next())
     }
-    
+
     pub fn list_tables(&self) -> Vec<String> {
         self.schemas.keys().cloned().collect()
     }
@@ -165,6 +159,6 @@ pub fn get_schema(table_name: &str) -> Option<&'static TableSchema> {
 
 // Get the default schema (for backward compatibility)
 pub fn get_default_schema() -> &'static TableSchema {
-    registry().get_default()
-        .expect("No schemas available in registry")
+    registry().get_default().expect("No schemas available in registry")
 }
+

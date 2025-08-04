@@ -123,7 +123,7 @@ query TI
 SELECT resource___service___name, COUNT(*) as span_count FROM otel_logs_and_spans 
 WHERE project_id = 'prod_monitoring' AND resource___service___name IS NOT NULL
 GROUP BY resource___service___name
-ORDER BY span_count DESC
+ORDER BY span_count DESC, resource___service___name
 ----
 user-service 4
 api-gateway 1
