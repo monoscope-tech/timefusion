@@ -1,5 +1,5 @@
-# Example SQLLogicTest for TimeFusion
-# This file contains SQL statements and expected results
+# Basic Operations SQLLogicTest for TimeFusion
+# Tests fundamental CRUD operations and basic queries
 
 # Create a test timestamp value
 statement ok
@@ -17,9 +17,9 @@ INSERT INTO otel_logs_and_spans (
     'OK', 'span inserted successfully', 'INFO'
 )
 
-# Query back the inserted data by ID without project_id
+# Query back the inserted data by ID (need project_id for partitioned table)
 query TT
-SELECT id, name FROM otel_logs_and_spans WHERE id = 'sql_span1'
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'sql_span1'
 ----
 sql_span1 sql_test_span
 
@@ -48,14 +48,14 @@ SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'
 ----
 3
 
-# Test filtering with LIKE
+# Test filtering with LIKE (need project_id for partitioned table)
 query I
-SELECT COUNT(*) FROM otel_logs_and_spans WHERE name LIKE 'batch%'
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name LIKE 'batch%'
 ----
 2
 
-# Test with aggregation on status_code
+# Test with aggregation on status_code (need project_id for partitioned table)
 query T rowsort
-SELECT status_code FROM otel_logs_and_spans WHERE id = 'sql_span1' GROUP BY status_code
+SELECT status_code FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'sql_span1' GROUP BY status_code
 ----
 OK

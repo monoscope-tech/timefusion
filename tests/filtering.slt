@@ -1,0 +1,187 @@
+# Filtering SQLLogicTest for TimeFusion
+# Tests various filtering conditions and WHERE clauses
+
+# Insert test data with different levels, durations, and status codes
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, status_message, duration
+) VALUES (
+    'filter_test', TIMESTAMP '2023-01-01T10:00:00Z', 'span_info_ok', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'info_operation', 'INFO', 'OK', 'Success', 100000000
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, status_message, duration
+) VALUES (
+    'filter_test', TIMESTAMP '2023-01-01T10:05:00Z', 'span_error', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'error_operation', 'ERROR', 'ERROR', 'Database connection failed', 200000000
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, status_message, duration
+) VALUES (
+    'filter_test', TIMESTAMP '2023-01-01T10:10:00Z', 'span_debug_ok', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'debug_operation', 'DEBUG', 'OK', 'Debug trace', 50000000
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, status_message, duration
+) VALUES (
+    'filter_test', TIMESTAMP '2023-01-01T10:15:00Z', 'span_warn', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'warning_operation', 'WARN', 'OK', 'Slow response', 300000000
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, status_message, duration
+) VALUES (
+    'filter_test', TIMESTAMP '2023-01-01T10:20:00Z', 'span_critical', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'critical_operation', 'ERROR', 'INTERNAL_ERROR', 'System failure', 500000000
+)
+
+# Test filtering by level
+query T rowsort
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'filter_test' AND level = 'ERROR'
+----
+span_critical
+span_error
+
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'filter_test' AND level = 'INFO'
+----
+span_info_ok
+
+# Test filtering by status_code
+query T rowsort
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'filter_test' AND status_code = 'OK'
+----
+span_debug_ok
+span_info_ok
+span_warn
+
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'filter_test' AND status_code = 'ERROR'
+----
+span_error
+
+# Test filtering by duration (greater than)
+query T rowsort
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'filter_test' AND duration > 150000000
+----
+span_critical
+span_error
+span_warn
+
+# Test filtering by duration (less than)
+query T rowsort
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'filter_test' AND duration < 100000000
+----
+span_debug_ok
+
+# Test filtering by duration range
+query T rowsort
+SELECT id FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND duration >= 100000000 
+AND duration <= 300000000
+----
+span_error
+span_info_ok
+span_warn
+
+# Test compound filtering (level AND status_code)
+query TT
+SELECT id, status_message FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND level = 'ERROR' 
+AND status_code = 'ERROR'
+----
+span_error Database connection failed
+
+# Test LIKE pattern matching on name
+query T rowsort
+SELECT id FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND name LIKE '%operation'
+----
+span_critical
+span_debug_ok
+span_error
+span_info_ok
+span_warn
+
+query T
+SELECT id FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND name LIKE 'error%'
+----
+span_error
+
+# Test NOT EQUAL filtering
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND level != 'DEBUG'
+----
+4
+
+# Test IN clause
+query T rowsort
+SELECT id FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND level IN ('ERROR', 'WARN')
+----
+span_critical
+span_error
+span_warn
+
+# Test NOT IN clause
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND level NOT IN ('DEBUG', 'INFO')
+----
+3
+
+# Test OR conditions
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND (level = 'ERROR' OR duration > 400000000)
+----
+2
+
+# Test complex compound conditions
+query T rowsort
+SELECT id FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND ((level = 'ERROR' AND status_code = 'ERROR') 
+     OR (level = 'WARN' AND duration > 250000000))
+----
+span_error
+span_warn
+
+# Test IS NOT NULL on status_message
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND status_message IS NOT NULL
+----
+5
+
+# Test filtering with timestamp ranges
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'filter_test' 
+AND timestamp >= TIMESTAMP '2023-01-01T10:00:00Z'
+AND timestamp <= TIMESTAMP '2023-01-01T10:15:00Z'
+----
+4

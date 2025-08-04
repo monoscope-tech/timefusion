@@ -1,0 +1,29 @@
+# Debug test to understand table behavior
+
+# Insert a simple record
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'debug_project', TIMESTAMP '2023-01-01T10:00:00Z', 'debug_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'debug_span', 'OK', 'INFO'
+)
+
+# Try to query without WHERE clause first (need project_id for partitioned table)
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'debug_project' LIMIT 5
+----
+debug_span1
+
+# Try with project_id filter
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'debug_project'
+----
+debug_span1
+
+# Try with id filter (need project_id for partitioned table)
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'debug_project' AND id = 'debug_span1'
+----
+debug_span1
