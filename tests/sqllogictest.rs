@@ -10,11 +10,42 @@ mod sqllogictest_tests {
         path::Path,
         sync::Arc,
         time::{Duration, Instant},
+        fmt,
     };
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{NoTls, Row};
     use uuid::Uuid;
+
+    // Custom error type that wraps both anyhow and tokio_postgres errors
+    #[derive(Debug)]
+    enum TestError {
+        Postgres(tokio_postgres::Error),
+        Other(String),
+    }
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                TestError::Postgres(e) => write!(f, "Postgres error: {}", e),
+                TestError::Other(s) => write!(f, "Error: {}", s),
+            }
+        }
+    }
+
+    impl std::error::Error for TestError {}
+
+    impl From<tokio_postgres::Error> for TestError {
+        fn from(e: tokio_postgres::Error) -> Self {
+            TestError::Postgres(e)
+        }
+    }
+
+    impl From<anyhow::Error> for TestError {
+        fn from(e: anyhow::Error) -> Self {
+            TestError::Other(e.to_string())
+        }
+    }
 
     struct TestDB {
         client: tokio_postgres::Client,
@@ -22,19 +53,22 @@ mod sqllogictest_tests {
 
     #[async_trait]
     impl AsyncDB for TestDB {
-        type Error = tokio_postgres::Error;
+        type Error = TestError;
         type ColumnType = DefaultColumnType;
 
         async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
             let sql = sql.trim();
+            println!("Executing SQL: {}", sql);
             let is_query = sql.to_lowercase().starts_with("select");
 
             if !is_query {
                 let affected = self.client.execute(sql, &[]).await?;
+                println!("Statement executed, {} rows affected", affected);
                 return Ok(DBOutput::StatementComplete(affected as u64));
             }
 
             let rows = self.client.query(sql, &[]).await?;
+            println!("Query returned {} rows", rows.len());
             if rows.is_empty() {
                 return Ok(DBOutput::Rows { types: vec![], rows: vec![] });
             }
@@ -173,25 +207,68 @@ mod sqllogictest_tests {
         Ok(shutdown_signal)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn run_sqllogictest() -> Result<()> {
+        // Wrap the entire test in a timeout
+        tokio::time::timeout(Duration::from_secs(120), async {
         let shutdown_signal = start_test_server().await?;
 
-        let factory = || async move {
+        let _factory = || async move {
             let (client, _) = connect_with_retry(Duration::from_secs(3)).await?;
-            Ok(TestDB { client })
+            Ok::<TestDB, TestError>(TestDB { client })
         };
 
-        let test_file = Path::new("tests/example.slt");
-        let result = sqllogictest::Runner::new(factory).run_file_async(test_file).await;
+        // Run all .slt test files
+        let test_files = vec![
+            "tests/simple_test.slt",
+            "tests/debug_test.slt",
+            "tests/basic_operations.slt",
+            "tests/multi_project.slt",
+            "tests/filtering.slt",  // Re-enable filtering test with timeout
+            "tests/aggregations.slt",
+            "tests/error_handling.slt",
+            "tests/end_to_end.slt",
+        ];
+
+        let mut all_passed = true;
+        for test_file in test_files {
+            let test_path = Path::new(test_file);
+            println!("Running SQLLogicTest: {}", test_file);
+            
+            let factory_clone = || async move {
+                let (client, _) = connect_with_retry(Duration::from_secs(3)).await?;
+                Ok::<TestDB, TestError>(TestDB { client })
+            };
+            
+            // Add timeout for individual test files (30 seconds each)
+            let test_result = tokio::time::timeout(
+                Duration::from_secs(30),
+                sqllogictest::Runner::new(factory_clone).run_file_async(test_path)
+            ).await;
+            
+            match test_result {
+                Ok(Ok(_)) => println!("✓ {} passed", test_file),
+                Ok(Err(e)) => {
+                    eprintln!("✗ {} failed: {:?}", test_file, e);
+                    all_passed = false;
+                }
+                Err(_) => {
+                    eprintln!("✗ {} timed out after 30 seconds", test_file);
+                    all_passed = false;
+                }
+            }
+        }
 
         // Always shut down the server
         shutdown_signal.notify_one();
 
-        match result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(anyhow::anyhow!("SQLLogicTest failed: {:?}", e)),
+        if all_passed {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("Some SQLLogicTests failed"))
         }
+        }).await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 120 seconds"))?
     }
 }

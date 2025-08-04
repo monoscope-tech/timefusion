@@ -1,0 +1,136 @@
+# Multi-Project SQLLogicTest for TimeFusion
+# Tests project isolation and multi-project operations
+
+# Insert data for project1
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project1', TIMESTAMP '2023-01-01T10:00:00Z', 'p1_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'project1_span', 'OK', 'INFO'
+)
+
+# Insert data for project2
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project2', TIMESTAMP '2023-01-01T10:00:00Z', 'p2_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'project2_span', 'OK', 'INFO'
+)
+
+# Insert data for project3
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project3', TIMESTAMP '2023-01-01T10:00:00Z', 'p3_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'project3_span', 'ERROR', 'ERROR'
+)
+
+# Query project1 data - should only see project1 records
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+p1_span1 project1_span
+
+# Query project2 data - should only see project2 records
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project2'
+----
+p2_span1 project2_span
+
+# Query project3 data - should only see project3 records
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project3'
+----
+p3_span1 project3_span
+
+# Count records per project
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+1
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project2'
+----
+1
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project3'
+----
+1
+
+# Test cross-project queries - need to query each project separately due to partitioning
+# Project1 count
+query TI
+SELECT 'project1' as project_id, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+project1 1
+
+# Project2 count  
+query TI
+SELECT 'project2' as project_id, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project2'
+----
+project2 1
+
+# Project3 count
+query TI
+SELECT 'project3' as project_id, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project3'
+----
+project3 1
+
+# Insert multiple records for a single project
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project1', TIMESTAMP '2023-01-01T11:00:00Z', 'p1_span2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'project1_span2', 'OK', 'DEBUG'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project1', TIMESTAMP '2023-01-01T12:00:00Z', 'p1_span3', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'project1_span3', 'ERROR', 'ERROR'
+)
+
+# Count after additional inserts
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+3
+
+# Test filtering with multiple projects - need to query each separately
+# Count ERROR level in project1
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1' AND level = 'ERROR'
+----
+1
+
+# Count ERROR level in project3
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project3' AND level = 'ERROR'
+----
+1
+
+# Test project isolation - no data should leak between projects
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'project1' AND name LIKE 'project2%'
+----
+0
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'project2' AND name LIKE 'project1%'
+----
+0

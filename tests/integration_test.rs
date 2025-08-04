@@ -127,13 +127,13 @@ mod integration {
                 )
                 .await?;
 
-            // Verify record count
-            let rows = client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE id = $1", &[&test_id]).await?;
+            // Verify record count - need to include project_id for partitioned table
+            let rows = client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &test_id]).await?;
 
             assert_eq!(rows[0].get::<_, i64>(0), 1, "Should have found exactly one row");
 
-            // Verify field values
-            let detail_rows = client.query("SELECT name, status_code FROM otel_logs_and_spans WHERE id = $1", &[&test_id]).await?;
+            // Verify field values - need to include project_id for partitioned table
+            let detail_rows = client.query("SELECT name, status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &test_id]).await?;
 
             assert_eq!(detail_rows.len(), 1, "Should have found exactly one detailed row");
             assert_eq!(detail_rows[0].get::<_, String>(0), "test_span_name", "Name should match");
@@ -288,9 +288,9 @@ mod integration {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to PostgreSQL: {}", e))?;
 
-        // Get total count of inserted records
+        // Get total count of inserted records - need project_id for partitioned table
         let count_rows = client
-            .query(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE id LIKE '{test_id}%'"), &[])
+            .query(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{test_id}%'"), &[])
             .await
             .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
 
@@ -300,9 +300,9 @@ mod integration {
         println!("Total records found: {} (expected {})", count, expected_count);
         assert_eq!(count, expected_count, "Should have inserted the expected number of records");
 
-        // Get and verify inserted IDs
+        // Get and verify inserted IDs - need project_id for partitioned table
         let id_rows = client
-            .query(&format!("SELECT id FROM otel_logs_and_spans WHERE id LIKE '{test_id}%'"), &[])
+            .query(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{test_id}%'"), &[])
             .await
             .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
 

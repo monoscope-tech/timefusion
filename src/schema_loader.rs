@@ -73,37 +73,32 @@ impl TableSchema {
     }
 }
 
-fn parse_arrow_data_type(type_str: &str) -> anyhow::Result<ArrowDataType> {
-    match type_str {
-        "Utf8" => Ok(ArrowDataType::Utf8),
-        "Date32" => Ok(ArrowDataType::Date32),
-        "Int32" => Ok(ArrowDataType::Int32),
-        "Int64" => Ok(ArrowDataType::Int64),
-        "UInt32" => Ok(ArrowDataType::UInt32),
-        "UInt64" => Ok(ArrowDataType::UInt64),
-        "List(Utf8)" => Ok(ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8, true)))),
-        "Timestamp(Microsecond, None)" => Ok(ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)),
-        "Timestamp(Microsecond, Some(\"UTC\"))" => Ok(ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()))),
-        _ => Err(anyhow::anyhow!("Unknown data type: {}", type_str)),
-    }
+fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
+    Ok(match s {
+        "Utf8" => ArrowDataType::Utf8,
+        "Date32" => ArrowDataType::Date32,
+        "Int32" => ArrowDataType::Int32,
+        "Int64" => ArrowDataType::Int64,
+        "UInt32" => ArrowDataType::UInt32,
+        "UInt64" => ArrowDataType::UInt64,
+        "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8, true))),
+        "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        _ => anyhow::bail!("Unknown type: {}", s),
+    })
 }
 
-fn parse_delta_data_type(type_str: &str) -> anyhow::Result<DeltaDataType> {
-    match type_str {
-        "Utf8" => Ok(DeltaDataType::Primitive(PrimitiveType::String)),
-        "Date32" => Ok(DeltaDataType::Primitive(PrimitiveType::Date)),
-        "Int32" => Ok(DeltaDataType::Primitive(PrimitiveType::Integer)),
-        "Int64" => Ok(DeltaDataType::Primitive(PrimitiveType::Long)),
-        "UInt32" => Ok(DeltaDataType::Primitive(PrimitiveType::Integer)),
-        "UInt64" => Ok(DeltaDataType::Primitive(PrimitiveType::Long)),
-        "List(Utf8)" => Ok(DeltaDataType::Array(Box::new(ArrayType::new(
-            DeltaDataType::Primitive(PrimitiveType::String),
-            true,
-        )))),
-        "Timestamp(Microsecond, None)" => Ok(DeltaDataType::Primitive(PrimitiveType::Timestamp)),
-        "Timestamp(Microsecond, Some(\"UTC\"))" => Ok(DeltaDataType::Primitive(PrimitiveType::Timestamp)),
-        _ => Err(anyhow::anyhow!("Unknown data type: {}", type_str)),
-    }
+fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
+    use PrimitiveType::*;
+    Ok(match s {
+        "Utf8" => DeltaDataType::Primitive(String),
+        "Date32" => DeltaDataType::Primitive(Date),
+        "Int32" | "UInt32" => DeltaDataType::Primitive(Integer),
+        "Int64" | "UInt64" => DeltaDataType::Primitive(Long),
+        "List(Utf8)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(String), true))),
+        _ if s.starts_with("Timestamp") => DeltaDataType::Primitive(Timestamp),
+        _ => anyhow::bail!("Unknown type: {}", s),
+    })
 }
 
 // Include all schema YAML files at compile time

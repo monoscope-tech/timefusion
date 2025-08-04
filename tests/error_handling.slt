@@ -1,0 +1,149 @@
+# Error Handling SQLLogicTest for TimeFusion
+# Tests various error conditions and edge cases
+
+# Test inserting with missing required fields (should fail)
+statement error
+INSERT INTO otel_logs_and_spans (project_id, timestamp) VALUES ('error_test', TIMESTAMP '2023-01-01T10:00:00Z')
+
+# Test inserting with invalid timestamp format (should fail)
+statement error
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date
+) VALUES (
+    'error_test', 'not-a-timestamp', 'error1', ARRAY[]::VARCHAR[], DATE '2023-01-01'
+)
+
+# Test querying non-existent project (should return empty)
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'non_existent_project_xyz'
+----
+0
+
+# Test with empty project_id (should work with default)
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code
+) VALUES (
+    '', TIMESTAMP '2023-01-01T10:00:00Z', 'default_proj_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'default_test', 'INFO', 'OK'
+)
+
+# Query with empty project_id should find the record (uses 'default')
+query T
+SELECT name FROM otel_logs_and_spans WHERE project_id = 'default' AND id = 'default_proj_1'
+----
+default_test
+
+# Test with very long string values
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, status_message
+) VALUES (
+    'error_test', TIMESTAMP '2023-01-01T10:00:00Z', 'long_string_test', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'test_long_strings', 'INFO', 'OK', REPEAT('x', 10000)
+)
+
+# Verify long string was stored
+query I
+SELECT LENGTH(status_message) FROM otel_logs_and_spans 
+WHERE project_id = 'error_test' AND id = 'long_string_test'
+----
+10000
+
+# Test with NULL values in nullable fields
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, parent_id, kind, status_code, status_message, level
+) VALUES (
+    'error_test', TIMESTAMP '2023-01-01T10:00:00Z', 'null_test', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'test_nulls', NULL, NULL, NULL, NULL, NULL
+)
+
+# Query NULL fields
+query TTTTT
+SELECT parent_id, kind, status_code, status_message, level 
+FROM otel_logs_and_spans WHERE project_id = 'error_test' AND id = 'null_test'
+----
+NULL NULL NULL NULL NULL
+
+# Test with special characters in strings
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_message, level
+) VALUES (
+    'error_test', TIMESTAMP '2023-01-01T10:00:00Z', 'special_chars', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'test''with''quotes', 'Message with "quotes" and \n newlines', 'INFO'
+)
+
+# Verify special characters preserved
+query TT
+SELECT name, status_message FROM otel_logs_and_spans 
+WHERE project_id = 'error_test' AND id = 'special_chars'
+----
+test'with'quotes Message with "quotes" and \n newlines
+
+# Test array operations with hashes
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level
+) VALUES (
+    'error_test', TIMESTAMP '2023-01-01T10:00:00Z', 'hash_test1', ARRAY['hash1', 'hash2', 'hash3']::VARCHAR[], DATE '2023-01-01',
+    'test_hashes', 'INFO'
+)
+
+# Query array length
+query I
+SELECT ARRAY_LENGTH(hashes) FROM otel_logs_and_spans 
+WHERE project_id = 'error_test' AND id = 'hash_test1'
+----
+3
+
+# Test with empty array
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level
+) VALUES (
+    'error_test', TIMESTAMP '2023-01-01T10:00:00Z', 'empty_hash_test', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'test_empty_hashes', 'INFO'
+)
+
+# Verify empty array
+query I
+SELECT ARRAY_LENGTH(hashes) FROM otel_logs_and_spans 
+WHERE project_id = 'error_test' AND id = 'empty_hash_test'
+----
+0
+
+# Test boundary conditions with duration
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, duration, level
+) VALUES (
+    'error_test', TIMESTAMP '2023-01-01T10:00:00Z', 'duration_test1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'test_max_duration', 9223372036854775807, 'INFO'
+)
+
+# Test with negative duration (should work as it's Int64)
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, duration, level
+) VALUES (
+    'error_test', TIMESTAMP '2023-01-01T10:00:00Z', 'duration_test2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'test_negative_duration', -1, 'ERROR'
+)
+
+# Verify boundary values
+query II
+SELECT duration, (duration < 0) as is_negative 
+FROM otel_logs_and_spans 
+WHERE project_id = 'error_test' AND id = 'duration_test2'
+----
+-1 true

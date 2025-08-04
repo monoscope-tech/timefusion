@@ -1,0 +1,17 @@
+# Simple test to verify SQL logic test setup
+
+# Test basic SELECT
+statement ok
+SELECT 1 as test_value
+
+# Test CREATE and INSERT with a simpler table
+statement ok
+CREATE TABLE IF NOT EXISTS test_table (id INT, name VARCHAR)
+
+statement ok
+INSERT INTO test_table (id, name) VALUES (1, 'test')
+
+query IT
+SELECT id, name FROM test_table WHERE id = 1
+----
+1 test
