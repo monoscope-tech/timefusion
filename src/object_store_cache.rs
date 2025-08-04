@@ -114,8 +114,8 @@ pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
     pub ttl_expirations: u64,
-    pub inner_gets: u64,  // Track actual fetches from inner store
-    pub inner_puts: u64,  // Track actual writes to inner store
+    pub inner_gets: u64,
+    pub inner_puts: u64,
 }
 
 /// Wrapper for cache value that implements foyer's required traits
@@ -161,20 +161,19 @@ impl SerializableCacheValue {
     }
 }
 
-/// Foyer-based hybrid cache implementation for object store
-/// Uses both memory and disk tiers for caching Parquet files
-pub struct FoyerObjectStoreCache {
-    inner: Arc<dyn ObjectStore>,
-    cache: HybridCache<String, SerializableCacheValue>,
+/// Shared Foyer cache that can be used across multiple object stores
+#[derive(Debug)]
+pub struct SharedFoyerCache {
+    cache: Arc<HybridCache<String, SerializableCacheValue>>,
     stats: Arc<RwLock<CacheStats>>,
     config: FoyerCacheConfig,
 }
 
-impl FoyerObjectStoreCache {
-    /// Create a new foyer-based hybrid cached object store
-    pub async fn new(inner: Arc<dyn ObjectStore>, config: FoyerCacheConfig) -> anyhow::Result<Self> {
+impl SharedFoyerCache {
+    /// Create a new shared Foyer cache
+    pub async fn new(config: FoyerCacheConfig) -> anyhow::Result<Self> {
         info!(
-            "Initializing foyer hybrid cache (memory: {}MB, disk: {}GB, ttl: {}s)",
+            "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, ttl: {}s)",
             config.memory_size_bytes / 1024 / 1024,
             config.disk_size_bytes / 1024 / 1024 / 1024,
             config.ttl.as_secs()
@@ -198,11 +197,67 @@ impl FoyerObjectStoreCache {
             .await?;
 
         Ok(Self {
-            inner,
-            cache,
+            cache: Arc::new(cache),
             stats: Arc::new(RwLock::new(CacheStats::default())),
             config,
         })
+    }
+
+    /// Get cache statistics
+    pub async fn get_stats(&self) -> CacheStats {
+        self.stats.read().await.clone()
+    }
+
+    /// Log cache statistics
+    pub async fn log_stats(&self) {
+        let stats = self.get_stats().await;
+        let hit_rate = if stats.hits + stats.misses > 0 {
+            (stats.hits as f64 / (stats.hits + stats.misses) as f64) * 100.0
+        } else {
+            0.0
+        };
+        
+        info!(
+            "Foyer cache stats - Hit rate: {:.2}%, Hits: {}, Misses: {}, TTL expirations: {}, Inner gets: {}, Inner puts: {}",
+            hit_rate, stats.hits, stats.misses, stats.ttl_expirations, stats.inner_gets, stats.inner_puts
+        );
+    }
+
+    /// Shutdown the cache gracefully
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        info!("Shutting down Foyer cache...");
+        self.log_stats().await;
+        // Cache shutdown is handled automatically when dropped
+        Ok(())
+    }
+}
+
+/// Foyer-based hybrid cache implementation for object store
+/// Uses both memory and disk tiers for caching Parquet files
+pub struct FoyerObjectStoreCache {
+    inner: Arc<dyn ObjectStore>,
+    cache: Arc<HybridCache<String, SerializableCacheValue>>,
+    stats: Arc<RwLock<CacheStats>>,
+    config: FoyerCacheConfig,
+}
+
+impl FoyerObjectStoreCache {
+    pub fn new_with_shared_cache(
+        inner: Arc<dyn ObjectStore>,
+        shared_cache: &SharedFoyerCache,
+    ) -> Self {
+        Self {
+            inner,
+            cache: shared_cache.cache.clone(),
+            stats: shared_cache.stats.clone(),
+            config: shared_cache.config.clone(),
+        }
+    }
+    
+    #[cfg(test)]
+    pub async fn new(inner: Arc<dyn ObjectStore>, config: FoyerCacheConfig) -> anyhow::Result<Self> {
+        let shared_cache = SharedFoyerCache::new(config).await?;
+        Ok(Self::new_with_shared_cache(inner, &shared_cache))
     }
 
     /// Check if cache entry is expired
@@ -237,13 +292,11 @@ impl FoyerObjectStoreCache {
         }
     }
     
-    /// Get current cache statistics (test helper)
     #[cfg(test)]
     pub async fn get_stats(&self) -> CacheStats {
         self.stats.read().await.clone()
     }
     
-    /// Reset cache statistics (test helper)
     #[cfg(test)]
     pub async fn reset_stats(&self) {
         let mut stats = self.stats.write().await;
@@ -266,6 +319,7 @@ impl ObjectStore for FoyerObjectStoreCache {
         stats.inner_puts += 1;
         drop(stats);
         
+        debug!("Cache PUT operation - writing through to inner store: {}", location);
         let result = self.inner.put(location, payload).await?;
 
         // Invalidate cache entry if it exists
@@ -314,7 +368,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 stats.hits += 1;
                 drop(stats);
                 
-                debug!("Cache hit for: {}", location);
+                info!("Foyer cache HIT for: {} (avoiding S3 access)", location);
                 
                 let cache_value = value.to_cache_value();
                 let data = cache_value.data.clone();
@@ -338,7 +392,7 @@ impl ObjectStore for FoyerObjectStoreCache {
         stats.inner_gets += 1;
         drop(stats);
         
-        debug!("Cache miss for: {}", location);
+        info!("Foyer cache MISS for: {} (fetching from S3)", location);
         
         // Fetch from underlying store
         let result = self.inner.get(location).await?;
@@ -377,7 +431,8 @@ impl ObjectStore for FoyerObjectStoreCache {
         
         // Insert into cache for next time
         let serializable_value = SerializableCacheValue::from(cache_value.clone());
-        self.cache.insert(cache_key, serializable_value);
+        self.cache.insert(cache_key.clone(), serializable_value);
+        debug!("Inserted {} into Foyer cache (size: {} bytes)", location, data.len());
         
         let data_len = data.len() as u64;
         Ok(GetResult {
