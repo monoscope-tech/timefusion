@@ -1,5 +1,5 @@
 use crate::schema_loader::{get_default_schema, get_schema};
-use crate::object_store_cache::{FoyerObjectStoreCache, FoyerCacheConfig};
+use crate::object_store_cache::{FoyerObjectStoreCache, FoyerCacheConfig, SharedFoyerCache};
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -84,7 +84,7 @@ pub struct Database {
     default_s3_prefix: Option<String>,
     default_s3_endpoint: Option<String>,
     // Object store cache (optional)
-    object_store_cache: Option<Arc<FoyerObjectStoreCache>>,
+    object_store_cache: Option<Arc<SharedFoyerCache>>,
 }
 
 impl Clone for Database {
@@ -228,9 +228,27 @@ impl Database {
 
         let project_configs = HashMap::new();
         
-        // Initialize object store cache (always enabled)
-        // Note: Currently prepared for future integration when Delta Lake supports custom object stores
-        let object_store_cache = None; // Will be initialized with with_object_store_cache()
+        // Initialize object store cache BEFORE creating any tables
+        // This ensures all tables benefit from caching
+        let object_store_cache = {
+            let config = FoyerCacheConfig::from_env();
+            info!("Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, TTL: {}s)",
+                config.memory_size_bytes / 1024 / 1024,
+                config.disk_size_bytes / 1024 / 1024 / 1024,
+                config.ttl.as_secs()
+            );
+            
+            match SharedFoyerCache::new(config).await {
+                Ok(cache) => {
+                    info!("Shared Foyer cache initialized successfully for all tables");
+                    Some(Arc::new(cache))
+                }
+                Err(e) => {
+                    error!("Failed to initialize shared Foyer cache: {}. Continuing without cache.", e);
+                    None
+                }
+            }
+        };
         
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
@@ -252,41 +270,115 @@ impl Database {
             );
             info!("Default project storage URI: {}", storage_uri);
 
-            // Initialize table for default project
-            let storage_options = HashMap::new();
-            let table = match DeltaTableBuilder::from_uri(&storage_uri)
-                .with_storage_options(storage_options.clone())
-                .with_allow_http(true)
-                .load()
-                .await
-            {
-                Ok(table) => {
-                    let version = table.version().unwrap_or(0);
-                    let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
-                        .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
-                        .parse::<i64>()
-                        .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
+            // Initialize table for default project with cache support
+            // Populate storage options with AWS credentials from environment
+            let mut storage_options = HashMap::new();
+            if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
+                storage_options.insert("aws_access_key_id".to_string(), access_key);
+            }
+            if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
+                storage_options.insert("aws_secret_access_key".to_string(), secret_key);
+            }
+            if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
+                storage_options.insert("aws_region".to_string(), region);
+            }
+            storage_options.insert("aws_endpoint".to_string(), aws_endpoint.clone());
+            
+            // Create the cached object store for the default table
+            let table = if let Some(ref shared_cache) = db.object_store_cache {
+                // Create base S3 object store
+                let base_store = db.create_object_store(&storage_uri, &storage_options).await?;
+                
+                // Wrap with the shared Foyer cache
+                let cached_store = Arc::new(FoyerObjectStoreCache::new_with_shared_cache(base_store, shared_cache)) as Arc<dyn object_store::ObjectStore>;
+                
+                info!("Default table will use Foyer cache for all object store operations");
+                
+                // Load or create table with cached object store
+                match DeltaTableBuilder::from_uri(&storage_uri)
+                    .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
+                    .with_storage_options(storage_options.clone())
+                    .with_allow_http(true)
+                    .load()
+                    .await
+                {
+                    Ok(table) => {
+                        let version = table.version().unwrap_or(0);
+                        let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
+                            .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
+                            .parse::<i64>()
+                            .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
 
-                    if version > 0 && version % checkpoint_interval == 0 {
-                        info!("Checkpointing table for default project at initial load, version {}", version);
-                        checkpoints::create_checkpoint(&table, None).await?;
+                        if version > 0 && version % checkpoint_interval == 0 {
+                            info!("Checkpointing table for default project at initial load, version {}", version);
+                            checkpoints::create_checkpoint(&table, None).await?;
+                        }
+                        table
                     }
-                    table
+                    Err(err) => {
+                        log::warn!("Table doesn't exist for default project. Creating new table. err: {:?}", err);
+
+                        let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
+                        
+                        // Create table with cached object store
+                        // Note: DeltaOps doesn't support custom object stores during create, but subsequent operations will use cache
+                        let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
+                        let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
+
+                        let _new_table = delta_ops
+                            .create()
+                            .with_columns(schema.columns().unwrap_or_default())
+                            .with_partition_columns(schema.partitions.clone())
+                            .with_storage_options(storage_options.clone())
+                            .with_commit_properties(commit_properties)
+                            .await?;
+                        
+                        // After creation, reload with cached object store for future operations
+                        DeltaTableBuilder::from_uri(&storage_uri)
+                            .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
+                            .with_storage_options(storage_options.clone())
+                            .with_allow_http(true)
+                            .load()
+                            .await?
+                    }
                 }
-                Err(err) => {
-                    log::warn!("Table doesn't exist for default project. Creating new table. err: {:?}", err);
+            } else {
+                // No cache available, fall back to non-cached table
+                log::warn!("Foyer cache not available, using non-cached object store for default table");
+                match DeltaTableBuilder::from_uri(&storage_uri)
+                    .with_storage_options(storage_options.clone())
+                    .with_allow_http(true)
+                    .load()
+                    .await
+                {
+                    Ok(table) => {
+                        let version = table.version().unwrap_or(0);
+                        let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
+                            .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
+                            .parse::<i64>()
+                            .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
 
-                    let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
-                    let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
-                    let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
+                        if version > 0 && version % checkpoint_interval == 0 {
+                            info!("Checkpointing table for default project at initial load, version {}", version);
+                            checkpoints::create_checkpoint(&table, None).await?;
+                        }
+                        table
+                    }
+                    Err(err) => {
+                        log::warn!("Table doesn't exist for default project. Creating new table. err: {:?}", err);
 
-                    delta_ops
-                        .create()
-                        .with_columns(schema.columns().unwrap_or_default())
-                        .with_partition_columns(schema.partitions.clone())
-                        .with_storage_options(storage_options.clone())
-                        .with_commit_properties(commit_properties)
-                        .await?
+                        let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
+                        let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
+                        let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
+
+                        delta_ops
+                            .create()
+                            .with_columns(schema.columns().unwrap_or_default())
+                            .with_partition_columns(schema.partitions.clone())
+                            .with_storage_options(storage_options.clone())
+                            .with_commit_properties(commit_properties)
+                            .await?
+                    }
                 }
             };
 
@@ -295,9 +387,7 @@ impl Database {
             info!("Initialized default project table at: {}", storage_uri);
         }
 
-        // Enable object store cache by default
-        let db = db.with_object_store_cache().await?;
-        
+        // Cache is already initialized above, no need to call with_object_store_cache()
         Ok(db)
     }
 
@@ -307,39 +397,10 @@ impl Database {
         self
     }
     
-    /// Enable object store cache with foyer (always enabled)
-    /// Note: Currently, Delta Lake creates its own object stores internally,
-    /// so this cache is prepared for future integration when Delta Lake
-    /// supports custom object store injection.
-    pub async fn with_object_store_cache(mut self) -> Result<Self> {
-        if self.object_store_cache.is_none() {
-            let config = FoyerCacheConfig::from_env();
-            info!("Initializing Foyer hybrid cache (memory: {}MB, disk: {}GB)",
-                config.memory_size_bytes / 1024 / 1024,
-                config.disk_size_bytes / 1024 / 1024 / 1024
-            );
-            
-            // Create a placeholder S3 store for now - will be replaced when Delta Lake supports custom stores
-            // For demonstration purposes, we initialize the cache infrastructure
-            use object_store::memory::InMemory;
-            let placeholder_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
-            
-            // Initialize the Foyer cache
-            match FoyerObjectStoreCache::new(placeholder_store, config).await {
-                Ok(cache) => {
-                    self.object_store_cache = Some(Arc::new(cache));
-                    info!("Foyer object store cache initialized successfully");
-                    
-                    // Note: When Delta Lake supports custom object stores, we'll use:
-                    // DeltaTableBuilder::from_uri(uri)
-                    //     .with_object_store(self.object_store_cache.clone())
-                    //     .load()
-                }
-                Err(e) => {
-                    error!("Failed to initialize Foyer cache: {}. Continuing without cache.", e);
-                }
-            }
-        }
+    /// Enable object store cache with foyer (deprecated - cache is now initialized in new())
+    /// This method is kept for backward compatibility but is now a no-op
+    pub async fn with_object_store_cache(self) -> Result<Self> {
+        // Cache is now initialized in new(), so this is a no-op
         Ok(self)
     }
 
@@ -597,11 +658,27 @@ impl Database {
 
             (storage_uri, storage_options)
         } else if let Some(ref bucket) = self.default_s3_bucket {
-            // No specific config, use default bucket
+            // No specific config, use default bucket with environment credentials
             let prefix = self.default_s3_prefix.as_ref().unwrap();
             let endpoint = self.default_s3_endpoint.as_ref().unwrap();
             let storage_uri = format!("s3://{}/{}/projects/{}/{}/?endpoint={}", bucket, prefix, project_id, table_name, endpoint);
-            (storage_uri, HashMap::new())
+            
+            // Populate storage options with AWS credentials from environment
+            let mut storage_options = HashMap::new();
+            if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
+                storage_options.insert("aws_access_key_id".to_string(), access_key);
+            }
+            if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
+                storage_options.insert("aws_secret_access_key".to_string(), secret_key);
+            }
+            if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
+                storage_options.insert("aws_region".to_string(), region);
+            }
+            if let Some(ref endpoint) = self.default_s3_endpoint {
+                storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
+            }
+            
+            (storage_uri, storage_options)
         } else {
             return Err(anyhow::anyhow!(
                 "No configuration for project '{}' table '{}' and no default S3 bucket set",
@@ -623,8 +700,21 @@ impl Database {
             return Ok(Arc::clone(table));
         }
 
-        // Try to load or create the table
+        // Create the base S3 object store
+        let base_store = self.create_object_store(&storage_uri, &storage_options).await?;
+        
+        // Wrap with the shared Foyer cache
+        let cached_store = if let Some(ref shared_cache) = self.object_store_cache {
+            // Create a new wrapper around the base store using our shared cache
+            // This allows the same cache to be used across all tables
+            Arc::new(FoyerObjectStoreCache::new_with_shared_cache(base_store, shared_cache)) as Arc<dyn object_store::ObjectStore>
+        } else {
+            return Err(anyhow::anyhow!("Shared Foyer cache not initialized"));
+        };
+        
+        // Try to load or create the table with the cached object store
         let table = match DeltaTableBuilder::from_uri(&storage_uri)
+            .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
             .with_storage_options(storage_options.clone())
             .with_allow_http(true)
             .load()
@@ -668,6 +758,7 @@ impl Database {
 
                                 // Try to load the table that was just created
                                 match DeltaTableBuilder::from_uri(&storage_uri)
+                                    .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
                                     .with_storage_options(storage_options.clone())
                                     .with_allow_http(true)
                                     .load()
@@ -694,6 +785,71 @@ impl Database {
         configs.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
 
         Ok(table_arc)
+    }
+
+    /// Create an object store for the given URI and storage options
+    async fn create_object_store(
+        &self,
+        storage_uri: &str,
+        storage_options: &HashMap<String, String>,
+    ) -> Result<Arc<dyn object_store::ObjectStore>> {
+        use object_store::aws::AmazonS3Builder;
+        
+        // Parse the S3 URI to extract bucket and prefix
+        let url = Url::parse(storage_uri)?;
+        let bucket = url.host_str().ok_or_else(|| anyhow::anyhow!("Invalid S3 URI: missing bucket"))?;
+        
+        // Build S3 configuration
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name(bucket);
+        
+        // Apply storage options
+        if let Some(access_key) = storage_options.get("aws_access_key_id") {
+            builder = builder.with_access_key_id(access_key);
+        }
+        if let Some(secret_key) = storage_options.get("aws_secret_access_key") {
+            builder = builder.with_secret_access_key(secret_key);
+        }
+        if let Some(region) = storage_options.get("aws_region") {
+            builder = builder.with_region(region);
+        }
+        if let Some(endpoint) = storage_options.get("aws_endpoint") {
+            builder = builder.with_endpoint(endpoint);
+            // If endpoint is HTTP, allow HTTP connections
+            if endpoint.starts_with("http://") {
+                builder = builder.with_allow_http(true);
+            }
+        }
+        
+        // Use environment variables as fallback
+        if storage_options.get("aws_access_key_id").is_none() {
+            if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
+                builder = builder.with_access_key_id(access_key);
+            }
+        }
+        if storage_options.get("aws_secret_access_key").is_none() {
+            if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
+                builder = builder.with_secret_access_key(secret_key);
+            }
+        }
+        if storage_options.get("aws_region").is_none() {
+            if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
+                builder = builder.with_region(region);
+            }
+        }
+        
+        // Check if we need to use environment variable for endpoint and allow HTTP
+        if storage_options.get("aws_endpoint").is_none() {
+            if let Ok(endpoint) = env::var("AWS_S3_ENDPOINT") {
+                builder = builder.with_endpoint(&endpoint);
+                if endpoint.starts_with("http://") {
+                    builder = builder.with_allow_http(true);
+                }
+            }
+        }
+        
+        let store = builder.build()?;
+        Ok(Arc::new(store))
     }
 
     pub async fn insert_records_batch(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
@@ -899,6 +1055,35 @@ impl Database {
             }
             Err(e) => error!("Vacuum operation failed: {}", e),
         }
+    }
+    
+    /// Gracefully shutdown the database, including cache and maintenance tasks
+    pub async fn shutdown(&self) -> Result<()> {
+        info!("Shutting down TimeFusion database...");
+        
+        // Cancel maintenance tasks
+        self.maintenance_shutdown.cancel();
+        
+        // Shutdown batch queue if present
+        if let Some(ref queue) = self.batch_queue {
+            info!("Flushing batch queue...");
+            queue.shutdown().await;
+        }
+        
+        // Log final cache stats and shutdown cache
+        if let Some(ref cache) = self.object_store_cache {
+            info!("Shutting down Foyer cache...");
+            cache.log_stats().await;
+            cache.shutdown().await?;
+        }
+        
+        // Close PostgreSQL connection pool if present
+        if let Some(ref pool) = self.config_pool {
+            pool.close().await;
+        }
+        
+        info!("Database shutdown complete");
+        Ok(())
     }
 }
 
