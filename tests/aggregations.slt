@@ -1,0 +1,192 @@
+# Aggregations SQLLogicTest for TimeFusion
+# Tests GROUP BY, COUNT, SUM, AVG, MIN, MAX and other aggregate functions
+
+# Insert test data for aggregation tests
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, duration
+) VALUES (
+    'agg_test', TIMESTAMP '2023-01-01T10:00:00Z', 'agg1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'service_a', 'INFO', 'OK', 100000000
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, duration
+) VALUES (
+    'agg_test', TIMESTAMP '2023-01-01T10:01:00Z', 'agg2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'service_a', 'ERROR', 'ERROR', 200000000
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, duration
+) VALUES (
+    'agg_test', TIMESTAMP '2023-01-01T10:02:00Z', 'agg3', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'service_b', 'INFO', 'OK', 150000000
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, duration
+) VALUES (
+    'agg_test', TIMESTAMP '2023-01-01T10:03:00Z', 'agg4', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'service_b', 'INFO', 'OK', 250000000
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, status_code, duration
+) VALUES (
+    'agg_test', TIMESTAMP '2023-01-01T10:04:00Z', 'agg5', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'service_c', 'WARN', 'OK', 300000000
+)
+
+# Test COUNT aggregation
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'agg_test'
+----
+5
+
+# Test COUNT with GROUP BY on single column
+query TI rowsort
+SELECT name, COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test'
+GROUP BY name
+----
+service_a 2
+service_b 2
+service_c 1
+
+# Test COUNT with GROUP BY on multiple columns
+query TTI rowsort
+SELECT name, level, COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test'
+GROUP BY name, level
+----
+service_a ERROR 1
+service_a INFO 1
+service_b INFO 2
+service_c WARN 1
+
+# Test SUM aggregation on duration
+query I
+SELECT SUM(duration) FROM otel_logs_and_spans WHERE project_id = 'agg_test'
+----
+1000000000
+
+# Test SUM with GROUP BY on duration
+query TI rowsort
+SELECT name, SUM(duration) FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test'
+GROUP BY name
+----
+service_a 300000000
+service_b 400000000
+service_c 300000000
+
+# Test AVG aggregation on duration
+query I
+SELECT CAST(AVG(duration) AS BIGINT) FROM otel_logs_and_spans WHERE project_id = 'agg_test'
+----
+200000000
+
+# Test MIN and MAX aggregations
+query II
+SELECT MIN(duration), MAX(duration) FROM otel_logs_and_spans WHERE project_id = 'agg_test'
+----
+100000000 300000000
+
+# Test MIN/MAX with GROUP BY
+query TII rowsort
+SELECT name, MIN(duration), MAX(duration) FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test'
+GROUP BY name
+----
+service_a 100000000 200000000
+service_b 150000000 250000000
+service_c 300000000 300000000
+
+# Test COUNT DISTINCT
+query I
+SELECT COUNT(DISTINCT level) FROM otel_logs_and_spans WHERE project_id = 'agg_test'
+----
+3
+
+query I
+SELECT COUNT(DISTINCT status_code) FROM otel_logs_and_spans WHERE project_id = 'agg_test'
+----
+2
+
+# Test GROUP BY with HAVING clause
+query TI rowsort
+SELECT name, COUNT(*) as cnt FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test'
+GROUP BY name
+HAVING COUNT(*) > 1
+----
+service_a 2
+service_b 2
+
+# Test aggregation with filtering
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test' AND status_code = 'OK'
+----
+4
+
+query I
+SELECT SUM(duration) FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test' AND level = 'INFO'
+----
+500000000
+
+# Test multiple aggregations in single query
+query II
+SELECT COUNT(*), CAST(AVG(duration) AS BIGINT)
+FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test' AND status_code = 'OK'
+----
+4 200000000
+
+# Test GROUP BY with ORDER BY
+query TI
+SELECT level, COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test'
+GROUP BY level
+ORDER BY COUNT(*) DESC
+----
+INFO 3
+ERROR 1
+WARN 1
+
+# Test aggregation on status_code distribution
+query TI rowsort
+SELECT status_code, COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test'
+GROUP BY status_code
+----
+ERROR 1
+OK 4
+
+# Test complex aggregation with multiple GROUP BY and filters
+query TTI rowsort
+SELECT level, status_code, COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'agg_test' AND duration >= 150000000
+GROUP BY level, status_code
+----
+ERROR ERROR 1
+INFO OK 2
+WARN OK 1
+
+# Test aggregation with date grouping
+# Simplified - just count by project
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'agg_test'
+----
+5

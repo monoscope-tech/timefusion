@@ -1,0 +1,369 @@
+# End-to-End SQLLogicTest for TimeFusion
+# Comprehensive test simulating real-world usage patterns
+
+# === SETUP: Create initial test data for a monitoring scenario ===
+
+# Project 1: Production environment
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    parent_id, name, kind, resource___service___name,
+    status_code, status_message, level, duration
+) VALUES (
+    'prod_monitoring', TIMESTAMP '2023-01-01T10:00:00Z', 'trace_root_1', ARRAY['hash_root']::VARCHAR[], DATE '2023-01-01',
+    NULL, '/api/users', 'SERVER', 'api-gateway',
+    'OK', 'Request completed', 'INFO', 250000000
+)
+
+# Add child spans for the trace
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    parent_id, name, kind, resource___service___name,
+    status_code, status_message, level, duration
+) VALUES (
+    'prod_monitoring', TIMESTAMP '2023-01-01T10:00:00.050Z', 'trace_child_1', ARRAY['hash_db']::VARCHAR[], DATE '2023-01-01',
+    'trace_root_1', 'db.query', 'CLIENT', 'user-service',
+    'OK', 'SELECT * FROM users', 'DEBUG', 45000000
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    parent_id, name, kind, resource___service___name,
+    status_code, status_message, level, duration
+) VALUES (
+    'prod_monitoring', TIMESTAMP '2023-01-01T10:00:00.100Z', 'trace_child_2', ARRAY['hash_cache']::VARCHAR[], DATE '2023-01-01',
+    'trace_root_1', 'cache.get', 'CLIENT', 'user-service',
+    'OK', 'Cache hit', 'DEBUG', 5000000
+)
+
+# Add some error traces
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    parent_id, name, kind, resource___service___name,
+    status_code, status_message, level, duration
+) VALUES (
+    'prod_monitoring', TIMESTAMP '2023-01-01T10:05:00Z', 'error_trace_1', ARRAY['hash_error']::VARCHAR[], DATE '2023-01-01',
+    NULL, '/api/payment', 'SERVER', 'payment-service',
+    'INTERNAL_ERROR', 'Payment gateway timeout', 'ERROR', 30000000000
+)
+
+# Add logs without traces
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, resource___service___name, level, status_message
+) VALUES (
+    'prod_monitoring', TIMESTAMP '2023-01-01T10:10:00Z', 'log_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'application.startup', 'user-service', 'INFO', 'Service started successfully'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, resource___service___name, level, status_message
+) VALUES (
+    'prod_monitoring', TIMESTAMP '2023-01-01T10:15:00Z', 'log_2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'database.connection', 'user-service', 'WARN', 'Connection pool reaching limit'
+)
+
+# Project 2: Staging environment with different patterns
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, kind, resource___service___name, level, duration
+) VALUES (
+    'staging_monitoring', TIMESTAMP '2023-01-01T10:00:00Z', 'staging_trace_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    '/api/test', 'SERVER', 'test-service', 'DEBUG', 100000000
+)
+
+# === QUERIES: Simulate real monitoring queries ===
+
+# 1. Count total spans per project
+query TI
+SELECT 'prod_monitoring' as project, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'prod_monitoring'
+----
+prod_monitoring 6
+
+query TI
+SELECT 'staging_monitoring' as project, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'staging_monitoring'
+----
+staging_monitoring 1
+
+# 2. Find all errors in production
+query TTT
+SELECT id, name, status_message FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND level = 'ERROR'
+ORDER BY timestamp
+----
+error_trace_1 /api/payment Payment gateway timeout
+
+# 3. Analyze trace hierarchy - find root spans
+query TTI
+SELECT id, name, duration FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND parent_id IS NULL AND kind IS NOT NULL
+ORDER BY timestamp
+----
+trace_root_1 /api/users 250000000
+error_trace_1 /api/payment 30000000000
+
+# 4. Find child spans of a specific trace
+query TTI
+SELECT id, name, duration FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND parent_id = 'trace_root_1'
+ORDER BY timestamp
+----
+trace_child_1 db.query 45000000
+trace_child_2 cache.get 5000000
+
+# 5. Service-level analysis
+query TI
+SELECT resource___service___name, COUNT(*) as span_count FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND resource___service___name IS NOT NULL
+GROUP BY resource___service___name
+ORDER BY span_count DESC, resource___service___name
+----
+user-service 4
+api-gateway 1
+payment-service 1
+
+# 6. Performance analysis - find slow operations
+query TTI
+SELECT id, name, duration FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND duration > 100000000
+ORDER BY duration DESC
+----
+error_trace_1 /api/payment 30000000000
+trace_root_1 /api/users 250000000
+
+# 7. Log level distribution
+query TI
+SELECT level, COUNT(*) as count FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND level IS NOT NULL
+GROUP BY level
+ORDER BY count DESC
+----
+DEBUG 2
+INFO 2
+ERROR 1
+WARN 1
+
+# 8. Find operations by pattern
+query TT
+SELECT id, name FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND name LIKE '%api%'
+ORDER BY timestamp
+----
+trace_root_1 /api/users
+error_trace_1 /api/payment
+
+# 9. Status code analysis
+query TI
+SELECT status_code, COUNT(*) as count FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND status_code IS NOT NULL
+GROUP BY status_code
+ORDER BY count DESC
+----
+OK 3
+INTERNAL_ERROR 1
+
+# 10. Time range queries - find recent errors (simulated with timestamp comparison)
+query TTT
+SELECT id, name, status_message FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' 
+    AND level = 'ERROR'
+    AND timestamp >= TIMESTAMP '2023-01-01T10:00:00Z'
+ORDER BY timestamp DESC
+----
+error_trace_1 /api/payment Payment gateway timeout
+
+# === UPDATE SCENARIOS ===
+
+# Add more data to simulate continuous monitoring
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, kind, resource___service___name, level, duration, status_code
+) VALUES (
+    'prod_monitoring', TIMESTAMP '2023-01-01T11:00:00Z', 'trace_2_root', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    '/api/health', 'SERVER', 'api-gateway', 'INFO', 10000000, 'OK'
+)
+
+# Verify new data is queryable
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'prod_monitoring'
+----
+7
+
+# Complex aggregation - average duration by service
+query TI
+SELECT resource___service___name, AVG(duration) as avg_duration FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' 
+    AND duration IS NOT NULL 
+    AND resource___service___name IS NOT NULL
+GROUP BY resource___service___name
+HAVING AVG(duration) > 0
+ORDER BY avg_duration DESC
+----
+payment-service 30000000000
+api-gateway 130000000
+user-service 25000000
+
+# === CLEANUP VERIFICATION ===
+
+# Ensure project isolation is maintained
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND name LIKE '%test%'
+----
+0
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'staging_monitoring' AND name LIKE '%payment%'
+----
+0
+
+# Final verification - total records across both projects
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'prod_monitoring'
+----
+7
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'staging_monitoring'
+----
+1
+
+# ============================================
+# Tests from multi_project.slt (project isolation)
+# ============================================
+
+# Insert data for multiple projects to test isolation
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project1', TIMESTAMP '2023-01-02T10:00:00Z', 'p1_span1', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project1_span', 'OK', 'INFO'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project2', TIMESTAMP '2023-01-02T10:00:00Z', 'p2_span1', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project2_span', 'OK', 'INFO'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project3', TIMESTAMP '2023-01-02T10:00:00Z', 'p3_span1', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project3_span', 'ERROR', 'ERROR'
+)
+
+# Query project1 data - should only see project1 records
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+p1_span1 project1_span
+
+# Query project2 data - should only see project2 records
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project2'
+----
+p2_span1 project2_span
+
+# Query project3 data - should only see project3 records
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project3'
+----
+p3_span1 project3_span
+
+# Count records per project
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+1
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project2'
+----
+1
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project3'
+----
+1
+
+# Test cross-project queries - need to query each project separately due to partitioning
+query TI
+SELECT 'project1' as project_id, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+project1 1
+
+query TI
+SELECT 'project2' as project_id, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project2'
+----
+project2 1
+
+query TI
+SELECT 'project3' as project_id, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project3'
+----
+project3 1
+
+# Insert multiple records for a single project
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project1', TIMESTAMP '2023-01-02T11:00:00Z', 'p1_span2', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project1_span2', 'OK', 'DEBUG'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project1', TIMESTAMP '2023-01-02T12:00:00Z', 'p1_span3', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project1_span3', 'ERROR', 'ERROR'
+)
+
+# Count after additional inserts
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+3
+
+# Test filtering with multiple projects
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1' AND level = 'ERROR'
+----
+1
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project3' AND level = 'ERROR'
+----
+1
+
+# Test project isolation - no data should leak between projects
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'project1' AND name LIKE 'project2%'
+----
+0
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'project2' AND name LIKE 'project1%'
+----
+0
