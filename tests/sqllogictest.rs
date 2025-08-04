@@ -219,22 +219,32 @@ mod sqllogictest_tests {
             Ok::<TestDB, TestError>(TestDB { client })
         };
 
-        // Run all .slt test files
-        let test_files = vec![
-            "tests/simple_test.slt",
-            "tests/debug_test.slt",
-            "tests/basic_operations.slt",
-            "tests/multi_project.slt",
-            "tests/filtering.slt",  // Re-enable filtering test with timeout
-            "tests/aggregations.slt",
-            "tests/error_handling.slt",
-            "tests/end_to_end.slt",
-        ];
+        // Auto-discover all .slt test files
+        let test_dir = Path::new("tests");
+        let mut test_files = Vec::new();
+        
+        if test_dir.is_dir() {
+            for entry in std::fs::read_dir(test_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("slt") {
+                    test_files.push(path);
+                }
+            }
+        }
+        
+        // Sort files for consistent test order
+        test_files.sort();
+        
+        println!("Found {} .slt test files", test_files.len());
+        for file in &test_files {
+            println!("  - {}", file.display());
+        }
 
         let mut all_passed = true;
         for test_file in test_files {
-            let test_path = Path::new(test_file);
-            println!("Running SQLLogicTest: {}", test_file);
+            let test_path = test_file.as_path();
+            println!("Running SQLLogicTest: {}", test_path.display());
             
             let factory_clone = || async move {
                 let (client, _) = connect_with_retry(Duration::from_secs(3)).await?;
@@ -248,13 +258,13 @@ mod sqllogictest_tests {
             ).await;
             
             match test_result {
-                Ok(Ok(_)) => println!("✓ {} passed", test_file),
+                Ok(Ok(_)) => println!("✓ {} passed", test_path.display()),
                 Ok(Err(e)) => {
-                    eprintln!("✗ {} failed: {:?}", test_file, e);
+                    eprintln!("✗ {} failed: {:?}", test_path.display(), e);
                     all_passed = false;
                 }
                 Err(_) => {
-                    eprintln!("✗ {} timed out after 30 seconds", test_file);
+                    eprintln!("✗ {} timed out after 30 seconds", test_path.display());
                     all_passed = false;
                 }
             }
