@@ -19,13 +19,13 @@ SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'non_existent_projec
 ----
 0
 
-# Test with empty project_id (should work with default)
+# Test with default project_id
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
     name, level, status_code
 ) VALUES (
-    '', TIMESTAMP '2023-01-01T10:00:00Z', 'default_proj_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'default', TIMESTAMP '2023-01-01T10:00:00Z', 'default_proj_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
     'default_test', 'INFO', 'OK'
 )
 

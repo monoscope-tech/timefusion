@@ -7,7 +7,7 @@
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    parent_id, name, kind, service_name,
+    parent_id, name, kind, resource___service___name,
     status_code, status_message, level, duration
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:00:00Z', 'trace_root_1', ARRAY['hash_root']::VARCHAR[], DATE '2023-01-01',
@@ -19,7 +19,7 @@ INSERT INTO otel_logs_and_spans (
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    parent_id, name, kind, service_name,
+    parent_id, name, kind, resource___service___name,
     status_code, status_message, level, duration
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:00:00.050Z', 'trace_child_1', ARRAY['hash_db']::VARCHAR[], DATE '2023-01-01',
@@ -30,7 +30,7 @@ INSERT INTO otel_logs_and_spans (
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    parent_id, name, kind, service_name,
+    parent_id, name, kind, resource___service___name,
     status_code, status_message, level, duration
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:00:00.100Z', 'trace_child_2', ARRAY['hash_cache']::VARCHAR[], DATE '2023-01-01',
@@ -42,7 +42,7 @@ INSERT INTO otel_logs_and_spans (
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    parent_id, name, kind, service_name,
+    parent_id, name, kind, resource___service___name,
     status_code, status_message, level, duration
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:05:00Z', 'error_trace_1', ARRAY['hash_error']::VARCHAR[], DATE '2023-01-01',
@@ -54,7 +54,7 @@ INSERT INTO otel_logs_and_spans (
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    name, service_name, level, status_message
+    name, resource___service___name, level, status_message
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:10:00Z', 'log_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
     'application.startup', 'user-service', 'INFO', 'Service started successfully'
@@ -63,7 +63,7 @@ INSERT INTO otel_logs_and_spans (
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    name, service_name, level, status_message
+    name, resource___service___name, level, status_message
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:15:00Z', 'log_2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
     'database.connection', 'user-service', 'WARN', 'Connection pool reaching limit'
@@ -73,7 +73,7 @@ INSERT INTO otel_logs_and_spans (
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    name, kind, service_name, level, duration
+    name, kind, resource___service___name, level, duration
 ) VALUES (
     'staging_monitoring', TIMESTAMP '2023-01-01T10:00:00Z', 'staging_trace_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
     '/api/test', 'SERVER', 'test-service', 'DEBUG', 100000000
@@ -120,9 +120,9 @@ trace_child_2 cache.get 5000000
 
 # 5. Service-level analysis
 query TI
-SELECT service_name, COUNT(*) as span_count FROM otel_logs_and_spans 
-WHERE project_id = 'prod_monitoring' AND service_name IS NOT NULL
-GROUP BY service_name
+SELECT resource___service___name, COUNT(*) as span_count FROM otel_logs_and_spans 
+WHERE project_id = 'prod_monitoring' AND resource___service___name IS NOT NULL
+GROUP BY resource___service___name
 ORDER BY span_count DESC
 ----
 user-service 4
@@ -185,7 +185,7 @@ error_trace_1 /api/payment Payment gateway timeout
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    name, kind, service_name, level, duration, status_code
+    name, kind, resource___service___name, level, duration, status_code
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T11:00:00Z', 'trace_2_root', ARRAY[]::VARCHAR[], DATE '2023-01-01',
     '/api/health', 'SERVER', 'api-gateway', 'INFO', 10000000, 'OK'
@@ -199,11 +199,11 @@ SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'prod_monitoring'
 
 # Complex aggregation - average duration by service
 query TI
-SELECT service_name, AVG(duration) as avg_duration FROM otel_logs_and_spans 
+SELECT resource___service___name, AVG(duration) as avg_duration FROM otel_logs_and_spans 
 WHERE project_id = 'prod_monitoring' 
     AND duration IS NOT NULL 
-    AND service_name IS NOT NULL
-GROUP BY service_name
+    AND resource___service___name IS NOT NULL
+GROUP BY resource___service___name
 HAVING AVG(duration) > 0
 ORDER BY avg_duration DESC
 ----
@@ -236,3 +236,134 @@ query I
 SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'staging_monitoring'
 ----
 1
+
+# ============================================
+# Tests from multi_project.slt (project isolation)
+# ============================================
+
+# Insert data for multiple projects to test isolation
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project1', TIMESTAMP '2023-01-02T10:00:00Z', 'p1_span1', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project1_span', 'OK', 'INFO'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project2', TIMESTAMP '2023-01-02T10:00:00Z', 'p2_span1', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project2_span', 'OK', 'INFO'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project3', TIMESTAMP '2023-01-02T10:00:00Z', 'p3_span1', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project3_span', 'ERROR', 'ERROR'
+)
+
+# Query project1 data - should only see project1 records
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+p1_span1 project1_span
+
+# Query project2 data - should only see project2 records
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project2'
+----
+p2_span1 project2_span
+
+# Query project3 data - should only see project3 records
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project3'
+----
+p3_span1 project3_span
+
+# Count records per project
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+1
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project2'
+----
+1
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project3'
+----
+1
+
+# Test cross-project queries - need to query each project separately due to partitioning
+query TI
+SELECT 'project1' as project_id, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+project1 1
+
+query TI
+SELECT 'project2' as project_id, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project2'
+----
+project2 1
+
+query TI
+SELECT 'project3' as project_id, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project3'
+----
+project3 1
+
+# Insert multiple records for a single project
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project1', TIMESTAMP '2023-01-02T11:00:00Z', 'p1_span2', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project1_span2', 'OK', 'DEBUG'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'project1', TIMESTAMP '2023-01-02T12:00:00Z', 'p1_span3', ARRAY[]::VARCHAR[], DATE '2023-01-02',
+    'project1_span3', 'ERROR', 'ERROR'
+)
+
+# Count after additional inserts
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1'
+----
+3
+
+# Test filtering with multiple projects
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project1' AND level = 'ERROR'
+----
+1
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'project3' AND level = 'ERROR'
+----
+1
+
+# Test project isolation - no data should leak between projects
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'project1' AND name LIKE 'project2%'
+----
+0
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'project2' AND name LIKE 'project1%'
+----
+0
