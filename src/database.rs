@@ -1,4 +1,5 @@
 use crate::schema_loader::{get_default_schema, get_schema};
+use crate::object_store_cache::{FoyerObjectStoreCache, FoyerCacheConfig};
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -82,6 +83,8 @@ pub struct Database {
     default_s3_bucket: Option<String>,
     default_s3_prefix: Option<String>,
     default_s3_endpoint: Option<String>,
+    // Object store cache (optional)
+    object_store_cache: Option<Arc<FoyerObjectStoreCache>>,
 }
 
 impl Clone for Database {
@@ -95,6 +98,7 @@ impl Clone for Database {
             default_s3_bucket: self.default_s3_bucket.clone(),
             default_s3_prefix: self.default_s3_prefix.clone(),
             default_s3_endpoint: self.default_s3_endpoint.clone(),
+            object_store_cache: self.object_store_cache.clone(),
         }
     }
 }
@@ -223,6 +227,11 @@ impl Database {
         };
 
         let project_configs = HashMap::new();
+        
+        // Initialize object store cache (always enabled)
+        // Note: Currently prepared for future integration when Delta Lake supports custom object stores
+        let object_store_cache = None; // Will be initialized with with_object_store_cache()
+        
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
             batch_queue: None,
@@ -232,6 +241,7 @@ impl Database {
             default_s3_bucket: default_s3_bucket.clone(),
             default_s3_prefix: Some(default_s3_prefix.clone()),
             default_s3_endpoint,
+            object_store_cache,
         };
 
         // Initialize default project with otel_logs_and_spans table if AWS_S3_BUCKET is set
@@ -285,6 +295,9 @@ impl Database {
             info!("Initialized default project table at: {}", storage_uri);
         }
 
+        // Enable object store cache by default
+        let db = db.with_object_store_cache().await?;
+        
         Ok(db)
     }
 
@@ -292,6 +305,42 @@ impl Database {
     pub fn with_batch_queue(mut self, batch_queue: Arc<crate::batch_queue::BatchQueue>) -> Self {
         self.batch_queue = Some(batch_queue);
         self
+    }
+    
+    /// Enable object store cache with foyer (always enabled)
+    /// Note: Currently, Delta Lake creates its own object stores internally,
+    /// so this cache is prepared for future integration when Delta Lake
+    /// supports custom object store injection.
+    pub async fn with_object_store_cache(mut self) -> Result<Self> {
+        if self.object_store_cache.is_none() {
+            let config = FoyerCacheConfig::from_env();
+            info!("Initializing Foyer hybrid cache (memory: {}MB, disk: {}GB)",
+                config.memory_size_bytes / 1024 / 1024,
+                config.disk_size_bytes / 1024 / 1024 / 1024
+            );
+            
+            // Create a placeholder S3 store for now - will be replaced when Delta Lake supports custom stores
+            // For demonstration purposes, we initialize the cache infrastructure
+            use object_store::memory::InMemory;
+            let placeholder_store = Arc::new(InMemory::new()) as Arc<dyn object_store::ObjectStore>;
+            
+            // Initialize the Foyer cache
+            match FoyerObjectStoreCache::new(placeholder_store, config).await {
+                Ok(cache) => {
+                    self.object_store_cache = Some(Arc::new(cache));
+                    info!("Foyer object store cache initialized successfully");
+                    
+                    // Note: When Delta Lake supports custom object stores, we'll use:
+                    // DeltaTableBuilder::from_uri(uri)
+                    //     .with_object_store(self.object_store_cache.clone())
+                    //     .load()
+                }
+                Err(e) => {
+                    error!("Failed to initialize Foyer cache: {}. Continuing without cache.", e);
+                }
+            }
+        }
+        Ok(self)
     }
 
     /// Start background maintenance schedulers for optimize and vacuum operations
@@ -340,6 +389,22 @@ impl Database {
         })?;
 
         scheduler.add(vacuum_job).await?;
+        
+        // Cache stats job - every 5 minutes
+        let cache_stats_job = Job::new_async("0 */5 * * * *", {
+            let db = db.clone();
+            move |_, _| {
+                let db = db.clone();
+                Box::pin(async move {
+                    // Log Foyer cache stats if available
+                    if let Some(ref cache) = db.object_store_cache {
+                        cache.log_stats().await;
+                    }
+                })
+            }
+        })?;
+        
+        scheduler.add(cache_stats_job).await?;
 
         // Start the scheduler
         scheduler.start().await?;
@@ -999,9 +1064,16 @@ impl TableProvider for ProjectRoutingTable {
         // Get project_id from filters if possible, otherwise use default
         let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
 
+        // Create cache key
+        // Execute query
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
         let table = delta_table.read().await;
-        table.scan(state, projection, filters, limit).await
+        let plan = table.scan(state, projection, filters, limit).await?;
+        
+        // Note: Async caching of results is disabled for now to avoid complexity
+        // Future improvement: implement proper async caching without blocking
+        
+        Ok(plan)
     }
 }
 
