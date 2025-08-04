@@ -28,6 +28,31 @@ pub struct DeltaStatisticsExtractor {
 }
 
 impl DeltaStatisticsExtractor {
+    /// Convert JSON value to DataFusion ScalarValue
+    fn json_to_scalar(json_val: &serde_json::Value, data_type: &arrow::datatypes::DataType) -> Result<datafusion::scalar::ScalarValue> {
+        use arrow::datatypes::DataType;
+        use datafusion::scalar::ScalarValue;
+        
+        match (json_val, data_type) {
+            (serde_json::Value::String(s), DataType::Utf8) => Ok(ScalarValue::Utf8(Some(s.clone()))),
+            (serde_json::Value::Number(n), DataType::Int64) => {
+                n.as_i64().map(|v| ScalarValue::Int64(Some(v)))
+                    .ok_or_else(|| anyhow::anyhow!("Invalid Int64 value"))
+            }
+            (serde_json::Value::Number(n), DataType::Float64) => {
+                n.as_f64().map(|v| ScalarValue::Float64(Some(v)))
+                    .ok_or_else(|| anyhow::anyhow!("Invalid Float64 value"))
+            }
+            (serde_json::Value::String(_s), DataType::Timestamp(_unit, _tz)) => {
+                // For now, we'll skip timestamp parsing as it's complex
+                // In production, you'd parse the timestamp string based on the format
+                Err(anyhow::anyhow!("Timestamp parsing not yet implemented"))
+            }
+            (serde_json::Value::Bool(b), DataType::Boolean) => Ok(ScalarValue::Boolean(Some(*b))),
+            _ => Err(anyhow::anyhow!("Unsupported type conversion")),
+        }
+    }
+    
     pub fn new(cache_size: usize, cache_ttl_seconds: u64) -> Self {
         let cache = LruCache::new(NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(50).unwrap()));
         Self {
@@ -102,22 +127,36 @@ impl DeltaStatisticsExtractor {
 
     /// Calculate table-level statistics
     async fn calculate_table_stats(&self, table: &DeltaTable) -> Result<(u64, u64)> {
-        // Get file URIs and count
-        let files: Vec<_> = table.get_file_uris()?.collect();
-        let num_files = files.len() as u64;
+        let snapshot = table.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {}", e))?;
         
-        // Get snapshot to access state
-        let _snapshot = table.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {}", e))?;
+        // Try to get actual statistics from Delta log
+        let _metadata = snapshot.metadata();
         
-        // Use better estimate based on our page row count limit
-        // Delta Lake doesn't expose row count directly in the Rust API
-        let num_rows = num_files * 20_000; // Default page row count limit from DELTA_CONFIG.md
+        // Get file actions to calculate real stats
+        let file_actions = snapshot.file_actions()?;
+        let mut total_rows = 0u64;
+        let mut total_bytes = 0u64;
         
-        // Estimate bytes based on typical Parquet compression ratio
-        let estimated_bytes_per_file = 10_000_000; // 10MB compressed
-        let total_bytes = num_files * estimated_bytes_per_file;
+        for action in file_actions {
+            // Delta stores actual row count and size in the log
+            if let Some(stats) = &action.stats {
+                // Parse stats JSON if available
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stats) {
+                    if let Some(num_records) = parsed.get("numRecords").and_then(|v| v.as_u64()) {
+                        total_rows += num_records;
+                    }
+                }
+            }
+            total_bytes += action.size as u64;
+        }
         
-        Ok((num_rows, total_bytes))
+        // Fallback to estimates if stats not available
+        if total_rows == 0 {
+            let num_files = snapshot.file_actions()?.len() as u64;
+            total_rows = num_files * 20_000; // Fallback estimate
+        }
+        
+        Ok((total_rows, total_bytes))
     }
 
     /// Extract column-level statistics
@@ -126,34 +165,94 @@ impl DeltaStatisticsExtractor {
         table: &DeltaTable,
         schema: &SchemaRef,
     ) -> Result<Vec<ColumnStatistics>> {
+        use datafusion::scalar::ScalarValue;
+        use std::collections::HashMap;
+        
+        let snapshot = table.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {}", e))?;
         let mut column_stats = Vec::new();
         
-        // Get snapshot to potentially access file statistics
-        let snapshot = table.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {}", e))?;
+        // Aggregate statistics across all files
+        let mut col_min_values: HashMap<String, ScalarValue> = HashMap::new();
+        let mut col_max_values: HashMap<String, ScalarValue> = HashMap::new();
+        let mut col_null_counts: HashMap<String, u64> = HashMap::new();
         
-        // For each column in the schema
+        // Parse Delta statistics from file actions
+        for action in snapshot.file_actions()? {
+            if let Some(stats_json) = &action.stats {
+                if let Ok(stats) = serde_json::from_str::<serde_json::Value>(stats_json) {
+                    // Extract min/max values for each column
+                    if let Some(min_values) = stats.get("minValues").and_then(|v| v.as_object()) {
+                        for (col_name, min_val) in min_values {
+                            if let Some(field) = schema.field_with_name(col_name).ok() {
+                                if let Ok(scalar) = Self::json_to_scalar(min_val, field.data_type()) {
+                                    col_min_values.entry(col_name.clone())
+                                        .and_modify(|v| {
+                                            if scalar.partial_cmp(v) == Some(std::cmp::Ordering::Less) {
+                                                *v = scalar.clone();
+                                            }
+                                        })
+                                        .or_insert(scalar);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if let Some(max_values) = stats.get("maxValues").and_then(|v| v.as_object()) {
+                        for (col_name, max_val) in max_values {
+                            if let Some(field) = schema.field_with_name(col_name).ok() {
+                                if let Ok(scalar) = Self::json_to_scalar(max_val, field.data_type()) {
+                                    col_max_values.entry(col_name.clone())
+                                        .and_modify(|v| {
+                                            if scalar.partial_cmp(v) == Some(std::cmp::Ordering::Greater) {
+                                                *v = scalar.clone();
+                                            }
+                                        })
+                                        .or_insert(scalar);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Extract null counts
+                    if let Some(null_counts) = stats.get("nullCount").and_then(|v| v.as_object()) {
+                        for (col_name, null_count) in null_counts {
+                            if let Some(count) = null_count.as_u64() {
+                                *col_null_counts.entry(col_name.clone()).or_insert(0) += count;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Build column statistics for each field
         for field in schema.fields() {
-            // Check if this is a partition column - these often have better statistics
-            let is_partition_col = snapshot.metadata().partition_columns().contains(&field.name().to_string());
+            let col_name = field.name();
+            let is_partition_col = snapshot.metadata().partition_columns().contains(&col_name.to_string());
             
             let stats = if is_partition_col {
-                // Partition columns typically have exact statistics
+                // Partition columns have exact statistics
                 ColumnStatistics {
-                    null_count: Precision::Exact(0), // Partitions don't allow nulls
+                    null_count: Precision::Exact(0),
                     max_value: Precision::Absent,
                     min_value: Precision::Absent,
                     distinct_count: Precision::Absent,
                     sum_value: Precision::Absent,
                 }
             } else {
-                // For non-partition columns, we'd need to parse parquet metadata
-                // This requires reading the actual parquet files which is expensive
+                // Use extracted statistics
                 ColumnStatistics {
-                    null_count: Precision::Absent,
-                    max_value: Precision::Absent,
-                    min_value: Precision::Absent,
-                    distinct_count: Precision::Absent,
-                    sum_value: Precision::Absent,
+                    null_count: col_null_counts.get(col_name)
+                        .map(|&c| Precision::Exact(c as usize))
+                        .unwrap_or(Precision::Absent),
+                    min_value: col_min_values.get(col_name)
+                        .map(|v| Precision::Exact(v.clone()))
+                        .unwrap_or(Precision::Absent),
+                    max_value: col_max_values.get(col_name)
+                        .map(|v| Precision::Exact(v.clone()))
+                        .unwrap_or(Precision::Absent),
+                    distinct_count: Precision::Absent, // Delta doesn't track this by default
+                    sum_value: Precision::Absent,      // Not commonly used for time-series
                 }
             };
             column_stats.push(stats);

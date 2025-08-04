@@ -98,6 +98,9 @@ pub struct Database {
     query_plan_cache: QueryPlanCache,
     // Statistics extractor for Delta Lake tables
     statistics_extractor: Arc<DeltaStatisticsExtractor>,
+    // Track last written versions for read-after-write consistency
+    // Map of (project_id, table_name) -> last_written_version
+    last_written_versions: Arc<RwLock<HashMap<(String, String), i64>>>,
 }
 
 impl Clone for Database {
@@ -114,6 +117,7 @@ impl Clone for Database {
             object_store_cache: self.object_store_cache.clone(),
             query_plan_cache: Arc::clone(&self.query_plan_cache),
             statistics_extractor: Arc::clone(&self.statistics_extractor),
+            last_written_versions: Arc::clone(&self.last_written_versions),
         }
     }
 }
@@ -161,16 +165,38 @@ impl Database {
     }
 
     /// Updates a DeltaTable and handles errors consistently
-    async fn update_table(table: &Arc<RwLock<DeltaTable>>, context: &str) -> Result<()> {
-        let mut table_write = table.write().await;
-        match table_write.update().await {
-            Ok(_) => {
-                debug!("Updated table for {} to latest version", context);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to update table for {}: {}", context, e);
-                Err(anyhow::anyhow!("Failed to update table: {}", e))
+    async fn update_table(&self, table: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str) -> Result<()> {
+        // Try to update with retries for eventual consistency
+        let mut retries = 0;
+        const MAX_RETRIES: u32 = 5;
+        
+        loop {
+            let mut table_write = table.write().await;
+            match table_write.update().await {
+                Ok(_) => {
+                    if let Some(version) = table_write.version() {
+                        debug!("Updated table for {}/{} to version {}", project_id, table_name, version);
+                        // Update our version tracking to reflect what we just loaded
+                        let mut versions = self.last_written_versions.write().await;
+                        versions.insert((project_id.to_string(), table_name.to_string()), version);
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    // Release the lock before retrying
+                    drop(table_write);
+                    
+                    retries += 1;
+                    if retries >= MAX_RETRIES {
+                        error!("Failed to update table for {}/{} after {} retries: {}", project_id, table_name, MAX_RETRIES, e);
+                        return Err(anyhow::anyhow!("Failed to update table: {}", e));
+                    }
+                    
+                    debug!("Failed to update table for {}/{} (attempt {}/{}): {}, retrying...", project_id, table_name, retries, MAX_RETRIES, e);
+                    // Exponential backoff with jitter
+                    let delay = 100 * retries as u64 + (retries as u64 * 50);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                }
             }
         }
     }
@@ -293,6 +319,7 @@ impl Database {
             object_store_cache,
             query_plan_cache,
             statistics_extractor,
+            last_written_versions: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Initialize default project with otel_logs_and_spans table if AWS_S3_BUCKET is set
@@ -706,9 +733,47 @@ impl Database {
         {
             let project_configs = self.project_configs.read().await;
             if let Some(table) = project_configs.get(&(project_id.to_string(), table_name.to_string())) {
-                Self::update_table(table, &format!("project '{}' table '{}'", project_id, table_name))
-                    .await
-                    .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
+                // Check if we have a recent write that might not be visible yet
+                let last_written_version = {
+                    let versions = self.last_written_versions.read().await;
+                    versions.get(&(project_id.to_string(), table_name.to_string())).cloned()
+                };
+                
+                // Check current version without holding the lock too long
+                let current_version = table.read().await.version();
+                
+                // Only update if we don't have a recent write or if the table version is behind
+                let should_update = match (current_version, last_written_version) {
+                    (Some(current), Some(last)) => {
+                        let needs_update = current < last;
+                        debug!("Version check for {}/{}: current={}, last_written={}, needs_update={}", 
+                               project_id, table_name, current, last, needs_update);
+                        needs_update
+                    }
+                    (None, Some(last)) => {
+                        debug!("No current version for {}/{}, but last_written={}, will skip update", project_id, table_name, last);
+                        // If we have a last written version but no current version, it means
+                        // we just wrote to a new table and it hasn't been loaded yet
+                        false
+                    }
+                    (Some(current), None) => {
+                        debug!("Current version {} for {}/{}, no last written, will update", current, project_id, table_name);
+                        true
+                    }
+                    (None, None) => {
+                        debug!("No version info for {}/{}, will update", project_id, table_name);
+                        true
+                    }
+                };
+                
+                if should_update {
+                    self.update_table(table, project_id, table_name)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
+                } else {
+                    debug!("Skipping update for {}/{} - using cached version", project_id, table_name);
+                }
+                
                 return Ok(Arc::clone(table));
             }
         }
@@ -1007,6 +1072,16 @@ impl Database {
 
             match write_op.await {
                 Ok(new_table) => {
+                    // Track the version we just wrote
+                    if let Some(version) = new_table.version() {
+                        // Store the last written version for read-after-write consistency
+                        let mut versions = self.last_written_versions.write().await;
+                        versions.insert((project_id.clone(), table_name.clone()), version);
+                        debug!("Stored last written version for {}/{}: {}", project_id, table_name, version);
+                    } else {
+                        debug!("WARNING: No version available after write for {}/{}", project_id, table_name);
+                    }
+                    
                     *table = new_table;
                     return Ok(());
                 }
