@@ -39,25 +39,23 @@ pub type ProjectConfigs = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaT
 
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
-    batch.schema().fields().iter().position(|f| f.name() == "project_id")
-        .and_then(|idx| {
-            let column = batch.column(idx);
-            let string_array = column.as_string::<i32>();
-            if string_array.len() > 0 && !string_array.is_null(0) {
-                Some(string_array.value(0).to_string())
-            } else {
-                None
-            }
-        })
+    batch.schema().fields().iter().position(|f| f.name() == "project_id").and_then(|idx| {
+        let column = batch.column(idx);
+        let string_array = column.as_string::<i32>();
+        if string_array.len() > 0 && !string_array.is_null(0) {
+            Some(string_array.value(0).to_string())
+        } else {
+            None
+        }
+    })
 }
 
 // Constants for optimization and vacuum operations
 const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 336; // 2 weeks
 const DEFAULT_CHECKPOINT_INTERVAL: i64 = 20;
-// const ZSTD_COMPRESSION_LEVEL: i32 = 6;  // Currently unused
 const DEFAULT_OPTIMIZE_TARGET_SIZE: i64 = 536870912; // 512MB
-const DEFAULT_BLOOM_FILTER_NDV: u64 = 1000000; // 1M distinct values
 const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20000;
+const ZSTD_COMPRESSION_LEVEL: i32 = 6; // Balance between compression ratio and speed
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct StorageConfig {
@@ -104,45 +102,42 @@ impl Clone for Database {
 impl Database {
     /// Creates standard writer properties used across different operations
     fn create_writer_properties() -> WriterProperties {
-        // Get configurable values from environment
-        let _bloom_filter_ndv = env::var("TIMEFUSION_BLOOM_FILTER_NDV")
-            .unwrap_or_else(|_| DEFAULT_BLOOM_FILTER_NDV.to_string())
-            .parse::<u64>()
-            .unwrap_or(DEFAULT_BLOOM_FILTER_NDV);
+        use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
+        use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
 
-        let _page_row_count_limit = env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
+        // Get configurable values from environment
+        let page_row_count_limit = env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
             .unwrap_or_else(|_| DEFAULT_PAGE_ROW_COUNT_LIMIT.to_string())
             .parse::<usize>()
             .unwrap_or(DEFAULT_PAGE_ROW_COUNT_LIMIT);
 
+        // Get compression level from environment (default to ZSTD_COMPRESSION_LEVEL constant)
+        let compression_level = env::var("TIMEFUSION_ZSTD_COMPRESSION_LEVEL")
+            .unwrap_or_else(|_| ZSTD_COMPRESSION_LEVEL.to_string())
+            .parse::<i32>()
+            .unwrap_or(ZSTD_COMPRESSION_LEVEL);
+
+        // Get max row group size from environment (default to 128MB)
+        let max_row_group_size = env::var("TIMEFUSION_MAX_ROW_GROUP_SIZE")
+            .unwrap_or_else(|_| "134217728".to_string())
+            .parse::<usize>()
+            .unwrap_or(134217728); // 128MB
+
         WriterProperties::builder()
-            // .set_compression(Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()))
-            // // .set_writer_version(WriterVersion::PARQUET_2_0)
-            // // .set_max_row_group_size(134217728) // 128MB
-            // .set_dictionary_enabled(true)
-            // // Dictionary page size - 2MB allows larger dictionaries for better compression
-            // .set_dictionary_page_size_limit(2097152) // 2MB
-            // .set_statistics_enabled(EnabledStatistics::Page)
-            // .set_bloom_filter_enabled(true)
-            // // Note: Sorting columns removed as they require writer version 7 with specific writer features
-            // // .set_sorting_columns(Some(get_default_schema().sorting_columns()))
-            // .set_column_bloom_filter_enabled(ColumnPath::from("id"), true)
-            // .set_column_bloom_filter_enabled(ColumnPath::from("parent_id"), true)
-            // .set_column_bloom_filter_enabled(ColumnPath::from("name"), true)
-            // .set_column_bloom_filter_enabled(ColumnPath::from("context___trace_id"), true)
-            // .set_column_bloom_filter_enabled(ColumnPath::from("context___span_id"), true)
-            // .set_column_bloom_filter_enabled(ColumnPath::from("resource___service___name"), true)
-            // // Additional bloom filters for frequently queried attributes
-            // .set_column_bloom_filter_enabled(ColumnPath::from("attributes___http___request___method"), true)
-            // .set_column_bloom_filter_enabled(ColumnPath::from("attributes___error___type"), true)
-            // .set_column_bloom_filter_enabled(ColumnPath::from("level"), true)
-            // .set_column_bloom_filter_enabled(ColumnPath::from("status_code"), true)
-            // // False positive probability for bloom filters (0.1% is good balance)
-            // .set_bloom_filter_fpp(0.01)
-            // // Number of distinct values hint for bloom filters (configurable)
-            // .set_bloom_filter_ndv(bloom_filter_ndv)
-            // // Enable page checksums for data integrity
-            // .set_data_page_row_count_limit(page_row_count_limit)
+            // Use ZSTD compression with high level for maximum compression ratio
+            .set_compression(Compression::ZSTD(
+                ZstdLevel::try_new(compression_level).unwrap_or_else(|_| ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()),
+            ))
+            // Set max row group size for better compression and query performance
+            .set_max_row_group_size(max_row_group_size)
+            // Enable dictionary encoding for better compression of repetitive values
+            .set_dictionary_enabled(true)
+            // Dictionary page size - 8MB allows larger dictionaries for better compression
+            .set_dictionary_page_size_limit(8388608) // 8MB
+            // Enable statistics for better query optimization
+            .set_statistics_enabled(EnabledStatistics::Page)
+            // Set page row count limit for better compression
+            .set_data_page_row_count_limit(page_row_count_limit)
             .build()
     }
 
@@ -188,7 +183,7 @@ impl Database {
         let configs: Vec<StorageConfig> = sqlx::query_as(
             "SELECT project_id, table_name, s3_bucket, s3_prefix, s3_region, 
              s3_access_key_id, s3_secret_access_key, s3_endpoint 
-             FROM timefusion_projects WHERE is_active = true"
+             FROM timefusion_projects WHERE is_active = true",
         )
         .fetch_all(pool)
         .await?;
@@ -214,12 +209,8 @@ impl Database {
 
         // Try to connect to config database if URL is provided
         let (config_pool, storage_configs) = if let Ok(db_url) = env::var("TIMEFUSION_CONFIG_DATABASE_URL") {
-            let pool = PgPoolOptions::new()
-                .max_connections(2)
-                .connect(&db_url)
-                .await
-                .ok();
-            
+            let pool = PgPoolOptions::new().max_connections(2).connect(&db_url).await.ok();
+
             if let Some(ref p) = pool {
                 let configs = Self::load_storage_configs(p).await.unwrap_or_default();
                 (pool, configs)
@@ -245,17 +236,19 @@ impl Database {
 
         // Initialize default project with otel_logs_and_spans table if AWS_S3_BUCKET is set
         if let Some(ref bucket) = default_s3_bucket {
-            let storage_uri = format!("s3://{}/{}/projects/default/otel_logs_and_spans/?endpoint={}", 
-                bucket, default_s3_prefix, aws_endpoint);
+            let storage_uri = format!(
+                "s3://{}/{}/projects/default/otel_logs_and_spans/?endpoint={}",
+                bucket, default_s3_prefix, aws_endpoint
+            );
             info!("Default project storage URI: {}", storage_uri);
-            
+
             // Initialize table for default project
             let storage_options = HashMap::new();
             let table = match DeltaTableBuilder::from_uri(&storage_uri)
                 .with_storage_options(storage_options.clone())
                 .with_allow_http(true)
                 .load()
-                .await 
+                .await
             {
                 Ok(table) => {
                     let version = table.version().unwrap_or(0);
@@ -275,9 +268,7 @@ impl Database {
 
                     let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
                     let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
-                    let commit_properties = CommitProperties::default()
-                        .with_create_checkpoint(true)
-                        .with_cleanup_expired_logs(Some(true));
+                    let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                     delta_ops
                         .create()
@@ -309,7 +300,7 @@ impl Database {
 
         let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
-        
+
         // Optimize job - every hour
         let optimize_job = Job::new_async("0 0 * * * *", {
             let db = db.clone();
@@ -325,9 +316,9 @@ impl Database {
                 })
             }
         })?;
-        
+
         scheduler.add(optimize_job).await?;
-        
+
         // Vacuum job - daily at 3AM
         let vacuum_job = Job::new_async("0 0 3 * * *", {
             let db = db.clone();
@@ -339,7 +330,7 @@ impl Database {
                         .unwrap_or_else(|_| DEFAULT_VACUUM_RETENTION_HOURS.to_string())
                         .parse::<u64>()
                         .unwrap_or(DEFAULT_VACUUM_RETENTION_HOURS);
-                    
+
                     for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
                         info!("Vacuuming project '{}' table '{}' (retention: {}h)", project_id, table_name, retention_hours);
                         db.vacuum_table(table, retention_hours).await;
@@ -347,12 +338,12 @@ impl Database {
                 })
             }
         })?;
-        
+
         scheduler.add(vacuum_job).await?;
-        
+
         // Start the scheduler
         scheduler.start().await?;
-        
+
         // Handle shutdown
         let shutdown = self.maintenance_shutdown.clone();
         tokio::spawn(async move {
@@ -360,7 +351,7 @@ impl Database {
             info!("Shutting down maintenance scheduler");
             // Note: scheduler will be dropped when this task ends
         });
-        
+
         Ok(self)
     }
 
@@ -377,7 +368,7 @@ impl Database {
     /// Setup the session context with tables and register DataFusion tables
     pub fn setup_session_context(&self, ctx: &SessionContext) -> DFResult<()> {
         use crate::schema_loader::registry;
-        
+
         // Get batch queue from the app state if available
         let batch_queue = self.batch_queue.as_ref().map(Arc::clone);
 
@@ -386,13 +377,13 @@ impl Database {
         for table_name in registry.list_tables() {
             if let Some(schema) = registry.get(&table_name) {
                 let routing_table = ProjectRoutingTable::new(
-                    "default".to_string(), 
-                    Arc::new(self.clone()), 
-                    schema.schema_ref(), 
-                    batch_queue.clone(), 
-                    table_name.clone()
+                    "default".to_string(),
+                    Arc::new(self.clone()),
+                    schema.schema_ref(),
+                    batch_queue.clone(),
+                    table_name.clone(),
                 );
-                
+
                 ctx.register_table(&table_name, Arc::new(routing_table))?;
                 info!("Registered ProjectRoutingTable for table '{}' with SessionContext", table_name);
             }
@@ -525,9 +516,12 @@ impl Database {
                 "s3://{}/{}/?endpoint={}",
                 config.s3_bucket,
                 config.s3_prefix,
-                config.s3_endpoint.as_ref().unwrap_or(&self.default_s3_endpoint.clone().unwrap_or_else(|| "https://s3.amazonaws.com".to_string()))
+                config
+                    .s3_endpoint
+                    .as_ref()
+                    .unwrap_or(&self.default_s3_endpoint.clone().unwrap_or_else(|| "https://s3.amazonaws.com".to_string()))
             );
-            
+
             let mut storage_options = HashMap::new();
             storage_options.insert("aws_access_key_id".to_string(), config.s3_access_key_id.clone());
             storage_options.insert("aws_secret_access_key".to_string(), config.s3_secret_access_key.clone());
@@ -535,7 +529,7 @@ impl Database {
             if let Some(ref endpoint) = config.s3_endpoint {
                 storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
             }
-            
+
             (storage_uri, storage_options)
         } else if let Some(ref bucket) = self.default_s3_bucket {
             // No specific config, use default bucket
@@ -544,14 +538,21 @@ impl Database {
             let storage_uri = format!("s3://{}/{}/projects/{}/{}/?endpoint={}", bucket, prefix, project_id, table_name, endpoint);
             (storage_uri, HashMap::new())
         } else {
-            return Err(anyhow::anyhow!("No configuration for project '{}' table '{}' and no default S3 bucket set", project_id, table_name));
+            return Err(anyhow::anyhow!(
+                "No configuration for project '{}' table '{}' and no default S3 bucket set",
+                project_id,
+                table_name
+            ));
         };
 
-        info!("Creating or loading table for project '{}' table '{}' at: {}", project_id, table_name, storage_uri);
+        info!(
+            "Creating or loading table for project '{}' table '{}' at: {}",
+            project_id, table_name, storage_uri
+        );
 
         // Hold a write lock during table creation to prevent concurrent creation
         let mut configs = self.project_configs.write().await;
-        
+
         // Double-check after acquiring write lock
         if let Some(table) = configs.get(&(project_id.to_string(), table_name.to_string())) {
             return Ok(Arc::clone(table));
@@ -562,26 +563,27 @@ impl Database {
             .with_storage_options(storage_options.clone())
             .with_allow_http(true)
             .load()
-            .await 
+            .await
         {
             Ok(table) => {
-                info!("Loaded existing table for project '{}' table '{}'" , project_id, table_name);
+                info!("Loaded existing table for project '{}' table '{}'", project_id, table_name);
                 table
             }
             Err(load_err) => {
-                info!("Table doesn't exist for project '{}' table '{}', creating new table. err: {:?}", project_id, table_name, load_err);
-                
+                info!(
+                    "Table doesn't exist for project '{}' table '{}', creating new table. err: {:?}",
+                    project_id, table_name, load_err
+                );
+
                 let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-                
+
                 // Try to create the table with retry logic for concurrent creation
                 let mut create_attempts = 0;
                 loop {
                     create_attempts += 1;
-                    
+
                     let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
-                    let commit_properties = CommitProperties::default()
-                        .with_create_checkpoint(true)
-                        .with_cleanup_expired_logs(Some(true));
+                    let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                     match delta_ops
                         .create()
@@ -598,7 +600,7 @@ impl Database {
                                 // Table was created by another process, try to load it
                                 debug!("Table creation conflict, attempting to load existing table (attempt {})", create_attempts);
                                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                
+
                                 // Try to load the table that was just created
                                 match DeltaTableBuilder::from_uri(&storage_uri)
                                     .with_storage_options(storage_options.clone())
@@ -622,10 +624,10 @@ impl Database {
         };
 
         let table_arc = Arc::new(RwLock::new(table));
-        
+
         // Store in cache (we already have the write lock)
         configs.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
-        
+
         Ok(table_arc)
     }
 
@@ -652,39 +654,35 @@ impl Database {
         };
 
         // Use provided table_name or default to otel_logs_and_spans
-        let table_name = if table_name.is_empty() {
-            "otel_logs_and_spans".to_string()
-        } else {
-            table_name.to_string()
-        };
+        let table_name = if table_name.is_empty() { "otel_logs_and_spans".to_string() } else { table_name.to_string() };
 
         // Get or create the table
         let table_ref = self.get_or_create_table(&project_id, &table_name).await?;
 
         // Get the appropriate schema for this table
         let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
-        
+
         let writer_properties = Self::create_writer_properties();
-        
+
         // Retry logic for concurrent writes
         let max_retries = 5;
         let mut retry_count = 0;
         let mut last_error = None;
-        
+
         while retry_count < max_retries {
             // Hold the write lock for the entire operation to prevent concurrent conflicts
             let mut table = table_ref.write().await;
-            
+
             // Update the table to get the latest version before writing
             if let Err(e) = table.update().await {
                 debug!("Failed to update table before write (attempt {}): {}", retry_count + 1, e);
             }
-            
+
             let write_op = DeltaOps(table.clone())
                 .write(batches.clone())
                 .with_partition_columns(schema.partitions.clone())
                 .with_writer_properties(writer_properties.clone());
-            
+
             match write_op.await {
                 Ok(new_table) => {
                     *table = new_table;
@@ -697,13 +695,13 @@ impl Database {
                         retry_count += 1;
                         last_error = Some(e);
                         debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, max_retries);
-                        
+
                         // Short backoff before retry
                         tokio::time::sleep(tokio::time::Duration::from_millis(100 * retry_count as u64)).await;
-                        
+
                         // Drop the lock and try to reload the table
                         drop(table);
-                        
+
                         // Force a table reload on conflict
                         if let Err(reload_err) = table_ref.write().await.update().await {
                             debug!("Failed to reload table after conflict: {}", reload_err);
@@ -715,12 +713,13 @@ impl Database {
                 }
             }
         }
-        
-        Err(anyhow::anyhow!("Delta write failed after {} retries: {}", 
-            max_retries, 
-            last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())))
-    }
 
+        Err(anyhow::anyhow!(
+            "Delta write failed after {} retries: {}",
+            max_retries,
+            last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
+        ))
+    }
 
     /// Optimize the Delta table using Z-ordering on timestamp and id columns
     /// This improves query performance for time-based queries
@@ -747,7 +746,9 @@ impl Database {
         // Note: Z-order functionality is achieved through sorting_columns in writer_properties
         let optimize_result = DeltaOps(table_clone)
             .optimize()
-            .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(get_default_schema().z_order_columns.clone()))
+            .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(
+                get_default_schema().z_order_columns.clone(),
+            ))
             .with_target_size(target_size)
             .with_writer_properties(writer_properties)
             .await;
@@ -846,7 +847,9 @@ pub struct ProjectRoutingTable {
 }
 
 impl ProjectRoutingTable {
-    pub fn new(default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>, table_name: String) -> Self {
+    pub fn new(
+        default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>, table_name: String,
+    ) -> Self {
         Self {
             default_project,
             database,
@@ -932,8 +935,11 @@ impl DataSink for ProjectRoutingTable {
         for (project_id, batches) in project_batches {
             let batch_count = batches.len();
             let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-            debug!("write_all: inserting {} batches with {} total rows for project {}", batch_count, row_count, project_id);
-            
+            debug!(
+                "write_all: inserting {} batches with {} total rows for project {}",
+                batch_count, row_count, project_id
+            );
+
             self.database
                 .insert_records_batch(&project_id, &self.table_name, batches, false)
                 .await
@@ -1005,7 +1011,6 @@ mod tests {
     use crate::test_utils::test_helpers::*;
     use serial_test::serial;
 
-
     async fn setup_test_database() -> Result<(Database, SessionContext)> {
         dotenv::dotenv().ok();
         unsafe {
@@ -1019,48 +1024,41 @@ mod tests {
         Ok((db, ctx))
     }
 
-
     #[serial]
     #[tokio::test]
     async fn test_insert_and_query() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
-        
+
         // Test basic insert
         let batch = json_to_batch(vec![test_span("test1", "span1", "project1")])?;
         db.insert_records_batch("project1", "otel_logs_and_spans", vec![batch], true).await?;
-        
+
         // Verify count
         let result = ctx.sql("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'project1'").await?.collect().await?;
         use datafusion::arrow::array::AsArray;
         let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(count, 1);
-        
+
         // Test field selection
         let result = ctx.sql("SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project1'").await?.collect().await?;
         assert_eq!(result[0].num_rows(), 1);
         assert_eq!(result[0].column(0).as_string::<i32>().value(0), "test1");
         assert_eq!(result[0].column(1).as_string::<i32>().value(0), "span1");
-        
+
         Ok(())
     }
-
-
 
     #[serial]
     #[tokio::test]
     async fn test_multiple_projects() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
-        
+
         // Insert data for multiple projects
         for project in ["project1", "project2", "project3"] {
-            let batch = json_to_batch(vec![test_span(
-                &format!("id_{}", project),
-                &format!("span_{}", project),
-                project
-            )])?;
+            let batch = json_to_batch(vec![test_span(&format!("id_{}", project), &format!("span_{}", project), project)])?;
             db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true).await?;
         }
-        
+
         // Verify project isolation
         use datafusion::arrow::array::AsArray;
         for project in ["project1", "project2", "project3"] {
@@ -1069,7 +1067,7 @@ mod tests {
             assert_eq!(result[0].num_rows(), 1);
             assert_eq!(result[0].column(0).as_string::<i32>().value(0), format!("id_{}", project));
         }
-        
+
         // Verify total count - need to check across all projects
         let mut total_count = 0;
         for project in ["project1", "project2", "project3"] {
@@ -1079,7 +1077,7 @@ mod tests {
             total_count += count;
         }
         assert_eq!(total_count, 3);
-        
+
         Ok(())
     }
 
@@ -1087,10 +1085,10 @@ mod tests {
     #[tokio::test]
     async fn test_filtering() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
-        use serde_json::json;
         use chrono::Utc;
         use datafusion::arrow::array::AsArray;
-        
+        use serde_json::json;
+
         let now = Utc::now();
         let records = vec![
             json!({
@@ -1117,25 +1115,37 @@ mod tests {
                 "hashes": []
             }),
         ];
-        
+
         let batch = json_to_batch(records)?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
-        
+
         // Test filtering by level
-        let result = ctx.sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?.collect().await?;
+        let result = ctx
+            .sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'")
+            .await?
+            .collect()
+            .await?;
         assert_eq!(result[0].num_rows(), 1);
         assert_eq!(result[0].column(0).as_string::<i32>().value(0), "span2");
-        
+
         // Test filtering by duration
-        let result = ctx.sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test_project' AND duration > 150000000").await?.collect().await?;
+        let result = ctx
+            .sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test_project' AND duration > 150000000")
+            .await?
+            .collect()
+            .await?;
         assert_eq!(result[0].num_rows(), 1);
         assert_eq!(result[0].column(0).as_string::<i32>().value(0), "span2");
-        
+
         // Test compound filtering
-        let result = ctx.sql("SELECT id, status_message FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?.collect().await?;
+        let result = ctx
+            .sql("SELECT id, status_message FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'")
+            .await?
+            .collect()
+            .await?;
         assert_eq!(result[0].num_rows(), 1);
         assert_eq!(result[0].column(1).as_string::<i32>().value(0), "Error occurred");
-        
+
         Ok(())
     }
 
@@ -1144,11 +1154,11 @@ mod tests {
     async fn test_sql_insert() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
         use datafusion::arrow::array::AsArray;
-        
+
         // Insert via API first
         let batch = json_to_batch(vec![test_span("id1", "name1", "default")])?;
         db.insert_records_batch("default", "otel_logs_and_spans", vec![batch], true).await?;
-        
+
         // Insert via SQL
         let sql = "INSERT INTO otel_logs_and_spans (
                    project_id, date, timestamp, id, hashes, name, level, status_code
@@ -1158,7 +1168,7 @@ mod tests {
                  )";
         let result = ctx.sql(sql).await?.collect().await?;
         assert_eq!(result[0].num_rows(), 1);
-        
+
         // Verify both records exist - need to check both projects
         let mut total_count = 0;
         for project in ["default", "project2"] {
@@ -1168,12 +1178,16 @@ mod tests {
             total_count += count;
         }
         assert_eq!(total_count, 2);
-        
+
         // Verify SQL-inserted record
-        let result = ctx.sql("SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project2' AND id = 'sql_id'").await?.collect().await?;
+        let result = ctx
+            .sql("SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project2' AND id = 'sql_id'")
+            .await?
+            .collect()
+            .await?;
         assert_eq!(result[0].num_rows(), 1);
         assert_eq!(result[0].column(1).as_string::<i32>().value(0), "sql_name");
-        
+
         Ok(())
     }
 
@@ -1182,7 +1196,7 @@ mod tests {
     async fn test_multi_row_sql_insert() -> Result<()> {
         let (_db, ctx) = setup_test_database().await?;
         use datafusion::arrow::array::AsArray;
-        
+
         // Test multi-row INSERT
         let sql = "INSERT INTO otel_logs_and_spans (
                    project_id, date, timestamp, id, hashes, name, level, status_code
@@ -1190,25 +1204,25 @@ mod tests {
                  ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'id1', ARRAY[], 'name1', 'INFO', 'OK'),
                  ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK'),
                  ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR')";
-        
+
         // Multi-row INSERT returns a count of rows inserted
         let result = ctx.sql(sql).await?.collect().await?;
         let inserted_count = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(inserted_count, 3);
-        
+
         // Verify all 3 records exist
         let sql = "SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'project1'";
         let result = ctx.sql(&sql).await?.collect().await?;
         let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(count, 3);
-        
+
         // Verify individual records
         let result = ctx.sql("SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project1' ORDER BY id").await?.collect().await?;
         assert_eq!(result[0].num_rows(), 3);
         assert_eq!(result[0].column(0).as_string::<i32>().value(0), "id1");
         assert_eq!(result[0].column(0).as_string::<i32>().value(1), "id2");
         assert_eq!(result[0].column(0).as_string::<i32>().value(2), "id3");
-        
+
         Ok(())
     }
 
@@ -1216,10 +1230,10 @@ mod tests {
     #[tokio::test]
     async fn test_timestamp_operations() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
-        use serde_json::json;
         use chrono::Utc;
         use datafusion::arrow::array::AsArray;
-        
+        use serde_json::json;
+
         let base_time = chrono::DateTime::parse_from_rfc3339("2023-01-01T10:00:00Z").unwrap().with_timezone(&Utc);
         let records = vec![
             json!({
@@ -1239,26 +1253,34 @@ mod tests {
                 "hashes": []
             }),
         ];
-        
+
         let batch = json_to_batch(records)?;
         db.insert_records_batch("test", "otel_logs_and_spans", vec![batch], true).await?;
-        
+
         // First check if any records were inserted - need to specify project_id
         let all_records = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test'").await?.collect().await?;
         assert!(!all_records.is_empty(), "No records found in table");
-        
+
         // Test timestamp filtering - need to include project_id
-        let result = ctx.sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test' AND timestamp > '2023-01-01T11:00:00Z'").await?.collect().await?;
+        let result = ctx
+            .sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test' AND timestamp > '2023-01-01T11:00:00Z'")
+            .await?
+            .collect()
+            .await?;
         assert!(!result.is_empty(), "Query returned no results");
         assert_eq!(result[0].num_rows(), 1);
         assert_eq!(result[0].column(0).as_string::<i32>().value(0), "late");
-        
+
         // Test timestamp formatting - need to include project_id
-        let result = ctx.sql("SELECT id, to_char(timestamp, '%Y-%m-%d %H:%M') as ts FROM otel_logs_and_spans WHERE project_id = 'test' ORDER BY timestamp").await?.collect().await?;
+        let result = ctx
+            .sql("SELECT id, to_char(timestamp, '%Y-%m-%d %H:%M') as ts FROM otel_logs_and_spans WHERE project_id = 'test' ORDER BY timestamp")
+            .await?
+            .collect()
+            .await?;
         assert_eq!(result[0].num_rows(), 2);
         assert_eq!(result[0].column(1).as_string::<i32>().value(0), "2023-01-01 10:00");
         assert_eq!(result[0].column(1).as_string::<i32>().value(1), "2023-01-01 12:00");
-        
+
         Ok(())
     }
 
@@ -1271,42 +1293,40 @@ mod tests {
             std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
             std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
         }
-        
+
         let db = Database::new().await?;
         let db = Arc::new(db);
         let project_id = format!("concurrent_test_{}", uuid::Uuid::new_v4());
-        
+
         // Create 10 concurrent write tasks
         let tasks = (0..10).map(|i| {
             let db = Arc::clone(&db);
             let project = project_id.clone();
-            
+
             tokio::spawn(async move {
                 let batch_id = format!("batch_{}", i);
                 let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project)])?;
-                
+
                 // Attempt to write
-                db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true)
-                    .await
-                    .map(|_| batch_id)
+                db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true).await.map(|_| batch_id)
             })
         });
-        
+
         // Wait for all tasks to complete
         let results: Vec<Result<String, _>> = futures::future::join_all(tasks)
             .await
             .into_iter()
             .map(|r| r.map_err(|e| anyhow::anyhow!("Task failed: {}", e))?)
             .collect();
-        
+
         // All writes should succeed
         let successful_writes: Vec<String> = results.into_iter().collect::<Result<Vec<_>>>()?;
-        
+
         assert_eq!(successful_writes.len(), 10, "All 10 concurrent writes should succeed");
-        
+
         // Verify all records were written
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // Give time for Delta to commit
-        
+
         Ok(())
     }
 
@@ -1319,38 +1339,36 @@ mod tests {
             std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
             std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
         }
-        
+
         let db = Database::new().await?;
         let db = Arc::new(db);
-        
+
         // Create multiple projects concurrently - each will try to create its own table
         let tasks = (0..5).map(|i| {
             let db = Arc::clone(&db);
             let project_id = format!("project_create_test_{}", i);
-            
+
             tokio::spawn(async move {
                 let batch_id = format!("init_batch_{}", i);
                 let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project_id)])?;
-                
+
                 // First write to a project creates the table
-                db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true)
-                    .await
-                    .map(|_| project_id)
+                db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await.map(|_| project_id)
             })
         });
-        
+
         // Wait for all tasks to complete
         let results: Vec<Result<String, _>> = futures::future::join_all(tasks)
             .await
             .into_iter()
             .map(|r| r.map_err(|e| anyhow::anyhow!("Task failed: {}", e))?)
             .collect();
-        
+
         // All table creations should succeed
         let created_projects: Vec<String> = results.into_iter().collect::<Result<Vec<_>>>()?;
-        
+
         assert_eq!(created_projects.len(), 5, "All 5 projects should be created successfully");
-        
+
         Ok(())
     }
 
@@ -1358,24 +1376,24 @@ mod tests {
     #[tokio::test]
     async fn test_batch_queue_under_load() -> Result<()> {
         use crate::batch_queue::BatchQueue;
-        
+
         dotenv::dotenv().ok();
         // Use same test environment as other tests
         unsafe {
             std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
             std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
         }
-        
+
         let db = Arc::new(Database::new().await?);
         let queue = BatchQueue::new(Arc::clone(&db), 100, 50); // 100ms interval, 50 rows max
-        
+
         let project_id = format!("queue_test_{}", uuid::Uuid::new_v4());
-        
+
         // Queue many batches rapidly
         for i in 0..100 {
             let batch_id = format!("queued_batch_{}", i);
             let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project_id)])?;
-            
+
             // Queue should handle this gracefully
             match queue.queue(batch) {
                 Ok(_) => {}
@@ -1386,13 +1404,13 @@ mod tests {
                 Err(e) => return Err(e),
             }
         }
-        
+
         // Give queue time to process
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-        
+
         // Queue shutdown
         queue.shutdown().await;
-        
+
         Ok(())
     }
 
@@ -1405,51 +1423,50 @@ mod tests {
             std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
             std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
         }
-        
+
         let db = Database::new().await?;
         let db = Arc::new(db);
-        
+
         // Mix of different operations happening concurrently
         let project_id = format!("mixed_ops_{}", uuid::Uuid::new_v4());
-        
+
         let write_tasks = (0..3).map(|i| {
             let db = Arc::clone(&db);
             let project = project_id.clone();
-            
+
             tokio::spawn(async move {
                 for j in 0..5 {
                     let batch_id = format!("writer_{}_batch_{}", i, j);
-                    let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project)])
-                        .expect("Failed to create test batch");
-                    
+                    let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project)]).expect("Failed to create test batch");
+
                     if let Err(e) = db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true).await {
                         eprintln!("Write failed: {}", e);
                     }
-                    
+
                     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                 }
             })
         });
-        
+
         // Run optimize while writes are happening
         let optimize_task = {
             let db = Arc::clone(&db);
             let project = project_id.clone();
-            
+
             tokio::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await; // Let some writes happen first
-                
+
                 // Get the table and optimize it
                 if let Ok(table_ref) = db.get_or_create_table(&project, "otel_logs_and_spans").await {
                     let _ = db.optimize_table(&table_ref, Some(1024 * 1024)).await;
                 }
             })
         };
-        
+
         // Wait for all operations to complete
         futures::future::join_all(write_tasks).await;
         optimize_task.await?;
-        
+
         Ok(())
     }
 }
