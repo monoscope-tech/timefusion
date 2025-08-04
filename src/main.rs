@@ -1,51 +1,12 @@
 // main.rs
-mod batch_queue;
-mod database;
-mod persistent_queue;
-use actix_web::{App, HttpResponse, HttpServer, Responder, middleware::Logger, post, web};
-use batch_queue::BatchQueue;
-use database::Database;
+use timefusion::batch_queue::{BatchQueue};
+use timefusion::database::{Database};
+use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
-use futures::TryFutureExt;
-use serde::Deserialize;
 use std::{env, sync::Arc};
-use tokio::time::{Duration, sleep};
-use tokio_util::sync::CancellationToken;
+use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-
-#[derive(Clone)]
-struct AppInfo {}
-
-#[derive(Deserialize)]
-struct RegisterProjectRequest {
-    project_id: String,
-    bucket: String,
-    access_key: String,
-    secret_key: String,
-    endpoint: Option<String>,
-}
-
-#[post("/register_project")]
-async fn register_project(req: web::Json<RegisterProjectRequest>, db: web::Data<Arc<Database>>) -> impl Responder {
-    match db
-        .register_project(
-            &req.project_id,
-            &req.bucket,
-            Some(&req.access_key),
-            Some(&req.secret_key),
-            req.endpoint.as_deref(),
-        )
-        .await
-    {
-        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
-            "message": format!("Project '{}' registered successfully", req.project_id)
-        })),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("Failed to register project: {:?}", e)
-        })),
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -55,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // Initialize database
+    // Initialize database (will auto-detect config mode)
     let mut db = Database::new().await?;
     info!("Database initialized successfully");
 
@@ -78,14 +39,6 @@ async fn main() -> anyhow::Result<()> {
     let session_context = db.create_session_context();
     db.setup_session_context(&session_context)?;
 
-    // Wrap for sharing
-    let db = Arc::new(db);
-    let app_info = web::Data::new(AppInfo {});
-
-    // Setup cancellation token for clean shutdown
-    let shutdown_token = CancellationToken::new();
-    let http_shutdown = shutdown_token.clone();
-
     // Start PGWire server
     let pgwire_port_var = env::var("PGWIRE_PORT");
     info!("PGWIRE_PORT environment variable: {:?}", pgwire_port_var);
@@ -102,58 +55,23 @@ async fn main() -> anyhow::Result<()> {
         });
 
     info!("Starting PGWire server on port: {}", pg_port);
-    let pg_server = db.start_pgwire_server(session_context, pg_port, shutdown_token.clone()).await?;
 
-    // Verify server started correctly
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    if pg_server.is_finished() {
-        error!("PGWire server failed to start, aborting...");
-        return Err(anyhow::anyhow!("PGWire server failed to start"));
-    }
+    let pg_task = tokio::spawn(async move {
+        let opts = ServerOptions::new()
+            .with_port(pg_port)
+            .with_host("0.0.0.0".to_string());
 
-    // Start HTTP server
-    let http_addr = format!("0.0.0.0:{}", env::var("PORT").unwrap_or_else(|_| "80".to_string()));
-    let http_server = HttpServer::new(move || {
-        App::new()
-            .wrap(Logger::default())
-            .app_data(web::Data::new(db.clone()))
-            .app_data(app_info.clone())
-            .service(register_project)
-    });
-
-    let server = match http_server.bind(&http_addr) {
-        Ok(s) => {
-            info!("HTTP server running on http://{}", http_addr);
-            s.run()
-        }
-        Err(e) => {
-            error!("Failed to bind HTTP server to {}: {:?}", http_addr, e);
-            return Err(anyhow::anyhow!("Failed to bind HTTP server: {:?}", e));
-        }
-    };
-
-    let http_server_handle = server.handle();
-    let http_task = tokio::spawn(async move {
-        tokio::select! {
-            _ = http_shutdown.cancelled() => info!("HTTP server shutting down."),
-            res = server => res.map_or_else(
-                |e| error!("HTTP server failed: {:?}", e),
-                |_| info!("HTTP server shut down gracefully")
-            ),
-        }
+        datafusion_postgres::serve(Arc::new(session_context), &opts).await
     });
 
     // Wait for shutdown signal
     tokio::select! {
-        _ = pg_server.map_err(|e| error!("PGWire server task failed: {:?}", e)) => {},
-        _ = http_task.map_err(|e| error!("HTTP server task failed: {:?}", e)) => {},
+        _ = pg_task => {error!("PGWire server task failed")},
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, initiating shutdown");
 
-            // Shutdown in order: batch queue first to flush pending data
+            // Shutdown batch queue to flush pending data
             batch_queue.shutdown().await;
-            shutdown_token.cancel();
-            http_server_handle.stop(true).await;
             sleep(Duration::from_secs(1)).await;
         }
     }

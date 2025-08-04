@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod integration {
     use anyhow::Result;
+    use datafusion_postgres::ServerOptions;
     use dotenv::dotenv;
     use rand::Rng;
     use scopeguard;
@@ -11,7 +12,6 @@ mod integration {
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{Client, NoTls};
-    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     async fn connect_with_retry(port: u16, timeout: Duration) -> Result<(Client, tokio::task::JoinHandle<()>), tokio_postgres::Error> {
@@ -49,8 +49,8 @@ mod integration {
         dotenv().ok();
 
         // Use a different port for each test to avoid conflicts
-        let mut rng = rand::thread_rng();
-        let port = 5433 + (rng.gen_range(1..100) as u16);
+        let mut rng = rand::rng();
+        let port = 5433 + (rng.random_range(1..100) as u16);
 
         unsafe {
             std::env::set_var("PGWIRE_PORT", &port.to_string());
@@ -68,13 +68,19 @@ mod integration {
 
             let port = std::env::var("PGWIRE_PORT").expect("PGWIRE_PORT not set").parse::<u16>().expect("Invalid PGWIRE_PORT");
 
-            let shutdown_token = CancellationToken::new();
-            let pg_server = db.start_pgwire_server(session_context, port, shutdown_token.clone()).await.expect("Failed to start PGWire server");
+            let opts = ServerOptions::new()
+                .with_port(port)
+                .with_host("0.0.0.0".to_string());
 
-            // Wait for shutdown signal
-            shutdown_signal_clone.notified().await;
-            shutdown_token.cancel();
-            let _ = pg_server.await;
+            // Wait for shutdown signal or server termination
+            tokio::select! {
+                _ = shutdown_signal_clone.notified() => {},
+                res = datafusion_postgres::serve(Arc::new(session_context), &opts) => {
+                    if let Err(e) = res {
+                        eprintln!("PGWire server error: {:?}", e);
+                    }
+                }
+            }
         });
 
         // Get the port number we set
@@ -121,13 +127,13 @@ mod integration {
                 )
                 .await?;
 
-            // Verify record count
-            let rows = client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE id = $1", &[&test_id]).await?;
+            // Verify record count - need to include project_id for partitioned table
+            let rows = client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &test_id]).await?;
 
             assert_eq!(rows[0].get::<_, i64>(0), 1, "Should have found exactly one row");
 
-            // Verify field values
-            let detail_rows = client.query("SELECT name, status_code FROM otel_logs_and_spans WHERE id = $1", &[&test_id]).await?;
+            // Verify field values - need to include project_id for partitioned table
+            let detail_rows = client.query("SELECT name, status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &test_id]).await?;
 
             assert_eq!(detail_rows.len(), 1, "Should have found exactly one detailed row");
             assert_eq!(detail_rows[0].get::<_, String>(0), "test_span_name", "Name should match");
@@ -282,9 +288,9 @@ mod integration {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to PostgreSQL: {}", e))?;
 
-        // Get total count of inserted records
+        // Get total count of inserted records - need project_id for partitioned table
         let count_rows = client
-            .query(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE id LIKE '{test_id}%'"), &[])
+            .query(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{test_id}%'"), &[])
             .await
             .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
 
@@ -294,9 +300,9 @@ mod integration {
         println!("Total records found: {} (expected {})", count, expected_count);
         assert_eq!(count, expected_count, "Should have inserted the expected number of records");
 
-        // Get and verify inserted IDs
+        // Get and verify inserted IDs - need project_id for partitioned table
         let id_rows = client
-            .query(&format!("SELECT id FROM otel_logs_and_spans WHERE id LIKE '{test_id}%'"), &[])
+            .query(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{test_id}%'"), &[])
             .await
             .map_err(|e| anyhow::anyhow!("Query failed: {}", e))?;
 

@@ -1,0 +1,113 @@
+# Basic Operations SQLLogicTest for TimeFusion
+# Tests fundamental CRUD operations and basic queries
+
+# Create a test timestamp value
+statement ok
+SELECT TIMESTAMP '2023-01-01T10:00:00Z' as test_timestamp;
+
+# Insert test span data
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    parent_id, name, kind,
+    status_code, status_message, level
+) VALUES (
+    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    NULL, 'sql_test_span', NULL,
+    'OK', 'span inserted successfully', 'INFO'
+)
+
+# Query back the inserted data by ID (need project_id for partitioned table)
+query TT
+SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'sql_span1'
+----
+sql_span1 sql_test_span
+
+# Insert a few more records with batch_spans
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, status_message, level
+) VALUES (
+    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'batch_test_1', 'OK', 'batch test 1', 'INFO'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, status_message, level
+) VALUES (
+    'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'batch_test_2', 'OK', 'batch test 2', 'INFO'
+)
+
+# Query count of records for the test project
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'
+----
+3
+
+# Test filtering with LIKE (need project_id for partitioned table)
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name LIKE 'batch%'
+----
+2
+
+# Test with aggregation on status_code (need project_id for partitioned table)
+query T rowsort
+SELECT status_code FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'sql_span1' GROUP BY status_code
+----
+OK
+
+# ============================================
+# Tests from simple_test.slt (generic SQL verification)
+# ============================================
+
+# Test basic SELECT
+statement ok
+SELECT 1 as test_value
+
+# Test CREATE and INSERT with a simpler table
+statement ok
+CREATE TABLE IF NOT EXISTS test_table (id INT, name VARCHAR)
+
+statement ok
+INSERT INTO test_table (id, name) VALUES (1, 'test')
+
+query IT
+SELECT id, name FROM test_table WHERE id = 1
+----
+1 test
+
+# ============================================
+# Tests from debug_test.slt (debug scenarios)
+# ============================================
+
+# Insert a debug record
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, status_code, level
+) VALUES (
+    'debug_project', TIMESTAMP '2023-01-01T10:00:00Z', 'debug_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
+    'debug_span', 'OK', 'INFO'
+)
+
+# Query without WHERE clause first (need project_id for partitioned table)
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'debug_project' LIMIT 5
+----
+debug_span1
+
+# Query with project_id filter
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'debug_project'
+----
+debug_span1
+
+# Query with id filter (need project_id for partitioned table)
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id = 'debug_project' AND id = 'debug_span1'
+----
+debug_span1
