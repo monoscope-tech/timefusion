@@ -50,6 +50,7 @@ tokio-cron-scheduler = "0.14"
 object_store = "0.12.3"
 foyer = { version = "0.18", features = ["serde"] }
 ahash = "0.8"
+lru = "0.12"
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
