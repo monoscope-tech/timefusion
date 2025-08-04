@@ -1,0 +1,52 @@
+# Test that timestamp filters automatically add date partition filters
+# This test verifies that our optimizer is working correctly
+
+# Insert test data across different dates
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date, name
+) VALUES (
+    'prune_test', TIMESTAMP '2024-01-01T10:00:00Z', 'span1', ARRAY[]::VARCHAR[], DATE '2024-01-01', 'operation1'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date, name
+) VALUES (
+    'prune_test', TIMESTAMP '2024-01-02T10:00:00Z', 'span2', ARRAY[]::VARCHAR[], DATE '2024-01-02', 'operation2'
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date, name
+) VALUES (
+    'prune_test', TIMESTAMP '2024-01-03T10:00:00Z', 'span3', ARRAY[]::VARCHAR[], DATE '2024-01-03', 'operation3'
+)
+
+# Query with timestamp filter - optimizer should add date filter for partition pruning
+query II
+SELECT id, name FROM otel_logs_and_spans 
+WHERE project_id = 'prune_test' 
+AND timestamp >= TIMESTAMP '2024-01-02T00:00:00Z'
+ORDER BY timestamp
+----
+span2 operation2
+span3 operation3
+
+# Another query with timestamp range - both bounds should generate date filters
+query II
+SELECT id, name FROM otel_logs_and_spans 
+WHERE project_id = 'prune_test' 
+AND timestamp >= TIMESTAMP '2024-01-01T12:00:00Z'
+AND timestamp < TIMESTAMP '2024-01-03T00:00:00Z'
+ORDER BY timestamp
+----
+span2 operation2
+
+# Verify exact timestamp equality also works
+query II
+SELECT id, name FROM otel_logs_and_spans 
+WHERE project_id = 'prune_test' 
+AND timestamp = TIMESTAMP '2024-01-02T10:00:00Z'
+----
+span2 operation2

@@ -6671,6 +6671,7 @@ dependencies = [
  "futures",
  "include_dir",
  "log",
+ "lru",
  "object_store",
  "pgwire 0.31.0 (git+https://github.com/sunng87/pgwire.git?rev=573bb87a81791fe1cddf51eff0ec631fb41a81df)",
  "rand 0.9.2",

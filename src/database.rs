@@ -1,11 +1,13 @@
 use crate::schema_loader::{get_default_schema, get_schema};
 use crate::object_store_cache::{FoyerObjectStoreCache, FoyerCacheConfig, SharedFoyerCache};
+use crate::statistics::DeltaStatisticsExtractor;
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::common::not_impl_err;
-use datafusion::common::SchemaExt;
+use datafusion::common::stats::Precision;
+use datafusion::common::{SchemaExt, Statistics};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
@@ -28,7 +30,11 @@ use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
+use ahash::AHasher;
+use lru::LruCache;
 use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -70,6 +76,9 @@ struct StorageConfig {
     s3_endpoint: Option<String>,
 }
 
+/// Type alias for query plan cache to reduce complexity
+type QueryPlanCache = Arc<RwLock<LruCache<(String, u64), Arc<dyn ExecutionPlan>>>>;
+
 #[derive(Debug)]
 pub struct Database {
     project_configs: ProjectConfigs,
@@ -85,6 +94,10 @@ pub struct Database {
     default_s3_endpoint: Option<String>,
     // Object store cache (optional)
     object_store_cache: Option<Arc<SharedFoyerCache>>,
+    // Query plan cache (project_id, query_hash) -> ExecutionPlan
+    query_plan_cache: QueryPlanCache,
+    // Statistics extractor for Delta Lake tables
+    statistics_extractor: Arc<DeltaStatisticsExtractor>,
 }
 
 impl Clone for Database {
@@ -99,6 +112,8 @@ impl Clone for Database {
             default_s3_prefix: self.default_s3_prefix.clone(),
             default_s3_endpoint: self.default_s3_endpoint.clone(),
             object_store_cache: self.object_store_cache.clone(),
+            query_plan_cache: Arc::clone(&self.query_plan_cache),
+            statistics_extractor: Arc::clone(&self.statistics_extractor),
         }
     }
 }
@@ -250,6 +265,22 @@ impl Database {
             }
         };
         
+        // Initialize query plan cache with configurable size (default 100 entries)
+        let cache_size = env::var("TIMEFUSION_QUERY_PLAN_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(100);
+        let query_plan_cache = Arc::new(RwLock::new(
+            LruCache::new(NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(100).unwrap()))
+        ));
+        
+        // Initialize statistics extractor with configurable cache size
+        let stats_cache_size = env::var("TIMEFUSION_STATS_CACHE_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(50);
+        let statistics_extractor = Arc::new(DeltaStatisticsExtractor::new(stats_cache_size, 300));
+        
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
             batch_queue: None,
@@ -260,6 +291,8 @@ impl Database {
             default_s3_prefix: Some(default_s3_prefix.clone()),
             default_s3_endpoint,
             object_store_cache,
+            query_plan_cache,
+            statistics_extractor,
         };
 
         // Initialize default project with otel_logs_and_spans table if AWS_S3_BUCKET is set
@@ -461,11 +494,40 @@ impl Database {
                     if let Some(ref cache) = db.object_store_cache {
                         cache.log_stats().await;
                     }
+                    
+                    // Log statistics cache stats
+                    let (used, capacity) = db.statistics_extractor.get_cache_stats().await;
+                    info!("Statistics cache: {}/{} entries used", used, capacity);
                 })
             }
         })?;
         
         scheduler.add(cache_stats_job).await?;
+        
+        // Statistics refresh job - every 15 minutes
+        let stats_refresh_job = Job::new_async("0 */15 * * * *", {
+            let db = db.clone();
+            move |_, _| {
+                let db = db.clone();
+                Box::pin(async move {
+                    info!("Refreshing Delta Lake statistics cache");
+                    db.statistics_extractor.clear_cache().await;
+                    
+                    // Pre-warm cache for active tables
+                    for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
+                        let table = table.read().await;
+                        // Get the schema for this table
+                        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
+                        let schema = schema_def.schema_ref();
+                        if let Err(e) = db.statistics_extractor.extract_statistics(&*table, project_id, table_name, &schema).await {
+                            error!("Failed to refresh statistics for {}:{}: {}", project_id, table_name, e);
+                        }
+                    }
+                })
+            }
+        })?;
+        
+        scheduler.add(stats_refresh_job).await?;
 
         // Start the scheduler
         scheduler.start().await?;
@@ -488,6 +550,45 @@ impl Database {
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
+        
+        // Enable Parquet statistics for better query optimization with Delta Lake
+        // These settings ensure DataFusion uses file and column statistics for pruning
+        let _ = options.set("datafusion.execution.parquet.enable_statistics", "true");
+        let _ = options.set("datafusion.execution.parquet.pushdown_filters", "true");
+        let _ = options.set("datafusion.execution.parquet.enable_page_index", "true");
+        let _ = options.set("datafusion.execution.parquet.pruning", "true");
+        let _ = options.set("datafusion.execution.parquet.skip_metadata", "false");
+        
+        // Enable general statistics collection for query optimization
+        let _ = options.set("datafusion.execution.collect_statistics", "true");
+        
+        // Enable bloom filter pruning if available in Parquet files
+        let _ = options.set("datafusion.execution.parquet.bloom_filter_on_read", "true");
+        
+        // Time-series optimized settings
+        // Larger batch size for better throughput with time-series data
+        let _ = options.set("datafusion.execution.batch_size", "8192");
+        
+        // Optimize for sorted data (timestamps are typically sorted)
+        let _ = options.set("datafusion.optimizer.prefer_existing_sort", "true");
+        
+        // Enable repartition for better parallel aggregations
+        let _ = options.set("datafusion.optimizer.repartition_aggregations", "true");
+        
+        // Disable round-robin repartitioning to maintain sort order
+        let _ = options.set("datafusion.optimizer.enable_round_robin_repartition", "false");
+        
+        // Enable filter and limit pushdown optimizations
+        let _ = options.set("datafusion.optimizer.filter_null_join_keys", "true");
+        let _ = options.set("datafusion.optimizer.skip_failed_rules", "false");
+        
+        // Memory management for large time-series queries
+        let _ = options.set("datafusion.execution.coalesce_batches", "true");
+        let _ = options.set("datafusion.execution.coalesce_target_batch_size", "8192");
+        
+        // Enable all optimizer rules for maximum optimization
+        let _ = options.set("datafusion.optimizer.max_passes", "5");
+        
         SessionContext::new_with_config(options.into())
     }
 
@@ -1057,6 +1158,24 @@ impl Database {
         }
     }
     
+    /// Get table statistics using the statistics extractor
+    pub async fn get_table_statistics(&self, table: &DeltaTable, project_id: &str, table_name: &str) -> Result<Statistics> {
+        // Get the schema for this table
+        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let schema = schema_def.schema_ref();
+        self.statistics_extractor.extract_statistics(table, project_id, table_name, &schema).await
+    }
+    
+    /// Clear the statistics cache
+    pub async fn clear_statistics_cache(&self) {
+        self.statistics_extractor.clear_cache().await
+    }
+    
+    /// Invalidate statistics for a specific table
+    pub async fn invalidate_table_statistics(&self, project_id: &str, table_name: &str) {
+        self.statistics_extractor.invalidate(project_id, table_name).await
+    }
+    
     /// Gracefully shutdown the database, including cache and maintenance tasks
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down TimeFusion database...");
@@ -1140,6 +1259,157 @@ impl ProjectRoutingTable {
             }
             Expr::Not(inner) => self.extract_project_id(inner),
             _ => None,
+        }
+    }
+
+    /// Determines if a filter can be pushed down exactly to Delta Lake
+    fn is_exact_pushdown_filter(expr: &Expr) -> bool {
+        match expr {
+            // AND expressions are exact if all parts are exact (check this first)
+            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
+                Self::is_exact_pushdown_filter(left) && Self::is_exact_pushdown_filter(right)
+            }
+            // Simple column comparisons are exact
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                let is_column_literal = matches!(
+                    (left.as_ref(), right.as_ref()),
+                    (Expr::Column(_), Expr::Literal(_, _)) | (Expr::Literal(_, _), Expr::Column(_))
+                );
+                
+                let is_supported_op = matches!(
+                    op,
+                    Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq | 
+                    Operator::Gt | Operator::GtEq
+                );
+                
+                if is_column_literal && is_supported_op {
+                    // Check if it's a partition column or indexed column
+                    if let Expr::Column(col) = left.as_ref() {
+                        return Self::is_pushdown_column(&col.name);
+                    }
+                    if let Expr::Column(col) = right.as_ref() {
+                        return Self::is_pushdown_column(&col.name);
+                    }
+                }
+                false
+            }
+            // IS NULL/IS NOT NULL are exact
+            Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+                matches!(inner.as_ref(), Expr::Column(col) if Self::is_pushdown_column(&col.name))
+            }
+            // IN lists are exact for pushdown columns
+            Expr::InList(in_list) => {
+                matches!(in_list.expr.as_ref(), Expr::Column(col) if Self::is_pushdown_column(&col.name))
+            }
+            _ => false,
+        }
+    }
+
+    /// Checks if a column supports exact pushdown (partitions, sorted columns, indexed columns)
+    fn is_pushdown_column(column_name: &str) -> bool {
+        matches!(
+            column_name,
+            "project_id" | "date" | "timestamp" | "id" | "level" | "status_code" | 
+            "resource___service___name" | "name" | "duration"
+        )
+    }
+    
+    /// Compute a hash key for query plan caching
+    fn compute_query_cache_key(
+        project_id: &str,
+        filters: &[Expr],
+        projection: Option<&Vec<usize>>,
+        limit: Option<usize>,
+    ) -> u64 {
+        let mut hasher = AHasher::default();
+        
+        // Hash the query components
+        project_id.hash(&mut hasher);
+        
+        // Hash filters (simplified - in production would need proper expr hashing)
+        for filter in filters {
+            format!("{:?}", filter).hash(&mut hasher);
+        }
+        
+        // Hash projection
+        if let Some(proj) = projection {
+            proj.hash(&mut hasher);
+        }
+        
+        // Hash limit
+        limit.hash(&mut hasher);
+        
+        hasher.finish()
+    }
+    
+    /// Apply time-series specific optimizations to filters
+    fn apply_time_series_optimizations(&self, filters: &[Expr]) -> DFResult<Vec<Expr>> {
+        use crate::optimizers::TimeRangePartitionPruner;
+        
+        let mut optimized_filters = Vec::new();
+        let mut has_date_filter = false;
+        
+        // First, check if we already have a date filter to avoid duplicates
+        for filter in filters {
+            if Self::is_date_filter(filter) {
+                has_date_filter = true;
+            }
+            optimized_filters.push(filter.clone());
+        }
+        
+        // Only add date filters if we don't already have one
+        if !has_date_filter {
+            for filter in filters {
+                // Check if this is a timestamp filter that needs a date filter added
+                if let Some(date_filter) = TimeRangePartitionPruner::timestamp_to_date_filter(filter) {
+                    optimized_filters.push(date_filter);
+                    debug!("Added date partition filter for timestamp query optimization");
+                }
+            }
+        }
+        
+        // Check if project_id filter is present
+        if !self.has_project_id_in_filters(&optimized_filters) {
+            debug!("Query missing project_id filter - may scan all partitions");
+        }
+        
+        Ok(optimized_filters)
+    }
+    
+    /// Check if an expression is a date filter
+    fn is_date_filter(expr: &Expr) -> bool {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, .. }) => {
+                matches!(left.as_ref(), Expr::Column(col) if col.name == "date")
+            }
+            _ => false,
+        }
+    }
+    
+    /// Check if filters contain a project_id filter
+    fn has_project_id_in_filters(&self, filters: &[Expr]) -> bool {
+        use crate::optimizers::ProjectIdPushdown;
+        ProjectIdPushdown::has_project_id_filter(filters)
+    }
+    
+    /// Get actual statistics from Delta Lake metadata
+    async fn get_delta_statistics(&self) -> Result<Statistics> {
+        // Get the Delta table for the default project or first available
+        let project_id = self.extract_project_id_from_filters(&[])
+            .unwrap_or_else(|| self.default_project.clone());
+        
+        // Try to get the table
+        match self.database.resolve_table(&project_id, &self.table_name).await {
+            Ok(table_ref) => {
+                let table = table_ref.read().await;
+                self.database.statistics_extractor
+                    .extract_statistics(&*table, &project_id, &self.table_name, &self.schema)
+                    .await
+            }
+            Err(e) => {
+                debug!("Failed to resolve table for statistics: {}", e);
+                Err(anyhow::anyhow!("Failed to get table for statistics"))
+            }
         }
     }
 }
@@ -1242,23 +1512,90 @@ impl TableProvider for ProjectRoutingTable {
     }
 
     fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        Ok(filter.iter().map(|_| TableProviderFilterPushDown::Inexact).collect())
+        // Analyze each filter to determine if it can be pushed down exactly
+        Ok(filter
+            .iter()
+            .map(|f| {
+                if Self::is_exact_pushdown_filter(f) {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Apply our custom optimizations to the filters
+        let optimized_filters = self.apply_time_series_optimizations(filters)?;
+        
         // Get project_id from filters if possible, otherwise use default
-        let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
+        let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
 
-        // Create cache key
-        // Execute query
+        // Create cache key based on project_id, filters, projection, and limit
+        let cache_key = Self::compute_query_cache_key(&project_id, &optimized_filters, projection, limit);
+        
+        // Check cache first
+        {
+            let mut cache = self.database.query_plan_cache.write().await;
+            if let Some(cached_plan) = cache.get(&(project_id.clone(), cache_key)) {
+                debug!("Query plan cache hit for project_id: {}, key: {}", project_id, cache_key);
+                return Ok(cached_plan.clone());
+            }
+        }
+        
+        // Execute query and create plan with optimized filters
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
         let table = delta_table.read().await;
-        let plan = table.scan(state, projection, filters, limit).await?;
+        let mut plan = table.scan(state, projection, &optimized_filters, limit).await?;
         
-        // Note: Async caching of results is disabled for now to avoid complexity
-        // Future improvement: implement proper async caching without blocking
+        // Apply physical optimizers for time-series patterns
+        {
+            use crate::physical_optimizers::TimeSeriesPhysicalOptimizers;
+            let optimizers = TimeSeriesPhysicalOptimizers::new();
+            let config = state.config_options();
+            match optimizers.optimize(plan.clone(), &config) {
+                Ok(optimized) => {
+                    debug!("Applied physical optimizers to query plan");
+                    plan = optimized;
+                }
+                Err(e) => {
+                    debug!("Physical optimization failed, using original plan: {}", e);
+                }
+            }
+        }
+        
+        // Cache the optimized plan (LRU will handle eviction automatically)
+        {
+            let mut cache = self.database.query_plan_cache.write().await;
+            cache.put((project_id.clone(), cache_key), plan.clone());
+            debug!("Cached optimized query plan for project_id: {}, key: {}, cache size: {}", 
+                   project_id, cache_key, cache.len());
+        }
         
         Ok(plan)
+    }
+    fn statistics(&self) -> Option<Statistics> {
+        // Use tokio's block_in_place to run async code in sync context
+        // This is safe here as statistics are cached and the operation is fast
+        tokio::task::block_in_place(|| {
+            let runtime = tokio::runtime::Handle::current();
+            runtime.block_on(async {
+                // Try to get statistics from Delta Lake
+                match self.get_delta_statistics().await {
+                    Ok(stats) => Some(stats),
+                    Err(e) => {
+                        debug!("Failed to get Delta Lake statistics: {}", e);
+                        // Fall back to conservative estimates
+                        Some(Statistics {
+                            num_rows: Precision::Inexact(1_000_000),
+                            total_byte_size: Precision::Inexact(100_000_000),
+                            column_statistics: vec![],
+                        })
+                    }
+                }
+            })
+        })
     }
 }
 
