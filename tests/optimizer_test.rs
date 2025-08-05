@@ -1,7 +1,7 @@
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 use datafusion::common::Column;
-use timefusion::optimizers::{TimeRangePartitionPruner, ProjectIdPushdown};
+use timefusion::optimizers::{time_range_partition_pruner, ProjectIdPushdown};
 
 #[test]
 fn test_timestamp_to_date_filter_conversion() {
@@ -18,7 +18,7 @@ fn test_timestamp_to_date_filter_conversion() {
     ));
     
     // Apply the optimizer
-    let date_filter = TimeRangePartitionPruner::timestamp_to_date_filter(&timestamp_filter);
+    let date_filter = time_range_partition_pruner::timestamp_to_date_filter(&timestamp_filter);
     
     // Verify a date filter was created
     assert!(date_filter.is_some(), "Should create a date filter from timestamp filter");
@@ -85,24 +85,3 @@ fn test_project_id_filter_detection() {
     );
 }
 
-#[test]
-fn test_optimizer_integration() {
-    // This test verifies that timestamp filters get date filters added
-    let timestamp_col = Expr::Column(Column::new_unqualified("timestamp"));
-    let timestamp_value = ScalarValue::TimestampNanosecond(
-        Some(1704067200000000000), // 2024-01-01 00:00:00 UTC
-        None
-    );
-    let timestamp_filter = Expr::BinaryExpr(BinaryExpr::new(
-        Box::new(timestamp_col),
-        Operator::GtEq,
-        Box::new(Expr::Literal(timestamp_value, None)),
-    ));
-    
-    // Apply the optimization
-    let date_filter = TimeRangePartitionPruner::timestamp_to_date_filter(&timestamp_filter);
-    assert!(date_filter.is_some(), "Should generate date filter for partition pruning");
-    
-    // In the actual implementation, this would be combined with the original filter
-    // to ensure both timestamp and date filters are applied for optimal pruning
-}

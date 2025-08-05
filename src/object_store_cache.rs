@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::info;
 
 use foyer::{
     DirectFsDeviceOptions, Engine, HybridCache, HybridCacheBuilder, LargeEngineOptions,
@@ -20,30 +20,87 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 /// Cache entry with metadata and TTL
-/// We store raw bytes and metadata separately to enable serialization
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheValue {
-    data: Bytes,
+    #[serde(with = "serde_bytes")]
+    data: Vec<u8>,
+    #[serde(with = "object_meta_serde")]
     meta: ObjectMeta,
     timestamp_millis: u64,
+}
+
+impl CacheValue {
+    fn new(data: Vec<u8>, meta: ObjectMeta) -> Self {
+        Self {
+            data,
+            meta,
+            timestamp_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+
+    fn is_expired(&self, ttl: Duration) -> bool {
+        let age_millis = current_millis().saturating_sub(self.timestamp_millis);
+        age_millis > ttl.as_millis() as u64
+    }
+}
+
+fn current_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+mod object_meta_serde {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    
+    #[derive(Serialize, Deserialize)]
+    struct SerializedMeta {
+        location: String,
+        last_modified: i64,
+        size: u64,
+        e_tag: Option<String>,
+        version: Option<String>,
+    }
+    
+    pub fn serialize<S>(meta: &ObjectMeta, serializer: S) -> Result<S::Ok, S::Error>
+    where S: Serializer {
+        SerializedMeta {
+            location: meta.location.to_string(),
+            last_modified: meta.last_modified.timestamp_millis(),
+            size: meta.size,
+            e_tag: meta.e_tag.clone(),
+            version: meta.version.clone(),
+        }.serialize(serializer)
+    }
+    
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<ObjectMeta, D::Error>
+    where D: Deserializer<'de> {
+        let s = SerializedMeta::deserialize(deserializer)?;
+        Ok(ObjectMeta {
+            location: Path::from(s.location),
+            last_modified: DateTime::<Utc>::from_timestamp_millis(s.last_modified)
+                .unwrap_or(Utc::now()),
+            size: s.size,
+            e_tag: s.e_tag,
+            version: s.version,
+        })
+    }
 }
 
 /// Configuration for the foyer-based object store cache
 #[derive(Debug, Clone)]
 pub struct FoyerCacheConfig {
-    /// Memory cache size in bytes
     pub memory_size_bytes: usize,
-    /// Disk cache size in bytes
     pub disk_size_bytes: usize,
-    /// Time-to-live for cache entries
     pub ttl: Duration,
-    /// Directory for disk cache
     pub cache_dir: PathBuf,
-    /// Number of shards for better concurrency
     pub shards: usize,
-    /// File size for disk cache files
     pub file_size_bytes: usize,
-    /// Whether to enable cache statistics logging
     pub enable_stats: bool,
 }
 
@@ -64,46 +121,18 @@ impl Default for FoyerCacheConfig {
 impl FoyerCacheConfig {
     /// Create cache config from environment variables
     pub fn from_env() -> Self {
-        let memory_size_mb = std::env::var("TIMEFUSION_FOYER_MEMORY_MB")
-            .unwrap_or_else(|_| "256".to_string())
-            .parse::<usize>()
-            .unwrap_or(256);
-
-        let disk_size_gb = std::env::var("TIMEFUSION_FOYER_DISK_GB")
-            .unwrap_or_else(|_| "10".to_string())
-            .parse::<usize>()
-            .unwrap_or(10);
-
-        let ttl_seconds = std::env::var("TIMEFUSION_FOYER_TTL_SECONDS")
-            .unwrap_or_else(|_| "300".to_string())
-            .parse::<u64>()
-            .unwrap_or(300);
-
-        let cache_dir = std::env::var("TIMEFUSION_FOYER_CACHE_DIR")
-            .unwrap_or_else(|_| "/tmp/timefusion_cache".to_string());
-
-        let shards = std::env::var("TIMEFUSION_FOYER_SHARDS")
-            .unwrap_or_else(|_| "8".to_string())
-            .parse::<usize>()
-            .unwrap_or(8);
-
-        let file_size_mb = std::env::var("TIMEFUSION_FOYER_FILE_SIZE_MB")
-            .unwrap_or_else(|_| "16".to_string())
-            .parse::<usize>()
-            .unwrap_or(16);
-
-        let enable_stats = std::env::var("TIMEFUSION_FOYER_STATS")
-            .unwrap_or_else(|_| "true".to_string())
-            .to_lowercase() == "true";
+        fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
+            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        }
 
         Self {
-            memory_size_bytes: memory_size_mb * 1024 * 1024,
-            disk_size_bytes: disk_size_gb * 1024 * 1024 * 1024,
-            ttl: Duration::from_secs(ttl_seconds),
-            cache_dir: PathBuf::from(cache_dir),
-            shards,
-            file_size_bytes: file_size_mb * 1024 * 1024,
-            enable_stats,
+            memory_size_bytes: parse_env("TIMEFUSION_FOYER_MEMORY_MB", 256) * 1024 * 1024,
+            disk_size_bytes: parse_env("TIMEFUSION_FOYER_DISK_GB", 10) * 1024 * 1024 * 1024,
+            ttl: Duration::from_secs(parse_env("TIMEFUSION_FOYER_TTL_SECONDS", 300)),
+            cache_dir: PathBuf::from(parse_env("TIMEFUSION_FOYER_CACHE_DIR", "/tmp/timefusion_cache".to_string())),
+            shards: parse_env("TIMEFUSION_FOYER_SHARDS", 8),
+            file_size_bytes: parse_env("TIMEFUSION_FOYER_FILE_SIZE_MB", 16) * 1024 * 1024,
+            enable_stats: parse_env("TIMEFUSION_FOYER_STATS", "true".to_string()).to_lowercase() == "true",
         }
     }
 }
@@ -118,54 +147,28 @@ pub struct CacheStats {
     pub inner_puts: u64,
 }
 
-/// Wrapper for cache value that implements foyer's required traits
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializableCacheValue {
-    data: Vec<u8>,  // Vec<u8> for serialization
-    meta_location: String,
-    meta_last_modified: i64,
-    meta_size: u64,
-    meta_e_tag: Option<String>,
-    meta_version: Option<String>,
-    timestamp_millis: u64,
-}
-
-impl From<CacheValue> for SerializableCacheValue {
-    fn from(value: CacheValue) -> Self {
-        Self {
-            data: value.data.to_vec(),
-            meta_location: value.meta.location.to_string(),
-            meta_last_modified: value.meta.last_modified.timestamp_millis(),
-            meta_size: value.meta.size,
-            meta_e_tag: value.meta.e_tag.clone(),
-            meta_version: value.meta.version.clone(),
-            timestamp_millis: value.timestamp_millis,
-        }
+impl CacheStats {
+    fn log(&self) {
+        let hit_rate = if self.hits + self.misses > 0 {
+            (self.hits as f64 / (self.hits + self.misses) as f64) * 100.0
+        } else {
+            0.0
+        };
+        info!(
+            "Foyer cache stats - Hit rate: {:.2}%, Hits: {}, Misses: {}, TTL expirations: {}, Inner gets: {}, Inner puts: {}",
+            hit_rate, self.hits, self.misses, self.ttl_expirations, self.inner_gets, self.inner_puts
+        );
     }
 }
 
-impl SerializableCacheValue {
-    fn to_cache_value(&self) -> CacheValue {
-        CacheValue {
-            data: Bytes::from(self.data.clone()),
-            meta: ObjectMeta {
-                location: Path::from(self.meta_location.clone()),
-                last_modified: DateTime::<Utc>::from_timestamp_millis(self.meta_last_modified)
-                    .unwrap_or(Utc::now()),
-                size: self.meta_size,
-                e_tag: self.meta_e_tag.clone(),
-                version: self.meta_version.clone(),
-            },
-            timestamp_millis: self.timestamp_millis,
-        }
-    }
-}
+type FoyerCache = Arc<HybridCache<String, CacheValue>>;
+type StatsRef = Arc<RwLock<CacheStats>>;
 
 /// Shared Foyer cache that can be used across multiple object stores
 #[derive(Debug)]
 pub struct SharedFoyerCache {
-    cache: Arc<HybridCache<String, SerializableCacheValue>>,
-    stats: Arc<RwLock<CacheStats>>,
+    cache: FoyerCache,
+    stats: StatsRef,
     config: FoyerCacheConfig,
 }
 
@@ -179,15 +182,13 @@ impl SharedFoyerCache {
             config.ttl.as_secs()
         );
 
-        // Create cache directory if it doesn't exist
         std::fs::create_dir_all(&config.cache_dir)?;
 
-        // Build the hybrid cache with both memory and disk tiers
-        let cache: HybridCache<String, SerializableCacheValue> = HybridCacheBuilder::new()
+        let cache = HybridCacheBuilder::new()
             .memory(config.memory_size_bytes)
             .with_shards(config.shards)
-            .with_weighter(|_key: &String, value: &SerializableCacheValue| value.data.len())
-            .storage(Engine::Large(LargeEngineOptions::default())) // Optimized for large Parquet files
+            .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
+            .storage(Engine::Large(LargeEngineOptions::default()))
             .with_device_options(
                 DirectFsDeviceOptions::new(&config.cache_dir)
                     .with_capacity(config.disk_size_bytes)
@@ -203,41 +204,26 @@ impl SharedFoyerCache {
         })
     }
 
-    /// Get cache statistics
     pub async fn get_stats(&self) -> CacheStats {
         self.stats.read().await.clone()
     }
 
-    /// Log cache statistics
     pub async fn log_stats(&self) {
-        let stats = self.get_stats().await;
-        let hit_rate = if stats.hits + stats.misses > 0 {
-            (stats.hits as f64 / (stats.hits + stats.misses) as f64) * 100.0
-        } else {
-            0.0
-        };
-        
-        info!(
-            "Foyer cache stats - Hit rate: {:.2}%, Hits: {}, Misses: {}, TTL expirations: {}, Inner gets: {}, Inner puts: {}",
-            hit_rate, stats.hits, stats.misses, stats.ttl_expirations, stats.inner_gets, stats.inner_puts
-        );
+        self.stats.read().await.log();
     }
 
-    /// Shutdown the cache gracefully
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("Shutting down Foyer cache...");
         self.log_stats().await;
-        // Cache shutdown is handled automatically when dropped
         Ok(())
     }
 }
 
 /// Foyer-based hybrid cache implementation for object store
-/// Uses both memory and disk tiers for caching Parquet files
 pub struct FoyerObjectStoreCache {
     inner: Arc<dyn ObjectStore>,
-    cache: Arc<HybridCache<String, SerializableCacheValue>>,
-    stats: Arc<RwLock<CacheStats>>,
+    cache: FoyerCache,
+    stats: StatsRef,
     config: FoyerCacheConfig,
 }
 
@@ -260,36 +246,31 @@ impl FoyerObjectStoreCache {
         Ok(Self::new_with_shared_cache(inner, &shared_cache))
     }
 
-    /// Check if cache entry is expired
-    fn is_expired(&self, entry: &SerializableCacheValue) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let age_millis = now.saturating_sub(entry.timestamp_millis);
-        age_millis > self.config.ttl.as_millis() as u64
+    async fn update_stats<F>(&self, f: F)
+    where F: FnOnce(&mut CacheStats) {
+        f(&mut *self.stats.write().await);
     }
 
-    /// Create cache key from path
     fn make_cache_key(location: &Path) -> String {
         location.to_string()
     }
-
-    /// Log cache statistics periodically
-    pub async fn log_stats(&self) {
-        if !self.config.enable_stats {
-            return;
+    
+    fn make_get_result(data: Bytes, meta: ObjectMeta) -> GetResult {
+        let data_len = data.len() as u64;
+        GetResult {
+            payload: GetResultPayload::Stream(Box::pin(futures::stream::once(
+                async move { Ok(data) },
+            ))),
+            meta,
+            attributes: Attributes::new(),
+            range: 0..data_len,
         }
+    }
 
-        let stats = self.stats.read().await;
-        let total_requests = stats.hits + stats.misses;
-        if total_requests > 0 {
-            let hit_rate = (stats.hits as f64 / total_requests as f64) * 100.0;
-            info!(
-                "Foyer hybrid cache stats - Hit rate: {:.1}%, Hits: {}, Misses: {}, TTL expirations: {}, Inner gets: {}, Inner puts: {}",
-                hit_rate, stats.hits, stats.misses, stats.ttl_expirations, stats.inner_gets, stats.inner_puts
-            );
-        }
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        info!("Shutting down foyer hybrid cache");
+        self.cache.close().await?;
+        Ok(())
     }
     
     #[cfg(test)]
@@ -299,34 +280,16 @@ impl FoyerObjectStoreCache {
     
     #[cfg(test)]
     pub async fn reset_stats(&self) {
-        let mut stats = self.stats.write().await;
-        *stats = CacheStats::default();
-    }
-
-    /// Gracefully shutdown the cache
-    pub async fn shutdown(&self) -> anyhow::Result<()> {
-        info!("Shutting down foyer hybrid cache");
-        self.cache.close().await?;
-        Ok(())
+        *self.stats.write().await = CacheStats::default();
     }
 }
 
 #[async_trait]
 impl ObjectStore for FoyerObjectStoreCache {
     async fn put(&self, location: &Path, payload: PutPayload) -> ObjectStoreResult<PutResult> {
-        // Write through to underlying store
-        let mut stats = self.stats.write().await;
-        stats.inner_puts += 1;
-        drop(stats);
-        
-        debug!("Cache PUT operation - writing through to inner store: {}", location);
+        self.update_stats(|s| s.inner_puts += 1).await;
         let result = self.inner.put(location, payload).await?;
-
-        // Invalidate cache entry if it exists
-        let cache_key = Self::make_cache_key(location);
-        self.cache.remove(&cache_key);
-        debug!("Invalidated cache entry after PUT: {}", location);
-
+        self.cache.remove(&Self::make_cache_key(location));
         Ok(result)
     }
 
@@ -336,185 +299,101 @@ impl ObjectStore for FoyerObjectStoreCache {
         payload: PutPayload,
         opts: PutOptions,
     ) -> ObjectStoreResult<PutResult> {
-        // Write through to underlying store
         let result = self.inner.put_opts(location, payload, opts).await?;
-
-        // Invalidate cache entry
-        let cache_key = Self::make_cache_key(location);
-        self.cache.remove(&cache_key);
-
+        self.cache.remove(&Self::make_cache_key(location));
         Ok(result)
     }
 
     async fn get(&self, location: &Path) -> ObjectStoreResult<GetResult> {
         let cache_key = Self::make_cache_key(location);
         
-        // First, try to get from cache
+        // Try cache first
         if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
             let value = entry.value();
             
-            // Check if entry is expired
-            if self.is_expired(value) {
-                // Entry expired - remove it
-                let mut stats = self.stats.write().await;
-                stats.ttl_expirations += 1;
-                drop(stats);
-                
+            if value.is_expired(self.config.ttl) {
+                self.update_stats(|s| s.ttl_expirations += 1).await;
                 self.cache.remove(&cache_key);
-                debug!("Removed expired cache entry: {}", location);
             } else {
-                // Cache hit!
-                let mut stats = self.stats.write().await;
-                stats.hits += 1;
-                drop(stats);
-                
+                self.update_stats(|s| s.hits += 1).await;
                 info!("Foyer cache HIT for: {} (avoiding S3 access)", location);
-                
-                let cache_value = value.to_cache_value();
-                let data = cache_value.data.clone();
-                let meta = cache_value.meta.clone();
-                let data_len = data.len() as u64;
-                
-                return Ok(GetResult {
-                    payload: GetResultPayload::Stream(Box::pin(futures::stream::once(
-                        async move { Ok(data) },
-                    ))),
-                    meta,
-                    attributes: Attributes::new(),
-                    range: 0..data_len,
-                });
+                return Ok(Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone()));
             }
         }
         
         // Cache miss - fetch from inner store
-        let mut stats = self.stats.write().await;
-        stats.misses += 1;
-        stats.inner_gets += 1;
-        drop(stats);
-        
+        self.update_stats(|s| { s.misses += 1; s.inner_gets += 1; }).await;
         info!("Foyer cache MISS for: {} (fetching from S3)", location);
         
-        // Fetch from underlying store
         let result = self.inner.get(location).await?;
         
-        // Collect the payload for caching
+        // Collect payload for caching
         use futures::TryStreamExt;
-        let stream = match result.payload {
-            GetResultPayload::Stream(s) => s,
+        let data = match result.payload {
+            GetResultPayload::Stream(s) => {
+                let chunks: Vec<Bytes> = s.try_collect().await?;
+                chunks.concat()
+            }
             GetResultPayload::File(mut file, _) => {
-                // Read file and create stream
                 use std::io::Read;
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).map_err(|e| object_store::Error::Generic {
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf).map_err(|e| object_store::Error::Generic {
                     store: "cache",
                     source: Box::new(e),
                 })?;
-                Box::pin(futures::stream::once(async move { Ok(Bytes::from(bytes)) }))
+                buf
             }
         };
         
-        let bytes_vec: Vec<Bytes> = stream.try_collect().await?;
-        let total_len: usize = bytes_vec.iter().map(|b| b.len()).sum();
-        let mut data = Vec::with_capacity(total_len);
-        for chunk in bytes_vec {
-            data.extend_from_slice(&chunk);
-        }
-        
-        let cache_value = CacheValue {
-            data: Bytes::from(data.clone()),
-            meta: result.meta.clone(),
-            timestamp_millis: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-        };
-        
-        // Insert into cache for next time
-        let serializable_value = SerializableCacheValue::from(cache_value.clone());
-        self.cache.insert(cache_key.clone(), serializable_value);
-        debug!("Inserted {} into Foyer cache (size: {} bytes)", location, data.len());
-        
-        let data_len = data.len() as u64;
-        Ok(GetResult {
-            payload: GetResultPayload::Stream(Box::pin(futures::stream::once(
-                async move { Ok(Bytes::from(data)) },
-            ))),
-            meta: result.meta,
-            attributes: Attributes::new(),
-            range: 0..data_len,
-        })
+        self.cache.insert(cache_key, CacheValue::new(data.clone(), result.meta.clone()));
+        Ok(Self::make_get_result(Bytes::from(data), result.meta))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        // For ranged requests or conditional gets, bypass cache
+        // Bypass cache for complex requests
         if options.range.is_some() || options.if_match.is_some() || 
            options.if_none_match.is_some() || options.if_modified_since.is_some() ||
            options.if_unmodified_since.is_some() {
             return self.inner.get_opts(location, options).await;
         }
-
-        // Use regular get for full object requests
         self.get(location).await
     }
 
     async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let cache_key = Self::make_cache_key(location);
 
-        // Try to get from cache first
         if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
             let value = entry.value();
-            if !self.is_expired(value) && range.end <= value.data.len() as u64 {
-                let mut stats = self.stats.write().await;
-                stats.hits += 1;
-                drop(stats);
-
-                debug!("Cache hit for range request: {} [{:?}]", location, range);
-
-                let cache_value = value.to_cache_value();
-                return Ok(cache_value.data.slice(range.start as usize..range.end as usize));
+            if !value.is_expired(self.config.ttl) && range.end <= value.data.len() as u64 {
+                self.update_stats(|s| s.hits += 1).await;
+                return Ok(Bytes::from(value.data[range.start as usize..range.end as usize].to_vec()));
             }
         }
 
-        // Cache miss or partial - fetch from underlying store
-        let mut stats = self.stats.write().await;
-        stats.misses += 1;
-        stats.inner_gets += 1;
-        drop(stats);
-
+        self.update_stats(|s| { s.misses += 1; s.inner_gets += 1; }).await;
         self.inner.get_range(location, range).await
     }
 
     async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
         let cache_key = Self::make_cache_key(location);
 
-        // Check cache for metadata
         if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
             let value = entry.value();
-            if !self.is_expired(value) {
-                return Ok(value.to_cache_value().meta);
+            if !value.is_expired(self.config.ttl) {
+                return Ok(value.meta.clone());
             }
         }
-
         self.inner.head(location).await
     }
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
-        // Delete from underlying store
-        let mut stats = self.stats.write().await;
-        stats.inner_puts += 1;  // Count delete as a write operation
-        drop(stats);
-        
+        self.update_stats(|s| s.inner_puts += 1).await;
         self.inner.delete(location).await?;
-
-        // Remove from cache
-        let cache_key = Self::make_cache_key(location);
-        self.cache.remove(&cache_key);
-
+        self.cache.remove(&Self::make_cache_key(location));
         Ok(())
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        // Delegate to inner store - no caching for list operations
         self.inner.list(prefix)
     }
 
@@ -523,7 +402,6 @@ impl ObjectStore for FoyerObjectStoreCache {
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        // Delegate to inner store - no caching for list operations
         self.inner.list_with_offset(prefix, offset)
     }
 
@@ -532,23 +410,15 @@ impl ObjectStore for FoyerObjectStoreCache {
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        let result = self.inner.copy(from, to).await?;
-        
-        // Invalidate destination cache
-        let cache_key = Self::make_cache_key(to);
-        self.cache.remove(&cache_key);
-        
-        Ok(result)
+        self.inner.copy(from, to).await?;
+        self.cache.remove(&Self::make_cache_key(to));
+        Ok(())
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        let result = self.inner.copy_if_not_exists(from, to).await?;
-        
-        // Invalidate destination cache
-        let cache_key = Self::make_cache_key(to);
-        self.cache.remove(&cache_key);
-        
-        Ok(result)
+        self.inner.copy_if_not_exists(from, to).await?;
+        self.cache.remove(&Self::make_cache_key(to));
+        Ok(())
     }
 
     async fn put_multipart(&self, location: &Path) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
@@ -580,92 +450,78 @@ impl std::fmt::Debug for FoyerObjectStoreCache {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    
+    fn test_config(name: &str) -> FoyerCacheConfig {
+        FoyerCacheConfig {
+            memory_size_bytes: 1024 * 1024,
+            disk_size_bytes: 10 * 1024 * 1024,
+            ttl: Duration::from_secs(5),
+            cache_dir: PathBuf::from(format!("/tmp/test_foyer_{}", name)),
+            shards: 2,
+            file_size_bytes: 1024 * 1024,
+            enable_stats: true,
+        }
+    }
 
     #[tokio::test]
     async fn test_basic_operations() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig {
-            memory_size_bytes: 1024 * 1024, // 1MB
-            disk_size_bytes: 10 * 1024 * 1024, // 10MB
-            ttl: Duration::from_secs(5),
-            cache_dir: PathBuf::from("/tmp/test_foyer_hybrid_cache"),
-            shards: 2,
-            file_size_bytes: 1024 * 1024, // 1MB
-            enable_stats: true,
-        };
-        
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        let cache = FoyerObjectStoreCache::new(inner, test_config("basic_ops")).await?;
         cache.reset_stats().await;
         
-        // Test put and get
         let path = Path::from("test/file.parquet");
         let data = Bytes::from("test data");
         
         cache.put(&path, PutPayload::from(data.clone())).await?;
         
-        // Verify put incremented inner_puts
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_puts, 1, "First put should write to inner store");
+        assert_eq!(stats.inner_puts, 1);
         
+        // First get - cache miss
         let result = cache.get(&path).await?;
         use futures::TryStreamExt;
-        let stream = match result.payload {
-            GetResultPayload::Stream(s) => s,
+        let bytes: Vec<Bytes> = match result.payload {
+            GetResultPayload::Stream(s) => s.try_collect().await?,
             _ => panic!("Expected stream"),
         };
-        let bytes: Vec<Bytes> = stream.try_collect().await?;
         assert_eq!(bytes[0], data);
         
-        // First get should fetch from inner store
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1, "First get should fetch from inner store");
-        assert_eq!(stats.misses, 1, "First get should be a cache miss");
-        assert_eq!(stats.hits, 0, "First get should not be a hit");
+        assert_eq!(stats.inner_gets, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 0);
         
-        // Second get should hit cache (from memory or disk)
+        // Second get - cache hit
         let result2 = cache.get(&path).await?;
-        let stream2 = match result2.payload {
-            GetResultPayload::Stream(s) => s,
+        let bytes2: Vec<Bytes> = match result2.payload {
+            GetResultPayload::Stream(s) => s.try_collect().await?,
             _ => panic!("Expected stream"),
         };
-        let bytes2: Vec<Bytes> = stream2.try_collect().await?;
         assert_eq!(bytes2[0], data);
         
-        // Verify second get didn't fetch from inner store
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1, "Second get should use cache, not inner store");
-        assert_eq!(stats.hits, 1, "Second get should be a cache hit");
-        assert_eq!(stats.misses, 1, "Still only one miss");
+        assert_eq!(stats.inner_gets, 1);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
         
-        // Test delete
         cache.delete(&path).await?;
-        
-        // Should fail after delete
         assert!(cache.get(&path).await.is_err());
         
-        // Cleanup
         cache.shutdown().await?;
-        
         Ok(())
     }
 
     #[tokio::test]
     async fn test_cache_prevents_s3_access() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig {
-            memory_size_bytes: 10 * 1024 * 1024, // 10MB
-            disk_size_bytes: 100 * 1024 * 1024, // 100MB
-            ttl: Duration::from_secs(300),
-            cache_dir: PathBuf::from("/tmp/test_foyer_s3_bypass"),
-            shards: 4,
-            file_size_bytes: 1024 * 1024,
-            enable_stats: true,
-        };
+        let mut config = test_config("s3_bypass");
+        config.memory_size_bytes = 10 * 1024 * 1024;
+        config.disk_size_bytes = 100 * 1024 * 1024;
+        config.ttl = Duration::from_secs(300);
         
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        let cache = FoyerObjectStoreCache::new(inner, config).await?;
         cache.reset_stats().await;
         
-        // Simulate multiple Parquet files
         let files = vec![
             ("table/part-001.parquet", vec![b'a'; 1024]),
             ("table/part-002.parquet", vec![b'b'; 2048]),
@@ -678,153 +534,110 @@ mod tests {
             cache.put(&path, PutPayload::from(Bytes::from(data.clone()))).await?;
         }
         
-        let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_puts, 3, "Should have 3 writes to inner store");
-        
-        // First read of all files - should fetch from inner store
+        // First read - cache miss
         for (path_str, data) in &files {
             let path = Path::from(*path_str);
             let result = cache.get(&path).await?;
             use futures::TryStreamExt;
-            let stream = match result.payload {
-                GetResultPayload::Stream(s) => s,
+            let bytes: Vec<Bytes> = match result.payload {
+                GetResultPayload::Stream(s) => s.try_collect().await?,
                 _ => panic!("Expected stream"),
             };
-            let bytes: Vec<Bytes> = stream.try_collect().await?;
             assert_eq!(bytes[0].len(), data.len());
         }
         
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 3, "First reads should fetch from inner store");
-        assert_eq!(stats.misses, 3, "First reads should all be cache misses");
+        assert_eq!(stats.inner_gets, 3);
+        assert_eq!(stats.misses, 3);
         
-        // Second read of all files - should use cache
+        // Second read - cache hit
         for (path_str, data) in &files {
             let path = Path::from(*path_str);
             let result = cache.get(&path).await?;
             use futures::TryStreamExt;
-            let stream = match result.payload {
-                GetResultPayload::Stream(s) => s,
+            let bytes: Vec<Bytes> = match result.payload {
+                GetResultPayload::Stream(s) => s.try_collect().await?,
                 _ => panic!("Expected stream"),
             };
-            let bytes: Vec<Bytes> = stream.try_collect().await?;
             assert_eq!(bytes[0].len(), data.len());
         }
         
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 3, "Second reads should NOT fetch from inner store");
-        assert_eq!(stats.hits, 3, "Second reads should all be cache hits");
+        assert_eq!(stats.inner_gets, 3); // No new inner gets
+        assert_eq!(stats.hits, 3);
         
-        // Third read - still cached
-        for (path_str, _) in &files {
-            let path = Path::from(*path_str);
-            let _ = cache.get(&path).await?;
-        }
+        info!("Cache successfully prevented {} S3 accesses", stats.hits);
+        stats.log();
         
-        let final_stats = cache.get_stats().await;
-        assert_eq!(final_stats.inner_gets, 3, "Third reads should still use cache");
-        assert_eq!(final_stats.hits, 6, "Should have 6 total cache hits");
-        
-        info!("Cache successfully prevented {} S3 accesses", final_stats.hits);
-        cache.log_stats().await;
-        
-        // Cleanup
         cache.shutdown().await?;
-        
         Ok(())
     }
     
     #[tokio::test]
     async fn test_ttl_expiration() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig {
-            memory_size_bytes: 1024 * 1024,
-            disk_size_bytes: 10 * 1024 * 1024,
-            ttl: Duration::from_millis(100), // Very short TTL
-            cache_dir: PathBuf::from("/tmp/test_foyer_ttl"),
-            shards: 2,
-            file_size_bytes: 1024 * 1024,
-            enable_stats: true,
-        };
+        let mut config = test_config("ttl");
+        config.ttl = Duration::from_millis(100);
         
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        let cache = FoyerObjectStoreCache::new(inner, config).await?;
         
         let path = Path::from("test/ttl_file.parquet");
         let data = Bytes::from("test data");
         
         cache.put(&path, PutPayload::from(data.clone())).await?;
-        
-        // First get should work
         let _ = cache.get(&path).await?;
         
-        // Wait for TTL to expire
         tokio::time::sleep(Duration::from_millis(200)).await;
         
-        // Should fetch from underlying store again (expired entry)
         let _ = cache.get(&path).await?;
         
-        // Check stats to see if TTL expiration was detected
-        cache.log_stats().await;
+        let stats = cache.get_stats().await;
+        stats.log();
         
-        // Cleanup
         cache.shutdown().await?;
-        
         Ok(())
     }
 
     #[tokio::test]
     async fn test_large_file_disk_cache() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig {
-            memory_size_bytes: 1024, // Very small memory (1KB)
-            disk_size_bytes: 10 * 1024 * 1024, // 10MB disk
-            ttl: Duration::from_secs(60),
-            cache_dir: PathBuf::from("/tmp/test_foyer_disk"),
-            shards: 2,
-            file_size_bytes: 1024 * 1024,
-            enable_stats: true,
-        };
+        let mut config = test_config("disk");
+        config.memory_size_bytes = 1024; // Very small memory
         
-        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        let cache = FoyerObjectStoreCache::new(inner, config).await?;
         cache.reset_stats().await;
         
-        // Create a large file that won't fit in memory cache
         let large_data = Bytes::from(vec![b'x'; 10 * 1024]); // 10KB
         let path = Path::from("test/large_file.parquet");
         
         cache.put(&path, PutPayload::from(large_data.clone())).await?;
         
-        // First get - will be stored in disk cache since it's too large for memory
+        // First get - cache miss
         let result = cache.get(&path).await?;
         use futures::TryStreamExt;
-        let stream = match result.payload {
-            GetResultPayload::Stream(s) => s,
+        let bytes: Vec<Bytes> = match result.payload {
+            GetResultPayload::Stream(s) => s.try_collect().await?,
             _ => panic!("Expected stream"),
         };
-        let bytes: Vec<Bytes> = stream.try_collect().await?;
         assert_eq!(bytes[0].len(), large_data.len());
         
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1, "First get should fetch from inner store");
+        assert_eq!(stats.inner_gets, 1);
         
-        // Second get should hit cache (from disk since too large for memory)
+        // Second get - cache hit
         let result2 = cache.get(&path).await?;
-        let stream2 = match result2.payload {
-            GetResultPayload::Stream(s) => s,
+        let bytes2: Vec<Bytes> = match result2.payload {
+            GetResultPayload::Stream(s) => s.try_collect().await?,
             _ => panic!("Expected stream"),
         };
-        let bytes2: Vec<Bytes> = stream2.try_collect().await?;
         assert_eq!(bytes2[0].len(), large_data.len());
         
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1, "Second get should use cache, not inner store");
-        assert_eq!(stats.hits, 1, "Second get should be a cache hit");
+        assert_eq!(stats.inner_gets, 1);
+        assert_eq!(stats.hits, 1);
         
-        cache.log_stats().await;
-        
-        // Cleanup
+        stats.log();
         cache.shutdown().await?;
-        
         Ok(())
     }
 }

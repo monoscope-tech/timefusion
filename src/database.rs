@@ -31,11 +31,7 @@ use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
-use ahash::AHasher;
-use lru::LruCache;
 use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -77,8 +73,6 @@ struct StorageConfig {
     s3_endpoint: Option<String>,
 }
 
-/// Type alias for query plan cache to reduce complexity
-type QueryPlanCache = Arc<RwLock<LruCache<(String, u64), Arc<dyn ExecutionPlan>>>>;
 
 #[derive(Debug)]
 pub struct Database {
@@ -95,8 +89,6 @@ pub struct Database {
     default_s3_endpoint: Option<String>,
     // Object store cache (optional)
     object_store_cache: Option<Arc<SharedFoyerCache>>,
-    // Query plan cache (project_id, query_hash) -> ExecutionPlan
-    query_plan_cache: QueryPlanCache,
     // Statistics extractor for Delta Lake tables
     statistics_extractor: Arc<DeltaStatisticsExtractor>,
     // Track last written versions for read-after-write consistency
@@ -116,7 +108,6 @@ impl Clone for Database {
             default_s3_prefix: self.default_s3_prefix.clone(),
             default_s3_endpoint: self.default_s3_endpoint.clone(),
             object_store_cache: self.object_store_cache.clone(),
-            query_plan_cache: Arc::clone(&self.query_plan_cache),
             statistics_extractor: Arc::clone(&self.statistics_extractor),
             last_written_versions: Arc::clone(&self.last_written_versions),
         }
@@ -292,15 +283,6 @@ impl Database {
             }
         };
         
-        // Initialize query plan cache with configurable size (default 100 entries)
-        let cache_size = env::var("TIMEFUSION_QUERY_PLAN_CACHE_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(100);
-        let query_plan_cache = Arc::new(RwLock::new(
-            LruCache::new(NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(100).unwrap()))
-        ));
-        
         // Initialize statistics extractor with configurable cache size
         let stats_cache_size = env::var("TIMEFUSION_STATS_CACHE_SIZE")
             .ok()
@@ -318,7 +300,6 @@ impl Database {
             default_s3_prefix: Some(default_s3_prefix.clone()),
             default_s3_endpoint,
             object_store_cache,
-            query_plan_cache,
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
         };
@@ -546,16 +527,13 @@ impl Database {
                         let table = table.read().await;
                         let current_version = table.version().unwrap_or(0);
                         
-                        // Check if statistics need refresh based on version
-                        if db.statistics_extractor.needs_refresh(project_id, table_name, current_version).await {
-                            // Get the schema for this table
-                            let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
-                            let schema = schema_def.schema_ref();
-                            if let Err(e) = db.statistics_extractor.extract_statistics(&*table, project_id, table_name, &schema).await {
-                                error!("Failed to refresh statistics for {}:{}: {}", project_id, table_name, e);
-                            } else {
-                                debug!("Refreshed statistics for {}:{} (version {})", project_id, table_name, current_version);
-                            }
+                        // Always refresh statistics after clearing cache
+                        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
+                        let schema = schema_def.schema_ref();
+                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, project_id, table_name, &schema).await {
+                            error!("Failed to refresh statistics for {}:{}: {}", project_id, table_name, e);
+                        } else {
+                            debug!("Refreshed statistics for {}:{} (version {})", project_id, table_name, current_version);
                         }
                     }
                 })
@@ -1410,97 +1388,9 @@ impl ProjectRoutingTable {
         )
     }
     
-    /// Compute a hash key for query plan caching
-    fn compute_query_cache_key(
-        project_id: &str,
-        filters: &[Expr],
-        projection: Option<&Vec<usize>>,
-        limit: Option<usize>,
-    ) -> u64 {
-        let mut hasher = AHasher::default();
-        
-        // Hash the query components
-        project_id.hash(&mut hasher);
-        
-        // Hash filters using proper expression hashing
-        for filter in filters {
-            Self::hash_expr(filter, &mut hasher);
-        }
-        
-        // Hash projection
-        if let Some(proj) = projection {
-            proj.hash(&mut hasher);
-        }
-        
-        // Hash limit
-        limit.hash(&mut hasher);
-        
-        hasher.finish()
-    }
-    
-    /// Recursively hash an expression for cache key computation
-    fn hash_expr(expr: &Expr, hasher: &mut AHasher) {
-        use datafusion::logical_expr::expr::{InList, Between, ScalarFunction};
-        
-        match expr {
-            Expr::Column(col) => {
-                "Column".hash(hasher);
-                col.name.hash(hasher);
-            }
-            Expr::Literal(scalar, _) => {
-                "Literal".hash(hasher);
-                format!("{:?}", scalar).hash(hasher);
-            }
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
-                "BinaryExpr".hash(hasher);
-                Self::hash_expr(left, hasher);
-                format!("{:?}", op).hash(hasher);
-                Self::hash_expr(right, hasher);
-            }
-            Expr::Not(inner) => {
-                "Not".hash(hasher);
-                Self::hash_expr(inner, hasher);
-            }
-            Expr::IsNull(inner) => {
-                "IsNull".hash(hasher);
-                Self::hash_expr(inner, hasher);
-            }
-            Expr::IsNotNull(inner) => {
-                "IsNotNull".hash(hasher);
-                Self::hash_expr(inner, hasher);
-            }
-            Expr::InList(InList { expr, list, negated }) => {
-                "InList".hash(hasher);
-                Self::hash_expr(expr, hasher);
-                for item in list {
-                    Self::hash_expr(item, hasher);
-                }
-                negated.hash(hasher);
-            }
-            Expr::Between(Between { expr, negated, low, high }) => {
-                "Between".hash(hasher);
-                Self::hash_expr(expr, hasher);
-                negated.hash(hasher);
-                Self::hash_expr(low, hasher);
-                Self::hash_expr(high, hasher);
-            }
-            Expr::ScalarFunction(ScalarFunction { func, args }) => {
-                "ScalarFunction".hash(hasher);
-                format!("{:?}", func).hash(hasher);
-                for arg in args {
-                    Self::hash_expr(arg, hasher);
-                }
-            }
-            _ => {
-                // For other expression types, use debug representation as fallback
-                format!("{:?}", expr).hash(hasher);
-            }
-        }
-    }
-    
     /// Apply time-series specific optimizations to filters
     fn apply_time_series_optimizations(&self, filters: &[Expr]) -> DFResult<Vec<Expr>> {
-        use crate::optimizers::TimeRangePartitionPruner;
+        use crate::optimizers::time_range_partition_pruner;
         
         let mut optimized_filters = Vec::new();
         let mut has_date_filter = false;
@@ -1517,7 +1407,7 @@ impl ProjectRoutingTable {
         if !has_date_filter {
             for filter in filters {
                 // Check if this is a timestamp filter that needs a date filter added
-                if let Some(date_filter) = TimeRangePartitionPruner::timestamp_to_date_filter(filter) {
+                if let Some(date_filter) = time_range_partition_pruner::timestamp_to_date_filter(filter) {
                     optimized_filters.push(date_filter);
                     debug!("Added date partition filter for timestamp query optimization");
                 }
@@ -1559,7 +1449,7 @@ impl ProjectRoutingTable {
             Ok(table_ref) => {
                 let table = table_ref.read().await;
                 self.database.statistics_extractor
-                    .extract_statistics(&*table, &project_id, &self.table_name, &self.schema)
+                    .extract_statistics(&table, &project_id, &self.table_name, &self.schema)
                     .await
             }
             Err(e) => {
@@ -1688,55 +1578,10 @@ impl TableProvider for ProjectRoutingTable {
         // Get project_id from filters if possible, otherwise use default
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
 
-        // Get current table version for cache invalidation
-        let table_version = {
-            let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
-            let table = delta_table.read().await;
-            table.version().unwrap_or(0)
-        };
-        
-        // Create cache key based on project_id, filters, projection, limit, and table version
-        let mut cache_key = Self::compute_query_cache_key(&project_id, &optimized_filters, projection, limit);
-        // Mix in table version to invalidate cache when data changes
-        cache_key = cache_key.wrapping_add(table_version as u64);
-        
-        // Check cache first
-        {
-            let mut cache = self.database.query_plan_cache.write().await;
-            if let Some(cached_plan) = cache.get(&(project_id.clone(), cache_key)) {
-                debug!("Query plan cache hit for project_id: {}, key: {}", project_id, cache_key);
-                return Ok(cached_plan.clone());
-            }
-        }
-        
         // Execute query and create plan with optimized filters
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
         let table = delta_table.read().await;
-        let mut plan = table.scan(state, projection, &optimized_filters, limit).await?;
-        
-        // Apply physical optimizers for time-series patterns
-        {
-            use crate::physical_optimizers::TimeSeriesPhysicalOptimizers;
-            let optimizers = TimeSeriesPhysicalOptimizers::new();
-            let config = state.config_options();
-            match optimizers.optimize(plan.clone(), &config) {
-                Ok(optimized) => {
-                    debug!("Applied physical optimizers to query plan");
-                    plan = optimized;
-                }
-                Err(e) => {
-                    debug!("Physical optimization failed, using original plan: {}", e);
-                }
-            }
-        }
-        
-        // Cache the optimized plan (LRU will handle eviction automatically)
-        {
-            let mut cache = self.database.query_plan_cache.write().await;
-            cache.put((project_id.clone(), cache_key), plan.clone());
-            debug!("Cached optimized query plan for project_id: {}, key: {}, cache size: {}", 
-                   project_id, cache_key, cache.len());
-        }
+        let plan = table.scan(state, projection, &optimized_filters, limit).await?;
         
         Ok(plan)
     }
@@ -1971,7 +1816,7 @@ mod tests {
 
         // Verify all 3 records exist
         let sql = "SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'project1'";
-        let result = ctx.sql(&sql).await?.collect().await?;
+        let result = ctx.sql(sql).await?.collect().await?;
         let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(count, 3);
 
