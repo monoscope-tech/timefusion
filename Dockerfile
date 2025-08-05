@@ -22,6 +22,7 @@ RUN cargo build --release
 
 # Copy the full source code, including dashboard.html
 COPY src/ src/
+COPY schemas/ schemas/
 
 # Build the real release binary
 RUN cargo build --release
