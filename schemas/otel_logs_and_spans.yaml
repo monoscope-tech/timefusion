@@ -13,10 +13,10 @@ z_order_columns:
   - resource___service___name
 fields:
   - name: timestamp
-    data_type: "Timestamp(Microsecond, Some(\"UTC\"))"
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
     nullable: false
   - name: observed_timestamp
-    data_type: "Timestamp(Microsecond, Some(\"UTC\"))"
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
     nullable: true
   - name: id
     data_type: Utf8
@@ -58,10 +58,10 @@ fields:
     data_type: Int64
     nullable: true
   - name: start_time
-    data_type: "Timestamp(Microsecond, Some(\"UTC\"))"
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
     nullable: true
   - name: end_time
-    data_type: "Timestamp(Microsecond, Some(\"UTC\"))"
+    data_type: 'Timestamp(Microsecond, Some("UTC"))'
     nullable: true
   - name: context
     data_type: Utf8
@@ -267,6 +267,10 @@ fields:
   - name: project_id
     data_type: Utf8
     nullable: false
+  - name: summary
+    data_type: Utf8
+    nullable: false
   - name: date
     data_type: Date32
     nullable: false
+
