@@ -36,8 +36,8 @@ mod integration {
 
             tokio::spawn(async move {
                 let db = Database::new().await.expect("Failed to create database");
-                let ctx = db.create_session_context();
-                db.setup_session_context(&ctx).expect("Failed to setup context");
+                let mut ctx = db.create_session_context();
+                db.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new()
                     .with_port(port)

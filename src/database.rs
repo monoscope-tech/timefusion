@@ -22,6 +22,7 @@ use datafusion::{
     logical_expr::{dml::InsertOp, BinaryExpr},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
+use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::checkpoints;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
@@ -627,7 +628,7 @@ impl Database {
     }
 
     /// Setup the session context with tables and register DataFusion tables
-    pub fn setup_session_context(&self, ctx: &SessionContext) -> DFResult<()> {
+    pub fn setup_session_context(&self, ctx: &mut SessionContext) -> DFResult<()> {
         use crate::schema_loader::registry;
 
         // Get batch queue from the app state if available
@@ -652,6 +653,7 @@ impl Database {
 
         self.register_pg_settings_table(ctx)?;
         self.register_set_config_udf(ctx);
+        self.register_json_functions(ctx);
 
         Ok(())
     }
@@ -733,6 +735,12 @@ impl Database {
         );
 
         ctx.register_udf(set_config_udf);
+    }
+
+    /// Register JSON functions from datafusion-functions-json
+    pub fn register_json_functions(&self, ctx: &mut SessionContext) {
+        datafusion_functions_json::register_all(ctx).expect("Failed to register JSON functions");
+        info!("Registered JSON functions with SessionContext");
     }
 
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
@@ -1771,7 +1779,7 @@ mod tests {
         let db = Database::new().await?;
         let mut ctx = db.create_session_context();
         datafusion_functions_json::register_all(&mut ctx)?;
-        db.setup_session_context(&ctx)?;
+        db.setup_session_context(&mut ctx)?;
         Ok((db, ctx))
     }
 

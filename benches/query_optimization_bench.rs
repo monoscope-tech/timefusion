@@ -40,9 +40,9 @@ fn query_with_statistics(c: &mut Criterion) {
         b.to_async(&rt).iter(|| {
             let db = db.clone();
             async move {
-                let ctx = db.create_session_context();
-                datafusion::functions_json::register_all(&mut ctx).unwrap();
-                db.setup_session_context(&ctx).unwrap();
+                let mut ctx = db.create_session_context();
+                datafusion_functions_json::register_all(&mut ctx).unwrap();
+                db.setup_session_context(&mut ctx).unwrap();
                 
                 // Execute a query that benefits from statistics
                 let result = ctx.sql(
@@ -64,9 +64,9 @@ fn query_with_physical_optimization(c: &mut Criterion) {
         b.to_async(&rt).iter(|| {
             let db = db.clone();
             async move {
-                let ctx = db.create_session_context();
-                datafusion::functions_json::register_all(&mut ctx).unwrap();
-                db.setup_session_context(&ctx).unwrap();
+                let mut ctx = db.create_session_context();
+                datafusion_functions_json::register_all(&mut ctx).unwrap();
+                db.setup_session_context(&mut ctx).unwrap();
                 
                 // Execute a time-bucketed aggregation that benefits from physical optimizers
                 let result = ctx.sql(

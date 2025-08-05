@@ -183,8 +183,8 @@ mod sqllogictest_tests {
 
         tokio::spawn(async move {
             let db = Database::new().await.expect("Failed to create database");
-            let session_context = db.create_session_context();
-            db.setup_session_context(&session_context).expect("Failed to setup session context");
+            let mut session_context = db.create_session_context();
+            db.setup_session_context(&mut session_context).expect("Failed to setup session context");
 
             let opts = ServerOptions::new()
                 .with_port(5433)
