@@ -5,46 +5,46 @@
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    name, level, status_code, status_message, duration
+    name, level, status_code, status_message, duration, summary
 ) VALUES (
     'filter_test', TIMESTAMP '2023-01-01T10:00:00Z', 'span_info_ok', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'info_operation', 'INFO', 'OK', 'Success', 100000000
+    'info_operation', 'INFO', 'OK', 'Success', 100000000, 'Info operation successful - INFO level'
 )
 
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    name, level, status_code, status_message, duration
+    name, level, status_code, status_message, duration, summary
 ) VALUES (
     'filter_test', TIMESTAMP '2023-01-01T10:05:00Z', 'span_error', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'error_operation', 'ERROR', 'ERROR', 'Database connection failed', 200000000
+    'error_operation', 'ERROR', 'ERROR', 'Database connection failed', 200000000, 'Error operation failed - ERROR level'
 )
 
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    name, level, status_code, status_message, duration
+    name, level, status_code, status_message, duration, summary
 ) VALUES (
     'filter_test', TIMESTAMP '2023-01-01T10:10:00Z', 'span_debug_ok', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'debug_operation', 'DEBUG', 'OK', 'Debug trace', 50000000
+    'debug_operation', 'DEBUG', 'OK', 'Debug trace', 50000000, 'Debug operation trace - DEBUG level'
 )
 
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    name, level, status_code, status_message, duration
+    name, level, status_code, status_message, duration, summary
 ) VALUES (
     'filter_test', TIMESTAMP '2023-01-01T10:15:00Z', 'span_warn', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'warning_operation', 'WARN', 'OK', 'Slow response', 300000000
+    'warning_operation', 'WARN', 'OK', 'Slow response', 300000000, 'Warning operation slow - WARN level'
 )
 
 statement ok
 INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
-    name, level, status_code, status_message, duration
+    name, level, status_code, status_message, duration, summary
 ) VALUES (
     'filter_test', TIMESTAMP '2023-01-01T10:20:00Z', 'span_critical', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'critical_operation', 'ERROR', 'INTERNAL_ERROR', 'System failure', 500000000
+    'critical_operation', 'ERROR', 'INTERNAL_ERROR', 'System failure', 500000000, 'Critical system failure - ERROR level'
 )
 
 # Test filtering by level

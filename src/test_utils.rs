@@ -40,7 +40,8 @@ pub mod test_helpers {
             "name": name,
             "project_id": project_id,
             "date": chrono::Utc::now().date_naive().to_string(),
-            "hashes": []
+            "hashes": [],
+            "summary": format!("Test span: {}", name)
         })
     }
 }

@@ -1,6 +1,7 @@
 /target
 /queue_db
 .env
+.env.prod
 users.json
 data/
 minio

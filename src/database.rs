@@ -1,5 +1,5 @@
+use crate::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
 use crate::schema_loader::{get_default_schema, get_schema};
-use crate::object_store_cache::{FoyerObjectStoreCache, FoyerCacheConfig, SharedFoyerCache};
 use crate::statistics::DeltaStatisticsExtractor;
 use anyhow::Result;
 use arrow_schema::SchemaRef;
@@ -73,7 +73,6 @@ struct StorageConfig {
     s3_endpoint: Option<String>,
 }
 
-
 #[derive(Debug)]
 pub struct Database {
     project_configs: ProjectConfigs,
@@ -118,7 +117,7 @@ impl Database {
     /// Build storage options with consistent configuration including DynamoDB locking if enabled
     fn build_storage_options(&self) -> HashMap<String, String> {
         let mut storage_options = HashMap::new();
-        
+
         // Add AWS credentials
         if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
             storage_options.insert("aws_access_key_id".to_string(), access_key);
@@ -129,12 +128,12 @@ impl Database {
         if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
             storage_options.insert("aws_region".to_string(), region);
         }
-        
+
         // Add endpoint if available
         if let Some(ref endpoint) = self.default_s3_endpoint {
             storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
         }
-        
+
         // Add DynamoDB locking configuration if enabled
         if let Ok(locking_provider) = env::var("AWS_S3_LOCKING_PROVIDER") {
             if locking_provider == "dynamodb" {
@@ -142,7 +141,7 @@ impl Database {
                 if let Ok(table_name) = env::var("DELTA_DYNAMO_TABLE_NAME") {
                     storage_options.insert("delta_dynamo_table_name".to_string(), table_name);
                 }
-                
+
                 // Add DynamoDB-specific credentials if available
                 if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID_DYNAMODB") {
                     storage_options.insert("aws_access_key_id_dynamodb".to_string(), access_key);
@@ -158,26 +157,10 @@ impl Database {
                 }
             }
         }
-        
-        // When using custom storage backend with DynamoDB, we need to allow unsafe rename
-        // This is because with_storage_backend bypasses Delta's internal factory that sets up DynamoDB
-        if storage_options.get("aws_s3_locking_provider") == Some(&"dynamodb".to_string()) {
-            storage_options.remove("conditional_put");
-            // IMPORTANT: When using a custom storage backend (like our Foyer cache),
-            // Delta Lake can't automatically set up the DynamoDB log store.
-            // We use unsafe rename as a temporary solution while maintaining cache benefits.
-            storage_options.insert("aws_s3_allow_unsafe_rename".to_string(), "true".to_string());
-            info!("Using custom storage backend with DynamoDB config - enabled unsafe rename for S3 compatibility");
-        }
-        
-        // Also check for the environment variable and add it if set
-        if env::var("AWS_S3_ALLOW_UNSAFE_RENAME").unwrap_or_default() == "true" {
-            storage_options.insert("aws_s3_allow_unsafe_rename".to_string(), "true".to_string());
-        }
-        
+
         // Debug log the storage options
         info!("Storage options configured: {:?}", storage_options);
-        
+
         storage_options
     }
     /// Creates standard writer properties used across different operations
@@ -226,7 +209,7 @@ impl Database {
         // Try to update with retries for eventual consistency
         let mut retries = 0;
         const MAX_RETRIES: u32 = 5;
-        
+
         loop {
             let mut table_write = table.write().await;
             match table_write.update().await {
@@ -242,14 +225,17 @@ impl Database {
                 Err(e) => {
                     // Release the lock before retrying
                     drop(table_write);
-                    
+
                     retries += 1;
                     if retries >= MAX_RETRIES {
                         error!("Failed to update table for {}/{} after {} retries: {}", project_id, table_name, MAX_RETRIES, e);
                         return Err(anyhow::anyhow!("Failed to update table: {}", e));
                     }
-                    
-                    debug!("Failed to update table for {}/{} (attempt {}/{}): {}, retrying...", project_id, table_name, retries, MAX_RETRIES, e);
+
+                    debug!(
+                        "Failed to update table for {}/{} (attempt {}/{}): {}, retrying...",
+                        project_id, table_name, retries, MAX_RETRIES, e
+                    );
                     // Exponential backoff with jitter
                     let delay = 100 * retries as u64 + (retries as u64 * 50);
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
@@ -303,15 +289,15 @@ impl Database {
         let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
-        
+
         // Check for DynamoDB locking configuration
         let locking_provider = env::var("AWS_S3_LOCKING_PROVIDER").ok();
         let dynamo_table_name = env::var("DELTA_DYNAMO_TABLE_NAME").ok();
-        
+
         if let (Some(provider), Some(table)) = (&locking_provider, &dynamo_table_name) {
             if provider == "dynamodb" {
                 info!("DynamoDB locking enabled with table: {}", table);
-                
+
                 // Log all relevant DynamoDB environment variables
                 if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL_DYNAMODB") {
                     info!("DynamoDB endpoint: {}", endpoint);
@@ -319,14 +305,17 @@ impl Database {
                 if let Ok(region) = env::var("AWS_REGION_DYNAMODB") {
                     info!("DynamoDB region: {}", region);
                 }
-                info!("DynamoDB credentials configured: access_key={}, secret_key={}", 
+                info!(
+                    "DynamoDB credentials configured: access_key={}, secret_key={}",
                     env::var("AWS_ACCESS_KEY_ID_DYNAMODB").is_ok(),
                     env::var("AWS_SECRET_ACCESS_KEY_DYNAMODB").is_ok()
                 );
             }
         } else {
-            info!("DynamoDB locking not configured. AWS_S3_LOCKING_PROVIDER={:?}, DELTA_DYNAMO_TABLE_NAME={:?}", 
-                locking_provider, dynamo_table_name);
+            info!(
+                "DynamoDB locking not configured. AWS_S3_LOCKING_PROVIDER={:?}, DELTA_DYNAMO_TABLE_NAME={:?}",
+                locking_provider, dynamo_table_name
+            );
         }
 
         // Store default S3 settings for unconfigured mode
@@ -350,17 +339,18 @@ impl Database {
         };
 
         let project_configs = HashMap::new();
-        
+
         // Initialize object store cache BEFORE creating any tables
         // This ensures all tables benefit from caching
         let object_store_cache = {
             let config = FoyerCacheConfig::from_env();
-            info!("Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, TTL: {}s)",
+            info!(
+                "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, TTL: {}s)",
                 config.memory_size_bytes / 1024 / 1024,
                 config.disk_size_bytes / 1024 / 1024 / 1024,
                 config.ttl.as_secs()
             );
-            
+
             match SharedFoyerCache::new(config).await {
                 Ok(cache) => {
                     info!("Shared Foyer cache initialized successfully for all tables");
@@ -372,14 +362,11 @@ impl Database {
                 }
             }
         };
-        
+
         // Initialize statistics extractor with configurable cache size
-        let stats_cache_size = env::var("TIMEFUSION_STATS_CACHE_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(50);
+        let stats_cache_size = env::var("TIMEFUSION_STATS_CACHE_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
         let statistics_extractor = Arc::new(DeltaStatisticsExtractor::new(stats_cache_size, 300));
-        
+
         let db = Self {
             project_configs: Arc::new(RwLock::new(project_configs)),
             batch_queue: None,
@@ -406,25 +393,19 @@ impl Database {
             // Populate storage options with AWS credentials and DynamoDB locking if enabled
             let mut storage_options = db.build_storage_options();
             storage_options.insert("aws_endpoint".to_string(), aws_endpoint.clone());
-            
+
             // Create the cached object store for the default table
             let table = if let Some(ref shared_cache) = db.object_store_cache {
                 // Create base S3 object store
                 let base_store = db.create_object_store(&storage_uri, &storage_options).await?;
-                
+
                 // Wrap with the shared Foyer cache
                 let cached_store = Arc::new(FoyerObjectStoreCache::new_with_shared_cache(base_store, shared_cache)) as Arc<dyn object_store::ObjectStore>;
-                
+
                 info!("Default table will use Foyer cache for all object store operations");
-                
+
                 // Load or create table with cached store
-                match DeltaTableBuilder::from_uri(&storage_uri)
-                    .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
-                    .with_storage_options(storage_options.clone())
-                    .with_allow_http(true)
-                    .load()
-                    .await
-                {
+                match db.create_or_load_delta_table(&storage_uri, storage_options.clone(), cached_store.clone()).await {
                     Ok(table) => {
                         let version = table.version().unwrap_or(0);
                         let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
@@ -442,7 +423,7 @@ impl Database {
                         log::warn!("Table doesn't exist for default project. Creating new table. err: {:?}", err);
 
                         let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
-                        
+
                         // Create table with storage options
                         // When using DynamoDB locking, we let Delta Lake handle the storage backend creation
                         let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
@@ -455,14 +436,9 @@ impl Database {
                             .with_storage_options(storage_options.clone())
                             .with_commit_properties(commit_properties)
                             .await?;
-                        
+
                         // After creation, reload the table with cached store
-                        DeltaTableBuilder::from_uri(&storage_uri)
-                            .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
-                            .with_storage_options(storage_options.clone())
-                            .with_allow_http(true)
-                            .load()
-                            .await?
+                        db.create_or_load_delta_table(&storage_uri, storage_options.clone(), cached_store.clone()).await?
                     }
                 }
             } else {
@@ -519,7 +495,7 @@ impl Database {
         self.batch_queue = Some(batch_queue);
         self
     }
-    
+
     /// Enable object store cache with foyer (deprecated - cache is now initialized in new())
     /// This method is kept for backward compatibility but is now a no-op
     pub async fn with_object_store_cache(self) -> Result<Self> {
@@ -573,7 +549,7 @@ impl Database {
         })?;
 
         scheduler.add(vacuum_job).await?;
-        
+
         // Cache stats job - every 5 minutes
         let cache_stats_job = Job::new_async("0 */5 * * * *", {
             let db = db.clone();
@@ -584,16 +560,16 @@ impl Database {
                     if let Some(ref cache) = db.object_store_cache {
                         cache.log_stats().await;
                     }
-                    
+
                     // Log statistics cache stats
                     let (used, capacity) = db.statistics_extractor.get_cache_stats().await;
                     info!("Statistics cache: {}/{} entries used", used, capacity);
                 })
             }
         })?;
-        
+
         scheduler.add(cache_stats_job).await?;
-        
+
         // Statistics refresh job - every 15 minutes
         let stats_refresh_job = Job::new_async("0 */15 * * * *", {
             let db = db.clone();
@@ -602,12 +578,12 @@ impl Database {
                 Box::pin(async move {
                     info!("Refreshing Delta Lake statistics cache");
                     db.statistics_extractor.clear_cache().await;
-                    
+
                     // Pre-warm cache for active tables
                     for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
                         let table = table.read().await;
                         let current_version = table.version().unwrap_or(0);
-                        
+
                         // Always refresh statistics after clearing cache
                         let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
                         let schema = schema_def.schema_ref();
@@ -620,7 +596,7 @@ impl Database {
                 })
             }
         })?;
-        
+
         scheduler.add(stats_refresh_job).await?;
 
         // Start the scheduler
@@ -644,7 +620,7 @@ impl Database {
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
-        
+
         // Enable Parquet statistics for better query optimization with Delta Lake
         // These settings ensure DataFusion uses file and column statistics for pruning
         let _ = options.set("datafusion.execution.parquet.enable_statistics", "true");
@@ -652,37 +628,37 @@ impl Database {
         let _ = options.set("datafusion.execution.parquet.enable_page_index", "true");
         let _ = options.set("datafusion.execution.parquet.pruning", "true");
         let _ = options.set("datafusion.execution.parquet.skip_metadata", "false");
-        
+
         // Enable general statistics collection for query optimization
         let _ = options.set("datafusion.execution.collect_statistics", "true");
-        
+
         // Enable bloom filter pruning if available in Parquet files
         let _ = options.set("datafusion.execution.parquet.bloom_filter_on_read", "true");
-        
+
         // Time-series optimized settings
         // Larger batch size for better throughput with time-series data
         let _ = options.set("datafusion.execution.batch_size", "8192");
-        
+
         // Optimize for sorted data (timestamps are typically sorted)
         let _ = options.set("datafusion.optimizer.prefer_existing_sort", "true");
-        
+
         // Enable repartition for better parallel aggregations
         let _ = options.set("datafusion.optimizer.repartition_aggregations", "true");
-        
+
         // Disable round-robin repartitioning to maintain sort order
         let _ = options.set("datafusion.optimizer.enable_round_robin_repartition", "false");
-        
+
         // Enable filter and limit pushdown optimizations
         let _ = options.set("datafusion.optimizer.filter_null_join_keys", "true");
         let _ = options.set("datafusion.optimizer.skip_failed_rules", "false");
-        
+
         // Memory management for large time-series queries
         let _ = options.set("datafusion.execution.coalesce_batches", "true");
         let _ = options.set("datafusion.execution.coalesce_target_batch_size", "8192");
-        
+
         // Enable all optimizer rules for maximum optimization
         let _ = options.set("datafusion.optimizer.max_passes", "5");
-        
+
         SessionContext::new_with_config(options.into())
     }
 
@@ -812,20 +788,25 @@ impl Database {
                     let versions = self.last_written_versions.read().await;
                     versions.get(&(project_id.to_string(), table_name.to_string())).cloned()
                 };
-                
+
                 // Check current version without holding the lock too long
                 let current_version = table.read().await.version();
-                
+
                 // Only update if we don't have a recent write or if the table version is behind
                 let should_update = match (current_version, last_written_version) {
                     (Some(current), Some(last)) => {
                         let needs_update = current < last;
-                        debug!("Version check for {}/{}: current={}, last_written={}, needs_update={}", 
-                               project_id, table_name, current, last, needs_update);
+                        debug!(
+                            "Version check for {}/{}: current={}, last_written={}, needs_update={}",
+                            project_id, table_name, current, last, needs_update
+                        );
                         needs_update
                     }
                     (None, Some(last)) => {
-                        debug!("No current version for {}/{}, but last_written={}, will skip update", project_id, table_name, last);
+                        debug!(
+                            "No current version for {}/{}, but last_written={}, will skip update",
+                            project_id, table_name, last
+                        );
                         // If we have a last written version but no current version, it means
                         // we just wrote to a new table and it hasn't been loaded yet
                         false
@@ -839,7 +820,7 @@ impl Database {
                         true
                     }
                 };
-                
+
                 if should_update {
                     self.update_table(table, project_id, table_name)
                         .await
@@ -847,7 +828,7 @@ impl Database {
                 } else {
                     debug!("Skipping update for {}/{} - using cached version", project_id, table_name);
                 }
-                
+
                 return Ok(Arc::clone(table));
             }
         }
@@ -895,7 +876,7 @@ impl Database {
             if let Some(ref endpoint) = config.s3_endpoint {
                 storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
             }
-            
+
             // Add DynamoDB locking configuration if enabled (even for project-specific configs)
             if let Ok(locking_provider) = env::var("AWS_S3_LOCKING_PROVIDER") {
                 if locking_provider == "dynamodb" {
@@ -903,7 +884,7 @@ impl Database {
                     if let Ok(table_name) = env::var("DELTA_DYNAMO_TABLE_NAME") {
                         storage_options.insert("delta_dynamo_table_name".to_string(), table_name);
                     }
-                    
+
                     // Add DynamoDB-specific credentials if available
                     if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID_DYNAMODB") {
                         storage_options.insert("aws_access_key_id_dynamodb".to_string(), access_key);
@@ -926,10 +907,10 @@ impl Database {
             let prefix = self.default_s3_prefix.as_ref().unwrap();
             let endpoint = self.default_s3_endpoint.as_ref().unwrap();
             let storage_uri = format!("s3://{}/{}/projects/{}/{}/?endpoint={}", bucket, prefix, project_id, table_name, endpoint);
-            
+
             // Populate storage options with AWS credentials and DynamoDB locking if enabled
             let storage_options = self.build_storage_options();
-            
+
             (storage_uri, storage_options)
         } else {
             return Err(anyhow::anyhow!(
@@ -954,7 +935,7 @@ impl Database {
 
         // Create the base S3 object store
         let base_store = self.create_object_store(&storage_uri, &storage_options).await?;
-        
+
         // Wrap with the shared Foyer cache
         let cached_store = if let Some(ref shared_cache) = self.object_store_cache {
             // Create a new wrapper around the base store using our shared cache
@@ -963,15 +944,9 @@ impl Database {
         } else {
             return Err(anyhow::anyhow!("Shared Foyer cache not initialized"));
         };
-        
+
         // Try to load or create the table with the cached object store
-        let table = match DeltaTableBuilder::from_uri(&storage_uri)
-            .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
-            .with_storage_options(storage_options.clone())
-            .with_allow_http(true)
-            .load()
-            .await
-        {
+        let table = match self.create_or_load_delta_table(&storage_uri, storage_options.clone(), cached_store.clone()).await {
             Ok(table) => {
                 info!("Loaded existing table for project '{}' table '{}'", project_id, table_name);
                 table
@@ -1003,22 +978,20 @@ impl Database {
                         Ok(table) => break table,
                         Err(create_err) => {
                             let err_str = create_err.to_string();
-                            if (err_str.contains("already exists") || err_str.contains("version 0") 
-                                || err_str.contains("ConditionalCheckFailedException")) && create_attempts < 3 {
+                            if (err_str.contains("already exists") || err_str.contains("version 0") || err_str.contains("ConditionalCheckFailedException"))
+                                && create_attempts < 3
+                            {
                                 // Table was created by another process or DynamoDB lock conflict, try to load it
-                                debug!("Table creation conflict (possibly DynamoDB lock), attempting to load existing table (attempt {})", create_attempts);
+                                debug!(
+                                    "Table creation conflict (possibly DynamoDB lock), attempting to load existing table (attempt {})",
+                                    create_attempts
+                                );
                                 // Exponential backoff
                                 let backoff_ms = 100 * (2_u64.pow(create_attempts.min(5)));
                                 tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
 
                                 // Try to load the table that was just created
-                                match DeltaTableBuilder::from_uri(&storage_uri)
-                                    .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
-                                    .with_storage_options(storage_options.clone())
-                                    .with_allow_http(true)
-                                    .load()
-                                    .await
-                                {
+                                match self.create_or_load_delta_table(&storage_uri, storage_options.clone(), cached_store.clone()).await {
                                     Ok(table) => break table,
                                     Err(reload_err) => {
                                         debug!("Failed to load table after creation conflict: {:?}", reload_err);
@@ -1043,21 +1016,16 @@ impl Database {
     }
 
     /// Create an object store for the given URI and storage options
-    async fn create_object_store(
-        &self,
-        storage_uri: &str,
-        storage_options: &HashMap<String, String>,
-    ) -> Result<Arc<dyn object_store::ObjectStore>> {
+    async fn create_object_store(&self, storage_uri: &str, storage_options: &HashMap<String, String>) -> Result<Arc<dyn object_store::ObjectStore>> {
         use object_store::aws::AmazonS3Builder;
-        
+
         // Parse the S3 URI to extract bucket and prefix
         let url = Url::parse(storage_uri)?;
         let bucket = url.host_str().ok_or_else(|| anyhow::anyhow!("Invalid S3 URI: missing bucket"))?;
-        
+
         // Build S3 configuration
-        let mut builder = AmazonS3Builder::new()
-            .with_bucket_name(bucket);
-        
+        let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+
         // Apply storage options
         if let Some(access_key) = storage_options.get("aws_access_key_id") {
             builder = builder.with_access_key_id(access_key);
@@ -1075,7 +1043,7 @@ impl Database {
                 builder = builder.with_allow_http(true);
             }
         }
-        
+
         // Use environment variables as fallback
         if storage_options.get("aws_access_key_id").is_none() {
             if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
@@ -1092,7 +1060,7 @@ impl Database {
                 builder = builder.with_region(region);
             }
         }
-        
+
         // Check if we need to use environment variable for endpoint and allow HTTP
         if storage_options.get("aws_endpoint").is_none() {
             if let Ok(endpoint) = env::var("AWS_S3_ENDPOINT") {
@@ -1102,17 +1070,32 @@ impl Database {
                 }
             }
         }
-        
+
         let store = builder.build()?;
-        
+
         // Log if DynamoDB locking is enabled for this store
         if storage_options.get("aws_s3_locking_provider") == Some(&"dynamodb".to_string()) {
             if let Some(table_name) = storage_options.get("delta_dynamo_table_name") {
                 debug!("Object store configured with DynamoDB locking using table: {}", table_name);
             }
         }
-        
+
         Ok(Arc::new(store))
+    }
+
+    /// Creates or loads a DeltaTable with proper configuration
+    /// When DynamoDB locking is enabled, we have to use the standard DeltaTableBuilder
+    /// without custom storage backend to ensure proper log store initialization
+    async fn create_or_load_delta_table(
+        &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
+    ) -> Result<DeltaTable> {
+        DeltaTableBuilder::from_uri(storage_uri)
+            .with_storage_backend(cached_store.clone(), Url::parse(storage_uri)?)
+            .with_storage_options(storage_options.clone())
+            .with_allow_http(true)
+            .load()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))
     }
 
     pub async fn insert_records_batch(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
@@ -1178,24 +1161,31 @@ impl Database {
                     } else {
                         debug!("WARNING: No version available after write for {}/{}", project_id, table_name);
                     }
-                    
+
                     *table = new_table;
-                    
+
                     // Invalidate statistics cache after successful write
                     drop(table); // Release write lock before async operation
                     self.statistics_extractor.invalidate(&project_id, &table_name).await;
                     debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
-                    
+
                     return Ok(());
                 }
                 Err(e) => {
                     let error_str = e.to_string();
-                    if error_str.contains("already exists") || error_str.contains("conflict") || error_str.contains("version") 
-                        || error_str.contains("ConditionalCheckFailedException") || error_str.contains("concurrent modification") {
+                    if error_str.contains("already exists")
+                        || error_str.contains("conflict")
+                        || error_str.contains("version")
+                        || error_str.contains("ConditionalCheckFailedException")
+                        || error_str.contains("concurrent modification")
+                    {
                         // This is a version conflict or DynamoDB locking conflict, retry
                         retry_count += 1;
                         last_error = Some(e);
-                        debug!("Delta write conflict detected (possibly DynamoDB lock conflict), retrying... (attempt {}/{})", retry_count, max_retries);
+                        debug!(
+                            "Delta write conflict detected (possibly DynamoDB lock conflict), retrying... (attempt {}/{})",
+                            retry_count, max_retries
+                        );
 
                         // Exponential backoff for better handling of concurrent writes
                         let backoff_ms = 100 * (2_u64.pow(retry_count.min(5)));
@@ -1337,7 +1327,7 @@ impl Database {
             Err(e) => error!("Vacuum operation failed: {}", e),
         }
     }
-    
+
     /// Get table statistics using the statistics extractor
     pub async fn get_table_statistics(&self, table: &DeltaTable, project_id: &str, table_name: &str) -> Result<Statistics> {
         // Get the schema for this table
@@ -1345,42 +1335,42 @@ impl Database {
         let schema = schema_def.schema_ref();
         self.statistics_extractor.extract_statistics(table, project_id, table_name, &schema).await
     }
-    
+
     /// Clear the statistics cache
     pub async fn clear_statistics_cache(&self) {
         self.statistics_extractor.clear_cache().await
     }
-    
+
     /// Invalidate statistics for a specific table
     pub async fn invalidate_table_statistics(&self, project_id: &str, table_name: &str) {
         self.statistics_extractor.invalidate(project_id, table_name).await
     }
-    
+
     /// Gracefully shutdown the database, including cache and maintenance tasks
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down TimeFusion database...");
-        
+
         // Cancel maintenance tasks
         self.maintenance_shutdown.cancel();
-        
+
         // Shutdown batch queue if present
         if let Some(ref queue) = self.batch_queue {
             info!("Flushing batch queue...");
             queue.shutdown().await;
         }
-        
+
         // Log final cache stats and shutdown cache
         if let Some(ref cache) = self.object_store_cache {
             info!("Shutting down Foyer cache...");
             cache.log_stats().await;
             cache.shutdown().await?;
         }
-        
+
         // Close PostgreSQL connection pool if present
         if let Some(ref pool) = self.config_pool {
             pool.close().await;
         }
-        
+
         info!("Database shutdown complete");
         Ok(())
     }
@@ -1446,22 +1436,23 @@ impl ProjectRoutingTable {
     fn is_exact_pushdown_filter(expr: &Expr) -> bool {
         match expr {
             // AND expressions are exact if all parts are exact (check this first)
-            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
-                Self::is_exact_pushdown_filter(left) && Self::is_exact_pushdown_filter(right)
-            }
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::And,
+                right,
+            }) => Self::is_exact_pushdown_filter(left) && Self::is_exact_pushdown_filter(right),
             // Simple column comparisons are exact
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let is_column_literal = matches!(
                     (left.as_ref(), right.as_ref()),
                     (Expr::Column(_), Expr::Literal(_, _)) | (Expr::Literal(_, _), Expr::Column(_))
                 );
-                
+
                 let is_supported_op = matches!(
                     op,
-                    Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq | 
-                    Operator::Gt | Operator::GtEq
+                    Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq
                 );
-                
+
                 if is_column_literal && is_supported_op {
                     // Check if it's a partition column or indexed column
                     if let Expr::Column(col) = left.as_ref() {
@@ -1489,18 +1480,17 @@ impl ProjectRoutingTable {
     fn is_pushdown_column(column_name: &str) -> bool {
         matches!(
             column_name,
-            "project_id" | "date" | "timestamp" | "id" | "level" | "status_code" | 
-            "resource___service___name" | "name" | "duration"
+            "project_id" | "date" | "timestamp" | "id" | "level" | "status_code" | "resource___service___name" | "name" | "duration"
         )
     }
-    
+
     /// Apply time-series specific optimizations to filters
     fn apply_time_series_optimizations(&self, filters: &[Expr]) -> DFResult<Vec<Expr>> {
         use crate::optimizers::time_range_partition_pruner;
-        
+
         let mut optimized_filters = Vec::new();
         let mut has_date_filter = false;
-        
+
         // First, check if we already have a date filter to avoid duplicates
         for filter in filters {
             if Self::is_date_filter(filter) {
@@ -1508,7 +1498,7 @@ impl ProjectRoutingTable {
             }
             optimized_filters.push(filter.clone());
         }
-        
+
         // Only add date filters if we don't already have one
         if !has_date_filter {
             for filter in filters {
@@ -1519,15 +1509,15 @@ impl ProjectRoutingTable {
                 }
             }
         }
-        
+
         // Check if project_id filter is present
         if !self.has_project_id_in_filters(&optimized_filters) {
             debug!("Query missing project_id filter - may scan all partitions");
         }
-        
+
         Ok(optimized_filters)
     }
-    
+
     /// Check if an expression is a date filter
     fn is_date_filter(expr: &Expr) -> bool {
         match expr {
@@ -1537,26 +1527,23 @@ impl ProjectRoutingTable {
             _ => false,
         }
     }
-    
+
     /// Check if filters contain a project_id filter
     fn has_project_id_in_filters(&self, filters: &[Expr]) -> bool {
         use crate::optimizers::ProjectIdPushdown;
         ProjectIdPushdown::has_project_id_filter(filters)
     }
-    
+
     /// Get actual statistics from Delta Lake metadata
     async fn get_delta_statistics(&self) -> Result<Statistics> {
         // Get the Delta table for the default project or first available
-        let project_id = self.extract_project_id_from_filters(&[])
-            .unwrap_or_else(|| self.default_project.clone());
-        
+        let project_id = self.extract_project_id_from_filters(&[]).unwrap_or_else(|| self.default_project.clone());
+
         // Try to get the table
         match self.database.resolve_table(&project_id, &self.table_name).await {
             Ok(table_ref) => {
                 let table = table_ref.read().await;
-                self.database.statistics_extractor
-                    .extract_statistics(&table, &project_id, &self.table_name, &self.schema)
-                    .await
+                self.database.statistics_extractor.extract_statistics(&table, &project_id, &self.table_name, &self.schema).await
             }
             Err(e) => {
                 debug!("Failed to resolve table for statistics: {}", e);
@@ -1680,7 +1667,7 @@ impl TableProvider for ProjectRoutingTable {
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Apply our custom optimizations to the filters
         let optimized_filters = self.apply_time_series_optimizations(filters)?;
-        
+
         // Get project_id from filters if possible, otherwise use default
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
 
@@ -1688,7 +1675,7 @@ impl TableProvider for ProjectRoutingTable {
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
         let table = delta_table.read().await;
         let plan = table.scan(state, projection, &optimized_filters, limit).await?;
-        
+
         Ok(plan)
     }
     fn statistics(&self) -> Option<Statistics> {
@@ -1810,7 +1797,8 @@ mod tests {
                 "status_code": "OK",
                 "duration": 100_000_000,
                 "date": now.date_naive().to_string(),
-                "hashes": []
+                "hashes": [],
+                "summary": "Test span 1 - INFO level"
             }),
             json!({
                 "timestamp": (now + chrono::Duration::minutes(10)).timestamp_micros(),
@@ -1822,7 +1810,8 @@ mod tests {
                 "status_message": "Error occurred",
                 "duration": 200_000_000,
                 "date": now.date_naive().to_string(),
-                "hashes": []
+                "hashes": [],
+                "summary": "Test span 2 - ERROR level"
             }),
         ];
 
@@ -1871,10 +1860,10 @@ mod tests {
 
         // Insert via SQL
         let sql = "INSERT INTO otel_logs_and_spans (
-                   project_id, date, timestamp, id, hashes, name, level, status_code
+                   project_id, date, timestamp, id, hashes, name, level, status_code, summary
                  ) VALUES (
                    'project2', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 
-                   'sql_id', ARRAY[], 'sql_name', 'INFO', 'OK'
+                   'sql_id', ARRAY[], 'sql_name', 'INFO', 'OK', 'SQL inserted test span'
                  )";
         let result = ctx.sql(sql).await?.collect().await?;
         assert_eq!(result[0].num_rows(), 1);
@@ -1909,11 +1898,11 @@ mod tests {
 
         // Test multi-row INSERT
         let sql = "INSERT INTO otel_logs_and_spans (
-                   project_id, date, timestamp, id, hashes, name, level, status_code
+                   project_id, date, timestamp, id, hashes, name, level, status_code, summary
                  ) VALUES 
-                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'id1', ARRAY[], 'name1', 'INFO', 'OK'),
-                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK'),
-                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR')";
+                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'id1', ARRAY[], 'name1', 'INFO', 'OK', 'Multi-row insert test 1'),
+                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK', 'Multi-row insert test 2'),
+                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR', 'Multi-row insert test 3 - ERROR')";
 
         // Multi-row INSERT returns a count of rows inserted
         let result = ctx.sql(sql).await?.collect().await?;
@@ -1952,7 +1941,8 @@ mod tests {
                 "name": "early_span",
                 "project_id": "test",
                 "date": base_time.date_naive().to_string(),
-                "hashes": []
+                "hashes": [],
+                "summary": "Early span for timestamp test"
             }),
             json!({
                 "timestamp": (base_time + chrono::Duration::hours(2)).timestamp_micros(),
@@ -1960,7 +1950,8 @@ mod tests {
                 "name": "late_span",
                 "project_id": "test",
                 "date": base_time.date_naive().to_string(),
-                "hashes": []
+                "hashes": [],
+                "summary": "Late span for timestamp test"
             }),
         ];
 

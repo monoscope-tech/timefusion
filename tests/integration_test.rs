@@ -83,8 +83,8 @@ mod integration {
 
         fn insert_sql() -> String {
             format!(
-                "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes) 
-                 VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[])",
+                "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) 
+                 VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[], $7)",
                 chrono::Utc::now().date_naive(),
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
             )
@@ -107,7 +107,7 @@ mod integration {
         // Insert and verify single record
         client.execute(&insert, &[
             &"test_project", &server.test_id, &"test_span_name", 
-            &"OK", &"Test integration", &"INFO"
+            &"OK", &"Test integration", &"INFO", &"Integration test summary"
         ]).await?;
 
         let count: i64 = client
@@ -130,7 +130,8 @@ mod integration {
             client.execute(&insert, &[
                 &"test_project", &Uuid::new_v4().to_string(), 
                 &format!("batch_span_{i}"), &"OK", 
-                &format!("Batch test {i}"), &"INFO"
+                &format!("Batch test {i}"), &"INFO",
+                &format!("Batch test summary {i}")
             ]).await?;
         }
 
@@ -147,7 +148,7 @@ mod integration {
             .query("SELECT * FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1", 
                    &[&"test_project"])
             .await?;
-        assert_eq!(rows[0].columns().len(), 86);
+        assert_eq!(rows[0].columns().len(), 87);
 
         Ok(())
     }
@@ -175,7 +176,8 @@ mod integration {
                     client.execute(&insert, &[
                         &"test_project", &span_id,
                         &format!("concurrent_span_{client_id}_{op}"),
-                        &"OK", &"Test", &"INFO"
+                        &"OK", &"Test", &"INFO",
+                        &format!("Concurrent test summary: client {} op {}", client_id, op)
                     ]).await?;
                     
                     // Mix in queries to simulate real workload

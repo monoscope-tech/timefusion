@@ -52,6 +52,8 @@ For multi-writer scenarios where multiple instances of TimeFusion may write to t
 
 This configuration ensures safe concurrent writes to Delta tables by using DynamoDB for distributed locking.
 
+**Note for S3-Compatible Storage (e.g., OVH, MinIO)**: When using S3-compatible stores that don't support conditional PUT operations, DynamoDB locking is strongly recommended to prevent data corruption in multi-writer scenarios. See [DELTA_CONFIG.md](DELTA_CONFIG.md) for detailed configuration options and trade-offs.
+
 ## Usage
 
 There currently exists only 1 table. otel_logs_and_spans.

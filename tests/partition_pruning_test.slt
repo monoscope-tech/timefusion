@@ -4,23 +4,23 @@
 # Insert test data across different dates
 statement ok
 INSERT INTO otel_logs_and_spans (
-    project_id, timestamp, id, hashes, date, name
+    project_id, timestamp, id, hashes, date, name, summary
 ) VALUES (
-    'prune_test', TIMESTAMP '2024-01-01T10:00:00Z', 'span1', ARRAY[]::VARCHAR[], DATE '2024-01-01', 'operation1'
+    'prune_test', TIMESTAMP '2024-01-01T10:00:00Z', 'span1', ARRAY[]::VARCHAR[], DATE '2024-01-01', 'operation1', 'Partition pruning test span 1'
 )
 
 statement ok
 INSERT INTO otel_logs_and_spans (
-    project_id, timestamp, id, hashes, date, name
+    project_id, timestamp, id, hashes, date, name, summary
 ) VALUES (
-    'prune_test', TIMESTAMP '2024-01-02T10:00:00Z', 'span2', ARRAY[]::VARCHAR[], DATE '2024-01-02', 'operation2'
+    'prune_test', TIMESTAMP '2024-01-02T10:00:00Z', 'span2', ARRAY[]::VARCHAR[], DATE '2024-01-02', 'operation2', 'Partition pruning test span 2'
 )
 
 statement ok
 INSERT INTO otel_logs_and_spans (
-    project_id, timestamp, id, hashes, date, name
+    project_id, timestamp, id, hashes, date, name, summary
 ) VALUES (
-    'prune_test', TIMESTAMP '2024-01-03T10:00:00Z', 'span3', ARRAY[]::VARCHAR[], DATE '2024-01-03', 'operation3'
+    'prune_test', TIMESTAMP '2024-01-03T10:00:00Z', 'span3', ARRAY[]::VARCHAR[], DATE '2024-01-03', 'operation3', 'Partition pruning test span 3'
 )
 
 # Query with timestamp filter - optimizer should add date filter for partition pruning
