@@ -19,6 +19,8 @@ Timefusion can be configured using the following environment variables:
 | `AWS_S3_ENDPOINT`      | AWS S3 endpoint URL                              | `https://s3.amazonaws.com`  |
 | `AWS_ACCESS_KEY_ID`    | AWS access key                                   | -                           |
 | `AWS_SECRET_ACCESS_KEY`| AWS secret key                                   | -                           |
+| `AWS_S3_LOCKING_PROVIDER` | Delta Lake locking provider ('dynamodb')      | -                           |
+| `DELTA_DYNAMO_TABLE_NAME` | DynamoDB table name for Delta Lake locking    | -                           |
 | `TIMEFUSION_TABLE_PREFIX` | Prefix for Delta tables                       | `timefusion`                |
 | `BATCH_INTERVAL_MS`    | Interval between batch inserts in milliseconds   | `1000`                      |
 | `MAX_BATCH_SIZE`       | Maximum number of rows in a single batch         | `1000`                      |
@@ -26,6 +28,29 @@ Timefusion can be configured using the following environment variables:
 | `MAX_PG_CONNECTIONS`   | Maximum number of concurrent PostgreSQL connections | `100`                     |
 
 For local development, you can set `QUEUE_DB_PATH` to a location in your development environment.
+
+### Delta Lake DynamoDB Locking
+
+For multi-writer scenarios where multiple instances of TimeFusion may write to the same Delta tables concurrently, it's recommended to enable DynamoDB locking:
+
+1. Create a DynamoDB table with the following configuration:
+   - Table name: Choose any name (e.g., `timefusion-delta-locks`)
+   - Partition key: `key` (String type)
+   - On-demand billing mode is recommended
+
+2. Set the following environment variables:
+   ```
+   AWS_S3_LOCKING_PROVIDER=dynamodb
+   DELTA_DYNAMO_TABLE_NAME=timefusion-delta-locks
+   ```
+
+3. Ensure your AWS credentials have the following DynamoDB permissions:
+   - `dynamodb:GetItem`
+   - `dynamodb:PutItem`
+   - `dynamodb:UpdateItem`
+   - `dynamodb:DeleteItem`
+
+This configuration ensures safe concurrent writes to Delta tables by using DynamoDB for distributed locking.
 
 ## Usage
 

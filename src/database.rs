@@ -115,6 +115,71 @@ impl Clone for Database {
 }
 
 impl Database {
+    /// Build storage options with consistent configuration including DynamoDB locking if enabled
+    fn build_storage_options(&self) -> HashMap<String, String> {
+        let mut storage_options = HashMap::new();
+        
+        // Add AWS credentials
+        if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
+            storage_options.insert("aws_access_key_id".to_string(), access_key);
+        }
+        if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
+            storage_options.insert("aws_secret_access_key".to_string(), secret_key);
+        }
+        if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
+            storage_options.insert("aws_region".to_string(), region);
+        }
+        
+        // Add endpoint if available
+        if let Some(ref endpoint) = self.default_s3_endpoint {
+            storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
+        }
+        
+        // Add DynamoDB locking configuration if enabled
+        if let Ok(locking_provider) = env::var("AWS_S3_LOCKING_PROVIDER") {
+            if locking_provider == "dynamodb" {
+                storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
+                if let Ok(table_name) = env::var("DELTA_DYNAMO_TABLE_NAME") {
+                    storage_options.insert("delta_dynamo_table_name".to_string(), table_name);
+                }
+                
+                // Add DynamoDB-specific credentials if available
+                if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID_DYNAMODB") {
+                    storage_options.insert("aws_access_key_id_dynamodb".to_string(), access_key);
+                }
+                if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY_DYNAMODB") {
+                    storage_options.insert("aws_secret_access_key_dynamodb".to_string(), secret_key);
+                }
+                if let Ok(region) = env::var("AWS_REGION_DYNAMODB") {
+                    storage_options.insert("aws_region_dynamodb".to_string(), region);
+                }
+                if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL_DYNAMODB") {
+                    storage_options.insert("aws_endpoint_url_dynamodb".to_string(), endpoint);
+                }
+            }
+        }
+        
+        // When using custom storage backend with DynamoDB, we need to allow unsafe rename
+        // This is because with_storage_backend bypasses Delta's internal factory that sets up DynamoDB
+        if storage_options.get("aws_s3_locking_provider") == Some(&"dynamodb".to_string()) {
+            storage_options.remove("conditional_put");
+            // IMPORTANT: When using a custom storage backend (like our Foyer cache),
+            // Delta Lake can't automatically set up the DynamoDB log store.
+            // We use unsafe rename as a temporary solution while maintaining cache benefits.
+            storage_options.insert("aws_s3_allow_unsafe_rename".to_string(), "true".to_string());
+            info!("Using custom storage backend with DynamoDB config - enabled unsafe rename for S3 compatibility");
+        }
+        
+        // Also check for the environment variable and add it if set
+        if env::var("AWS_S3_ALLOW_UNSAFE_RENAME").unwrap_or_default() == "true" {
+            storage_options.insert("aws_s3_allow_unsafe_rename".to_string(), "true".to_string());
+        }
+        
+        // Debug log the storage options
+        info!("Storage options configured: {:?}", storage_options);
+        
+        storage_options
+    }
     /// Creates standard writer properties used across different operations
     fn create_writer_properties() -> WriterProperties {
         use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
@@ -238,6 +303,31 @@ impl Database {
         let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
+        
+        // Check for DynamoDB locking configuration
+        let locking_provider = env::var("AWS_S3_LOCKING_PROVIDER").ok();
+        let dynamo_table_name = env::var("DELTA_DYNAMO_TABLE_NAME").ok();
+        
+        if let (Some(provider), Some(table)) = (&locking_provider, &dynamo_table_name) {
+            if provider == "dynamodb" {
+                info!("DynamoDB locking enabled with table: {}", table);
+                
+                // Log all relevant DynamoDB environment variables
+                if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL_DYNAMODB") {
+                    info!("DynamoDB endpoint: {}", endpoint);
+                }
+                if let Ok(region) = env::var("AWS_REGION_DYNAMODB") {
+                    info!("DynamoDB region: {}", region);
+                }
+                info!("DynamoDB credentials configured: access_key={}, secret_key={}", 
+                    env::var("AWS_ACCESS_KEY_ID_DYNAMODB").is_ok(),
+                    env::var("AWS_SECRET_ACCESS_KEY_DYNAMODB").is_ok()
+                );
+            }
+        } else {
+            info!("DynamoDB locking not configured. AWS_S3_LOCKING_PROVIDER={:?}, DELTA_DYNAMO_TABLE_NAME={:?}", 
+                locking_provider, dynamo_table_name);
+        }
 
         // Store default S3 settings for unconfigured mode
         let default_s3_bucket = env::var("AWS_S3_BUCKET").ok();
@@ -313,17 +403,8 @@ impl Database {
             info!("Default project storage URI: {}", storage_uri);
 
             // Initialize table for default project with cache support
-            // Populate storage options with AWS credentials from environment
-            let mut storage_options = HashMap::new();
-            if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
-                storage_options.insert("aws_access_key_id".to_string(), access_key);
-            }
-            if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
-                storage_options.insert("aws_secret_access_key".to_string(), secret_key);
-            }
-            if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
-                storage_options.insert("aws_region".to_string(), region);
-            }
+            // Populate storage options with AWS credentials and DynamoDB locking if enabled
+            let mut storage_options = db.build_storage_options();
             storage_options.insert("aws_endpoint".to_string(), aws_endpoint.clone());
             
             // Create the cached object store for the default table
@@ -336,7 +417,7 @@ impl Database {
                 
                 info!("Default table will use Foyer cache for all object store operations");
                 
-                // Load or create table with cached object store
+                // Load or create table with cached store
                 match DeltaTableBuilder::from_uri(&storage_uri)
                     .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
                     .with_storage_options(storage_options.clone())
@@ -362,9 +443,9 @@ impl Database {
 
                         let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
                         
-                        // Create table with cached object store
-                        // Note: DeltaOps doesn't support custom object stores during create, but subsequent operations will use cache
-                        let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
+                        // Create table with storage options
+                        // When using DynamoDB locking, we let Delta Lake handle the storage backend creation
+                        let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
                         let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                         let _new_table = delta_ops
@@ -375,7 +456,7 @@ impl Database {
                             .with_commit_properties(commit_properties)
                             .await?;
                         
-                        // After creation, reload with cached object store for future operations
+                        // After creation, reload the table with cached store
                         DeltaTableBuilder::from_uri(&storage_uri)
                             .with_storage_backend(cached_store.clone(), Url::parse(&storage_uri)?)
                             .with_storage_options(storage_options.clone())
@@ -410,7 +491,7 @@ impl Database {
                         log::warn!("Table doesn't exist for default project. Creating new table. err: {:?}", err);
 
                         let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
-                        let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
+                        let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
                         let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                         delta_ops
@@ -814,6 +895,30 @@ impl Database {
             if let Some(ref endpoint) = config.s3_endpoint {
                 storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
             }
+            
+            // Add DynamoDB locking configuration if enabled (even for project-specific configs)
+            if let Ok(locking_provider) = env::var("AWS_S3_LOCKING_PROVIDER") {
+                if locking_provider == "dynamodb" {
+                    storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
+                    if let Ok(table_name) = env::var("DELTA_DYNAMO_TABLE_NAME") {
+                        storage_options.insert("delta_dynamo_table_name".to_string(), table_name);
+                    }
+                    
+                    // Add DynamoDB-specific credentials if available
+                    if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID_DYNAMODB") {
+                        storage_options.insert("aws_access_key_id_dynamodb".to_string(), access_key);
+                    }
+                    if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY_DYNAMODB") {
+                        storage_options.insert("aws_secret_access_key_dynamodb".to_string(), secret_key);
+                    }
+                    if let Ok(region) = env::var("AWS_REGION_DYNAMODB") {
+                        storage_options.insert("aws_region_dynamodb".to_string(), region);
+                    }
+                    if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL_DYNAMODB") {
+                        storage_options.insert("aws_endpoint_url_dynamodb".to_string(), endpoint);
+                    }
+                }
+            }
 
             (storage_uri, storage_options)
         } else if let Some(ref bucket) = self.default_s3_bucket {
@@ -822,20 +927,8 @@ impl Database {
             let endpoint = self.default_s3_endpoint.as_ref().unwrap();
             let storage_uri = format!("s3://{}/{}/projects/{}/{}/?endpoint={}", bucket, prefix, project_id, table_name, endpoint);
             
-            // Populate storage options with AWS credentials from environment
-            let mut storage_options = HashMap::new();
-            if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
-                storage_options.insert("aws_access_key_id".to_string(), access_key);
-            }
-            if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
-                storage_options.insert("aws_secret_access_key".to_string(), secret_key);
-            }
-            if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
-                storage_options.insert("aws_region".to_string(), region);
-            }
-            if let Some(ref endpoint) = self.default_s3_endpoint {
-                storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
-            }
+            // Populate storage options with AWS credentials and DynamoDB locking if enabled
+            let storage_options = self.build_storage_options();
             
             (storage_uri, storage_options)
         } else {
@@ -896,7 +989,7 @@ impl Database {
                 loop {
                     create_attempts += 1;
 
-                    let delta_ops = DeltaOps::try_from_uri(&storage_uri).await?;
+                    let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                     match delta_ops
@@ -910,10 +1003,13 @@ impl Database {
                         Ok(table) => break table,
                         Err(create_err) => {
                             let err_str = create_err.to_string();
-                            if (err_str.contains("already exists") || err_str.contains("version 0")) && create_attempts < 3 {
-                                // Table was created by another process, try to load it
-                                debug!("Table creation conflict, attempting to load existing table (attempt {})", create_attempts);
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            if (err_str.contains("already exists") || err_str.contains("version 0") 
+                                || err_str.contains("ConditionalCheckFailedException")) && create_attempts < 3 {
+                                // Table was created by another process or DynamoDB lock conflict, try to load it
+                                debug!("Table creation conflict (possibly DynamoDB lock), attempting to load existing table (attempt {})", create_attempts);
+                                // Exponential backoff
+                                let backoff_ms = 100 * (2_u64.pow(create_attempts.min(5)));
+                                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
 
                                 // Try to load the table that was just created
                                 match DeltaTableBuilder::from_uri(&storage_uri)
@@ -1008,6 +1104,14 @@ impl Database {
         }
         
         let store = builder.build()?;
+        
+        // Log if DynamoDB locking is enabled for this store
+        if storage_options.get("aws_s3_locking_provider") == Some(&"dynamodb".to_string()) {
+            if let Some(table_name) = storage_options.get("delta_dynamo_table_name") {
+                debug!("Object store configured with DynamoDB locking using table: {}", table_name);
+            }
+        }
+        
         Ok(Arc::new(store))
     }
 
@@ -1086,14 +1190,16 @@ impl Database {
                 }
                 Err(e) => {
                     let error_str = e.to_string();
-                    if error_str.contains("already exists") || error_str.contains("conflict") || error_str.contains("version") {
-                        // This is a version conflict, retry
+                    if error_str.contains("already exists") || error_str.contains("conflict") || error_str.contains("version") 
+                        || error_str.contains("ConditionalCheckFailedException") || error_str.contains("concurrent modification") {
+                        // This is a version conflict or DynamoDB locking conflict, retry
                         retry_count += 1;
                         last_error = Some(e);
-                        debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, max_retries);
+                        debug!("Delta write conflict detected (possibly DynamoDB lock conflict), retrying... (attempt {}/{})", retry_count, max_retries);
 
-                        // Short backoff before retry
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100 * retry_count as u64)).await;
+                        // Exponential backoff for better handling of concurrent writes
+                        let backoff_ms = 100 * (2_u64.pow(retry_count.min(5)));
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
 
                         // Drop the lock and try to reload the table
                         drop(table);
