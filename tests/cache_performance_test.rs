@@ -23,6 +23,8 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
         shards: 4,
         file_size_bytes: 1024 * 1024,  // 1MB segments
         enable_stats: true,
+        delta_metadata_ttl: Some(Duration::from_secs(5)),
+        cache_delta_checkpoints: true,
     };
     
     // Create shared cache
@@ -112,6 +114,8 @@ async fn test_large_file_disk_caching() -> Result<()> {
         shards: 2,
         file_size_bytes: 1024 * 1024,
         enable_stats: true,
+        delta_metadata_ttl: Some(Duration::from_secs(5)),
+        cache_delta_checkpoints: true,
     };
     
     let shared_cache = SharedFoyerCache::new(config).await?;

@@ -416,6 +416,11 @@ impl Database {
                         if version > 0 && version % checkpoint_interval == 0 {
                             info!("Checkpointing table for default project at initial load, version {}", version);
                             checkpoints::create_checkpoint(&table, None).await?;
+                            
+                            // Invalidate checkpoint cache after creating checkpoint
+                            if let Some(cache) = &db.object_store_cache {
+                                cache.invalidate_checkpoint_cache(&storage_uri);
+                            }
                         }
                         table
                     }
@@ -460,6 +465,11 @@ impl Database {
                         if version > 0 && version % checkpoint_interval == 0 {
                             info!("Checkpointing table for default project at initial load, version {}", version);
                             checkpoints::create_checkpoint(&table, None).await?;
+                            
+                            // Invalidate checkpoint cache after creating checkpoint
+                            if let Some(cache) = &db.object_store_cache {
+                                cache.invalidate_checkpoint_cache(&storage_uri);
+                            }
                         }
                         table
                     }
