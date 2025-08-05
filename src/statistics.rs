@@ -18,6 +18,7 @@ pub struct CachedStatistics {
     pub stats: Statistics,
     pub timestamp: std::time::Instant,
     pub version: i64,
+    pub row_count_hash: u64, // Hash of row counts for quick comparison
 }
 
 /// Statistics extractor for Delta Lake tables
@@ -30,7 +31,7 @@ pub struct DeltaStatisticsExtractor {
 impl DeltaStatisticsExtractor {
     /// Convert JSON value to DataFusion ScalarValue
     fn json_to_scalar(json_val: &serde_json::Value, data_type: &arrow::datatypes::DataType) -> Result<datafusion::scalar::ScalarValue> {
-        use arrow::datatypes::DataType;
+        use arrow::datatypes::{DataType, TimeUnit};
         use datafusion::scalar::ScalarValue;
         
         match (json_val, data_type) {
@@ -43,13 +44,57 @@ impl DeltaStatisticsExtractor {
                 n.as_f64().map(|v| ScalarValue::Float64(Some(v)))
                     .ok_or_else(|| anyhow::anyhow!("Invalid Float64 value"))
             }
-            (serde_json::Value::String(_s), DataType::Timestamp(_unit, _tz)) => {
-                // For now, we'll skip timestamp parsing as it's complex
-                // In production, you'd parse the timestamp string based on the format
-                Err(anyhow::anyhow!("Timestamp parsing not yet implemented"))
+            (serde_json::Value::String(s), DataType::Timestamp(unit, tz)) => {
+                // Parse ISO 8601 timestamp strings
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                    let nanos = dt.timestamp_nanos_opt().unwrap_or(0);
+                    match unit {
+                        TimeUnit::Nanosecond => Ok(ScalarValue::TimestampNanosecond(Some(nanos), tz.clone())),
+                        TimeUnit::Microsecond => Ok(ScalarValue::TimestampMicrosecond(Some(nanos / 1000), tz.clone())),
+                        TimeUnit::Millisecond => Ok(ScalarValue::TimestampMillisecond(Some(nanos / 1_000_000), tz.clone())),
+                        TimeUnit::Second => Ok(ScalarValue::TimestampSecond(Some(nanos / 1_000_000_000), tz.clone())),
+                    }
+                } else if let Ok(ts) = s.parse::<i64>() {
+                    // Handle numeric timestamp strings
+                    match unit {
+                        TimeUnit::Nanosecond => Ok(ScalarValue::TimestampNanosecond(Some(ts), tz.clone())),
+                        TimeUnit::Microsecond => Ok(ScalarValue::TimestampMicrosecond(Some(ts), tz.clone())),
+                        TimeUnit::Millisecond => Ok(ScalarValue::TimestampMillisecond(Some(ts), tz.clone())),
+                        TimeUnit::Second => Ok(ScalarValue::TimestampSecond(Some(ts), tz.clone())),
+                    }
+                } else {
+                    Err(anyhow::anyhow!("Invalid timestamp format: {}", s))
+                }
+            }
+            (serde_json::Value::Number(n), DataType::Timestamp(unit, tz)) => {
+                // Handle numeric timestamps in JSON
+                if let Some(ts) = n.as_i64() {
+                    match unit {
+                        TimeUnit::Nanosecond => Ok(ScalarValue::TimestampNanosecond(Some(ts), tz.clone())),
+                        TimeUnit::Microsecond => Ok(ScalarValue::TimestampMicrosecond(Some(ts), tz.clone())),
+                        TimeUnit::Millisecond => Ok(ScalarValue::TimestampMillisecond(Some(ts), tz.clone())),
+                        TimeUnit::Second => Ok(ScalarValue::TimestampSecond(Some(ts), tz.clone())),
+                    }
+                } else {
+                    Err(anyhow::anyhow!("Invalid timestamp number"))
+                }
             }
             (serde_json::Value::Bool(b), DataType::Boolean) => Ok(ScalarValue::Boolean(Some(*b))),
-            _ => Err(anyhow::anyhow!("Unsupported type conversion")),
+            (serde_json::Value::Number(n), DataType::Int32) => {
+                n.as_i64().and_then(|v| i32::try_from(v).ok())
+                    .map(|v| ScalarValue::Int32(Some(v)))
+                    .ok_or_else(|| anyhow::anyhow!("Invalid Int32 value"))
+            }
+            (serde_json::Value::String(s), DataType::Date32) => {
+                // Parse date strings
+                if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                    let days_since_epoch = (date - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32;
+                    Ok(ScalarValue::Date32(Some(days_since_epoch)))
+                } else {
+                    Err(anyhow::anyhow!("Invalid date format: {}", s))
+                }
+            }
+            _ => Err(anyhow::anyhow!("Unsupported type conversion: {:?} to {:?}", json_val, data_type)),
         }
     }
     
@@ -75,9 +120,18 @@ impl DeltaStatisticsExtractor {
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.peek(&cache_key) {
-                if cached.timestamp.elapsed().as_secs() < self.cache_ttl_seconds {
-                    debug!("Statistics cache hit for {}", cache_key);
+                // Check both TTL and version
+                let elapsed = cached.timestamp.elapsed().as_secs();
+                let current_version = table.version().unwrap_or(-1);
+                
+                if elapsed < self.cache_ttl_seconds && cached.version == current_version {
+                    debug!("Statistics cache hit for {} (version {})", cache_key, current_version);
                     return Ok(cached.stats.clone());
+                } else if cached.version != current_version {
+                    debug!("Statistics cache miss for {} - version changed from {} to {}", 
+                           cache_key, cached.version, current_version);
+                } else {
+                    debug!("Statistics cache miss for {} - TTL expired ({}s)", cache_key, elapsed);
                 }
             }
         }
@@ -98,10 +152,27 @@ impl DeltaStatisticsExtractor {
         // Extract column statistics
         let column_statistics = self.extract_column_statistics(table, schema).await?;
         
+        // Use Exact precision when we have actual counts from Delta metadata
+        let row_precision = if self.has_exact_row_count(&table).await {
+            Precision::Exact(num_rows as usize)
+        } else {
+            Precision::Inexact(num_rows as usize)
+        };
+        
         let stats = Statistics {
-            num_rows: Precision::Inexact(num_rows as usize),
-            total_byte_size: Precision::Inexact(total_byte_size as usize),
+            num_rows: row_precision,
+            total_byte_size: Precision::Exact(total_byte_size as usize), // File sizes are always exact
             column_statistics,
+        };
+        
+        // Calculate row count hash for quick invalidation checks
+        let row_count_hash = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            num_rows.hash(&mut hasher);
+            total_byte_size.hash(&mut hasher);
+            hasher.finish()
         };
         
         // Update cache
@@ -113,6 +184,7 @@ impl DeltaStatisticsExtractor {
                     stats: stats.clone(),
                     timestamp: std::time::Instant::now(),
                     version: version.unwrap_or(0),
+                    row_count_hash,
                 },
             );
         }
@@ -136,6 +208,7 @@ impl DeltaStatisticsExtractor {
         let file_actions = snapshot.file_actions()?;
         let mut total_rows = 0u64;
         let mut total_bytes = 0u64;
+        let mut has_row_stats = false;
         
         for action in file_actions {
             // Delta stores actual row count and size in the log
@@ -144,6 +217,7 @@ impl DeltaStatisticsExtractor {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stats) {
                     if let Some(num_records) = parsed.get("numRecords").and_then(|v| v.as_u64()) {
                         total_rows += num_records;
+                        has_row_stats = true;
                     }
                 }
             }
@@ -151,12 +225,32 @@ impl DeltaStatisticsExtractor {
         }
         
         // Fallback to estimates if stats not available
-        if total_rows == 0 {
+        if !has_row_stats {
             let num_files = snapshot.file_actions()?.len() as u64;
-            total_rows = num_files * 20_000; // Fallback estimate
+            let page_row_limit = std::env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(20_000);
+            total_rows = num_files * page_row_limit;
         }
         
         Ok((total_rows, total_bytes))
+    }
+    
+    /// Check if we have exact row counts from Delta metadata
+    async fn has_exact_row_count(&self, table: &DeltaTable) -> bool {
+        if let Ok(snapshot) = table.snapshot() {
+            if let Ok(actions) = snapshot.file_actions() {
+                for action in actions.into_iter().take(1) { // Check just first file
+                    if let Some(stats) = &action.stats {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stats) {
+                            return parsed.get("numRecords").is_some();
+                        }
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Extract column-level statistics
@@ -175,6 +269,7 @@ impl DeltaStatisticsExtractor {
         let mut col_min_values: HashMap<String, ScalarValue> = HashMap::new();
         let mut col_max_values: HashMap<String, ScalarValue> = HashMap::new();
         let mut col_null_counts: HashMap<String, u64> = HashMap::new();
+        let col_distinct_counts: HashMap<String, u64> = HashMap::new();
         
         // Parse Delta statistics from file actions
         for action in snapshot.file_actions()? {
@@ -241,6 +336,27 @@ impl DeltaStatisticsExtractor {
                 }
             } else {
                 // Use extracted statistics
+                // Estimate distinct count for certain columns
+                let distinct_precision = if let Some(&count) = col_distinct_counts.get(col_name) {
+                    Precision::Inexact(count as usize)
+                } else {
+                    // Heuristic estimation for common columns
+                    match col_name.as_str() {
+                        "project_id" => Precision::Inexact(100), // Estimated number of projects
+                        "level" => Precision::Exact(5), // ERROR, WARN, INFO, DEBUG, TRACE
+                        "status_code" => Precision::Inexact(50), // Common HTTP status codes
+                        "resource___service___name" => Precision::Inexact(1000), // Service names
+                        _ => {
+                            // For other columns, estimate based on min/max if available
+                            if let (Some(min), Some(max)) = (col_min_values.get(col_name), col_max_values.get(col_name)) {
+                                Self::estimate_distinct_from_range(min, max, col_name)
+                            } else {
+                                Precision::Absent
+                            }
+                        }
+                    }
+                };
+                
                 ColumnStatistics {
                     null_count: col_null_counts.get(col_name)
                         .map(|&c| Precision::Exact(c as usize))
@@ -251,14 +367,47 @@ impl DeltaStatisticsExtractor {
                     max_value: col_max_values.get(col_name)
                         .map(|v| Precision::Exact(v.clone()))
                         .unwrap_or(Precision::Absent),
-                    distinct_count: Precision::Absent, // Delta doesn't track this by default
-                    sum_value: Precision::Absent,      // Not commonly used for time-series
+                    distinct_count: distinct_precision,
+                    sum_value: Precision::Absent, // Not commonly used for time-series
                 }
             };
             column_stats.push(stats);
         }
         
         Ok(column_stats)
+    }
+    
+    /// Estimate distinct count based on min/max range
+    fn estimate_distinct_from_range(min: &datafusion::scalar::ScalarValue, max: &datafusion::scalar::ScalarValue, col_name: &str) -> Precision<usize> {
+        
+        use datafusion::scalar::ScalarValue;
+        
+        match (min, max) {
+            (ScalarValue::Int64(Some(min_val)), ScalarValue::Int64(Some(max_val))) => {
+                let range = (max_val - min_val).abs() as usize + 1;
+                // For ID-like columns, assume most values are present
+                if col_name.contains("id") || col_name == "duration" {
+                    Precision::Inexact(range.min(1_000_000)) // Cap at 1M for safety
+                } else {
+                    Precision::Inexact((range as f64).sqrt() as usize) // Conservative estimate
+                }
+            }
+            (ScalarValue::Float64(Some(min_val)), ScalarValue::Float64(Some(max_val))) => {
+                let range = (max_val - min_val).abs();
+                Precision::Inexact((range * 100.0) as usize) // Assume 100 buckets
+            }
+            (ScalarValue::TimestampNanosecond(Some(min_ts), _), ScalarValue::TimestampNanosecond(Some(max_ts), _)) => {
+                let duration_secs = (max_ts - min_ts) / 1_000_000_000;
+                // For timestamps, estimate based on typical data patterns
+                if col_name == "timestamp" {
+                    // Assume one distinct value per second on average
+                    Precision::Inexact((duration_secs as usize).min(10_000_000))
+                } else {
+                    Precision::Inexact((duration_secs as f64).sqrt() as usize)
+                }
+            }
+            _ => Precision::Absent,
+        }
     }
 
     /// Clear the statistics cache
@@ -278,8 +427,21 @@ impl DeltaStatisticsExtractor {
     pub async fn invalidate(&self, project_id: &str, table_name: &str) {
         let cache_key = format!("{}:{}", project_id, table_name);
         let mut cache = self.cache.write().await;
-        cache.pop(&cache_key);
-        debug!("Invalidated statistics for {}", cache_key);
+        if let Some(removed) = cache.pop(&cache_key) {
+            debug!("Invalidated statistics for {} (was version {})", cache_key, removed.version);
+        }
+    }
+    
+    /// Check if statistics need refresh based on version
+    pub async fn needs_refresh(&self, project_id: &str, table_name: &str, current_version: i64) -> bool {
+        let cache_key = format!("{}:{}", project_id, table_name);
+        let cache = self.cache.read().await;
+        
+        if let Some(cached) = cache.peek(&cache_key) {
+            cached.version != current_version
+        } else {
+            true // Not cached, needs refresh
+        }
     }
     
     /// Get cache statistics for monitoring

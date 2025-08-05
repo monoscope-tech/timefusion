@@ -543,11 +543,18 @@ impl Database {
                     // Pre-warm cache for active tables
                     for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
                         let table = table.read().await;
-                        // Get the schema for this table
-                        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
-                        let schema = schema_def.schema_ref();
-                        if let Err(e) = db.statistics_extractor.extract_statistics(&*table, project_id, table_name, &schema).await {
-                            error!("Failed to refresh statistics for {}:{}: {}", project_id, table_name, e);
+                        let current_version = table.version().unwrap_or(0);
+                        
+                        // Check if statistics need refresh based on version
+                        if db.statistics_extractor.needs_refresh(project_id, table_name, current_version).await {
+                            // Get the schema for this table
+                            let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
+                            let schema = schema_def.schema_ref();
+                            if let Err(e) = db.statistics_extractor.extract_statistics(&*table, project_id, table_name, &schema).await {
+                                error!("Failed to refresh statistics for {}:{}: {}", project_id, table_name, e);
+                            } else {
+                                debug!("Refreshed statistics for {}:{} (version {})", project_id, table_name, current_version);
+                            }
                         }
                     }
                 })
@@ -1083,6 +1090,12 @@ impl Database {
                     }
                     
                     *table = new_table;
+                    
+                    // Invalidate statistics cache after successful write
+                    drop(table); // Release write lock before async operation
+                    self.statistics_extractor.invalidate(&project_id, &table_name).await;
+                    debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
+                    
                     return Ok(());
                 }
                 Err(e) => {
@@ -1401,9 +1414,9 @@ impl ProjectRoutingTable {
         // Hash the query components
         project_id.hash(&mut hasher);
         
-        // Hash filters (simplified - in production would need proper expr hashing)
+        // Hash filters using proper expression hashing
         for filter in filters {
-            format!("{:?}", filter).hash(&mut hasher);
+            Self::hash_expr(filter, &mut hasher);
         }
         
         // Hash projection
@@ -1415,6 +1428,66 @@ impl ProjectRoutingTable {
         limit.hash(&mut hasher);
         
         hasher.finish()
+    }
+    
+    /// Recursively hash an expression for cache key computation
+    fn hash_expr(expr: &Expr, hasher: &mut AHasher) {
+        use datafusion::logical_expr::expr::{InList, Between, ScalarFunction};
+        
+        match expr {
+            Expr::Column(col) => {
+                "Column".hash(hasher);
+                col.name.hash(hasher);
+            }
+            Expr::Literal(scalar, _) => {
+                "Literal".hash(hasher);
+                format!("{:?}", scalar).hash(hasher);
+            }
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                "BinaryExpr".hash(hasher);
+                Self::hash_expr(left, hasher);
+                format!("{:?}", op).hash(hasher);
+                Self::hash_expr(right, hasher);
+            }
+            Expr::Not(inner) => {
+                "Not".hash(hasher);
+                Self::hash_expr(inner, hasher);
+            }
+            Expr::IsNull(inner) => {
+                "IsNull".hash(hasher);
+                Self::hash_expr(inner, hasher);
+            }
+            Expr::IsNotNull(inner) => {
+                "IsNotNull".hash(hasher);
+                Self::hash_expr(inner, hasher);
+            }
+            Expr::InList(InList { expr, list, negated }) => {
+                "InList".hash(hasher);
+                Self::hash_expr(expr, hasher);
+                for item in list {
+                    Self::hash_expr(item, hasher);
+                }
+                negated.hash(hasher);
+            }
+            Expr::Between(Between { expr, negated, low, high }) => {
+                "Between".hash(hasher);
+                Self::hash_expr(expr, hasher);
+                negated.hash(hasher);
+                Self::hash_expr(low, hasher);
+                Self::hash_expr(high, hasher);
+            }
+            Expr::ScalarFunction(ScalarFunction { func, args }) => {
+                "ScalarFunction".hash(hasher);
+                format!("{:?}", func).hash(hasher);
+                for arg in args {
+                    Self::hash_expr(arg, hasher);
+                }
+            }
+            _ => {
+                // For other expression types, use debug representation as fallback
+                format!("{:?}", expr).hash(hasher);
+            }
+        }
     }
     
     /// Apply time-series specific optimizations to filters
@@ -1607,8 +1680,17 @@ impl TableProvider for ProjectRoutingTable {
         // Get project_id from filters if possible, otherwise use default
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
 
-        // Create cache key based on project_id, filters, projection, and limit
-        let cache_key = Self::compute_query_cache_key(&project_id, &optimized_filters, projection, limit);
+        // Get current table version for cache invalidation
+        let table_version = {
+            let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
+            let table = delta_table.read().await;
+            table.version().unwrap_or(0)
+        };
+        
+        // Create cache key based on project_id, filters, projection, limit, and table version
+        let mut cache_key = Self::compute_query_cache_key(&project_id, &optimized_filters, projection, limit);
+        // Mix in table version to invalidate cache when data changes
+        cache_key = cache_key.wrapping_add(table_version as u64);
         
         // Check cache first
         {

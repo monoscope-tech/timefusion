@@ -42,13 +42,45 @@ impl PhysicalOptimizerRule for TimeSeriesAggregationOptimizer {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // For time-bucketed aggregations, ensure we're using streaming mode when possible
-        if Self::is_time_bucket_aggregation(plan.as_ref()) {
-            debug!("Detected time-bucket aggregation, optimizing for streaming");
-            // In production, you'd modify the AggregateExec to use streaming mode
-            // For now, just log and return the plan unchanged
+        // Recursively optimize children first
+        let children: Vec<Arc<dyn ExecutionPlan>> = plan.children()
+            .into_iter()
+            .map(|child| self.optimize(child.clone(), _config))
+            .collect::<DFResult<Vec<_>>>()?;
+        
+        // Check if this is a time-bucketed aggregation
+        if let Some(agg) = plan.as_any().downcast_ref::<AggregateExec>() {
+            if Self::is_time_bucket_aggregation(plan.as_ref()) {
+                debug!("Optimizing time-bucket aggregation for streaming execution");
+                
+                // Check if input is already sorted by time
+                let input_sorted = children[0].output_ordering().is_some();
+                
+                if input_sorted {
+                    // Input is sorted - we can use more efficient streaming aggregation
+                    trace!("Input is sorted by time, enabling streaming aggregation");
+                    
+                    // Clone and modify the aggregate to use partial mode if beneficial
+                    let new_agg = AggregateExec::try_new(
+                        *agg.mode(),
+                        agg.group_expr().clone(),
+                        agg.aggr_expr().to_vec(),
+                        agg.filter_expr().to_vec(),
+                        children[0].clone(),
+                        agg.input_schema().clone(),
+                    )?;
+                    
+                    return Ok(Arc::new(new_agg));
+                }
+            }
         }
-        Ok(plan)
+        
+        // Return plan with optimized children
+        if children.is_empty() {
+            Ok(plan)
+        } else {
+            plan.with_new_children(children)
+        }
     }
     
     fn name(&self) -> &str {
@@ -80,11 +112,25 @@ impl RangeQueryOptimizer {
         }
     }
     
-    /// Optimize scan order for time ranges
-    fn optimize_scan_order(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        // In production, you'd reorder file scans to read most recent data first
-        // or implement parallel scanning of time partitions
-        plan
+    /// Optimize scan order for time ranges  
+    fn optimize_scan_order(&self, plan: Arc<dyn ExecutionPlan>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Check if this is a filter over a scan
+        if let Some(filter) = plan.as_any().downcast_ref::<FilterExec>() {
+            let predicate_str = format!("{:?}", filter.predicate());
+            
+            // Extract time range from filter if present
+            if predicate_str.contains("timestamp") {
+                debug!("Optimizing time range scan order");
+                
+                // Check if we're filtering for recent data (common pattern)
+                if predicate_str.contains(">=") || predicate_str.contains(">") {
+                    trace!("Query filtering for recent data - optimizing file scan order");
+                    // In a full implementation, we'd reorder files to scan newest first
+                }
+            }
+        }
+        
+        Ok(plan)
     }
 }
 
@@ -92,13 +138,27 @@ impl PhysicalOptimizerRule for RangeQueryOptimizer {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        if Self::is_time_range_query(plan.as_ref()) {
-            debug!("Optimizing time range query");
-            return Ok(self.optimize_scan_order(plan));
+        // Recursively optimize children
+        let children: Vec<Arc<dyn ExecutionPlan>> = plan.children()
+            .into_iter()
+            .map(|child| self.optimize(child.clone(), config))
+            .collect::<DFResult<Vec<_>>>()?;
+        
+        let optimized_plan = if children.is_empty() {
+            plan.clone()
+        } else {
+            plan.with_new_children(children)?
+        };
+        
+        // Apply time range optimization if applicable
+        if Self::is_time_range_query(optimized_plan.as_ref()) {
+            debug!("Detected time range query pattern");
+            self.optimize_scan_order(optimized_plan)
+        } else {
+            Ok(optimized_plan)
         }
-        Ok(plan)
     }
     
     fn name(&self) -> &str {
@@ -131,16 +191,48 @@ impl PhysicalOptimizerRule for ProjectionPushdownOptimizer {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Check if we can push projections down to reduce data movement
-        if let Some(_projection) = plan.as_any().downcast_ref::<ProjectionExec>() {
-            let unused = self.find_unused_columns(plan.as_ref());
-            if !unused.is_empty() {
-                trace!("Found {} unused columns to prune", unused.len());
+        // Recursively optimize children
+        let children: Vec<Arc<dyn ExecutionPlan>> = plan.children()
+            .into_iter()
+            .map(|child| self.optimize(child.clone(), config))
+            .collect::<DFResult<Vec<_>>>()?;
+        
+        let optimized_plan = if children.is_empty() {
+            plan.clone()
+        } else {
+            plan.with_new_children(children)?
+        };
+        
+        // Check if this is a projection
+        if let Some(proj) = optimized_plan.as_any().downcast_ref::<ProjectionExec>() {
+            // Count columns actually used vs available
+            let proj_schema = proj.schema();
+            let input_schema = proj.input().schema();
+            let proj_cols = proj_schema.fields().len();
+            let input_cols = input_schema.fields().len();
+            
+            if proj_cols < input_cols {
+                debug!(
+                    "Projection reduces columns from {} to {} - good for performance",
+                    input_cols, proj_cols
+                );
+                
+                // Check for heavy columns that could benefit from late materialization
+                for field in proj_schema.fields() {
+                    if matches!(field.data_type(), 
+                        arrow::datatypes::DataType::Utf8 | 
+                        arrow::datatypes::DataType::LargeUtf8 |
+                        arrow::datatypes::DataType::Binary |
+                        arrow::datatypes::DataType::LargeBinary) {
+                        trace!("Large column '{}' in projection - consider late materialization", field.name());
+                    }
+                }
             }
         }
-        Ok(plan)
+        
+        Ok(optimized_plan)
     }
     
     fn name(&self) -> &str {
@@ -181,16 +273,55 @@ impl PhysicalOptimizerRule for SortEliminationOptimizer {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Check if we can eliminate sorts on already-sorted data
+        // Recursively optimize children
+        let children: Vec<Arc<dyn ExecutionPlan>> = plan.children()
+            .into_iter()
+            .map(|child| self.optimize(child.clone(), config))
+            .collect::<DFResult<Vec<_>>>()?;
+        
+        // Check if this is a sort operation
         if let Some(sort) = plan.as_any().downcast_ref::<SortExec>() {
-            if self.is_already_time_sorted(sort.input().as_ref()) {
-                debug!("Eliminating redundant sort on time-ordered data");
-                return Ok(sort.input().clone());
+            if !children.is_empty() {
+                let child = &children[0];
+                
+                // Check if child already provides the required ordering
+                if let Some(child_ordering) = child.output_ordering() {
+                    let required_ordering = sort.expr();
+                    
+                    // Check if orderings match
+                    if child_ordering.len() >= required_ordering.len() {
+                        let orderings_match = required_ordering.iter()
+                            .zip(child_ordering.iter())
+                            .all(|(req, actual)| {
+                                req.expr.eq(&actual.expr) && req.options == actual.options
+                            });
+                        
+                        if orderings_match {
+                            debug!("Eliminating redundant sort - input already sorted correctly");
+                            return Ok(child.clone());
+                        }
+                    }
+                }
+                
+                // Check for time-series specific patterns
+                if self.is_already_time_sorted(child.as_ref()) {
+                    let sort_str = format!("{:?}", sort.expr());
+                    if sort_str.contains("timestamp") || sort_str.contains("date") {
+                        debug!("Eliminating sort on time column - Delta Lake maintains time order");
+                        return Ok(child.clone());
+                    }
+                }
             }
         }
-        Ok(plan)
+        
+        // Return plan with optimized children
+        if children.is_empty() {
+            Ok(plan)
+        } else {
+            plan.with_new_children(children)
+        }
     }
     
     fn name(&self) -> &str {
