@@ -295,10 +295,18 @@ impl FoyerObjectStoreCache {
         path_str.contains("_delta_log/") && (path_str.contains("_last_checkpoint") || path_str.contains(".checkpoint."))
     }
 
+    /// Check if a path is the mutable _last_checkpoint file
+    fn is_last_checkpoint(location: &Path) -> bool {
+        location.as_ref().contains("_delta_log/_last_checkpoint")
+    }
+
     /// Get the appropriate TTL for a file based on its type
     fn get_ttl_for_path(&self, location: &Path) -> Duration {
-        if Self::is_delta_checkpoint(location) {
-            // Use very short TTL for checkpoint files
+        if Self::is_last_checkpoint(location) {
+            // Use very short TTL for _last_checkpoint file (mutable pointer)
+            Duration::from_secs(5)
+        } else if Self::is_delta_checkpoint(location) {
+            // Use configured TTL for immutable checkpoint files
             self.config.checkpoint_ttl.unwrap_or(Duration::from_secs(1))
         } else if Self::is_delta_metadata(location) {
             // Use shorter TTL for Delta metadata files
@@ -456,9 +464,24 @@ impl ObjectStore for FoyerObjectStoreCache {
             if value.is_expired(ttl) {
                 self.update_stats(|s| s.ttl_expirations += 1).await;
                 self.cache.remove(&cache_key);
+                info!(
+                    "Foyer cache EXPIRED for: {} (TTL: {}s, age: {}ms)",
+                    location,
+                    ttl.as_secs(),
+                    current_millis().saturating_sub(value.timestamp_millis)
+                );
             } else {
                 self.update_stats(|s| s.hits += 1).await;
-                info!("Foyer cache HIT for: {} (avoiding S3 access)", location);
+                let is_delta = Self::is_delta_metadata(location);
+                let is_checkpoint = Self::is_delta_checkpoint(location);
+                info!(
+                    "Foyer cache HIT for: {} (avoiding S3 access, delta={}, checkpoint={}, TTL={}s, age={}ms)",
+                    location,
+                    is_delta,
+                    is_checkpoint,
+                    ttl.as_secs(),
+                    current_millis().saturating_sub(value.timestamp_millis)
+                );
                 return Ok(Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone()));
             }
         }
@@ -469,7 +492,17 @@ impl ObjectStore for FoyerObjectStoreCache {
             s.inner_gets += 1;
         })
         .await;
-        info!("Foyer cache MISS for: {} (fetching from S3)", location);
+        let is_delta = Self::is_delta_metadata(location);
+        let is_checkpoint = Self::is_delta_checkpoint(location);
+        let ttl = self.get_ttl_for_path(location);
+        info!(
+            "Foyer cache MISS for: {} (fetching from S3, delta={}, checkpoint={}, will_cache={}, TTL={}s)",
+            location,
+            is_delta,
+            is_checkpoint,
+            self.should_cache(location),
+            ttl.as_secs()
+        );
 
         let result = self.inner.get(location).await?;
 
