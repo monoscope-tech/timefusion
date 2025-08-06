@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{debug, info};
 
 use foyer::{DirectFsDeviceOptions, Engine, HybridCache, HybridCacheBuilder, LargeEngineOptions};
 use serde::{Deserialize, Serialize};
@@ -474,11 +474,13 @@ impl ObjectStore for FoyerObjectStoreCache {
                 self.update_stats(|s| s.hits += 1).await;
                 let is_delta = Self::is_delta_metadata(location);
                 let is_checkpoint = Self::is_delta_checkpoint(location);
-                info!(
-                    "Foyer cache HIT for: {} (avoiding S3 access, delta={}, checkpoint={}, TTL={}s, age={}ms)",
+                let is_parquet = location.as_ref().ends_with(".parquet");
+                debug!(
+                    "Foyer cache HIT for: {} (avoiding S3 access, delta={}, checkpoint={}, parquet={}, TTL={}s, age={}ms)",
                     location,
                     is_delta,
                     is_checkpoint,
+                    is_parquet,
                     ttl.as_secs(),
                     current_millis().saturating_sub(value.timestamp_millis)
                 );
@@ -494,12 +496,14 @@ impl ObjectStore for FoyerObjectStoreCache {
         .await;
         let is_delta = Self::is_delta_metadata(location);
         let is_checkpoint = Self::is_delta_checkpoint(location);
+        let is_parquet = location.as_ref().ends_with(".parquet");
         let ttl = self.get_ttl_for_path(location);
         info!(
-            "Foyer cache MISS for: {} (fetching from S3, delta={}, checkpoint={}, will_cache={}, TTL={}s)",
+            "Foyer cache MISS for: {} (fetching from S3, delta={}, checkpoint={}, parquet={}, will_cache={}, TTL={}s)",
             location,
             is_delta,
             is_checkpoint,
+            is_parquet,
             self.should_cache(location),
             ttl.as_secs()
         );
@@ -545,6 +549,8 @@ impl ObjectStore for FoyerObjectStoreCache {
     }
 
     async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
+        let is_parquet = location.as_ref().ends_with(".parquet");
+        
         // Check if we should cache this file
         if !self.should_cache(location) {
             self.update_stats(|s| {
@@ -557,20 +563,68 @@ impl ObjectStore for FoyerObjectStoreCache {
 
         let cache_key = Self::make_cache_key(location);
 
+        // Check if we have the full file cached
         if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
             let value = entry.value();
             let ttl = self.get_ttl_for_path(location);
             if !value.is_expired(ttl) && range.end <= value.data.len() as u64 {
                 self.update_stats(|s| s.hits += 1).await;
+                debug!(
+                    "Foyer cache HIT for range: {} (range: {}..{}, parquet={}, age={}ms)",
+                    location, range.start, range.end, is_parquet,
+                    current_millis().saturating_sub(value.timestamp_millis)
+                );
                 return Ok(Bytes::from(value.data[range.start as usize..range.end as usize].to_vec()));
             }
         }
 
+        // For Parquet files, cache the entire file on first access
+        if is_parquet {
+            info!(
+                "Foyer cache MISS for Parquet: {} (range: {}..{}, fetching full file)",
+                location, range.start, range.end
+            );
+            
+            // Try to fetch and cache the full file
+            if let Ok(result) = self.get(location).await {
+                // The file is now cached, extract the range
+                if range.end <= result.meta.size as u64 {
+                    let data = match result.payload {
+                        GetResultPayload::Stream(s) => {
+                            use futures::TryStreamExt;
+                            let chunks: Vec<Bytes> = s.try_collect().await?;
+                            let full_data = chunks.concat();
+                            Bytes::from(full_data[range.start as usize..range.end as usize].to_vec())
+                        }
+                        GetResultPayload::File(mut file, _) => {
+                            use std::io::{Read, Seek, SeekFrom};
+                            file.seek(SeekFrom::Start(range.start)).map_err(|e| object_store::Error::Generic {
+                                store: "cache",
+                                source: Box::new(e),
+                            })?;
+                            let mut buf = vec![0; (range.end - range.start) as usize];
+                            file.read_exact(&mut buf).map_err(|e| object_store::Error::Generic {
+                                store: "cache",
+                                source: Box::new(e),
+                            })?;
+                            Bytes::from(buf)
+                        }
+                    };
+                    return Ok(data);
+                }
+            }
+        }
+
+        // Fallback to regular range request
         self.update_stats(|s| {
             s.misses += 1;
             s.inner_gets += 1;
         })
         .await;
+        debug!(
+            "get_range request for: {} (range: {}..{}, parquet={})",
+            location, range.start, range.end, is_parquet
+        );
         self.inner.get_range(location, range).await
     }
 

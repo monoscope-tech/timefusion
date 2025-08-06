@@ -1,0 +1,25 @@
+    Finished `release` profile [optimized] target(s) in 1.04s
+     Running `target/release/timefusion`
+[2m2025-08-06T13:36:58.059502Z[0m [32m INFO[0m [2mtimefusion[0m[2m:[0m Starting TimeFusion application
+[2m2025-08-06T13:36:58.059950Z[0m [32m INFO[0m [2mtimefusion::database[0m[2m:[0m AWS handlers registered
+[2m2025-08-06T13:36:58.059953Z[0m [32m INFO[0m [2mtimefusion::database[0m[2m:[0m DynamoDB locking not configured. AWS_S3_LOCKING_PROVIDER=None, DELTA_DYNAMO_TABLE_NAME=None
+[2m2025-08-06T13:36:58.059995Z[0m [32m INFO[0m [2mtimefusion::database[0m[2m:[0m Initializing shared Foyer hybrid cache (memory: 64MB, disk: 1GB, TTL: 60s)
+[2m2025-08-06T13:36:58.059997Z[0m [32m INFO[0m [2mtimefusion::object_store_cache[0m[2m:[0m Initializing shared Foyer hybrid cache (memory: 64MB, disk: 1GB, ttl: 60s)
+[2m2025-08-06T13:36:58.060589Z[0m [32m INFO[0m [2mfoyer_storage::store[0m[2m:[0m [store]: Dedicated runtime is disabled. This may lead to spikes in latency under high load. Hint: Consider configuring a dedicated runtime.
+[2m2025-08-06T13:36:58.068639Z[0m [32m INFO[0m [2mfoyer_storage::large::recover[0m[2m:[0m Recovers 0 regions with data, 128 clean regions, 0 total entries with max sequence as 0, initial reclaim permits is 0.
+[2m2025-08-06T13:36:58.068755Z[0m [32m INFO[0m [2mfoyer_storage::large::recover[0m[2m:[0m [recover] finish in 1.516625ms
+[2m2025-08-06T13:36:58.069000Z[0m [32m INFO[0m [2mtimefusion::database[0m[2m:[0m Shared Foyer cache initialized successfully for all tables
+[2m2025-08-06T13:36:58.069165Z[0m [32m INFO[0m [2mtimefusion[0m[2m:[0m Database initialized successfully
+[2m2025-08-06T13:36:58.069306Z[0m [32m INFO[0m [2mtimefusion[0m[2m:[0m Batch queue configured (enabled=true, interval=100ms, max_size=100)
+[2m2025-08-06T13:36:58.070029Z[0m [32m INFO[0m [2mtokio_cron_scheduler::job_scheduler[0m[2m:[0m Uninited
+[2m2025-08-06T13:36:58.070177Z[0m [32m INFO[0m [2mtokio_cron_scheduler::job_scheduler[0m[2m:[0m Job creator created
+[2m2025-08-06T13:36:58.070222Z[0m [32m INFO[0m [2mtokio_cron_scheduler::job_scheduler[0m[2m:[0m Job creator created
+[2m2025-08-06T13:36:58.070273Z[0m [32m INFO[0m [2mtokio_cron_scheduler::job_scheduler[0m[2m:[0m Job creator created
+[2m2025-08-06T13:36:58.070339Z[0m [32m INFO[0m [2mtokio_cron_scheduler::job_scheduler[0m[2m:[0m Job creator created
+[2m2025-08-06T13:36:58.075211Z[0m [32m INFO[0m [2mtimefusion::database[0m[2m:[0m Registered ProjectRoutingTable for table 'otel_logs_and_spans' with SessionContext
+[2m2025-08-06T13:36:58.075506Z[0m [32m INFO[0m [2mtimefusion::database[0m[2m:[0m Registered JSON functions with SessionContext
+[2m2025-08-06T13:36:58.075509Z[0m [32m INFO[0m [2mtimefusion[0m[2m:[0m PGWIRE_PORT environment variable: Ok("12345")
+[2m2025-08-06T13:36:58.075525Z[0m [32m INFO[0m [2mtimefusion[0m[2m:[0m Starting PGWire server on port: 12345
+[2m2025-08-06T13:36:58.075617Z[0m [32m INFO[0m [2mdatafusion_postgres[0m[2m:[0m TLS not configured. Running without encryption.    
+[2m2025-08-06T13:36:58.076198Z[0m [31mERROR[0m [2mtimefusion[0m[2m:[0m PGWire server task failed
+[2m2025-08-06T13:36:58.076202Z[0m [32m INFO[0m [2mtimefusion[0m[2m:[0m Shutdown complete.

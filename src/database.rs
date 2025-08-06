@@ -675,7 +675,12 @@ impl Database {
         // First check if table already exists
         {
             let project_configs = self.project_configs.read().await;
+            debug!(
+                "Checking cache for project '{}' table '{}', cache contains {} entries",
+                project_id, table_name, project_configs.len()
+            );
             if let Some(table) = project_configs.get(&(project_id.to_string(), table_name.to_string())) {
+                debug!("Found table in cache for project '{}' table '{}'", project_id, table_name);
                 // Check if we have a recent write that might not be visible yet
                 let last_written_version = {
                     let versions = self.last_written_versions.read().await;
@@ -727,6 +732,7 @@ impl Database {
         }
 
         // Table doesn't exist, try to create it
+        debug!("Table not found in cache for project '{}' table '{}', creating/loading", project_id, table_name);
         self.get_or_create_table(project_id, table_name)
             .await
             .map_err(|e| DataFusionError::Execution(format!("Failed to get or create table: {}", e)))
@@ -904,6 +910,10 @@ impl Database {
 
         // Store in cache (we already have the write lock)
         configs.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
+        info!(
+            "Cached table for project '{}' table '{}', cache now contains {} entries",
+            project_id, table_name, configs.len()
+        );
 
         Ok(table_arc)
     }
