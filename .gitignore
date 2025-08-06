@@ -2,6 +2,7 @@
 /queue_db
 .env
 .env.prod
+.env.*
 users.json
 data/
 minio
