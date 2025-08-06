@@ -206,10 +206,10 @@ INSERT INTO timefusion_projects (
     s3_secret_access_key,
     s3_endpoint
 ) VALUES (
-    'default',
+    'your-project-uuid',  -- Use actual project UUID
     'otel_logs_and_spans',
     'your-existing-bucket',
-    'timefusion/projects/default/otel_logs_and_spans',
+    'timefusion/projects/your-project-uuid/otel_logs_and_spans',
     'your-region',
     'your-access-key',
     'your-secret-key',

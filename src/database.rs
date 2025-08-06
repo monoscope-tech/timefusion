@@ -24,7 +24,6 @@ use datafusion::{
 };
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use deltalake::checkpoints;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
@@ -55,8 +54,7 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 }
 
 // Constants for optimization and vacuum operations
-const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 336; // 2 weeks
-const DEFAULT_CHECKPOINT_INTERVAL: i64 = 20;
+const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 72; // 2 weeks
 const DEFAULT_OPTIMIZE_TARGET_SIZE: i64 = 536870912; // 512MB
 const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20000;
 const ZSTD_COMPRESSION_LEVEL: i32 = 6; // Balance between compression ratio and speed
@@ -380,121 +378,6 @@ impl Database {
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
         };
-
-        // Initialize default project with otel_logs_and_spans table if AWS_S3_BUCKET is set
-        if let Some(ref bucket) = default_s3_bucket {
-            let storage_uri = format!(
-                "s3://{}/{}/projects/default/otel_logs_and_spans/?endpoint={}",
-                bucket, default_s3_prefix, aws_endpoint
-            );
-            info!("Default project storage URI: {}", storage_uri);
-
-            // Initialize table for default project with cache support
-            // Populate storage options with AWS credentials and DynamoDB locking if enabled
-            let mut storage_options = db.build_storage_options();
-            storage_options.insert("aws_endpoint".to_string(), aws_endpoint.clone());
-
-            // Create the cached object store for the default table
-            let table = if let Some(ref shared_cache) = db.object_store_cache {
-                // Create base S3 object store
-                let base_store = db.create_object_store(&storage_uri, &storage_options).await?;
-
-                // Wrap with the shared Foyer cache
-                let cached_store = Arc::new(FoyerObjectStoreCache::new_with_shared_cache(base_store, shared_cache)) as Arc<dyn object_store::ObjectStore>;
-
-                info!("Default table will use Foyer cache for all object store operations");
-
-                // Load or create table with cached store
-                match db.create_or_load_delta_table(&storage_uri, storage_options.clone(), cached_store.clone()).await {
-                    Ok(table) => {
-                        let version = table.version().unwrap_or(0);
-                        let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
-                            .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
-                            .parse::<i64>()
-                            .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
-
-                        if version > 0 && version % checkpoint_interval == 0 {
-                            info!("Checkpointing table for default project at initial load, version {}", version);
-                            checkpoints::create_checkpoint(&table, None).await?;
-                            
-                            // Invalidate checkpoint cache after creating checkpoint
-                            if let Some(cache) = &db.object_store_cache {
-                                cache.invalidate_checkpoint_cache(&storage_uri);
-                            }
-                        }
-                        table
-                    }
-                    Err(err) => {
-                        log::warn!("Table doesn't exist for default project. Creating new table. err: {:?}", err);
-
-                        let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
-
-                        // Create table with storage options
-                        // When using DynamoDB locking, we let Delta Lake handle the storage backend creation
-                        let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
-                        let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
-
-                        let _new_table = delta_ops
-                            .create()
-                            .with_columns(schema.columns().unwrap_or_default())
-                            .with_partition_columns(schema.partitions.clone())
-                            .with_storage_options(storage_options.clone())
-                            .with_commit_properties(commit_properties)
-                            .await?;
-
-                        // After creation, reload the table with cached store
-                        db.create_or_load_delta_table(&storage_uri, storage_options.clone(), cached_store.clone()).await?
-                    }
-                }
-            } else {
-                // No cache available, fall back to non-cached table
-                log::warn!("Foyer cache not available, using non-cached object store for default table");
-                match DeltaTableBuilder::from_uri(&storage_uri)
-                    .with_storage_options(storage_options.clone())
-                    .with_allow_http(true)
-                    .load()
-                    .await
-                {
-                    Ok(table) => {
-                        let version = table.version().unwrap_or(0);
-                        let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
-                            .unwrap_or_else(|_| DEFAULT_CHECKPOINT_INTERVAL.to_string())
-                            .parse::<i64>()
-                            .unwrap_or(DEFAULT_CHECKPOINT_INTERVAL);
-
-                        if version > 0 && version % checkpoint_interval == 0 {
-                            info!("Checkpointing table for default project at initial load, version {}", version);
-                            checkpoints::create_checkpoint(&table, None).await?;
-                            
-                            // Invalidate checkpoint cache after creating checkpoint
-                            if let Some(cache) = &db.object_store_cache {
-                                cache.invalidate_checkpoint_cache(&storage_uri);
-                            }
-                        }
-                        table
-                    }
-                    Err(err) => {
-                        log::warn!("Table doesn't exist for default project. Creating new table. err: {:?}", err);
-
-                        let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
-                        let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
-                        let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
-
-                        delta_ops
-                            .create()
-                            .with_columns(schema.columns().unwrap_or_default())
-                            .with_partition_columns(schema.partitions.clone())
-                            .with_storage_options(storage_options.clone())
-                            .with_commit_properties(commit_properties)
-                            .await?
-                    }
-                }
-            };
-
-            let mut configs = db.project_configs.write().await;
-            configs.insert(("default".to_string(), "otel_logs_and_spans".to_string()), Arc::new(RwLock::new(table)));
-            info!("Initialized default project table at: {}", storage_uri);
-        }
 
         // Cache is already initialized above, no need to call with_object_store_cache()
         Ok(db)
@@ -1253,6 +1136,7 @@ impl Database {
             ))
             .with_target_size(target_size)
             .with_writer_properties(writer_properties)
+            .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
             .await;
 
         match optimize_result {
