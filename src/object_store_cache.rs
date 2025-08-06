@@ -26,6 +26,7 @@ struct CacheValue {
     timestamp_millis: u64,
 }
 
+
 impl CacheValue {
     fn new(data: Vec<u8>, meta: ObjectMeta) -> Self {
         Self {
@@ -99,10 +100,6 @@ pub struct FoyerCacheConfig {
     pub enable_stats: bool,
     /// Separate TTL for Delta metadata files (_delta_log/*)
     pub delta_metadata_ttl: Option<Duration>,
-    /// Whether to cache Delta checkpoint files
-    pub cache_delta_checkpoints: bool,
-    /// Specific TTL for checkpoint files (when cache_delta_checkpoints is true)
-    pub checkpoint_ttl: Option<Duration>,
 }
 
 impl Default for FoyerCacheConfig {
@@ -116,8 +113,6 @@ impl Default for FoyerCacheConfig {
             file_size_bytes: 16_777_216, // 16MB - good for Parquet files
             enable_stats: true,
             delta_metadata_ttl: Some(Duration::from_secs(5)), // Short TTL for metadata
-            cache_delta_checkpoints: false,                   // Disable caching for checkpoint files by default
-            checkpoint_ttl: Some(Duration::from_secs(1)),     // Very short TTL for checkpoints if cached
         }
     }
 }
@@ -129,20 +124,17 @@ impl FoyerCacheConfig {
             std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
         }
 
-        let delta_metadata_ttl_secs = parse_env("TIMEFUSION_FOYER_DELTA_METADATA_TTL_SECONDS", 5);
-        let checkpoint_ttl_secs = parse_env("TIMEFUSION_CHECKPOINT_CACHE_TTL_SECONDS", 1);
+        let delta_metadata_ttl_secs = parse_env("TIMEFUSION_FOYER_DELTA_METADATA_TTL_SECONDS", 3600);
 
         Self {
             memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_MEMORY_MB", 256) * 1024 * 1024,
             disk_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_DISK_GB", 10) * 1024 * 1024 * 1024,
-            ttl: Duration::from_secs(parse_env("TIMEFUSION_FOYER_TTL_SECONDS", 300)),
+            ttl: Duration::from_secs(parse_env("TIMEFUSION_FOYER_TTL_SECONDS", 36000)),
             cache_dir: PathBuf::from(parse_env("TIMEFUSION_FOYER_CACHE_DIR", "/tmp/timefusion_cache".to_string())),
             shards: parse_env("TIMEFUSION_FOYER_SHARDS", 8),
-            file_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_FILE_SIZE_MB", 16) * 1024 * 1024,
+            file_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_FILE_SIZE_MB", 32) * 1024 * 1024,
             enable_stats: parse_env("TIMEFUSION_FOYER_STATS", "true".to_string()).to_lowercase() == "true",
             delta_metadata_ttl: if delta_metadata_ttl_secs > 0 { Some(Duration::from_secs(delta_metadata_ttl_secs)) } else { None },
-            cache_delta_checkpoints: parse_env("TIMEFUSION_FOYER_CACHE_DELTA_CHECKPOINTS", "false".to_string()).to_lowercase() == "true",
-            checkpoint_ttl: if checkpoint_ttl_secs > 0 { Some(Duration::from_secs(checkpoint_ttl_secs)) } else { None },
         }
     }
 
@@ -150,16 +142,14 @@ impl FoyerCacheConfig {
     /// The name parameter is used to create unique cache directories
     pub fn test_config(name: &str) -> Self {
         Self {
-            memory_size_bytes: 10 * 1024 * 1024,  // 10MB
-            disk_size_bytes: 50 * 1024 * 1024,    // 50MB
+            memory_size_bytes: 10 * 1024 * 1024, // 10MB
+            disk_size_bytes: 50 * 1024 * 1024,   // 50MB
             ttl: Duration::from_secs(300),
             cache_dir: PathBuf::from(format!("/tmp/test_foyer_{}", name)),
             shards: 2,
-            file_size_bytes: 1024 * 1024,  // 1MB
+            file_size_bytes: 1024 * 1024, // 1MB
             enable_stats: true,
             delta_metadata_ttl: Some(Duration::from_secs(5)),
-            cache_delta_checkpoints: false,  // Default to false for tests
-            checkpoint_ttl: Some(Duration::from_secs(1)),
         }
     }
 
@@ -289,12 +279,6 @@ impl FoyerObjectStoreCache {
         location.as_ref().contains("_delta_log/")
     }
 
-    /// Check if a path is a Delta Lake checkpoint file
-    fn is_delta_checkpoint(location: &Path) -> bool {
-        let path_str = location.as_ref();
-        path_str.contains("_delta_log/") && (path_str.contains("_last_checkpoint") || path_str.contains(".checkpoint."))
-    }
-
     /// Check if a path is the mutable _last_checkpoint file
     fn is_last_checkpoint(location: &Path) -> bool {
         location.as_ref().contains("_delta_log/_last_checkpoint")
@@ -305,54 +289,11 @@ impl FoyerObjectStoreCache {
         if Self::is_last_checkpoint(location) {
             // Use very short TTL for _last_checkpoint file (mutable pointer)
             Duration::from_secs(5)
-        } else if Self::is_delta_checkpoint(location) {
-            // Use configured TTL for immutable checkpoint files
-            self.config.checkpoint_ttl.unwrap_or(Duration::from_secs(1))
         } else if Self::is_delta_metadata(location) {
             // Use shorter TTL for Delta metadata files
             self.config.delta_metadata_ttl.unwrap_or(self.config.ttl)
         } else {
             self.config.ttl
-        }
-    }
-
-    /// Check if a file should be cached
-    fn should_cache(&self, location: &Path) -> bool {
-        // Don't cache checkpoint files if disabled
-        if !self.config.cache_delta_checkpoints && Self::is_delta_checkpoint(location) {
-            return false;
-        }
-        true
-    }
-
-    /// Invalidate related cache entries when writing to Delta log
-    async fn invalidate_related_delta_entries(&self, location: &Path) {
-        let path_str = location.as_ref();
-
-        // Always invalidate checkpoint cache if aggressive invalidation is enabled
-        let aggressive_invalidation =
-            std::env::var("TIMEFUSION_AGGRESSIVE_CHECKPOINT_INVALIDATION").unwrap_or_else(|_| "true".to_string()).to_lowercase() == "true";
-
-        // If writing any file to _delta_log, invalidate checkpoint files
-        if path_str.contains("_delta_log/") {
-            // Extract the table path (everything before _delta_log/)
-            if let Some(delta_log_idx) = path_str.find("_delta_log/") {
-                let table_path = &path_str[..delta_log_idx];
-
-                // Always invalidate _last_checkpoint for any delta log write in aggressive mode
-                if aggressive_invalidation || path_str.ends_with(".json") {
-                    let last_checkpoint_path = format!("{}_delta_log/_last_checkpoint", table_path);
-                    info!(
-                        "Invalidating _last_checkpoint cache for table: {} (aggressive={})",
-                        table_path, aggressive_invalidation
-                    );
-                    self.cache.remove(&last_checkpoint_path);
-                }
-
-                // Also invalidate any checkpoint.parquet files to ensure consistency
-                // Note: Foyer doesn't support pattern-based removal, so we can't easily remove all checkpoint files
-                // This is a limitation we'll document
-            }
         }
     }
 
@@ -417,13 +358,8 @@ impl FoyerObjectStoreCache {
 impl ObjectStore for FoyerObjectStoreCache {
     async fn put(&self, location: &Path, payload: PutPayload) -> ObjectStoreResult<PutResult> {
         self.update_stats(|s| s.inner_puts += 1).await;
-        let result = self.inner.put(location, payload).await?;
-
-        // Remove the written file from cache
         self.cache.remove(&Self::make_cache_key(location));
-
-        // Invalidate related Delta entries if writing to _delta_log
-        self.invalidate_related_delta_entries(location).await;
+        let result = self.inner.put(location, payload).await?;
 
         Ok(result)
     }
@@ -435,24 +371,10 @@ impl ObjectStore for FoyerObjectStoreCache {
         // Remove the written file from cache
         self.cache.remove(&Self::make_cache_key(location));
 
-        // Invalidate related Delta entries if writing to _delta_log
-        self.invalidate_related_delta_entries(location).await;
-
         Ok(result)
     }
 
     async fn get(&self, location: &Path) -> ObjectStoreResult<GetResult> {
-        // Check if we should cache this file
-        if !self.should_cache(location) {
-            self.update_stats(|s| {
-                s.misses += 1;
-                s.inner_gets += 1;
-            })
-            .await;
-            info!("Bypassing cache for Delta checkpoint file: {}", location);
-            return self.inner.get(location).await;
-        }
-
         let cache_key = Self::make_cache_key(location);
 
         // Try cache first
@@ -473,13 +395,11 @@ impl ObjectStore for FoyerObjectStoreCache {
             } else {
                 self.update_stats(|s| s.hits += 1).await;
                 let is_delta = Self::is_delta_metadata(location);
-                let is_checkpoint = Self::is_delta_checkpoint(location);
                 let is_parquet = location.as_ref().ends_with(".parquet");
                 debug!(
-                    "Foyer cache HIT for: {} (avoiding S3 access, delta={}, checkpoint={}, parquet={}, TTL={}s, age={}ms)",
+                    "Foyer cache HIT for: {} (avoiding S3 access, delta={}, parquet={}, TTL={}s, age={}ms)",
                     location,
                     is_delta,
-                    is_checkpoint,
                     is_parquet,
                     ttl.as_secs(),
                     current_millis().saturating_sub(value.timestamp_millis)
@@ -495,16 +415,13 @@ impl ObjectStore for FoyerObjectStoreCache {
         })
         .await;
         let is_delta = Self::is_delta_metadata(location);
-        let is_checkpoint = Self::is_delta_checkpoint(location);
         let is_parquet = location.as_ref().ends_with(".parquet");
         let ttl = self.get_ttl_for_path(location);
         info!(
-            "Foyer cache MISS for: {} (fetching from S3, delta={}, checkpoint={}, parquet={}, will_cache={}, TTL={}s)",
+            "Foyer cache MISS for: {} (fetching from S3, delta={}, parquet={}, TTL={}s)",
             location,
             is_delta,
-            is_checkpoint,
             is_parquet,
-            self.should_cache(location),
             ttl.as_secs()
         );
 
@@ -528,10 +445,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             }
         };
 
-        // Only cache if we should cache this file type
-        if self.should_cache(location) {
-            self.cache.insert(cache_key, CacheValue::new(data.clone(), result.meta.clone()));
-        }
+        self.cache.insert(cache_key, CacheValue::new(data.clone(), result.meta.clone()));
         Ok(Self::make_get_result(Bytes::from(data), result.meta))
     }
 
@@ -550,17 +464,6 @@ impl ObjectStore for FoyerObjectStoreCache {
 
     async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let is_parquet = location.as_ref().ends_with(".parquet");
-        
-        // Check if we should cache this file
-        if !self.should_cache(location) {
-            self.update_stats(|s| {
-                s.misses += 1;
-                s.inner_gets += 1;
-            })
-            .await;
-            return self.inner.get_range(location, range).await;
-        }
-
         let cache_key = Self::make_cache_key(location);
 
         // Check if we have the full file cached
@@ -571,7 +474,10 @@ impl ObjectStore for FoyerObjectStoreCache {
                 self.update_stats(|s| s.hits += 1).await;
                 debug!(
                     "Foyer cache HIT for range: {} (range: {}..{}, parquet={}, age={}ms)",
-                    location, range.start, range.end, is_parquet,
+                    location,
+                    range.start,
+                    range.end,
+                    is_parquet,
                     current_millis().saturating_sub(value.timestamp_millis)
                 );
                 return Ok(Bytes::from(value.data[range.start as usize..range.end as usize].to_vec()));
@@ -584,7 +490,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 "Foyer cache MISS for Parquet: {} (range: {}..{}, fetching full file)",
                 location, range.start, range.end
             );
-            
+
             // Try to fetch and cache the full file
             if let Ok(result) = self.get(location).await {
                 // The file is now cached, extract the range
@@ -629,11 +535,6 @@ impl ObjectStore for FoyerObjectStoreCache {
     }
 
     async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
-        // Check if we should cache this file
-        if !self.should_cache(location) {
-            return self.inner.head(location).await;
-        }
-
         let cache_key = Self::make_cache_key(location);
 
         if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
@@ -698,12 +599,10 @@ impl std::fmt::Debug for FoyerObjectStoreCache {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
-
 
     #[tokio::test]
     async fn test_basic_operations() -> anyhow::Result<()> {
@@ -886,4 +785,3 @@ mod tests {
         Ok(())
     }
 }
-
