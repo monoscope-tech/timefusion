@@ -26,7 +26,6 @@ struct CacheValue {
     timestamp_millis: u64,
 }
 
-
 impl CacheValue {
     fn new(data: Vec<u8>, meta: ObjectMeta) -> Self {
         Self {
@@ -417,7 +416,7 @@ impl ObjectStore for FoyerObjectStoreCache {
         let is_delta = Self::is_delta_metadata(location);
         let is_parquet = location.as_ref().ends_with(".parquet");
         let ttl = self.get_ttl_for_path(location);
-        info!(
+        debug!(
             "Foyer cache MISS for: {} (fetching from S3, delta={}, parquet={}, TTL={}s)",
             location,
             is_delta,
@@ -486,7 +485,7 @@ impl ObjectStore for FoyerObjectStoreCache {
 
         // For Parquet files, cache the entire file on first access
         if is_parquet {
-            info!(
+            debug!(
                 "Foyer cache MISS for Parquet: {} (range: {}..{}, fetching full file)",
                 location, range.start, range.end
             );
