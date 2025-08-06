@@ -403,8 +403,11 @@ impl Database {
         let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
 
-        // Optimize job - every hour
-        let optimize_job = Job::new_async("0 0 * * * *", {
+        // Optimize job - configurable schedule (default: every 30mins)
+        let optimize_schedule = env::var("TIMEFUSION_OPTIMIZE_SCHEDULE").unwrap_or_else(|_| "0 */30 * * * *".to_string());
+        info!("Optimize job scheduled with cron expression: {}", optimize_schedule);
+
+        let optimize_job = Job::new_async(&optimize_schedule, {
             let db = db.clone();
             move |_, _| {
                 let db = db.clone();
@@ -421,8 +424,11 @@ impl Database {
 
         scheduler.add(optimize_job).await?;
 
-        // Vacuum job - daily at 3AM
-        let vacuum_job = Job::new_async("0 0 3 * * *", {
+        // Vacuum job - configurable schedule (default: daily at 2AM)
+        let vacuum_schedule = env::var("TIMEFUSION_VACUUM_SCHEDULE").unwrap_or_else(|_| "0 0 2 * * *".to_string());
+        info!("Vacuum job scheduled with cron expression: {}", vacuum_schedule);
+
+        let vacuum_job = Job::new_async(&vacuum_schedule, {
             let db = db.clone();
             move |_, _| {
                 let db = db.clone();
@@ -677,7 +683,9 @@ impl Database {
             let project_configs = self.project_configs.read().await;
             debug!(
                 "Checking cache for project '{}' table '{}', cache contains {} entries",
-                project_id, table_name, project_configs.len()
+                project_id,
+                table_name,
+                project_configs.len()
             );
             if let Some(table) = project_configs.get(&(project_id.to_string(), table_name.to_string())) {
                 debug!("Found table in cache for project '{}' table '{}'", project_id, table_name);
@@ -912,7 +920,9 @@ impl Database {
         configs.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
         info!(
             "Cached table for project '{}' table '{}', cache now contains {} entries",
-            project_id, table_name, configs.len()
+            project_id,
+            table_name,
+            configs.len()
         );
 
         Ok(table_arc)
