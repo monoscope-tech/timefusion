@@ -6,3 +6,4 @@ users.json
 data/
 minio
 dis-newstyle 
+*.log
