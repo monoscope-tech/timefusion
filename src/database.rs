@@ -874,12 +874,20 @@ impl Database {
                     let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
+                    let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
+                        .unwrap_or_else(|_| "50".to_string());
+                    
+                    let mut config = HashMap::new();
+                    config.insert("delta.checkpointInterval".to_string(), Some(checkpoint_interval));
+                    config.insert("delta.checkpointPolicy".to_string(), Some("v2".to_string()));
+
                     match delta_ops
                         .create()
                         .with_columns(schema.columns().unwrap_or_default())
                         .with_partition_columns(schema.partitions.clone())
                         .with_storage_options(storage_options.clone())
                         .with_commit_properties(commit_properties)
+                        .with_configuration(config)
                         .await
                     {
                         Ok(table) => break table,
