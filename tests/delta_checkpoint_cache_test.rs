@@ -9,17 +9,7 @@ use futures::TryStreamExt;
 #[tokio::test]
 async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     // Create config with checkpoint caching disabled (default)
-    let config = FoyerCacheConfig {
-        memory_size_bytes: 10 * 1024 * 1024, // 10MB
-        disk_size_bytes: 50 * 1024 * 1024,   // 50MB
-        ttl: Duration::from_secs(300),
-        cache_dir: std::path::PathBuf::from("/tmp/test_delta_checkpoint_cache"),
-        shards: 2,
-        file_size_bytes: 1024 * 1024,
-        enable_stats: true,
-        delta_metadata_ttl: Some(Duration::from_secs(5)),
-        cache_delta_checkpoints: false, // Checkpoints not cached
-    };
+    let config = FoyerCacheConfig::test_config("delta_checkpoint_cache");
 
     let inner = Arc::new(InMemory::new());
     let shared_cache = SharedFoyerCache::new(config).await?;
@@ -95,17 +85,10 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
 #[tokio::test]
 async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     // Create config with checkpoint caching ENABLED to test invalidation
-    let config = FoyerCacheConfig {
-        memory_size_bytes: 10 * 1024 * 1024,
-        disk_size_bytes: 50 * 1024 * 1024,
-        ttl: Duration::from_secs(300),
-        cache_dir: std::path::PathBuf::from("/tmp/test_checkpoint_invalidation"),
-        shards: 2,
-        file_size_bytes: 1024 * 1024,
-        enable_stats: true,
-        delta_metadata_ttl: Some(Duration::from_secs(60)), // Longer TTL to test invalidation
-        cache_delta_checkpoints: true, // Enable caching to test invalidation
-    };
+    let config = FoyerCacheConfig::test_config_with("checkpoint_invalidation", |c| {
+        c.delta_metadata_ttl = Some(Duration::from_secs(60)); // Longer TTL to test invalidation
+        c.cache_delta_checkpoints = true; // Enable caching to test invalidation
+    });
 
     let inner = Arc::new(InMemory::new());
     let shared_cache = SharedFoyerCache::new(config).await?;
@@ -156,17 +139,11 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
-    let config = FoyerCacheConfig {
-        memory_size_bytes: 10 * 1024 * 1024,
-        disk_size_bytes: 50 * 1024 * 1024,
-        ttl: Duration::from_secs(10), // Regular TTL
-        cache_dir: std::path::PathBuf::from("/tmp/test_delta_ttl"),
-        shards: 2,
-        file_size_bytes: 1024 * 1024,
-        enable_stats: true,
-        delta_metadata_ttl: Some(Duration::from_millis(100)), // Very short TTL for test
-        cache_delta_checkpoints: true,
-    };
+    let config = FoyerCacheConfig::test_config_with("delta_ttl", |c| {
+        c.ttl = Duration::from_secs(10); // Regular TTL
+        c.delta_metadata_ttl = Some(Duration::from_millis(100)); // Very short TTL for test
+        c.cache_delta_checkpoints = true;
+    });
 
     let inner = Arc::new(InMemory::new());
     let shared_cache = SharedFoyerCache::new(config).await?;

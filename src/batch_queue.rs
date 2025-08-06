@@ -36,8 +36,11 @@ impl BatchQueue {
                         if !batches.is_empty() {
                             let mut grouped = std::collections::HashMap::<String, Vec<RecordBatch>>::new();
                             for batch in batches {
-                                let project_id = crate::database::extract_project_id(&batch).unwrap_or_else(|| "default".to_string());
-                                grouped.entry(project_id).or_default().push(batch);
+                                if let Some(project_id) = crate::database::extract_project_id(&batch) {
+                                    grouped.entry(project_id).or_default().push(batch);
+                                } else {
+                                    error!("Skipping batch without project_id");
+                                }
                             }
                             
                             for (project_id, batches) in grouped {
@@ -98,7 +101,7 @@ mod tests {
                 let mut record = create_default_record();
                 record.insert("timestamp".to_string(), json!(now.timestamp_micros()));
                 record.insert("id".to_string(), json!(format!("test-{}", i)));
-                record.insert("project_id".to_string(), json!("default"));
+                record.insert("project_id".to_string(), json!("test-project-uuid"));
                 record.insert("date".to_string(), json!(now.date_naive().to_string()));
                 record.insert("hashes".to_string(), json!([]));
                 record.insert("summary".to_string(), json!(format!("Batch queue test record {}", i)));

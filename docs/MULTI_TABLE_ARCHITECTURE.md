@@ -87,7 +87,7 @@ Response:
 ```json
 {
   "tables": [
-    {"project_id": "default", "table_name": "otel_logs_and_spans"},
+    {"project_id": "project-uuid-1", "table_name": "otel_logs_and_spans"},
     {"project_id": "acme-corp", "table_name": "otel_logs_and_spans"},
     {"project_id": "acme-corp", "table_name": "metrics"},
     {"project_id": "acme-corp", "table_name": "events"}
@@ -107,7 +107,7 @@ Response:
 
 For existing deployments:
 
-1. The default table (`otel_logs_and_spans`) continues to work as before
+1. Each project must have a valid UUID for project_id
 2. Existing data paths remain unchanged for backward compatibility
 3. New table types can be added incrementally without affecting existing data
 
