@@ -6668,6 +6668,7 @@ dependencies = [
  "aws-types",
  "bytes",
  "chrono",
+ "chrono-tz",
  "color-eyre",
  "dashmap",
  "datafusion",

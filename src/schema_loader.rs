@@ -2,7 +2,7 @@ use arrow::datatypes::DataType as ArrowDataType;
 use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
 use delta_kernel::parquet::format::SortingColumn;
 use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
-use include_dir::{include_dir, Dir};
+use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -161,4 +161,3 @@ pub fn get_schema(table_name: &str) -> Option<&'static TableSchema> {
 pub fn get_default_schema() -> &'static TableSchema {
     registry().get_default().expect("No schemas available in registry")
 }
-

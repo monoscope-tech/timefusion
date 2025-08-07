@@ -1,10 +1,10 @@
 // main.rs
-use timefusion::batch_queue::{BatchQueue};
-use timefusion::database::{Database};
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use std::{env, sync::Arc};
-use tokio::time::{sleep, Duration};
+use timefusion::batch_queue::BatchQueue;
+use timefusion::database::Database;
+use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -57,16 +57,14 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting PGWire server on port: {}", pg_port);
 
     let pg_task = tokio::spawn(async move {
-        let opts = ServerOptions::new()
-            .with_port(pg_port)
-            .with_host("0.0.0.0".to_string());
+        let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
 
         datafusion_postgres::serve(Arc::new(session_context), &opts).await
     });
 
     // Store database for shutdown
     let db_for_shutdown = db.clone();
-    
+
     // Wait for shutdown signal
     tokio::select! {
         _ = pg_task => {error!("PGWire server task failed")},
@@ -76,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
             // Shutdown batch queue to flush pending data
             batch_queue.shutdown().await;
             sleep(Duration::from_secs(1)).await;
-            
+
             // Properly shutdown the database including cache
             if let Err(e) = db_for_shutdown.shutdown().await {
                 error!("Error during database shutdown: {}", e);

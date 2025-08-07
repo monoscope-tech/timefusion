@@ -7,10 +7,10 @@ mod sqllogictest_tests {
     use serial_test::serial;
     use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
     use std::{
+        fmt,
         path::Path,
         sync::Arc,
         time::{Duration, Instant},
-        fmt,
     };
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
@@ -186,9 +186,7 @@ mod sqllogictest_tests {
             let mut session_context = db.create_session_context();
             db.setup_session_context(&mut session_context).expect("Failed to setup session context");
 
-            let opts = ServerOptions::new()
-                .with_port(5433)
-                .with_host("0.0.0.0".to_string());
+            let opts = ServerOptions::new().with_port(5433).with_host("0.0.0.0".to_string());
 
             // Wait for shutdown signal or server termination
             tokio::select! {
@@ -212,73 +210,67 @@ mod sqllogictest_tests {
     async fn run_sqllogictest() -> Result<()> {
         // Wrap the entire test in a timeout
         tokio::time::timeout(Duration::from_secs(120), async {
-        let shutdown_signal = start_test_server().await?;
+            let shutdown_signal = start_test_server().await?;
 
-        let _factory = || async move {
-            let (client, _) = connect_with_retry(Duration::from_secs(3)).await?;
-            Ok::<TestDB, TestError>(TestDB { client })
-        };
-
-        // Auto-discover all .slt test files
-        let test_dir = Path::new("tests");
-        let mut test_files = Vec::new();
-        
-        if test_dir.is_dir() {
-            for entry in std::fs::read_dir(test_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("slt") {
-                    test_files.push(path);
-                }
-            }
-        }
-        
-        // Sort files for consistent test order
-        test_files.sort();
-        
-        println!("Found {} .slt test files", test_files.len());
-        for file in &test_files {
-            println!("  - {}", file.display());
-        }
-
-        let mut all_passed = true;
-        for test_file in test_files {
-            let test_path = test_file.as_path();
-            println!("Running SQLLogicTest: {}", test_path.display());
-            
-            let factory_clone = || async move {
+            let _factory = || async move {
                 let (client, _) = connect_with_retry(Duration::from_secs(3)).await?;
                 Ok::<TestDB, TestError>(TestDB { client })
             };
-            
-            // Add timeout for individual test files (30 seconds each)
-            let test_result = tokio::time::timeout(
-                Duration::from_secs(30),
-                sqllogictest::Runner::new(factory_clone).run_file_async(test_path)
-            ).await;
-            
-            match test_result {
-                Ok(Ok(_)) => println!("✓ {} passed", test_path.display()),
-                Ok(Err(e)) => {
-                    eprintln!("✗ {} failed: {:?}", test_path.display(), e);
-                    all_passed = false;
-                }
-                Err(_) => {
-                    eprintln!("✗ {} timed out after 30 seconds", test_path.display());
-                    all_passed = false;
+
+            // Auto-discover all .slt test files
+            let test_dir = Path::new("tests");
+            let mut test_files = Vec::new();
+
+            if test_dir.is_dir() {
+                for entry in std::fs::read_dir(test_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("slt") {
+                        test_files.push(path);
+                    }
                 }
             }
-        }
 
-        // Always shut down the server
-        shutdown_signal.notify_one();
+            // Sort files for consistent test order
+            test_files.sort();
 
-        if all_passed {
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Some SQLLogicTests failed"))
-        }
-        }).await
+            println!("Found {} .slt test files", test_files.len());
+            for file in &test_files {
+                println!("  - {}", file.display());
+            }
+
+            let mut all_passed = true;
+            for test_file in test_files {
+                let test_path = test_file.as_path();
+                println!("Running SQLLogicTest: {}", test_path.display());
+
+                let factory_clone = || async move {
+                    let (client, _) = connect_with_retry(Duration::from_secs(3)).await?;
+                    Ok::<TestDB, TestError>(TestDB { client })
+                };
+
+                // Add timeout for individual test files (30 seconds each)
+                let test_result = tokio::time::timeout(Duration::from_secs(30), sqllogictest::Runner::new(factory_clone).run_file_async(test_path)).await;
+
+                match test_result {
+                    Ok(Ok(_)) => println!("✓ {} passed", test_path.display()),
+                    Ok(Err(e)) => {
+                        eprintln!("✗ {} failed: {:?}", test_path.display(), e);
+                        all_passed = false;
+                    }
+                    Err(_) => {
+                        eprintln!("✗ {} timed out after 30 seconds", test_path.display());
+                        all_passed = false;
+                    }
+                }
+            }
+
+            // Always shut down the server
+            shutdown_signal.notify_one();
+
+            if all_passed { Ok(()) } else { Err(anyhow::anyhow!("Some SQLLogicTests failed")) }
+        })
+        .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 120 seconds"))?
     }
 }

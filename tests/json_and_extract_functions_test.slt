@@ -1,0 +1,237 @@
+# Test available JSON and date/time functions in TimeFusion
+
+# First, let's insert some test data with JSON content
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    parent_id, name, kind, resource___service___name,
+    status_code, status_message, level, duration, summary
+) VALUES 
+    ('test_functions', TIMESTAMP '2024-01-15T14:30:45.123456Z', 'json_test_1', ARRAY['hash1']::VARCHAR[], DATE '2024-01-15',
+     NULL, 'test_json', 'SERVER', 'test-service',
+     'OK', '{"name": "John", "age": 30, "items": ["apple", "banana"], "nested": {"key": "value"}}', 'INFO', 1000000, 'Test JSON functions'),
+    ('test_functions', TIMESTAMP '2024-12-25T08:00:00Z', 'date_test_1', ARRAY['hash2']::VARCHAR[], DATE '2024-12-25',
+     NULL, 'test_date', 'SERVER', 'test-service',
+     'OK', 'Regular message', 'INFO', 2000000, 'Test date functions')
+
+# === Test DataFusion built-in JSON functions ===
+
+# Test json_get (from datafusion-functions-json)
+query T
+SELECT json_get(status_message, '$.name') as name
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+"John"
+
+# Test json_get_int
+query I
+SELECT json_get_int(status_message, '$.age') as age
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+30
+
+# Test json_get_str
+query T
+SELECT json_get_str(status_message, '$.name') as name
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+John
+
+# Test json_get with nested path
+query T
+SELECT json_get_str(status_message, '$.nested.key') as nested_value
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+value
+
+# Test json_get with array access
+query T
+SELECT json_get_str(status_message, '$.items[0]') as first_item
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+apple
+
+# Test json_get with array access (second item)
+query T
+SELECT json_get_str(status_message, '$.items[1]') as second_item
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+banana
+
+# Test json_length for objects
+query I
+SELECT json_length(status_message) as obj_length
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+4
+
+# Test json_length for arrays
+query I
+SELECT json_length(status_message, '$.items') as array_length
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+2
+
+# Test json_contains
+query B
+SELECT json_contains(status_message, '$.name', '"John"') as has_john
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+true
+
+# Test json_contains with non-existent value
+query B
+SELECT json_contains(status_message, '$.name', '"Jane"') as has_jane
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+false
+
+# === Test EXTRACT function (DataFusion built-in) ===
+
+# Test EXTRACT year
+query I
+SELECT EXTRACT(YEAR FROM timestamp) as year
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+2024
+
+# Test EXTRACT month
+query I
+SELECT EXTRACT(MONTH FROM timestamp) as month
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+1
+
+# Test EXTRACT day
+query I
+SELECT EXTRACT(DAY FROM timestamp) as day
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+15
+
+# Test EXTRACT hour
+query I
+SELECT EXTRACT(HOUR FROM timestamp) as hour
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+14
+
+# Test EXTRACT minute
+query I
+SELECT EXTRACT(MINUTE FROM timestamp) as minute
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+30
+
+# Test EXTRACT second (should include fractional seconds)
+query R
+SELECT EXTRACT(SECOND FROM timestamp) as second
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+45.123456
+
+# Test EXTRACT with different timestamp
+query I
+SELECT EXTRACT(MONTH FROM timestamp) as month
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'date_test_1'
+----
+12
+
+# Test EXTRACT day of week (Sunday = 0)
+query I
+SELECT EXTRACT(DOW FROM timestamp) as day_of_week
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'date_test_1'
+----
+3
+
+# Test EXTRACT day of year
+query I
+SELECT EXTRACT(DOY FROM timestamp) as day_of_year
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'date_test_1'
+----
+360
+
+# Test EXTRACT quarter
+query I
+SELECT EXTRACT(QUARTER FROM timestamp) as quarter
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+1
+
+# Test EXTRACT week
+query I
+SELECT EXTRACT(WEEK FROM timestamp) as week
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+3
+
+# === Test date_part function (alias for EXTRACT) ===
+
+query I
+SELECT date_part('year', timestamp) as year
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+2024
+
+query I
+SELECT date_part('month', timestamp) as month
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'  
+----
+1
+
+# === Test combined JSON and date functions ===
+
+# Extract year and JSON field in same query
+query IT
+SELECT EXTRACT(YEAR FROM timestamp) as year, json_get_str(status_message, '$.name') as name
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+2024	John
+
+# === Test functions that might NOT be available ===
+
+# Test json_build_array (likely not available)
+statement error
+SELECT json_build_array('a', 'b', 'c') as array_result
+
+# Test to_json (likely not available)
+statement error
+SELECT to_json(name) as json_name
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+
+# Test json_array_elements (registered but not implemented)
+statement error
+SELECT json_array_elements(status_message -> 'items') as item
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+
+# Test jsonb_array_elements (registered but not implemented)
+statement error
+SELECT jsonb_array_elements(status_message) as element
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'

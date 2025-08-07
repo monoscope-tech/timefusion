@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use dashmap::DashSet;
 use futures::stream::BoxStream;
 use object_store::{
-    path::Path, Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result as ObjectStoreResult,
+    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result as ObjectStoreResult, path::Path,
 };
 use std::ops::Range;
 use std::path::PathBuf;
@@ -307,10 +307,10 @@ impl FoyerObjectStoreCache {
         let last_checkpoint_path = format!("{}/_delta_log/_last_checkpoint", table_path);
         let cache_key = last_checkpoint_path.clone();
         info!("Explicitly invalidating and refreshing _last_checkpoint cache for table: {}", table_path);
-        
+
         // Remove from cache first
         self.cache.remove(&cache_key);
-        
+
         // Immediately fetch and cache the new version
         let location = Path::from(last_checkpoint_path);
         if let Ok(get_result) = self.inner.get(&location).await {
@@ -326,11 +326,7 @@ impl FoyerObjectStoreCache {
                 GetResultPayload::File(mut file, _) => {
                     use std::io::Read;
                     let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() {
-                        buf
-                    } else {
-                        vec![]
-                    }
+                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
                 }
             };
             if !data.is_empty() {
@@ -405,11 +401,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                     GetResultPayload::File(mut file, _) => {
                         use std::io::Read;
                         let mut buf = Vec::new();
-                        if file.read_to_end(&mut buf).is_ok() {
-                            buf
-                        } else {
-                            vec![]
-                        }
+                        if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
                     }
                 };
                 if !data.is_empty() {
@@ -446,11 +438,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                     GetResultPayload::File(mut file, _) => {
                         use std::io::Read;
                         let mut buf = Vec::new();
-                        if file.read_to_end(&mut buf).is_ok() {
-                            buf
-                        } else {
-                            vec![]
-                        }
+                        if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
                     }
                 };
                 if !data.is_empty() {
@@ -473,11 +461,11 @@ impl ObjectStore for FoyerObjectStoreCache {
 
             // Use appropriate TTL based on file type
             let ttl = self.get_ttl_for_path(location);
-            
+
             // Special handling for _last_checkpoint: stale-while-revalidate
             if Self::is_last_checkpoint(location) && !value.is_expired(ttl) {
                 self.update_stats(|s| s.hits += 1).await;
-                
+
                 // Check if older than 5 seconds
                 let age_millis = current_millis().saturating_sub(value.timestamp_millis);
                 if age_millis > 5000 {
@@ -488,7 +476,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                         let refreshing = self.refreshing.clone();
                         let location = location.clone();
                         let key = cache_key.clone();
-                        
+
                         tokio::spawn(async move {
                             debug!("Background refresh for _last_checkpoint: {}", location);
                             if let Ok(result) = inner.get(&location).await {
@@ -505,11 +493,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                                     GetResultPayload::File(mut file, _) => {
                                         use std::io::Read;
                                         let mut buf = Vec::new();
-                                        if file.read_to_end(&mut buf).is_ok() {
-                                            buf
-                                        } else {
-                                            vec![]
-                                        }
+                                        if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
                                     }
                                 };
                                 if !data.is_empty() {
@@ -519,24 +503,16 @@ impl ObjectStore for FoyerObjectStoreCache {
                             refreshing.remove(&key);
                         });
                     }
-                    
-                    debug!(
-                        "Foyer cache HIT (stale-while-revalidate) for: {} (age: {}ms)",
-                        location,
-                        age_millis
-                    );
+
+                    debug!("Foyer cache HIT (stale-while-revalidate) for: {} (age: {}ms)", location, age_millis);
                 } else {
-                    debug!(
-                        "Foyer cache HIT (fresh) for: {} (age: {}ms)",
-                        location,
-                        age_millis
-                    );
+                    debug!("Foyer cache HIT (fresh) for: {} (age: {}ms)", location, age_millis);
                 }
-                
+
                 // Always return cached value immediately
                 return Ok(Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone()));
             }
-            
+
             // Regular cache expiration check for non-checkpoint files
             if value.is_expired(ttl) {
                 self.update_stats(|s| s.ttl_expirations += 1).await;
