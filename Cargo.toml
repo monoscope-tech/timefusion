@@ -49,7 +49,7 @@ aws-sdk-dynamodb = "1.3.0"
 url = "2.5.4"
 tokio-cron-scheduler = "0.14"
 object_store = "0.12.3"
-foyer = { version = "0.18", features = ["serde"] }
+foyer = { version = "0.18", features = ["serde", "dedicated-thread-runtime"] }
 ahash = "0.8"
 lru = "0.12"
 serde_bytes = "0.11"
