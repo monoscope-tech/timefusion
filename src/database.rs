@@ -9,8 +9,8 @@ use datafusion::common::not_impl_err;
 use datafusion::common::stats::Precision;
 use datafusion::common::{SchemaExt, Statistics};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
-use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
+use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 // Removed unused imports
 use datafusion::physical_plan::DisplayAs;
@@ -19,7 +19,7 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{dml::InsertOp, BinaryExpr},
+    logical_expr::{BinaryExpr, dml::InsertOp},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 use datafusion_functions_json;
@@ -29,7 +29,7 @@ use deltalake::kernel::transaction::CommitProperties;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
@@ -589,6 +589,9 @@ impl Database {
         self.register_set_config_udf(ctx);
         self.register_json_functions(ctx);
 
+        // Register custom PostgreSQL-compatible functions
+        crate::functions::register_custom_functions(ctx).map_err(|e| DataFusionError::Execution(format!("Failed to register custom functions: {}", e)))?;
+
         Ok(())
     }
 
@@ -641,7 +644,7 @@ impl Database {
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
         use datafusion::arrow::array::{StringArray, StringBuilder};
         use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
+        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
@@ -874,9 +877,8 @@ impl Database {
                     let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
-                    let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL")
-                        .unwrap_or_else(|_| "50".to_string());
-                    
+                    let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "50".to_string());
+
                     let mut config = HashMap::new();
                     config.insert("delta.checkpointInterval".to_string(), Some(checkpoint_interval));
                     config.insert("delta.checkpointPolicy".to_string(), Some("v2".to_string()));

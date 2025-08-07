@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use std::time::Duration;
-use object_store::{ObjectStore, PutPayload};
+use futures::TryStreamExt;
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use object_store::{ObjectStore, PutPayload};
+use std::sync::Arc;
+use std::time::Duration;
 use timefusion::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
-use futures::TryStreamExt;
 
 #[tokio::test]
 async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
@@ -19,13 +19,13 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     let regular_path = Path::from("data/file.parquet");
     let regular_data = b"regular parquet data";
     cache.put(&regular_path, PutPayload::from(&regular_data[..])).await?;
-    
+
     // First get should hit the inner store
     let stats1 = cache.get_stats().await;
     let _ = cache.get(&regular_path).await?;
     let stats2 = cache.get_stats().await;
     assert_eq!(stats2.misses - stats1.misses, 1, "First get should be a miss");
-    
+
     // Second get should hit the cache
     let _ = cache.get(&regular_path).await?;
     let stats3 = cache.get_stats().await;
@@ -35,13 +35,13 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     let checkpoint_path = Path::from("table/_delta_log/_last_checkpoint");
     let checkpoint_data = b"checkpoint metadata";
     inner.put(&checkpoint_path, PutPayload::from(&checkpoint_data[..])).await?;
-    
+
     // First get should miss the cache
     let stats4 = cache.get_stats().await;
     let _ = cache.get(&checkpoint_path).await?;
     let stats5 = cache.get_stats().await;
     assert_eq!(stats5.misses - stats4.misses, 1, "First checkpoint get should miss");
-    
+
     // Second get should hit the cache (now cached)
     let _ = cache.get(&checkpoint_path).await?;
     let stats6 = cache.get_stats().await;
@@ -50,27 +50,27 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     // Test 3: Writing a commit file should invalidate _last_checkpoint
     let commit_path = Path::from("table/_delta_log/00000001.json");
     let commit_data = b"commit data";
-    
+
     // Put checkpoint in inner store
     inner.put(&checkpoint_path, PutPayload::from(&b"old checkpoint"[..])).await?;
-    
+
     // Write commit file through cache
     cache.put(&commit_path, PutPayload::from(&commit_data[..])).await?;
-    
+
     // The checkpoint cache should have been invalidated
     // (though in this case it wasn't cached anyway due to cache_delta_checkpoints=false)
-    
+
     // Test 4: Delta metadata files should use shorter TTL
     let metadata_path = Path::from("table/_delta_log/00000000.json");
     let metadata_data = b"metadata";
     cache.put(&metadata_path, PutPayload::from(&metadata_data[..])).await?;
-    
+
     // First get should miss
     let stats7 = cache.get_stats().await;
     let _ = cache.get(&metadata_path).await?;
     let stats8 = cache.get_stats().await;
     assert_eq!(stats8.misses - stats7.misses, 1, "First metadata get should miss");
-    
+
     // Second get should hit (within TTL)
     let _ = cache.get(&metadata_path).await?;
     let stats9 = cache.get_stats().await;
@@ -79,7 +79,7 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     // Cleanup
     cache.shutdown().await?;
     let _ = std::fs::remove_dir_all("/tmp/test_delta_checkpoint_cache");
-    
+
     Ok(())
 }
 
@@ -131,11 +131,11 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     assert_eq!(data3, checkpoint_data, "Should still get cached (stale) checkpoint data");
     let stats5 = cache.get_stats().await;
     assert_eq!(stats5.hits - stats4.hits, 1, "Should hit cache with stale data");
-    
+
     // To get the new data, we need to wait for the stale threshold (5 seconds)
     // or manually invalidate the cache
     cache.invalidate_checkpoint_cache("mytable").await;
-    
+
     // After invalidation, the cache is immediately refreshed, so we get a hit with new data
     let stats6 = cache.get_stats().await;
     let result4 = cache.get(&checkpoint_path).await?;
@@ -148,7 +148,7 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     // Cleanup
     cache.shutdown().await?;
     let _ = std::fs::remove_dir_all("/tmp/test_checkpoint_invalidation");
-    
+
     Ok(())
 }
 
@@ -193,10 +193,10 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
 
     let _ = cache.get(&regular_path).await?;
     let _ = cache.get(&regular_path).await?;
-    
+
     // Wait same time as before (less than regular TTL)
     tokio::time::sleep(Duration::from_millis(150)).await;
-    
+
     // Should still hit cache (regular TTL is longer)
     let stats5 = cache.get_stats().await;
     let _ = cache.get(&regular_path).await?;
@@ -206,6 +206,6 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     // Cleanup
     cache.shutdown().await?;
     let _ = std::fs::remove_dir_all("/tmp/test_delta_ttl");
-    
+
     Ok(())
 }

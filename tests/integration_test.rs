@@ -39,9 +39,7 @@ mod integration {
                 let mut ctx = db.create_session_context();
                 db.setup_session_context(&mut ctx).expect("Failed to setup context");
 
-                let opts = ServerOptions::new()
-                    .with_port(port)
-                    .with_host("0.0.0.0".to_string());
+                let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
 
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
@@ -55,13 +53,13 @@ mod integration {
 
             // Wait for server readiness
             Self::connect(port).await?;
-            
+
             Ok(Self { port, test_id, shutdown })
         }
 
         async fn connect(port: u16) -> Result<Client> {
             let conn_str = format!("host=localhost port={port} user=postgres password=postgres");
-            
+
             for _ in 0..100 {
                 if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                     tokio::spawn(async move {
@@ -73,7 +71,7 @@ mod integration {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            
+
             Err(anyhow::anyhow!("Failed to connect after timeout"))
         }
 
@@ -105,49 +103,56 @@ mod integration {
         let insert = TestServer::insert_sql();
 
         // Insert and verify single record
-        client.execute(&insert, &[
-            &"test_project", &server.test_id, &"test_span_name", 
-            &"OK", &"Test integration", &"INFO", &"Integration test summary"
-        ]).await?;
+        client
+            .execute(
+                &insert,
+                &[&"test_project", &server.test_id, &"test_span_name", &"OK", &"Test integration", &"INFO", &"Integration test summary"],
+            )
+            .await?;
 
         let count: i64 = client
-            .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", 
-                       &[&"test_project", &server.test_id])
+            .query_one(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &server.test_id],
+            )
             .await?
             .get(0);
         assert_eq!(count, 1);
 
         // Verify field values
         let row = client
-            .query_one("SELECT name, status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-                       &[&"test_project", &server.test_id])
+            .query_one(
+                "SELECT name, status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &server.test_id],
+            )
             .await?;
         assert_eq!(row.get::<_, String>(0), "test_span_name");
         assert_eq!(row.get::<_, String>(1), "OK");
 
         // Batch insert
         for i in 0..5 {
-            client.execute(&insert, &[
-                &"test_project", &Uuid::new_v4().to_string(), 
-                &format!("batch_span_{i}"), &"OK", 
-                &format!("Batch test {i}"), &"INFO",
-                &format!("Batch test summary {i}")
-            ]).await?;
+            client
+                .execute(
+                    &insert,
+                    &[
+                        &"test_project",
+                        &Uuid::new_v4().to_string(),
+                        &format!("batch_span_{i}"),
+                        &"OK",
+                        &format!("Batch test {i}"),
+                        &"INFO",
+                        &format!("Batch test summary {i}"),
+                    ],
+                )
+                .await?;
         }
 
         // Verify total count
-        let total: i64 = client
-            .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", 
-                       &[&"test_project"])
-            .await?
-            .get(0);
+        let total: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
         assert_eq!(total, 6);
 
         // Verify schema
-        let rows = client
-            .query("SELECT * FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1", 
-                   &[&"test_project"])
-            .await?;
+        let rows = client.query("SELECT * FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1", &[&"test_project"]).await?;
         assert_eq!(rows[0].columns().len(), 87);
 
         Ok(())
@@ -158,7 +163,7 @@ mod integration {
     async fn test_concurrent_postgres_requests() -> Result<()> {
         let server = TestServer::start().await?;
         let insert = TestServer::insert_sql();
-        
+
         const CLIENTS: usize = 3;
         const OPS_PER_CLIENT: usize = 5;
 
@@ -168,22 +173,29 @@ mod integration {
             let server_port = server.port;
             let test_prefix = format!("{}-client-{client_id}", server.test_id);
             let insert = insert.clone();
-            
+
             handles.push(tokio::spawn(async move {
                 let client = TestServer::connect(server_port).await?;
                 for op in 0..OPS_PER_CLIENT {
                     let span_id = format!("{test_prefix}-op-{op}");
-                    client.execute(&insert, &[
-                        &"test_project", &span_id,
-                        &format!("concurrent_span_{client_id}_{op}"),
-                        &"OK", &"Test", &"INFO",
-                        &format!("Concurrent test summary: client {} op {}", client_id, op)
-                    ]).await?;
-                    
+                    client
+                        .execute(
+                            &insert,
+                            &[
+                                &"test_project",
+                                &span_id,
+                                &format!("concurrent_span_{client_id}_{op}"),
+                                &"OK",
+                                &"Test",
+                                &"INFO",
+                                &format!("Concurrent test summary: client {} op {}", client_id, op),
+                            ],
+                        )
+                        .await?;
+
                     // Mix in queries to simulate real workload
                     if op % 2 == 0 {
-                        client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", 
-                                    &[&"test_project"]).await?;
+                        client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?;
                     }
                 }
                 Ok::<_, anyhow::Error>(())
@@ -197,8 +209,13 @@ mod integration {
         // Verify results
         let client = server.client().await?;
         let count: i64 = client
-            .query_one(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{}%'", 
-                               server.test_id), &[])
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{}%'",
+                    server.test_id
+                ),
+                &[],
+            )
             .await?
             .get(0);
         assert_eq!(count, (CLIENTS * OPS_PER_CLIENT) as i64);
@@ -208,17 +225,28 @@ mod integration {
         for _ in 0..3 {
             let server_port = server.port;
             let test_id = server.test_id.clone();
-            
+
             read_handles.push(tokio::spawn(async move {
                 let client = TestServer::connect(server_port).await?;
                 for j in 0..5 {
                     match j % 3 {
-                        0 => client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", 
-                                         &[&"test_project"]).await?,
-                        1 => client.query(&format!("SELECT name FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{test_id}%' LIMIT 10"), 
-                                         &[]).await?,
-                        _ => client.query("SELECT status_code, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' GROUP BY status_code", 
-                                         &[]).await?,
+                        0 => client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?,
+                        1 => {
+                            client
+                                .query(
+                                    &format!("SELECT name FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{test_id}%' LIMIT 10"),
+                                    &[],
+                                )
+                                .await?
+                        }
+                        _ => {
+                            client
+                                .query(
+                                    "SELECT status_code, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' GROUP BY status_code",
+                                    &[],
+                                )
+                                .await?
+                        }
                     };
                 }
                 Ok::<_, anyhow::Error>(())

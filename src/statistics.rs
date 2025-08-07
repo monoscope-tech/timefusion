@@ -35,22 +35,16 @@ impl DeltaStatisticsExtractor {
     }
 
     /// Extract basic statistics from a Delta table (row count and byte size only)
-    pub async fn extract_statistics(
-        &self,
-        table: &DeltaTable,
-        project_id: &str,
-        table_name: &str,
-        _schema: &SchemaRef,
-    ) -> Result<Statistics> {
+    pub async fn extract_statistics(&self, table: &DeltaTable, project_id: &str, table_name: &str, _schema: &SchemaRef) -> Result<Statistics> {
         let cache_key = format!("{}:{}", project_id, table_name);
-        
+
         // Check cache first
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.peek(&cache_key) {
                 let elapsed = cached.timestamp.elapsed().as_secs();
                 let current_version = table.version().unwrap_or(-1);
-                
+
                 if elapsed < self.cache_ttl_seconds && cached.version == current_version {
                     debug!("Statistics cache hit for {} (version {})", cache_key, current_version);
                     return Ok(cached.stats.clone());
@@ -59,21 +53,21 @@ impl DeltaStatisticsExtractor {
         }
 
         debug!("Extracting basic statistics for {}", cache_key);
-        
+
         // Get table metadata
         let version = table.version();
         let num_files = table.get_file_uris()?.count();
-        
+
         // Calculate row count and byte size from Delta metadata
         let (num_rows, total_byte_size) = self.calculate_table_stats(table).await?;
-        
+
         // Create basic statistics without column-level details
         let stats = Statistics {
             num_rows: Precision::Inexact(num_rows as usize),
             total_byte_size: Precision::Exact(total_byte_size as usize),
             column_statistics: vec![], // No column statistics needed
         };
-        
+
         // Update cache
         {
             let mut cache = self.cache.write().await;
@@ -86,28 +80,28 @@ impl DeltaStatisticsExtractor {
                 },
             );
         }
-        
+
         info!(
             "Extracted basic statistics for {}: {} rows, {} bytes, {} files",
             cache_key, num_rows, total_byte_size, num_files
         );
-        
+
         Ok(stats)
     }
 
     /// Calculate table-level statistics
     async fn calculate_table_stats(&self, table: &DeltaTable) -> Result<(u64, u64)> {
         let snapshot = table.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {}", e))?;
-        
+
         // Try to get actual statistics from Delta log
         let _metadata = snapshot.metadata();
-        
+
         // Get file actions to calculate real stats
         let file_actions = snapshot.file_actions()?;
         let mut total_rows = 0u64;
         let mut total_bytes = 0u64;
         let mut has_row_stats = false;
-        
+
         for action in file_actions {
             // Delta stores actual row count and size in the log
             if let Some(stats) = &action.stats {
@@ -121,17 +115,14 @@ impl DeltaStatisticsExtractor {
             }
             total_bytes += action.size as u64;
         }
-        
+
         // Fallback to estimates if stats not available
         if !has_row_stats {
             let num_files = snapshot.file_actions()?.len() as u64;
-            let page_row_limit = std::env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(20_000);
+            let page_row_limit = std::env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20_000);
             total_rows = num_files * page_row_limit;
         }
-        
+
         Ok((total_rows, total_bytes))
     }
 
@@ -156,7 +147,7 @@ impl DeltaStatisticsExtractor {
             debug!("Invalidated statistics for {} (was version {})", cache_key, removed.version);
         }
     }
-    
+
     /// Get cache statistics for monitoring
     pub async fn get_cache_stats(&self) -> (usize, usize) {
         let cache = self.cache.read().await;
@@ -172,7 +163,7 @@ mod tests {
     async fn test_statistics_cache() {
         let extractor = DeltaStatisticsExtractor::new(10, 300);
         assert_eq!(extractor.cache_size().await, 0);
-        
+
         extractor.invalidate("project1", "table1").await;
         assert_eq!(extractor.cache_size().await, 0);
     }

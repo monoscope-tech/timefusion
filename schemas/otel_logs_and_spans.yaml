@@ -268,7 +268,7 @@ fields:
     data_type: Utf8
     nullable: false
   - name: summary
-    data_type: Utf8
+    data_type: "List(Utf8)"
     nullable: false
   - name: date
     data_type: Date32
