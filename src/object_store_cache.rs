@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use dashmap::DashSet;
 use futures::stream::BoxStream;
 use object_store::{
     path::Path, Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
@@ -249,7 +250,7 @@ impl SharedFoyerCache {
         // Remove any trailing slashes
         let table_path = table_path.trim_end_matches('/');
 
-        let last_checkpoint_key = format!("{}_delta_log/_last_checkpoint", table_path);
+        let last_checkpoint_key = format!("{}/_delta_log/_last_checkpoint", table_path);
         info!("Invalidating _last_checkpoint cache for table: {}", table_path);
         self.cache.remove(&last_checkpoint_key);
     }
@@ -261,6 +262,7 @@ pub struct FoyerObjectStoreCache {
     cache: FoyerCache,
     stats: StatsRef,
     config: FoyerCacheConfig,
+    refreshing: Arc<DashSet<String>>,
 }
 
 impl FoyerObjectStoreCache {
@@ -270,6 +272,7 @@ impl FoyerObjectStoreCache {
             cache: shared_cache.cache.clone(),
             stats: shared_cache.stats.clone(),
             config: shared_cache.config.clone(),
+            refreshing: Arc::new(DashSet::new()),
         }
     }
 
@@ -285,10 +288,7 @@ impl FoyerObjectStoreCache {
 
     /// Get the appropriate TTL for a file based on its type
     fn get_ttl_for_path(&self, location: &Path) -> Duration {
-        if Self::is_last_checkpoint(location) {
-            // Use very short TTL for _last_checkpoint file (mutable pointer)
-            Duration::from_secs(5)
-        } else if Self::is_delta_metadata(location) {
+        if Self::is_delta_metadata(location) {
             // Use shorter TTL for Delta metadata files
             self.config.delta_metadata_ttl.unwrap_or(self.config.ttl)
         } else {
@@ -304,11 +304,40 @@ impl FoyerObjectStoreCache {
         // Remove any trailing slashes
         let table_path = table_path.trim_end_matches('/');
 
-        let last_checkpoint_path = format!("{}_delta_log/_last_checkpoint", table_path);
-        info!("Explicitly invalidating _last_checkpoint cache for table: {}", table_path);
-        self.cache.remove(&last_checkpoint_path);
-
-        // TODO: In the future, we could track and invalidate specific checkpoint.parquet files
+        let last_checkpoint_path = format!("{}/_delta_log/_last_checkpoint", table_path);
+        let cache_key = last_checkpoint_path.clone();
+        info!("Explicitly invalidating and refreshing _last_checkpoint cache for table: {}", table_path);
+        
+        // Remove from cache first
+        self.cache.remove(&cache_key);
+        
+        // Immediately fetch and cache the new version
+        let location = Path::from(last_checkpoint_path);
+        if let Ok(get_result) = self.inner.get(&location).await {
+            use futures::TryStreamExt;
+            let data = match get_result.payload {
+                GetResultPayload::Stream(s) => {
+                    if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
+                        chunks.concat()
+                    } else {
+                        vec![]
+                    }
+                }
+                GetResultPayload::File(mut file, _) => {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    if file.read_to_end(&mut buf).is_ok() {
+                        buf
+                    } else {
+                        vec![]
+                    }
+                }
+            };
+            if !data.is_empty() {
+                self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
+                debug!("Proactively refreshed _last_checkpoint cache after invalidation");
+            }
+        }
     }
 
     pub async fn new(inner: Arc<dyn ObjectStore>, config: FoyerCacheConfig) -> anyhow::Result<Self> {
@@ -360,6 +389,37 @@ impl ObjectStore for FoyerObjectStoreCache {
         self.cache.remove(&Self::make_cache_key(location));
         let result = self.inner.put(location, payload).await?;
 
+        // If we just wrote _last_checkpoint, immediately cache it
+        if Self::is_last_checkpoint(location) {
+            // Get the file we just wrote and cache it
+            if let Ok(get_result) = self.inner.get(location).await {
+                use futures::TryStreamExt;
+                let data = match get_result.payload {
+                    GetResultPayload::Stream(s) => {
+                        if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
+                            chunks.concat()
+                        } else {
+                            vec![]
+                        }
+                    }
+                    GetResultPayload::File(mut file, _) => {
+                        use std::io::Read;
+                        let mut buf = Vec::new();
+                        if file.read_to_end(&mut buf).is_ok() {
+                            buf
+                        } else {
+                            vec![]
+                        }
+                    }
+                };
+                if !data.is_empty() {
+                    let cache_key = Self::make_cache_key(location);
+                    self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
+                    debug!("Proactively cached _last_checkpoint after write: {}", location);
+                }
+            }
+        }
+
         Ok(result)
     }
 
@@ -369,6 +429,37 @@ impl ObjectStore for FoyerObjectStoreCache {
 
         // Remove the written file from cache
         self.cache.remove(&Self::make_cache_key(location));
+
+        // If we just wrote _last_checkpoint, immediately cache it
+        if Self::is_last_checkpoint(location) {
+            // Get the file we just wrote and cache it
+            if let Ok(get_result) = self.inner.get(location).await {
+                use futures::TryStreamExt;
+                let data = match get_result.payload {
+                    GetResultPayload::Stream(s) => {
+                        if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
+                            chunks.concat()
+                        } else {
+                            vec![]
+                        }
+                    }
+                    GetResultPayload::File(mut file, _) => {
+                        use std::io::Read;
+                        let mut buf = Vec::new();
+                        if file.read_to_end(&mut buf).is_ok() {
+                            buf
+                        } else {
+                            vec![]
+                        }
+                    }
+                };
+                if !data.is_empty() {
+                    let cache_key = Self::make_cache_key(location);
+                    self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
+                    debug!("Proactively cached _last_checkpoint after write: {}", location);
+                }
+            }
+        }
 
         Ok(result)
     }
@@ -382,6 +473,71 @@ impl ObjectStore for FoyerObjectStoreCache {
 
             // Use appropriate TTL based on file type
             let ttl = self.get_ttl_for_path(location);
+            
+            // Special handling for _last_checkpoint: stale-while-revalidate
+            if Self::is_last_checkpoint(location) && !value.is_expired(ttl) {
+                self.update_stats(|s| s.hits += 1).await;
+                
+                // Check if older than 5 seconds
+                let age_millis = current_millis().saturating_sub(value.timestamp_millis);
+                if age_millis > 5000 {
+                    // Trigger background refresh if not already refreshing
+                    if self.refreshing.insert(cache_key.clone()) {
+                        let inner = self.inner.clone();
+                        let cache = self.cache.clone();
+                        let refreshing = self.refreshing.clone();
+                        let location = location.clone();
+                        let key = cache_key.clone();
+                        
+                        tokio::spawn(async move {
+                            debug!("Background refresh for _last_checkpoint: {}", location);
+                            if let Ok(result) = inner.get(&location).await {
+                                // Collect payload for caching
+                                use futures::TryStreamExt;
+                                let data = match result.payload {
+                                    GetResultPayload::Stream(s) => {
+                                        if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
+                                            chunks.concat()
+                                        } else {
+                                            vec![]
+                                        }
+                                    }
+                                    GetResultPayload::File(mut file, _) => {
+                                        use std::io::Read;
+                                        let mut buf = Vec::new();
+                                        if file.read_to_end(&mut buf).is_ok() {
+                                            buf
+                                        } else {
+                                            vec![]
+                                        }
+                                    }
+                                };
+                                if !data.is_empty() {
+                                    cache.insert(key.clone(), CacheValue::new(data, result.meta));
+                                }
+                            }
+                            refreshing.remove(&key);
+                        });
+                    }
+                    
+                    debug!(
+                        "Foyer cache HIT (stale-while-revalidate) for: {} (age: {}ms)",
+                        location,
+                        age_millis
+                    );
+                } else {
+                    debug!(
+                        "Foyer cache HIT (fresh) for: {} (age: {}ms)",
+                        location,
+                        age_millis
+                    );
+                }
+                
+                // Always return cached value immediately
+                return Ok(Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone()));
+            }
+            
+            // Regular cache expiration check for non-checkpoint files
             if value.is_expired(ttl) {
                 self.update_stats(|s| s.ttl_expirations += 1).await;
                 self.cache.remove(&cache_key);
@@ -493,7 +649,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             // Try to fetch and cache the full file
             if let Ok(result) = self.get(location).await {
                 // The file is now cached, extract the range
-                if range.end <= result.meta.size as u64 {
+                if range.end <= result.meta.size {
                     let data = match result.payload {
                         GetResultPayload::Stream(s) => {
                             use futures::TryStreamExt;
