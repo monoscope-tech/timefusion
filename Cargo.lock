@@ -6669,6 +6669,7 @@ dependencies = [
  "bytes",
  "chrono",
  "color-eyre",
+ "dashmap",
  "datafusion",
  "datafusion-common",
  "datafusion-functions-json",

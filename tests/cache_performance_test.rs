@@ -18,7 +18,7 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
         c.memory_size_bytes = 50 * 1024 * 1024;  // 50MB memory
         c.disk_size_bytes = 100 * 1024 * 1024;   // 100MB disk
         c.shards = 4;
-        c.cache_delta_checkpoints = true;
+        // Checkpoint caching is always enabled now with stale-while-revalidate
     });
     
     // Create shared cache
@@ -103,7 +103,7 @@ async fn test_large_file_disk_caching() -> Result<()> {
     // Test with reasonable cache sizes
     let config = FoyerCacheConfig::test_config_with("disk_cache", |c| {
         c.ttl = Duration::from_secs(60);
-        c.cache_delta_checkpoints = true;
+        // Checkpoint caching is always enabled now with stale-while-revalidate
     });
     
     let shared_cache = SharedFoyerCache::new(config).await?;

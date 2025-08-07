@@ -31,20 +31,21 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     let stats3 = cache.get_stats().await;
     assert_eq!(stats3.hits - stats2.hits, 1, "Second get should be a hit");
 
-    // Test 2: _last_checkpoint file should not be cached
+    // Test 2: _last_checkpoint file should now be cached (with stale-while-revalidate)
     let checkpoint_path = Path::from("table/_delta_log/_last_checkpoint");
     let checkpoint_data = b"checkpoint metadata";
     inner.put(&checkpoint_path, PutPayload::from(&checkpoint_data[..])).await?;
     
-    // Both gets should miss the cache (not cached)
+    // First get should miss the cache
     let stats4 = cache.get_stats().await;
     let _ = cache.get(&checkpoint_path).await?;
     let stats5 = cache.get_stats().await;
-    assert_eq!(stats5.misses - stats4.misses, 1, "Checkpoint get should miss");
+    assert_eq!(stats5.misses - stats4.misses, 1, "First checkpoint get should miss");
     
+    // Second get should hit the cache (now cached)
     let _ = cache.get(&checkpoint_path).await?;
     let stats6 = cache.get_stats().await;
-    assert_eq!(stats6.misses - stats5.misses, 1, "Second checkpoint get should also miss");
+    assert_eq!(stats6.hits - stats5.hits, 1, "Second checkpoint get should hit");
 
     // Test 3: Writing a commit file should invalidate _last_checkpoint
     let commit_path = Path::from("table/_delta_log/00000001.json");
@@ -87,7 +88,6 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     // Create config with checkpoint caching ENABLED to test invalidation
     let config = FoyerCacheConfig::test_config_with("checkpoint_invalidation", |c| {
         c.delta_metadata_ttl = Some(Duration::from_secs(60)); // Longer TTL to test invalidation
-        c.cache_delta_checkpoints = true; // Enable caching to test invalidation
     });
 
     let inner = Arc::new(InMemory::new());
@@ -118,17 +118,32 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     let new_checkpoint_data = b"version: 11";
     inner.put(&checkpoint_path, PutPayload::from(&new_checkpoint_data[..])).await?;
 
-    // Write a commit file - should invalidate checkpoint cache
+    // Write a commit file
     let commit_path = Path::from("mytable/_delta_log/00000011.json");
     cache.put(&commit_path, PutPayload::from(&b"commit 11"[..])).await?;
 
-    // Get checkpoint again - should miss cache and get new data
+    // With stale-while-revalidate, checkpoint is still served from cache (stale data)
+    // The refresh happens in background after 5 seconds
     let stats4 = cache.get_stats().await;
     let result3 = cache.get(&checkpoint_path).await?;
     let data3 = result3.into_stream().try_collect::<Vec<_>>().await?.concat();
-    assert_eq!(data3, new_checkpoint_data, "Should get new checkpoint data");
+    // Still gets old data initially (stale-while-revalidate behavior)
+    assert_eq!(data3, checkpoint_data, "Should still get cached (stale) checkpoint data");
     let stats5 = cache.get_stats().await;
-    assert_eq!(stats5.misses - stats4.misses, 1, "Should miss cache after invalidation");
+    assert_eq!(stats5.hits - stats4.hits, 1, "Should hit cache with stale data");
+    
+    // To get the new data, we need to wait for the stale threshold (5 seconds)
+    // or manually invalidate the cache
+    cache.invalidate_checkpoint_cache("mytable").await;
+    
+    // After invalidation, the cache is immediately refreshed, so we get a hit with new data
+    let stats6 = cache.get_stats().await;
+    let result4 = cache.get(&checkpoint_path).await?;
+    let data4 = result4.into_stream().try_collect::<Vec<_>>().await?.concat();
+    assert_eq!(data4, new_checkpoint_data, "Should get new checkpoint data after invalidation");
+    let stats7 = cache.get_stats().await;
+    // Should be a hit because invalidate_checkpoint_cache now immediately refreshes the cache
+    assert_eq!(stats7.hits - stats6.hits, 1, "Should hit cache after invalidation (cache was refreshed)");
 
     // Cleanup
     cache.shutdown().await?;
@@ -142,7 +157,7 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let config = FoyerCacheConfig::test_config_with("delta_ttl", |c| {
         c.ttl = Duration::from_secs(10); // Regular TTL
         c.delta_metadata_ttl = Some(Duration::from_millis(100)); // Very short TTL for test
-        c.cache_delta_checkpoints = true;
+        // Checkpoint caching is always enabled now with stale-while-revalidate
     });
 
     let inner = Arc::new(InMemory::new());
