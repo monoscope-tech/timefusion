@@ -405,49 +405,59 @@ impl Database {
 
         // Optimize job - configurable schedule (default: every 30mins)
         let optimize_schedule = env::var("TIMEFUSION_OPTIMIZE_SCHEDULE").unwrap_or_else(|_| "0 */30 * * * *".to_string());
-        info!("Optimize job scheduled with cron expression: {}", optimize_schedule);
+        
+        if !optimize_schedule.is_empty() {
+            info!("Optimize job scheduled with cron expression: {}", optimize_schedule);
 
-        let optimize_job = Job::new_async(&optimize_schedule, {
-            let db = db.clone();
-            move |_, _| {
+            let optimize_job = Job::new_async(&optimize_schedule, {
                 let db = db.clone();
-                Box::pin(async move {
-                    info!("Running scheduled optimize on all tables");
-                    for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
-                        if let Err(e) = db.optimize_table(table, None).await {
-                            error!("Optimize failed for project '{}' table '{}': {}", project_id, table_name, e);
+                move |_, _| {
+                    let db = db.clone();
+                    Box::pin(async move {
+                        info!("Running scheduled optimize on all tables");
+                        for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
+                            if let Err(e) = db.optimize_table(table, None).await {
+                                error!("Optimize failed for project '{}' table '{}': {}", project_id, table_name, e);
+                            }
                         }
-                    }
-                })
-            }
-        })?;
+                    })
+                }
+            })?;
 
-        scheduler.add(optimize_job).await?;
+            scheduler.add(optimize_job).await?;
+        } else {
+            info!("Optimize job scheduling skipped - empty schedule");
+        }
 
         // Vacuum job - configurable schedule (default: daily at 2AM)
         let vacuum_schedule = env::var("TIMEFUSION_VACUUM_SCHEDULE").unwrap_or_else(|_| "0 0 2 * * *".to_string());
-        info!("Vacuum job scheduled with cron expression: {}", vacuum_schedule);
+        
+        if !vacuum_schedule.is_empty() {
+            info!("Vacuum job scheduled with cron expression: {}", vacuum_schedule);
 
-        let vacuum_job = Job::new_async(&vacuum_schedule, {
-            let db = db.clone();
-            move |_, _| {
+            let vacuum_job = Job::new_async(&vacuum_schedule, {
                 let db = db.clone();
-                Box::pin(async move {
-                    info!("Running scheduled vacuum on all tables");
-                    let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS")
-                        .unwrap_or_else(|_| DEFAULT_VACUUM_RETENTION_HOURS.to_string())
-                        .parse::<u64>()
-                        .unwrap_or(DEFAULT_VACUUM_RETENTION_HOURS);
+                move |_, _| {
+                    let db = db.clone();
+                    Box::pin(async move {
+                        info!("Running scheduled vacuum on all tables");
+                        let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS")
+                            .unwrap_or_else(|_| DEFAULT_VACUUM_RETENTION_HOURS.to_string())
+                            .parse::<u64>()
+                            .unwrap_or(DEFAULT_VACUUM_RETENTION_HOURS);
 
-                    for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
-                        info!("Vacuuming project '{}' table '{}' (retention: {}h)", project_id, table_name, retention_hours);
-                        db.vacuum_table(table, retention_hours).await;
-                    }
-                })
-            }
-        })?;
+                        for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
+                            info!("Vacuuming project '{}' table '{}' (retention: {}h)", project_id, table_name, retention_hours);
+                            db.vacuum_table(table, retention_hours).await;
+                        }
+                    })
+                }
+            })?;
 
-        scheduler.add(vacuum_job).await?;
+            scheduler.add(vacuum_job).await?;
+        } else {
+            info!("Vacuum job scheduling skipped - empty schedule");
+        }
 
         // Cache stats job - every 5 minutes
         let cache_stats_job = Job::new_async("0 */5 * * * *", {
