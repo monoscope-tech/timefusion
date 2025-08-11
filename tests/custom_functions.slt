@@ -11,10 +11,10 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES 
     ('test_functions', TIMESTAMP '2024-01-15T14:30:45.123456Z', 'func_test_1', ARRAY['hash1']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_to_char', 'SERVER', 'test-service',
-     'OK', 'Test record', 'INFO', 1000000, 'Test to_char function'),
+     'OK', ARRAY['Test record'], 'INFO', 1000000, ARRAY['Test to_char function']),
     ('test_functions', TIMESTAMP '2024-12-25T08:00:00Z', 'func_test_2', ARRAY['hash2']::VARCHAR[], DATE '2024-12-25',
      NULL, 'test_christmas', 'SERVER', 'test-service',
-     'OK', 'Christmas test', 'INFO', 2000000, 'Test date formatting')
+     'OK', 'Christmas test', 'INFO', 2000000, ARRAY['Test date formatting'])
 
 # Test basic date formatting
 query T
@@ -76,7 +76,7 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES 
     ('test_json', TIMESTAMP '2024-01-15T12:00:00Z', 'json_test_1', ARRAY['hash_json']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_json_funcs', 'SERVER', 'json-service',
-     'OK', '{"items": ["apple", "banana", "orange"], "count": 3}', 'INFO', 1000000, 'Test JSON functions')
+     'OK', '{"items": ["apple", "banana", "orange"], "count": 3}', 'INFO', 1000000, ARRAY['Test JSON functions'])
 
 # First verify the JSON data is stored correctly
 query T
@@ -123,7 +123,7 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES 
     ('test_formats', TIMESTAMP '2024-07-04T16:45:30Z', 'format_test_1', ARRAY['hash_format']::VARCHAR[], DATE '2024-07-04',
      NULL, 'test_formats', 'SERVER', 'format-service',
-     'OK', 'Test various formats', 'INFO', 1000000, 'Test different date formats')
+     'OK', ARRAY['Test various formats'], 'INFO', 1000000, ARRAY['Test different date formats'])
 
 # Test various date format patterns
 query T
@@ -144,16 +144,16 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES 
     ('test_time_bucket', TIMESTAMP '2024-01-15T14:32:45.123456Z', 'bucket_test_1', ARRAY['hash_tb1']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_metric_1', 'SERVER', 'metrics-service',
-     'OK', 'Metric 1', 'INFO', 1000000, 'Test time bucket 1'),
+     'OK', 'Metric 1', 'INFO', 1000000, ARRAY['Test time bucket 1']),
     ('test_time_bucket', TIMESTAMP '2024-01-15T14:33:15.456789Z', 'bucket_test_2', ARRAY['hash_tb2']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_metric_2', 'SERVER', 'metrics-service',
-     'OK', 'Metric 2', 'INFO', 2000000, 'Test time bucket 2'),
+     'OK', 'Metric 2', 'INFO', 2000000, ARRAY['Test time bucket 2']),
     ('test_time_bucket', TIMESTAMP '2024-01-15T14:36:30.789012Z', 'bucket_test_3', ARRAY['hash_tb3']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_metric_3', 'SERVER', 'metrics-service',
-     'OK', 'Metric 3', 'INFO', 3000000, 'Test time bucket 3'),
+     'OK', 'Metric 3', 'INFO', 3000000, ARRAY['Test time bucket 3']),
     ('test_time_bucket', TIMESTAMP '2024-01-15T14:38:00.345678Z', 'bucket_test_4', ARRAY['hash_tb4']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_metric_4', 'SERVER', 'metrics-service',
-     'OK', 'Metric 4', 'INFO', 4000000, 'Test time bucket 4')
+     'OK', 'Metric 4', 'INFO', 4000000, ARRAY['Test time bucket 4'])
 
 # Test 5 minute buckets
 query TI
@@ -193,8 +193,8 @@ WHERE project_id = 'test_time_bucket'
 GROUP BY time_bucket('5 minutes', timestamp)
 ORDER BY five_min_bucket
 ----
-2024-01-15 14:30:00	1500000.0
-2024-01-15 14:35:00	3500000.0
+2024-01-15 14:30:00 1500000
+2024-01-15 14:35:00 3500000
 
 # Test with different time units - hourly buckets
 query TI

@@ -9,7 +9,7 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES 
     ('json_test', TIMESTAMP '2024-01-15T10:00:00Z', 'json_1', ARRAY['hash1']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_json', 'SERVER', 'test-service',
-     'OK', '{"name": "John", "age": 30, "active": true, "items": ["apple", "banana"], "address": {"city": "NYC", "zip": "10001"}}', 'INFO', 1000000, 'Test JSON')
+     'OK', '{"name": "John", "age": 30, "active": true, "items": ["apple", "banana"], "address": {"city": "NYC", "zip": "10001"}}', 'INFO', 1000000, ARRAY['Test JSON'])
 
 # === Available JSON functions in datafusion-functions-json ===
 
@@ -36,9 +36,11 @@ WHERE project_id = 'json_test' AND id = 'json_1'
 
 # === Functions that are NOT available ===
 
-# json_build_array - NOT part of datafusion-functions-json
-statement error
+# json_build_array - Now available in our implementation
+query T
 SELECT json_build_array('a', 'b', 'c')
+----
+["a","b","c"]
 
 # to_json - NOT part of datafusion-functions-json  
 statement error

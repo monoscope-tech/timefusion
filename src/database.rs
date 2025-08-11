@@ -1732,7 +1732,7 @@ mod tests {
                 "duration": 100_000_000,
                 "date": now.date_naive().to_string(),
                 "hashes": [],
-                "summary": "Test span 1 - INFO level"
+                "summary": ["Test span 1 - INFO level"]
             }),
             json!({
                 "timestamp": (now + chrono::Duration::minutes(10)).timestamp_micros(),
@@ -1745,7 +1745,7 @@ mod tests {
                 "duration": 200_000_000,
                 "date": now.date_naive().to_string(),
                 "hashes": [],
-                "summary": "Test span 2 - ERROR level"
+                "summary": ["Test span 2 - ERROR level"]
             }),
         ];
 
@@ -1876,7 +1876,7 @@ mod tests {
                 "project_id": "test",
                 "date": base_time.date_naive().to_string(),
                 "hashes": [],
-                "summary": "Early span for timestamp test"
+                "summary": ["Early span for timestamp test"]
             }),
             json!({
                 "timestamp": (base_time + chrono::Duration::hours(2)).timestamp_micros(),
@@ -1885,7 +1885,7 @@ mod tests {
                 "project_id": "test",
                 "date": base_time.date_naive().to_string(),
                 "hashes": [],
-                "summary": "Late span for timestamp test"
+                "summary": ["Late span for timestamp test"]
             }),
         ];
 

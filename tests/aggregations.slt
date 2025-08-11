@@ -8,7 +8,7 @@ INSERT INTO otel_logs_and_spans (
     name, level, status_code, duration, summary
 ) VALUES (
     'agg_test', TIMESTAMP '2023-01-01T10:00:00Z', 'agg1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'service_a', 'INFO', 'OK', 100000000, 'Service A operation 1 - INFO level'
+    'service_a', 'INFO', 'OK', 100000000, ARRAY['Service A operation 1 - INFO level']
 )
 
 statement ok
@@ -17,7 +17,7 @@ INSERT INTO otel_logs_and_spans (
     name, level, status_code, duration, summary
 ) VALUES (
     'agg_test', TIMESTAMP '2023-01-01T10:01:00Z', 'agg2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'service_a', 'ERROR', 'ERROR', 200000000, 'Service A operation 2 - ERROR level'
+    'service_a', 'ERROR', 'ERROR', 200000000, ARRAY['Service A operation 2 - ERROR level']
 )
 
 statement ok
@@ -26,7 +26,7 @@ INSERT INTO otel_logs_and_spans (
     name, level, status_code, duration, summary
 ) VALUES (
     'agg_test', TIMESTAMP '2023-01-01T10:02:00Z', 'agg3', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'service_b', 'INFO', 'OK', 150000000, 'Service B operation 1 - INFO level'
+    'service_b', 'INFO', 'OK', 150000000, ARRAY['Service B operation 1 - INFO level']
 )
 
 statement ok
@@ -35,7 +35,7 @@ INSERT INTO otel_logs_and_spans (
     name, level, status_code, duration, summary
 ) VALUES (
     'agg_test', TIMESTAMP '2023-01-01T10:03:00Z', 'agg4', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'service_b', 'INFO', 'OK', 250000000, 'Service B operation 2 - INFO level'
+    'service_b', 'INFO', 'OK', 250000000, ARRAY['Service B operation 2 - INFO level']
 )
 
 statement ok
@@ -44,7 +44,7 @@ INSERT INTO otel_logs_and_spans (
     name, level, status_code, duration, summary
 ) VALUES (
     'agg_test', TIMESTAMP '2023-01-01T10:04:00Z', 'agg5', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'service_c', 'WARN', 'OK', 300000000, 'Service C operation - WARN level'
+    'service_c', 'WARN', 'OK', 300000000, ARRAY['Service C operation - WARN level']
 )
 
 # Test COUNT aggregation

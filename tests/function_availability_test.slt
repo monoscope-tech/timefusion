@@ -9,7 +9,7 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES 
     ('test_funcs', TIMESTAMP '2024-01-15T14:30:45.123456Z', 'func_test_1', ARRAY['hash1']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_json', 'SERVER', 'test-service',
-     'OK', 'Test message', 'INFO', 1000000, 'Test functions')
+     'OK', ARRAY['Test message'], 'INFO', 1000000, ARRAY['Test functions'])
 
 # === Test EXTRACT function (should work - DataFusion built-in) ===
 
@@ -90,9 +90,11 @@ WHERE project_id = 'test_funcs' AND id = 'func_test_1'
 
 # === Test functions that are NOT available ===
 
-# Test json_build_array (not available in datafusion-functions-json)
-statement error
+# Test json_build_array (now available in our implementation)
+query T
 SELECT json_build_array('a', 'b', 'c') as array_result
+----
+["a","b","c"]
 
 # Test to_json (not available)  
 statement error

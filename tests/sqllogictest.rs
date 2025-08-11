@@ -58,17 +58,24 @@ mod sqllogictest_tests {
 
         async fn run(&mut self, sql: &str) -> Result<DBOutput<Self::ColumnType>, Self::Error> {
             let sql = sql.trim();
-            println!("Executing SQL: {}", sql);
+            // Only print SQL in verbose mode
+            if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
+                println!("Executing SQL: {}", sql);
+            }
             let is_query = sql.to_lowercase().starts_with("select");
 
             if !is_query {
                 let affected = self.client.execute(sql, &[]).await?;
-                println!("Statement executed, {} rows affected", affected);
+                if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
+                    println!("Statement executed, {} rows affected", affected);
+                }
                 return Ok(DBOutput::StatementComplete(affected as u64));
             }
 
             let rows = self.client.query(sql, &[]).await?;
-            println!("Query returned {} rows", rows.len());
+            if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
+                println!("Query returned {} rows", rows.len());
+            }
             if rows.is_empty() {
                 return Ok(DBOutput::Rows { types: vec![], rows: vec![] });
             }
@@ -139,12 +146,12 @@ mod sqllogictest_tests {
             .collect()
     }
 
-    async fn connect_with_retry(timeout: Duration) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), tokio_postgres::Error> {
+    async fn connect_with_retry(port: u16, timeout: Duration) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>), tokio_postgres::Error> {
         let start = Instant::now();
-        let conn_string = "host=localhost port=5433 user=postgres password=postgres";
+        let conn_string = format!("host=localhost port={} user=postgres password=postgres", port);
 
         while start.elapsed() < timeout {
-            match tokio_postgres::connect(conn_string, NoTls).await {
+            match tokio_postgres::connect(&conn_string, NoTls).await {
                 Ok((client, connection)) => {
                     let handle = tokio::spawn(async move {
                         if let Err(e) = connection.await {
@@ -158,7 +165,7 @@ mod sqllogictest_tests {
         }
 
         // Final attempt
-        let (client, connection) = tokio_postgres::connect(conn_string, NoTls).await?;
+        let (client, connection) = tokio_postgres::connect(&conn_string, NoTls).await?;
         let handle = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 eprintln!("Connection error: {}", e);
@@ -168,12 +175,14 @@ mod sqllogictest_tests {
         Ok((client, handle))
     }
 
-    async fn start_test_server() -> Result<Arc<Notify>> {
+    async fn start_test_server() -> Result<(Arc<Notify>, u16)> {
         let test_id = Uuid::new_v4().to_string();
         dotenv().ok();
 
+        // Use a unique port for each test run
+        let port = 5433 + (std::process::id() % 100) as u16;
         unsafe {
-            std::env::set_var("PGWIRE_PORT", "5433");
+            std::env::set_var("PGWIRE_PORT", port.to_string());
             std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-slt-{}", test_id));
         }
 
@@ -186,7 +195,7 @@ mod sqllogictest_tests {
             let mut session_context = db.create_session_context();
             db.setup_session_context(&mut session_context).expect("Failed to setup session context");
 
-            let opts = ServerOptions::new().with_port(5433).with_host("0.0.0.0".to_string());
+            let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
 
             // Wait for shutdown signal or server termination
             tokio::select! {
@@ -200,9 +209,9 @@ mod sqllogictest_tests {
         });
 
         // Wait for server to be ready
-        let _ = connect_with_retry(Duration::from_secs(5)).await?;
+        let _ = connect_with_retry(port, Duration::from_secs(5)).await?;
 
-        Ok(shutdown_signal)
+        Ok((shutdown_signal, port))
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -210,10 +219,10 @@ mod sqllogictest_tests {
     async fn run_sqllogictest() -> Result<()> {
         // Wrap the entire test in a timeout
         tokio::time::timeout(Duration::from_secs(120), async {
-            let shutdown_signal = start_test_server().await?;
+            let (shutdown_signal, port) = start_test_server().await?;
 
             let _factory = || async move {
-                let (client, _) = connect_with_retry(Duration::from_secs(3)).await?;
+                let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
                 Ok::<TestDB, TestError>(TestDB { client })
             };
 
@@ -221,12 +230,28 @@ mod sqllogictest_tests {
             let test_dir = Path::new("tests");
             let mut test_files = Vec::new();
 
+            // Check if a specific test file is requested via environment variable
+            let test_filter = std::env::var("SQLLOGICTEST_FILE").ok();
+            
+            // Pretty output mode
+            let pretty_mode = std::env::var("SQLLOGICTEST_PRETTY").is_ok();
+            
             if test_dir.is_dir() {
                 for entry in std::fs::read_dir(test_dir)? {
                     let entry = entry?;
                     let path = entry.path();
                     if path.extension().and_then(|s| s.to_str()) == Some("slt") {
-                        test_files.push(path);
+                        // If a filter is set, only include files that match
+                        if let Some(ref filter) = test_filter {
+                            let filename = path.file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("");
+                            if filename.contains(filter) {
+                                test_files.push(path);
+                            }
+                        } else {
+                            test_files.push(path);
+                        }
                     }
                 }
             }
@@ -234,18 +259,49 @@ mod sqllogictest_tests {
             // Sort files for consistent test order
             test_files.sort();
 
-            println!("Found {} .slt test files", test_files.len());
+            if pretty_mode {
+                println!("\n🧪 SQLLogicTest Runner");
+                println!("{}", "=".repeat(50));
+            }
+            
+            if let Some(ref filter) = test_filter {
+                println!("\n📁 Filtering for test files containing: '{}'", filter);
+            }
+            
+            println!("\n📋 Found {} test files:", test_files.len());
             for file in &test_files {
-                println!("  - {}", file.display());
+                println!("   • {}", file.file_name().unwrap().to_string_lossy());
+            }
+            
+            if test_files.is_empty() {
+                if let Some(ref filter) = test_filter {
+                    return Err(anyhow::anyhow!("No test files found matching filter '{}'", filter));
+                } else {
+                    return Err(anyhow::anyhow!("No .slt test files found in tests directory"));
+                }
             }
 
             let mut all_passed = true;
             for test_file in test_files {
                 let test_path = test_file.as_path();
-                println!("Running SQLLogicTest: {}", test_path.display());
+                if pretty_mode {
+                    println!("\n\n🔄 Running: {}", test_path.file_name().unwrap().to_string_lossy());
+                    println!("{}", "-".repeat(50));
+                } else {
+                    println!("\nRunning SQLLogicTest: {}", test_path.display());
+                }
 
+                // Clean up before running each test file
+                let (cleanup_client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
+                // Drop common test tables to ensure clean state
+                let tables_to_drop = ["test_table", "events", "t", "numeric_test", "percentile_test", "test_spans"];
+                for table in &tables_to_drop {
+                    let drop_sql = format!("DROP TABLE IF EXISTS {}", table);
+                    let _ = cleanup_client.execute(&drop_sql, &[]).await;
+                }
+                
                 let factory_clone = || async move {
-                    let (client, _) = connect_with_retry(Duration::from_secs(3)).await?;
+                    let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
                     Ok::<TestDB, TestError>(TestDB { client })
                 };
 
@@ -253,13 +309,28 @@ mod sqllogictest_tests {
                 let test_result = tokio::time::timeout(Duration::from_secs(30), sqllogictest::Runner::new(factory_clone).run_file_async(test_path)).await;
 
                 match test_result {
-                    Ok(Ok(_)) => println!("✓ {} passed", test_path.display()),
+                    Ok(Ok(_)) => {
+                        if pretty_mode {
+                            println!("✅ PASSED: {}", test_path.file_name().unwrap().to_string_lossy());
+                        } else {
+                            println!("✓ {} passed", test_path.display());
+                        }
+                    },
                     Ok(Err(e)) => {
-                        eprintln!("✗ {} failed: {:?}", test_path.display(), e);
+                        if pretty_mode {
+                            eprintln!("❌ FAILED: {}", test_path.file_name().unwrap().to_string_lossy());
+                            eprintln!("   Error: {:?}", e);
+                        } else {
+                            eprintln!("✗ {} failed: {:?}", test_path.display(), e);
+                        }
                         all_passed = false;
                     }
                     Err(_) => {
-                        eprintln!("✗ {} timed out after 30 seconds", test_path.display());
+                        if pretty_mode {
+                            eprintln!("⏱️  TIMEOUT: {} (exceeded 30 seconds)", test_path.file_name().unwrap().to_string_lossy());
+                        } else {
+                            eprintln!("✗ {} timed out after 30 seconds", test_path.display());
+                        }
                         all_passed = false;
                     }
                 }
@@ -268,6 +339,15 @@ mod sqllogictest_tests {
             // Always shut down the server
             shutdown_signal.notify_one();
 
+            if pretty_mode {
+                println!("\n{}", "=".repeat(50));
+                if all_passed {
+                    println!("✅ All tests passed!");
+                } else {
+                    println!("❌ Some tests failed");
+                }
+            }
+            
             if all_passed { Ok(()) } else { Err(anyhow::anyhow!("Some SQLLogicTests failed")) }
         })
         .await

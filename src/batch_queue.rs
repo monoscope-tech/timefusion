@@ -100,7 +100,7 @@ mod tests {
                     record.insert("project_id".to_string(), json!("test-project-uuid"));
                     record.insert("date".to_string(), json!(now.date_naive().to_string()));
                     record.insert("hashes".to_string(), json!([]));
-                    record.insert("summary".to_string(), json!(format!("Batch queue test record {}", i)));
+                    record.insert("summary".to_string(), json!(vec![format!("Batch queue test record {}", i)]));
                     serde_json::Value::Object(record.into_iter().collect())
                 })
                 .collect();
