@@ -708,7 +708,7 @@ fn create_percentile_agg_udaf() -> AggregateUDF {
         Arc::new(DataType::Binary),
         Volatility::Immutable,
         Arc::new(|_| Ok(Box::new(PercentileAccumulator::new()))),
-        Arc::new(vec![DataType::Float64]),
+        Arc::new(vec![DataType::Binary]),  // State type should match return type
     )
 }
 
@@ -876,14 +876,20 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
             ));
         }
 
+        // Determine the result size based on the digest array (which comes from GROUP BY)
+        let digest_size = match &args.args[1] {
+            ColumnarValue::Array(array) => array.len(),
+            ColumnarValue::Scalar(_) => 1,
+        };
+
         let percentile_array = match &args.args[0] {
             ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(1)?,
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(digest_size)?,
         };
 
         let digest_array = match &args.args[1] {
             ColumnarValue::Array(array) => array.clone(),
-            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(percentile_array.len())?,
+            ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(digest_size)?,
         };
 
         let percentile_values = percentile_array
@@ -896,9 +902,11 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
             .downcast_ref::<BinaryArray>()
             .ok_or_else(|| DataFusionError::Execution("Second argument must be a t-digest (Binary)".to_string()))?;
 
-        let mut builder = Float64Array::builder(percentile_array.len());
+        // Ensure we process the correct number of rows
+        let num_rows = digest_array.len();
+        let mut builder = Float64Array::builder(num_rows);
 
-        for i in 0..percentile_array.len() {
+        for i in 0..num_rows {
             if percentile_values.is_null(i) || digest_values.is_null(i) {
                 builder.append_null();
             } else {
