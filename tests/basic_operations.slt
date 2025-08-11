@@ -14,7 +14,7 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES (
     'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'sql_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
     NULL, 'sql_test_span', NULL,
-    'OK', 'span inserted successfully', 'INFO', 'SQL test span - INFO level'
+    'OK', 'span inserted successfully', 'INFO', ARRAY['SQL test span - INFO level']
 )
 
 # Query back the inserted data by ID (need project_id for partitioned table)
@@ -30,7 +30,7 @@ INSERT INTO otel_logs_and_spans (
     name, status_code, status_message, level, summary
 ) VALUES (
     'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'batch_test_1', 'OK', 'batch test 1', 'INFO', 'Batch test 1 - INFO level'
+    'batch_test_1', 'OK', 'batch test 1', 'INFO', ARRAY['Batch test 1 - INFO level']
 )
 
 statement ok
@@ -39,7 +39,7 @@ INSERT INTO otel_logs_and_spans (
     name, status_code, status_message, level, summary
 ) VALUES (
     'test_project', TIMESTAMP '2023-01-01T10:00:00Z', 'batch_span2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'batch_test_2', 'OK', 'batch test 2', 'INFO', 'Batch test 2 - INFO level'
+    'batch_test_2', 'OK', 'batch test 2', 'INFO', ARRAY['Batch test 2 - INFO level']
 )
 
 # Query count of records for the test project
@@ -91,7 +91,7 @@ INSERT INTO otel_logs_and_spans (
     name, status_code, level, summary
 ) VALUES (
     'debug_project', TIMESTAMP '2023-01-01T10:00:00Z', 'debug_span1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'debug_span', 'OK', 'INFO', 'Debug span - INFO level'
+    'debug_span', 'OK', 'INFO', ARRAY['Debug span - INFO level']
 )
 
 # Query without WHERE clause first (need project_id for partitioned table)

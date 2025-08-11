@@ -12,7 +12,7 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:00:00Z', 'trace_root_1', ARRAY['hash_root']::VARCHAR[], DATE '2023-01-01',
     NULL, '/api/users', 'SERVER', 'api-gateway',
-    'OK', 'Request completed', 'INFO', 250000000, 'API users endpoint root trace - INFO level'
+    'OK', 'Request completed', 'INFO', 250000000, ARRAY['API users endpoint root trace - INFO level']
 )
 
 # Add child spans for the trace
@@ -24,7 +24,7 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:00:00.050Z', 'trace_child_1', ARRAY['hash_db']::VARCHAR[], DATE '2023-01-01',
     'trace_root_1', 'db.query', 'CLIENT', 'user-service',
-    'OK', 'SELECT * FROM users', 'DEBUG', 45000000, 'Database query child span - DEBUG level'
+    'OK', 'SELECT * FROM users', 'DEBUG', 45000000, ARRAY['Database query child span - DEBUG level']
 )
 
 statement ok
@@ -35,7 +35,7 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:00:00.100Z', 'trace_child_2', ARRAY['hash_cache']::VARCHAR[], DATE '2023-01-01',
     'trace_root_1', 'cache.get', 'CLIENT', 'user-service',
-    'OK', 'Cache hit', 'DEBUG', 5000000, 'Cache get child span - DEBUG level'
+    'OK', 'Cache hit', 'DEBUG', 5000000, ARRAY['Cache get child span - DEBUG level']
 )
 
 # Add some error traces
@@ -47,7 +47,7 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:05:00Z', 'error_trace_1', ARRAY['hash_error']::VARCHAR[], DATE '2023-01-01',
     NULL, '/api/payment', 'SERVER', 'payment-service',
-    'INTERNAL_ERROR', 'Payment gateway timeout', 'ERROR', 30000000000, 'Payment API error trace - ERROR level'
+    'INTERNAL_ERROR', 'Payment gateway timeout', 'ERROR', 30000000000, ARRAY['Payment API error trace - ERROR level']
 )
 
 # Add logs without traces
@@ -57,7 +57,7 @@ INSERT INTO otel_logs_and_spans (
     name, resource___service___name, level, status_message, summary
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:10:00Z', 'log_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'application.startup', 'user-service', 'INFO', 'Service started successfully', 'Application startup log - INFO level'
+    'application.startup', 'user-service', 'INFO', ARRAY['Service started successfully'], ARRAY['Application startup log - INFO level']
 )
 
 statement ok
@@ -66,7 +66,7 @@ INSERT INTO otel_logs_and_spans (
     name, resource___service___name, level, status_message, summary
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:15:00Z', 'log_2', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'database.connection', 'user-service', 'WARN', 'Connection pool reaching limit', 'Database connection warning - WARN level'
+    'database.connection', 'user-service', 'WARN', 'Connection pool reaching limit', ARRAY['Database connection warning - WARN level']
 )
 
 # Project 2: Staging environment with different patterns
@@ -76,7 +76,7 @@ INSERT INTO otel_logs_and_spans (
     name, kind, resource___service___name, level, duration, summary
 ) VALUES (
     'staging_monitoring', TIMESTAMP '2023-01-01T10:00:00Z', 'staging_trace_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    '/api/test', 'SERVER', 'test-service', 'DEBUG', 100000000, 'Staging test API trace - DEBUG level'
+    '/api/test', 'SERVER', 'test-service', 'DEBUG', 100000000, ARRAY['Staging test API trace - DEBUG level']
 )
 
 # === QUERIES: Simulate real monitoring queries ===
@@ -188,7 +188,7 @@ INSERT INTO otel_logs_and_spans (
     name, kind, resource___service___name, level, duration, status_code, summary
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T11:00:00Z', 'trace_2_root', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    '/api/health', 'SERVER', 'api-gateway', 'INFO', 10000000, 'OK', 'Health check endpoint - INFO level'
+    '/api/health', 'SERVER', 'api-gateway', 'INFO', 10000000, 'OK', ARRAY['Health check endpoint - INFO level']
 )
 
 # Verify new data is queryable
@@ -248,7 +248,7 @@ INSERT INTO otel_logs_and_spans (
     name, status_code, level, summary
 ) VALUES (
     'project1', TIMESTAMP '2023-01-02T10:00:00Z', 'p1_span1', ARRAY[]::VARCHAR[], DATE '2023-01-02',
-    'project1_span', 'OK', 'INFO', 'Project 1 span - INFO level'
+    'project1_span', 'OK', 'INFO', ARRAY['Project 1 span - INFO level']
 )
 
 statement ok
@@ -257,7 +257,7 @@ INSERT INTO otel_logs_and_spans (
     name, status_code, level, summary
 ) VALUES (
     'project2', TIMESTAMP '2023-01-02T10:00:00Z', 'p2_span1', ARRAY[]::VARCHAR[], DATE '2023-01-02',
-    'project2_span', 'OK', 'INFO', 'Project 2 span - INFO level'
+    'project2_span', 'OK', 'INFO', ARRAY['Project 2 span - INFO level']
 )
 
 statement ok
@@ -266,7 +266,7 @@ INSERT INTO otel_logs_and_spans (
     name, status_code, level, summary
 ) VALUES (
     'project3', TIMESTAMP '2023-01-02T10:00:00Z', 'p3_span1', ARRAY[]::VARCHAR[], DATE '2023-01-02',
-    'project3_span', 'ERROR', 'ERROR', 'Project 3 span - ERROR level'
+    'project3_span', 'ERROR', 'ERROR', ARRAY['Project 3 span - ERROR level']
 )
 
 # Query project1 data - should only see project1 records
@@ -326,7 +326,7 @@ INSERT INTO otel_logs_and_spans (
     name, status_code, level, summary
 ) VALUES (
     'project1', TIMESTAMP '2023-01-02T11:00:00Z', 'p1_span2', ARRAY[]::VARCHAR[], DATE '2023-01-02',
-    'project1_span2', 'OK', 'DEBUG', 'Project 1 span 2 - DEBUG level'
+    'project1_span2', 'OK', 'DEBUG', ARRAY['Project 1 span 2 - DEBUG level']
 )
 
 statement ok
@@ -335,7 +335,7 @@ INSERT INTO otel_logs_and_spans (
     name, status_code, level, summary
 ) VALUES (
     'project1', TIMESTAMP '2023-01-02T12:00:00Z', 'p1_span3', ARRAY[]::VARCHAR[], DATE '2023-01-02',
-    'project1_span3', 'ERROR', 'ERROR', 'Project 1 span 3 - ERROR level'
+    'project1_span3', 'ERROR', 'ERROR', ARRAY['Project 1 span 3 - ERROR level']
 )
 
 # Count after additional inserts

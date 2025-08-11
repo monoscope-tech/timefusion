@@ -6549,6 +6549,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e502f78cdbb8ba4718f566c418c52bc729126ffd16baee5baa718cf25dd5a69a"
 
 [[package]]
+name = "tdigests"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0795c7e1ac9870b984bd463299937fe83f95ba6ebf7ae3bf9c3ccdafb45537bb"
+
+[[package]]
 name = "tempfile"
 version = "3.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6666,6 +6672,7 @@ dependencies = [
  "aws-sdk-dynamodb",
  "aws-sdk-s3",
  "aws-types",
+ "bincode",
  "bytes",
  "chrono",
  "chrono-tz",
@@ -6698,6 +6705,7 @@ dependencies = [
  "serial_test",
  "sqllogictest",
  "sqlx",
+ "tdigests",
  "tokio",
  "tokio-cron-scheduler",
  "tokio-postgres",

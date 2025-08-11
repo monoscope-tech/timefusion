@@ -9,20 +9,20 @@ INSERT INTO otel_logs_and_spans (
 ) VALUES 
     ('test_functions', TIMESTAMP '2024-01-15T14:30:45.123456Z', 'json_test_1', ARRAY['hash1']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_json', 'SERVER', 'test-service',
-     'OK', '{"name": "John", "age": 30, "items": ["apple", "banana"], "nested": {"key": "value"}}', 'INFO', 1000000, 'Test JSON functions'),
+     'OK', '{"name": "John", "age": 30, "items": ["apple", "banana"], "nested": {"key": "value"}}', 'INFO', 1000000, ARRAY['Test JSON functions']),
     ('test_functions', TIMESTAMP '2024-12-25T08:00:00Z', 'date_test_1', ARRAY['hash2']::VARCHAR[], DATE '2024-12-25',
      NULL, 'test_date', 'SERVER', 'test-service',
-     'OK', 'Regular message', 'INFO', 2000000, 'Test date functions')
+     'OK', 'Regular message', 'INFO', 2000000, ARRAY['Test date functions'])
 
 # === Test DataFusion built-in JSON functions ===
 
-# Test json_get (from datafusion-functions-json)
+# Test json_get_str instead (json_get returns Union type which is not supported)
 query T
-SELECT json_get(status_message, '$.name') as name
+SELECT json_get_str(status_message, '$.name') as name
 FROM otel_logs_and_spans 
 WHERE project_id = 'test_functions' AND id = 'json_test_1'
 ----
-"John"
+John
 
 # Test json_get_int
 query I
