@@ -31,6 +31,9 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     // Register extract_epoch function for fractional seconds
     ctx.register_udf(create_extract_epoch_udf());
 
+    // Register time_bucket function for time-series bucketing
+    ctx.register_udf(create_time_bucket_udf());
+
     Ok(())
 }
 
@@ -549,6 +552,117 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
     Ok(values)
 }
 
+/// Create the time_bucket UDF for time-series bucketing (similar to TimescaleDB)
+fn create_time_bucket_udf() -> ScalarUDF {
+    let time_bucket_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
+        if args.len() != 2 {
+            return Err(DataFusionError::Execution(
+                "time_bucket requires exactly 2 arguments: interval and timestamp".to_string(),
+            ));
+        }
+
+        // Extract interval string
+        let interval_str = match &args[0] {
+            ColumnarValue::Scalar(scalar) => match scalar {
+                datafusion::scalar::ScalarValue::Utf8(Some(s)) => s.clone(),
+                _ => return Err(DataFusionError::Execution("Interval must be a UTF8 string".to_string())),
+            },
+            ColumnarValue::Array(_) => {
+                return Err(DataFusionError::Execution("Interval must be a scalar value".to_string()));
+            }
+        };
+
+        // Parse the interval to get bucket size in microseconds
+        let bucket_size_micros = parse_interval_to_micros(&interval_str)?;
+
+        // Extract timestamp array
+        let timestamp_array = match &args[1] {
+            ColumnarValue::Array(array) => array.clone(),
+            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
+        };
+
+        // Bucket the timestamps
+        let result = bucket_timestamps(&timestamp_array, bucket_size_micros)?;
+
+        Ok(ColumnarValue::Array(result))
+    });
+
+    create_udf(
+        "time_bucket",
+        vec![DataType::Utf8, DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))],
+        DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
+        Volatility::Immutable,
+        time_bucket_fn,
+    )
+}
+
+/// Parse interval string to microseconds
+fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64> {
+    let parts: Vec<&str> = interval_str.split_whitespace().collect();
+    if parts.len() != 2 {
+        return Err(DataFusionError::Execution(
+            "Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes')".to_string(),
+        ));
+    }
+
+    let value = parts[0].parse::<i64>().map_err(|_| DataFusionError::Execution("Invalid interval value".to_string()))?;
+
+    let unit = parts[1].to_lowercase();
+    let micros_per_unit = match unit.as_str() {
+        "second" | "seconds" | "sec" | "secs" | "s" => 1_000_000,
+        "minute" | "minutes" | "min" | "mins" | "m" => 60 * 1_000_000,
+        "hour" | "hours" | "hr" | "hrs" | "h" => 3600 * 1_000_000,
+        "day" | "days" | "d" => 86400 * 1_000_000,
+        "week" | "weeks" | "w" => 7 * 86400 * 1_000_000,
+        _ => {
+            return Err(DataFusionError::Execution(format!(
+                "Unsupported time unit: {}. Supported units: second(s), minute(s), hour(s), day(s), week(s)",
+                unit
+            )));
+        }
+    };
+
+    Ok(value * micros_per_unit)
+}
+
+/// Bucket timestamps to the nearest bucket boundary
+fn bucket_timestamps(timestamp_array: &ArrayRef, bucket_size_micros: i64) -> datafusion::error::Result<ArrayRef> {
+    if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+        let mut builder = TimestampMicrosecondArray::builder(timestamps.len());
+
+        for i in 0..timestamps.len() {
+            if timestamps.is_null(i) {
+                builder.append_null();
+            } else {
+                let timestamp_us = timestamps.value(i);
+                // Calculate the bucket: floor(timestamp / bucket_size) * bucket_size
+                let bucket = (timestamp_us / bucket_size_micros) * bucket_size_micros;
+                builder.append_value(bucket);
+            }
+        }
+
+        Ok(Arc::new(builder.finish()))
+    } else if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        let mut builder = TimestampNanosecondArray::builder(timestamps.len());
+        let bucket_size_nanos = bucket_size_micros * 1000;
+
+        for i in 0..timestamps.len() {
+            if timestamps.is_null(i) {
+                builder.append_null();
+            } else {
+                let timestamp_ns = timestamps.value(i);
+                // Calculate the bucket: floor(timestamp / bucket_size) * bucket_size
+                let bucket = (timestamp_ns / bucket_size_nanos) * bucket_size_nanos;
+                builder.append_value(bucket);
+            }
+        }
+
+        Ok(Arc::new(builder.finish()))
+    } else {
+        Err(DataFusionError::Execution("Argument must be a timestamp".to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +672,27 @@ mod tests {
         assert_eq!(postgres_to_chrono_format("YYYY-MM-DD"), "%Y-%m-%d");
         assert_eq!(postgres_to_chrono_format("YYYY-MM-DD HH24:MI:SS"), "%Y-%m-%d %H:%M:%S");
         assert_eq!(postgres_to_chrono_format("Day, DD Mon YYYY"), "%A, %d %b %Y");
+    }
+
+    #[test]
+    fn test_parse_interval_to_micros() {
+        assert_eq!(parse_interval_to_micros("1 second").unwrap(), 1_000_000);
+        assert_eq!(parse_interval_to_micros("5 seconds").unwrap(), 5_000_000);
+        assert_eq!(parse_interval_to_micros("1 minute").unwrap(), 60_000_000);
+        assert_eq!(parse_interval_to_micros("5 minutes").unwrap(), 300_000_000);
+        assert_eq!(parse_interval_to_micros("1 hour").unwrap(), 3_600_000_000);
+        assert_eq!(parse_interval_to_micros("2 hours").unwrap(), 7_200_000_000);
+        assert_eq!(parse_interval_to_micros("1 day").unwrap(), 86_400_000_000);
+        assert_eq!(parse_interval_to_micros("1 week").unwrap(), 604_800_000_000);
+
+        // Test different unit formats
+        assert_eq!(parse_interval_to_micros("5 min").unwrap(), 300_000_000);
+        assert_eq!(parse_interval_to_micros("5 mins").unwrap(), 300_000_000);
+        assert_eq!(parse_interval_to_micros("5 m").unwrap(), 300_000_000);
+
+        // Test error cases
+        assert!(parse_interval_to_micros("invalid").is_err());
+        assert!(parse_interval_to_micros("5").is_err());
+        assert!(parse_interval_to_micros("abc minutes").is_err());
     }
 }

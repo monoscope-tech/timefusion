@@ -382,7 +382,7 @@ impl FoyerObjectStoreCache {
 impl ObjectStore for FoyerObjectStoreCache {
     async fn put(&self, location: &Path, payload: PutPayload) -> ObjectStoreResult<PutResult> {
         self.update_stats(|s| s.inner_puts += 1).await;
-        
+
         // Write to S3 first without removing from cache (to avoid cache stampede)
         let result = self.inner.put(location, payload).await?;
 
@@ -418,7 +418,7 @@ impl ObjectStore for FoyerObjectStoreCache {
 
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
         self.update_stats(|s| s.inner_puts += 1).await;
-        
+
         // Write to S3 first without removing from cache (to avoid cache stampede)
         let result = self.inner.put_opts(location, payload, opts).await?;
 
