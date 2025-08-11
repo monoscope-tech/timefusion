@@ -133,5 +133,80 @@ WHERE project_id = 'test_formats' AND id = 'format_test_1'
 ----
 Jul 04, 2024 16:45:30
 
+# === Test time_bucket function ===
+
+# Insert test data for time_bucket
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    parent_id, name, kind, resource___service___name,
+    status_code, status_message, level, duration, summary
+) VALUES 
+    ('test_time_bucket', TIMESTAMP '2024-01-15T14:32:45.123456Z', 'bucket_test_1', ARRAY['hash_tb1']::VARCHAR[], DATE '2024-01-15',
+     NULL, 'test_metric_1', 'SERVER', 'metrics-service',
+     'OK', 'Metric 1', 'INFO', 1000000, 'Test time bucket 1'),
+    ('test_time_bucket', TIMESTAMP '2024-01-15T14:33:15.456789Z', 'bucket_test_2', ARRAY['hash_tb2']::VARCHAR[], DATE '2024-01-15',
+     NULL, 'test_metric_2', 'SERVER', 'metrics-service',
+     'OK', 'Metric 2', 'INFO', 2000000, 'Test time bucket 2'),
+    ('test_time_bucket', TIMESTAMP '2024-01-15T14:36:30.789012Z', 'bucket_test_3', ARRAY['hash_tb3']::VARCHAR[], DATE '2024-01-15',
+     NULL, 'test_metric_3', 'SERVER', 'metrics-service',
+     'OK', 'Metric 3', 'INFO', 3000000, 'Test time bucket 3'),
+    ('test_time_bucket', TIMESTAMP '2024-01-15T14:38:00.345678Z', 'bucket_test_4', ARRAY['hash_tb4']::VARCHAR[], DATE '2024-01-15',
+     NULL, 'test_metric_4', 'SERVER', 'metrics-service',
+     'OK', 'Metric 4', 'INFO', 4000000, 'Test time bucket 4')
+
+# Test 5 minute buckets
+query TI
+SELECT 
+    to_char(time_bucket('5 minutes', timestamp), 'YYYY-MM-DD HH24:MI:SS') as five_min_bucket,
+    COUNT(*) as count
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_time_bucket'
+GROUP BY time_bucket('5 minutes', timestamp)
+ORDER BY five_min_bucket
+----
+2024-01-15 14:30:00	2
+2024-01-15 14:35:00	2
+
+# Test 1 minute buckets
+query TI
+SELECT 
+    to_char(time_bucket('1 minute', timestamp), 'YYYY-MM-DD HH24:MI:SS') as one_min_bucket,
+    COUNT(*) as count
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_time_bucket'
+GROUP BY time_bucket('1 minute', timestamp)
+ORDER BY one_min_bucket
+----
+2024-01-15 14:32:00	1
+2024-01-15 14:33:00	1
+2024-01-15 14:36:00	1
+2024-01-15 14:38:00	1
+
+# Test aggregation with time_bucket (average duration per 5 minute bucket)
+query TF
+SELECT 
+    to_char(time_bucket('5 minutes', timestamp), 'YYYY-MM-DD HH24:MI:SS') as five_min_bucket,
+    AVG(duration) as avg_duration
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_time_bucket'
+GROUP BY time_bucket('5 minutes', timestamp)
+ORDER BY five_min_bucket
+----
+2024-01-15 14:30:00	1500000.0
+2024-01-15 14:35:00	3500000.0
+
+# Test with different time units - hourly buckets
+query TI
+SELECT 
+    to_char(time_bucket('1 hour', timestamp), 'YYYY-MM-DD HH24:MI:SS') as hour_bucket,
+    COUNT(*) as count
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_time_bucket'
+GROUP BY time_bucket('1 hour', timestamp)
+ORDER BY hour_bucket
+----
+2024-01-15 14:00:00	4
+
 # Clean up would go here, but DELETE is not supported in this system
 # Test data will remain in the table

@@ -405,7 +405,7 @@ impl Database {
 
         // Optimize job - configurable schedule (default: every 30mins)
         let optimize_schedule = env::var("TIMEFUSION_OPTIMIZE_SCHEDULE").unwrap_or_else(|_| "0 */30 * * * *".to_string());
-        
+
         if !optimize_schedule.is_empty() {
             info!("Optimize job scheduled with cron expression: {}", optimize_schedule);
 
@@ -431,7 +431,7 @@ impl Database {
 
         // Vacuum job - configurable schedule (default: daily at 2AM)
         let vacuum_schedule = env::var("TIMEFUSION_VACUUM_SCHEDULE").unwrap_or_else(|_| "0 0 2 * * *".to_string());
-        
+
         if !vacuum_schedule.is_empty() {
             info!("Vacuum job scheduled with cron expression: {}", vacuum_schedule);
 
