@@ -130,8 +130,10 @@ ORDER BY project_id
 statement ok
 INSERT INTO percentile_test VALUES (2, NULL), (2, 50.0), (2, NULL), (2, 60.0), (2, 70.0)
 
+# After adding values, project_id=2 has: 5, 10, 15, 20, 25, 50, 60, 70
+# Median should be (20+25)/2 = 22.5
 query B
-SELECT approx_percentile(0.5, percentile_agg(value)) BETWEEN 58 AND 62 as median_in_range
+SELECT approx_percentile(0.5, percentile_agg(value)) BETWEEN 20 AND 25 as median_in_range
 FROM percentile_test
 WHERE project_id = 2
 ----
@@ -232,11 +234,11 @@ query TBB
 SELECT 
     date_trunc('hour', timestamp) as hour,
     approx_percentile(0.5, percentile_agg(duration)) / 1000000.0 BETWEEN
-        CASE EXTRACT(HOUR FROM timestamp) WHEN 15 THEN 65 ELSE 140 END AND
-        CASE EXTRACT(HOUR FROM timestamp) WHEN 15 THEN 85 ELSE 160 END as p50_ok,
+        CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 65 ELSE 140 END AND
+        CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 85 ELSE 160 END as p50_ok,
     approx_percentile(0.95, percentile_agg(duration)) / 1000000.0 BETWEEN
-        CASE EXTRACT(HOUR FROM timestamp) WHEN 15 THEN 85 ELSE 190 END AND
-        CASE EXTRACT(HOUR FROM timestamp) WHEN 15 THEN 95 ELSE 210 END as p95_ok
+        CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 85 ELSE 190 END AND
+        CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 95 ELSE 210 END as p95_ok
 FROM test_spans
 WHERE project_id = 'test-project'
 GROUP BY date_trunc('hour', timestamp)
@@ -279,21 +281,38 @@ INSERT INTO test_spans VALUES
 ('other-project', '2025-08-10T16:00:00Z', 45000000),   -- 45ms
 ('other-project', '2025-08-10T16:30:00Z', 55000000)    -- 55ms
 
-query TTRR
+# Test with ranges instead of exact values due to t-digest approximation and ROUND formatting
+query TTBB
 SELECT 
     project_id,
     date_trunc('hour', timestamp) as hour,
-    ROUND(approx_percentile(0.5, percentile_agg(duration)) / 1000000.0, 1) as p50_ms,
-    ROUND(approx_percentile(0.95, percentile_agg(duration)) / 1000000.0, 1) as p95_ms
+    approx_percentile(0.5, percentile_agg(duration)) / 1000000.0 BETWEEN 
+        CASE project_id 
+            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 29 ELSE 49 END
+            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 74 ELSE 149 END
+        END AND
+        CASE project_id 
+            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 31 ELSE 51 END
+            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 76 ELSE 151 END
+        END as p50_ok,
+    approx_percentile(0.95, percentile_agg(duration)) / 1000000.0 BETWEEN 
+        CASE project_id 
+            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 34 ELSE 54 END
+            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 88 ELSE 194 END
+        END AND
+        CASE project_id 
+            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 35 ELSE 55 END
+            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 90 ELSE 199 END
+        END as p95_ok
 FROM test_spans
 WHERE project_id IN ('test-project', 'other-project')
 GROUP BY project_id, date_trunc('hour', timestamp)
 ORDER BY project_id, hour
 ----
-other-project 2025-08-10 15:00:00 30.0 34.5
-other-project 2025-08-10 16:00:00 50.0 54.5
-test-project 2025-08-10 15:00:00 75.0 89.0
-test-project 2025-08-10 16:00:00 150.0 198.0
+other-project 2025-08-10 15:00:00 true true
+other-project 2025-08-10 16:00:00 true true
+test-project 2025-08-10 15:00:00 true true
+test-project 2025-08-10 16:00:00 true true
 
 # Clean up
 statement ok
