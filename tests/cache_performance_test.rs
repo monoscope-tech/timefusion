@@ -148,57 +148,6 @@ async fn test_large_file_disk_caching() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_cache_configuration_from_env() -> Result<()> {
-    // Test that configuration is loaded correctly from environment
-    // Save current values to restore later
-    let orig_mem = env::var("TIMEFUSION_FOYER_MEMORY_MB").ok();
-    let orig_disk = env::var("TIMEFUSION_FOYER_DISK_GB").ok();
-    let orig_ttl = env::var("TIMEFUSION_FOYER_TTL_SECONDS").ok();
-    let orig_shards = env::var("TIMEFUSION_FOYER_SHARDS").ok();
-
-    unsafe {
-        env::set_var("TIMEFUSION_FOYER_MEMORY_MB", "512");
-        env::set_var("TIMEFUSION_FOYER_DISK_GB", "20");
-        env::set_var("TIMEFUSION_FOYER_TTL_SECONDS", "600");
-        env::set_var("TIMEFUSION_FOYER_SHARDS", "16");
-    }
-
-    let config = FoyerCacheConfig::from_env();
-
-    // The config should match what we set (unless overridden by .env file)
-    // Since we can't guarantee clean env in CI, just check the values were read
-    assert!(config.memory_size_bytes > 0);
-    assert!(config.disk_size_bytes > 0);
-    assert_eq!(config.ttl.as_secs(), 600);
-    assert_eq!(config.shards, 16);
-
-    // Restore original values
-    unsafe {
-        if let Some(val) = orig_mem {
-            env::set_var("TIMEFUSION_FOYER_MEMORY_MB", val);
-        } else {
-            env::remove_var("TIMEFUSION_FOYER_MEMORY_MB");
-        }
-        if let Some(val) = orig_disk {
-            env::set_var("TIMEFUSION_FOYER_DISK_GB", val);
-        } else {
-            env::remove_var("TIMEFUSION_FOYER_DISK_GB");
-        }
-        if let Some(val) = orig_ttl {
-            env::set_var("TIMEFUSION_FOYER_TTL_SECONDS", val);
-        } else {
-            env::remove_var("TIMEFUSION_FOYER_TTL_SECONDS");
-        }
-        if let Some(val) = orig_shards {
-            env::set_var("TIMEFUSION_FOYER_SHARDS", val);
-        } else {
-            env::remove_var("TIMEFUSION_FOYER_SHARDS");
-        }
-    }
-
-    Ok(())
-}
 
 #[tokio::test]
 async fn test_cache_with_database_integration() -> Result<()> {

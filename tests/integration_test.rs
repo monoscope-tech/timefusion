@@ -82,7 +82,7 @@ mod integration {
         fn insert_sql() -> String {
             format!(
                 "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) 
-                 VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[], $7)",
+                 VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[]::text[], $7)",
                 chrono::Utc::now().date_naive(),
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
             )
@@ -106,7 +106,7 @@ mod integration {
         client
             .execute(
                 &insert,
-                &[&"test_project", &server.test_id, &"test_span_name", &"OK", &"Test integration", &"INFO", &"Integration test summary"],
+                &[&"test_project", &server.test_id, &"test_span_name", &"OK", &"Test integration", &"INFO", &vec!["Integration test summary"]],
             )
             .await?;
 
@@ -141,7 +141,7 @@ mod integration {
                         &"OK",
                         &format!("Batch test {i}"),
                         &"INFO",
-                        &format!("Batch test summary {i}"),
+                        &vec![format!("Batch test summary {i}")],
                     ],
                 )
                 .await?;
@@ -188,7 +188,7 @@ mod integration {
                                 &"OK",
                                 &"Test",
                                 &"INFO",
-                                &format!("Concurrent test summary: client {} op {}", client_id, op),
+                                &vec![format!("Concurrent test summary: client {} op {}", client_id, op)],
                             ],
                         )
                         .await?;

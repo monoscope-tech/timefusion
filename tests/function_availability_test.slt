@@ -96,11 +96,13 @@ SELECT json_build_array('a', 'b', 'c') as array_result
 ----
 ["a","b","c"]
 
-# Test to_json (not available)  
-statement error
+# Test to_json (now available)  
+query T
 SELECT to_json(name) as json_name
 FROM otel_logs_and_spans 
 WHERE project_id = 'test_funcs' AND id = 'func_test_1'
+----
+"test_json"
 
 # Test json_object (not available)
 statement error

@@ -1,0 +1,292 @@
+# Test JSON functions in TimeFusion
+# This file combines all JSON-specific tests from:
+# - available_json_functions.slt
+# - json_and_extract_functions_test.slt
+# - postgres_json_functions.slt
+
+# === Test Data Setup ===
+
+# Insert test data with valid JSON
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    parent_id, name, kind, resource___service___name,
+    status_code, status_message, level, duration, summary
+) VALUES 
+    ('json_test', TIMESTAMP '2024-01-15T10:00:00Z', 'json_1', ARRAY['hash1']::VARCHAR[], DATE '2024-01-15',
+     NULL, 'test_json', 'SERVER', 'test-service',
+     'OK', '{"name": "John", "age": 30, "active": true, "items": ["apple", "banana"], "address": {"city": "NYC", "zip": "10001"}}', 'INFO', 1000000, ARRAY['Test JSON'])
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    parent_id, name, kind, resource___service___name,
+    status_code, status_message, level, duration, summary
+) VALUES 
+    ('test_functions', TIMESTAMP '2024-01-15T14:30:45.123456Z', 'json_test_1', ARRAY['hash1']::VARCHAR[], DATE '2024-01-15',
+     NULL, 'test_json', 'SERVER', 'test-service',
+     'OK', '{"name": "John", "age": 30, "items": ["apple", "banana"], "nested": {"key": "value"}}', 'INFO', 1000000, ARRAY['Test JSON functions']),
+    ('test_functions', TIMESTAMP '2024-12-25T08:00:00Z', 'date_test_1', ARRAY['hash2']::VARCHAR[], DATE '2024-12-25',
+     NULL, 'test_date', 'SERVER', 'test-service',
+     'OK', 'Regular message', 'INFO', 2000000, ARRAY['Test date functions'])
+
+# Insert additional test data for PostgreSQL JSON functions
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id,
+    timestamp,
+    context___trace_id,
+    name,
+    duration,
+    resource___service___name,
+    parent_id,
+    start_time,
+    events,
+    summary,
+    context___span_id,
+    id,
+    date,
+    hashes
+) VALUES
+(
+    '00000000-0000-0000-0000-000000000000',
+    '2025-08-07T10:00:00Z',
+    'trace123',
+    'test_span',
+    1500,
+    'test_service',
+    'parent123',
+    '2025-08-07T10:00:00Z',
+    '[{"event_name": "start"}, {"event_name": "exception"}]',
+    ARRAY['{"status": "ok", "count": 5}'],
+    'span123',
+    '00000000-0000-0000-0000-000000000001',
+    DATE '2025-08-07',
+    ARRAY[]::VARCHAR[]
+)
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id,
+    timestamp,
+    context___trace_id,
+    name,
+    duration,
+    resource___service___name,
+    parent_id,
+    start_time,
+    events,
+    summary,
+    context___span_id,
+    id,
+    date,
+    hashes
+) VALUES
+(
+    '00000000-0000-0000-0000-000000000000',
+    '2025-08-07T11:00:00Z',
+    'trace456',
+    'another_span',
+    2500,
+    'test_service2',
+    'parent456',
+    '2025-08-07T11:00:00Z',
+    '[{"event_name": "info"}]',
+    ARRAY['{"status": "error", "count": 0}'],
+    'span456',
+    '00000000-0000-0000-0000-000000000002',
+    DATE '2025-08-07',
+    ARRAY[]::VARCHAR[]
+)
+
+# === DataFusion JSON Functions ===
+
+# Verify JSON string content
+query T
+SELECT status_message
+FROM otel_logs_and_spans 
+WHERE project_id = 'json_test' AND id = 'json_1'
+----
+{"name": "John", "age": 30, "active": true, "items": ["apple", "banana"], "address": {"city": "NYC", "zip": "10001"}}
+
+# Test json field accessor -> returns JSON, ->> returns text
+query T
+SELECT status_message->>'name' as name
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+John
+
+# Test json field accessor for numeric value
+query I
+SELECT (status_message->>'age')::INT as age
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+30
+
+# Test json_get with nested path
+query T
+SELECT status_message->'nested'->>'key' as nested_value
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+value
+
+# Test json field accessor with array access
+query T
+SELECT status_message->'items'->>0 as first_item
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+apple
+
+# Test json field accessor with array access (second item)
+query T
+SELECT status_message->'items'->>1 as second_item
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+banana
+
+# Test json_length for objects
+query I
+SELECT json_length(status_message) as obj_length
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+4
+
+# Test json_length for arrays (need to pass path as string)
+query I
+SELECT json_length(status_message, 'items') as array_length
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+2
+
+# Test json_contains - checks if key exists
+query B
+SELECT json_contains(status_message, 'name') as has_name_key
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+true
+
+# Test json_contains with non-existent key
+query B
+SELECT json_contains(status_message, 'nonexistent') as has_nonexistent_key
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+false
+
+# === PostgreSQL-compatible JSON Functions ===
+
+# Test json_build_array with simple values
+query T
+SELECT json_build_array('a', 'b', 'c') FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' LIMIT 1
+----
+["a","b","c"]
+
+# Test json_build_array with column values
+query T
+SELECT json_build_array(id, name, duration) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1
+----
+["00000000-0000-0000-0000-000000000001","test_span",1500]
+
+# Test to_json function
+query T
+SELECT to_json(summary) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1
+----
+"[{\"status\": \"ok\", \"count\": 5}]"
+
+# Test to_json with different types
+query T
+SELECT to_json(duration) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1
+----
+1500
+
+# Test to_json with column values
+query T
+SELECT to_json(name)
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+"test_json"
+
+# === Combined JSON and other functions ===
+
+# Extract year and JSON field in same query
+query IT
+SELECT EXTRACT(YEAR FROM timestamp) as year, status_message->>'name' as name
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+----
+2024	John
+
+# Test extract_epoch function
+query R
+SELECT extract_epoch(timestamp) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1
+----
+1754560800
+
+# Test complex query with multiple JSON functions
+query T
+SELECT json_build_array(
+    id,
+    to_char(timestamp, 'YYYY-MM-DDTHH24:MI:SS.USZ'),
+    context___trace_id,
+    name,
+    duration,
+    resource___service___name,
+    parent_id,
+    CAST(extract_epoch(start_time) * 1000000000 AS BIGINT),
+    to_json(summary),
+    context___span_id
+) 
+FROM otel_logs_and_spans 
+WHERE project_id='00000000-0000-0000-0000-000000000000' 
+    AND (timestamp BETWEEN '2025-08-06T15:03:47.380203Z' AND '2025-08-07T15:03:47.380203Z')
+ORDER BY timestamp DESC 
+LIMIT 2
+----
+["00000000-0000-0000-0000-000000000002","2025-08-07T11:00:00.000000Z","trace456","another_span",2500,"test_service2","parent456",1754564400000000000,"\"[{\\\"status\\\": \\\"error\\\", \\\"count\\\": 0}]\"","span456"]
+["00000000-0000-0000-0000-000000000001","2025-08-07T10:00:00.000000Z","trace123","test_span",1500,"test_service","parent123",1754560800000000000,"\"[{\\\"status\\\": \\\"ok\\\", \\\"count\\\": 5}]\"","span123"]
+
+# === Functions that are NOT available ===
+
+# json_object - NOT part of datafusion-functions-json
+statement error
+SELECT json_object('key', 'value')
+
+# json_agg - NOT part of datafusion-functions-json
+statement error
+SELECT json_agg(name)
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions'
+
+# Test json_array_elements (registered but not implemented)
+statement error
+SELECT json_array_elements(status_message -> 'items') as item
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+
+# Test jsonb_array_elements (registered but not implemented)
+statement error
+SELECT jsonb_array_elements(status_message) as element
+FROM otel_logs_and_spans 
+WHERE project_id = 'test_functions' AND id = 'json_test_1'
+
+# === Summary of available JSON functions ===
+# 1. JSON field accessors: -> (returns JSON) and ->> (returns text)
+# 2. json_length: Get length of JSON array/object
+# 3. json_contains: Check if JSON contains a key
+# 4. json_build_array: Build JSON arrays (custom implementation)
+# 5. to_json: Convert values to JSON (custom implementation)
+# 6. extract_epoch: Extract epoch time from timestamps (custom implementation)
+# 7. to_char: Format timestamps (custom implementation)
+#
+# NOT available:
+# - json_object, json_agg
+# - json_array_elements, jsonb_array_elements (registered but not implemented)

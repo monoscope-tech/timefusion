@@ -12,7 +12,7 @@ test-ovh:
 # Test with MinIO
 test-minio:
 	@echo "Testing with MinIO..."
-	@export $$(cat .env.test | grep -v '^#' | xargs) && cargo test $${ARGS}
+	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo test $${ARGS}
 
 # Test with production config (be careful!)
 test-prod:
