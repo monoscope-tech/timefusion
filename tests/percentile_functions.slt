@@ -162,7 +162,7 @@ DROP TABLE percentile_test
 statement ok
 CREATE TABLE test_spans (
     project_id VARCHAR,
-    timestamp TIMESTAMP,
+    timestamp TIMESTAMP WITH TIME ZONE,
     duration BIGINT
 )
 
@@ -229,25 +229,25 @@ LIMIT 1
 ----
 p90
 
-# Test 6: Percentiles grouped by time buckets with actual percentile calculations
+# Test 6: Percentiles grouped by time buckets using time_bucket function
 query TBB
 SELECT 
-    date_trunc('hour', timestamp) as hour,
+    to_char(time_bucket('1 hour', timestamp), 'YYYY-MM-DD HH24:MI:SS') as hour,
     approx_percentile(0.5, percentile_agg(duration)) / 1000000.0 BETWEEN
-        CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 65 ELSE 140 END AND
-        CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 85 ELSE 160 END as p50_ok,
+        CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 65 ELSE 140 END AND
+        CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 85 ELSE 160 END as p50_ok,
     approx_percentile(0.95, percentile_agg(duration)) / 1000000.0 BETWEEN
-        CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 85 ELSE 190 END AND
-        CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 95 ELSE 210 END as p95_ok
+        CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 85 ELSE 190 END AND
+        CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 95 ELSE 210 END as p95_ok
 FROM test_spans
 WHERE project_id = 'test-project'
-GROUP BY date_trunc('hour', timestamp)
+GROUP BY time_bucket('1 hour', timestamp)
 ORDER BY hour
 ----
 2025-08-10 15:00:00 true true
 2025-08-10 16:00:00 true true
 
-# Test 7: Check individual percentile calculations for hour 15:00
+# Test 7: Check individual percentile calculations for hour 15:00 using time_bucket
 query B
 SELECT 
     approx_percentile(0.50, percentile_agg(duration)) / 1000000.0 BETWEEN 65 AND 85 AND
@@ -256,11 +256,11 @@ SELECT
     AS percentiles_in_range
 FROM test_spans
 WHERE project_id = 'test-project'
-AND date_trunc('hour', timestamp) = '2025-08-10T15:00:00'::timestamp
+AND time_bucket('1 hour', timestamp) = '2025-08-10T15:00:00'
 ----
 true
 
-# Test 8: Check individual percentile calculations for hour 16:00
+# Test 8: Check individual percentile calculations for hour 16:00 using time_bucket
 query B
 SELECT 
     approx_percentile(0.50, percentile_agg(duration)) / 1000000.0 BETWEEN 140 AND 160 AND
@@ -269,7 +269,7 @@ SELECT
     AS percentiles_in_range
 FROM test_spans
 WHERE project_id = 'test-project'
-AND date_trunc('hour', timestamp) = '2025-08-10T16:00:00'::timestamp
+AND time_bucket('1 hour', timestamp) = '2025-08-10T16:00:00'
 ----
 true
 
@@ -281,38 +281,75 @@ INSERT INTO test_spans VALUES
 ('other-project', '2025-08-10T16:00:00Z', 45000000),   -- 45ms
 ('other-project', '2025-08-10T16:30:00Z', 55000000)    -- 55ms
 
-# Test with ranges instead of exact values due to t-digest approximation and ROUND formatting
+# Test with ranges using time_bucket for hourly aggregation
 query TTBB
 SELECT 
     project_id,
-    date_trunc('hour', timestamp) as hour,
+    to_char(time_bucket('1 hour', timestamp), 'YYYY-MM-DD HH24:MI:SS') as hour,
     approx_percentile(0.5, percentile_agg(duration)) / 1000000.0 BETWEEN 
         CASE project_id 
-            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 29 ELSE 49 END
-            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 74 ELSE 149 END
+            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 29 ELSE 49 END
+            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 74 ELSE 149 END
         END AND
         CASE project_id 
-            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 31 ELSE 51 END
-            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 76 ELSE 151 END
+            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 31 ELSE 51 END
+            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 76 ELSE 151 END
         END as p50_ok,
     approx_percentile(0.95, percentile_agg(duration)) / 1000000.0 BETWEEN 
         CASE project_id 
-            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 34 ELSE 54 END
-            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 88 ELSE 194 END
+            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 34 ELSE 54 END
+            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 88 ELSE 194 END
         END AND
         CASE project_id 
-            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 35 ELSE 55 END
-            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM date_trunc('hour', timestamp)) WHEN 15 THEN 90 ELSE 199 END
+            WHEN 'other-project' THEN CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 35 ELSE 55 END
+            WHEN 'test-project' THEN CASE EXTRACT(HOUR FROM time_bucket('1 hour', timestamp)) WHEN 15 THEN 90 ELSE 199 END
         END as p95_ok
 FROM test_spans
 WHERE project_id IN ('test-project', 'other-project')
-GROUP BY project_id, date_trunc('hour', timestamp)
+GROUP BY project_id, time_bucket('1 hour', timestamp)
 ORDER BY project_id, hour
 ----
 other-project 2025-08-10 15:00:00 true true
 other-project 2025-08-10 16:00:00 true true
 test-project 2025-08-10 15:00:00 true true
 test-project 2025-08-10 16:00:00 true true
+
+# Test 10: Test time_bucket with different intervals (30 minutes, 2 hours)
+query TB
+SELECT 
+    to_char(time_bucket('30 minutes', timestamp), 'YYYY-MM-DD HH24:MI:SS') as half_hour_bucket,
+    approx_percentile(0.5, percentile_agg(duration)) / 1000000.0 BETWEEN 25 AND 200 as median_ok
+FROM test_spans
+WHERE project_id = 'test-project'
+GROUP BY time_bucket('30 minutes', timestamp)
+ORDER BY half_hour_bucket
+----
+2025-08-10 15:00:00 true
+2025-08-10 15:30:00 true
+2025-08-10 16:00:00 true
+2025-08-10 16:30:00 true
+
+# Test time_bucket with 2 hour intervals
+query TB
+SELECT 
+    to_char(time_bucket('2 hours', timestamp), 'YYYY-MM-DD HH24:MI:SS') as two_hour_bucket,
+    approx_percentile(0.5, percentile_agg(duration)) / 1000000.0 BETWEEN 
+        CASE EXTRACT(HOUR FROM time_bucket('2 hours', timestamp)) 
+            WHEN 14 THEN 45 
+            ELSE 95 
+        END AND 
+        CASE EXTRACT(HOUR FROM time_bucket('2 hours', timestamp)) 
+            WHEN 14 THEN 65 
+            ELSE 105 
+        END as median_ok
+FROM test_spans
+WHERE project_id IN ('test-project', 'other-project')
+GROUP BY time_bucket('2 hours', timestamp)
+HAVING COUNT(*) > 1
+ORDER BY two_hour_bucket
+----
+2025-08-10 14:00:00 true
+2025-08-10 16:00:00 true
 
 # Clean up
 statement ok

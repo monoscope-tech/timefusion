@@ -665,7 +665,8 @@ fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64
 /// Bucket timestamps to the nearest bucket boundary
 fn bucket_timestamps(timestamp_array: &ArrayRef, bucket_size_micros: i64) -> datafusion::error::Result<ArrayRef> {
     if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        let mut builder = TimestampMicrosecondArray::builder(timestamps.len());
+        let mut builder = TimestampMicrosecondArray::builder(timestamps.len())
+            .with_timezone("UTC");
 
         for i in 0..timestamps.len() {
             if timestamps.is_null(i) {
@@ -680,7 +681,8 @@ fn bucket_timestamps(timestamp_array: &ArrayRef, bucket_size_micros: i64) -> dat
 
         Ok(Arc::new(builder.finish()))
     } else if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        let mut builder = TimestampNanosecondArray::builder(timestamps.len());
+        let mut builder = TimestampNanosecondArray::builder(timestamps.len())
+            .with_timezone("UTC");
         let bucket_size_nanos = bucket_size_micros * 1000;
 
         for i in 0..timestamps.len() {
