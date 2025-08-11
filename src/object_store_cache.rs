@@ -382,33 +382,34 @@ impl FoyerObjectStoreCache {
 impl ObjectStore for FoyerObjectStoreCache {
     async fn put(&self, location: &Path, payload: PutPayload) -> ObjectStoreResult<PutResult> {
         self.update_stats(|s| s.inner_puts += 1).await;
-        self.cache.remove(&Self::make_cache_key(location));
+        
+        // Write to S3 first without removing from cache (to avoid cache stampede)
         let result = self.inner.put(location, payload).await?;
 
-        // If we just wrote _last_checkpoint, immediately cache it
-        if Self::is_last_checkpoint(location) {
-            // Get the file we just wrote and cache it
-            if let Ok(get_result) = self.inner.get(location).await {
-                use futures::TryStreamExt;
-                let data = match get_result.payload {
-                    GetResultPayload::Stream(s) => {
-                        if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
-                            chunks.concat()
-                        } else {
-                            vec![]
-                        }
+        // After successful write, update the cache with the new data
+        self.update_stats(|s| s.inner_gets += 1).await;
+        if let Ok(get_result) = self.inner.get(location).await {
+            use futures::TryStreamExt;
+            let data = match get_result.payload {
+                GetResultPayload::Stream(s) => {
+                    if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
+                        chunks.concat()
+                    } else {
+                        vec![]
                     }
-                    GetResultPayload::File(mut file, _) => {
-                        use std::io::Read;
-                        let mut buf = Vec::new();
-                        if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
-                    }
-                };
-                if !data.is_empty() {
-                    let cache_key = Self::make_cache_key(location);
-                    self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
-                    debug!("Proactively cached _last_checkpoint after write: {}", location);
                 }
+                GetResultPayload::File(mut file, _) => {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
+                }
+            };
+            if !data.is_empty() {
+                let cache_key = Self::make_cache_key(location);
+                let size = get_result.meta.size;
+                // This will atomically replace the old entry (if any) with the new one
+                self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
+                debug!("Updated cache after write: {} (size: {} bytes)", location, size);
             }
         }
 
@@ -417,35 +418,33 @@ impl ObjectStore for FoyerObjectStoreCache {
 
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
         self.update_stats(|s| s.inner_puts += 1).await;
+        
+        // Write to S3 first without removing from cache (to avoid cache stampede)
         let result = self.inner.put_opts(location, payload, opts).await?;
 
-        // Remove the written file from cache
-        self.cache.remove(&Self::make_cache_key(location));
-
-        // If we just wrote _last_checkpoint, immediately cache it
-        if Self::is_last_checkpoint(location) {
-            // Get the file we just wrote and cache it
-            if let Ok(get_result) = self.inner.get(location).await {
-                use futures::TryStreamExt;
-                let data = match get_result.payload {
-                    GetResultPayload::Stream(s) => {
-                        if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
-                            chunks.concat()
-                        } else {
-                            vec![]
-                        }
+        // After successful write, update the cache with the new data
+        if let Ok(get_result) = self.inner.get(location).await {
+            use futures::TryStreamExt;
+            let data = match get_result.payload {
+                GetResultPayload::Stream(s) => {
+                    if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
+                        chunks.concat()
+                    } else {
+                        vec![]
                     }
-                    GetResultPayload::File(mut file, _) => {
-                        use std::io::Read;
-                        let mut buf = Vec::new();
-                        if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
-                    }
-                };
-                if !data.is_empty() {
-                    let cache_key = Self::make_cache_key(location);
-                    self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
-                    debug!("Proactively cached _last_checkpoint after write: {}", location);
                 }
+                GetResultPayload::File(mut file, _) => {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
+                }
+            };
+            if !data.is_empty() {
+                let cache_key = Self::make_cache_key(location);
+                let size = get_result.meta.size;
+                // This will atomically replace the old entry (if any) with the new one
+                self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
+                debug!("Updated cache after write: {} (size: {} bytes)", location, size);
             }
         }
 
@@ -748,8 +747,9 @@ mod tests {
 
         let stats = cache.get_stats().await;
         assert_eq!(stats.inner_puts, 1);
+        assert_eq!(stats.inner_gets, 1); // We fetch after write to cache it
 
-        // First get - cache miss
+        // First get - cache hit (since we cache on write)
         let result = cache.get(&path).await?;
         use futures::TryStreamExt;
         let bytes: Vec<Bytes> = match result.payload {
@@ -759,9 +759,9 @@ mod tests {
         assert_eq!(bytes[0], data);
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1);
-        assert_eq!(stats.misses, 1);
-        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.inner_gets, 1); // No additional fetch needed
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.hits, 1);
 
         // Second get - cache hit
         let result2 = cache.get(&path).await?;
@@ -772,9 +772,9 @@ mod tests {
         assert_eq!(bytes2[0], data);
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1);
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.inner_gets, 1); // Still just the one from write
+        assert_eq!(stats.hits, 2); // Two cache hits total
+        assert_eq!(stats.misses, 0);
 
         cache.delete(&path).await?;
         assert!(cache.get(&path).await.is_err());
@@ -807,7 +807,7 @@ mod tests {
             cache.put(&path, PutPayload::from(Bytes::from(data.clone()))).await?;
         }
 
-        // First read - cache miss
+        // First read - cache hit (since we cache on write)
         for (path_str, data) in &files {
             let path = Path::from(*path_str);
             let result = cache.get(&path).await?;
@@ -820,8 +820,9 @@ mod tests {
         }
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 3);
-        assert_eq!(stats.misses, 3);
+        assert_eq!(stats.inner_gets, 3); // From the writes
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.hits, 3);
 
         // Second read - cache hit
         for (path_str, data) in &files {
@@ -837,7 +838,7 @@ mod tests {
 
         let stats = cache.get_stats().await;
         assert_eq!(stats.inner_gets, 3); // No new inner gets
-        assert_eq!(stats.hits, 3);
+        assert_eq!(stats.hits, 6); // Total 6 hits (3 per read)
 
         info!("Cache successfully prevented {} S3 accesses", stats.hits);
         stats.log();
@@ -887,7 +888,7 @@ mod tests {
 
         cache.put(&path, PutPayload::from(large_data.clone())).await?;
 
-        // First get - cache miss
+        // First get - cache hit (since we cache on write)
         let result = cache.get(&path).await?;
         use futures::TryStreamExt;
         let bytes: Vec<Bytes> = match result.payload {
@@ -897,7 +898,8 @@ mod tests {
         assert_eq!(bytes[0].len(), large_data.len());
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1);
+        assert_eq!(stats.inner_gets, 1); // From the write
+        assert_eq!(stats.hits, 1);
 
         // Second get - cache hit
         let result2 = cache.get(&path).await?;
@@ -908,8 +910,8 @@ mod tests {
         assert_eq!(bytes2[0].len(), large_data.len());
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1);
-        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.inner_gets, 1); // Still just from the write
+        assert_eq!(stats.hits, 2); // Two cache hits total
 
         stats.log();
         cache.shutdown().await?;

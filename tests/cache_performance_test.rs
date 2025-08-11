@@ -32,13 +32,18 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
         ("table/2024/01/part-003.parquet", vec![2u8; 1024 * 256]), // 256KB
     ];
 
-    // Write test files
+    // Write test files (these will be cached immediately after write)
     for (path_str, data) in &test_files {
         let path = Path::from(*path_str);
         cached_store.put(&path, PutPayload::from(Bytes::from(data.clone()))).await?;
     }
 
-    // First read - should miss cache and fetch from store
+    // Get baseline stats after writes
+    let stats_after_write = shared_cache.get_stats().await;
+    assert_eq!(stats_after_write.inner_puts, 3, "Should have written to inner store 3 times");
+    assert_eq!(stats_after_write.inner_gets, 3, "Should have fetched from inner store 3 times during write");
+
+    // First read - should hit cache since we cache on write
     let start = Instant::now();
     for (path_str, _) in &test_files {
         let path = Path::from(*path_str);
@@ -46,7 +51,7 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
     }
     let first_read_time = start.elapsed();
 
-    // Second read - should hit cache (memory or disk)
+    // Second read - should also hit cache
     let start = Instant::now();
     for (path_str, _) in &test_files {
         let path = Path::from(*path_str);
@@ -57,20 +62,19 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
     // Log stats to verify cache behavior
     shared_cache.log_stats().await;
 
-    // Cache should be faster, but in test environments this can be unreliable
-    // So we'll just verify it's not slower
+    // Both reads should be fast since they hit cache
     assert!(
-        cached_read_time <= first_read_time,
-        "Cached reads should not be slower than uncached. First: {:?}, Cached: {:?}",
+        cached_read_time <= first_read_time * 2,
+        "Cached reads should be consistently fast. First: {:?}, Cached: {:?}",
         first_read_time,
         cached_read_time
     );
 
-    // Verify cache stats show hits
+    // Verify cache stats - all reads should hit cache since we cache on write
     let stats = shared_cache.get_stats().await;
-    assert_eq!(stats.hits, 3, "Should have 3 cache hits on second read");
-    assert_eq!(stats.misses, 3, "Should have 3 cache misses on first read");
-    assert_eq!(stats.inner_gets, 3, "Should have fetched from inner store 3 times");
+    assert_eq!(stats.hits, 6, "Should have 6 cache hits total (3 per read iteration)");
+    assert_eq!(stats.misses, 0, "Should have no cache misses since files were cached on write");
+    assert_eq!(stats.inner_gets, 3, "Should have fetched from inner store 3 times during write");
     assert_eq!(stats.inner_puts, 3, "Should have written to inner store 3 times");
 
     // Test cache invalidation on write
