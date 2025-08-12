@@ -227,7 +227,7 @@ mod sqllogictest_tests {
             };
 
             // Auto-discover all .slt test files
-            let test_dir = Path::new("tests");
+            let test_dir = Path::new("tests/slt");
             let mut test_files = Vec::new();
 
             // Check if a specific test file is requested via environment variable
@@ -277,7 +277,7 @@ mod sqllogictest_tests {
                 if let Some(ref filter) = test_filter {
                     return Err(anyhow::anyhow!("No test files found matching filter '{}'", filter));
                 } else {
-                    return Err(anyhow::anyhow!("No .slt test files found in tests directory"));
+                    return Err(anyhow::anyhow!("No .slt test files found in tests/slt directory"));
                 }
             }
 
