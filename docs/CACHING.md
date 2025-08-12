@@ -31,6 +31,7 @@ Configure the object store cache via environment variables:
 | `TIMEFUSION_FOYER_STATS` | `true` | Enable statistics logging |
 | `TIMEFUSION_FOYER_DELTA_METADATA_TTL_SECONDS` | `5` | TTL for Delta metadata files (0 to disable) |
 | `TIMEFUSION_FOYER_CACHE_DELTA_CHECKPOINTS` | `false` | Whether to cache Delta checkpoint files |
+| `TIMEFUSION_PARQUET_METADATA_SIZE_HINT` | `1048576` | Size hint (bytes) for Parquet metadata reads |
 
 ### Cache Operations
 
@@ -38,6 +39,9 @@ Configure the object store cache via environment variables:
 - **PUT**: Write to S3, then invalidate cache entry (with special handling for Delta files)
 - **DELETE**: Delete from S3, then remove from cache
 - **LIST**: Pass-through to S3 (no caching)
+- **GET_RANGE**: Smart handling for Parquet files:
+  - Metadata requests (near end of file) cache only the requested range
+  - Data requests cache the full file for better subsequent performance
 
 #### Delta Lake Special Handling
 
@@ -54,6 +58,7 @@ The cache includes special handling for Delta Lake metadata files to prevent rac
 2. **Lower Latency**: Serve frequently accessed files from memory/disk
 3. **Better Throughput**: Lock-free data structures and sharding
 4. **Automatic Tiering**: Hot data in memory, warm data on disk
+5. **Optimized Parquet Metadata**: Cache only metadata portions instead of full files
 
 ### Cache Statistics
 
@@ -111,6 +116,7 @@ The `FoyerObjectStoreCache` (`src/object_store_cache.rs`) provides:
 - Serializable cache entries with metadata
 - Automatic TTL checking on access
 - Graceful shutdown with cache persistence
+- Smart range caching for Parquet metadata optimization
 
 ### Cache Effectiveness
 
@@ -119,6 +125,7 @@ The cache is most effective for:
 - Delta Lake metadata (_delta_log files)
 - Repeated scans of the same partitions
 - Dashboard queries accessing recent data
+- Parquet metadata reads (footer/statistics)
 
 ## Delta Lake Considerations
 

@@ -30,12 +30,12 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     let stats1 = cache.get_stats().await;
     let _ = cache.get(&regular_path).await?;
     let stats2 = cache.get_stats().await;
-    assert_eq!(stats2.hits - stats1.hits, 1, "First get should be a hit (cached by put)");
+    assert_eq!(stats2.main.hits - stats1.main.hits, 1, "First get should be a hit (cached by put)");
 
     // Second get should hit the cache
     let _ = cache.get(&regular_path).await?;
     let stats3 = cache.get_stats().await;
-    assert_eq!(stats3.hits - stats2.hits, 1, "Second get should be a hit");
+    assert_eq!(stats3.main.hits - stats2.main.hits, 1, "Second get should be a hit");
 
     // Test 2: _last_checkpoint file should now be cached (with stale-while-revalidate)
     let checkpoint_path = Path::from("table/_delta_log/_last_checkpoint");
@@ -46,12 +46,12 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     let stats4 = cache.get_stats().await;
     let _ = cache.get(&checkpoint_path).await?;
     let stats5 = cache.get_stats().await;
-    assert_eq!(stats5.misses - stats4.misses, 1, "First checkpoint get should miss");
+    assert_eq!(stats5.main.misses - stats4.main.misses, 1, "First checkpoint get should miss");
 
     // Second get should hit the cache (now cached)
     let _ = cache.get(&checkpoint_path).await?;
     let stats6 = cache.get_stats().await;
-    assert_eq!(stats6.hits - stats5.hits, 1, "Second checkpoint get should hit");
+    assert_eq!(stats6.main.hits - stats5.main.hits, 1, "Second checkpoint get should hit");
 
     // Test 3: Writing a commit file should invalidate _last_checkpoint
     let commit_path = Path::from("table/_delta_log/00000001.json");
@@ -72,12 +72,12 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     let stats7 = cache.get_stats().await;
     let _ = cache.get(&metadata_path).await?;
     let stats8 = cache.get_stats().await;
-    assert_eq!(stats8.hits - stats7.hits, 1, "First metadata get should hit (cached by put)");
+    assert_eq!(stats8.main.hits - stats7.main.hits, 1, "First metadata get should hit (cached by put)");
 
     // Second get should hit (within TTL)
     let _ = cache.get(&metadata_path).await?;
     let stats9 = cache.get_stats().await;
-    assert_eq!(stats9.hits - stats8.hits, 1, "Second metadata get should hit");
+    assert_eq!(stats9.main.hits - stats8.main.hits, 1, "Second metadata get should hit");
 
     // Cleanup
     cache.shutdown().await?;
@@ -112,14 +112,14 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     let data1 = result1.into_stream().try_collect::<Vec<_>>().await?.concat();
     assert_eq!(data1, checkpoint_data);
     let stats2 = cache.get_stats().await;
-    assert_eq!(stats2.misses - stats1.misses, 1, "First get should miss");
+    assert_eq!(stats2.main.misses - stats1.main.misses, 1, "First get should miss");
 
     // Get again - should hit cache
     let result2 = cache.get(&checkpoint_path).await?;
     let data2 = result2.into_stream().try_collect::<Vec<_>>().await?.concat();
     assert_eq!(data2, checkpoint_data);
     let stats3 = cache.get_stats().await;
-    assert_eq!(stats3.hits - stats2.hits, 1, "Second get should hit cache");
+    assert_eq!(stats3.main.hits - stats2.main.hits, 1, "Second get should hit cache");
 
     // Update checkpoint in inner store
     let new_checkpoint_data = b"version: 11";
@@ -137,7 +137,7 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     // Still gets old data initially (stale-while-revalidate behavior)
     assert_eq!(data3, checkpoint_data, "Should still get cached (stale) checkpoint data");
     let stats5 = cache.get_stats().await;
-    assert_eq!(stats5.hits - stats4.hits, 1, "Should hit cache with stale data");
+    assert_eq!(stats5.main.hits - stats4.main.hits, 1, "Should hit cache with stale data");
 
     // To get the new data, we need to wait for the stale threshold (5 seconds)
     // or manually invalidate the cache
@@ -150,7 +150,7 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     assert_eq!(data4, new_checkpoint_data, "Should get new checkpoint data after invalidation");
     let stats7 = cache.get_stats().await;
     // Should be a hit because invalidate_checkpoint_cache now immediately refreshes the cache
-    assert_eq!(stats7.hits - stats6.hits, 1, "Should hit cache after invalidation (cache was refreshed)");
+    assert_eq!(stats7.main.hits - stats6.main.hits, 1, "Should hit cache after invalidation (cache was refreshed)");
 
     // Cleanup
     cache.shutdown().await?;
@@ -183,11 +183,11 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let stats1 = cache.get_stats().await;
     let _ = cache.get(&metadata_path).await?;
     let stats2 = cache.get_stats().await;
-    assert_eq!(stats2.hits - stats1.hits, 1, "First get should hit (cached by put)");
+    assert_eq!(stats2.main.hits - stats1.main.hits, 1, "First get should hit (cached by put)");
 
     let _ = cache.get(&metadata_path).await?;
     let stats3 = cache.get_stats().await;
-    assert_eq!(stats3.hits - stats2.hits, 1, "Should hit cache within TTL");
+    assert_eq!(stats3.main.hits - stats2.main.hits, 1, "Should hit cache within TTL");
 
     // Wait for metadata TTL to expire
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -195,8 +195,8 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     // Should miss cache after TTL
     let _ = cache.get(&metadata_path).await?;
     let stats4 = cache.get_stats().await;
-    assert_eq!(stats4.misses - stats3.misses, 1, "Should miss cache after TTL");
-    assert_eq!(stats4.ttl_expirations - stats3.ttl_expirations, 1, "Should record TTL expiration");
+    assert_eq!(stats4.main.misses - stats3.main.misses, 1, "Should miss cache after TTL");
+    assert_eq!(stats4.main.ttl_expirations - stats3.main.ttl_expirations, 1, "Should record TTL expiration");
 
     // Test regular file with longer TTL
     let regular_path = Path::from("data/file.parquet");
@@ -212,7 +212,7 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let stats5 = cache.get_stats().await;
     let _ = cache.get(&regular_path).await?;
     let stats6 = cache.get_stats().await;
-    assert_eq!(stats6.hits - stats5.hits, 1, "Regular file should still be cached");
+    assert_eq!(stats6.main.hits - stats5.main.hits, 1, "Regular file should still be cached");
 
     // Cleanup
     cache.shutdown().await?;
