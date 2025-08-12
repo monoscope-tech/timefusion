@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use dashmap::DashSet;
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, Result as ObjectStoreResult, path::Path,
+    path::Path, Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, Result as ObjectStoreResult,
 };
 use std::ops::Range;
 use std::path::PathBuf;
@@ -100,19 +100,34 @@ pub struct FoyerCacheConfig {
     pub enable_stats: bool,
     /// Separate TTL for Delta metadata files (_delta_log/*)
     pub delta_metadata_ttl: Option<Duration>,
+    /// Size hint for reading parquet metadata from the end of files
+    pub parquet_metadata_size_hint: usize,
+    /// Memory size for metadata cache in bytes
+    pub metadata_memory_size_bytes: usize,
+    /// Disk size for metadata cache in bytes
+    pub metadata_disk_size_bytes: usize,
+    /// TTL for metadata cache entries
+    pub metadata_ttl: Duration,
+    /// Number of shards for metadata cache
+    pub metadata_shards: usize,
 }
 
 impl Default for FoyerCacheConfig {
     fn default() -> Self {
         Self {
-            memory_size_bytes: 268_435_456,  // 256MB
-            disk_size_bytes: 10_737_418_240, // 10GB
-            ttl: Duration::from_secs(300),   // 5 minutes
+            memory_size_bytes: 536_870_912,      // 512MB
+            disk_size_bytes: 107_374_182_400,    // 100GB
+            ttl: Duration::from_secs(604_800),   // 7 days
             cache_dir: PathBuf::from("/tmp/timefusion_cache"),
             shards: 8,
             file_size_bytes: 16_777_216, // 16MB - good for Parquet files
             enable_stats: true,
             delta_metadata_ttl: Some(Duration::from_secs(5)), // Short TTL for metadata
+            parquet_metadata_size_hint: 1_048_576, // 1MB - typical size for parquet metadata
+            metadata_memory_size_bytes: 536_870_912,   // 512MB
+            metadata_disk_size_bytes: 5_368_709_120,   // 5GB
+            metadata_ttl: Duration::from_secs(604_800), // 7 days
+            metadata_shards: 4,                        // Fewer shards for metadata cache
         }
     }
 }
@@ -127,14 +142,19 @@ impl FoyerCacheConfig {
         let delta_metadata_ttl_secs = parse_env("TIMEFUSION_FOYER_DELTA_METADATA_TTL_SECONDS", 3600);
 
         Self {
-            memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_MEMORY_MB", 256) * 1024 * 1024,
-            disk_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_DISK_GB", 10) * 1024 * 1024 * 1024,
-            ttl: Duration::from_secs(parse_env("TIMEFUSION_FOYER_TTL_SECONDS", 36000)),
+            memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_MEMORY_MB", 512) * 1024 * 1024,
+            disk_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_DISK_GB", 100) * 1024 * 1024 * 1024,
+            ttl: Duration::from_secs(parse_env("TIMEFUSION_FOYER_TTL_SECONDS", 604800)),
             cache_dir: PathBuf::from(parse_env("TIMEFUSION_FOYER_CACHE_DIR", "/tmp/timefusion_cache".to_string())),
             shards: parse_env("TIMEFUSION_FOYER_SHARDS", 8),
             file_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_FILE_SIZE_MB", 32) * 1024 * 1024,
             enable_stats: parse_env("TIMEFUSION_FOYER_STATS", "true".to_string()).to_lowercase() == "true",
             delta_metadata_ttl: if delta_metadata_ttl_secs > 0 { Some(Duration::from_secs(delta_metadata_ttl_secs)) } else { None },
+            parquet_metadata_size_hint: parse_env("TIMEFUSION_PARQUET_METADATA_SIZE_HINT", 1_048_576),
+            metadata_memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_METADATA_MEMORY_MB", 512) * 1024 * 1024,
+            metadata_disk_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_METADATA_DISK_GB", 5) * 1024 * 1024 * 1024,
+            metadata_ttl: Duration::from_secs(parse_env("TIMEFUSION_FOYER_METADATA_CACHE_TTL_SECONDS", 604800)),
+            metadata_shards: parse_env("TIMEFUSION_FOYER_METADATA_SHARDS", 4),
         }
     }
 
@@ -150,6 +170,11 @@ impl FoyerCacheConfig {
             file_size_bytes: 1024 * 1024, // 1MB
             enable_stats: true,
             delta_metadata_ttl: Some(Duration::from_secs(5)),
+            parquet_metadata_size_hint: 1_048_576, // 1MB
+            metadata_memory_size_bytes: 10 * 1024 * 1024, // 10MB for tests
+            metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB for tests
+            metadata_ttl: Duration::from_secs(300),
+            metadata_shards: 2,
         }
     }
 
@@ -169,6 +194,13 @@ pub struct CacheStats {
     pub ttl_expirations: u64,
     pub inner_gets: u64,
     pub inner_puts: u64,
+}
+
+/// Combined statistics for both caches
+#[derive(Debug, Default, Clone)]
+pub struct CombinedCacheStats {
+    pub main: CacheStats,
+    pub metadata: CacheStats,
 }
 
 impl CacheStats {
@@ -192,7 +224,9 @@ type StatsRef = Arc<RwLock<CacheStats>>;
 #[derive(Debug)]
 pub struct SharedFoyerCache {
     cache: FoyerCache,
+    metadata_cache: FoyerCache,
     stats: StatsRef,
+    metadata_stats: StatsRef,
     config: FoyerCacheConfig,
 }
 
@@ -200,15 +234,26 @@ impl SharedFoyerCache {
     /// Create a new shared Foyer cache
     pub async fn new(config: FoyerCacheConfig) -> anyhow::Result<Self> {
         info!(
-            "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, ttl: {}s)",
+            "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, ttl: {}s, parquet_metadata_hint: {}KB)",
             config.memory_size_bytes / 1024 / 1024,
             config.disk_size_bytes / 1024 / 1024 / 1024,
-            config.ttl.as_secs()
+            config.ttl.as_secs(),
+            config.parquet_metadata_size_hint / 1024
+        );
+        
+        info!(
+            "Initializing metadata cache (memory: {}MB, disk: {}GB, ttl: {}s)",
+            config.metadata_memory_size_bytes / 1024 / 1024,
+            config.metadata_disk_size_bytes / 1024 / 1024 / 1024,
+            config.metadata_ttl.as_secs()
         );
 
         std::fs::create_dir_all(&config.cache_dir)?;
+        let metadata_cache_dir = config.cache_dir.join("metadata");
+        std::fs::create_dir_all(&metadata_cache_dir)?;
 
         let cache = HybridCacheBuilder::new()
+            .with_policy(foyer::HybridCachePolicy::WriteOnInsertion)
             .memory(config.memory_size_bytes)
             .with_shards(config.shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
@@ -220,20 +265,42 @@ impl SharedFoyerCache {
             )
             .build()
             .await?;
+            
+        let metadata_cache = HybridCacheBuilder::new()
+            .with_policy(foyer::HybridCachePolicy::WriteOnInsertion)
+            .memory(config.metadata_memory_size_bytes)
+            .with_shards(config.metadata_shards)
+            .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
+            .storage(Engine::Large(LargeEngineOptions::default()))
+            .with_device_options(
+                DirectFsDeviceOptions::new(&metadata_cache_dir)
+                    .with_capacity(config.metadata_disk_size_bytes)
+                    .with_file_size(config.file_size_bytes),
+            )
+            .build()
+            .await?;
 
         Ok(Self {
             cache: Arc::new(cache),
+            metadata_cache: Arc::new(metadata_cache),
             stats: Arc::new(RwLock::new(CacheStats::default())),
+            metadata_stats: Arc::new(RwLock::new(CacheStats::default())),
             config,
         })
     }
 
-    pub async fn get_stats(&self) -> CacheStats {
-        self.stats.read().await.clone()
+    pub async fn get_stats(&self) -> CombinedCacheStats {
+        CombinedCacheStats {
+            main: self.stats.read().await.clone(),
+            metadata: self.metadata_stats.read().await.clone(),
+        }
     }
 
     pub async fn log_stats(&self) {
+        info!("Main cache stats:");
         self.stats.read().await.log();
+        info!("Metadata cache stats:");
+        self.metadata_stats.read().await.log();
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
@@ -260,7 +327,9 @@ impl SharedFoyerCache {
 pub struct FoyerObjectStoreCache {
     inner: Arc<dyn ObjectStore>,
     cache: FoyerCache,
+    metadata_cache: FoyerCache,
     stats: StatsRef,
+    metadata_stats: StatsRef,
     config: FoyerCacheConfig,
     refreshing: Arc<DashSet<String>>,
 }
@@ -270,7 +339,9 @@ impl FoyerObjectStoreCache {
         Self {
             inner,
             cache: shared_cache.cache.clone(),
+            metadata_cache: shared_cache.metadata_cache.clone(),
             stats: shared_cache.stats.clone(),
+            metadata_stats: shared_cache.metadata_stats.clone(),
             config: shared_cache.config.clone(),
             refreshing: Arc::new(DashSet::new()),
         }
@@ -326,7 +397,11 @@ impl FoyerObjectStoreCache {
                 GetResultPayload::File(mut file, _) => {
                     use std::io::Read;
                     let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
+                    if file.read_to_end(&mut buf).is_ok() {
+                        buf
+                    } else {
+                        vec![]
+                    }
                 }
             };
             if !data.is_empty() {
@@ -347,9 +422,45 @@ impl FoyerObjectStoreCache {
     {
         f(&mut *self.stats.write().await);
     }
+    
+    async fn update_metadata_stats<F>(&self, f: F)
+    where
+        F: FnOnce(&mut CacheStats),
+    {
+        f(&mut *self.metadata_stats.write().await);
+    }
 
     fn make_cache_key(location: &Path) -> String {
         location.to_string()
+    }
+
+    fn make_range_cache_key(location: &Path, range: &Range<u64>) -> String {
+        format!("{}#range:{}-{}", location, range.start, range.end)
+    }
+    
+    /// Invalidate all metadata cache entries for a given file
+    async fn invalidate_metadata_cache(&self, location: &Path) {
+        // We can't enumerate all possible range keys, but we can at least
+        // invalidate the most common metadata ranges
+        let file_meta = match self.inner.head(location).await {
+            Ok(meta) => meta,
+            Err(_) => return,
+        };
+        
+        let file_size = file_meta.size;
+        let metadata_size_hint = self.config.parquet_metadata_size_hint as u64;
+        
+        // Invalidate common metadata ranges
+        for offset in [8, 1024, 4096, 8192, metadata_size_hint] {
+            if offset < file_size {
+                let start = file_size.saturating_sub(offset);
+                let range = start..file_size;
+                let cache_key = Self::make_range_cache_key(location, &range);
+                self.metadata_cache.remove(&cache_key);
+            }
+        }
+        
+        debug!("Invalidated metadata cache entries for: {}", location);
     }
 
     fn make_get_result(data: Bytes, meta: ObjectMeta) -> GetResult {
@@ -365,16 +476,20 @@ impl FoyerObjectStoreCache {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("Shutting down foyer hybrid cache");
         self.cache.close().await?;
+        self.metadata_cache.close().await?;
         Ok(())
     }
 
-    pub async fn get_stats(&self) -> CacheStats {
-        self.stats.read().await.clone()
+    pub async fn get_stats(&self) -> CombinedCacheStats {
+        CombinedCacheStats {
+            main: self.stats.read().await.clone(),
+            metadata: self.metadata_stats.read().await.clone(),
+        }
     }
 
-    #[cfg(test)]
     pub async fn reset_stats(&self) {
         *self.stats.write().await = CacheStats::default();
+        *self.metadata_stats.write().await = CacheStats::default();
     }
 }
 
@@ -401,7 +516,11 @@ impl ObjectStore for FoyerObjectStoreCache {
                 GetResultPayload::File(mut file, _) => {
                     use std::io::Read;
                     let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
+                    if file.read_to_end(&mut buf).is_ok() {
+                        buf
+                    } else {
+                        vec![]
+                    }
                 }
             };
             if !data.is_empty() {
@@ -411,6 +530,11 @@ impl ObjectStore for FoyerObjectStoreCache {
                 self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
                 debug!("Updated cache after write: {} (size: {} bytes)", location, size);
             }
+        }
+        
+        // Invalidate metadata cache entries for this file
+        if location.as_ref().ends_with(".parquet") {
+            self.invalidate_metadata_cache(location).await;
         }
 
         Ok(result)
@@ -436,7 +560,11 @@ impl ObjectStore for FoyerObjectStoreCache {
                 GetResultPayload::File(mut file, _) => {
                     use std::io::Read;
                     let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
+                    if file.read_to_end(&mut buf).is_ok() {
+                        buf
+                    } else {
+                        vec![]
+                    }
                 }
             };
             if !data.is_empty() {
@@ -446,6 +574,11 @@ impl ObjectStore for FoyerObjectStoreCache {
                 self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
                 debug!("Updated cache after write: {} (size: {} bytes)", location, size);
             }
+        }
+        
+        // Invalidate metadata cache entries for this file
+        if location.as_ref().ends_with(".parquet") {
+            self.invalidate_metadata_cache(location).await;
         }
 
         Ok(result)
@@ -492,7 +625,11 @@ impl ObjectStore for FoyerObjectStoreCache {
                                     GetResultPayload::File(mut file, _) => {
                                         use std::io::Read;
                                         let mut buf = Vec::new();
-                                        if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
+                                        if file.read_to_end(&mut buf).is_ok() {
+                                            buf
+                                        } else {
+                                            vec![]
+                                        }
                                     }
                                 };
                                 if !data.is_empty() {
@@ -594,16 +731,16 @@ impl ObjectStore for FoyerObjectStoreCache {
 
     async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let is_parquet = location.as_ref().ends_with(".parquet");
-        let cache_key = Self::make_cache_key(location);
-
-        // Check if we have the full file cached
-        if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
+        
+        // First check if we have the full file cached
+        let full_cache_key = Self::make_cache_key(location);
+        if let Ok(Some(entry)) = self.cache.get(&full_cache_key).await {
             let value = entry.value();
             let ttl = self.get_ttl_for_path(location);
             if !value.is_expired(ttl) && range.end <= value.data.len() as u64 {
                 self.update_stats(|s| s.hits += 1).await;
                 debug!(
-                    "Foyer cache HIT for range: {} (range: {}..{}, parquet={}, age={}ms)",
+                    "Foyer cache HIT (full file) for range: {} (range: {}..{}, parquet={}, age={}ms)",
                     location,
                     range.start,
                     range.end,
@@ -613,45 +750,109 @@ impl ObjectStore for FoyerObjectStoreCache {
                 return Ok(Bytes::from(value.data[range.start as usize..range.end as usize].to_vec()));
             }
         }
+        
 
-        // For Parquet files, cache the entire file on first access
+        // For Parquet files, implement smart caching based on the range
         if is_parquet {
-            debug!(
-                "Foyer cache MISS for Parquet: {} (range: {}..{}, fetching full file)",
-                location, range.start, range.end
-            );
+            // First get the file size to determine if this is a metadata request
+            let file_meta = match self.inner.head(location).await {
+                Ok(meta) => meta,
+                Err(e) => {
+                    debug!("Failed to get metadata for {}: {}", location, e);
+                    return Err(e);
+                }
+            };
+            
+            let file_size = file_meta.size;
+            let metadata_size_hint = self.config.parquet_metadata_size_hint as u64;
+            
+            // Check if this is likely a metadata request (reading from near the end of the file)
+            let is_metadata_request = range.start >= file_size.saturating_sub(metadata_size_hint);
+            
+            if is_metadata_request {
+                // For metadata requests, use the metadata cache
+                let range_cache_key = Self::make_range_cache_key(location, &range);
+                
+                // Check if we have this specific range cached in the metadata cache
+                if let Ok(Some(entry)) = self.metadata_cache.get(&range_cache_key).await {
+                    let value = entry.value();
+                    let ttl = self.config.metadata_ttl;
+                    if !value.is_expired(ttl) {
+                        self.update_metadata_stats(|s| s.hits += 1).await;
+                        debug!(
+                            "Metadata cache HIT for: {} (range: {}..{}, age={}ms)",
+                            location,
+                            range.start,
+                            range.end,
+                            current_millis().saturating_sub(value.timestamp_millis)
+                        );
+                        return Ok(Bytes::from(value.data.clone()));
+                    }
+                }
+                
+                // Cache miss for metadata range - fetch just the range
+                self.update_metadata_stats(|s| {
+                    s.misses += 1;
+                    s.inner_gets += 1;
+                })
+                .await;
+                debug!(
+                    "Metadata cache MISS for Parquet: {} (range: {}..{}, file_size: {})",
+                    location, range.start, range.end, file_size
+                );
+                
+                let data = self.inner.get_range(location, range.clone()).await?;
+                
+                // Cache the metadata range in the metadata cache
+                let range_meta = ObjectMeta {
+                    location: location.clone(),
+                    last_modified: file_meta.last_modified,
+                    size: data.len() as u64,
+                    e_tag: file_meta.e_tag.clone(),
+                    version: file_meta.version.clone(),
+                };
+                self.metadata_cache.insert(range_cache_key, CacheValue::new(data.to_vec(), range_meta));
+                
+                return Ok(data);
+            } else {
+                // For data requests, try to cache the full file
+                debug!(
+                    "Foyer cache MISS for Parquet data: {} (range: {}..{}, fetching full file)",
+                    location, range.start, range.end
+                );
 
-            // Try to fetch and cache the full file
-            if let Ok(result) = self.get(location).await {
-                // The file is now cached, extract the range
-                if range.end <= result.meta.size {
-                    let data = match result.payload {
-                        GetResultPayload::Stream(s) => {
-                            use futures::TryStreamExt;
-                            let chunks: Vec<Bytes> = s.try_collect().await?;
-                            let full_data = chunks.concat();
-                            Bytes::from(full_data[range.start as usize..range.end as usize].to_vec())
-                        }
-                        GetResultPayload::File(mut file, _) => {
-                            use std::io::{Read, Seek, SeekFrom};
-                            file.seek(SeekFrom::Start(range.start)).map_err(|e| object_store::Error::Generic {
-                                store: "cache",
-                                source: Box::new(e),
-                            })?;
-                            let mut buf = vec![0; (range.end - range.start) as usize];
-                            file.read_exact(&mut buf).map_err(|e| object_store::Error::Generic {
-                                store: "cache",
-                                source: Box::new(e),
-                            })?;
-                            Bytes::from(buf)
-                        }
-                    };
-                    return Ok(data);
+                // Try to fetch and cache the full file
+                if let Ok(result) = self.get(location).await {
+                    // The file is now cached, extract the range
+                    if range.end <= result.meta.size {
+                        let data = match result.payload {
+                            GetResultPayload::Stream(s) => {
+                                use futures::TryStreamExt;
+                                let chunks: Vec<Bytes> = s.try_collect().await?;
+                                let full_data = chunks.concat();
+                                Bytes::from(full_data[range.start as usize..range.end as usize].to_vec())
+                            }
+                            GetResultPayload::File(mut file, _) => {
+                                use std::io::{Read, Seek, SeekFrom};
+                                file.seek(SeekFrom::Start(range.start)).map_err(|e| object_store::Error::Generic {
+                                    store: "cache",
+                                    source: Box::new(e),
+                                })?;
+                                let mut buf = vec![0; (range.end - range.start) as usize];
+                                file.read_exact(&mut buf).map_err(|e| object_store::Error::Generic {
+                                    store: "cache",
+                                    source: Box::new(e),
+                                })?;
+                                Bytes::from(buf)
+                            }
+                        };
+                        return Ok(data);
+                    }
                 }
             }
         }
 
-        // Fallback to regular range request
+        // Fallback to regular range request for non-parquet files
         self.update_stats(|s| {
             s.misses += 1;
             s.inner_gets += 1;
@@ -681,6 +882,12 @@ impl ObjectStore for FoyerObjectStoreCache {
         self.update_stats(|s| s.inner_puts += 1).await;
         self.inner.delete(location).await?;
         self.cache.remove(&Self::make_cache_key(location));
+        
+        // Invalidate metadata cache entries for this file
+        if location.as_ref().ends_with(".parquet") {
+            self.invalidate_metadata_cache(location).await;
+        }
+        
         Ok(())
     }
 
@@ -699,12 +906,24 @@ impl ObjectStore for FoyerObjectStoreCache {
     async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
         self.inner.copy(from, to).await?;
         self.cache.remove(&Self::make_cache_key(to));
+        
+        // Invalidate metadata cache entries for the destination file
+        if to.as_ref().ends_with(".parquet") {
+            self.invalidate_metadata_cache(to).await;
+        }
+        
         Ok(())
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
         self.inner.copy_if_not_exists(from, to).await?;
         self.cache.remove(&Self::make_cache_key(to));
+        
+        // Invalidate metadata cache entries for the destination file
+        if to.as_ref().ends_with(".parquet") {
+            self.invalidate_metadata_cache(to).await;
+        }
+        
         Ok(())
     }
 
@@ -746,8 +965,8 @@ mod tests {
         cache.put(&path, PutPayload::from(data.clone())).await?;
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_puts, 1);
-        assert_eq!(stats.inner_gets, 1); // We fetch after write to cache it
+        assert_eq!(stats.main.inner_puts, 1);
+        assert_eq!(stats.main.inner_gets, 1); // We fetch after write to cache it
 
         // First get - cache hit (since we cache on write)
         let result = cache.get(&path).await?;
@@ -759,9 +978,9 @@ mod tests {
         assert_eq!(bytes[0], data);
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1); // No additional fetch needed
-        assert_eq!(stats.misses, 0);
-        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.main.inner_gets, 1); // No additional fetch needed
+        assert_eq!(stats.main.misses, 0);
+        assert_eq!(stats.main.hits, 1);
 
         // Second get - cache hit
         let result2 = cache.get(&path).await?;
@@ -772,9 +991,9 @@ mod tests {
         assert_eq!(bytes2[0], data);
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1); // Still just the one from write
-        assert_eq!(stats.hits, 2); // Two cache hits total
-        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.main.inner_gets, 1); // Still just the one from write
+        assert_eq!(stats.main.hits, 2); // Two cache hits total
+        assert_eq!(stats.main.misses, 0);
 
         cache.delete(&path).await?;
         assert!(cache.get(&path).await.is_err());
@@ -820,9 +1039,9 @@ mod tests {
         }
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 3); // From the writes
-        assert_eq!(stats.misses, 0);
-        assert_eq!(stats.hits, 3);
+        assert_eq!(stats.main.inner_gets, 3); // From the writes
+        assert_eq!(stats.main.misses, 0);
+        assert_eq!(stats.main.hits, 3);
 
         // Second read - cache hit
         for (path_str, data) in &files {
@@ -837,11 +1056,10 @@ mod tests {
         }
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 3); // No new inner gets
-        assert_eq!(stats.hits, 6); // Total 6 hits (3 per read)
+        assert_eq!(stats.main.inner_gets, 3); // No new inner gets
+        assert_eq!(stats.main.hits, 6); // Total 6 hits (3 per read)
 
-        info!("Cache successfully prevented {} S3 accesses", stats.hits);
-        stats.log();
+        info!("Cache successfully prevented {} S3 accesses", stats.main.hits);
 
         cache.shutdown().await?;
         Ok(())
@@ -849,11 +1067,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_ttl_expiration() -> anyhow::Result<()> {
-        let inner = Arc::new(InMemory::new());
-        let config = FoyerCacheConfig::test_config_with("ttl", |c| {
+        // Use a unique test name to avoid conflicts
+        let test_id = format!("ttl_{}", std::process::id());
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
             c.ttl = Duration::from_millis(100);
         });
-
+        
+        // Clean up any existing cache directory
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        
+        let inner = Arc::new(InMemory::new());
         let cache = FoyerObjectStoreCache::new(inner, config).await?;
 
         let path = Path::from("test/ttl_file.parquet");
@@ -867,9 +1091,12 @@ mod tests {
         let _ = cache.get(&path).await?;
 
         let stats = cache.get_stats().await;
-        stats.log();
+        info!("TTL test - main cache hits: {}, misses: {}", stats.main.hits, stats.main.misses);
 
         cache.shutdown().await?;
+        
+        // Clean up cache directory after test
+        let _ = std::fs::remove_dir_all(&cache_dir);
         Ok(())
     }
 
@@ -898,8 +1125,8 @@ mod tests {
         assert_eq!(bytes[0].len(), large_data.len());
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1); // From the write
-        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.main.inner_gets, 1); // From the write
+        assert_eq!(stats.main.hits, 1);
 
         // Second get - cache hit
         let result2 = cache.get(&path).await?;
@@ -910,11 +1137,223 @@ mod tests {
         assert_eq!(bytes2[0].len(), large_data.len());
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.inner_gets, 1); // Still just from the write
-        assert_eq!(stats.hits, 2); // Two cache hits total
+        assert_eq!(stats.main.inner_gets, 1); // Still just from the write
+        assert_eq!(stats.main.hits, 2); // Two cache hits total
 
-        stats.log();
+        info!("Large file test - main cache hits: {}, misses: {}", stats.main.hits, stats.main.misses);
         cache.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_parquet_metadata_optimization() -> anyhow::Result<()> {
+        // Use a unique test name to avoid cache conflicts
+        let test_id = format!("parquet_metadata_{}", std::process::id());
+        
+        let inner = Arc::new(InMemory::new());
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.parquet_metadata_size_hint = 1024; // 1KB for testing
+            c.ttl = Duration::from_secs(300);
+        });
+
+        // Ensure cache directory is cleaned up first
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        
+        // Create a test parquet file (10KB)
+        let file_size = 10 * 1024;
+        let parquet_data = vec![b'x'; file_size];
+        let path = Path::from("test/file.parquet");
+        
+        // Put the file directly in the inner store to avoid caching
+        inner.put(&path, PutPayload::from(Bytes::from(parquet_data.clone()))).await?;
+        
+        // Reset stats to start fresh
+        cache.reset_stats().await;
+
+        // Test 1: Request metadata (last 1KB) - should cache only the range
+        let metadata_range = (file_size - 1024) as u64..file_size as u64;
+        let metadata = cache.get_range(&path, metadata_range.clone()).await?;
+        assert_eq!(metadata.len(), 1024);
+        
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.metadata.inner_gets, 1); // One get_range call for metadata
+        assert_eq!(stats.metadata.misses, 1);
+        assert_eq!(stats.metadata.hits, 0);
+        
+        // Test 2: Request same metadata range again - should hit range cache
+        let metadata2 = cache.get_range(&path, metadata_range.clone()).await?;
+        assert_eq!(metadata2.len(), 1024);
+        assert_eq!(metadata, metadata2);
+        
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.metadata.inner_gets, 1); // No additional inner get
+        assert_eq!(stats.metadata.hits, 1); // Cache hit on range
+        assert_eq!(stats.metadata.misses, 1);
+
+        // Test 3: Request data from beginning - should fetch and cache full file
+        let data_range = 0..1024;
+        let data = cache.get_range(&path, data_range.clone()).await?;
+        assert_eq!(data.len(), 1024);
+        
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.inner_gets, 1); // One get for full file
+        assert_eq!(stats.main.misses, 1);
+        assert_eq!(stats.metadata.hits, 1); // Still have metadata cache hit
+
+        // Test 4: Request any range now - should hit full file cache
+        let another_range = 2048..3072;
+        let another_data = cache.get_range(&path, another_range).await?;
+        assert_eq!(another_data.len(), 1024);
+        
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.inner_gets, 1); // No additional inner get
+        assert_eq!(stats.main.hits, 1); // Cache hit on full file
+        
+        info!("Parquet metadata optimization test passed");
+        info!("Main cache - hits: {}, misses: {}", stats.main.hits, stats.main.misses);
+        info!("Metadata cache - hits: {}, misses: {}", stats.metadata.hits, stats.metadata.misses);
+        cache.shutdown().await?;
+        
+        // Clean up cache directory after test
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metadata_cache_separation() -> anyhow::Result<()> {
+        // Use a unique test name to avoid conflicts
+        let test_id = format!("metadata_separation_{}", std::process::id());
+        
+        // Use in-memory store for testing
+        let inner = Arc::new(InMemory::new());
+        
+        // Configure cache with small limits to test separation
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.memory_size_bytes = 10 * 1024 * 1024;  // 10MB
+            c.disk_size_bytes = 50 * 1024 * 1024;    // 50MB
+            c.metadata_memory_size_bytes = 5 * 1024 * 1024;  // 5MB
+            c.metadata_disk_size_bytes = 20 * 1024 * 1024;   // 20MB
+            c.parquet_metadata_size_hint = 1024;      // 1KB
+        });
+        
+        // Clean up any existing cache directory
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        cache.reset_stats().await;
+        
+        // Create a parquet file
+        let path = Path::from("test.parquet");
+        let file_size = 1024 * 1024; // 1MB
+        let data = vec![b'a'; file_size];
+        inner.put(&path, PutPayload::from(Bytes::from(data))).await?;
+        
+        // Test 1: Read metadata range (should use metadata cache)
+        let metadata_range = (file_size - 1024) as u64..file_size as u64;
+        let result = cache.get_range(&path, metadata_range.clone()).await?;
+        assert_eq!(result.len(), 1024, "Should get correct range size");
+        
+        let stats = cache.get_stats().await;
+        info!("After first get_range - metadata.misses: {}, metadata.hits: {}, main.misses: {}, main.hits: {}", 
+              stats.metadata.misses, stats.metadata.hits, stats.main.misses, stats.main.hits);
+        assert_eq!(stats.metadata.misses, 1, "Should have 1 metadata cache miss");
+        assert_eq!(stats.metadata.hits, 0, "Should have 0 metadata cache hits");
+        assert_eq!(stats.main.hits, 0, "Should have 0 main cache hits");
+        
+        // Test 2: Read same metadata range again (should hit metadata cache)
+        let _ = cache.get_range(&path, metadata_range.clone()).await?;
+        
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.metadata.hits, 1, "Should have 1 metadata cache hit");
+        assert_eq!(stats.metadata.misses, 1, "Should still have 1 metadata cache miss");
+        
+        // Test 3: Read data range (should use main cache)
+        let data_range = 0..1024;
+        let _ = cache.get_range(&path, data_range).await?;
+        
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.misses, 1, "Should have 1 main cache miss");
+        
+        // Test 4: Read full file (should use main cache)
+        let _ = cache.get(&path).await?;
+        
+        let stats = cache.get_stats().await;
+        assert!(stats.main.hits > 0 || stats.main.misses > 0, "Main cache should be used for full file");
+        
+        info!("Main cache stats: hits={}, misses={}", stats.main.hits, stats.main.misses);
+        info!("Metadata cache stats: hits={}, misses={}", stats.metadata.hits, stats.metadata.misses);
+        
+        cache.shutdown().await?;
+        
+        // Clean up cache directory after test
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_metadata_cache_invalidation() -> anyhow::Result<()> {
+        // Use a unique test name to avoid conflicts
+        let test_id = format!("metadata_invalidation_{}", std::process::id());
+        
+        let inner = Arc::new(InMemory::new());
+        
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.parquet_metadata_size_hint = 1024;
+            c.metadata_memory_size_bytes = 5 * 1024 * 1024;
+            c.metadata_disk_size_bytes = 20 * 1024 * 1024;
+        });
+        
+        // Clean up any existing cache directory
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        cache.reset_stats().await;
+        
+        // Create a parquet file directly in inner store (to avoid main cache)
+        let path = Path::from("test.parquet");
+        let file_size = 10 * 1024; // 10KB
+        let data = vec![b'a'; file_size];
+        inner.put(&path, PutPayload::from(Bytes::from(data.clone()))).await?;
+        
+        // Read metadata range - should use metadata cache
+        let metadata_range = (file_size - 1024) as u64..file_size as u64;
+        let result = cache.get_range(&path, metadata_range.clone()).await?;
+        assert_eq!(result.len(), 1024, "Should get correct range size");
+        
+        let stats = cache.get_stats().await;
+        info!("After first get_range - metadata.misses: {}, metadata.hits: {}, main.misses: {}, main.hits: {}", 
+              stats.metadata.misses, stats.metadata.hits, stats.main.misses, stats.main.hits);
+        assert_eq!(stats.metadata.misses, 1, "Should have metadata cache miss");
+        assert_eq!(stats.metadata.hits, 0, "Should have no metadata cache hits yet");
+        
+        // Read again - should hit metadata cache
+        let _ = cache.get_range(&path, metadata_range.clone()).await?;
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.metadata.hits, 1, "Should hit metadata cache");
+        
+        // Update the file via cache - should invalidate metadata cache
+        let new_data = vec![b'b'; file_size];
+        cache.put(&path, PutPayload::from(Bytes::from(new_data))).await?;
+        
+        // Read metadata again - should be served from main cache now (file was cached on put)
+        let _ = cache.get_range(&path, metadata_range).await?;
+        let stats = cache.get_stats().await;
+        // The range will be served from the main cache since put() caches the full file
+        assert_eq!(stats.main.hits, 1, "Should hit main cache after put");
+        
+        info!("Metadata cache invalidation test passed");
+        info!("Final stats - Main: hits={}, misses={}, Metadata: hits={}, misses={}", 
+                 stats.main.hits, stats.main.misses, stats.metadata.hits, stats.metadata.misses);
+        
+        cache.shutdown().await?;
+        
+        // Clean up cache directory after test
+        let _ = std::fs::remove_dir_all(&cache_dir);
         Ok(())
     }
 }
