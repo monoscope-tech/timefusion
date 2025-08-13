@@ -2,7 +2,7 @@
 
 ## Overview
 
-TimeFusion's object store cache now includes special handling for Delta Lake checkpoint files to prevent race conditions when multiple writers are updating Delta tables concurrently.
+TimeFusion's object store cache includes special handling for Delta Lake checkpoint files to ensure consistency while maintaining performance.
 
 ## The Problem
 
@@ -15,35 +15,34 @@ Delta Lake uses a `_last_checkpoint` file to track the latest checkpoint version
 
 ## The Solution
 
-TimeFusion addresses this through several mechanisms:
+TimeFusion uses a "stale-while-revalidate" approach for `_last_checkpoint` files:
 
-### 1. Configurable Checkpoint Caching
+### 1. Stale-While-Revalidate Pattern
 
-By default, `_last_checkpoint` files are NOT cached to ensure readers always get the latest checkpoint information:
+`_last_checkpoint` files are always cached but with special handling:
+- If the cached entry is older than 5 seconds, a background refresh is triggered
+- The stale cached value is returned immediately while the refresh happens
+- This provides low latency while ensuring eventual consistency
 
-```bash
-# Disable checkpoint caching (default)
-export TIMEFUSION_FOYER_CACHE_DELTA_CHECKPOINTS=false
+### 2. Explicit Cache Invalidation
 
-# Enable checkpoint caching (only for single-writer scenarios)
-export TIMEFUSION_FOYER_CACHE_DELTA_CHECKPOINTS=true
+Applications can explicitly invalidate the checkpoint cache when they know a table has been updated:
+
+```rust
+// After updating a Delta table
+cache.invalidate_checkpoint_cache("s3://bucket/table");
 ```
 
-### 2. Separate TTL for Delta Metadata
+### 3. Unified TTL Configuration
 
-Delta metadata files (all files in `_delta_log/`) use a shorter TTL to reduce staleness:
+All files now use the same TTL configuration for simplicity:
 
 ```bash
-# Short TTL for Delta metadata (default: 5 seconds)
-export TIMEFUSION_FOYER_DELTA_METADATA_TTL_SECONDS=5
-
-# Disable separate TTL (use regular TTL for all files)
-export TIMEFUSION_FOYER_DELTA_METADATA_TTL_SECONDS=0
+# TTL for all cache entries (default: 7 days)
+export TIMEFUSION_FOYER_TTL_SECONDS=604800
 ```
 
-### 3. Automatic Cache Invalidation
-
-When writing commit files (`*.json`) to the Delta log, the cache automatically invalidates the corresponding `_last_checkpoint` file to ensure subsequent reads get fresh data.
+The special handling for `_last_checkpoint` files happens automatically regardless of the TTL setting.
 
 ## Configuration Recommendations
 

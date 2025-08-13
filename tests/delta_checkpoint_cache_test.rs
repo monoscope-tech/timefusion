@@ -94,7 +94,7 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     
     // Create config with checkpoint caching ENABLED to test invalidation
     let config = FoyerCacheConfig::test_config_with("checkpoint_invalidation", |c| {
-        c.delta_metadata_ttl = Some(Duration::from_secs(60)); // Longer TTL to test invalidation
+        c.ttl = Duration::from_secs(60); // Longer TTL to test invalidation
     });
 
     let inner = Arc::new(InMemory::new());
@@ -166,16 +166,15 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all("/tmp/test_foyer_delta_ttl");
     
     let config = FoyerCacheConfig::test_config_with("delta_ttl", |c| {
-        c.ttl = Duration::from_secs(10); // Regular TTL
-        c.delta_metadata_ttl = Some(Duration::from_millis(100)); // Very short TTL for test
-        // Checkpoint caching is always enabled now with stale-while-revalidate
+        c.ttl = Duration::from_millis(100); // Very short TTL for test
+        // All files now use the same TTL in unified caching approach
     });
 
     let inner = Arc::new(InMemory::new());
     let shared_cache = SharedFoyerCache::new(config).await?;
     let cache = FoyerObjectStoreCache::new_with_shared_cache(inner.clone(), &shared_cache);
 
-    // Test metadata file with short TTL
+    // Test both metadata and regular files with same TTL
     let metadata_path = Path::from("table/_delta_log/00000000.json");
     cache.put(&metadata_path, PutPayload::from(&b"metadata"[..])).await?;
 
@@ -189,7 +188,7 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let stats3 = cache.get_stats().await;
     assert_eq!(stats3.main.hits - stats2.main.hits, 1, "Should hit cache within TTL");
 
-    // Wait for metadata TTL to expire
+    // Wait for TTL to expire
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Should miss cache after TTL
@@ -198,21 +197,21 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     assert_eq!(stats4.main.misses - stats3.main.misses, 1, "Should miss cache after TTL");
     assert_eq!(stats4.main.ttl_expirations - stats3.main.ttl_expirations, 1, "Should record TTL expiration");
 
-    // Test regular file with longer TTL
+    // Test regular file with SAME TTL (unified caching)
     let regular_path = Path::from("data/file.parquet");
     cache.put(&regular_path, PutPayload::from(&b"data"[..])).await?;
 
     let _ = cache.get(&regular_path).await?;
     let _ = cache.get(&regular_path).await?;
 
-    // Wait same time as before (less than regular TTL)
+    // Wait same time as before
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Should still hit cache (regular TTL is longer)
+    // Should also miss cache after TTL (same TTL for all files)
     let stats5 = cache.get_stats().await;
     let _ = cache.get(&regular_path).await?;
     let stats6 = cache.get_stats().await;
-    assert_eq!(stats6.main.hits - stats5.main.hits, 1, "Regular file should still be cached");
+    assert_eq!(stats6.main.misses - stats5.main.misses, 1, "Regular file should also expire after same TTL");
 
     // Cleanup
     cache.shutdown().await?;

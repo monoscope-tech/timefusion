@@ -29,8 +29,6 @@ Configure the object store cache via environment variables:
 | `TIMEFUSION_FOYER_SHARDS` | `8` | Number of shards for concurrency |
 | `TIMEFUSION_FOYER_FILE_SIZE_MB` | `16` | File size for disk cache segments |
 | `TIMEFUSION_FOYER_STATS` | `true` | Enable statistics logging |
-| `TIMEFUSION_FOYER_DELTA_METADATA_TTL_SECONDS` | `5` | TTL for Delta metadata files (0 to disable) |
-| `TIMEFUSION_FOYER_CACHE_DELTA_CHECKPOINTS` | `false` | Whether to cache Delta checkpoint files |
 | `TIMEFUSION_PARQUET_METADATA_SIZE_HINT` | `1048576` | Size hint (bytes) for Parquet metadata reads |
 
 ### Cache Operations
@@ -45,12 +43,11 @@ Configure the object store cache via environment variables:
 
 #### Delta Lake Special Handling
 
-The cache includes special handling for Delta Lake metadata files to prevent race conditions with multiple writers:
+The cache includes special handling for Delta Lake metadata files:
 
-1. **Shorter TTL for Metadata**: Delta metadata files (`_delta_log/*`) use a separate, shorter TTL (default 5s)
-2. **Checkpoint File Handling**: `_last_checkpoint` files are not cached by default to ensure consistency
-3. **Automatic Invalidation**: When writing commit files (`*.json`), the cache automatically invalidates related `_last_checkpoint` files
-4. **Configurable Behavior**: Can be tuned via environment variables for different consistency requirements
+1. **Checkpoint File Handling**: `_last_checkpoint` files use a "stale-while-revalidate" approach - serving cached data while refreshing in the background after 5 seconds
+2. **Automatic Invalidation**: When writing commit files, the cache can be explicitly invalidated for `_last_checkpoint` files
+3. **Unified TTL**: All cached files use the same TTL configuration for simplicity
 
 ### Performance Benefits
 
