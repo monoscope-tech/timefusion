@@ -9,8 +9,8 @@ use datafusion::common::not_impl_err;
 use datafusion::common::stats::Precision;
 use datafusion::common::{SchemaExt, Statistics};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
-use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 // Removed unused imports
 use datafusion::physical_plan::DisplayAs;
@@ -19,7 +19,7 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{BinaryExpr, dml::InsertOp},
+    logical_expr::{dml::InsertOp, BinaryExpr},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 use datafusion_functions_json;
@@ -29,7 +29,7 @@ use deltalake::kernel::transaction::CommitProperties;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
@@ -654,7 +654,7 @@ impl Database {
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
         use datafusion::arrow::array::{StringArray, StringBuilder};
         use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
+        use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
@@ -1174,7 +1174,7 @@ impl Database {
             .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(
                 get_default_schema().z_order_columns.clone(),
             ))
-            .with_target_size(target_size)
+            .with_target_size(target_size as u64)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
             .await;
