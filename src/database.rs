@@ -1174,7 +1174,7 @@ impl Database {
             .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(
                 get_default_schema().z_order_columns.clone(),
             ))
-            .with_target_size(target_size as u64)
+            .with_target_size(target_size)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
             .await;
