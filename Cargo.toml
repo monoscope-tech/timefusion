@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.47", features = ["full"] }
 datafusion = "48.0.1"
 arrow = "55.0.0"
 arrow-json = "55.0.0"
@@ -18,7 +18,7 @@ async-trait = "0.1.86"
 env_logger = "0.11.6"
 log = "0.4.27"
 color-eyre = "0.6.5"
-arrow-schema = "55.0.0"
+arrow-schema = "55.2.0"
 regex = "1.11.1"
 deltalake = { version = "0.27.0", features = ["datafusion", "s3"] }
 delta_kernel = { version = "0.14.0", features = [
@@ -28,13 +28,20 @@ delta_kernel = { version = "0.14.0", features = [
 ] }
 chrono = { version = "0.4.39", features = ["serde"] }
 chrono-tz = "0.10"
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = [
+  "runtime-tokio",
+  "postgres",
+  "chrono",
+  "uuid",
+] }
 # pgwire = "0.31.0"
 pgwire = { git = "https://github.com/sunng87/pgwire.git", rev = "573bb87a81791fe1cddf51eff0ec631fb41a81df" }
 futures = { version = "0.3.31", features = ["alloc"] }
 bytes = "1.4"
 tokio-rustls = "0.26.1"
-datafusion-postgres = { git = "https://github.com/sunng87/datafusion-postgres.git", rev = "83fb024ea708c3d72ff582a5228641fd5eeb28a7" }
+# datafusion-postgres = "0.7.0"
+datafusion-postgres = { git = "https://github.com/datafusion-contrib/datafusion-postgres.git", rev = "7482a14d40cda4ee5b859e5ac9445b53ef855197" }
+# datafusion-postgres = { path = "/Users/tonyalaribe/Projects/apitoolkit/datafusion-projects/datafusion-postgres/datafusion-postgres" }
 datafusion-functions-json = "0.48.0"
 anyhow = "1.0.98"
 tokio-util = "0.7.13"

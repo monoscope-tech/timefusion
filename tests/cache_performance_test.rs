@@ -187,11 +187,9 @@ async fn test_parquet_metadata_cache_performance() -> Result<()> {
         shards: 4,
         file_size_bytes: 4 * 1024 * 1024,     // 4MB
         enable_stats: true,
-        delta_metadata_ttl: Some(std::time::Duration::from_secs(60)),
         parquet_metadata_size_hint: 1_048_576, // 1MB
         metadata_memory_size_bytes: 20 * 1024 * 1024, // 20MB
         metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB
-        metadata_ttl: std::time::Duration::from_secs(300),
         metadata_shards: 2,
     };
     
