@@ -1,5 +1,5 @@
 // main.rs
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
