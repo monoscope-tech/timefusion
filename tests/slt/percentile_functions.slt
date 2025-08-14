@@ -211,18 +211,18 @@ LIMIT 1
 ----
 true
 
-# Test 4: array_element function with literal array
+# Test 4: array indexing with literal array (0-based indexing)
 query R
-SELECT array_element(ARRAY[10.5, 20.5, 30.5], 2) as second_element
+SELECT ARRAY[10.5, 20.5, 30.5][1] as second_element
 FROM test_spans
 WHERE project_id = 'test-project'
 LIMIT 1
 ----
 20.5
 
-# Test 5: array_element with string array
+# Test 5: array indexing with string array (0-based indexing)
 query T
-SELECT array_element(ARRAY['p50', 'p75', 'p90', 'p95'], 3) as third_quantile
+SELECT ARRAY['p50', 'p75', 'p90', 'p95'][2] as third_quantile
 FROM test_spans
 WHERE project_id = 'test-project'
 LIMIT 1
