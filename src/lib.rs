@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 pub mod batch_queue;
 pub mod database;
 pub mod functions;
