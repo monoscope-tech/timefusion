@@ -3,7 +3,7 @@
 ##############################
 #         Builder Stage      #
 ##############################
-FROM rustlang/rust:nightly-bullseye-slim AS builder
+FROM rust:1.89-slim-bullseye AS builder
 WORKDIR /app
 
 # Install build dependencies
