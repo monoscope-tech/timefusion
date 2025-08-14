@@ -3,8 +3,8 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tracing::{error, info};
 
 #[derive(Debug)]
@@ -16,7 +16,10 @@ pub struct BatchQueue {
 impl BatchQueue {
     pub fn new(db: Arc<crate::database::Database>, interval_ms: u64, max_rows: usize) -> Self {
         // Make channel capacity configurable via environment variable
-        let channel_capacity = std::env::var("TIMEFUSION_BATCH_QUEUE_CAPACITY").unwrap_or_else(|_| "1000".to_string()).parse::<usize>().unwrap_or(1000);
+        let channel_capacity = std::env::var("TIMEFUSION_BATCH_QUEUE_CAPACITY")
+            .unwrap_or_else(|_| "100000000".to_string())
+            .parse::<usize>()
+            .unwrap_or(100_000_000);
 
         let (tx, rx) = mpsc::channel(channel_capacity);
         let shutdown = tokio_util::sync::CancellationToken::new();
