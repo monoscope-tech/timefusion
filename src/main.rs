@@ -6,7 +6,7 @@ use dotenv::dotenv;
 use std::{env, sync::Arc};
 use timefusion::batch_queue::BatchQueue;
 use timefusion::database::Database;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -24,8 +24,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Setup batch processing with configurable params
     let interval_ms = env::var("BATCH_INTERVAL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
-    let max_size = env::var("MAX_BATCH_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
-    let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
+    let max_size = env::var("MAX_BATCH_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+    let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "true".to_string()) == "true";
 
     // Create batch queue
     let batch_queue = Arc::new(BatchQueue::new(Arc::new(db.clone()), interval_ms, max_size));
