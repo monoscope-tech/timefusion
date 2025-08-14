@@ -1,4 +1,6 @@
 // main.rs
+#![recursion_limit = "256"]
+
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use std::{env, sync::Arc};
