@@ -526,6 +526,8 @@ impl Database {
     pub fn create_session_context(&self) -> SessionContext {
         use datafusion::config::ConfigOptions;
         use datafusion::execution::context::SessionContext;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use std::sync::Arc;
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
@@ -568,7 +570,38 @@ impl Database {
         // Enable all optimizer rules for maximum optimization
         let _ = options.set("datafusion.optimizer.max_passes", "5");
 
-        SessionContext::new_with_config(options.into())
+        // Configure memory limit for DataFusion operations
+        let memory_limit_gb = env::var("TIMEFUSION_MEMORY_LIMIT_GB")
+            .unwrap_or_else(|_| "8".to_string())
+            .parse::<usize>()
+            .unwrap_or(8);
+        
+        // Configure memory fraction (how much of the memory pool to use for execution)
+        let memory_fraction = env::var("TIMEFUSION_MEMORY_FRACTION")
+            .unwrap_or_else(|_| "0.9".to_string())
+            .parse::<f64>()
+            .unwrap_or(0.9);
+
+        // Configure external sort spill size
+        let sort_spill_reservation_bytes = env::var("TIMEFUSION_SORT_SPILL_RESERVATION_BYTES")
+            .unwrap_or_else(|_| "67108864".to_string()) // Default 64MB
+            .parse::<usize>()
+            .unwrap_or(67108864);
+
+        // Set memory-related configuration options
+        let _ = options.set("datafusion.execution.memory_fraction", &memory_fraction.to_string());
+        let _ = options.set("datafusion.execution.sort_spill_reservation_bytes", &sort_spill_reservation_bytes.to_string());
+
+        // Create runtime environment with memory limit
+        let runtime_env = RuntimeEnvBuilder::new()
+            .with_memory_limit(memory_limit_gb * 1024 * 1024 * 1024, memory_fraction)
+            .build()
+            .expect("Failed to create runtime environment");
+        
+        let runtime_env = Arc::new(runtime_env);
+
+        // Create session context with both config options and runtime environment
+        SessionContext::new_with_config_rt(options.into(), runtime_env)
     }
 
     /// Setup the session context with tables and register DataFusion tables
