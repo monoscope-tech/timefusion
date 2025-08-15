@@ -476,8 +476,28 @@ impl ObjectStore for FoyerObjectStoreCache {
     async fn put(&self, location: &Path, payload: PutPayload) -> ObjectStoreResult<PutResult> {
         self.update_stats(|s| s.inner_puts += 1).await;
 
+        let payload_size = payload.content_length();
+        let is_parquet = location.as_ref().ends_with(".parquet");
+        
+        debug!(
+            "S3 PUT request starting: {} (size: {} bytes, parquet: {})",
+            location,
+            payload_size,
+            is_parquet
+        );
+
         // Write to S3 first without removing from cache (to avoid cache stampede)
+        let start_time = std::time::Instant::now();
         let result = self.inner.put(location, payload).await?;
+        let duration = start_time.elapsed();
+        
+        debug!(
+            "S3 PUT request completed: {} (size: {} bytes, duration: {}ms, parquet: {})",
+            location,
+            payload_size,
+            duration.as_millis(),
+            is_parquet
+        );
 
         // After successful write, update the cache with the new data
         self.update_stats(|s| s.inner_gets += 1).await;
@@ -641,11 +661,12 @@ impl ObjectStore for FoyerObjectStoreCache {
                 self.update_stats(|s| s.hits += 1).await;
                 let is_parquet = location.as_ref().ends_with(".parquet");
                 debug!(
-                    "Foyer cache HIT for: {} (avoiding S3 access, parquet={}, TTL={}s, age={}ms)",
+                    "Foyer cache HIT for: {} (avoiding S3 access, parquet={}, TTL={}s, age={}ms, size={} bytes)",
                     location,
                     is_parquet,
                     ttl.as_secs(),
-                    current_millis().saturating_sub(value.timestamp_millis)
+                    current_millis().saturating_sub(value.timestamp_millis),
+                    value.data.len()
                 );
                 return Ok(Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone()));
             }
@@ -666,7 +687,17 @@ impl ObjectStore for FoyerObjectStoreCache {
             ttl.as_secs()
         );
 
+        let start_time = std::time::Instant::now();
         let result = self.inner.get(location).await?;
+        let duration = start_time.elapsed();
+        
+        debug!(
+            "S3 GET request: {} (size: {} bytes, duration: {}ms, parquet: {})",
+            location,
+            result.meta.size,
+            duration.as_millis(),
+            is_parquet
+        );
 
         // Collect payload for caching
         use futures::TryStreamExt;
@@ -714,10 +745,11 @@ impl ObjectStore for FoyerObjectStoreCache {
             if !value.is_expired(ttl) && range.end <= value.data.len() as u64 {
                 self.update_stats(|s| s.hits += 1).await;
                 debug!(
-                    "Foyer cache HIT (full file) for range: {} (range: {}..{}, parquet={}, age={}ms)",
+                    "Foyer cache HIT (full file) for range: {} (range: {}..{}, size: {} bytes, parquet={}, age={}ms)",
                     location,
                     range.start,
                     range.end,
+                    range.end - range.start,
                     is_parquet,
                     current_millis().saturating_sub(value.timestamp_millis)
                 );
@@ -753,10 +785,11 @@ impl ObjectStore for FoyerObjectStoreCache {
                     if !value.is_expired(ttl) {
                         self.update_metadata_stats(|s| s.hits += 1).await;
                         debug!(
-                            "Metadata cache HIT for: {} (range: {}..{}, age={}ms)",
+                            "Metadata cache HIT for: {} (range: {}..{}, size: {} bytes, age={}ms)",
                             location,
                             range.start,
                             range.end,
+                            value.data.len(),
                             current_millis().saturating_sub(value.timestamp_millis)
                         );
                         return Ok(Bytes::from(value.data.clone()));
@@ -774,7 +807,18 @@ impl ObjectStore for FoyerObjectStoreCache {
                     location, range.start, range.end, file_size
                 );
 
+                let start_time = std::time::Instant::now();
                 let data = self.inner.get_range(location, range.clone()).await?;
+                let duration = start_time.elapsed();
+                
+                debug!(
+                    "S3 GET_RANGE request (metadata): {} (range: {}..{}, size: {} bytes, duration: {}ms)",
+                    location,
+                    range.start,
+                    range.end,
+                    data.len(),
+                    duration.as_millis()
+                );
 
                 // Cache the metadata range in the metadata cache
                 let range_meta = ObjectMeta {
@@ -835,7 +879,22 @@ impl ObjectStore for FoyerObjectStoreCache {
             "get_range request for: {} (range: {}..{}, parquet={})",
             location, range.start, range.end, is_parquet
         );
-        self.inner.get_range(location, range).await
+        
+        let start_time = std::time::Instant::now();
+        let result = self.inner.get_range(location, range.clone()).await?;
+        let duration = start_time.elapsed();
+        
+        debug!(
+            "S3 GET_RANGE request: {} (range: {}..{}, size: {} bytes, duration: {}ms, parquet: {})",
+            location,
+            range.start,
+            range.end,
+            range.end - range.start,
+            duration.as_millis(),
+            is_parquet
+        );
+        
+        Ok(result)
     }
 
     async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
