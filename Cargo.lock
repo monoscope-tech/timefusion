@@ -330,8 +330,7 @@ dependencies = [
 [[package]]
 name = "arrow-pg"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b3c9c67c5445fdfabaad4d61f76c88a8612baaedc42d8c5124678c96f7d1959"
+source = "git+https://github.com/monoscope-tech/datafusion-postgres.git?rev=79f9e63af878b8b025f2cb3da1b68265631e5b8a#79f9e63af878b8b025f2cb3da1b68265631e5b8a"
 dependencies = [
  "bytes",
  "chrono",
@@ -2280,8 +2279,7 @@ dependencies = [
 [[package]]
 name = "datafusion-postgres"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b36c83c352b8ec275ba3026245565f9a478741dbe8dea6551c4f2c59e6415fb4"
+source = "git+https://github.com/monoscope-tech/datafusion-postgres.git?rev=79f9e63af878b8b025f2cb3da1b68265631e5b8a#79f9e63af878b8b025f2cb3da1b68265631e5b8a"
 dependencies = [
  "arrow-pg",
  "async-trait",
