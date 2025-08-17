@@ -39,7 +39,8 @@ pgwire = { git = "https://github.com/sunng87/pgwire.git", rev = "573bb87a81791fe
 futures = { version = "0.3.31", features = ["alloc"] }
 bytes = "1.4"
 tokio-rustls = "0.26.1"
-datafusion-postgres = "0.7.0"
+# datafusion-postgres = "0.7.0"
+datafusion-postgres = { git = "https://github.com/monoscope-tech/datafusion-postgres.git", rev = "79f9e63af878b8b025f2cb3da1b68265631e5b8a" }
 # datafusion-postgres = { git = "https://github.com/datafusion-contrib/datafusion-postgres.git", rev = "7482a14d40cda4ee5b859e5ac9445b53ef855197" }
 # datafusion-postgres = { path = "/Users/tonyalaribe/Projects/apitoolkit/datafusion-projects/datafusion-postgres/datafusion-postgres" }
 datafusion-functions-json = "0.48.0"
