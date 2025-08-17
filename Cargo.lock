@@ -330,7 +330,6 @@ dependencies = [
 [[package]]
 name = "arrow-pg"
 version = "0.3.0"
-source = "git+https://github.com/monoscope-tech/datafusion-postgres.git?rev=79f9e63af878b8b025f2cb3da1b68265631e5b8a#79f9e63af878b8b025f2cb3da1b68265631e5b8a"
 dependencies = [
  "bytes",
  "chrono",
@@ -2279,7 +2278,6 @@ dependencies = [
 [[package]]
 name = "datafusion-postgres"
 version = "0.7.0"
-source = "git+https://github.com/monoscope-tech/datafusion-postgres.git?rev=79f9e63af878b8b025f2cb3da1b68265631e5b8a#79f9e63af878b8b025f2cb3da1b68265631e5b8a"
 dependencies = [
  "arrow-pg",
  "async-trait",
