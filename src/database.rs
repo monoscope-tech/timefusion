@@ -530,17 +530,21 @@ impl Database {
         use std::sync::Arc;
 
         let mut options = ConfigOptions::new();
-        let _ = options.set("datafusion.sql_parser.enable_information_schema", "true");
+        let _ = options.set("datafusion.catalog.information_schema", "true");
 
         // Enable Parquet statistics for better query optimization with Delta Lake
         // These settings ensure DataFusion uses file and column statistics for pruning
-        let _ = options.set("datafusion.execution.parquet.enable_statistics", "true");
+        let _ = options.set("datafusion.execution.parquet.statistics_enabled", "page");
         let _ = options.set("datafusion.execution.parquet.pushdown_filters", "true");
+        let _ = options.set("datafusion.execution.parquet.reorder_filters", "true");
         let _ = options.set("datafusion.execution.parquet.enable_page_index", "true");
         let _ = options.set("datafusion.execution.parquet.pruning", "true");
         let _ = options.set("datafusion.execution.parquet.skip_metadata", "false");
+        let _ = options.set("datafusion.explain.show_schema", "true");
+        let _ = options.set("datafusion.runtime.metadata_cache_limit", "500M");
 
         // Enable general statistics collection for query optimization
+        // TOOD: Delete, since its true by default
         let _ = options.set("datafusion.execution.collect_statistics", "true");
 
         // Enable bloom filter pruning if available in Parquet files
@@ -563,6 +567,10 @@ impl Database {
         let _ = options.set("datafusion.optimizer.filter_null_join_keys", "true");
         let _ = options.set("datafusion.optimizer.skip_failed_rules", "false");
 
+        // Enable proper limit handling across partitions
+        let _ = options.set("datafusion.optimizer.enable_distinct_aggregation_soft_limit", "true");
+        let _ = options.set("datafusion.optimizer.enable_topk_aggregation", "true");
+
         // Memory management for large time-series queries
         let _ = options.set("datafusion.execution.coalesce_batches", "true");
         let _ = options.set("datafusion.execution.coalesce_target_batch_size", "8192");
@@ -571,16 +579,10 @@ impl Database {
         let _ = options.set("datafusion.optimizer.max_passes", "5");
 
         // Configure memory limit for DataFusion operations
-        let memory_limit_gb = env::var("TIMEFUSION_MEMORY_LIMIT_GB")
-            .unwrap_or_else(|_| "8".to_string())
-            .parse::<usize>()
-            .unwrap_or(8);
-        
+        let memory_limit_gb = env::var("TIMEFUSION_MEMORY_LIMIT_GB").unwrap_or_else(|_| "8".to_string()).parse::<usize>().unwrap_or(8);
+
         // Configure memory fraction (how much of the memory pool to use for execution)
-        let memory_fraction = env::var("TIMEFUSION_MEMORY_FRACTION")
-            .unwrap_or_else(|_| "0.9".to_string())
-            .parse::<f64>()
-            .unwrap_or(0.9);
+        let memory_fraction = env::var("TIMEFUSION_MEMORY_FRACTION").unwrap_or_else(|_| "0.9".to_string()).parse::<f64>().unwrap_or(0.9);
 
         // Configure external sort spill size
         let sort_spill_reservation_bytes = env::var("TIMEFUSION_SORT_SPILL_RESERVATION_BYTES")
@@ -597,7 +599,7 @@ impl Database {
             .with_memory_limit(memory_limit_gb * 1024 * 1024 * 1024, memory_fraction)
             .build()
             .expect("Failed to create runtime environment");
-        
+
         let runtime_env = Arc::new(runtime_env);
 
         // Create session context with both config options and runtime environment
