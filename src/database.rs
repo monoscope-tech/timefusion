@@ -4,6 +4,7 @@ use crate::statistics::DeltaStatisticsExtractor;
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use chrono::Utc;
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::common::not_impl_err;
 use datafusion::common::stats::Precision;
@@ -27,6 +28,7 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
+use deltalake::PartitionFilter;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -413,11 +415,45 @@ impl Database {
         let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
 
+        // Light optimize job - every 5 minutes for small recent files
+        let light_optimize_schedule = env::var("TIMEFUSION_LIGHT_OPTIMIZE_SCHEDULE")
+            .unwrap_or_else(|_| "0 */5 * * * *".to_string());
+
+        if !light_optimize_schedule.is_empty() {
+            info!("Light optimize job scheduled with cron expression: {}", light_optimize_schedule);
+
+            let light_optimize_job = Job::new_async(&light_optimize_schedule, {
+                let db = db.clone();
+                move |_, _| {
+                    let db = db.clone();
+                    Box::pin(async move {
+                        info!("Running scheduled light optimize on recent small files");
+                        for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
+                            match db.optimize_table_light(table).await {
+                                Ok(_) => {
+                                    debug!("Light optimize completed for project '{}' table '{}'", 
+                                           project_id, table_name);
+                                }
+                                Err(e) => {
+                                    error!("Light optimize failed for project '{}' table '{}': {}", 
+                                           project_id, table_name, e);
+                                }
+                            }
+                        }
+                    })
+                }
+            })?;
+
+            scheduler.add(light_optimize_job).await?;
+        } else {
+            info!("Light optimize job scheduling skipped - empty schedule");
+        }
+
         // Optimize job - configurable schedule (default: every 30mins)
         let optimize_schedule = env::var("TIMEFUSION_OPTIMIZE_SCHEDULE").unwrap_or_else(|_| "0 */30 * * * *".to_string());
 
         if !optimize_schedule.is_empty() {
-            info!("Optimize job scheduled with cron expression: {}", optimize_schedule);
+            info!("Optimize job scheduled with cron expression: {} (processes last 28 hours only)", optimize_schedule);
 
             let optimize_job = Job::new_async(&optimize_schedule, {
                 let db = db.clone();
@@ -1197,7 +1233,7 @@ impl Database {
     pub async fn optimize_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, _target_size: Option<i64>) -> Result<()> {
         // Log the start of the optimization operation
         let start_time = std::time::Instant::now();
-        info!("Starting Delta table optimization with Z-ordering");
+        info!("Starting Delta table optimization with Z-ordering (last 28 hours only)");
 
         // Get a clone of the table to avoid holding the lock during the operation
         let table_clone = {
@@ -1211,12 +1247,23 @@ impl Database {
             .parse::<i64>()
             .unwrap_or(DEFAULT_OPTIMIZE_TARGET_SIZE);
 
+        // Calculate dates for filtering - last 2 days (today and yesterday)
+        let today = Utc::now().date_naive();
+        let yesterday = (Utc::now() - chrono::Duration::days(1)).date_naive();
+        info!("Optimizing files from dates: {} and {}", yesterday, today);
+
+        // Create partition filters for the last 2 days
+        let partition_filters = vec![
+            PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?,
+            PartitionFilter::try_from(("date", "=", yesterday.to_string().as_str()))?,
+        ];
+
         // Run optimize operation with Z-order on the timestamp and id columns
         let writer_properties = Self::create_writer_properties();
 
-        // Note: Z-order functionality is achieved through sorting_columns in writer_properties
         let optimize_result = DeltaOps(table_clone)
             .optimize()
+            .with_filters(&partition_filters)
             .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(
                 get_default_schema().z_order_columns.clone(),
             ))
@@ -1253,6 +1300,62 @@ impl Database {
             Err(e) => {
                 error!("Optimization operation failed: {}", e);
                 Err(anyhow::anyhow!("Table optimization failed: {}", e))
+            }
+        }
+    }
+
+    /// Light optimization for small recent files
+    /// Targets files < 10MB from today's partition only
+    pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<()> {
+        let start_time = std::time::Instant::now();
+        info!("Starting light Delta table optimization for small recent files");
+
+        // Get a clone of the table to avoid holding the lock during the operation
+        let table_clone = {
+            let table = table_ref.read().await;
+            table.clone()
+        };
+
+        // Target 64MB files for quick compaction of small files
+        let target_size = 67_108_864; // 64MB
+
+        // Only optimize today's partition for light optimization
+        let today = Utc::now().date_naive();
+        info!("Light optimizing files from date: {}", today);
+        
+        // Create partition filter for today only
+        let partition_filters = vec![
+            PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?,
+        ];
+
+        let optimize_result = DeltaOps(table_clone)
+            .optimize()
+            .with_filters(&partition_filters)
+            .with_type(deltalake::operations::optimize::OptimizeType::Compact)
+            .with_target_size(target_size)
+            .with_writer_properties(Self::create_writer_properties())
+            .with_min_commit_interval(tokio::time::Duration::from_secs(60)) // 1 minute min interval
+            .await;
+
+        match optimize_result {
+            Ok((new_table, metrics)) => {
+                let duration = start_time.elapsed();
+                info!(
+                    "Light optimization completed in {:?}: {} files removed, {} files added",
+                    duration,
+                    metrics.num_files_removed,
+                    metrics.num_files_added,
+                );
+
+                // Update the table reference with the optimized version
+                let mut table = table_ref.write().await;
+                *table = new_table;
+
+                Ok(())
+            }
+            Err(e) => {
+                error!("Light optimization operation failed: {}", e);
+                Err(anyhow::anyhow!("Light table optimization failed: {}", e))
             }
         }
     }
