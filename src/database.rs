@@ -27,8 +27,8 @@ use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use deltalake::PartitionFilter;
+use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
@@ -363,10 +363,16 @@ impl Database {
                     Err(e) => {
                         retry_count += 1;
                         if retry_count >= max_retries {
-                            error!("Failed to initialize shared Foyer cache after {} retries: {}. Continuing without cache.", max_retries, e);
+                            error!(
+                                "Failed to initialize shared Foyer cache after {} retries: {}. Continuing without cache.",
+                                max_retries, e
+                            );
                             break None;
                         }
-                        warn!("Failed to initialize shared Foyer cache (attempt {}/{}): {}. Retrying...", retry_count, max_retries, e);
+                        warn!(
+                            "Failed to initialize shared Foyer cache (attempt {}/{}): {}. Retrying...",
+                            retry_count, max_retries, e
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                     }
                 }
@@ -416,8 +422,7 @@ impl Database {
         let db = Arc::new(self.clone());
 
         // Light optimize job - every 5 minutes for small recent files
-        let light_optimize_schedule = env::var("TIMEFUSION_LIGHT_OPTIMIZE_SCHEDULE")
-            .unwrap_or_else(|_| "0 */5 * * * *".to_string());
+        let light_optimize_schedule = env::var("TIMEFUSION_LIGHT_OPTIMIZE_SCHEDULE").unwrap_or_else(|_| "0 */5 * * * *".to_string());
 
         if !light_optimize_schedule.is_empty() {
             info!("Light optimize job scheduled with cron expression: {}", light_optimize_schedule);
@@ -431,12 +436,10 @@ impl Database {
                         for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
                             match db.optimize_table_light(table).await {
                                 Ok(_) => {
-                                    debug!("Light optimize completed for project '{}' table '{}'", 
-                                           project_id, table_name);
+                                    info!("Light optimize completed for project '{}' table '{}'", project_id, table_name);
                                 }
                                 Err(e) => {
-                                    error!("Light optimize failed for project '{}' table '{}': {}", 
-                                           project_id, table_name, e);
+                                    error!("Light optimize failed for project '{}' table '{}': {}", project_id, table_name, e);
                                 }
                             }
                         }
@@ -453,7 +456,10 @@ impl Database {
         let optimize_schedule = env::var("TIMEFUSION_OPTIMIZE_SCHEDULE").unwrap_or_else(|_| "0 */30 * * * *".to_string());
 
         if !optimize_schedule.is_empty() {
-            info!("Optimize job scheduled with cron expression: {} (processes last 28 hours only)", optimize_schedule);
+            info!(
+                "Optimize job scheduled with cron expression: {} (processes last 28 hours only)",
+                optimize_schedule
+            );
 
             let optimize_job = Job::new_async(&optimize_schedule, {
                 let db = db.clone();
@@ -1308,8 +1314,6 @@ impl Database {
     /// Targets files < 10MB from today's partition only
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<()> {
         let start_time = std::time::Instant::now();
-        info!("Starting light Delta table optimization for small recent files");
-
         // Get a clone of the table to avoid holding the lock during the operation
         let table_clone = {
             let table = table_ref.read().await;
@@ -1322,11 +1326,9 @@ impl Database {
         // Only optimize today's partition for light optimization
         let today = Utc::now().date_naive();
         info!("Light optimizing files from date: {}", today);
-        
+
         // Create partition filter for today only
-        let partition_filters = vec![
-            PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?,
-        ];
+        let partition_filters = vec![PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?];
 
         let optimize_result = DeltaOps(table_clone)
             .optimize()
@@ -1342,9 +1344,7 @@ impl Database {
                 let duration = start_time.elapsed();
                 info!(
                     "Light optimization completed in {:?}: {} files removed, {} files added",
-                    duration,
-                    metrics.num_files_removed,
-                    metrics.num_files_added,
+                    duration, metrics.num_files_removed, metrics.num_files_added,
                 );
 
                 // Update the table reference with the optimized version
