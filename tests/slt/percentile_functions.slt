@@ -211,23 +211,23 @@ LIMIT 1
 ----
 true
 
-# Test 4: array indexing with literal array (0-based indexing)
+# Test 4: array indexing with literal array (1-based indexing in SQL)
 query R
-SELECT ARRAY[10.5, 20.5, 30.5][1] as second_element
+SELECT ARRAY[10.5, 20.5, 30.5][1] as first_element
 FROM test_spans
 WHERE project_id = 'test-project'
 LIMIT 1
 ----
-20.5
+10.5
 
-# Test 5: array indexing with string array (0-based indexing)
+# Test 5: array indexing with string array (1-based indexing in SQL)
 query T
-SELECT ARRAY['p50', 'p75', 'p90', 'p95'][2] as third_quantile
+SELECT ARRAY['p50', 'p75', 'p90', 'p95'][2] as second_quantile
 FROM test_spans
 WHERE project_id = 'test-project'
 LIMIT 1
 ----
-p90
+p75
 
 # Test 6: Percentiles grouped by time buckets using time_bucket function
 query TBB
