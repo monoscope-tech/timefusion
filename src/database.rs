@@ -34,7 +34,7 @@ use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 // Changed to support multiple tables per project: (project_id, table_name) -> DeltaTable
@@ -349,14 +349,24 @@ impl Database {
                 config.ttl.as_secs()
             );
 
-            match SharedFoyerCache::new(config).await {
-                Ok(cache) => {
-                    info!("Shared Foyer cache initialized successfully for all tables");
-                    Some(Arc::new(cache))
-                }
-                Err(e) => {
-                    error!("Failed to initialize shared Foyer cache: {}. Continuing without cache.", e);
-                    None
+            // Retry cache initialization a few times to handle transient failures
+            let mut retry_count = 0;
+            let max_retries = 3;
+            loop {
+                match SharedFoyerCache::new(config.clone()).await {
+                    Ok(cache) => {
+                        info!("Shared Foyer cache initialized successfully for all tables");
+                        break Some(Arc::new(cache));
+                    }
+                    Err(e) => {
+                        retry_count += 1;
+                        if retry_count >= max_retries {
+                            error!("Failed to initialize shared Foyer cache after {} retries: {}. Continuing without cache.", max_retries, e);
+                            break None;
+                        }
+                        warn!("Failed to initialize shared Foyer cache (attempt {}/{}): {}. Retrying...", retry_count, max_retries, e);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    }
                 }
             }
         };
@@ -891,13 +901,14 @@ impl Database {
         // Create the base S3 object store
         let base_store = self.create_object_store(&storage_uri, &storage_options).await?;
 
-        // Wrap with the shared Foyer cache
+        // Wrap with the shared Foyer cache if available, otherwise use base store
         let cached_store = if let Some(ref shared_cache) = self.object_store_cache {
             // Create a new wrapper around the base store using our shared cache
             // This allows the same cache to be used across all tables
-            Arc::new(FoyerObjectStoreCache::new_with_shared_cache(base_store, shared_cache)) as Arc<dyn object_store::ObjectStore>
+            Arc::new(FoyerObjectStoreCache::new_with_shared_cache(base_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>
         } else {
-            return Err(anyhow::anyhow!("Shared Foyer cache not initialized"));
+            warn!("Shared Foyer cache not initialized, using uncached object store");
+            base_store
         };
 
         // Try to load or create the table with the cached object store
@@ -1832,7 +1843,7 @@ mod tests {
                    project_id, date, timestamp, id, hashes, name, level, status_code, summary
                  ) VALUES (
                    'project2', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 
-                   'sql_id', ARRAY[], 'sql_name', 'INFO', 'OK', 'SQL inserted test span'
+                   'sql_id', ARRAY[], 'sql_name', 'INFO', 'OK', ARRAY['SQL inserted test span']
                  )";
         let result = ctx.sql(sql).await?.collect().await?;
         assert_eq!(result[0].num_rows(), 1);
@@ -1869,9 +1880,9 @@ mod tests {
         let sql = "INSERT INTO otel_logs_and_spans (
                    project_id, date, timestamp, id, hashes, name, level, status_code, summary
                  ) VALUES 
-                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'id1', ARRAY[], 'name1', 'INFO', 'OK', 'Multi-row insert test 1'),
-                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK', 'Multi-row insert test 2'),
-                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR', 'Multi-row insert test 3 - ERROR')";
+                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'id1', ARRAY[], 'name1', 'INFO', 'OK', ARRAY['Multi-row insert test 1']),
+                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK', ARRAY['Multi-row insert test 2']),
+                 ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR', ARRAY['Multi-row insert test 3 - ERROR'])";
 
         // Multi-row INSERT returns a count of rows inserted
         let result = ctx.sql(sql).await?.collect().await?;
