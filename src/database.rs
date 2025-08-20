@@ -1613,23 +1613,23 @@ impl ProjectRoutingTable {
         ProjectIdPushdown::has_project_id_filter(filters)
     }
 
-    /// Get actual statistics from Delta Lake metadata
-    async fn get_delta_statistics(&self) -> Result<Statistics> {
-        // Get the Delta table for the default project or first available
-        let project_id = self.extract_project_id_from_filters(&[]).unwrap_or_else(|| self.default_project.clone());
-
-        // Try to get the table
-        match self.database.resolve_table(&project_id, &self.table_name).await {
-            Ok(table_ref) => {
-                let table = table_ref.read().await;
-                self.database.statistics_extractor.extract_statistics(&table, &project_id, &self.table_name, &self.schema).await
-            }
-            Err(e) => {
-                debug!("Failed to resolve table for statistics: {}", e);
-                Err(anyhow::anyhow!("Failed to get table for statistics"))
-            }
-        }
-    }
+    ///// Get actual statistics from Delta Lake metadata
+    //async fn get_delta_statistics(&self) -> Result<Statistics> {
+    //    // Get the Delta table for the default project or first available
+    //    let project_id = self.extract_project_id_from_filters(&[]).unwrap_or_else(|| self.default_project.clone());
+    //
+    //    // Try to get the table
+    //    match self.database.resolve_table(&project_id, &self.table_name).await {
+    //        Ok(table_ref) => {
+    //            let table = table_ref.read().await;
+    //            self.database.statistics_extractor.extract_statistics(&table, &project_id, &self.table_name, &self.schema).await
+    //        }
+    //        Err(e) => {
+    //            debug!("Failed to resolve table for statistics: {}", e);
+    //            Err(anyhow::anyhow!("Failed to get table for statistics"))
+    //        }
+    //    }
+    //}
 }
 
 // Needed by DataSink
@@ -1758,26 +1758,27 @@ impl TableProvider for ProjectRoutingTable {
         Ok(plan)
     }
     fn statistics(&self) -> Option<Statistics> {
-        // Use tokio's block_in_place to run async code in sync context
-        // This is safe here as statistics are cached and the operation is fast
-        tokio::task::block_in_place(|| {
-            let runtime = tokio::runtime::Handle::current();
-            runtime.block_on(async {
-                // Try to get statistics from Delta Lake
-                match self.get_delta_statistics().await {
-                    Ok(stats) => Some(stats),
-                    Err(e) => {
-                        debug!("Failed to get Delta Lake statistics: {}", e);
-                        // Fall back to conservative estimates
-                        Some(Statistics {
-                            num_rows: Precision::Inexact(1_000_000),
-                            total_byte_size: Precision::Inexact(100_000_000),
-                            column_statistics: vec![],
-                        })
-                    }
-                }
-            })
-        })
+        None
+        // // Use tokio's block_in_place to run async code in sync context
+        // // This is safe here as statistics are cached and the operation is fast
+        // tokio::task::block_in_place(|| {
+        //     let runtime = tokio::runtime::Handle::current();
+        //     runtime.block_on(async {
+        //         // Try to get statistics from Delta Lake
+        //         match self.get_delta_statistics().await {
+        //             Ok(stats) => Some(stats),
+        //             Err(e) => {
+        //                 debug!("Failed to get Delta Lake statistics: {}", e);
+        //                 // Fall back to conservative estimates
+        //                 Some(Statistics {
+        //                     num_rows: Precision::Inexact(1_000_000),
+        //                     total_byte_size: Precision::Inexact(100_000_000),
+        //                     column_statistics: vec![],
+        //                 })
+        //             }
+        //         }
+        //     })
+        // })
     }
 }
 
