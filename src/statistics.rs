@@ -1,7 +1,7 @@
 use anyhow::Result;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::Statistics;
 use datafusion::common::stats::Precision;
+use datafusion::common::Statistics;
 use deltalake::DeltaTable;
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -17,6 +17,7 @@ pub struct CachedStatistics {
     pub version: i64,
 }
 
+// TODO: delete this file in favor of using:
 /// Simplified statistics extractor for Delta Lake tables
 /// Only extracts basic row count and byte size statistics
 #[derive(Debug)]
