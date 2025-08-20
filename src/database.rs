@@ -59,7 +59,7 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 72; // 2 weeks
 const DEFAULT_OPTIMIZE_TARGET_SIZE: i64 = 128 * 1024 * 1024; // 512MB
 const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20000;
-const ZSTD_COMPRESSION_LEVEL: i32 = 6; // Balance between compression ratio and speed
+const ZSTD_COMPRESSION_LEVEL: i32 = 3; // Balance between compression ratio and speed
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct StorageConfig {
