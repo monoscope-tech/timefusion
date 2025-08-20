@@ -57,7 +57,7 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 
 // Constants for optimization and vacuum operations
 const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 72; // 2 weeks
-const DEFAULT_OPTIMIZE_TARGET_SIZE: i64 = 536870912; // 512MB
+const DEFAULT_OPTIMIZE_TARGET_SIZE: i64 = 128 * 1024 * 1024; // 512MB
 const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20000;
 const ZSTD_COMPRESSION_LEVEL: i32 = 6; // Balance between compression ratio and speed
 
@@ -468,7 +468,7 @@ impl Database {
                     Box::pin(async move {
                         info!("Running scheduled optimize on all tables");
                         for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
-                            if let Err(e) = db.optimize_table(table, None).await {
+                            if let Err(e) = db.optimize_table(table, table_name, None).await {
                                 error!("Optimize failed for project '{}' table '{}': {}", project_id, table_name, e);
                             }
                         }
@@ -975,7 +975,7 @@ impl Database {
                     let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
-                    let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "50".to_string());
+                    let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "10".to_string());
 
                     let mut config = HashMap::new();
                     config.insert("delta.checkpointInterval".to_string(), Some(checkpoint_interval));
@@ -1236,7 +1236,7 @@ impl Database {
 
     /// Optimize the Delta table using Z-ordering on timestamp and id columns
     /// This improves query performance for time-based queries
-    pub async fn optimize_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, _target_size: Option<i64>) -> Result<()> {
+    pub async fn optimize_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, _target_size: Option<i64>) -> Result<()> {
         // Log the start of the optimization operation
         let start_time = std::time::Instant::now();
         info!("Starting Delta table optimization with Z-ordering (last 28 hours only)");
@@ -1271,7 +1271,7 @@ impl Database {
             .optimize()
             .with_filters(&partition_filters)
             .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(
-                get_default_schema().z_order_columns.clone(),
+                get_schema(table_name).unwrap_or_else(get_default_schema).z_order_columns.clone(),
             ))
             .with_target_size(target_size)
             .with_writer_properties(writer_properties)
@@ -1320,10 +1320,6 @@ impl Database {
             table.clone()
         };
 
-        // Target 64MB files for quick compaction of small files
-        let target_size = 67_108_864; // 64MB
-
-        // Only optimize today's partition for light optimization
         let today = Utc::now().date_naive();
         info!("Light optimizing files from date: {}", today);
 
@@ -1334,9 +1330,9 @@ impl Database {
             .optimize()
             .with_filters(&partition_filters)
             .with_type(deltalake::operations::optimize::OptimizeType::Compact)
-            .with_target_size(target_size)
+            .with_target_size(16 * 1024 * 1024)
             .with_writer_properties(Self::create_writer_properties())
-            .with_min_commit_interval(tokio::time::Duration::from_secs(60)) // 1 minute min interval
+            .with_min_commit_interval(tokio::time::Duration::from_secs(30)) // 1 minute min interval
             .await;
 
         match optimize_result {
@@ -2242,7 +2238,7 @@ mod tests {
 
                 // Get the table and optimize it
                 if let Ok(table_ref) = db.get_or_create_table(&project, "otel_logs_and_spans").await {
-                    let _ = db.optimize_table(&table_ref, Some(1024 * 1024)).await;
+                    let _ = db.optimize_table(&table_ref, "otel_logs_and_spans", Some(1024 * 1024)).await;
                 }
             })
         };
