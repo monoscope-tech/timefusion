@@ -98,7 +98,8 @@ impl DeltaStatisticsExtractor {
         let _metadata = snapshot.metadata();
 
         // Get file actions to calculate real stats
-        let file_actions = snapshot.file_actions()?;
+        let log_store = table.log_store();
+        let file_actions = snapshot.file_actions(log_store.as_ref()).await?;
         let mut total_rows = 0u64;
         let mut total_bytes = 0u64;
         let mut has_row_stats = false;
@@ -119,7 +120,8 @@ impl DeltaStatisticsExtractor {
 
         // Fallback to estimates if stats not available
         if !has_row_stats {
-            let num_files = snapshot.file_actions()?.len() as u64;
+            let log_store = table.log_store();
+            let num_files = snapshot.file_actions(log_store.as_ref()).await?.len() as u64;
             let page_row_limit = std::env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20_000);
             total_rows = num_files * page_row_limit;
         }

@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::common::not_impl_err;
-use datafusion::common::stats::Precision;
 use datafusion::common::{SchemaExt, Statistics};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::execution::context::SessionContext;
@@ -1273,7 +1272,7 @@ impl Database {
             .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(
                 get_schema(table_name).unwrap_or_else(get_default_schema).z_order_columns.clone(),
             ))
-            .with_target_size(target_size)
+            .with_target_size(target_size as u64)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
             .await;
