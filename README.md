@@ -33,6 +33,7 @@ Traditional time-series databases force you to choose between performance, cost,
 ## ✨ Features
 
 ### Core Capabilities
+
 - 🚀 **High-Performance Ingestion**: Batch processing with configurable intervals
 - 🔍 **Fast Queries**: Columnar storage with predicate pushdown and partition pruning
 - 🔒 **ACID Compliance**: Full transactional guarantees via Delta Lake
@@ -41,12 +42,14 @@ Traditional time-series databases force you to choose between performance, cost,
 - 🔄 **Auto-Optimization**: Background compaction and vacuuming
 
 ### Storage & Caching
+
 - 💾 **S3-Compatible Storage**: Works with AWS S3, MinIO, R2, and more
 - ⚡ **Intelligent Caching**: Two-tier cache (memory + disk) with configurable TTLs
 - 🗜️ **Compression**: Zstandard compression with tunable levels
 - 📦 **Parquet Format**: Industry-standard columnar storage
 
 ### Operations
+
 - 🔐 **Distributed Locking**: DynamoDB-based locking for multi-instance deployments
 - 📈 **Connection Limiting**: Built-in proxy to prevent overload
 - 🛡️ **Graceful Degradation**: Continues operating even under extreme load
@@ -55,6 +58,7 @@ Traditional time-series databases force you to choose between performance, cost,
 ## 🚀 Quick Start
 
 ### Prerequisites
+
 - Rust 1.75+ (for building from source)
 - S3-compatible object storage (AWS S3, MinIO, etc.)
 - (Optional) DynamoDB table for distributed locking
@@ -62,6 +66,7 @@ Traditional time-series databases force you to choose between performance, cost,
 ### Installation
 
 #### Using Docker
+
 ```bash
 docker run -d \
   -p 5432:5432 \
@@ -72,6 +77,7 @@ docker run -d \
 ```
 
 #### Building from Source
+
 ```bash
 git clone https://github.com/apitoolkit/timefusion.git
 cd timefusion
@@ -80,37 +86,40 @@ cargo build --release
 ```
 
 ### Connect with Any PostgreSQL Client
+
 ```bash
 psql "postgresql://postgres:postgres@localhost:5432/postgres"
 ```
 
 ### Insert Data
+
 ```sql
 INSERT INTO otel_logs_and_spans (
   name, id, project_id, timestamp, date, hashes
 ) VALUES (
-  'api.request', 
-  '550e8400-e29b-41d4-a716-446655440000', 
-  'prod-api-001', 
-  '2025-01-17 14:25:00', 
+  'api.request',
+  '550e8400-e29b-41d4-a716-446655440000',
+  'prod-api-001',
+  '2025-01-17 14:25:00',
   '2025-01-17',
   ARRAY[]::text[]
 );
 ```
 
 ### Query Data
+
 ```sql
 -- Get recent logs for a project
-SELECT name, id, timestamp 
-FROM otel_logs_and_spans 
-WHERE project_id = 'prod-api-001' 
+SELECT name, id, timestamp
+FROM otel_logs_and_spans
+WHERE project_id = 'prod-api-001'
   AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00'
 ORDER BY timestamp DESC
 LIMIT 100;
 
 -- Aggregate by name
-SELECT name, COUNT(*) as count 
-FROM otel_logs_and_spans 
+SELECT name, COUNT(*) as count
+FROM otel_logs_and_spans
 WHERE project_id = 'prod-api-001'
   AND date = '2025-01-17'
 GROUP BY name
@@ -131,10 +140,10 @@ Type "help" for help.
 
 postgres=> -- Insert sample API trace data
 postgres=> INSERT INTO otel_logs_and_spans (
-    name, id, project_id, timestamp, date, hashes, 
-    duration, attributes___http___response___status_code, 
+    name, id, project_id, timestamp, date, hashes,
+    duration, attributes___http___response___status_code,
     attributes___user___id, attributes___error___type, kind
-) VALUES 
+) VALUES
 ('POST /api/v1/users', '550e8400-e29b-41d4-a716-446655440001', 'prod-api-001', '2025-01-17 14:30:00', '2025-01-17', ARRAY['trace_123'], 245000000, 200, 'u_123', NULL, 'SERVER'),
 ('POST /api/v1/users', '550e8400-e29b-41d4-a716-446655440002', 'prod-api-001', '2025-01-17 14:35:00', '2025-01-17', ARRAY['trace_124'], 1523000000, 500, NULL, 'database_timeout', 'SERVER'),
 ('GET /api/v1/users/:id', '550e8400-e29b-41d4-a716-446655440003', 'prod-api-001', '2025-01-17 14:40:00', '2025-01-17', ARRAY['trace_125'], 89000000, 200, 'u_456', NULL, 'SERVER'),
@@ -143,20 +152,20 @@ postgres=> INSERT INTO otel_logs_and_spans (
 INSERT 0 5
 
 postgres=> -- Find slow API endpoints (>1 second response time)
-postgres=> SELECT 
+postgres=> SELECT
     name as endpoint,
     COUNT(*) as request_count,
     AVG(duration / 1000000)::INT as avg_duration_ms,
     MAX(duration / 1000000)::INT as max_duration_ms,
     ARRAY_AGG(DISTINCT attributes___http___response___status_code::TEXT) as status_codes
-FROM otel_logs_and_spans 
+FROM otel_logs_and_spans
 WHERE project_id = 'prod-api-001'
     AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00'
     AND duration > 1000000000  -- 1 second in nanoseconds
 GROUP BY name
 ORDER BY avg_duration_ms DESC;
 
-         endpoint         | request_count | avg_duration_ms | max_duration_ms | status_codes 
+         endpoint         | request_count | avg_duration_ms | max_duration_ms | status_codes
 --------------------------+---------------+-----------------+-----------------+--------------
  POST /api/v1/payments    |             1 |            3421 |            3421 | {200}
  GET /api/v1/users/:id    |             1 |            2100 |            2100 | {408}
@@ -164,7 +173,7 @@ ORDER BY avg_duration_ms DESC;
 (3 rows)
 
 postgres=> -- Analyze error rates by endpoint over time windows
-postgres=> SELECT 
+postgres=> SELECT
     name as endpoint,
     date_trunc('hour', timestamp) as hour,
     COUNT(*) as total_requests,
@@ -177,7 +186,7 @@ GROUP BY name, date_trunc('hour', timestamp)
 HAVING COUNT(*) > 0
 ORDER BY hour DESC, error_rate DESC;
 
-         endpoint         |         hour         | total_requests | errors | error_rate 
+         endpoint         |         hour         | total_requests | errors | error_rate
 --------------------------+----------------------+----------------+--------+------------
  POST /api/v1/users       | 2025-01-17 15:00:00 |              2 |      1 |      50.00
  GET /api/v1/users/:id    | 2025-01-17 15:00:00 |              2 |      1 |      50.00
@@ -185,7 +194,7 @@ ORDER BY hour DESC, error_rate DESC;
 (3 rows)
 
 postgres=> -- Find traces with specific characteristics using hash lookups
-postgres=> SELECT 
+postgres=> SELECT
     id as trace_id,
     name as endpoint,
     timestamp,
@@ -196,13 +205,13 @@ WHERE project_id = 'prod-api-001'
     AND 'trace_124' = ANY(hashes)
     AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00';
 
-               trace_id               |    endpoint     |         timestamp          | duration_ms |     error_type     
+               trace_id               |    endpoint     |         timestamp          | duration_ms |     error_type
 --------------------------------------+-----------------+----------------------------+-------------+--------------------
  550e8400-e29b-41d4-a716-446655440002 | POST /api/v1/users | 2025-01-17 14:35:00.000000 |        1523 | database_timeout
 (1 row)
 
 postgres=> -- Time-series aggregation using TimescaleDB's time_bucket function
-postgres=> SELECT 
+postgres=> SELECT
     time_bucket(INTERVAL '5 minutes', timestamp) as bucket,
     COUNT(*) as requests,
     AVG(duration / 1000000)::INT as avg_duration_ms,
@@ -213,7 +222,7 @@ WHERE project_id = 'prod-api-001'
 GROUP BY bucket
 ORDER BY bucket DESC;
 
-        bucket          | requests | avg_duration_ms | p95_duration_ms 
+        bucket          | requests | avg_duration_ms | p95_duration_ms
 ------------------------+----------+-----------------+-----------------
  2025-01-17 14:45:00   |        2 |            2760 |            3421
  2025-01-17 14:40:00   |        1 |              89 |              89
@@ -223,7 +232,7 @@ ORDER BY bucket DESC;
 
 postgres=> -- Advanced time-series: Moving averages with time_bucket
 postgres=> WITH time_series AS (
-    SELECT 
+    SELECT
         time_bucket(INTERVAL '1 minute', timestamp) as minute,
         name as endpoint,
         COUNT(*) as requests,
@@ -233,20 +242,20 @@ postgres=> WITH time_series AS (
         AND timestamp >= '2025-01-17 14:30:00' AND timestamp < '2025-01-17 15:00:00'
     GROUP BY minute, endpoint
 )
-SELECT 
+SELECT
     minute,
     endpoint,
     requests,
     avg_duration_ms::INT,
     AVG(avg_duration_ms) OVER (
-        PARTITION BY endpoint 
-        ORDER BY minute 
+        PARTITION BY endpoint
+        ORDER BY minute
         ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
     )::INT as moving_avg_3min
 FROM time_series
 ORDER BY endpoint, minute DESC;
 
-        minute          |       endpoint        | requests | avg_duration_ms | moving_avg_3min 
+        minute          |       endpoint        | requests | avg_duration_ms | moving_avg_3min
 ------------------------+-----------------------+----------+-----------------+-----------------
  GET /api/v1/users/:id  | 2025-01-17 14:50:00  |        1 |            2100 |            2100
  GET /api/v1/users/:id  | 2025-01-17 14:40:00  |        1 |              89 |            1094
@@ -276,6 +285,7 @@ TimeFusion combines best-in-class technologies to deliver exceptional performanc
 ```
 
 ### Technology Stack
+
 - **Query Engine**: Apache DataFusion (vectorized execution)
 - **Storage Format**: Delta Lake with Parquet files
 - **Wire Protocol**: PostgreSQL-compatible via pgwire
@@ -286,36 +296,36 @@ TimeFusion combines best-in-class technologies to deliver exceptional performanc
 
 ### Essential Settings
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `AWS_S3_BUCKET` | S3 bucket for data storage | Required |
-| `AWS_ACCESS_KEY_ID` | AWS access key | Required |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key | Required |
-| `PGWIRE_PORT` | PostgreSQL protocol port | `5432` |
+| Variable                | Description                | Default  |
+| ----------------------- | -------------------------- | -------- |
+| `AWS_S3_BUCKET`         | S3 bucket for data storage | Required |
+| `AWS_ACCESS_KEY_ID`     | AWS access key             | Required |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key             | Required |
+| `PGWIRE_PORT`           | PostgreSQL protocol port   | `5432`   |
 
 ### Performance Tuning
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `TIMEFUSION_PAGE_ROW_COUNT_LIMIT` | Rows per page | `20000` |
-| `TIMEFUSION_MAX_ROW_GROUP_SIZE` | Max row group size | `128MB` |
-| `TIMEFUSION_OPTIMIZE_TARGET_SIZE` | Target file size | `512MB` |
-| `TIMEFUSION_BATCH_QUEUE_CAPACITY` | Batch queue size | `1000` |
+| Variable                          | Description        | Default |
+| --------------------------------- | ------------------ | ------- |
+| `TIMEFUSION_PAGE_ROW_COUNT_LIMIT` | Rows per page      | `20000` |
+| `TIMEFUSION_MAX_ROW_GROUP_SIZE`   | Max row group size | `128MB` |
+| `TIMEFUSION_OPTIMIZE_TARGET_SIZE` | Target file size   | `512MB` |
+| `TIMEFUSION_BATCH_QUEUE_CAPACITY` | Batch queue size   | `1000`  |
 
 ### Cache Configuration
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `TIMEFUSION_FOYER_MEMORY_MB` | Memory cache size | `512` |
-| `TIMEFUSION_FOYER_DISK_GB` | Disk cache size | `100` |
-| `TIMEFUSION_FOYER_TTL_SECONDS` | Cache TTL | `604800` (7 days) |
+| Variable                       | Description       | Default           |
+| ------------------------------ | ----------------- | ----------------- |
+| `TIMEFUSION_FOYER_MEMORY_MB`   | Memory cache size | `512`             |
+| `TIMEFUSION_FOYER_DISK_GB`     | Disk cache size   | `100`             |
+| `TIMEFUSION_FOYER_TTL_SECONDS` | Cache TTL         | `604800` (7 days) |
 
 ### Connection Limiting
 
-| Variable | Description | Default |
-|----------|-------------|---------|
+| Variable                             | Description                | Default |
+| ------------------------------------ | -------------------------- | ------- |
 | `TIMEFUSION_ENABLE_CONNECTION_LIMIT` | Enable connection limiting | `false` |
-| `TIMEFUSION_MAX_CONNECTIONS` | Max concurrent connections | `100` |
+| `TIMEFUSION_MAX_CONNECTIONS`         | Max concurrent connections | `100`   |
 
 See [DELTA_CONFIG.md](DELTA_CONFIG.md) for complete configuration reference.
 
@@ -324,12 +334,14 @@ See [DELTA_CONFIG.md](DELTA_CONFIG.md) for complete configuration reference.
 TimeFusion is designed for high-throughput ingestion and low-latency queries:
 
 ### Benchmarks
+
 - **Ingestion**: 500K+ events/second per instance
 - **Query Latency**: Sub-second for most analytical queries
 - **Compression**: 10-20x reduction with Zstandard
 - **Cache Hit Rate**: 95%+ for hot data
 
 ### Optimization Tips
+
 1. **Batch Inserts**: Use larger batches for better throughput
 2. **Partition by Date**: Queries filtering by date are much faster
 3. **Project Isolation**: Always include `project_id` in WHERE clauses
@@ -355,9 +367,10 @@ RUST_LOG=debug cargo test
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
 
 ### Development Setup
+
 ```bash
 # Clone the repository
-git clone https://github.com/apitoolkit/timefusion.git
+git clone https://github.com/monoscope-tech/timefusion.git
 cd timefusion
 
 # Install dependencies
@@ -379,6 +392,7 @@ TimeFusion is licensed under the [MIT License](LICENSE).
 ## 🙏 Acknowledgments
 
 TimeFusion is built on the shoulders of giants:
+
 - [Apache Arrow](https://arrow.apache.org/) & [DataFusion](https://arrow.apache.org/datafusion/)
 - [Delta Lake](https://delta.io/)
 - [pgwire](https://github.com/sunng87/pgwire)
@@ -389,3 +403,4 @@ TimeFusion is built on the shoulders of giants:
 <p align="center">
   Made with ❤️ by the <a href="https://apitoolkit.io">APIToolkit</a> team
 </p>
+
