@@ -971,7 +971,7 @@ impl Database {
                 loop {
                     create_attempts += 1;
 
-                    let delta_ops = DeltaOps::try_from_uri_with_storage_options(&storage_uri, storage_options.clone()).await?;
+                    let delta_ops = DeltaOps::try_from_uri_with_storage_options(Url::parse(&storage_uri)?, storage_options.clone()).await?;
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                     let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "10".to_string());
@@ -1109,7 +1109,7 @@ impl Database {
     async fn create_or_load_delta_table(
         &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<DeltaTable> {
-        DeltaTableBuilder::from_uri(storage_uri)
+        DeltaTableBuilder::from_uri(Url::parse(storage_uri)?)?
             .with_storage_backend(cached_store.clone(), Url::parse(storage_uri)?)
             .with_storage_options(storage_options.clone())
             .with_allow_http(true)
