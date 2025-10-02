@@ -272,7 +272,7 @@ fn create_json_build_array_udf() -> ScalarUDF {
     ScalarUDF::from(JsonBuildArrayUDF::new())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonBuildArrayUDF {
     signature: Signature,
 }
@@ -350,7 +350,7 @@ fn create_to_json_udf() -> ScalarUDF {
     ScalarUDF::from(ToJsonUDF::new())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 struct ToJsonUDF {
     signature: Signature,
 }
@@ -407,7 +407,7 @@ fn create_extract_epoch_udf() -> ScalarUDF {
     ScalarUDF::from(ExtractEpochUDF::new())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 struct ExtractEpochUDF {
     signature: Signature,
 }
@@ -835,7 +835,7 @@ fn create_approx_percentile_udf() -> ScalarUDF {
 }
 
 /// UDF implementation for approx_percentile
-#[derive(Debug)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 struct ApproxPercentileUDF {
     signature: Signature,
 }
