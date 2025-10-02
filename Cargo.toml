@@ -52,8 +52,9 @@ datafusion-functions-json = "0.50.0"
 anyhow = "1.0.98"
 tokio-util = "0.7.13"
 tokio-stream = { version = "0.1.17", features = ["net"] }
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing = "0.1.41"
+datafusion-tracing = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git" }
 dotenv = "0.15.0"
 include_dir = "0.7"
 aws-config = { version = "1.6.0", features = ["behavior-version-latest"] }

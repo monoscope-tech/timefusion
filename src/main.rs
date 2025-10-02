@@ -12,9 +12,14 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize environment and logging
+    // Initialize environment and telemetry
     dotenv().ok();
-    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
+    
+    // Initialize tracing with JSON format for structured logs
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .json()
+        .init();
 
     info!("Starting TimeFusion application");
 
@@ -85,5 +90,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Shutdown complete.");
+    
+    // Shutdown telemetry to ensure all spans are flushed
+    telemetry::shutdown_telemetry();
+    
     Ok(())
 }
