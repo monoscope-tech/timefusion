@@ -578,6 +578,8 @@ impl Database {
         use datafusion::config::ConfigOptions;
         use datafusion::execution::context::SessionContext;
         use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use datafusion::execution::SessionStateBuilder;
+        use datafusion_tracing::{instrument_with_info_spans, InstrumentationOptions};
         use std::sync::Arc;
 
         let mut options = ConfigOptions::new();
@@ -653,8 +655,34 @@ impl Database {
 
         let runtime_env = Arc::new(runtime_env);
 
-        // Create session context with both config options and runtime environment
-        SessionContext::new_with_config_rt(options.into(), runtime_env)
+        // Set up tracing options with configurable sampling
+        let record_metrics = env::var("TIMEFUSION_TRACING_RECORD_METRICS")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+        
+        let tracing_options = InstrumentationOptions::builder()
+            .record_metrics(record_metrics)
+            .preview_limit(5)
+            .build();
+
+        // Create instrumentation rule
+        let instrument_rule = instrument_with_info_spans!(
+            options: tracing_options,
+        );
+
+        // Create session state with tracing rule
+        let session_state = SessionStateBuilder::new()
+            .with_config(options.into())
+            .with_runtime_env(runtime_env)
+            .with_default_features()
+            .with_physical_optimizer_rule(instrument_rule)
+            .build();
+
+        // Create session context with the configured state
+        let ctx = SessionContext::new_with_state(session_state);
+        
+        ctx
     }
 
     /// Setup the session context with tables and register DataFusion tables
