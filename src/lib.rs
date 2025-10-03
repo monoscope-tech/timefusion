@@ -7,4 +7,5 @@ pub mod object_store_cache;
 pub mod optimizers;
 pub mod schema_loader;
 pub mod statistics;
+pub mod telemetry;
 pub mod test_utils;

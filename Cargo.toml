@@ -54,6 +54,10 @@ tokio-util = "0.7.13"
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing = "0.1.41"
+tracing-opentelemetry = "0.27"
+opentelemetry = "0.27"
+opentelemetry_otlp = { version = "0.27", features = ["tonic"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
 datafusion-tracing = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git" }
 instrumented-object-store = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git" }
 dotenv = "0.15.0"
