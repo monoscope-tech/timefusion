@@ -2,13 +2,12 @@ use opentelemetry::{trace::TracerProvider, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
-    runtime,
-    trace::{self, RandomIdGenerator, Sampler},
+    trace::{RandomIdGenerator, Sampler},
     Resource,
 };
 use std::env;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::info;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
 
@@ -26,30 +25,31 @@ pub fn init_telemetry() -> anyhow::Result<()> {
     let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "timefusion".to_string());
     let service_version = env::var("OTEL_SERVICE_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
     
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", service_name.clone()),
-        KeyValue::new("service.version", service_version),
-    ]);
+    let resource = Resource::builder()
+        .with_attributes([
+            KeyValue::new("service.name", service_name.clone()),
+            KeyValue::new("service.version", service_version),
+        ])
+        .build();
 
-    // Create OTLP exporter
-    let exporter = opentelemetry_otlp::new_exporter()
-        .tonic()
+    // Create OTLP span exporter
+    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
         .with_endpoint(otlp_endpoint)
-        .with_timeout(Duration::from_secs(10));
-
-    // Configure trace config
-    let trace_config = trace::Config::default()
-        .with_sampler(Sampler::AlwaysOn)
-        .with_id_generator(RandomIdGenerator::default())
-        .with_resource(resource);
+        .with_timeout(Duration::from_secs(10))
+        .build()?;
 
     // Build the tracer provider
-    let tracer_provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(exporter)
-        .with_trace_config(trace_config)
-        .install_batch(runtime::Tokio)?;
+    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(span_exporter)
+        .with_sampler(Sampler::AlwaysOn)
+        .with_id_generator(RandomIdGenerator::default())
+        .with_resource(resource)
+        .build();
 
+    // Set global tracer provider
+    opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+    
     // Create tracer
     let tracer = tracer_provider.tracer("timefusion");
 
@@ -81,5 +81,6 @@ pub fn init_telemetry() -> anyhow::Result<()> {
 
 pub fn shutdown_telemetry() {
     info!("Shutting down OpenTelemetry");
-    opentelemetry::global::shutdown_tracer_provider();
+    // Note: In OpenTelemetry 0.31, there's no global shutdown function
+    // The tracer provider will be shut down when dropped
 }

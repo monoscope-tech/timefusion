@@ -54,10 +54,10 @@ tokio-util = "0.7.13"
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing = "0.1.41"
-tracing-opentelemetry = "0.27"
-opentelemetry = "0.27"
-opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 datafusion-tracing = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git" }
 instrumented-object-store = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git" }
 dotenv = "0.15.0"
@@ -67,9 +67,9 @@ aws-types = "1.3.6"
 aws-sdk-s3 = "1.3.0"
 aws-sdk-dynamodb = "1.3.0"
 url = "2.5.4"
-tokio-cron-scheduler = "0.14"
+tokio-cron-scheduler = "0.15"
 object_store = "0.12.3"
-foyer = { version = "0.18", features = ["serde"] }
+foyer = { version = "0.20", features = ["serde"] }
 ahash = "0.8"
 lru = "0.12"
 serde_bytes = "0.11"

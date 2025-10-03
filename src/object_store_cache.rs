@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
-use foyer::{DirectFsDeviceOptions, Engine, HybridCache, HybridCacheBuilder, LargeEngineOptions};
+use foyer::{
+    BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, 
+    HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -241,29 +244,37 @@ impl SharedFoyerCache {
         std::fs::create_dir_all(&metadata_cache_dir)?;
 
         let cache = HybridCacheBuilder::new()
-            .with_policy(foyer::HybridCachePolicy::WriteOnInsertion)
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(config.memory_size_bytes)
             .with_shards(config.shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
-            .storage(Engine::Large(LargeEngineOptions::default()))
-            .with_device_options(
-                DirectFsDeviceOptions::new(&config.cache_dir)
-                    .with_capacity(config.disk_size_bytes)
-                    .with_file_size(config.file_size_bytes),
+            .storage()
+            .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
+            .with_engine_config(
+                BlockEngineBuilder::new(
+                    FsDeviceBuilder::new(&config.cache_dir)
+                        .with_capacity(config.disk_size_bytes)
+                        .build()?,
+                )
+                .with_block_size(config.file_size_bytes),
             )
             .build()
             .await?;
 
         let metadata_cache = HybridCacheBuilder::new()
-            .with_policy(foyer::HybridCachePolicy::WriteOnInsertion)
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(config.metadata_memory_size_bytes)
             .with_shards(config.metadata_shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
-            .storage(Engine::Large(LargeEngineOptions::default()))
-            .with_device_options(
-                DirectFsDeviceOptions::new(&metadata_cache_dir)
-                    .with_capacity(config.metadata_disk_size_bytes)
-                    .with_file_size(config.file_size_bytes),
+            .storage()
+            .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
+            .with_engine_config(
+                BlockEngineBuilder::new(
+                    FsDeviceBuilder::new(&metadata_cache_dir)
+                        .with_capacity(config.metadata_disk_size_bytes)
+                        .build()?,
+                )
+                .with_block_size(config.file_size_bytes),
             )
             .build()
             .await?;
@@ -912,8 +923,11 @@ impl ObjectStore for FoyerObjectStoreCache {
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
         self.update_stats(|s| s.inner_puts += 1).await;
+        let cache_key = Self::make_cache_key(location);
+        self.cache.remove(&cache_key);
+        
+        // Delete from inner store
         self.inner.delete(location).await?;
-        self.cache.remove(&Self::make_cache_key(location));
 
         // Invalidate metadata cache entries for this file
         if location.as_ref().ends_with(".parquet") {
