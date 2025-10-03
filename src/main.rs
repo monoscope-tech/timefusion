@@ -6,20 +6,17 @@ use dotenv::dotenv;
 use std::{env, sync::Arc};
 use timefusion::batch_queue::BatchQueue;
 use timefusion::database::Database;
+use timefusion::telemetry;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize environment and telemetry
     dotenv().ok();
     
-    // Initialize tracing with JSON format for structured logs
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .json()
-        .init();
+    // Initialize OpenTelemetry with OTLP exporter
+    telemetry::init_telemetry()?;
 
     info!("Starting TimeFusion application");
 
@@ -92,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Shutdown complete.");
     
     // Shutdown telemetry to ensure all spans are flushed
-    // telemetry::shutdown_telemetry();
+    telemetry::shutdown_telemetry();
     
     Ok(())
 }
