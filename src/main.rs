@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
     info!("Shutdown complete.");
     
     // Shutdown telemetry to ensure all spans are flushed
-    telemetry::shutdown_telemetry();
+    // telemetry::shutdown_telemetry();
     
     Ok(())
 }

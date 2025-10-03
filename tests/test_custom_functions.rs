@@ -81,4 +81,35 @@ mod test_custom_functions {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_update_delete_syntax() -> Result<()> {
+        let ctx = SessionContext::new();
+        
+        // Create a simple test table
+        ctx.sql("CREATE TABLE test_table (id INT, name VARCHAR, status VARCHAR)").await?;
+        ctx.sql("INSERT INTO test_table VALUES (1, 'test1', 'active'), (2, 'test2', 'inactive')").await?;
+        
+        // Test UPDATE
+        let update_result = ctx.sql("UPDATE test_table SET status = 'updated' WHERE id = 1").await?;
+        let _ = update_result.collect().await?; // Execute the update
+        
+        let df = ctx.sql("SELECT status FROM test_table WHERE id = 1").await?;
+        let results = df.collect().await?;
+        assert!(!results.is_empty(), "Expected results from SELECT after UPDATE");
+        assert_eq!(results[0].num_rows(), 1);
+        assert_eq!(results[0].column(0).as_string::<i32>().value(0), "updated");
+        
+        // Test DELETE  
+        let delete_result = ctx.sql("DELETE FROM test_table WHERE id = 2").await?;
+        let _ = delete_result.collect().await?; // Execute the delete
+        
+        let df = ctx.sql("SELECT COUNT(*) as cnt FROM test_table").await?;
+        let results = df.collect().await?;
+        assert!(!results.is_empty(), "Expected results from COUNT after DELETE");
+        assert_eq!(results[0].num_rows(), 1);
+        assert_eq!(results[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0), 1);
+        
+        Ok(())
+    }
 }
