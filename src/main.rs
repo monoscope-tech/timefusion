@@ -1,7 +1,7 @@
 // main.rs
 #![recursion_limit = "512"]
 
-use datafusion_postgres::ServerOptions;
+use datafusion_postgres::{ServerOptions, auth::AuthManager};
 use dotenv::dotenv;
 use std::{env, sync::Arc};
 use timefusion::batch_queue::BatchQueue;
@@ -62,8 +62,9 @@ async fn main() -> anyhow::Result<()> {
 
     let pg_task = tokio::spawn(async move {
         let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
+        let auth_manager = Arc::new(AuthManager::new());
 
-        datafusion_postgres::serve(Arc::new(session_context), &opts).await
+        datafusion_postgres::serve(Arc::new(session_context), &opts, auth_manager).await
     });
 
     // Store database for shutdown

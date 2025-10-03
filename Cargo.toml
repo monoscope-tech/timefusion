@@ -45,7 +45,7 @@ futures = { version = "0.3.31", features = ["alloc"] }
 bytes = "1.4"
 tokio-rustls = "0.26.1"
 # datafusion-postgres = "0.7.0"
-datafusion-postgres = "0.10.2"
+datafusion-postgres = "0.11.0"
 # datafusion-postgres = { git = "https://github.com/datafusion-contrib/datafusion-postgres.git", rev = "7482a14d40cda4ee5b859e5ac9445b53ef855197" }
 # datafusion-postgres = { path = "/Users/tonyalaribe/Projects/apitoolkit/datafusion-projects/datafusion-postgres/datafusion-postgres" }
 datafusion-functions-json = "0.50.0"
@@ -71,11 +71,11 @@ tokio-cron-scheduler = "0.15"
 object_store = "0.12.3"
 foyer = { version = "0.20", features = ["serde"] }
 ahash = "0.8"
-lru = "0.12"
-serde_bytes = "0.11"
+lru = "0.16.1"
+serde_bytes = "0.11.19"
 dashmap = "6.1"
 tdigests = "1.0"
-bincode = "1.3"
+bincode = "2.0"
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }

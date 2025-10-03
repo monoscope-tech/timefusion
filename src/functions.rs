@@ -741,12 +741,13 @@ impl TDigestWrapper {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        bincode::serialize(&self.values).unwrap_or_else(|_| Vec::new())
+        bincode::encode_to_vec(&self.values, bincode::config::standard()).unwrap_or_else(|_| Vec::new())
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let values: Vec<f64> = bincode::deserialize(bytes)
-            .map_err(|e| format!("Failed to deserialize: {}", e))?;
+        let values: Vec<f64> = bincode::decode_from_slice(bytes, bincode::config::standard())
+            .map_err(|e| format!("Failed to deserialize: {}", e))?
+            .0;
         Ok(Self { values })
     }
 }
