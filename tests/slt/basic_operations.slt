@@ -111,3 +111,69 @@ query T
 SELECT id FROM otel_logs_and_spans WHERE project_id = 'debug_project' AND id = 'debug_span1'
 ----
 debug_span1
+
+# ============================================
+# UPDATE and DELETE tests
+# ============================================
+
+# Test UPDATE on test_table
+statement ok
+UPDATE test_table SET name = 'updated' WHERE id = 1
+
+query T
+SELECT name FROM test_table WHERE id = 1
+----
+updated
+
+# Test UPDATE on otel_logs_and_spans
+statement ok
+UPDATE otel_logs_and_spans 
+SET status_message = 'Updated via UPDATE statement' 
+WHERE project_id = 'test_project' AND id = 'sql_span1'
+
+query T
+SELECT status_message FROM otel_logs_and_spans 
+WHERE project_id = 'test_project' AND id = 'sql_span1'
+----
+Updated via UPDATE statement
+
+# Test conditional UPDATE
+statement ok
+UPDATE otel_logs_and_spans 
+SET status_code = 'SUCCESS' 
+WHERE project_id = 'test_project' AND status_code = 'OK'
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'test_project' AND status_code = 'SUCCESS'
+----
+3
+
+# Test DELETE on test_table
+statement ok
+INSERT INTO test_table (id, name) VALUES (2, 'to_delete')
+
+statement ok
+DELETE FROM test_table WHERE id = 2
+
+query I
+SELECT COUNT(*) FROM test_table WHERE id = 2
+----
+0
+
+# Test DELETE on otel_logs_and_spans
+statement ok
+DELETE FROM otel_logs_and_spans 
+WHERE project_id = 'debug_project' AND id = 'debug_span1'
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'debug_project'
+----
+0
+
+# Verify remaining records
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'
+----
+3
