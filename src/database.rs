@@ -24,6 +24,7 @@ use datafusion::{
 };
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use instrumented_object_store::instrument_object_store;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::PartitionFilter;
@@ -970,14 +971,19 @@ impl Database {
         // Create the base S3 object store
         let base_store = self.create_object_store(&storage_uri, &storage_options).await?;
 
+        // Wrap with instrumentation for tracing
+        let instrumented_store = instrument_object_store(base_store, "s3");
+
         // Wrap with the shared Foyer cache if available, otherwise use base store
         let cached_store = if let Some(ref shared_cache) = self.object_store_cache {
-            // Create a new wrapper around the base store using our shared cache
+            // Create a new wrapper around the instrumented store using our shared cache
             // This allows the same cache to be used across all tables
-            Arc::new(FoyerObjectStoreCache::new_with_shared_cache(base_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>
+            let cache_wrapped = Arc::new(FoyerObjectStoreCache::new_with_shared_cache(instrumented_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>;
+            // Instrument the cache layer as well to see cache hits/misses
+            instrument_object_store(cache_wrapped, "foyer_cache")
         } else {
             warn!("Shared Foyer cache not initialized, using uncached object store");
-            base_store
+            instrumented_store
         };
 
         // Try to load or create the table with the cached object store
