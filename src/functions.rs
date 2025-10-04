@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray, StringBuilder, TimestampMicrosecondArray, TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringBuilder, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{DataFusionError, not_impl_err, ScalarValue};
@@ -546,6 +546,22 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
                     let datetime =
                         DateTime::<Utc>::from_timestamp_micros(timestamp_us).ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))?;
                     values.push(JsonValue::String(datetime.to_rfc3339()));
+                }
+            }
+        }
+        DataType::List(_) => {
+            let list_array = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to ListArray".to_string()))?;
+            
+            for i in 0..list_array.len() {
+                if list_array.is_null(i) {
+                    values.push(JsonValue::Null);
+                } else {
+                    let array_ref = list_array.value(i);
+                    let inner_values = array_to_json_values(&array_ref)?;
+                    values.push(JsonValue::Array(inner_values));
                 }
             }
         }
