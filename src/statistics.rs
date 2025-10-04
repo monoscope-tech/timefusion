@@ -106,14 +106,11 @@ impl DeltaStatisticsExtractor {
 
         for action in file_actions {
             // Delta stores actual row count and size in the log
-            if let Some(stats) = &action.stats {
-                // Parse stats JSON if available
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(stats) {
-                    if let Some(num_records) = parsed.get("numRecords").and_then(|v| v.as_u64()) {
-                        total_rows += num_records;
-                        has_row_stats = true;
-                    }
-                }
+            if let Some(num_records) = action.stats.as_ref()
+                .and_then(|stats| serde_json::from_str::<serde_json::Value>(stats).ok())
+                .and_then(|parsed| parsed.get("numRecords").and_then(|v| v.as_u64())) {
+                total_rows += num_records;
+                has_row_stats = true;
             }
             total_bytes += action.size as u64;
         }

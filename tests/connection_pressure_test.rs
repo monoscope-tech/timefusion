@@ -249,7 +249,7 @@ mod connection_pressure {
                                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
                             );
 
-                            if let Err(_) = timeout(
+                            if timeout(
                                 Duration::from_millis(500),
                                 client.execute(
                                     &insert_sql,
@@ -265,7 +265,7 @@ mod connection_pressure {
                                 ),
                             )
                             .await
-                            {
+                            .is_err() {
                                 write_errs.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("Write error or timeout");
                             }
@@ -299,14 +299,14 @@ mod connection_pressure {
                                 let _ = conn.await;
                             });
 
-                            let queries = vec![
+                            let queries = [
                                 "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'exhaust_test'",
                                 "SELECT name FROM otel_logs_and_spans WHERE project_id = 'exhaust_test' LIMIT 5",
                                 "SELECT status_code, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'exhaust_test' GROUP BY status_code",
                             ];
 
                             let query = queries[op % queries.len()];
-                            if let Err(_) = timeout(Duration::from_millis(500), client.query(query, &[])).await {
+                            if timeout(Duration::from_millis(500), client.query(query, &[])).await.is_err() {
                                 read_errs.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("Read error or timeout");
                             }
