@@ -42,7 +42,8 @@ mod connection_pressure {
 
             tokio::spawn(async move {
                 let db = Database::new().await.expect("Failed to create database");
-                let mut ctx = db.create_session_context();
+                let db = Arc::new(db);
+                let mut ctx = db.clone().create_session_context();
                 db.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());

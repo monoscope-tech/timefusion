@@ -36,7 +36,8 @@ mod integration {
 
             tokio::spawn(async move {
                 let db = Database::new().await.expect("Failed to create database");
-                let mut ctx = db.create_session_context();
+                let db = Arc::new(db);
+                let mut ctx = db.clone().create_session_context();
                 db.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
@@ -335,7 +336,7 @@ mod integration {
             )
             .await?
             .get(0);
-        assert_eq!(count, 3); // original + 2 from loop
+        assert_eq!(count, 2); // Only the 2 "OK" records from the loop (original was changed to ERROR)
 
         Ok(())
     }

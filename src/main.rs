@@ -40,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
     db = db.with_batch_queue(Arc::clone(&batch_queue));
     // Start maintenance schedulers for regular optimize and vacuum
     db = db.start_maintenance_schedulers().await?;
-    let mut session_context = db.create_session_context();
+    let db = Arc::new(db);
+    let mut session_context = db.clone().create_session_context();
     db.setup_session_context(&mut session_context)?;
 
     // Start PGWire server

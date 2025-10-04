@@ -42,6 +42,20 @@ use url::Url;
 // Changed to support multiple tables per project: (project_id, table_name) -> DeltaTable
 pub type ProjectConfigs = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
 
+/// Get a Delta table by project_id and table_name
+pub async fn get_delta_table(
+    project_configs: &ProjectConfigs,
+    project_id: &str,
+    table_name: &str,
+) -> Option<Arc<RwLock<DeltaTable>>> {
+    let table_key = (project_id.to_string(), table_name.to_string());
+    project_configs
+        .read()
+        .await
+        .get(&table_key)
+        .cloned()
+}
+
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     batch.schema().fields().iter().position(|f| f.name() == "project_id").and_then(|idx| {
@@ -114,6 +128,28 @@ impl Clone for Database {
 }
 
 impl Database {
+    /// Get the project configs for direct access
+    pub fn project_configs(&self) -> &ProjectConfigs {
+        &self.project_configs
+    }
+
+    /// Perform a Delta table UPDATE operation
+    pub async fn perform_delta_update(
+        &self,
+        table_name: &str,
+        project_id: &str,
+        predicate: Option<datafusion::logical_expr::Expr>,
+        assignments: Vec<(String, datafusion::logical_expr::Expr)>,
+    ) -> Result<u64, DataFusionError> {
+        crate::dml_executor::perform_delta_update_internal(
+            self,
+            table_name,
+            project_id,
+            predicate,
+            assignments,
+        ).await
+    }
+    
     /// Build storage options with consistent configuration including DynamoDB locking if enabled
     fn build_storage_options(&self) -> HashMap<String, String> {
         let mut storage_options = HashMap::new();
@@ -575,7 +611,7 @@ impl Database {
     }
 
     /// Create and configure a SessionContext with DataFusion settings
-    pub fn create_session_context(&self) -> SessionContext {
+    pub fn create_session_context(self: Arc<Self>) -> SessionContext {
         use datafusion::config::ConfigOptions;
         use datafusion::execution::context::SessionContext;
         use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -679,7 +715,7 @@ impl Database {
             .with_runtime_env(runtime_env)
             .with_default_features()
             .with_physical_optimizer_rule(instrument_rule)
-            .with_query_planner(Arc::new(DmlQueryPlanner::new()))
+            .with_query_planner(Arc::new(DmlQueryPlanner::new(self.clone())))
             .build();
 
         // Create session context with the configured state
@@ -1830,7 +1866,8 @@ mod tests {
             std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
         }
         let db = Database::new().await?;
-        let mut ctx = db.create_session_context();
+        let db_arc = Arc::new(db.clone());
+        let mut ctx = db_arc.create_session_context();
         datafusion_functions_json::register_all(&mut ctx)?;
         db.setup_session_context(&mut ctx)?;
         Ok((db, ctx))
