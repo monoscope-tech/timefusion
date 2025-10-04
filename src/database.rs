@@ -36,8 +36,8 @@ use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn, instrument, Instrument};
 use tracing::field::Empty;
+use tracing::{debug, error, info, instrument, warn, Instrument};
 use url::Url;
 
 // Changed to support multiple tables per project: (project_id, table_name) -> DeltaTable
@@ -978,9 +978,7 @@ impl Database {
         }
 
         // Create the base S3 object store
-        let base_store = self.create_object_store(&storage_uri, &storage_options)
-            .instrument(tracing::trace_span!("create_object_store"))
-            .await?;
+        let base_store = self.create_object_store(&storage_uri, &storage_options).instrument(tracing::trace_span!("create_object_store")).await?;
 
         // Wrap with instrumentation for tracing
         let instrumented_store = instrument_object_store(base_store, "s3");
@@ -1190,7 +1188,7 @@ impl Database {
             }
             return Ok(());
         }
-        
+
         span.record("use_queue", false);
 
         // Extract project_id from first batch if not provided
@@ -1229,10 +1227,13 @@ impl Database {
 
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
             let write_result = async {
+                // Schema evolution enabled: new columns will be automatically added to the table
                 DeltaOps(table.clone())
                     .write(batches.clone())
                     .with_partition_columns(schema.partitions.clone())
                     .with_writer_properties(writer_properties.clone())
+                    .with_save_mode(deltalake::protocol::SaveMode::Append)
+                    .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
                     .await
             }
             .instrument(write_span)
@@ -1554,6 +1555,8 @@ impl ProjectRoutingTable {
     }
 
     fn schema(&self) -> SchemaRef {
+        // For now, return the YAML schema. 
+        // TODO: Consider caching the actual Delta schema to handle evolution better
         self.schema.clone()
     }
 
@@ -1840,7 +1843,7 @@ impl TableProvider for ProjectRoutingTable {
     )]
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
         let span = tracing::Span::current();
-        
+
         // Apply our custom optimizations to the filters
         let optimized_filters = self.apply_time_series_optimizations(filters)?;
 
@@ -1850,21 +1853,17 @@ impl TableProvider for ProjectRoutingTable {
 
         // Execute query and create plan with optimized filters
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
-        let delta_table = self.database.resolve_table(&project_id, &self.table_name)
-            .instrument(resolve_span)
-            .await?;
+        let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
         let table = delta_table.read().await;
-        
+
         // Create a span for the table scan that will be the parent for all object store operations
-        let scan_span = tracing::trace_span!("delta_table.scan", 
-            table.name = %self.table_name, 
+        let scan_span = tracing::trace_span!("delta_table.scan",
+            table.name = %self.table_name,
             table.project_id = %project_id,
             partition_filters = ?optimized_filters.iter().filter(|f| matches!(f, Expr::BinaryExpr(_))).count()
         );
-        
-        let plan = table.scan(state, projection, &optimized_filters, limit)
-            .instrument(scan_span)
-            .await?;
+
+        let plan = table.scan(state, projection, &optimized_filters, limit).instrument(scan_span).await?;
 
         Ok(plan)
     }

@@ -12,6 +12,9 @@ z_order_columns:
   - timestamp
   - resource___service___name
 fields:
+  - name: date
+    data_type: Date32
+    nullable: false
   - name: timestamp
     data_type: 'Timestamp(Microsecond, Some("UTC"))'
     nullable: false
@@ -270,7 +273,9 @@ fields:
   - name: summary
     data_type: "List(Utf8)"
     nullable: false
-  - name: date
-    data_type: Date32
-    nullable: false
-
+  - name: errors
+    data_type: Utf8
+    nullable: true
+  - name: log_pattern
+    data_type: Utf8
+    nullable: true
