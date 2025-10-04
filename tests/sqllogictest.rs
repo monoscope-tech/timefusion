@@ -2,7 +2,7 @@
 mod sqllogictest_tests {
     use anyhow::Result;
     use async_trait::async_trait;
-    use datafusion_postgres::ServerOptions;
+    use datafusion_postgres::{ServerOptions, auth::AuthManager};
     use dotenv::dotenv;
     use serial_test::serial;
     use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
@@ -192,15 +192,17 @@ mod sqllogictest_tests {
 
         tokio::spawn(async move {
             let db = Database::new().await.expect("Failed to create database");
-            let mut session_context = db.create_session_context();
+            let db = Arc::new(db);
+            let mut session_context = db.clone().create_session_context();
             db.setup_session_context(&mut session_context).expect("Failed to setup session context");
 
             let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
+            let auth_manager = Arc::new(AuthManager::new());
 
             // Wait for shutdown signal or server termination
             tokio::select! {
                 _ = shutdown_signal_clone.notified() => {},
-                res = datafusion_postgres::serve(Arc::new(session_context), &opts) => {
+                res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(session_context), &opts, auth_manager) => {
                     if let Err(e) = res {
                         eprintln!("PGWire server error: {:?}", e);
                     }

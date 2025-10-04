@@ -1,20 +1,22 @@
 // main.rs
 #![recursion_limit = "512"]
 
-use datafusion_postgres::ServerOptions;
+use datafusion_postgres::{ServerOptions, auth::AuthManager};
 use dotenv::dotenv;
 use std::{env, sync::Arc};
 use timefusion::batch_queue::BatchQueue;
 use timefusion::database::Database;
+use timefusion::telemetry;
 use tokio::time::{sleep, Duration};
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize environment and logging
+    // Initialize environment and telemetry
     dotenv().ok();
-    tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
+    
+    // Initialize OpenTelemetry with OTLP exporter
+    telemetry::init_telemetry()?;
 
     info!("Starting TimeFusion application");
 
@@ -38,7 +40,8 @@ async fn main() -> anyhow::Result<()> {
     db = db.with_batch_queue(Arc::clone(&batch_queue));
     // Start maintenance schedulers for regular optimize and vacuum
     db = db.start_maintenance_schedulers().await?;
-    let mut session_context = db.create_session_context();
+    let db = Arc::new(db);
+    let mut session_context = db.clone().create_session_context();
     db.setup_session_context(&mut session_context)?;
 
     // Start PGWire server
@@ -60,8 +63,12 @@ async fn main() -> anyhow::Result<()> {
 
     let pg_task = tokio::spawn(async move {
         let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
+        let auth_manager = Arc::new(AuthManager::new());
 
-        datafusion_postgres::serve(Arc::new(session_context), &opts).await
+        // Use our custom handlers that log UPDATE queries
+        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(Arc::new(session_context), &opts, auth_manager).await {
+            error!("PGWire server error: {}", e);
+        }
     });
 
     // Store database for shutdown
@@ -85,5 +92,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Shutdown complete.");
+    
+    // Shutdown telemetry to ensure all spans are flushed
+    telemetry::shutdown_telemetry();
+    
     Ok(())
 }

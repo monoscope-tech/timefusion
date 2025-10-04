@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod integration {
     use anyhow::Result;
-    use datafusion_postgres::ServerOptions;
+    use datafusion_postgres::{ServerOptions, auth::AuthManager};
     use dotenv::dotenv;
     use rand::Rng;
     use serial_test::serial;
@@ -36,14 +36,16 @@ mod integration {
 
             tokio::spawn(async move {
                 let db = Database::new().await.expect("Failed to create database");
-                let mut ctx = db.create_session_context();
+                let db = Arc::new(db);
+                let mut ctx = db.clone().create_session_context();
                 db.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
+                let auth_manager = Arc::new(AuthManager::new());
 
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
-                    res = datafusion_postgres::serve(Arc::new(ctx), &opts) => {
+                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth_manager) => {
                         if let Err(e) = res {
                             eprintln!("Server error: {:?}", e);
                         }
@@ -256,6 +258,173 @@ mod integration {
         for handle in read_handles {
             handle.await??;
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_update_operations() -> Result<()> {
+        let server = TestServer::start().await?;
+        let client = server.client().await?;
+        let insert = TestServer::insert_sql();
+
+        // Insert test data
+        let span_id = Uuid::new_v4().to_string();
+        client
+            .execute(
+                &insert,
+                &[&"test_project", &span_id, &"original_name", &"OK", &"Original message", &"INFO", &vec!["Original summary"]],
+            )
+            .await?;
+
+        // Test single field update
+        client
+            .execute(
+                "UPDATE otel_logs_and_spans SET status_message = $1 WHERE project_id = $2 AND id = $3",
+                &[&"Updated message", &"test_project", &span_id],
+            )
+            .await?;
+
+        let row = client
+            .query_one(
+                "SELECT status_message FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &span_id],
+            )
+            .await?;
+        assert_eq!(row.get::<_, String>(0), "Updated message");
+
+        // Test multiple field update
+        client
+            .execute(
+                "UPDATE otel_logs_and_spans SET status_code = $1, level = $2 WHERE project_id = $3 AND id = $4",
+                &[&"ERROR", &"ERROR", &"test_project", &span_id],
+            )
+            .await?;
+
+        let row = client
+            .query_one(
+                "SELECT status_code, level FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &span_id],
+            )
+            .await?;
+        assert_eq!(row.get::<_, String>(0), "ERROR");
+        assert_eq!(row.get::<_, String>(1), "ERROR");
+
+        // Test conditional update
+        for i in 0..3 {
+            let status = if i % 2 == 0 { "OK" } else { "ERROR" };
+            client
+                .execute(
+                    &insert,
+                    &[&"test_project", &format!("update_test_{}", i), &"test", &status, &"Message", &"INFO", &vec!["Summary"]],
+                )
+                .await?;
+        }
+
+        client
+            .execute(
+                "UPDATE otel_logs_and_spans SET status_code = $1 WHERE project_id = $2 AND status_code = $3",
+                &[&"SUCCESS", &"test_project", &"OK"],
+            )
+            .await?;
+
+        let count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2",
+                &[&"test_project", &"SUCCESS"],
+            )
+            .await?
+            .get(0);
+        assert_eq!(count, 2); // Only the 2 "OK" records from the loop (original was changed to ERROR)
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_delete_operations() -> Result<()> {
+        let server = TestServer::start().await?;
+        let client = server.client().await?;
+        let insert = TestServer::insert_sql();
+
+        // Insert test data
+        let span_id = Uuid::new_v4().to_string();
+        client
+            .execute(
+                &insert,
+                &[&"test_project", &span_id, &"to_delete", &"OK", &"Message", &"INFO", &vec!["Summary"]],
+            )
+            .await?;
+
+        // Verify insertion
+        let count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &span_id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(count, 1);
+
+        // Delete the record
+        client
+            .execute(
+                "DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &span_id],
+            )
+            .await?;
+
+        // Verify deletion
+        let count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &span_id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(count, 0);
+
+        // Test conditional delete
+        for i in 0..4 {
+            let status = match i % 3 {
+                0 => "OK",
+                1 => "ERROR",
+                _ => "WARNING",
+            };
+            client
+                .execute(
+                    &insert,
+                    &[&"test_project", &format!("delete_test_{}", i), &"test", &status, &"Message", &"INFO", &vec!["Summary"]],
+                )
+                .await?;
+        }
+
+        // Delete all ERROR records
+        client
+            .execute(
+                "DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2",
+                &[&"test_project", &"ERROR"],
+            )
+            .await?;
+
+        let error_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2",
+                &[&"test_project", &"ERROR"],
+            )
+            .await?
+            .get(0);
+        assert_eq!(error_count, 0);
+
+        let total_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1",
+                &[&"test_project"],
+            )
+            .await?
+            .get(0);
+        assert_eq!(total_count, 3); // 1 OK + 2 WARNING
 
         Ok(())
     }

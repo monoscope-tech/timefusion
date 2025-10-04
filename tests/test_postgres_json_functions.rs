@@ -7,7 +7,8 @@ mod test_json_functions {
     async fn test_json_build_array() -> Result<()> {
         // Initialize database
         let db = Database::new().await?;
-        let mut ctx = db.create_session_context();
+        let db = std::sync::Arc::new(db);
+        let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
         // Test json_build_array with literals
@@ -26,7 +27,8 @@ mod test_json_functions {
     async fn test_to_json() -> Result<()> {
         // Initialize database
         let db = Database::new().await?;
-        let mut ctx = db.create_session_context();
+        let db = std::sync::Arc::new(db);
+        let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
         // Test to_json with string
@@ -54,7 +56,8 @@ mod test_json_functions {
     async fn test_extract_epoch() -> Result<()> {
         // Initialize database
         let db = Database::new().await?;
-        let mut ctx = db.create_session_context();
+        let db = std::sync::Arc::new(db);
+        let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
         // Test extract_epoch
@@ -74,7 +77,8 @@ mod test_json_functions {
     async fn test_to_char() -> Result<()> {
         // Initialize database
         let db = Database::new().await?;
-        let mut ctx = db.create_session_context();
+        let db = std::sync::Arc::new(db);
+        let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
         // Test to_char
@@ -93,7 +97,8 @@ mod test_json_functions {
     async fn test_complex_query() -> Result<()> {
         // Initialize database
         let db = Database::new().await?;
-        let mut ctx = db.create_session_context();
+        let db = std::sync::Arc::new(db);
+        let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
         // Create test table and insert data

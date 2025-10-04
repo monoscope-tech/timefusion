@@ -5,9 +5,9 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.47", features = ["full"] }
-datafusion = "49.0.2"
-arrow = "55.0.0"
-arrow-json = "55.0.0"
+datafusion = "50.1.0"
+arrow = "56.0.0"
+arrow-json = "56.0.0"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_arrow = { version = "0.13.4", features = ["arrow-55"] }
@@ -18,10 +18,15 @@ async-trait = "0.1.86"
 env_logger = "0.11.6"
 log = "0.4.27"
 color-eyre = "0.6.5"
-arrow-schema = "55.2.0"
+arrow-schema = "56.0.0"
 regex = "1.11.1"
-deltalake = { version = "0.28.1", features = ["datafusion", "s3"] }
-delta_kernel = { version = "0.15.1", features = [
+# Updated so we can use 0.16 kernel version which fixes the json writes error
+deltalake = { git = "https://github.com/delta-io/delta-rs.git", rev = "18f949efba220f9b6840a3a991e6d0726198fa18", features = [
+  "datafusion",
+  "s3",
+] }
+# deltalake = { version = "0.28.1", features = ["datafusion", "s3"] }
+delta_kernel = { version = "0.16.0", features = [
   "arrow-conversion",
   "default-engine-rustls",
   "arrow-55",
@@ -35,20 +40,27 @@ sqlx = { version = "0.8", features = [
   "uuid",
 ] }
 # pgwire = "0.31.0"
-pgwire = { git = "https://github.com/sunng87/pgwire.git", rev = "573bb87a81791fe1cddf51eff0ec631fb41a81df" }
+# pgwire = { git = "https://github.com/sunng87/pgwire.git", rev = "573bb87a81791fe1cddf51eff0ec631fb41a81df" }
+# pgwire = "0.32.1"  # Not needed - using re-exports from datafusion-postgres
 futures = { version = "0.3.31", features = ["alloc"] }
 bytes = "1.4"
 tokio-rustls = "0.26.1"
 # datafusion-postgres = "0.7.0"
-datafusion-postgres = { git = "https://github.com/monoscope-tech/datafusion-postgres.git", rev = "32152646033793f15545134e9122e8ef9629823e" }
+datafusion-postgres = "0.11.0"
 # datafusion-postgres = { git = "https://github.com/datafusion-contrib/datafusion-postgres.git", rev = "7482a14d40cda4ee5b859e5ac9445b53ef855197" }
 # datafusion-postgres = { path = "/Users/tonyalaribe/Projects/apitoolkit/datafusion-projects/datafusion-postgres/datafusion-postgres" }
-datafusion-functions-json = "0.49.0"
+datafusion-functions-json = "0.50.0"
 anyhow = "1.0.98"
 tokio-util = "0.7.13"
 tokio-stream = { version = "0.1.17", features = ["net"] }
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing = "0.1.41"
+tracing-opentelemetry = "0.32"
+opentelemetry = "0.31"
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+datafusion-tracing = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git" }
+instrumented-object-store = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git" }
 dotenv = "0.15.0"
 include_dir = "0.7"
 aws-config = { version = "1.6.0", features = ["behavior-version-latest"] }
@@ -56,20 +68,21 @@ aws-types = "1.3.6"
 aws-sdk-s3 = "1.3.0"
 aws-sdk-dynamodb = "1.3.0"
 url = "2.5.4"
-tokio-cron-scheduler = "0.14"
+tokio-cron-scheduler = "0.15"
 object_store = "0.12.3"
-foyer = { version = "0.18", features = ["serde"] }
+foyer = { version = "0.20", features = ["serde"] }
 ahash = "0.8"
-lru = "0.12"
-serde_bytes = "0.11"
+lru = "0.16.1"
+serde_bytes = "0.11.19"
 dashmap = "6.1"
 tdigests = "1.0"
-bincode = "1.3"
+bincode = "2.0"
+# pgwire = "0.33.0"  # Remove duplicate, using version specified above
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
 serial_test = "3.2.0"
-datafusion-common = "49.0.2"
+datafusion-common = "50.1.0"
 tokio-postgres = { version = "0.7.10", features = ["with-chrono-0_4"] }
 scopeguard = "1.2.0"
 rand = "0.9.2"

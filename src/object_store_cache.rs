@@ -13,9 +13,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
-use foyer::{DirectFsDeviceOptions, Engine, HybridCache, HybridCacheBuilder, LargeEngineOptions};
+use foyer::{
+    BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, 
+    HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder
+};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Mutex};
+use tokio::task::JoinSet;
 
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,29 +245,37 @@ impl SharedFoyerCache {
         std::fs::create_dir_all(&metadata_cache_dir)?;
 
         let cache = HybridCacheBuilder::new()
-            .with_policy(foyer::HybridCachePolicy::WriteOnInsertion)
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(config.memory_size_bytes)
             .with_shards(config.shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
-            .storage(Engine::Large(LargeEngineOptions::default()))
-            .with_device_options(
-                DirectFsDeviceOptions::new(&config.cache_dir)
-                    .with_capacity(config.disk_size_bytes)
-                    .with_file_size(config.file_size_bytes),
+            .storage()
+            .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
+            .with_engine_config(
+                BlockEngineBuilder::new(
+                    FsDeviceBuilder::new(&config.cache_dir)
+                        .with_capacity(config.disk_size_bytes)
+                        .build()?,
+                )
+                .with_block_size(config.file_size_bytes),
             )
             .build()
             .await?;
 
         let metadata_cache = HybridCacheBuilder::new()
-            .with_policy(foyer::HybridCachePolicy::WriteOnInsertion)
+            .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(config.metadata_memory_size_bytes)
             .with_shards(config.metadata_shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
-            .storage(Engine::Large(LargeEngineOptions::default()))
-            .with_device_options(
-                DirectFsDeviceOptions::new(&metadata_cache_dir)
-                    .with_capacity(config.metadata_disk_size_bytes)
-                    .with_file_size(config.file_size_bytes),
+            .storage()
+            .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
+            .with_engine_config(
+                BlockEngineBuilder::new(
+                    FsDeviceBuilder::new(&metadata_cache_dir)
+                        .with_capacity(config.metadata_disk_size_bytes)
+                        .build()?,
+                )
+                .with_block_size(config.file_size_bytes),
             )
             .build()
             .await?;
@@ -294,6 +306,12 @@ impl SharedFoyerCache {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("Shutting down Foyer cache...");
         self.log_stats().await;
+        
+        // Close the underlying caches
+        info!("Closing Foyer caches...");
+        self.cache.close().await?;
+        self.metadata_cache.close().await?;
+        
         Ok(())
     }
 
@@ -320,6 +338,7 @@ pub struct FoyerObjectStoreCache {
     metadata_stats: StatsRef,
     config: FoyerCacheConfig,
     refreshing: Arc<DashSet<String>>,
+    background_tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
 impl FoyerObjectStoreCache {
@@ -332,6 +351,7 @@ impl FoyerObjectStoreCache {
             metadata_stats: shared_cache.metadata_stats.clone(),
             config: shared_cache.config.clone(),
             refreshing: Arc::new(DashSet::new()),
+            background_tasks: Arc::new(Mutex::new(JoinSet::new())),
         }
     }
 
@@ -453,8 +473,19 @@ impl FoyerObjectStoreCache {
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("Shutting down foyer hybrid cache");
-        self.cache.close().await?;
-        self.metadata_cache.close().await?;
+        
+        // Cancel all background refresh tasks
+        let mut tasks = self.background_tasks.lock().await;
+        debug!("Cancelling {} background refresh tasks", tasks.len());
+        tasks.abort_all();
+        // Wait for all tasks to complete or be cancelled
+        while tasks.join_next().await.is_some() {}
+        
+        // Clear the refreshing set
+        self.refreshing.clear();
+        
+        // Note: We don't close the caches here because they're shared 
+        // and owned by SharedFoyerCache
         Ok(())
     }
 
@@ -607,7 +638,8 @@ impl ObjectStore for FoyerObjectStoreCache {
                         let location = location.clone();
                         let key = cache_key.clone();
 
-                        tokio::spawn(async move {
+                        let tasks = self.background_tasks.clone();
+                        let handle = tokio::spawn(async move {
                             debug!("Background refresh for _last_checkpoint: {}", location);
                             if let Ok(result) = inner.get(&location).await {
                                 // Collect payload for caching
@@ -636,6 +668,13 @@ impl ObjectStore for FoyerObjectStoreCache {
                             }
                             refreshing.remove(&key);
                         });
+                        
+                        // Track the background task
+                        if let Ok(mut tasks_guard) = tasks.try_lock() {
+                            tasks_guard.spawn(async move {
+                                let _ = handle.await;
+                            });
+                        }
                     }
 
                     debug!("Foyer cache HIT (stale-while-revalidate) for: {} (age: {}ms)", location, age_millis);
@@ -912,8 +951,11 @@ impl ObjectStore for FoyerObjectStoreCache {
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
         self.update_stats(|s| s.inner_puts += 1).await;
+        let cache_key = Self::make_cache_key(location);
+        self.cache.remove(&cache_key);
+        
+        // Delete from inner store
         self.inner.delete(location).await?;
-        self.cache.remove(&Self::make_cache_key(location));
 
         // Invalidate metadata cache entries for this file
         if location.as_ref().ends_with(".parquet") {
@@ -1028,7 +1070,13 @@ mod tests {
         assert_eq!(stats.main.misses, 0);
 
         cache.delete(&path).await?;
-        assert!(cache.get(&path).await.is_err());
+        
+        // Give cache time to process deletion
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        
+        // After deletion, get should fail
+        let get_result = cache.get(&path).await;
+        assert!(get_result.is_err(), "Expected error after delete, got: {:?}", get_result);
 
         cache.shutdown().await?;
         Ok(())
