@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod connection_pressure {
     use anyhow::Result;
-    use datafusion_postgres::ServerOptions;
+    use datafusion_postgres::{ServerOptions, auth::AuthManager};
     use dotenv::dotenv;
     use rand::Rng;
     use serial_test::serial;
@@ -46,10 +46,11 @@ mod connection_pressure {
                 db.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
+                let auth_manager = Arc::new(AuthManager::new());
 
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
-                    res = datafusion_postgres::serve(Arc::new(ctx), &opts) => {
+                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth_manager) => {
                         if let Err(e) = res {
                             eprintln!("Server error: {:?}", e);
                         }
