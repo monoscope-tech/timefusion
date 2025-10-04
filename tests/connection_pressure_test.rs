@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod connection_pressure {
     use anyhow::Result;
-    use datafusion_postgres::ServerOptions;
+    use datafusion_postgres::{ServerOptions, auth::AuthManager};
     use dotenv::dotenv;
     use rand::Rng;
     use serial_test::serial;
@@ -42,14 +42,16 @@ mod connection_pressure {
 
             tokio::spawn(async move {
                 let db = Database::new().await.expect("Failed to create database");
-                let mut ctx = db.create_session_context();
+                let db = Arc::new(db);
+                let mut ctx = db.clone().create_session_context();
                 db.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
+                let auth_manager = Arc::new(AuthManager::new());
 
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
-                    res = datafusion_postgres::serve(Arc::new(ctx), &opts) => {
+                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth_manager) => {
                         if let Err(e) = res {
                             eprintln!("Server error: {:?}", e);
                         }
@@ -247,7 +249,7 @@ mod connection_pressure {
                                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
                             );
 
-                            if let Err(_) = timeout(
+                            if timeout(
                                 Duration::from_millis(500),
                                 client.execute(
                                     &insert_sql,
@@ -263,7 +265,7 @@ mod connection_pressure {
                                 ),
                             )
                             .await
-                            {
+                            .is_err() {
                                 write_errs.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("Write error or timeout");
                             }
@@ -297,14 +299,14 @@ mod connection_pressure {
                                 let _ = conn.await;
                             });
 
-                            let queries = vec![
+                            let queries = [
                                 "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'exhaust_test'",
                                 "SELECT name FROM otel_logs_and_spans WHERE project_id = 'exhaust_test' LIMIT 5",
                                 "SELECT status_code, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'exhaust_test' GROUP BY status_code",
                             ];
 
                             let query = queries[op % queries.len()];
-                            if let Err(_) = timeout(Duration::from_millis(500), client.query(query, &[])).await {
+                            if timeout(Duration::from_millis(500), client.query(query, &[])).await.is_err() {
                                 read_errs.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("Read error or timeout");
                             }

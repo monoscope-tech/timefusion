@@ -70,13 +70,13 @@ SELECT 1 as test_value
 
 # Test CREATE and INSERT with a simpler table
 statement ok
-CREATE TABLE IF NOT EXISTS test_table (id INT, name VARCHAR)
+CREATE TABLE IF NOT EXISTS test_table (id INT, name VARCHAR, project_id VARCHAR)
 
 statement ok
-INSERT INTO test_table (id, name) VALUES (1, 'test')
+INSERT INTO test_table (id, name, project_id) VALUES (1, 'test', 'test_project')
 
 query IT
-SELECT id, name FROM test_table WHERE id = 1
+SELECT id, name FROM test_table WHERE project_id = 'test_project' AND id = 1
 ----
 1 test
 
@@ -111,3 +111,54 @@ query T
 SELECT id FROM otel_logs_and_spans WHERE project_id = 'debug_project' AND id = 'debug_span1'
 ----
 debug_span1
+
+# ============================================
+# UPDATE and DELETE tests
+# ============================================
+
+# Note: UPDATE operations only work on Delta tables like otel_logs_and_spans
+# test_table is an in-memory table and doesn't support UPDATE operations
+
+# Test UPDATE on otel_logs_and_spans
+statement ok
+UPDATE otel_logs_and_spans 
+SET status_message = 'Updated via UPDATE statement' 
+WHERE project_id = 'test_project' AND id = 'sql_span1'
+
+query T
+SELECT status_message FROM otel_logs_and_spans 
+WHERE project_id = 'test_project' AND id = 'sql_span1'
+----
+Updated via UPDATE statement
+
+# Test conditional UPDATE
+statement ok
+UPDATE otel_logs_and_spans 
+SET status_code = 'SUCCESS' 
+WHERE project_id = 'test_project' AND status_code = 'OK'
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'test_project' AND status_code = 'SUCCESS'
+----
+3
+
+# Note: DELETE operations only work on Delta tables like otel_logs_and_spans
+# test_table is an in-memory table and doesn't support DELETE operations
+
+# Test DELETE on otel_logs_and_spans
+statement ok
+DELETE FROM otel_logs_and_spans 
+WHERE project_id = 'debug_project' AND id = 'debug_span1'
+
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans 
+WHERE project_id = 'debug_project'
+----
+0
+
+# Verify remaining records
+query I
+SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'
+----
+3
