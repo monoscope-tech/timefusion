@@ -93,7 +93,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         name = "postgres.query.simple",
         skip_all,
         fields(
-            query.text = %query,
+            query.text = Empty,
             query.type = Empty,
             query.operation = Empty,
             db.system = "postgresql",
@@ -136,10 +136,13 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         span.record("query.operation", operation);
         span.record("db.operation", operation);
         
-        // Log DML queries
-        if query_type == "DML" && (operation == "UPDATE" || operation == "DELETE") {
-            info!("{} query executed: {}", operation, query);
-        }
+        // Truncate sensitive data from DML queries
+        let sanitized_query = match operation {
+            "INSERT" => query_lower.find(" values").map(|i| format!("{} VALUES ...", &query[..i])).unwrap_or_else(|| query.to_string()),
+            "UPDATE" => query_lower.find(" set").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.to_string()),
+            _ => query.to_string(),
+        };
+        span.record("query.text", &sanitized_query.as_str());
         
         // Delegate to inner handler with the span context
         // Use the current span as parent to ensure proper context propagation
@@ -229,7 +232,6 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         
         // Get query text and determine type
         let query = &portal.statement.statement.0;
-        span.record("query.text", &query.as_str());
         
         let query_lower = query.trim().to_lowercase();
         let (query_type, operation) = if query_lower.starts_with("select") || query_lower.contains(" select ") {
@@ -254,10 +256,13 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         span.record("query.operation", operation);
         span.record("db.operation", operation);
         
-        // Log DML queries
-        if query_type == "DML" && (operation == "UPDATE" || operation == "DELETE") {
-            info!("{} query executed (extended): {}", operation, query);
-        }
+        // Truncate sensitive data from DML queries
+        let sanitized_query = match operation {
+            "INSERT" => query_lower.find(" values").map(|i| format!("{} VALUES ...", &query[..i])).unwrap_or_else(|| query.to_string()),
+            "UPDATE" => query_lower.find(" set").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.to_string()),
+            _ => query.to_string(),
+        };
+        span.record("query.text", &sanitized_query.as_str());
         
         // Delegate to inner handler with the span context
         // Use the current span as parent to ensure proper context propagation
