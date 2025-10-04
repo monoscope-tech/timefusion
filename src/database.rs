@@ -625,6 +625,7 @@ impl Database {
         Ok(self)
     }
 
+
     /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(self: Arc<Self>) -> SessionContext {
         use datafusion::config::ConfigOptions;
@@ -1909,6 +1910,9 @@ mod tests {
         assert_eq!(result[0].column(0).as_string::<i32>().value(0), "test1");
         assert_eq!(result[0].column(1).as_string::<i32>().value(0), "span1");
 
+        // Shutdown database
+        db.shutdown().await?;
+        
         Ok(())
     }
 
@@ -1942,6 +1946,9 @@ mod tests {
         }
         assert_eq!(total_count, 3);
 
+        // Shutdown database
+        db.shutdown().await?;
+        
         Ok(())
     }
 
@@ -2012,6 +2019,9 @@ mod tests {
         assert_eq!(result[0].num_rows(), 1);
         assert_eq!(result[0].column(1).as_string::<i32>().value(0), "Error occurred");
 
+        // Shutdown database to ensure proper cleanup
+        db.shutdown().await?;
+        
         Ok(())
     }
 
@@ -2060,7 +2070,7 @@ mod tests {
     #[serial]
     #[tokio::test]
     async fn test_multi_row_sql_insert() -> Result<()> {
-        let (_db, ctx) = setup_test_database().await?;
+        let (db, ctx) = setup_test_database().await?;
         use datafusion::arrow::array::AsArray;
 
         // Test multi-row INSERT
@@ -2089,6 +2099,9 @@ mod tests {
         assert_eq!(result[0].column(0).as_string::<i32>().value(1), "id2");
         assert_eq!(result[0].column(0).as_string::<i32>().value(2), "id3");
 
+        // Shutdown database
+        db.shutdown().await?;
+        
         Ok(())
     }
 
@@ -2149,6 +2162,9 @@ mod tests {
         assert_eq!(result[0].column(1).as_string::<i32>().value(0), "2023-01-01 10:00");
         assert_eq!(result[0].column(1).as_string::<i32>().value(1), "2023-01-01 12:00");
 
+        // Shutdown database to ensure proper cleanup
+        db.shutdown().await?;
+        
         Ok(())
     }
 
@@ -2195,6 +2211,9 @@ mod tests {
         // Verify all records were written
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await; // Give time for Delta to commit
 
+        // Shutdown database
+        db.shutdown().await?;
+        
         Ok(())
     }
 
@@ -2237,6 +2256,9 @@ mod tests {
 
         assert_eq!(created_projects.len(), 5, "All 5 projects should be created successfully");
 
+        // Shutdown database
+        db.shutdown().await?;
+        
         Ok(())
     }
 
@@ -2278,6 +2300,9 @@ mod tests {
 
         // Queue shutdown
         queue.shutdown().await;
+        
+        // Database shutdown
+        db.shutdown().await?;
 
         Ok(())
     }
@@ -2335,6 +2360,19 @@ mod tests {
         futures::future::join_all(write_tasks).await;
         optimize_task.await?;
 
+        // Shutdown database
+        db.shutdown().await?;
+        
         Ok(())
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Cancel maintenance tasks immediately
+        self.maintenance_shutdown.cancel();
+        
+        // Note: We can't do async cleanup in Drop, but cancelling the token
+        // will cause background tasks to stop, preventing the panic
     }
 }
