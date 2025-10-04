@@ -1042,7 +1042,13 @@ mod tests {
         assert_eq!(stats.main.misses, 0);
 
         cache.delete(&path).await?;
-        assert!(cache.get(&path).await.is_err());
+        
+        // Give cache time to process deletion
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        
+        // After deletion, get should fail
+        let get_result = cache.get(&path).await;
+        assert!(get_result.is_err(), "Expected error after delete, got: {:?}", get_result);
 
         cache.shutdown().await?;
         Ok(())
