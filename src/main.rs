@@ -64,7 +64,10 @@ async fn main() -> anyhow::Result<()> {
         let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
         let auth_manager = Arc::new(AuthManager::new());
 
-        datafusion_postgres::serve(Arc::new(session_context), &opts, auth_manager).await
+        // Use our custom handlers that log UPDATE queries
+        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(Arc::new(session_context), &opts, auth_manager).await {
+            error!("PGWire server error: {}", e);
+        }
     });
 
     // Store database for shutdown

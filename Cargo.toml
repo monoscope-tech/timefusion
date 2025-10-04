@@ -40,7 +40,8 @@ sqlx = { version = "0.8", features = [
   "uuid",
 ] }
 # pgwire = "0.31.0"
-pgwire = { git = "https://github.com/sunng87/pgwire.git", rev = "573bb87a81791fe1cddf51eff0ec631fb41a81df" }
+# pgwire = { git = "https://github.com/sunng87/pgwire.git", rev = "573bb87a81791fe1cddf51eff0ec631fb41a81df" }
+# pgwire = "0.32.1"  # Not needed - using re-exports from datafusion-postgres
 futures = { version = "0.3.31", features = ["alloc"] }
 bytes = "1.4"
 tokio-rustls = "0.26.1"
@@ -76,6 +77,7 @@ serde_bytes = "0.11.19"
 dashmap = "6.1"
 tdigests = "1.0"
 bincode = "2.0"
+# pgwire = "0.33.0"  # Remove duplicate, using version specified above
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
