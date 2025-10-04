@@ -343,7 +343,6 @@ mod integration {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "DELETE operations are not yet implemented"]
     async fn test_delete_operations() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;

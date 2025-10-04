@@ -62,10 +62,27 @@ impl QueryPlanner for DmlQueryPlanner {
                 Ok(Arc::new(update_exec))
             }
             LogicalPlan::Dml(dml) if dml.op == WriteOp::Delete => {
-                // DELETE operations will be implemented similarly
-                datafusion::common::plan_err!(
-                    "DELETE operations are not yet implemented. Coming soon."
-                )
+                // Extract information from the DML input plan
+                let (table_name, project_id, predicate) = 
+                    extract_delete_info(&dml.input, &dml.table_name.to_string())?;
+                
+                // Create the physical plan for the input (to get matching rows)
+                let input_exec = self
+                    .planner
+                    .create_physical_plan(&dml.input, session_state)
+                    .await?;
+                
+                // Create our Delta DELETE execution plan
+                let delete_exec = crate::dml_executor::DeltaDeleteExec::new(
+                    table_name,
+                    project_id,
+                    dml.output_schema.clone(),
+                    predicate,
+                    input_exec,
+                    self.database.clone(),
+                );
+                
+                Ok(Arc::new(delete_exec))
             }
             // All other plans fallback to the default planner
             _ => self.planner.create_physical_plan(logical_plan, session_state).await,
@@ -201,6 +218,75 @@ fn extract_assignments_from_projection(proj: &Projection) -> Result<Vec<(String,
     }
     
     Ok(assignments)
+}
+
+/// Extract delete information from the logical plan
+fn extract_delete_info(
+    input: &LogicalPlan,
+    table_name: &str,
+) -> Result<(String, String, Option<Expr>)> {
+    // Similar to extract_update_info but without assignments
+    let mut current_plan = input;
+    let mut predicate = None;
+    let mut project_id = String::new();
+    
+    loop {
+        match current_plan {
+            LogicalPlan::Filter(filter) => {
+                // Extract the WHERE clause predicate
+                predicate = Some(filter.predicate.clone());
+                // Try to extract project_id from the predicate
+                if let Some(pid) = extract_project_id(&filter.predicate) {
+                    if project_id.is_empty() {
+                        project_id = pid;
+                    }
+                }
+                current_plan = filter.input.as_ref();
+            }
+            LogicalPlan::TableScan(scan) => {
+                // The filters are in the TableScan for DELETE queries
+                
+                // Combine all filters with AND
+                if !scan.filters.is_empty() {
+                    let mut combined_predicate = scan.filters[0].clone();
+                    for (i, filter) in scan.filters.iter().enumerate() {
+                        if let Some(pid) = extract_project_id(filter) {
+                            project_id = pid;
+                        }
+                        if i > 0 {
+                            combined_predicate = Expr::BinaryExpr(BinaryExpr {
+                                left: Box::new(combined_predicate),
+                                op: Operator::And,
+                                right: Box::new(filter.clone()),
+                            });
+                        }
+                    }
+                    // Only set predicate if we don't already have one from a Filter node
+                    if predicate.is_none() {
+                        predicate = Some(combined_predicate);
+                    }
+                }
+                break;
+            }
+            _ => {
+                // Try to go deeper
+                let inputs = current_plan.inputs();
+                if !inputs.is_empty() {
+                    current_plan = inputs[0];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    
+    if project_id.is_empty() {
+        return Err(datafusion::error::DataFusionError::Plan(
+            "DELETE requires a project_id filter in WHERE clause".to_string()
+        ));
+    }
+    
+    Ok((table_name.to_string(), project_id, predicate))
 }
 
 /// Extract project_id from a filter expression
