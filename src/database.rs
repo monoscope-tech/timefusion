@@ -150,6 +150,21 @@ impl Database {
         ).await
     }
     
+    /// Perform a Delta table DELETE operation
+    pub async fn perform_delta_delete(
+        &self,
+        table_name: &str,
+        project_id: &str,
+        predicate: Option<datafusion::logical_expr::Expr>,
+    ) -> Result<u64, DataFusionError> {
+        crate::dml_executor::perform_delta_delete_internal(
+            self,
+            table_name,
+            project_id,
+            predicate,
+        ).await
+    }
+    
     /// Build storage options with consistent configuration including DynamoDB locking if enabled
     fn build_storage_options(&self) -> HashMap<String, String> {
         let mut storage_options = HashMap::new();

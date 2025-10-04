@@ -17,6 +17,43 @@ use tracing::{error, info};
 
 use crate::database::Database;
 
+/// Physical execution plan for DELETE operations on Delta tables
+#[derive(Debug)]
+pub struct DeltaDeleteExec {
+    /// Table name to delete from
+    table_name: String,
+    /// Project ID (extracted from filter predicates)
+    project_id: String,
+    /// Schema of the table
+    table_schema: Arc<DFSchema>,
+    /// Filter predicate from WHERE clause
+    predicate: Option<Expr>,
+    /// Input plan that provides the matching rows
+    input: Arc<dyn ExecutionPlan>,
+    /// Database instance for accessing Delta tables
+    database: Arc<Database>,
+}
+
+impl DeltaDeleteExec {
+    pub fn new(
+        table_name: String,
+        project_id: String,
+        table_schema: Arc<DFSchema>,
+        predicate: Option<Expr>,
+        input: Arc<dyn ExecutionPlan>,
+        database: Arc<Database>,
+    ) -> Self {
+        Self {
+            table_name,
+            project_id,
+            table_schema,
+            predicate,
+            input,
+            database,
+        }
+    }
+}
+
 /// Physical execution plan for UPDATE operations on Delta tables
 #[derive(Debug)]
 pub struct DeltaUpdateExec {
@@ -258,6 +295,166 @@ fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
         _ => {
             // For other expression types, return as-is
             Ok(expr.clone())
+        }
+    }
+}
+
+impl DisplayAs for DeltaDeleteExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "DeltaDeleteExec: table={}, project_id={}",
+                    self.table_name, self.project_id
+                )?;
+                if let Some(ref pred) = self.predicate {
+                    write!(f, ", predicate={}", pred)?;
+                }
+                Ok(())
+            }
+            _ => write!(f, "DeltaDeleteExec"),
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionPlan for DeltaDeleteExec {
+    fn name(&self) -> &'static str {
+        "DeltaDeleteExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        // Deletes return a single batch with row count
+        self.input.properties()
+    }
+
+    fn required_input_distribution(&self) -> Vec<datafusion::physical_plan::Distribution> {
+        vec![datafusion::physical_plan::Distribution::SinglePartition]
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            table_name: self.table_name.clone(),
+            project_id: self.project_id.clone(),
+            table_schema: self.table_schema.clone(),
+            predicate: self.predicate.clone(),
+            input: children[0].clone(),
+            database: self.database.clone(),
+        }))
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let table_name = self.table_name.clone();
+        let project_id = self.project_id.clone();
+        let predicate = self.predicate.clone();
+        let database = self.database.clone();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("rows_deleted", DataType::Int64, false),
+        ]));
+        let schema_clone = schema.clone();
+
+        let future = async move {
+            match database.perform_delta_delete(
+                &table_name,
+                &project_id,
+                predicate,
+            ).await {
+                Ok(rows_deleted) => {
+                    let batch = RecordBatch::try_new(
+                        schema_clone,
+                        vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![rows_deleted as i64]))],
+                    );
+                    
+                    batch.map_err(|e| DataFusionError::External(Box::new(e)))
+                }
+                Err(e) => {
+                    error!("Delta DELETE failed: {}", e);
+                    Err(e)
+                }
+            }
+        };
+        
+        let stream = futures::stream::once(future);
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+/// Internal implementation of Delta table delete
+pub async fn perform_delta_delete_internal(
+    database: &Database,
+    table_name: &str,
+    project_id: &str,
+    predicate: Option<Expr>,
+) -> Result<u64> {
+    info!(
+        "Performing Delta DELETE on table {} for project {}",
+        table_name, project_id
+    );
+
+    // Get the Delta table from the database
+    let table_key = (project_id.to_string(), table_name.to_string());
+    let table_lock = database
+        .project_configs()
+        .read()
+        .await
+        .get(&table_key)
+        .ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "Table not found: {} for project {}",
+                table_name, project_id
+            ))
+        })?
+        .clone();
+
+    let delta_table = table_lock.write().await;
+    
+    // Create the DeltaOps wrapper for the delete operation
+    let mut delete_builder = DeltaOps(delta_table.clone()).delete();
+
+    // Apply the predicate if provided
+    if let Some(pred) = predicate.clone() {
+        // Convert DataFusion Expr to delta-rs Expression
+        let delta_expr = convert_expr_to_delta(&pred)?;
+        delete_builder = delete_builder.with_predicate(delta_expr);
+    }
+
+    // Execute the delete
+    match delete_builder.await {
+        Ok((new_table, metrics)) => {
+            // Update the table reference in the lock
+            drop(delta_table);
+            *table_lock.write().await = new_table;
+
+            // Return the number of rows deleted
+            let rows_deleted = metrics.num_deleted_rows;
+
+            info!("Delta DELETE completed: {} rows deleted", rows_deleted);
+            Ok(rows_deleted as u64)
+        }
+        Err(e) => {
+            error!("Delta DELETE failed: {}", e);
+            Err(DataFusionError::Execution(format!(
+                "Failed to execute Delta DELETE: {}",
+                e
+            )))
         }
     }
 }
