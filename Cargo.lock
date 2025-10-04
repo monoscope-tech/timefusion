@@ -492,7 +492,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "futures",
- "pgwire 0.32.1",
+ "pgwire",
  "postgres-types",
  "rust_decimal",
 ]
@@ -743,7 +743,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879b6c89592deb404ba4dc0ae6b58ffd1795c78991cbb5b8bc441c48a070440d"
 dependencies = [
  "aws-lc-sys",
- "untrusted 0.7.1",
  "zeroize",
 ]
 
@@ -2640,7 +2639,7 @@ dependencies = [
  "futures",
  "getset",
  "log",
- "pgwire 0.32.1",
+ "pgwire",
  "postgres-types",
  "rust_decimal",
  "rustls-pemfile 2.2.0",
@@ -5164,30 +5163,6 @@ dependencies = [
 
 [[package]]
 name = "pgwire"
-version = "0.31.0"
-source = "git+https://github.com/sunng87/pgwire.git?rev=573bb87a81791fe1cddf51eff0ec631fb41a81df#573bb87a81791fe1cddf51eff0ec631fb41a81df"
-dependencies = [
- "async-trait",
- "aws-lc-rs",
- "bytes",
- "chrono",
- "derive-new",
- "futures",
- "hex",
- "lazy-regex",
- "md5",
- "postgres-types",
- "rand 0.9.2",
- "rust_decimal",
- "rustls-pki-types",
- "thiserror 2.0.17",
- "tokio",
- "tokio-rustls 0.26.4",
- "tokio-util",
-]
-
-[[package]]
-name = "pgwire"
 version = "0.32.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddf403a6ee31cf7f2217b2bd8447cb13dbb6c268d7e81501bc78a4d3daafd294"
@@ -5900,7 +5875,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.16",
  "libc",
- "untrusted 0.9.0",
+ "untrusted",
  "windows-sys 0.52.0",
 ]
 
@@ -6114,7 +6089,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
 dependencies = [
  "ring",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -6126,7 +6101,7 @@ dependencies = [
  "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -6205,7 +6180,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
 dependencies = [
  "ring",
- "untrusted 0.9.0",
+ "untrusted",
 ]
 
 [[package]]
@@ -7154,7 +7129,6 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "pgwire 0.31.0",
  "rand 0.9.2",
  "regex",
  "scopeguard",
@@ -7662,12 +7636,6 @@ name = "unsafe-libyaml"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
-
-[[package]]
-name = "untrusted"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 
 [[package]]
 name = "untrusted"
