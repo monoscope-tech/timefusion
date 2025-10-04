@@ -991,8 +991,9 @@ impl Database {
             // This allows the same cache to be used across all tables
             let cache_wrapped =
                 Arc::new(FoyerObjectStoreCache::new_with_shared_cache(instrumented_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>;
-            // Instrument the cache layer as well to see cache hits/misses
-            instrument_object_store(cache_wrapped, "foyer_cache")
+            // Note: We don't double-instrument with instrument_object_store here since FoyerObjectStoreCache
+            // already has its own instrumentation that properly propagates parent spans
+            cache_wrapped
         } else {
             warn!("Shared Foyer cache not initialized, using uncached object store");
             instrumented_store

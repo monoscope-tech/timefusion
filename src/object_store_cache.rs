@@ -11,7 +11,8 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info};
+use tracing::{debug, info, instrument, Instrument};
+use tracing::field::Empty;
 
 use foyer::{
     BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, 
@@ -613,7 +614,17 @@ impl ObjectStore for FoyerObjectStoreCache {
         Ok(result)
     }
 
+    #[instrument(
+        name = "foyer_cache.get",
+        skip_all,
+        fields(
+            location = %location,
+            cache_hit = Empty,
+            is_checkpoint = Self::is_last_checkpoint(location),
+        )
+    )]
     async fn get(&self, location: &Path) -> ObjectStoreResult<GetResult> {
+        let span = tracing::Span::current();
         let cache_key = Self::make_cache_key(location);
 
         // Try cache first
@@ -626,6 +637,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             // Special handling for _last_checkpoint: stale-while-revalidate
             if Self::is_last_checkpoint(location) && !value.is_expired(ttl) {
                 self.update_stats(|s| s.hits += 1).await;
+                span.record("cache_hit", true);
 
                 // Check if older than 5 seconds
                 let age_millis = current_millis().saturating_sub(value.timestamp_millis);
@@ -698,6 +710,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 );
             } else {
                 self.update_stats(|s| s.hits += 1).await;
+                span.record("cache_hit", true);
                 let is_parquet = location.as_ref().ends_with(".parquet");
                 debug!(
                     "Foyer cache HIT for: {} (avoiding S3 access, parquet={}, TTL={}s, age={}ms, size={} bytes)",
@@ -712,6 +725,7 @@ impl ObjectStore for FoyerObjectStoreCache {
         }
 
         // Cache miss - fetch from inner store
+        span.record("cache_hit", false);
         self.update_stats(|s| {
             s.misses += 1;
             s.inner_gets += 1;
@@ -727,7 +741,10 @@ impl ObjectStore for FoyerObjectStoreCache {
         );
 
         let start_time = std::time::Instant::now();
-        let result = self.inner.get(location).await?;
+        let inner_span = tracing::trace_span!(parent: &span, "s3.get", location = %location);
+        let result = self.inner.get(location)
+            .instrument(inner_span)
+            .await?;
         let duration = start_time.elapsed();
         
         debug!(
@@ -773,7 +790,21 @@ impl ObjectStore for FoyerObjectStoreCache {
         self.get(location).await
     }
 
+    #[instrument(
+        name = "foyer_cache.get_range",
+        skip_all,
+        fields(
+            location = %location,
+            range.start = range.start,
+            range.end = range.end,
+            range.size = range.end - range.start,
+            is_parquet = location.as_ref().ends_with(".parquet"),
+            cache_hit = Empty,
+            is_metadata = Empty,
+        )
+    )]
     async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
+        let span = tracing::Span::current();
         let is_parquet = location.as_ref().ends_with(".parquet");
 
         // First check if we have the full file cached
@@ -783,6 +814,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             let ttl = self.get_ttl_for_path(location);
             if !value.is_expired(ttl) && range.end <= value.data.len() as u64 {
                 self.update_stats(|s| s.hits += 1).await;
+                span.record("cache_hit", true);
                 debug!(
                     "Foyer cache HIT (full file) for range: {} (range: {}..{}, size: {} bytes, parquet={}, age={}ms)",
                     location,
@@ -812,6 +844,7 @@ impl ObjectStore for FoyerObjectStoreCache {
 
             // Check if this is likely a metadata request (reading from near the end of the file)
             let is_metadata_request = range.start >= file_size.saturating_sub(metadata_size_hint);
+            span.record("is_metadata", is_metadata_request);
 
             if is_metadata_request {
                 // For metadata requests, use the metadata cache
@@ -823,6 +856,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                     let ttl = self.config.ttl;  // Use unified TTL
                     if !value.is_expired(ttl) {
                         self.update_metadata_stats(|s| s.hits += 1).await;
+                        span.record("cache_hit", true);
                         debug!(
                             "Metadata cache HIT for: {} (range: {}..{}, size: {} bytes, age={}ms)",
                             location,
@@ -836,6 +870,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 }
 
                 // Cache miss for metadata range - fetch just the range
+                span.record("cache_hit", false);
                 self.update_metadata_stats(|s| {
                     s.misses += 1;
                     s.inner_gets += 1;
@@ -847,7 +882,15 @@ impl ObjectStore for FoyerObjectStoreCache {
                 );
 
                 let start_time = std::time::Instant::now();
-                let data = self.inner.get_range(location, range.clone()).await?;
+                let inner_span = tracing::trace_span!(parent: &span, "s3.get_range", 
+                    location = %location, 
+                    range.start = range.start,
+                    range.end = range.end,
+                    is_metadata = true
+                );
+                let data = self.inner.get_range(location, range.clone())
+                    .instrument(inner_span)
+                    .await?;
                 let duration = start_time.elapsed();
                 
                 debug!(
@@ -909,6 +952,7 @@ impl ObjectStore for FoyerObjectStoreCache {
         }
 
         // Fallback to regular range request for non-parquet files
+        span.record("cache_hit", false);
         self.update_stats(|s| {
             s.misses += 1;
             s.inner_gets += 1;
@@ -920,7 +964,14 @@ impl ObjectStore for FoyerObjectStoreCache {
         );
         
         let start_time = std::time::Instant::now();
-        let result = self.inner.get_range(location, range.clone()).await?;
+        let inner_span = tracing::trace_span!(parent: &span, "s3.get_range", 
+            location = %location,
+            range.start = range.start,
+            range.end = range.end
+        );
+        let result = self.inner.get_range(location, range.clone())
+            .instrument(inner_span)
+            .await?;
         let duration = start_time.elapsed();
         
         debug!(
@@ -936,17 +987,32 @@ impl ObjectStore for FoyerObjectStoreCache {
         Ok(result)
     }
 
+    #[instrument(
+        name = "foyer_cache.head",
+        skip_all,
+        fields(
+            location = %location,
+            cache_hit = Empty,
+        )
+    )]
     async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
+        let span = tracing::Span::current();
         let cache_key = Self::make_cache_key(location);
 
         if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
             let value = entry.value();
             let ttl = self.get_ttl_for_path(location);
             if !value.is_expired(ttl) {
+                span.record("cache_hit", true);
                 return Ok(value.meta.clone());
             }
         }
-        self.inner.head(location).await
+        
+        span.record("cache_hit", false);
+        let inner_span = tracing::trace_span!(parent: &span, "s3.head", location = %location);
+        self.inner.head(location)
+            .instrument(inner_span)
+            .await
     }
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
