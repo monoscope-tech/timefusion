@@ -141,7 +141,7 @@ impl Database {
         predicate: Option<datafusion::logical_expr::Expr>,
         assignments: Vec<(String, datafusion::logical_expr::Expr)>,
     ) -> Result<u64, DataFusionError> {
-        crate::dml_executor::perform_delta_update_internal(
+        crate::dml::perform_delta_update_internal(
             self,
             table_name,
             project_id,
@@ -157,7 +157,7 @@ impl Database {
         project_id: &str,
         predicate: Option<datafusion::logical_expr::Expr>,
     ) -> Result<u64, DataFusionError> {
-        crate::dml_executor::perform_delta_delete_internal(
+        crate::dml::perform_delta_delete_internal(
             self,
             table_name,
             project_id,
@@ -633,7 +633,7 @@ impl Database {
         use datafusion::execution::SessionStateBuilder;
         use datafusion_tracing::{instrument_with_info_spans, InstrumentationOptions};
         use std::sync::Arc;
-        use crate::dml_query_planner::DmlQueryPlanner;
+        use crate::dml::DmlQueryPlanner;
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.catalog.information_schema", "true");
