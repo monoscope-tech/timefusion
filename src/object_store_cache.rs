@@ -18,7 +18,8 @@ use foyer::{
     HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Mutex};
+use tokio::task::JoinSet;
 
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +306,12 @@ impl SharedFoyerCache {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("Shutting down Foyer cache...");
         self.log_stats().await;
+        
+        // Close the underlying caches
+        info!("Closing Foyer caches...");
+        self.cache.close().await?;
+        self.metadata_cache.close().await?;
+        
         Ok(())
     }
 
@@ -331,6 +338,7 @@ pub struct FoyerObjectStoreCache {
     metadata_stats: StatsRef,
     config: FoyerCacheConfig,
     refreshing: Arc<DashSet<String>>,
+    background_tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
 impl FoyerObjectStoreCache {
@@ -343,6 +351,7 @@ impl FoyerObjectStoreCache {
             metadata_stats: shared_cache.metadata_stats.clone(),
             config: shared_cache.config.clone(),
             refreshing: Arc::new(DashSet::new()),
+            background_tasks: Arc::new(Mutex::new(JoinSet::new())),
         }
     }
 
@@ -464,8 +473,19 @@ impl FoyerObjectStoreCache {
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("Shutting down foyer hybrid cache");
-        self.cache.close().await?;
-        self.metadata_cache.close().await?;
+        
+        // Cancel all background refresh tasks
+        let mut tasks = self.background_tasks.lock().await;
+        debug!("Cancelling {} background refresh tasks", tasks.len());
+        tasks.abort_all();
+        // Wait for all tasks to complete or be cancelled
+        while tasks.join_next().await.is_some() {}
+        
+        // Clear the refreshing set
+        self.refreshing.clear();
+        
+        // Note: We don't close the caches here because they're shared 
+        // and owned by SharedFoyerCache
         Ok(())
     }
 
@@ -618,7 +638,8 @@ impl ObjectStore for FoyerObjectStoreCache {
                         let location = location.clone();
                         let key = cache_key.clone();
 
-                        tokio::spawn(async move {
+                        let tasks = self.background_tasks.clone();
+                        let handle = tokio::spawn(async move {
                             debug!("Background refresh for _last_checkpoint: {}", location);
                             if let Ok(result) = inner.get(&location).await {
                                 // Collect payload for caching
@@ -647,6 +668,13 @@ impl ObjectStore for FoyerObjectStoreCache {
                             }
                             refreshing.remove(&key);
                         });
+                        
+                        // Track the background task
+                        if let Ok(mut tasks_guard) = tasks.try_lock() {
+                            tasks_guard.spawn(async move {
+                                let _ = handle.await;
+                            });
+                        }
                     }
 
                     debug!("Foyer cache HIT (stale-while-revalidate) for: {} (age: {}ms)", location, age_millis);
