@@ -24,48 +24,38 @@ use datafusion::{
 };
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use instrumented_object_store::instrument_object_store;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::PartitionFilter;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
+use instrumented_object_store::instrument_object_store;
 use serde::{Deserialize, Serialize};
 use sqlx::{postgres::PgPoolOptions, PgPool};
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, instrument, Instrument};
+use tracing::field::Empty;
 use url::Url;
 
 // Changed to support multiple tables per project: (project_id, table_name) -> DeltaTable
 pub type ProjectConfigs = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
 
 /// Get a Delta table by project_id and table_name
-pub async fn get_delta_table(
-    project_configs: &ProjectConfigs,
-    project_id: &str,
-    table_name: &str,
-) -> Option<Arc<RwLock<DeltaTable>>> {
+pub async fn get_delta_table(project_configs: &ProjectConfigs, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
     let table_key = (project_id.to_string(), table_name.to_string());
-    project_configs
-        .read()
-        .await
-        .get(&table_key)
-        .cloned()
+    project_configs.read().await.get(&table_key).cloned()
 }
 
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
-    batch.schema().fields().iter()
-        .position(|f| f.name() == "project_id")
-        .and_then(|idx| {
-            let column = batch.column(idx);
-            let string_array = column.as_string::<i32>();
-            (string_array.len() > 0 && !string_array.is_null(0))
-                .then(|| string_array.value(0).to_string())
-        })
+    batch.schema().fields().iter().position(|f| f.name() == "project_id").and_then(|idx| {
+        let column = batch.column(idx);
+        let string_array = column.as_string::<i32>();
+        (string_array.len() > 0 && !string_array.is_null(0)).then(|| string_array.value(0).to_string())
+    })
 }
 
 // Constants for optimization and vacuum operations
@@ -134,36 +124,19 @@ impl Database {
 
     /// Perform a Delta table UPDATE operation
     pub async fn perform_delta_update(
-        &self,
-        table_name: &str,
-        project_id: &str,
-        predicate: Option<datafusion::logical_expr::Expr>,
+        &self, table_name: &str, project_id: &str, predicate: Option<datafusion::logical_expr::Expr>,
         assignments: Vec<(String, datafusion::logical_expr::Expr)>,
     ) -> Result<u64, DataFusionError> {
-        crate::dml::perform_delta_update_internal(
-            self,
-            table_name,
-            project_id,
-            predicate,
-            assignments,
-        ).await
+        crate::dml::perform_delta_update(self, table_name, project_id, predicate, assignments).await
     }
-    
+
     /// Perform a Delta table DELETE operation
     pub async fn perform_delta_delete(
-        &self,
-        table_name: &str,
-        project_id: &str,
-        predicate: Option<datafusion::logical_expr::Expr>,
+        &self, table_name: &str, project_id: &str, predicate: Option<datafusion::logical_expr::Expr>,
     ) -> Result<u64, DataFusionError> {
-        crate::dml::perform_delta_delete_internal(
-            self,
-            table_name,
-            project_id,
-            predicate,
-        ).await
+        crate::dml::perform_delta_delete(self, table_name, project_id, predicate).await
     }
-    
+
     /// Build storage options with consistent configuration including DynamoDB locking if enabled
     fn build_storage_options(&self) -> HashMap<String, String> {
         let mut storage_options = HashMap::new();
@@ -174,13 +147,8 @@ impl Database {
             ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
             ("AWS_DEFAULT_REGION", "aws_region"),
         ];
-        
-        storage_options.extend(
-            aws_vars.iter()
-                .filter_map(|(env_key, opt_key)| {
-                    env::var(env_key).ok().map(|val| (opt_key.to_string(), val))
-                })
-        );
+
+        storage_options.extend(aws_vars.iter().filter_map(|(env_key, opt_key)| env::var(env_key).ok().map(|val| (opt_key.to_string(), val))));
 
         // Add endpoint if available
         if let Some(ref endpoint) = self.default_s3_endpoint {
@@ -190,7 +158,7 @@ impl Database {
         // Add DynamoDB locking configuration if enabled
         if env::var("AWS_S3_LOCKING_PROVIDER").ok().as_deref() == Some("dynamodb") {
             storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
-            
+
             let dynamo_vars = [
                 ("DELTA_DYNAMO_TABLE_NAME", "delta_dynamo_table_name"),
                 ("AWS_ACCESS_KEY_ID_DYNAMODB", "aws_access_key_id_dynamodb"),
@@ -198,13 +166,8 @@ impl Database {
                 ("AWS_REGION_DYNAMODB", "aws_region_dynamodb"),
                 ("AWS_ENDPOINT_URL_DYNAMODB", "aws_endpoint_url_dynamodb"),
             ];
-            
-            storage_options.extend(
-                dynamo_vars.iter()
-                    .filter_map(|(env_key, opt_key)| {
-                        env::var(env_key).ok().map(|val| (opt_key.to_string(), val))
-                    })
-            );
+
+            storage_options.extend(dynamo_vars.iter().filter_map(|(env_key, opt_key)| env::var(env_key).ok().map(|val| (opt_key.to_string(), val))));
         }
 
         info!("Storage options configured: {:?}", storage_options);
@@ -221,15 +184,9 @@ impl Database {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(DEFAULT_PAGE_ROW_COUNT_LIMIT);
 
-        let compression_level = env::var("TIMEFUSION_ZSTD_COMPRESSION_LEVEL")
-            .ok()
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(ZSTD_COMPRESSION_LEVEL);
+        let compression_level = env::var("TIMEFUSION_ZSTD_COMPRESSION_LEVEL").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(ZSTD_COMPRESSION_LEVEL);
 
-        let max_row_group_size = env::var("TIMEFUSION_MAX_ROW_GROUP_SIZE")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(134217728); // 128MB
+        let max_row_group_size = env::var("TIMEFUSION_MAX_ROW_GROUP_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(134217728); // 128MB
 
         WriterProperties::builder()
             // Use ZSTD compression with high level for maximum compression ratio
@@ -398,18 +355,16 @@ impl Database {
 
         // Try to connect to config database if URL is provided
         let (config_pool, storage_configs) = match env::var("TIMEFUSION_CONFIG_DATABASE_URL").ok() {
-            Some(db_url) => {
-                match PgPoolOptions::new().max_connections(2).connect(&db_url).await {
-                    Ok(pool) => {
-                        let configs = Self::load_storage_configs(&pool).await.unwrap_or_default();
-                        (Some(pool), configs)
-                    }
-                    Err(_) => {
-                        info!("Could not connect to config database, using default mode");
-                        (None, HashMap::new())
-                    }
+            Some(db_url) => match PgPoolOptions::new().max_connections(2).connect(&db_url).await {
+                Ok(pool) => {
+                    let configs = Self::load_storage_configs(&pool).await.unwrap_or_default();
+                    (Some(pool), configs)
                 }
-            }
+                Err(_) => {
+                    info!("Could not connect to config database, using default mode");
+                    (None, HashMap::new())
+                }
+            },
             None => (None, HashMap::new()),
         };
 
@@ -614,16 +569,15 @@ impl Database {
         Ok(self)
     }
 
-
     /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(self: Arc<Self>) -> SessionContext {
+        use crate::dml::DmlQueryPlanner;
         use datafusion::config::ConfigOptions;
         use datafusion::execution::context::SessionContext;
         use datafusion::execution::runtime_env::RuntimeEnvBuilder;
         use datafusion::execution::SessionStateBuilder;
         use datafusion_tracing::{instrument_with_info_spans, InstrumentationOptions};
         use std::sync::Arc;
-        use crate::dml::DmlQueryPlanner;
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.catalog.information_schema", "true");
@@ -699,15 +653,9 @@ impl Database {
         let runtime_env = Arc::new(runtime_env);
 
         // Set up tracing options with configurable sampling
-        let record_metrics = env::var("TIMEFUSION_TRACING_RECORD_METRICS")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse::<bool>()
-            .unwrap_or(true);
-        
-        let tracing_options = InstrumentationOptions::builder()
-            .record_metrics(record_metrics)
-            .preview_limit(5)
-            .build();
+        let record_metrics = env::var("TIMEFUSION_TRACING_RECORD_METRICS").unwrap_or_else(|_| "true".to_string()).parse::<bool>().unwrap_or(true);
+
+        let tracing_options = InstrumentationOptions::builder().record_metrics(record_metrics).preview_limit(5).build();
 
         // Create instrumentation rule
         let instrument_rule = instrument_with_info_spans!(
@@ -846,7 +794,17 @@ impl Database {
         info!("Registered JSON functions with SessionContext");
     }
 
+    #[instrument(
+        name = "database.resolve_table",
+        skip(self),
+        fields(
+            project_id = %project_id,
+            table.name = %table_name,
+            cache_hit = Empty,
+        )
+    )]
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
+        let span = tracing::Span::current();
         // First check if table already exists
         {
             let project_configs = self.project_configs.read().await;
@@ -858,6 +816,7 @@ impl Database {
             );
             if let Some(table) = project_configs.get(&(project_id.to_string(), table_name.to_string())) {
                 debug!("Found table in cache for project '{}' table '{}'", project_id, table_name);
+                span.record("cache_hit", true);
                 // Check if we have a recent write that might not be visible yet
                 let last_written_version = {
                     let versions = self.last_written_versions.read().await;
@@ -910,11 +869,20 @@ impl Database {
 
         // Table doesn't exist, try to create it
         debug!("Table not found in cache for project '{}' table '{}', creating/loading", project_id, table_name);
+        span.record("cache_hit", false);
         self.get_or_create_table(project_id, table_name)
             .await
             .map_err(|e| DataFusionError::Execution(format!("Failed to get or create table: {}", e)))
     }
 
+    #[instrument(
+        name = "database.get_or_create_table",
+        skip(self),
+        fields(
+            project_id = %project_id,
+            table.name = %table_name,
+        )
+    )]
     pub async fn get_or_create_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
         // Check if table already exists before trying to create
         {
@@ -925,7 +893,8 @@ impl Database {
         }
         // Try to reload configs from database if we have a pool (lazy loading)
         if let Some(ref pool) = self.config_pool
-            && let Ok(new_configs) = Self::load_storage_configs(pool).await {
+            && let Ok(new_configs) = Self::load_storage_configs(pool).await
+        {
             let mut configs = self.storage_configs.write().await;
             *configs = new_configs;
         }
@@ -954,7 +923,8 @@ impl Database {
 
             // Add DynamoDB locking configuration if enabled (even for project-specific configs)
             if let Ok(locking_provider) = env::var("AWS_S3_LOCKING_PROVIDER")
-                && locking_provider == "dynamodb" {
+                && locking_provider == "dynamodb"
+            {
                 storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
                 if let Ok(table_name) = env::var("DELTA_DYNAMO_TABLE_NAME") {
                     storage_options.insert("delta_dynamo_table_name".to_string(), table_name);
@@ -1008,7 +978,9 @@ impl Database {
         }
 
         // Create the base S3 object store
-        let base_store = self.create_object_store(&storage_uri, &storage_options).await?;
+        let base_store = self.create_object_store(&storage_uri, &storage_options)
+            .instrument(tracing::trace_span!("create_object_store"))
+            .await?;
 
         // Wrap with instrumentation for tracing
         let instrumented_store = instrument_object_store(base_store, "s3");
@@ -1017,7 +989,8 @@ impl Database {
         let cached_store = if let Some(ref shared_cache) = self.object_store_cache {
             // Create a new wrapper around the instrumented store using our shared cache
             // This allows the same cache to be used across all tables
-            let cache_wrapped = Arc::new(FoyerObjectStoreCache::new_with_shared_cache(instrumented_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>;
+            let cache_wrapped =
+                Arc::new(FoyerObjectStoreCache::new_with_shared_cache(instrumented_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>;
             // Instrument the cache layer as well to see cache hits/misses
             instrument_object_store(cache_wrapped, "foyer_cache")
         } else {
@@ -1139,21 +1112,25 @@ impl Database {
 
         // Use environment variables as fallback
         if storage_options.get("aws_access_key_id").is_none()
-            && let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
+            && let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID")
+        {
             builder = builder.with_access_key_id(access_key);
         }
         if storage_options.get("aws_secret_access_key").is_none()
-            && let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
+            && let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY")
+        {
             builder = builder.with_secret_access_key(secret_key);
         }
         if storage_options.get("aws_region").is_none()
-            && let Ok(region) = env::var("AWS_DEFAULT_REGION") {
+            && let Ok(region) = env::var("AWS_DEFAULT_REGION")
+        {
             builder = builder.with_region(region);
         }
 
         // Check if we need to use environment variable for endpoint and allow HTTP
         if storage_options.get("aws_endpoint").is_none()
-            && let Ok(endpoint) = env::var("AWS_S3_ENDPOINT") {
+            && let Ok(endpoint) = env::var("AWS_S3_ENDPOINT")
+        {
             builder = builder.with_endpoint(&endpoint);
             if endpoint.starts_with("http://") {
                 builder = builder.with_allow_http(true);
@@ -1164,7 +1141,8 @@ impl Database {
 
         // Log if DynamoDB locking is enabled for this store
         if storage_options.get("aws_s3_locking_provider") == Some(&"dynamodb".to_string())
-            && let Some(table_name) = storage_options.get("delta_dynamo_table_name") {
+            && let Some(table_name) = storage_options.get("delta_dynamo_table_name")
+        {
             debug!("Object store configured with DynamoDB locking using table: {}", table_name);
         }
 
@@ -1186,10 +1164,23 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))
     }
 
+    #[instrument(
+        name = "delta.insert_batch",
+        skip_all,
+        fields(
+            table.name = %table_name,
+            project_id = %project_id,
+            batches.count = batches.len(),
+            rows.count = batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+            use_queue = Empty,
+        )
+    )]
     pub async fn insert_records_batch(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
+        let span = tracing::Span::current();
         let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
 
         if !skip_queue && enable_queue && self.batch_queue.is_some() {
+            span.record("use_queue", true);
             let queue = self.batch_queue.as_ref().unwrap();
             for batch in batches {
                 if let Err(e) = queue.queue(batch) {
@@ -1198,6 +1189,8 @@ impl Database {
             }
             return Ok(());
         }
+        
+        span.record("use_queue", false);
 
         // Extract project_id from first batch if not provided
         let project_id = if project_id.is_empty() && !batches.is_empty() {
@@ -1233,12 +1226,18 @@ impl Database {
                 debug!("Failed to update table before write (attempt {}): {}", retry_count + 1, e);
             }
 
-            let write_op = DeltaOps(table.clone())
-                .write(batches.clone())
-                .with_partition_columns(schema.partitions.clone())
-                .with_writer_properties(writer_properties.clone());
+            let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
+            let write_result = async {
+                DeltaOps(table.clone())
+                    .write(batches.clone())
+                    .with_partition_columns(schema.partitions.clone())
+                    .with_writer_properties(writer_properties.clone())
+                    .await
+            }
+            .instrument(write_span)
+            .await;
 
-            match write_op.await {
+            match write_result {
                 Ok(new_table) => {
                     // Track the version we just wrote
                     if let Some(version) = new_table.version() {
@@ -1562,11 +1561,13 @@ impl ProjectRoutingTable {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
                 if let (Expr::Column(col), Expr::Literal(ScalarValue::Utf8(Some(value)), None)) = (left.as_ref(), right.as_ref())
-                    && col.name == "project_id" {
+                    && col.name == "project_id"
+                {
                     return Some(value.clone());
                 }
                 if let (Expr::Literal(ScalarValue::Utf8(Some(value)), None), Expr::Column(col)) = (left.as_ref(), right.as_ref())
-                    && col.name == "project_id" {
+                    && col.name == "project_id"
+                {
                     return Some(value.clone());
                 }
                 None
@@ -1717,7 +1718,18 @@ impl DataSink for ProjectRoutingTable {
         &self.schema
     }
 
+    #[instrument(
+        name = "datafusion.table.write",
+        skip_all,
+        fields(
+            table.name = %self.table_name,
+            operation = "INSERT",
+            rows.count = Empty,
+            projects.count = Empty,
+        )
+    )]
     async fn write_all(&self, mut data: SendableRecordBatchStream, _context: &Arc<TaskContext>) -> DFResult<u64> {
+        let span = tracing::Span::current();
         let mut total_row_count = 0;
         let mut project_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
 
@@ -1729,6 +1741,9 @@ impl DataSink for ProjectRoutingTable {
             let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
             project_batches.entry(project_id).or_default().push(batch);
         }
+
+        span.record("rows.count", total_row_count);
+        span.record("projects.count", project_batches.len());
 
         if project_batches.is_empty() {
             return Ok(0);
@@ -1743,8 +1758,10 @@ impl DataSink for ProjectRoutingTable {
                 batch_count, row_count, project_id
             );
 
+            let insert_span = tracing::trace_span!(parent: &span, "delta_table.insert", project_id = %project_id, rows = row_count);
             self.database
                 .insert_records_batch(&project_id, &self.table_name, batches, false)
+                .instrument(insert_span)
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("Insert error for project {} table {}: {}", project_id, self.table_name, e)))?;
         }
@@ -1808,17 +1825,45 @@ impl TableProvider for ProjectRoutingTable {
             .collect())
     }
 
+    #[instrument(
+        name = "datafusion.table.scan",
+        skip_all,
+        fields(
+            table.name = %self.table_name,
+            table.project_id = Empty,
+            scan.filters_count = filters.len(),
+            scan.has_limit = limit.is_some(),
+            scan.limit = limit.unwrap_or(0),
+            scan.has_projection = projection.is_some(),
+        )
+    )]
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let span = tracing::Span::current();
+        
         // Apply our custom optimizations to the filters
         let optimized_filters = self.apply_time_series_optimizations(filters)?;
 
         // Get project_id from filters if possible, otherwise use default
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
+        span.record("table.project_id", &project_id.as_str());
 
         // Execute query and create plan with optimized filters
-        let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
+        let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
+        let delta_table = self.database.resolve_table(&project_id, &self.table_name)
+            .instrument(resolve_span)
+            .await?;
         let table = delta_table.read().await;
-        let plan = table.scan(state, projection, &optimized_filters, limit).await?;
+        
+        // Create a span for the table scan that will be the parent for all object store operations
+        let scan_span = tracing::trace_span!("delta_table.scan", 
+            table.name = %self.table_name, 
+            table.project_id = %project_id,
+            partition_filters = ?optimized_filters.iter().filter(|f| matches!(f, Expr::BinaryExpr(_))).count()
+        );
+        
+        let plan = table.scan(state, projection, &optimized_filters, limit)
+            .instrument(scan_span)
+            .await?;
 
         Ok(plan)
     }
@@ -1851,7 +1896,7 @@ impl Drop for Database {
     fn drop(&mut self) {
         // Cancel maintenance tasks immediately
         self.maintenance_shutdown.cancel();
-        
+
         // Note: We can't do async cleanup in Drop, but cancelling the token
         // will cause background tasks to stop, preventing the panic
     }
@@ -1900,7 +1945,7 @@ mod tests {
 
         // Shutdown database
         db.shutdown().await?;
-        
+
         Ok(())
     }
 
@@ -1936,7 +1981,7 @@ mod tests {
 
         // Shutdown database
         db.shutdown().await?;
-        
+
         Ok(())
     }
 
@@ -2009,7 +2054,7 @@ mod tests {
 
         // Shutdown database to ensure proper cleanup
         db.shutdown().await?;
-        
+
         Ok(())
     }
 
@@ -2089,7 +2134,7 @@ mod tests {
 
         // Shutdown database
         db.shutdown().await?;
-        
+
         Ok(())
     }
 
@@ -2152,7 +2197,7 @@ mod tests {
 
         // Shutdown database to ensure proper cleanup
         db.shutdown().await?;
-        
+
         Ok(())
     }
 
@@ -2201,7 +2246,7 @@ mod tests {
 
         // Shutdown database
         db.shutdown().await?;
-        
+
         Ok(())
     }
 
@@ -2246,7 +2291,7 @@ mod tests {
 
         // Shutdown database
         db.shutdown().await?;
-        
+
         Ok(())
     }
 
@@ -2288,7 +2333,7 @@ mod tests {
 
         // Queue shutdown
         queue.shutdown().await;
-        
+
         // Database shutdown
         db.shutdown().await?;
 
@@ -2350,7 +2395,7 @@ mod tests {
 
         // Shutdown database
         db.shutdown().await?;
-        
+
         Ok(())
     }
 }

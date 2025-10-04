@@ -14,7 +14,8 @@ use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
 use futures::Sink;
 use std::sync::Arc;
 use std::fmt::Debug;
-use tracing::info;
+use tracing::{info, instrument, Instrument};
+use tracing::field::Empty;
 
 /// Custom handler factory that creates handlers which log UPDATE queries
 pub struct LoggingHandlerFactory {
@@ -88,6 +89,17 @@ impl LoggingSimpleQueryHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for LoggingSimpleQueryHandler {
+    #[instrument(
+        name = "postgres.query.simple",
+        skip_all,
+        fields(
+            query.text = %query,
+            query.type = Empty,
+            query.operation = Empty,
+            db.system = "postgresql",
+            db.operation = Empty,
+        )
+    )]
     async fn do_query<'a, C>(
         &self,
         client: &mut C,
@@ -98,18 +110,43 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        // Log UPDATE and DELETE queries
-        let query_lower = query.trim().to_lowercase();
-        let is_dml = ["update", "delete"].iter()
-            .any(|&cmd| query_lower.starts_with(cmd) || query_lower.contains(&format!(" {} ", cmd)));
+        let span = tracing::Span::current();
         
-        if is_dml {
-            let cmd_type = if query_lower.contains("update") { "UPDATE" } else { "DELETE" };
-            info!("{} query executed: {}", cmd_type, query);
+        // Determine query type and operation
+        let query_lower = query.trim().to_lowercase();
+        let (query_type, operation) = if query_lower.starts_with("select") || query_lower.contains(" select ") {
+            ("SELECT", "SELECT")
+        } else if query_lower.starts_with("update") || query_lower.contains(" update ") {
+            ("DML", "UPDATE")
+        } else if query_lower.starts_with("delete") || query_lower.contains(" delete ") {
+            ("DML", "DELETE")
+        } else if query_lower.starts_with("insert") || query_lower.contains(" insert ") {
+            ("DML", "INSERT")
+        } else if query_lower.starts_with("create") || query_lower.contains(" create ") {
+            ("DDL", "CREATE")
+        } else if query_lower.starts_with("drop") || query_lower.contains(" drop ") {
+            ("DDL", "DROP")
+        } else if query_lower.starts_with("alter") || query_lower.contains(" alter ") {
+            ("DDL", "ALTER")
+        } else {
+            ("OTHER", "UNKNOWN")
+        };
+        
+        span.record("query.type", query_type);
+        span.record("query.operation", operation);
+        span.record("db.operation", operation);
+        
+        // Log DML queries
+        if query_type == "DML" && (operation == "UPDATE" || operation == "DELETE") {
+            info!("{} query executed: {}", operation, query);
         }
         
-        // Delegate to inner handler
-        <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).await
+        // Delegate to inner handler with the span context
+        // Use the current span as parent to ensure proper context propagation
+        let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
+        <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query)
+            .instrument(execute_span)
+            .await
     }
 }
 
@@ -163,6 +200,19 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         self.inner.do_describe_portal(client, portal).await
     }
 
+    #[instrument(
+        name = "postgres.query.extended",
+        skip_all,
+        fields(
+            query.text = Empty,
+            query.type = Empty,
+            query.operation = Empty,
+            query.portal = %portal.name,
+            query.max_rows = max_rows,
+            db.system = "postgresql",
+            db.operation = Empty,
+        )
+    )]
     async fn do_query<'a, C>(
         &self,
         client: &mut C,
@@ -175,18 +225,46 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        // Log UPDATE and DELETE queries being executed
-        let query = &portal.statement.statement.0;
-        let query_lower = query.trim().to_lowercase();
-        let is_dml = ["update", "delete"].iter()
-            .any(|&cmd| query_lower.starts_with(cmd) || query_lower.contains(&format!(" {} ", cmd)));
+        let span = tracing::Span::current();
         
-        if is_dml {
-            let cmd_type = if query_lower.contains("update") { "UPDATE" } else { "DELETE" };
-            info!("{} query executed (extended): {}", cmd_type, query);
+        // Get query text and determine type
+        let query = &portal.statement.statement.0;
+        span.record("query.text", &query.as_str());
+        
+        let query_lower = query.trim().to_lowercase();
+        let (query_type, operation) = if query_lower.starts_with("select") || query_lower.contains(" select ") {
+            ("SELECT", "SELECT")
+        } else if query_lower.starts_with("update") || query_lower.contains(" update ") {
+            ("DML", "UPDATE")
+        } else if query_lower.starts_with("delete") || query_lower.contains(" delete ") {
+            ("DML", "DELETE")
+        } else if query_lower.starts_with("insert") || query_lower.contains(" insert ") {
+            ("DML", "INSERT")
+        } else if query_lower.starts_with("create") || query_lower.contains(" create ") {
+            ("DDL", "CREATE")
+        } else if query_lower.starts_with("drop") || query_lower.contains(" drop ") {
+            ("DDL", "DROP")
+        } else if query_lower.starts_with("alter") || query_lower.contains(" alter ") {
+            ("DDL", "ALTER")
+        } else {
+            ("OTHER", "UNKNOWN")
+        };
+        
+        span.record("query.type", query_type);
+        span.record("query.operation", operation);
+        span.record("db.operation", operation);
+        
+        // Log DML queries
+        if query_type == "DML" && (operation == "UPDATE" || operation == "DELETE") {
+            info!("{} query executed (extended): {}", operation, query);
         }
         
-        <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).await
+        // Delegate to inner handler with the span context
+        // Use the current span as parent to ensure proper context propagation
+        let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
+        <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows)
+            .instrument(execute_span)
+            .await
     }
 }
 
