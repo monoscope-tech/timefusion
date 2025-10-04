@@ -2,8 +2,7 @@
 
 pub mod batch_queue;
 pub mod database;
-pub mod dml_executor;
-pub mod dml_query_planner;
+pub mod dml;
 pub mod functions;
 pub mod object_store_cache;
 pub mod optimizers;
