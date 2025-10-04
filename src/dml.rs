@@ -45,41 +45,32 @@ impl QueryPlanner for DmlQueryPlanner {
         session_state: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         match logical_plan {
-            LogicalPlan::Dml(dml) => {
-                let input_exec = self.planner
-                    .create_physical_plan(&dml.input, session_state)
-                    .await?;
+            LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {
+                let input_exec = self.planner.create_physical_plan(&dml.input, session_state).await?;
+                let is_update = matches!(dml.op, WriteOp::Update);
+                let (table_name, project_id, predicate, assignments) = 
+                    extract_dml_info(&dml.input, &dml.table_name.to_string(), is_update)?;
                 
-                match dml.op {
-                    WriteOp::Update => {
-                        let (table_name, project_id, predicate, assignments) = 
-                            extract_dml_info(&dml.input, &dml.table_name.to_string(), true)?;
-                        
-                        Ok(Arc::new(DmlExec::update(
-                            table_name,
-                            project_id,
-                            dml.output_schema.clone(),
-                            predicate,
-                            assignments.unwrap_or_default(),
-                            input_exec,
-                            self.database.clone(),
-                        )))
-                    }
-                    WriteOp::Delete => {
-                        let (table_name, project_id, predicate, _) = 
-                            extract_dml_info(&dml.input, &dml.table_name.to_string(), false)?;
-                        
-                        Ok(Arc::new(DmlExec::delete(
-                            table_name,
-                            project_id,
-                            dml.output_schema.clone(),
-                            predicate,
-                            input_exec,
-                            self.database.clone(),
-                        )))
-                    }
-                    _ => self.planner.create_physical_plan(logical_plan, session_state).await,
-                }
+                Ok(Arc::new(if is_update {
+                    DmlExec::update(
+                        table_name,
+                        project_id,
+                        dml.output_schema.clone(),
+                        predicate,
+                        assignments.unwrap_or_default(),
+                        input_exec,
+                        self.database.clone(),
+                    )
+                } else {
+                    DmlExec::delete(
+                        table_name,
+                        project_id,
+                        dml.output_schema.clone(),
+                        predicate,
+                        input_exec,
+                        self.database.clone(),
+                    )
+                }))
             }
             _ => self.planner.create_physical_plan(logical_plan, session_state).await,
         }
@@ -105,53 +96,39 @@ fn extract_dml_info(
             }
             LogicalPlan::Filter(filter) => {
                 predicate = Some(filter.predicate.clone());
-                if let Some(pid) = extract_project_id(&filter.predicate) {
-                    project_id = pid;
-                }
+                project_id = extract_project_id(&filter.predicate).unwrap_or(project_id);
                 current_plan = filter.input.as_ref();
             }
             LogicalPlan::TableScan(scan) => {
                 if !scan.filters.is_empty() {
-                    let combined = scan.filters.iter()
-                        .enumerate()
-                        .fold(None, |acc, (i, filter)| {
-                            if project_id.is_empty() {
-                                if let Some(pid) = extract_project_id(filter) {
-                                    project_id = pid;
-                                }
-                            }
-                            match i {
-                                0 => Some(filter.clone()),
-                                _ => acc.map(|prev| Expr::BinaryExpr(BinaryExpr {
-                                    left: Box::new(prev),
-                                    op: Operator::And,
-                                    right: Box::new(filter.clone()),
-                                })),
-                            }
-                        });
+                    project_id = scan.filters.iter()
+                        .find_map(extract_project_id)
+                        .unwrap_or(project_id);
                     
-                    if predicate.is_none() {
-                        predicate = combined;
-                    }
+                    let combined = scan.filters.iter()
+                        .cloned()
+                        .reduce(|acc, filter| Expr::BinaryExpr(BinaryExpr {
+                            left: Box::new(acc),
+                            op: Operator::And,
+                            right: Box::new(filter),
+                        }));
+                    
+                    predicate = predicate.or(combined);
                 }
                 break;
             }
-            _ => {
-                let inputs = current_plan.inputs();
-                if !inputs.is_empty() {
-                    current_plan = inputs[0];
-                } else {
-                    break;
-                }
+            _ => match current_plan.inputs().first() {
+                Some(input) => current_plan = input,
+                None => break,
             }
         }
     }
     
     if project_id.is_empty() {
-        return Err(DataFusionError::Plan(
-            format!("{} requires a project_id filter in WHERE clause", 
-                if extract_assignments { "UPDATE" } else { "DELETE" })
-        ));
+        return Err(DataFusionError::Plan(format!(
+            "{} requires a project_id filter in WHERE clause",
+            if extract_assignments { "UPDATE" } else { "DELETE" }
+        )));
     }
     
     Ok((table_name.to_string(), project_id, predicate, assignments))
@@ -159,24 +136,17 @@ fn extract_dml_info(
 
 /// Extract assignments from projection
 fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projection) -> Result<Vec<(String, Expr)>> {
-    let fields: Vec<_> = proj.schema.fields().iter()
-        .map(|f| f.name().clone())
-        .collect();
-    
     Ok(proj.expr.iter()
-        .zip(&fields)
-        .filter_map(|(expr, field_name)| {
+        .zip(proj.schema.fields())
+        .filter_map(|(expr, field)| {
+            let field_name = field.name();
             match expr {
-                Expr::Column(col) if col.name == *field_name => None,
-                Expr::Alias(alias) if alias.name == *field_name => {
-                    match &*alias.expr {
-                        Expr::Column(col) if col.name == *field_name => None,
-                        _ => Some((field_name.clone(), (*alias.expr).clone())),
-                    }
-                }
-                _ if !matches!(expr, Expr::Column(_)) => {
-                    Some((field_name.clone(), expr.clone()))
-                }
+                Expr::Column(col) if &col.name == field_name => None,
+                Expr::Alias(alias) if &alias.name == field_name => match &*alias.expr {
+                    Expr::Column(col) if &col.name == field_name => None,
+                    _ => Some((field_name.clone(), (*alias.expr).clone())),
+                },
+                _ if !matches!(expr, Expr::Column(_)) => Some((field_name.clone(), expr.clone())),
                 _ => None,
             }
         })
@@ -188,30 +158,23 @@ fn extract_project_id(expr: &Expr) -> Option<String> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => {
             match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(col), Expr::Literal(val, _)) | 
-                (Expr::Literal(val, _), Expr::Column(col)) if col.name == "project_id" => {
-                    match val {
-                        datafusion::scalar::ScalarValue::Utf8(Some(s)) => Some(s.clone()),
-                        _ => Some(val.to_string()),
-                    }
-                }
+                (Expr::Column(col), Expr::Literal(val, _)) | (Expr::Literal(val, _), Expr::Column(col)) 
+                    if col.name == "project_id" => Some(val.to_string()),
                 _ => None,
             }
         }
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
-            extract_project_id(left).or_else(|| extract_project_id(right))
-        }
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => 
+            extract_project_id(left).or_else(|| extract_project_id(right)),
         _ => None,
     }
 }
 
 /// Unified DML execution plan
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DmlExec {
     op_type: DmlOperation,
     table_name: String,
     project_id: String,
-    table_schema: Arc<DFSchema>,
     predicate: Option<Expr>,
     assignments: Vec<(String, Expr)>,
     input: Arc<dyn ExecutionPlan>,
@@ -225,65 +188,60 @@ enum DmlOperation {
 }
 
 impl DmlExec {
-    pub fn update(
+    fn new(
+        op_type: DmlOperation,
         table_name: String,
         project_id: String,
-        table_schema: Arc<DFSchema>,
         predicate: Option<Expr>,
         assignments: Vec<(String, Expr)>,
         input: Arc<dyn ExecutionPlan>,
         database: Arc<Database>,
     ) -> Self {
-        Self {
-            op_type: DmlOperation::Update,
-            table_name,
-            project_id,
-            table_schema,
-            predicate,
-            assignments,
-            input,
-            database,
-        }
+        Self { op_type, table_name, project_id, predicate, assignments, input, database }
+    }
+
+    pub fn update(
+        table_name: String,
+        project_id: String,
+        _table_schema: Arc<DFSchema>,
+        predicate: Option<Expr>,
+        assignments: Vec<(String, Expr)>,
+        input: Arc<dyn ExecutionPlan>,
+        database: Arc<Database>,
+    ) -> Self {
+        Self::new(DmlOperation::Update, table_name, project_id, predicate, assignments, input, database)
     }
 
     pub fn delete(
         table_name: String,
         project_id: String,
-        table_schema: Arc<DFSchema>,
+        _table_schema: Arc<DFSchema>,
         predicate: Option<Expr>,
         input: Arc<dyn ExecutionPlan>,
         database: Arc<Database>,
     ) -> Self {
-        Self {
-            op_type: DmlOperation::Delete,
-            table_name,
-            project_id,
-            table_schema,
-            predicate,
-            assignments: vec![],
-            input,
-            database,
-        }
+        Self::new(DmlOperation::Delete, table_name, project_id, predicate, vec![], input, database)
     }
 }
 
 impl DisplayAs for DmlExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let op_name = match self.op_type {
+            DmlOperation::Update => "Update",
+            DmlOperation::Delete => "Delete",
+        };
+        
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "Delta{}Exec: table={}, project_id={}", 
-                    if self.op_type == DmlOperation::Update { "Update" } else { "Delete" },
-                    self.table_name, 
-                    self.project_id
-                )?;
+                write!(f, "Delta{}Exec: table={}, project_id={}", op_name, self.table_name, self.project_id)?;
                 
                 if self.op_type == DmlOperation::Update && !self.assignments.is_empty() {
-                    write!(f, ", assignments=[")?;
-                    for (i, (col, expr)) in self.assignments.iter().enumerate() {
-                        if i > 0 { write!(f, ", ")?; }
-                        write!(f, "{} = {}", col, expr)?;
-                    }
-                    write!(f, "]")?;
+                    write!(f, ", assignments=[{}]", 
+                        self.assignments.iter()
+                            .map(|(col, expr)| format!("{} = {}", col, expr))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )?;
                 }
                 
                 if let Some(ref pred) = self.predicate {
@@ -291,9 +249,7 @@ impl DisplayAs for DmlExec {
                 }
                 Ok(())
             }
-            _ => write!(f, "Delta{}Exec", 
-                if self.op_type == DmlOperation::Update { "Update" } else { "Delete" }
-            ),
+            _ => write!(f, "Delta{}Exec", op_name),
         }
     }
 }
@@ -328,14 +284,8 @@ impl ExecutionPlan for DmlExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(Self {
-            op_type: self.op_type.clone(),
-            table_name: self.table_name.clone(),
-            project_id: self.project_id.clone(),
-            table_schema: self.table_schema.clone(),
-            predicate: self.predicate.clone(),
-            assignments: self.assignments.clone(),
             input: children[0].clone(),
-            database: self.database.clone(),
+            ..(*self).clone()
         }))
     }
 
@@ -344,6 +294,14 @@ impl ExecutionPlan for DmlExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let field_name = match self.op_type {
+            DmlOperation::Update => "rows_updated",
+            DmlOperation::Delete => "rows_deleted",
+        };
+        
+        let schema = Arc::new(Schema::new(vec![Field::new(field_name, DataType::Int64, false)]));
+        let schema_clone = schema.clone();
+        
         let op_type = self.op_type.clone();
         let table_name = self.table_name.clone();
         let project_id = self.project_id.clone();
@@ -351,49 +309,27 @@ impl ExecutionPlan for DmlExec {
         let predicate = self.predicate.clone();
         let database = self.database.clone();
 
-        let field_name = match op_type {
-            DmlOperation::Update => "rows_updated",
-            DmlOperation::Delete => "rows_deleted",
-        };
-        
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(field_name, DataType::Int64, false),
-        ]));
-        let schema_clone = schema.clone();
-
         let future = async move {
             let result = match op_type {
-                DmlOperation::Update => {
-                    perform_delta_update(
-                        &database, &table_name, &project_id, predicate, assignments
-                    ).await
-                }
-                DmlOperation::Delete => {
-                    perform_delta_delete(
-                        &database, &table_name, &project_id, predicate
-                    ).await
-                }
+                DmlOperation::Update => perform_delta_update(&database, &table_name, &project_id, predicate, assignments).await,
+                DmlOperation::Delete => perform_delta_delete(&database, &table_name, &project_id, predicate).await,
             };
 
-            match result {
-                Ok(rows_affected) => {
-                    RecordBatch::try_new(
-                        schema_clone,
-                        vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![rows_affected as i64]))],
-                    ).map_err(|e| DataFusionError::External(Box::new(e)))
-                }
-                Err(e) => {
+            result
+                .and_then(|rows| RecordBatch::try_new(
+                    schema_clone,
+                    vec![Arc::new(datafusion::arrow::array::Int64Array::from(vec![rows as i64]))],
+                ).map_err(|e| DataFusionError::External(Box::new(e))))
+                .map_err(|e| {
                     error!("Delta {} failed: {}", 
-                        if matches!(op_type, DmlOperation::Update) { "UPDATE" } else { "DELETE" }, 
+                        match op_type { DmlOperation::Update => "UPDATE", DmlOperation::Delete => "DELETE" }, 
                         e
                     );
-                    Err(e)
-                }
-            }
+                    e
+                })
         };
         
-        let stream = futures::stream::once(future);
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, futures::stream::once(future))))
     }
 }
 
@@ -408,17 +344,17 @@ pub async fn perform_delta_update(
     info!("Performing Delta UPDATE on table {} for project {}", table_name, project_id);
     
     perform_delta_operation(database, table_name, project_id, |delta_table| async move {
-        let mut update_builder = DeltaOps(delta_table).update();
+        let mut builder = DeltaOps(delta_table).update();
         
         if let Some(pred) = predicate {
-            update_builder = update_builder.with_predicate(convert_expr_to_delta(&pred)?);
+            builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
         }
         
         for (column, value_expr) in assignments {
-            update_builder = update_builder.with_update(column, convert_expr_to_delta(&value_expr)?);
+            builder = builder.with_update(column, convert_expr_to_delta(&value_expr)?);
         }
         
-        update_builder.await
+        builder.await
             .map(|(table, metrics)| (table, metrics.num_updated_rows as u64))
             .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta UPDATE: {}", e)))
     }).await
@@ -434,13 +370,13 @@ pub async fn perform_delta_delete(
     info!("Performing Delta DELETE on table {} for project {}", table_name, project_id);
     
     perform_delta_operation(database, table_name, project_id, |delta_table| async move {
-        let mut delete_builder = DeltaOps(delta_table).delete();
+        let mut builder = DeltaOps(delta_table).delete();
         
         if let Some(pred) = predicate {
-            delete_builder = delete_builder.with_predicate(convert_expr_to_delta(&pred)?);
+            builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
         }
         
-        delete_builder.await
+        builder.await
             .map(|(table, metrics)| (table, metrics.num_deleted_rows as u64))
             .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta DELETE: {}", e)))
     }).await
