@@ -25,6 +25,7 @@ use datafusion::{
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
+use deltalake::delta_datafusion::DataFusionMixins;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::PartitionFilter;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
@@ -1856,6 +1857,36 @@ impl TableProvider for ProjectRoutingTable {
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
         let table = delta_table.read().await;
 
+        // Map projection indices from our schema to the Delta table's schema
+        let mapped_projection = if let Some(proj) = projection {
+            // Get the actual Delta table arrow schema directly
+            let snapshot = table.snapshot().map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let delta_arrow_schema = snapshot.arrow_schema()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            
+            // Map projection indices
+            let mut mapped_indices = Vec::new();
+            for &idx in proj {
+                // Get field name from our schema
+                if let Some(field) = self.schema.fields().get(idx) {
+                    let field_name = field.name();
+                    // Find corresponding index in Delta schema
+                    if let Ok(delta_idx) = delta_arrow_schema.index_of(field_name) {
+                        mapped_indices.push(delta_idx);
+                    } else {
+                        // Field not found in Delta schema - this shouldn't happen but handle gracefully
+                        warn!("Field '{}' at index {} not found in Delta table schema", field_name, idx);
+                        return Err(DataFusionError::Plan(format!("Column '{}' not found in table", field_name)));
+                    }
+                } else {
+                    return Err(DataFusionError::Plan(format!("Invalid projection index: {}", idx)));
+                }
+            }
+            Some(mapped_indices)
+        } else {
+            None
+        };
+
         // Create a span for the table scan that will be the parent for all object store operations
         let scan_span = tracing::trace_span!("delta_table.scan",
             table.name = %self.table_name,
@@ -1863,7 +1894,7 @@ impl TableProvider for ProjectRoutingTable {
             partition_filters = ?optimized_filters.iter().filter(|f| matches!(f, Expr::BinaryExpr(_))).count()
         );
 
-        let plan = table.scan(state, projection, &optimized_filters, limit).instrument(scan_span).await?;
+        let plan = table.scan(state, mapped_projection.as_ref(), &optimized_filters, limit).instrument(scan_span).await?;
 
         Ok(plan)
     }
