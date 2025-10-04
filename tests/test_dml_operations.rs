@@ -6,12 +6,7 @@ mod test_dml_operations {
     use std::sync::Arc;
     use timefusion::database::Database;
     use tracing::{info, Level};
-    use tracing_subscriber;
-    use uuid;
-    use dotenv;
     use serial_test::serial;
-    use chrono;
-    use serde_json;
 
     fn init_tracing() {
         let subscriber = tracing_subscriber::fmt()

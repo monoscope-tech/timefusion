@@ -16,6 +16,9 @@ use tracing::{error, info};
 
 use crate::database::Database;
 
+/// Type alias for DML information extracted from logical plan
+type DmlInfo = (String, String, Option<Expr>, Option<Vec<(String, Expr)>>);
+
 /// Custom query planner that intercepts DML operations
 pub struct DmlQueryPlanner {
     planner: DefaultPhysicalPlanner,
@@ -82,7 +85,7 @@ fn extract_dml_info(
     input: &LogicalPlan,
     table_name: &str,
     extract_assignments: bool,
-) -> Result<(String, String, Option<Expr>, Option<Vec<(String, Expr)>>)> {
+) -> Result<DmlInfo> {
     let mut current_plan = input;
     let mut predicate = None;
     let mut assignments = None;
@@ -100,21 +103,21 @@ fn extract_dml_info(
                 current_plan = filter.input.as_ref();
             }
             LogicalPlan::TableScan(scan) => {
-                if !scan.filters.is_empty() {
-                    project_id = scan.filters.iter()
-                        .find_map(extract_project_id)
-                        .unwrap_or(project_id);
-                    
-                    let combined = scan.filters.iter()
-                        .cloned()
-                        .reduce(|acc, filter| Expr::BinaryExpr(BinaryExpr {
-                            left: Box::new(acc),
-                            op: Operator::And,
-                            right: Box::new(filter),
-                        }));
-                    
-                    predicate = predicate.or(combined);
-                }
+                project_id = scan.filters.iter()
+                    .find_map(extract_project_id)
+                    .unwrap_or(project_id);
+                
+                predicate = predicate.or_else(|| {
+                    (!scan.filters.is_empty()).then(|| {
+                        scan.filters.iter()
+                            .cloned()
+                            .reduce(|acc, filter| Expr::BinaryExpr(BinaryExpr {
+                                left: Box::new(acc),
+                                op: Operator::And,
+                                right: Box::new(filter),
+                            }))
+                    }).flatten()
+                });
                 break;
             }
             _ => match current_plan.inputs().first() {
@@ -141,13 +144,12 @@ fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projecti
         .filter_map(|(expr, field)| {
             let field_name = field.name();
             match expr {
-                Expr::Column(col) if &col.name == field_name => None,
-                Expr::Alias(alias) if &alias.name == field_name => match &*alias.expr {
-                    Expr::Column(col) if &col.name == field_name => None,
-                    _ => Some((field_name.clone(), (*alias.expr).clone())),
-                },
-                _ if !matches!(expr, Expr::Column(_)) => Some((field_name.clone(), expr.clone())),
-                _ => None,
+                Expr::Column(col) if col.name == *field_name => None,
+                Expr::Alias(alias) if alias.name == *field_name => 
+                    (!matches!(&*alias.expr, Expr::Column(col) if col.name == *field_name))
+                        .then(|| (field_name.clone(), (*alias.expr).clone())),
+                Expr::Column(_) => None,
+                _ => Some((field_name.clone(), expr.clone())),
             }
         })
         .collect())
@@ -156,13 +158,12 @@ fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projecti
 /// Extract project_id from filter expression
 fn extract_project_id(expr: &Expr) -> Option<String> {
     match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => {
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => 
             match (left.as_ref(), right.as_ref()) {
                 (Expr::Column(col), Expr::Literal(val, _)) | (Expr::Literal(val, _), Expr::Column(col)) 
                     if col.name == "project_id" => Some(val.to_string()),
                 _ => None,
-            }
-        }
+            },
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => 
             extract_project_id(left).or_else(|| extract_project_id(right)),
         _ => None,
@@ -421,7 +422,7 @@ fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
         Expr::Column(col) => Ok(Expr::Column(Column::from_name(&col.name))),
         Expr::BinaryExpr(binary) => Ok(Expr::BinaryExpr(BinaryExpr {
             left: Box::new(convert_expr_to_delta(&binary.left)?),
-            op: binary.op.clone(),
+            op: binary.op,
             right: Box::new(convert_expr_to_delta(&binary.right)?),
         })),
         _ => Ok(expr.clone()),

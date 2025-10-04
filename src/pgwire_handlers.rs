@@ -100,10 +100,12 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
     {
         // Log UPDATE and DELETE queries
         let query_lower = query.trim().to_lowercase();
-        if query_lower.starts_with("update") || query_lower.contains(" update ") {
-            info!("UPDATE query executed: {}", query);
-        } else if query_lower.starts_with("delete") || query_lower.contains(" delete ") {
-            info!("DELETE query executed: {}", query);
+        let is_dml = ["update", "delete"].iter()
+            .any(|&cmd| query_lower.starts_with(cmd) || query_lower.contains(&format!(" {} ", cmd)));
+        
+        if is_dml {
+            let cmd_type = if query_lower.contains("update") { "UPDATE" } else { "DELETE" };
+            info!("{} query executed: {}", cmd_type, query);
         }
         
         // Delegate to inner handler
@@ -174,14 +176,14 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         // Log UPDATE and DELETE queries being executed
-        // portal.statement is an Arc<StoredStatement>, not Option
-        let statement = &portal.statement;
-        let query = &statement.statement.0;
+        let query = &portal.statement.statement.0;
         let query_lower = query.trim().to_lowercase();
-        if query_lower.starts_with("update") || query_lower.contains(" update ") {
-            info!("UPDATE query executed (extended): {}", query);
-        } else if query_lower.starts_with("delete") || query_lower.contains(" delete ") {
-            info!("DELETE query executed (extended): {}", query);
+        let is_dml = ["update", "delete"].iter()
+            .any(|&cmd| query_lower.starts_with(cmd) || query_lower.contains(&format!(" {} ", cmd)));
+        
+        if is_dml {
+            let cmd_type = if query_lower.contains("update") { "UPDATE" } else { "DELETE" };
+            info!("{} query executed (extended): {}", cmd_type, query);
         }
         
         <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).await

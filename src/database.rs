@@ -58,15 +58,14 @@ pub async fn get_delta_table(
 
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
-    batch.schema().fields().iter().position(|f| f.name() == "project_id").and_then(|idx| {
-        let column = batch.column(idx);
-        let string_array = column.as_string::<i32>();
-        if string_array.len() > 0 && !string_array.is_null(0) {
-            Some(string_array.value(0).to_string())
-        } else {
-            None
-        }
-    })
+    batch.schema().fields().iter()
+        .position(|f| f.name() == "project_id")
+        .and_then(|idx| {
+            let column = batch.column(idx);
+            let string_array = column.as_string::<i32>();
+            (string_array.len() > 0 && !string_array.is_null(0))
+                .then(|| string_array.value(0).to_string())
+        })
 }
 
 // Constants for optimization and vacuum operations
@@ -169,16 +168,19 @@ impl Database {
     fn build_storage_options(&self) -> HashMap<String, String> {
         let mut storage_options = HashMap::new();
 
-        // Add AWS credentials
-        if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
-            storage_options.insert("aws_access_key_id".to_string(), access_key);
-        }
-        if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
-            storage_options.insert("aws_secret_access_key".to_string(), secret_key);
-        }
-        if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
-            storage_options.insert("aws_region".to_string(), region);
-        }
+        // Add AWS credentials using iterator
+        let aws_vars = [
+            ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
+            ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
+            ("AWS_DEFAULT_REGION", "aws_region"),
+        ];
+        
+        storage_options.extend(
+            aws_vars.iter()
+                .filter_map(|(env_key, opt_key)| {
+                    env::var(env_key).ok().map(|val| (opt_key.to_string(), val))
+                })
+        );
 
         // Add endpoint if available
         if let Some(ref endpoint) = self.default_s3_endpoint {
@@ -186,32 +188,26 @@ impl Database {
         }
 
         // Add DynamoDB locking configuration if enabled
-        if let Ok(locking_provider) = env::var("AWS_S3_LOCKING_PROVIDER") {
-            if locking_provider == "dynamodb" {
-                storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
-                if let Ok(table_name) = env::var("DELTA_DYNAMO_TABLE_NAME") {
-                    storage_options.insert("delta_dynamo_table_name".to_string(), table_name);
-                }
-
-                // Add DynamoDB-specific credentials if available
-                if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID_DYNAMODB") {
-                    storage_options.insert("aws_access_key_id_dynamodb".to_string(), access_key);
-                }
-                if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY_DYNAMODB") {
-                    storage_options.insert("aws_secret_access_key_dynamodb".to_string(), secret_key);
-                }
-                if let Ok(region) = env::var("AWS_REGION_DYNAMODB") {
-                    storage_options.insert("aws_region_dynamodb".to_string(), region);
-                }
-                if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL_DYNAMODB") {
-                    storage_options.insert("aws_endpoint_url_dynamodb".to_string(), endpoint);
-                }
-            }
+        if env::var("AWS_S3_LOCKING_PROVIDER").ok().as_deref() == Some("dynamodb") {
+            storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
+            
+            let dynamo_vars = [
+                ("DELTA_DYNAMO_TABLE_NAME", "delta_dynamo_table_name"),
+                ("AWS_ACCESS_KEY_ID_DYNAMODB", "aws_access_key_id_dynamodb"),
+                ("AWS_SECRET_ACCESS_KEY_DYNAMODB", "aws_secret_access_key_dynamodb"),
+                ("AWS_REGION_DYNAMODB", "aws_region_dynamodb"),
+                ("AWS_ENDPOINT_URL_DYNAMODB", "aws_endpoint_url_dynamodb"),
+            ];
+            
+            storage_options.extend(
+                dynamo_vars.iter()
+                    .filter_map(|(env_key, opt_key)| {
+                        env::var(env_key).ok().map(|val| (opt_key.to_string(), val))
+                    })
+            );
         }
 
-        // Debug log the storage options
         info!("Storage options configured: {:?}", storage_options);
-
         storage_options
     }
     /// Creates standard writer properties used across different operations
@@ -221,20 +217,18 @@ impl Database {
 
         // Get configurable values from environment
         let page_row_count_limit = env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
-            .unwrap_or_else(|_| DEFAULT_PAGE_ROW_COUNT_LIMIT.to_string())
-            .parse::<usize>()
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(DEFAULT_PAGE_ROW_COUNT_LIMIT);
 
-        // Get compression level from environment (default to ZSTD_COMPRESSION_LEVEL constant)
         let compression_level = env::var("TIMEFUSION_ZSTD_COMPRESSION_LEVEL")
-            .unwrap_or_else(|_| ZSTD_COMPRESSION_LEVEL.to_string())
-            .parse::<i32>()
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(ZSTD_COMPRESSION_LEVEL);
 
-        // Get max row group size from environment (default to 128MB)
         let max_row_group_size = env::var("TIMEFUSION_MAX_ROW_GROUP_SIZE")
-            .unwrap_or_else(|_| "134217728".to_string())
-            .parse::<usize>()
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(134217728); // 128MB
 
         WriterProperties::builder()
@@ -335,6 +329,34 @@ impl Database {
         Ok(map)
     }
 
+    async fn initialize_cache_with_retry() -> Option<Arc<SharedFoyerCache>> {
+        let config = FoyerCacheConfig::from_env();
+        info!(
+            "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, TTL: {}s)",
+            config.memory_size_bytes / 1024 / 1024,
+            config.disk_size_bytes / 1024 / 1024 / 1024,
+            config.ttl.as_secs()
+        );
+
+        for attempt in 1..=3 {
+            match SharedFoyerCache::new(config.clone()).await {
+                Ok(cache) => {
+                    info!("Shared Foyer cache initialized successfully for all tables");
+                    return Some(Arc::new(cache));
+                }
+                Err(e) if attempt < 3 => {
+                    warn!("Failed to initialize shared Foyer cache (attempt {}/3): {}. Retrying...", attempt, e);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    error!("Failed to initialize shared Foyer cache after 3 retries: {}. Continuing without cache.", e);
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
     pub async fn new() -> Result<Self> {
         let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
         let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
@@ -375,60 +397,27 @@ impl Database {
         let default_s3_endpoint = Some(aws_endpoint.clone());
 
         // Try to connect to config database if URL is provided
-        let (config_pool, storage_configs) = if let Ok(db_url) = env::var("TIMEFUSION_CONFIG_DATABASE_URL") {
-            let pool = PgPoolOptions::new().max_connections(2).connect(&db_url).await.ok();
-
-            if let Some(ref p) = pool {
-                let configs = Self::load_storage_configs(p).await.unwrap_or_default();
-                (pool, configs)
-            } else {
-                info!("Could not connect to config database, using default mode");
-                (None, HashMap::new())
+        let (config_pool, storage_configs) = match env::var("TIMEFUSION_CONFIG_DATABASE_URL").ok() {
+            Some(db_url) => {
+                match PgPoolOptions::new().max_connections(2).connect(&db_url).await {
+                    Ok(pool) => {
+                        let configs = Self::load_storage_configs(&pool).await.unwrap_or_default();
+                        (Some(pool), configs)
+                    }
+                    Err(_) => {
+                        info!("Could not connect to config database, using default mode");
+                        (None, HashMap::new())
+                    }
+                }
             }
-        } else {
-            (None, HashMap::new())
+            None => (None, HashMap::new()),
         };
 
         let project_configs = HashMap::new();
 
         // Initialize object store cache BEFORE creating any tables
         // This ensures all tables benefit from caching
-        let object_store_cache = {
-            let config = FoyerCacheConfig::from_env();
-            info!(
-                "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, TTL: {}s)",
-                config.memory_size_bytes / 1024 / 1024,
-                config.disk_size_bytes / 1024 / 1024 / 1024,
-                config.ttl.as_secs()
-            );
-
-            // Retry cache initialization a few times to handle transient failures
-            let mut retry_count = 0;
-            let max_retries = 3;
-            loop {
-                match SharedFoyerCache::new(config.clone()).await {
-                    Ok(cache) => {
-                        info!("Shared Foyer cache initialized successfully for all tables");
-                        break Some(Arc::new(cache));
-                    }
-                    Err(e) => {
-                        retry_count += 1;
-                        if retry_count >= max_retries {
-                            error!(
-                                "Failed to initialize shared Foyer cache after {} retries: {}. Continuing without cache.",
-                                max_retries, e
-                            );
-                            break None;
-                        }
-                        warn!(
-                            "Failed to initialize shared Foyer cache (attempt {}/{}): {}. Retrying...",
-                            retry_count, max_retries, e
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        };
+        let object_store_cache = Self::initialize_cache_with_retry().await;
 
         // Initialize statistics extractor with configurable cache size
         let stats_cache_size = env::var("TIMEFUSION_STATS_CACHE_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
@@ -735,9 +724,7 @@ impl Database {
             .build();
 
         // Create session context with the configured state
-        let ctx = SessionContext::new_with_state(session_state);
-        
-        ctx
+        SessionContext::new_with_state(session_state)
     }
 
     /// Setup the session context with tables and register DataFusion tables
@@ -937,11 +924,10 @@ impl Database {
             }
         }
         // Try to reload configs from database if we have a pool (lazy loading)
-        if let Some(ref pool) = self.config_pool {
-            if let Ok(new_configs) = Self::load_storage_configs(pool).await {
-                let mut configs = self.storage_configs.write().await;
-                *configs = new_configs;
-            }
+        if let Some(ref pool) = self.config_pool
+            && let Ok(new_configs) = Self::load_storage_configs(pool).await {
+            let mut configs = self.storage_configs.write().await;
+            *configs = new_configs;
         }
 
         // Check if we have specific config for this project
@@ -967,26 +953,25 @@ impl Database {
             }
 
             // Add DynamoDB locking configuration if enabled (even for project-specific configs)
-            if let Ok(locking_provider) = env::var("AWS_S3_LOCKING_PROVIDER") {
-                if locking_provider == "dynamodb" {
-                    storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
-                    if let Ok(table_name) = env::var("DELTA_DYNAMO_TABLE_NAME") {
-                        storage_options.insert("delta_dynamo_table_name".to_string(), table_name);
-                    }
+            if let Ok(locking_provider) = env::var("AWS_S3_LOCKING_PROVIDER")
+                && locking_provider == "dynamodb" {
+                storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
+                if let Ok(table_name) = env::var("DELTA_DYNAMO_TABLE_NAME") {
+                    storage_options.insert("delta_dynamo_table_name".to_string(), table_name);
+                }
 
-                    // Add DynamoDB-specific credentials if available
-                    if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID_DYNAMODB") {
-                        storage_options.insert("aws_access_key_id_dynamodb".to_string(), access_key);
-                    }
-                    if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY_DYNAMODB") {
-                        storage_options.insert("aws_secret_access_key_dynamodb".to_string(), secret_key);
-                    }
-                    if let Ok(region) = env::var("AWS_REGION_DYNAMODB") {
-                        storage_options.insert("aws_region_dynamodb".to_string(), region);
-                    }
-                    if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL_DYNAMODB") {
-                        storage_options.insert("aws_endpoint_url_dynamodb".to_string(), endpoint);
-                    }
+                // Add DynamoDB-specific credentials if available
+                if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID_DYNAMODB") {
+                    storage_options.insert("aws_access_key_id_dynamodb".to_string(), access_key);
+                }
+                if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY_DYNAMODB") {
+                    storage_options.insert("aws_secret_access_key_dynamodb".to_string(), secret_key);
+                }
+                if let Ok(region) = env::var("AWS_REGION_DYNAMODB") {
+                    storage_options.insert("aws_region_dynamodb".to_string(), region);
+                }
+                if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL_DYNAMODB") {
+                    storage_options.insert("aws_endpoint_url_dynamodb".to_string(), endpoint);
                 }
             }
 
@@ -1153,39 +1138,34 @@ impl Database {
         }
 
         // Use environment variables as fallback
-        if storage_options.get("aws_access_key_id").is_none() {
-            if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
-                builder = builder.with_access_key_id(access_key);
-            }
+        if storage_options.get("aws_access_key_id").is_none()
+            && let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID") {
+            builder = builder.with_access_key_id(access_key);
         }
-        if storage_options.get("aws_secret_access_key").is_none() {
-            if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
-                builder = builder.with_secret_access_key(secret_key);
-            }
+        if storage_options.get("aws_secret_access_key").is_none()
+            && let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY") {
+            builder = builder.with_secret_access_key(secret_key);
         }
-        if storage_options.get("aws_region").is_none() {
-            if let Ok(region) = env::var("AWS_DEFAULT_REGION") {
-                builder = builder.with_region(region);
-            }
+        if storage_options.get("aws_region").is_none()
+            && let Ok(region) = env::var("AWS_DEFAULT_REGION") {
+            builder = builder.with_region(region);
         }
 
         // Check if we need to use environment variable for endpoint and allow HTTP
-        if storage_options.get("aws_endpoint").is_none() {
-            if let Ok(endpoint) = env::var("AWS_S3_ENDPOINT") {
-                builder = builder.with_endpoint(&endpoint);
-                if endpoint.starts_with("http://") {
-                    builder = builder.with_allow_http(true);
-                }
+        if storage_options.get("aws_endpoint").is_none()
+            && let Ok(endpoint) = env::var("AWS_S3_ENDPOINT") {
+            builder = builder.with_endpoint(&endpoint);
+            if endpoint.starts_with("http://") {
+                builder = builder.with_allow_http(true);
             }
         }
 
         let store = builder.build()?;
 
         // Log if DynamoDB locking is enabled for this store
-        if storage_options.get("aws_s3_locking_provider") == Some(&"dynamodb".to_string()) {
-            if let Some(table_name) = storage_options.get("delta_dynamo_table_name") {
-                debug!("Object store configured with DynamoDB locking using table: {}", table_name);
-            }
+        if storage_options.get("aws_s3_locking_provider") == Some(&"dynamodb".to_string())
+            && let Some(table_name) = storage_options.get("delta_dynamo_table_name") {
+            debug!("Object store configured with DynamoDB locking using table: {}", table_name);
         }
 
         Ok(Arc::new(store))
@@ -1581,15 +1561,13 @@ impl ProjectRoutingTable {
     fn extract_project_id(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
-                if let (Expr::Column(col), Expr::Literal(ScalarValue::Utf8(Some(value)), None)) = (left.as_ref(), right.as_ref()) {
-                    if col.name == "project_id" {
-                        return Some(value.clone());
-                    }
+                if let (Expr::Column(col), Expr::Literal(ScalarValue::Utf8(Some(value)), None)) = (left.as_ref(), right.as_ref())
+                    && col.name == "project_id" {
+                    return Some(value.clone());
                 }
-                if let (Expr::Literal(ScalarValue::Utf8(Some(value)), None), Expr::Column(col)) = (left.as_ref(), right.as_ref()) {
-                    if col.name == "project_id" {
-                        return Some(value.clone());
-                    }
+                if let (Expr::Literal(ScalarValue::Utf8(Some(value)), None), Expr::Column(col)) = (left.as_ref(), right.as_ref())
+                    && col.name == "project_id" {
+                    return Some(value.clone());
                 }
                 None
             }
@@ -1866,6 +1844,16 @@ impl TableProvider for ProjectRoutingTable {
         //         }
         //     })
         // })
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Cancel maintenance tasks immediately
+        self.maintenance_shutdown.cancel();
+        
+        // Note: We can't do async cleanup in Drop, but cancelling the token
+        // will cause background tasks to stop, preventing the panic
     }
 }
 
@@ -2364,15 +2352,5 @@ mod tests {
         db.shutdown().await?;
         
         Ok(())
-    }
-}
-
-impl Drop for Database {
-    fn drop(&mut self) {
-        // Cancel maintenance tasks immediately
-        self.maintenance_shutdown.cancel();
-        
-        // Note: We can't do async cleanup in Drop, but cancelling the token
-        // will cause background tasks to stop, preventing the panic
     }
 }
