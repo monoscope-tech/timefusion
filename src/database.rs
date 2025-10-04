@@ -582,6 +582,7 @@ impl Database {
         use datafusion::execution::SessionStateBuilder;
         use datafusion_tracing::{instrument_with_info_spans, InstrumentationOptions};
         use std::sync::Arc;
+        use crate::dml_query_planner::DmlQueryPlanner;
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.catalog.information_schema", "true");
@@ -672,12 +673,13 @@ impl Database {
             options: tracing_options,
         );
 
-        // Create session state with tracing rule
+        // Create session state with tracing rule and DML support
         let session_state = SessionStateBuilder::new()
             .with_config(options.into())
             .with_runtime_env(runtime_env)
             .with_default_features()
             .with_physical_optimizer_rule(instrument_rule)
+            .with_query_planner(Arc::new(DmlQueryPlanner::new()))
             .build();
 
         // Create session context with the configured state
