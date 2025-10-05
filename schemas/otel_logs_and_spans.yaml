@@ -52,7 +52,7 @@ fields:
     data_type: Utf8
     nullable: true
   - name: severity___severity_number
-    data_type: Utf8
+    data_type: Int32
     nullable: true
   - name: body
     data_type: Utf8
@@ -133,16 +133,16 @@ fields:
     data_type: Int32
     nullable: true
   - name: attributes___code___file___path
-    data_type: Int32
+    data_type: Utf8
     nullable: true
   - name: attributes___code___function___name
-    data_type: Int32
+    data_type: Utf8
     nullable: true
   - name: attributes___code___line___number
     data_type: Int32
     nullable: true
   - name: attributes___code___stacktrace
-    data_type: Int32
+    data_type: Utf8
     nullable: true
   - name: attributes___log__record___original
     data_type: Utf8
