@@ -1,11 +1,12 @@
 use crate::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
-use crate::schema_loader::{get_default_schema, get_schema};
+use crate::schema_loader::{get_default_schema, get_schema, TableSchema};
 use crate::statistics::DeltaStatisticsExtractor;
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use chrono::Utc;
-use datafusion::arrow::array::{Array, AsArray};
+use datafusion::arrow::array::{Array, AsArray, new_null_array};
+use datafusion::arrow::compute::cast;
 use datafusion::common::not_impl_err;
 use datafusion::common::{SchemaExt, Statistics};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
@@ -1164,6 +1165,73 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))
     }
 
+    /// Maps a RecordBatch to match the expected Delta table schema
+    /// This includes reordering columns and coercing types where necessary
+    async fn map_batch_to_delta_schema(&self, batch: &RecordBatch, delta_table: &DeltaTable, _expected_schema: &TableSchema) -> Result<RecordBatch> {
+        // Get the Delta table's current schema
+        let snapshot = delta_table.snapshot()
+            .map_err(|e| anyhow::anyhow!("Failed to get Delta snapshot: {}", e))?;
+        let delta_arrow_schema = snapshot.arrow_schema()
+            .map_err(|e| anyhow::anyhow!("Failed to get Delta arrow schema: {}", e))?;
+        
+        // Build new columns in the order expected by Delta table
+        let mut new_columns = Vec::new();
+        
+        for field in delta_arrow_schema.fields() {
+            let field_name = field.name();
+            
+            // Try to find the column in the incoming batch
+            if let Some((idx, _)) = batch.schema().column_with_name(field_name) {
+                let column = batch.column(idx);
+                
+                // Check if types match, if not try to cast
+                if column.data_type() != field.data_type() {
+                    // Attempt to cast the column to the expected type
+                    match cast(column, field.data_type()) {
+                        Ok(casted_column) => {
+                            new_columns.push(casted_column);
+                        }
+                        Err(e) => {
+                            // If cast fails, log warning and return error
+                            warn!(
+                                "Failed to cast column '{}' from {:?} to {:?}: {}",
+                                field_name,
+                                column.data_type(),
+                                field.data_type(),
+                                e
+                            );
+                            return Err(anyhow::anyhow!(
+                                "Type mismatch for column '{}': cannot cast from {:?} to {:?}",
+                                field_name,
+                                column.data_type(),
+                                field.data_type()
+                            ));
+                        }
+                    }
+                } else {
+                    // Types match, use column as-is
+                    new_columns.push(column.clone());
+                }
+            } else {
+                // Column not found in batch
+                // For nullable columns, create a null array
+                if field.is_nullable() {
+                    let null_array = new_null_array(field.data_type(), batch.num_rows());
+                    new_columns.push(null_array);
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Required column '{}' not found in batch",
+                        field_name
+                    ));
+                }
+            }
+        }
+        
+        // Create new batch with mapped columns
+        RecordBatch::try_new(delta_arrow_schema.clone(), new_columns)
+            .map_err(|e| anyhow::anyhow!("Failed to create mapped batch: {}", e))
+    }
+
     #[instrument(
         name = "delta.insert_batch",
         skip_all,
@@ -1226,11 +1294,26 @@ impl Database {
                 debug!("Failed to update table before write (attempt {}): {}", retry_count + 1, e);
             }
 
+            // Map batches to match Delta table schema
+            let mapped_batches = {
+                let mut mapped = Vec::new();
+                for batch in &batches {
+                    match self.map_batch_to_delta_schema(batch, &table, &schema).await {
+                        Ok(mapped_batch) => mapped.push(mapped_batch),
+                        Err(e) => {
+                            warn!("Failed to map batch to Delta schema: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+                mapped
+            };
+
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
             let write_result = async {
                 // Schema evolution enabled: new columns will be automatically added to the table
                 DeltaOps(table.clone())
-                    .write(batches.clone())
+                    .write(mapped_batches)
                     .with_partition_columns(schema.partitions.clone())
                     .with_writer_properties(writer_properties.clone())
                     .with_save_mode(deltalake::protocol::SaveMode::Append)
