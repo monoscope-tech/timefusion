@@ -2,7 +2,7 @@ use opentelemetry::{trace::TracerProvider, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
-    trace::{RandomIdGenerator, Sampler},
+    trace::{RandomIdGenerator, Sampler, BatchConfig},
     Resource,
 };
 use std::env;
@@ -32,16 +32,27 @@ pub fn init_telemetry() -> anyhow::Result<()> {
         ])
         .build();
 
-    // Create OTLP span exporter
+    // Create OTLP span exporter with increased message size limits
     let span_exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(otlp_endpoint)
         .with_timeout(Duration::from_secs(10))
+        .with_channel(
+            tonic::transport::Channel::builder(otlp_endpoint.parse()?)
+                .max_decoding_message_size(32 * 1024 * 1024) // 32MB
+                .max_encoding_message_size(32 * 1024 * 1024) // 32MB
+        )
         .build()?;
+
+    // Configure batch processor to limit batch sizes
+    let batch_config = BatchConfig::default()
+        .with_max_export_batch_size(512) // Limit batch size to prevent large messages
+        .with_scheduled_delay(Duration::from_secs(5))
+        .with_max_queue_size(2048);
 
     // Build the tracer provider
     let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_batch_exporter(span_exporter)
+        .with_batch_exporter(span_exporter, batch_config)
         .with_sampler(Sampler::AlwaysOn)
         .with_id_generator(RandomIdGenerator::default())
         .with_resource(resource)
