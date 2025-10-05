@@ -64,12 +64,22 @@ pub fn init_telemetry() -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Initialize tracing subscriber with telemetry and formatting layers
+    let is_json = env::var("LOG_FORMAT").unwrap_or_default() == "json";
+    
     let subscriber = Registry::default()
         .with(env_filter)
-        .with(telemetry_layer)
-        .with(tracing_subscriber::fmt::layer().json().with_target(true).with_thread_ids(true).with_thread_names(true));
+        .with(telemetry_layer);
 
-    subscriber.try_init().map_err(|e| anyhow::anyhow!("Failed to set tracing subscriber: {}", e))?;
+    if is_json {
+        subscriber
+            .with(tracing_subscriber::fmt::layer().json().with_target(true).with_thread_ids(true).with_thread_names(true))
+            .try_init()
+    } else {
+        subscriber
+            .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true).with_thread_names(true))
+            .try_init()
+    }
+    .map_err(|e| anyhow::anyhow!("Failed to set tracing subscriber: {}", e))?;
 
     info!("OpenTelemetry initialized successfully with service name: {}", service_name);
 

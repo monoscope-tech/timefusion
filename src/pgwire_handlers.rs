@@ -1,21 +1,21 @@
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
-use datafusion_postgres::{DfSessionService, auth::AuthManager};
-use datafusion_postgres::pgwire::api::auth::{StartupHandler, noop::NoopStartupHandler};
-use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use datafusion_postgres::pgwire::api::results::{Response, DescribeStatementResponse, DescribePortalResponse};
-use datafusion_postgres::pgwire::api::{ClientInfo, PgWireServerHandlers, ErrorHandler};
+use datafusion_postgres::pgwire::api::auth::{noop::NoopStartupHandler, StartupHandler};
 use datafusion_postgres::pgwire::api::portal::Portal;
+use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use datafusion_postgres::pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
 use datafusion_postgres::pgwire::api::stmt::StoredStatement;
 use datafusion_postgres::pgwire::api::store::PortalStore;
 use datafusion_postgres::pgwire::api::ClientPortalStore;
-use datafusion_postgres::pgwire::error::{PgWireResult, PgWireError};
+use datafusion_postgres::pgwire::api::{ClientInfo, ErrorHandler, PgWireServerHandlers};
+use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
+use datafusion_postgres::{auth::AuthManager, DfSessionService};
 use futures::Sink;
-use std::sync::Arc;
 use std::fmt::Debug;
-use tracing::{info, instrument, Instrument};
+use std::sync::Arc;
 use tracing::field::Empty;
+use tracing::{info, instrument, Instrument};
 
 /// Custom handler factory that creates handlers which log UPDATE queries
 pub struct LoggingHandlerFactory {
@@ -25,10 +25,7 @@ pub struct LoggingHandlerFactory {
 
 impl LoggingHandlerFactory {
     pub fn new(session_context: Arc<SessionContext>, auth_manager: Arc<AuthManager>) -> Self {
-        Self {
-            session_context,
-            auth_manager,
-        }
+        Self { session_context, auth_manager }
     }
 }
 
@@ -40,17 +37,11 @@ impl NoopStartupHandler for SimpleStartupHandler {}
 
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        Arc::new(LoggingSimpleQueryHandler::new(
-            self.session_context.clone(),
-            self.auth_manager.clone(),
-        ))
+        Arc::new(LoggingSimpleQueryHandler::new(self.session_context.clone(), self.auth_manager.clone()))
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        Arc::new(LoggingExtendedQueryHandler::new(
-            self.session_context.clone(),
-            self.auth_manager.clone(),
-        ))
+        Arc::new(LoggingExtendedQueryHandler::new(self.session_context.clone(), self.auth_manager.clone()))
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
@@ -100,18 +91,14 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
             db.operation = Empty,
         )
     )]
-    async fn do_query<'a, C>(
-        &self,
-        client: &mut C,
-        query: &str,
-    ) -> PgWireResult<Vec<Response<'a>>>
+    async fn do_query<'a, C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response<'a>>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let span = tracing::Span::current();
-        
+
         // Determine query type and operation
         let query_lower = query.trim().to_lowercase();
         let (query_type, operation) = if query_lower.starts_with("select") || query_lower.contains(" select ") {
@@ -131,11 +118,11 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         } else {
             ("OTHER", "UNKNOWN")
         };
-        
+
         span.record("query.type", query_type);
         span.record("query.operation", operation);
         span.record("db.operation", operation);
-        
+
         // Truncate sensitive data from DML queries
         let sanitized_query = match operation {
             "INSERT" => query_lower.find(" values").map(|i| format!("{} VALUES ...", &query[..i])).unwrap_or_else(|| query.to_string()),
@@ -143,13 +130,11 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
             _ => query.to_string(),
         };
         span.record("query.text", &sanitized_query.as_str());
-        
+
         // Delegate to inner handler with the span context
         // Use the current span as parent to ensure proper context propagation
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
-        <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query)
-            .instrument(execute_span)
-            .await
+        <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span).await
     }
 }
 
@@ -175,11 +160,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         self.inner.query_parser()
     }
 
-    async fn do_describe_statement<C>(
-        &self,
-        client: &mut C,
-        statement: &StoredStatement<Self::Statement>,
-    ) -> PgWireResult<DescribeStatementResponse>
+    async fn do_describe_statement<C>(&self, client: &mut C, statement: &StoredStatement<Self::Statement>) -> PgWireResult<DescribeStatementResponse>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore<Statement = Self::Statement>,
@@ -189,11 +170,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         self.inner.do_describe_statement(client, statement).await
     }
 
-    async fn do_describe_portal<C>(
-        &self,
-        client: &mut C,
-        portal: &Portal<Self::Statement>,
-    ) -> PgWireResult<DescribePortalResponse>
+    async fn do_describe_portal<C>(&self, client: &mut C, portal: &Portal<Self::Statement>) -> PgWireResult<DescribePortalResponse>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore<Statement = Self::Statement>,
@@ -216,12 +193,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
             db.operation = Empty,
         )
     )]
-    async fn do_query<'a, C>(
-        &self,
-        client: &mut C,
-        portal: &Portal<Self::Statement>,
-        max_rows: usize,
-    ) -> PgWireResult<Response<'a>>
+    async fn do_query<'a, C>(&self, client: &mut C, portal: &Portal<Self::Statement>, max_rows: usize) -> PgWireResult<Response<'a>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore<Statement = Self::Statement>,
@@ -229,10 +201,10 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let span = tracing::Span::current();
-        
+
         // Get query text and determine type
         let query = &portal.statement.statement.0;
-        
+
         let query_lower = query.trim().to_lowercase();
         let (query_type, operation) = if query_lower.starts_with("select") || query_lower.contains(" select ") {
             ("SELECT", "SELECT")
@@ -251,11 +223,11 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         } else {
             ("OTHER", "UNKNOWN")
         };
-        
+
         span.record("query.type", query_type);
         span.record("query.operation", operation);
         span.record("db.operation", operation);
-        
+
         // Truncate sensitive data from DML queries
         let sanitized_query = match operation {
             "INSERT" => query_lower.find(" values").map(|i| format!("{} VALUES ...", &query[..i])).unwrap_or_else(|| query.to_string()),
@@ -263,7 +235,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
             _ => query.to_string(),
         };
         span.record("query.text", &sanitized_query.as_str());
-        
+
         // Delegate to inner handler with the span context
         // Use the current span as parent to ensure proper context propagation
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
@@ -275,14 +247,13 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
 
 /// Start the server with custom handlers that log UPDATE queries
 pub async fn serve_with_logging(
-    session_context: Arc<SessionContext>,
-    options: &datafusion_postgres::ServerOptions,
-    auth_manager: Arc<AuthManager>,
+    session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_manager: Arc<AuthManager>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_manager));
-    
+
     // Use datafusion-postgres's serve_with_handlers
     datafusion_postgres::serve_with_handlers(handlers, options).await?;
-    
+
     Ok(())
 }
+
