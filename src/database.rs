@@ -24,6 +24,7 @@ use datafusion::{
 };
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use deltalake::PartitionFilter;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::delta_datafusion::DataFusionMixins;
@@ -215,8 +216,8 @@ impl Database {
 
         loop {
             let mut table_write = table.write().await;
-            match table_write.update().await {
-                Ok(_) => {
+            match table_write.update_state().await {
+                Ok(()) => {
                     if let Some(version) = table_write.version() {
                         debug!("Updated table for {}/{} to version {}", project_id, table_name, version);
                         // Update our version tracking to reflect what we just loaded
@@ -1029,7 +1030,7 @@ impl Database {
                 loop {
                     create_attempts += 1;
 
-                    let delta_ops = DeltaOps::try_from_uri_with_storage_options(Url::parse(&storage_uri)?, storage_options.clone()).await?;
+                    let delta_ops = DeltaOps::try_from_url_with_storage_options(Url::parse(&storage_uri)?, storage_options.clone()).await?;
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                     let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "10".to_string());
@@ -1167,7 +1168,7 @@ impl Database {
     async fn create_or_load_delta_table(
         &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<DeltaTable> {
-        DeltaTableBuilder::from_uri(Url::parse(storage_uri)?)?
+        DeltaTableBuilder::from_url(Url::parse(storage_uri)?)?
             .with_storage_backend(cached_store.clone(), Url::parse(storage_uri)?)
             .with_storage_options(storage_options.clone())
             .with_allow_http(true)
@@ -1233,9 +1234,9 @@ impl Database {
             // Hold the write lock for the entire operation to prevent concurrent conflicts
             let mut table = table_ref.write().await;
 
-            // Update the table to get the latest version before writing
-            if let Err(e) = table.update().await {
-                debug!("Failed to update table before write (attempt {}): {}", retry_count + 1, e);
+            // Update the table state to get the latest version before writing
+            if let Err(e) = table.update_state().await {
+                debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
             }
 
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
@@ -1296,9 +1297,9 @@ impl Database {
                         // Drop the lock and try to reload the table
                         drop(table);
 
-                        // Force a table reload on conflict
-                        if let Err(reload_err) = table_ref.write().await.update().await {
-                            debug!("Failed to reload table after conflict: {}", reload_err);
+                        // Force a table state reload on conflict
+                        if let Err(reload_err) = table_ref.write().await.update_state().await {
+                            debug!("Failed to reload table state after conflict: {}", reload_err);
                         }
                     } else {
                         // Non-retryable error
@@ -1476,12 +1477,12 @@ impl Database {
                     debug!("Vacuum operation details: {:?}", metrics.files_deleted);
                 }
 
-                // Update the table reference with the vacuumed version
+                // Update the table state after vacuum
                 let mut table = table_ref.write().await;
-                if let Ok(()) = table.update().await {
-                    info!("Table updated after vacuum");
+                if table.update_state().await.is_ok() {
+                    info!("Table state updated after vacuum");
                 } else {
-                    error!("Failed to update table after vacuum");
+                    error!("Failed to update table state after vacuum");
                 }
             }
             Err(e) => error!("Vacuum operation failed: {}", e),
@@ -1873,7 +1874,8 @@ impl TableProvider for ProjectRoutingTable {
         let mapped_projection = if let Some(proj) = projection {
             // Get the actual Delta table arrow schema directly
             let snapshot = table.snapshot().map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let delta_arrow_schema = snapshot.arrow_schema().map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let delta_arrow_schema: arrow_schema::Schema =
+                snapshot.schema().as_ref().try_into_arrow().map_err(|e| DataFusionError::External(Box::new(e)))?;
 
             // Map projection indices
             let mut mapped_indices = Vec::new();
