@@ -27,8 +27,9 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use deltalake::PartitionFilter;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
-use deltalake::delta_datafusion::DataFusionMixins;
+use deltalake::datafusion::parquet::file::metadata::SortingColumn;
 use deltalake::kernel::transaction::CommitProperties;
+use deltalake::operations::create::CreateBuilder;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use instrumented_object_store::instrument_object_store;
@@ -176,7 +177,7 @@ impl Database {
         storage_options
     }
     /// Creates standard writer properties used across different operations
-    fn create_writer_properties() -> WriterProperties {
+    fn create_writer_properties(sorting_columns: Vec<SortingColumn>) -> WriterProperties {
         use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
         use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
 
@@ -205,6 +206,8 @@ impl Database {
             .set_statistics_enabled(EnabledStatistics::Page)
             // Set page row count limit for better compression
             .set_data_page_row_count_limit(page_row_count_limit)
+            // Set sorting columns for better query performance on sorted data
+            .set_sorting_columns(Some(sorting_columns))
             .build()
     }
 
@@ -431,7 +434,7 @@ impl Database {
                     Box::pin(async move {
                         info!("Running scheduled light optimize on recent small files");
                         for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
-                            match db.optimize_table_light(table).await {
+                            match db.optimize_table_light(table, table_name).await {
                                 Ok(_) => {
                                     info!("Light optimize completed for project '{}' table '{}'", project_id, table_name);
                                 }
@@ -1030,7 +1033,6 @@ impl Database {
                 loop {
                     create_attempts += 1;
 
-                    let delta_ops = DeltaOps::try_from_url_with_storage_options(Url::parse(&storage_uri)?, storage_options.clone()).await?;
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
                     let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "10".to_string());
@@ -1039,8 +1041,8 @@ impl Database {
                     config.insert("delta.checkpointInterval".to_string(), Some(checkpoint_interval));
                     config.insert("delta.checkpointPolicy".to_string(), Some("v2".to_string()));
 
-                    match delta_ops
-                        .create()
+                    match CreateBuilder::new()
+                        .with_location(&storage_uri)
                         .with_columns(schema.columns().unwrap_or_default())
                         .with_partition_columns(schema.partitions.clone())
                         .with_storage_options(storage_options.clone())
@@ -1223,7 +1225,7 @@ impl Database {
         // Get the appropriate schema for this table
         let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
 
-        let writer_properties = Self::create_writer_properties();
+        let writer_properties = Self::create_writer_properties(schema.sorting_columns());
 
         // Retry logic for concurrent writes
         let max_retries = 5;
@@ -1242,7 +1244,8 @@ impl Database {
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
             let write_result = async {
                 // Schema evolution enabled: new columns will be automatically added to the table
-                DeltaOps(table.clone())
+                table
+                    .clone()
                     .write(batches.clone())
                     .with_partition_columns(schema.partitions.clone())
                     .with_writer_properties(writer_properties.clone())
@@ -1346,14 +1349,15 @@ impl Database {
             PartitionFilter::try_from(("date", "=", yesterday.to_string().as_str()))?,
         ];
 
-        // Run optimize operation with Z-order on the timestamp and id columns
-        let writer_properties = Self::create_writer_properties();
+        // Z-order files for better query performance on timestamp and service_name filters
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let writer_properties = Self::create_writer_properties(schema.sorting_columns());
 
-        let optimize_result = DeltaOps(table_clone)
+        let optimize_result = table_clone
             .optimize()
             .with_filters(&partition_filters)
             .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(
-                get_schema(table_name).unwrap_or_else(get_default_schema).z_order_columns.clone(),
+                schema.z_order_columns.clone(),
             ))
             .with_target_size(target_size as u64)
             .with_writer_properties(writer_properties)
@@ -1394,7 +1398,7 @@ impl Database {
 
     /// Light optimization for small recent files
     /// Targets files < 10MB from today's partition only
-    pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<()> {
+    pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         let start_time = std::time::Instant::now();
         // Get a clone of the table to avoid holding the lock during the operation
         let table_clone = {
@@ -1408,12 +1412,13 @@ impl Database {
         // Create partition filter for today only
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?];
 
-        let optimize_result = DeltaOps(table_clone)
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let optimize_result = table_clone
             .optimize()
             .with_filters(&partition_filters)
             .with_type(deltalake::operations::optimize::OptimizeType::Compact)
             .with_target_size(16 * 1024 * 1024)
-            .with_writer_properties(Self::create_writer_properties())
+            .with_writer_properties(Self::create_writer_properties(schema.sorting_columns()))
             .with_min_commit_interval(tokio::time::Duration::from_secs(30)) // 1 minute min interval
             .await;
 
@@ -1452,7 +1457,7 @@ impl Database {
         };
 
         // Directly run vacuum without dry run to delete old files
-        match DeltaOps(table_clone)
+        match table_clone
             .vacuum()
             .with_retention_period(chrono::Duration::hours(retention_hours as i64))
             .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
@@ -1870,35 +1875,8 @@ impl TableProvider for ProjectRoutingTable {
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
         let table = delta_table.read().await;
 
-        // Map projection indices from our schema to the Delta table's schema
-        let mapped_projection = if let Some(proj) = projection {
-            // Get the actual Delta table arrow schema directly
-            let snapshot = table.snapshot().map_err(|e| DataFusionError::External(Box::new(e)))?;
-            let delta_arrow_schema: arrow_schema::Schema =
-                snapshot.schema().as_ref().try_into_arrow().map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-            // Map projection indices
-            let mut mapped_indices = Vec::new();
-            for &idx in proj {
-                // Get field name from our schema
-                if let Some(field) = self.schema.fields().get(idx) {
-                    let field_name = field.name();
-                    // Find corresponding index in Delta schema
-                    if let Ok(delta_idx) = delta_arrow_schema.index_of(field_name) {
-                        mapped_indices.push(delta_idx);
-                    } else {
-                        // Field not found in Delta schema - this shouldn't happen but handle gracefully
-                        warn!("Field '{}' at index {} not found in Delta table schema", field_name, idx);
-                        return Err(DataFusionError::Plan(format!("Column '{}' not found in table", field_name)));
-                    }
-                } else {
-                    return Err(DataFusionError::Plan(format!("Invalid projection index: {}", idx)));
-                }
-            }
-            Some(mapped_indices)
-        } else {
-            None
-        };
+        // Pass projection directly - delta-rs handles schema mapping internally via SchemaAdapter
+        let mapped_projection = projection.cloned();
 
         // Create a span for the table scan that will be the parent for all object store operations
         let scan_span = tracing::trace_span!("delta_table.scan",
@@ -1967,7 +1945,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_insert_and_query() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
 
@@ -1994,7 +1972,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_multiple_projects() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
 
@@ -2030,7 +2008,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_filtering() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
         use chrono::Utc;
@@ -2103,7 +2081,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_sql_insert() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
         use datafusion::arrow::array::AsArray;
@@ -2145,7 +2123,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_multi_row_sql_insert() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
         use datafusion::arrow::array::AsArray;
@@ -2183,7 +2161,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_timestamp_operations() -> Result<()> {
         let (db, ctx) = setup_test_database().await?;
         use chrono::Utc;
@@ -2246,7 +2224,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_writes_same_project() -> Result<()> {
         dotenv::dotenv().ok();
         // Use same test environment as other tests
@@ -2295,7 +2273,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_table_creation() -> Result<()> {
         dotenv::dotenv().ok();
         // Use same test environment as other tests
@@ -2340,7 +2318,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_batch_queue_under_load() -> Result<()> {
         use crate::batch_queue::BatchQueue;
 
@@ -2385,7 +2363,7 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_mixed_operations() -> Result<()> {
         dotenv::dotenv().ok();
         // Use same test environment as other tests
