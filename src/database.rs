@@ -673,7 +673,19 @@ impl Database {
             .build();
 
         // Create session context with the configured state
-        SessionContext::new_with_state(session_state)
+        let ctx = SessionContext::new_with_state(session_state);
+
+        // Initialize pg_catalog support asynchronously
+        let ctx_clone = ctx.clone();
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Err(e) = crate::pg_catalog_integration::init_pg_catalog(&ctx_clone).await {
+                    warn!("Failed to initialize pg_catalog: {}", e);
+                }
+            })
+        });
+
+        ctx
     }
 
     /// Setup the session context with tables and register DataFusion tables
