@@ -1,4 +1,5 @@
 use anyhow::Result;
+use datafusion::arrow::array::Array;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Statistics;
 use datafusion::common::stats::Precision;
@@ -90,39 +91,45 @@ impl DeltaStatisticsExtractor {
         Ok(stats)
     }
 
-    /// Calculate table-level statistics
+    /// Calculate table-level statistics using add_actions_table
     async fn calculate_table_stats(&self, table: &DeltaTable) -> Result<(u64, u64)> {
+
         let snapshot = table.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {}", e))?;
 
-        // Try to get actual statistics from Delta log
-        let _metadata = snapshot.metadata();
+        // Get add actions as a RecordBatch with flattened schema
+        let actions_batch = snapshot.add_actions_table(true)
+            .map_err(|e| anyhow::anyhow!("Failed to get add actions: {}", e))?;
 
-        // Get file actions to calculate real stats
-        let log_store = table.log_store();
-        let file_actions = snapshot.file_actions(log_store.as_ref()).await?;
         let mut total_rows = 0u64;
         let mut total_bytes = 0u64;
-        let mut has_row_stats = false;
+        let num_files = actions_batch.num_rows() as u64;
 
-        for action in file_actions {
-            // Delta stores actual row count and size in the log
-            if let Some(num_records) = action
-                .stats
-                .as_ref()
-                .and_then(|stats| serde_json::from_str::<serde_json::Value>(stats).ok())
-                .and_then(|parsed| parsed.get("numRecords").and_then(|v| v.as_u64()))
-            {
-                total_rows += num_records;
-                has_row_stats = true;
+        // Try to get size_bytes column
+        if let Some(size_col) = actions_batch.column_by_name("size_bytes") {
+            if let Some(int_array) = size_col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
+                for i in 0..int_array.len() {
+                    if !int_array.is_null(i) {
+                        total_bytes += int_array.value(i) as u64;
+                    }
+                }
             }
-            total_bytes += action.size as u64;
         }
 
-        // Fallback to estimates if stats not available
-        if !has_row_stats {
-            let log_store = table.log_store();
-            let num_files = snapshot.file_actions(log_store.as_ref()).await?.len() as u64;
-            let page_row_limit = std::env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20_000);
+        // Try to get numRecords from stats column if available
+        if let Some(stats_col) = actions_batch.column_by_name("stats.numRecords") {
+            if let Some(int_array) = stats_col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
+                for i in 0..int_array.len() {
+                    if !int_array.is_null(i) {
+                        total_rows += int_array.value(i) as u64;
+                    }
+                }
+            }
+        } else {
+            // Fallback: estimate rows based on file count
+            let page_row_limit = std::env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(20_000);
             total_rows = num_files * page_row_limit;
         }
 
