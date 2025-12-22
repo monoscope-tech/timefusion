@@ -1,6 +1,6 @@
 use arrow::datatypes::DataType as ArrowDataType;
 use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
-use delta_kernel::parquet::format::SortingColumn;
+use deltalake::datafusion::parquet::file::metadata::SortingColumn;
 use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
@@ -53,11 +53,29 @@ impl TableSchema {
     }
 
     pub fn schema_ref(&self) -> SchemaRef {
-        let fields = self.fields().unwrap_or_else(|e| {
+        // Return schema with partition columns moved to the end to match Delta Lake's output order
+        let all_fields = self.fields().unwrap_or_else(|e| {
             log::error!("Failed to get fields: {:?}", e);
             Vec::new()
         });
-        Arc::new(Schema::new(fields))
+
+        let partition_set: std::collections::HashSet<&str> = self.partitions.iter().map(|s| s.as_str()).collect();
+
+        // Separate non-partition and partition fields, maintaining order within each group
+        let mut non_partition_fields = Vec::new();
+        let mut partition_fields = Vec::new();
+
+        for field in all_fields {
+            if partition_set.contains(field.name().as_str()) {
+                partition_fields.push(field);
+            } else {
+                non_partition_fields.push(field);
+            }
+        }
+
+        // Combine: non-partition fields first, then partition fields at the end
+        non_partition_fields.extend(partition_fields);
+        Arc::new(Schema::new(non_partition_fields))
     }
 
     pub fn sorting_columns(&self) -> Vec<SortingColumn> {

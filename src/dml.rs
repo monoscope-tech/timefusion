@@ -17,7 +17,6 @@ use datafusion::{
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
-use deltalake::DeltaOps;
 use tracing::field::Empty;
 use tracing::{Instrument, error, info, instrument};
 
@@ -377,7 +376,7 @@ pub async fn perform_delta_update(
 
     let span = tracing::Span::current();
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| async move {
-        let mut builder = DeltaOps(delta_table).update();
+        let mut builder = delta_table.update();
 
         if let Some(pred) = predicate {
             builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
@@ -417,7 +416,7 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
 
     let span = tracing::Span::current();
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| async move {
-        let mut builder = DeltaOps(delta_table).delete();
+        let mut builder = delta_table.delete();
 
         if let Some(pred) = predicate {
             builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
