@@ -68,8 +68,8 @@ impl QueryPlanner for DmlQueryPlanner {
                 let is_update = matches!(dml.op, WriteOp::Update);
                 let (table_name, project_id, predicate, assignments) = extract_dml_info(&dml.input, &dml.table_name.to_string(), is_update)?;
 
-                span.record("table.name", &table_name.as_str());
-                span.record("project_id", &project_id.as_str());
+                span.record("table.name", table_name.as_str());
+                span.record("project_id", project_id.as_str());
 
                 Ok(Arc::new(if is_update {
                     DmlExec::update(
@@ -328,11 +328,8 @@ impl ExecutionPlan for DmlExec {
                 }
             };
 
-            match &result {
-                Ok(rows) => {
-                    span.record("rows.affected", rows);
-                }
-                Err(_) => {}
+            if let Ok(rows) = &result {
+                span.record("rows.affected", rows);
             }
 
             result

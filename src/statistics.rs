@@ -105,12 +105,12 @@ impl DeltaStatisticsExtractor {
         let num_files = actions_batch.num_rows() as u64;
 
         // Try to get size_bytes column
-        if let Some(size_col) = actions_batch.column_by_name("size_bytes") {
-            if let Some(int_array) = size_col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>() {
-                for i in 0..int_array.len() {
-                    if !int_array.is_null(i) {
-                        total_bytes += int_array.value(i) as u64;
-                    }
+        if let Some(size_col) = actions_batch.column_by_name("size_bytes")
+            && let Some(int_array) = size_col.as_any().downcast_ref::<datafusion::arrow::array::Int64Array>()
+        {
+            for i in 0..int_array.len() {
+                if !int_array.is_null(i) {
+                    total_bytes += int_array.value(i) as u64;
                 }
             }
         }

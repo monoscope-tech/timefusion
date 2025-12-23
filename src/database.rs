@@ -24,7 +24,6 @@ use datafusion::{
 };
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use deltalake::PartitionFilter;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::datafusion::parquet::file::metadata::SortingColumn;
@@ -1004,11 +1003,9 @@ impl Database {
         let cached_store = if let Some(ref shared_cache) = self.object_store_cache {
             // Create a new wrapper around the instrumented store using our shared cache
             // This allows the same cache to be used across all tables
-            let cache_wrapped =
-                Arc::new(FoyerObjectStoreCache::new_with_shared_cache(instrumented_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>;
             // Note: We don't double-instrument with instrument_object_store here since FoyerObjectStoreCache
             // already has its own instrumentation that properly propagates parent spans
-            cache_wrapped
+            Arc::new(FoyerObjectStoreCache::new_with_shared_cache(instrumented_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>
         } else {
             warn!("Shared Foyer cache not initialized, using uncached object store");
             instrumented_store
@@ -1868,7 +1865,7 @@ impl TableProvider for ProjectRoutingTable {
 
         // Get project_id from filters if possible, otherwise use default
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
-        span.record("table.project_id", &project_id.as_str());
+        span.record("table.project_id", project_id.as_str());
 
         // Execute query and create plan with optimized filters
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
