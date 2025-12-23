@@ -44,15 +44,6 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    services:
-      minio:
-        image: bitnami/minio:latest
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        options: --health-cmd "curl -f http://localhost:9000/minio/health/live" --health-interval 10s --health-timeout 5s --health-retries 10
     env:
       AWS_SDK_LOAD_CONFIG: "false"
       AWS_ENDPOINT_URL: http://127.0.0.1:9000
@@ -78,6 +69,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      - name: Start MinIO
+        run: |
+          docker run -d -p 9000:9000 --name minio \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          sleep 5
+          until curl -sf http://localhost:9000/minio/health/live; do sleep 1; done
 
       - name: Install AWS CLI
         run: |

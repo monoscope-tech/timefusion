@@ -29,7 +29,7 @@ use deltalake::datafusion::parquet::file::metadata::SortingColumn;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::operations::create::CreateBuilder;
-use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
+use deltalake::{DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use instrumented_object_store::instrument_object_store;
 use serde::{Deserialize, Serialize};
@@ -172,7 +172,8 @@ impl Database {
             storage_options.extend(dynamo_vars.iter().filter_map(|(env_key, opt_key)| env::var(env_key).ok().map(|val| (opt_key.to_string(), val))));
         }
 
-        info!("Storage options configured: {:?}", storage_options);
+        let safe_options: HashMap<_, _> = storage_options.iter().filter(|(k, _)| !k.contains("secret") && !k.contains("password")).collect();
+        info!("Storage options configured: {:?}", safe_options);
         storage_options
     }
     /// Creates standard writer properties used across different operations
