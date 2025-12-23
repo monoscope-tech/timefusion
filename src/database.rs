@@ -207,7 +207,7 @@ impl Database {
             // Set page row count limit for better compression
             .set_data_page_row_count_limit(page_row_count_limit)
             // Set sorting columns for better query performance on sorted data
-            .set_sorting_columns(Some(sorting_columns))
+            .set_sorting_columns(if sorting_columns.is_empty() { None } else { Some(sorting_columns) })
             .build()
     }
 
