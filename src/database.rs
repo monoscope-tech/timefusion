@@ -9,8 +9,8 @@ use datafusion::arrow::array::{Array, AsArray};
 use datafusion::common::not_impl_err;
 use datafusion::common::{SchemaExt, Statistics};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
-use datafusion::execution::context::SessionContext;
 use datafusion::execution::TaskContext;
+use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 // Removed unused imports
 use datafusion::physical_plan::DisplayAs;
@@ -19,27 +19,27 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{dml::InsertOp, BinaryExpr},
+    logical_expr::{BinaryExpr, dml::InsertOp},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
 };
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
+use deltalake::PartitionFilter;
 use deltalake::datafusion::parquet::file::metadata::SortingColumn;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::operations::create::CreateBuilder;
-use deltalake::PartitionFilter;
 use deltalake::{DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use instrumented_object_store::instrument_object_store;
 use serde::{Deserialize, Serialize};
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::fmt;
 use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::field::Empty;
-use tracing::{debug, error, info, instrument, warn, Instrument};
+use tracing::{Instrument, debug, error, info, instrument, warn};
 use url::Url;
 
 // Changed to support multiple tables per project: (project_id, table_name) -> DeltaTable
@@ -578,10 +578,10 @@ impl Database {
     pub fn create_session_context(self: Arc<Self>) -> SessionContext {
         use crate::dml::DmlQueryPlanner;
         use datafusion::config::ConfigOptions;
+        use datafusion::execution::SessionStateBuilder;
         use datafusion::execution::context::SessionContext;
         use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-        use datafusion::execution::SessionStateBuilder;
-        use datafusion_tracing::{instrument_with_info_spans, InstrumentationOptions};
+        use datafusion_tracing::{InstrumentationOptions, instrument_with_info_spans};
         use std::sync::Arc;
 
         let mut options = ConfigOptions::new();
@@ -676,10 +676,7 @@ impl Database {
             .with_query_planner(Arc::new(DmlQueryPlanner::new(self.clone())))
             .build();
 
-        // Create session context with the configured state
-        let ctx = SessionContext::new_with_state(session_state);
-
-        ctx
+        SessionContext::new_with_state(session_state)
     }
 
     /// Setup the session context with tables and register DataFusion tables
@@ -765,7 +762,7 @@ impl Database {
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
         use datafusion::arrow::array::{StringArray, StringBuilder};
         use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{create_udf, ColumnarValue, ScalarFunctionImplementation, Volatility};
+        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
