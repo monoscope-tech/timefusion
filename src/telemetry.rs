@@ -1,15 +1,15 @@
-use opentelemetry::{trace::TracerProvider, KeyValue};
+use opentelemetry::{KeyValue, trace::TracerProvider};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
+    Resource,
     propagation::TraceContextPropagator,
     trace::{RandomIdGenerator, Sampler},
-    Resource,
 };
 use std::env;
 use std::time::Duration;
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Registry};
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 pub fn init_telemetry() -> anyhow::Result<()> {
     // Set global propagator for trace context
@@ -65,10 +65,8 @@ pub fn init_telemetry() -> anyhow::Result<()> {
 
     // Initialize tracing subscriber with telemetry and formatting layers
     let is_json = env::var("LOG_FORMAT").unwrap_or_default() == "json";
-    
-    let subscriber = Registry::default()
-        .with(env_filter)
-        .with(telemetry_layer);
+
+    let subscriber = Registry::default().with(env_filter).with(telemetry_layer);
 
     if is_json {
         subscriber
@@ -91,4 +89,3 @@ pub fn shutdown_telemetry() {
     // Note: In OpenTelemetry 0.31, there's no global shutdown function
     // The tracer provider will be shut down when dropped
 }
-

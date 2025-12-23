@@ -41,7 +41,10 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
     // Get baseline stats after writes
     let stats_after_write = shared_cache.get_stats().await;
     assert_eq!(stats_after_write.main.inner_puts, 3, "Should have written to inner store 3 times");
-    assert_eq!(stats_after_write.main.inner_gets, 3, "Should have fetched from inner store 3 times during write");
+    assert_eq!(
+        stats_after_write.main.inner_gets, 3,
+        "Should have fetched from inner store 3 times during write"
+    );
 
     // First read - should hit cache since we cache on write
     let start = Instant::now();
@@ -148,7 +151,6 @@ async fn test_large_file_disk_caching() -> Result<()> {
     Ok(())
 }
 
-
 #[tokio::test]
 async fn test_cache_with_database_integration() -> Result<()> {
     // Configure cache with specific test settings
@@ -177,102 +179,110 @@ async fn test_cache_with_database_integration() -> Result<()> {
 async fn test_parquet_metadata_cache_performance() -> Result<()> {
     // Use in-memory store for testing
     let inner = Arc::new(object_store::memory::InMemory::new());
-    
+
     // Configure cache with metadata optimization
     let config = FoyerCacheConfig {
-        memory_size_bytes: 50 * 1024 * 1024,  // 50MB
-        disk_size_bytes: 100 * 1024 * 1024,   // 100MB
+        memory_size_bytes: 50 * 1024 * 1024, // 50MB
+        disk_size_bytes: 100 * 1024 * 1024,  // 100MB
         ttl: std::time::Duration::from_secs(300),
         cache_dir: std::path::PathBuf::from("/tmp/test_parquet_metadata_perf"),
         shards: 4,
-        file_size_bytes: 4 * 1024 * 1024,     // 4MB
+        file_size_bytes: 4 * 1024 * 1024, // 4MB
         enable_stats: true,
-        parquet_metadata_size_hint: 1_048_576, // 1MB
+        parquet_metadata_size_hint: 1_048_576,        // 1MB
         metadata_memory_size_bytes: 20 * 1024 * 1024, // 20MB
         metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB
         metadata_shards: 2,
     };
-    
+
     // Clean up cache directory
     let cache_dir = config.cache_dir.clone();
     let _ = std::fs::remove_dir_all(&cache_dir);
-    
+
     let cache = Arc::new(FoyerObjectStoreCache::new(inner.clone(), config).await?);
-    
+
     // Create multiple large parquet files (simulating real scenario)
     let file_count = 10;
     let file_size = 50 * 1024 * 1024; // 50MB each
-    let metadata_size = 1024 * 1024;   // 1MB metadata
-    
+    let metadata_size = 1024 * 1024; // 1MB metadata
+
     println!("Creating {} parquet files of {}MB each...", file_count, file_size / 1024 / 1024);
-    
+
     for i in 0..file_count {
         let path = Path::from(format!("data/part-{:04}.parquet", i));
         let data = vec![b'x'; file_size];
         inner.put(&path, PutPayload::from(Bytes::from(data))).await?;
     }
-    
+
     // Get initial stats
     let initial_stats = cache.get_stats().await;
-    
+
     // Test 1: Read metadata from all files (cold cache)
     println!("\nTest 1: Reading metadata with cold cache...");
     let start = Instant::now();
-    
+
     for i in 0..file_count {
         let path = Path::from(format!("data/part-{:04}.parquet", i));
         let metadata_range = (file_size - metadata_size) as u64..file_size as u64;
         let _ = cache.get_range(&path, metadata_range).await?;
     }
-    
+
     let cold_duration = start.elapsed();
     let cold_stats = cache.get_stats().await;
-    
+
     println!("Cold cache duration: {:?}", cold_duration);
-    println!("Cold cache stats: metadata_hits={}, metadata_misses={}, metadata_inner_gets={}", 
-             cold_stats.metadata.hits - initial_stats.metadata.hits, 
-             cold_stats.metadata.misses - initial_stats.metadata.misses, 
-             cold_stats.metadata.inner_gets - initial_stats.metadata.inner_gets);
-    
+    println!(
+        "Cold cache stats: metadata_hits={}, metadata_misses={}, metadata_inner_gets={}",
+        cold_stats.metadata.hits - initial_stats.metadata.hits,
+        cold_stats.metadata.misses - initial_stats.metadata.misses,
+        cold_stats.metadata.inner_gets - initial_stats.metadata.inner_gets
+    );
+
     // Test 2: Read metadata again (warm cache)
     println!("\nTest 2: Reading metadata with warm cache...");
     let start = Instant::now();
-    
+
     for i in 0..file_count {
         let path = Path::from(format!("data/part-{:04}.parquet", i));
         let metadata_range = (file_size - metadata_size) as u64..file_size as u64;
         let _ = cache.get_range(&path, metadata_range).await?;
     }
-    
+
     let warm_duration = start.elapsed();
     let final_stats = cache.get_stats().await;
-    
+
     println!("Warm cache duration: {:?}", warm_duration);
-    println!("Final stats: metadata_hits={}, metadata_misses={}, metadata_inner_gets={}", 
-             final_stats.metadata.hits, final_stats.metadata.misses, final_stats.metadata.inner_gets);
-    
+    println!(
+        "Final stats: metadata_hits={}, metadata_misses={}, metadata_inner_gets={}",
+        final_stats.metadata.hits, final_stats.metadata.misses, final_stats.metadata.inner_gets
+    );
+
     // Calculate speedup
     let speedup = cold_duration.as_secs_f64() / warm_duration.as_secs_f64();
     println!("\nSpeedup: {:.2}x", speedup);
-    
+
     // Calculate data savings
     let cold_inner_gets = cold_stats.metadata.inner_gets - initial_stats.metadata.inner_gets;
     let data_fetched = cold_inner_gets as usize * metadata_size;
     let data_saved = file_count * file_size - data_fetched;
-    println!("Data fetched: {}MB (instead of {}MB)", 
-             data_fetched / 1024 / 1024, 
-             file_count * file_size / 1024 / 1024);
-    println!("Data saved: {}MB ({:.1}% reduction)", 
-             data_saved / 1024 / 1024,
-             (data_saved as f64 / (file_count * file_size) as f64) * 100.0);
-    
+    println!(
+        "Data fetched: {}MB (instead of {}MB)",
+        data_fetched / 1024 / 1024,
+        file_count * file_size / 1024 / 1024
+    );
+    println!(
+        "Data saved: {}MB ({:.1}% reduction)",
+        data_saved / 1024 / 1024,
+        (data_saved as f64 / (file_count * file_size) as f64) * 100.0
+    );
+
     // Verify correctness
     assert_eq!(final_stats.metadata.hits - cold_stats.metadata.hits, file_count as u64);
     assert_eq!(final_stats.metadata.inner_gets, cold_stats.metadata.inner_gets); // No new fetches
-    
+
     // Clean up
     cache.shutdown().await?;
     let _ = std::fs::remove_dir_all(&cache_dir);
-    
+
     Ok(())
 }

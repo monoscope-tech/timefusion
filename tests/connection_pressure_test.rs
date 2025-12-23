@@ -9,8 +9,8 @@ mod connection_pressure {
     use dotenv::dotenv;
     use rand::Rng;
     use serial_test::serial;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use timefusion::database::Database;
     use tokio::sync::Notify;
@@ -265,7 +265,8 @@ mod connection_pressure {
                                 ),
                             )
                             .await
-                            .is_err() {
+                            .is_err()
+                            {
                                 write_errs.fetch_add(1, Ordering::Relaxed);
                                 eprintln!("Write error or timeout");
                             }
@@ -349,4 +350,3 @@ mod connection_pressure {
         Ok(())
     }
 }
-

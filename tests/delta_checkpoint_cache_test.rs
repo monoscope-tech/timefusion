@@ -12,7 +12,7 @@ use timefusion::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, Sh
 async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
     // Clean up any existing cache directory
     let _ = std::fs::remove_dir_all("/tmp/test_foyer_delta_checkpoint_cache");
-    
+
     // Create config with checkpoint caching disabled (default)
     let config = FoyerCacheConfig::test_config("delta_checkpoint_cache");
 
@@ -91,7 +91,7 @@ async fn test_delta_checkpoint_cache_behavior() -> anyhow::Result<()> {
 async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     // Clean up any existing cache directory
     let _ = std::fs::remove_dir_all("/tmp/test_foyer_checkpoint_invalidation");
-    
+
     // Create config with checkpoint caching ENABLED to test invalidation
     let config = FoyerCacheConfig::test_config_with("checkpoint_invalidation", |c| {
         c.ttl = Duration::from_secs(60); // Longer TTL to test invalidation
@@ -150,7 +150,11 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     assert_eq!(data4, new_checkpoint_data, "Should get new checkpoint data after invalidation");
     let stats7 = cache.get_stats().await;
     // Should be a hit because invalidate_checkpoint_cache now immediately refreshes the cache
-    assert_eq!(stats7.main.hits - stats6.main.hits, 1, "Should hit cache after invalidation (cache was refreshed)");
+    assert_eq!(
+        stats7.main.hits - stats6.main.hits,
+        1,
+        "Should hit cache after invalidation (cache was refreshed)"
+    );
 
     // Cleanup
     cache.shutdown().await?;
@@ -164,7 +168,7 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
 async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     // Clean up any existing cache directory
     let _ = std::fs::remove_dir_all("/tmp/test_foyer_delta_ttl");
-    
+
     let config = FoyerCacheConfig::test_config_with("delta_ttl", |c| {
         c.ttl = Duration::from_millis(100); // Very short TTL for test
         // All files now use the same TTL in unified caching approach

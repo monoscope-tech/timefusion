@@ -1,7 +1,7 @@
 use anyhow::Result;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::stats::Precision;
 use datafusion::common::Statistics;
+use datafusion::common::stats::Precision;
 use deltalake::DeltaTable;
 use lru::LruCache;
 use std::num::NonZeroUsize;
@@ -106,9 +106,12 @@ impl DeltaStatisticsExtractor {
 
         for action in file_actions {
             // Delta stores actual row count and size in the log
-            if let Some(num_records) = action.stats.as_ref()
+            if let Some(num_records) = action
+                .stats
+                .as_ref()
                 .and_then(|stats| serde_json::from_str::<serde_json::Value>(stats).ok())
-                .and_then(|parsed| parsed.get("numRecords").and_then(|v| v.as_u64())) {
+                .and_then(|parsed| parsed.get("numRecords").and_then(|v| v.as_u64()))
+            {
                 total_rows += num_records;
                 has_row_stats = true;
             }

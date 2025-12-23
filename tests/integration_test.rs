@@ -108,7 +108,15 @@ mod integration {
         client
             .execute(
                 &insert,
-                &[&"test_project", &server.test_id, &"test_span_name", &"OK", &"Test integration", &"INFO", &vec!["Integration test summary"]],
+                &[
+                    &"test_project",
+                    &server.test_id,
+                    &"test_span_name",
+                    &"OK",
+                    &"Test integration",
+                    &"INFO",
+                    &vec!["Integration test summary"],
+                ],
             )
             .await?;
 
@@ -417,13 +425,7 @@ mod integration {
             .get(0);
         assert_eq!(error_count, 0);
 
-        let total_count: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1",
-                &[&"test_project"],
-            )
-            .await?
-            .get(0);
+        let total_count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
         assert_eq!(total_count, 3); // 1 OK + 2 WARNING
 
         Ok(())

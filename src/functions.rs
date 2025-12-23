@@ -2,14 +2,14 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringBuilder, TimestampMicrosecondArray, TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringBuilder, TimestampMicrosecondArray,
+    TimestampNanosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::{DataFusionError, not_impl_err, ScalarValue};
+use datafusion::common::{DataFusionError, ScalarValue, not_impl_err};
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, ColumnarValue, ScalarFunctionArgs, 
-    ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, 
-    Volatility, create_udf, create_udaf
+    Accumulator, AggregateUDF, ColumnarValue, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
+    create_udaf, create_udf,
 };
 use serde_json::{Value as JsonValue, json};
 use std::any::Any;
@@ -122,7 +122,7 @@ fn format_timestamps(timestamp_array: &ArrayRef, format_str: &str) -> datafusion
                 }
             }
             None => return Err(DataFusionError::Execution("First argument must be a timestamp".to_string())),
-        }
+        },
     }
 
     Ok(Arc::new(builder.finish()))
@@ -554,7 +554,7 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| DataFusionError::Execution("Failed to downcast to ListArray".to_string()))?;
-            
+
             for i in 0..list_array.len() {
                 if list_array.is_null(i) {
                     values.push(JsonValue::Null);
@@ -623,28 +623,27 @@ fn create_time_bucket_udf() -> ScalarUDF {
 fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64> {
     let trimmed = interval_str.trim();
     let parts: Vec<&str> = trimmed.split_whitespace().collect();
-    
+
     let (value, unit) = match parts.as_slice() {
         [value_str, unit_str] => {
-            let value = value_str.parse::<i64>()
-                .map_err(|_| DataFusionError::Execution("Invalid interval value".to_string()))?;
+            let value = value_str.parse::<i64>().map_err(|_| DataFusionError::Execution("Invalid interval value".to_string()))?;
             (value, unit_str.to_lowercase())
         }
         [combined] => {
-            let split_pos = combined.chars()
+            let split_pos = combined
+                .chars()
                 .position(|c| c.is_alphabetic())
-                .ok_or_else(|| DataFusionError::Execution(
-                    "Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string()
-                ))?;
-            
+                .ok_or_else(|| DataFusionError::Execution("Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string()))?;
+
             let (num_str, unit_str) = combined.split_at(split_pos);
-            let value = num_str.parse::<i64>()
-                .map_err(|_| DataFusionError::Execution("Invalid interval value".to_string()))?;
+            let value = num_str.parse::<i64>().map_err(|_| DataFusionError::Execution("Invalid interval value".to_string()))?;
             (value, unit_str.to_lowercase())
         }
-        _ => return Err(DataFusionError::Execution(
-            "Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string(),
-        )),
+        _ => {
+            return Err(DataFusionError::Execution(
+                "Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string(),
+            ));
+        }
     };
 
     let micros_per_unit = match unit.as_str() {
@@ -653,10 +652,12 @@ fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64
         "hour" | "hours" | "hr" | "hrs" | "h" => 3_600_000_000,
         "day" | "days" | "d" => 86_400_000_000,
         "week" | "weeks" | "w" => 604_800_000_000,
-        _ => return Err(DataFusionError::Execution(format!(
-            "Unsupported time unit: {}. Supported units: second(s), minute(s), hour(s), day(s), week(s)",
-            unit
-        ))),
+        _ => {
+            return Err(DataFusionError::Execution(format!(
+                "Unsupported time unit: {}. Supported units: second(s), minute(s), hour(s), day(s), week(s)",
+                unit
+            )));
+        }
     };
 
     Ok(value * micros_per_unit)
@@ -665,8 +666,7 @@ fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64
 /// Bucket timestamps to the nearest bucket boundary
 fn bucket_timestamps(timestamp_array: &ArrayRef, bucket_size_micros: i64) -> datafusion::error::Result<ArrayRef> {
     if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        let mut builder = TimestampMicrosecondArray::builder(timestamps.len())
-            .with_timezone("UTC");
+        let mut builder = TimestampMicrosecondArray::builder(timestamps.len()).with_timezone("UTC");
 
         for i in 0..timestamps.len() {
             if timestamps.is_null(i) {
@@ -681,8 +681,7 @@ fn bucket_timestamps(timestamp_array: &ArrayRef, bucket_size_micros: i64) -> dat
 
         Ok(Arc::new(builder.finish()))
     } else if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampNanosecondArray>() {
-        let mut builder = TimestampNanosecondArray::builder(timestamps.len())
-            .with_timezone("UTC");
+        let mut builder = TimestampNanosecondArray::builder(timestamps.len()).with_timezone("UTC");
         let bucket_size_nanos = bucket_size_micros * 1000;
 
         for i in 0..timestamps.len() {
@@ -710,7 +709,7 @@ fn create_percentile_agg_udaf() -> AggregateUDF {
         Arc::new(DataType::Binary),
         Volatility::Immutable,
         Arc::new(|_| Ok(Box::new(PercentileAccumulator::new()))),
-        Arc::new(vec![DataType::Binary]),  // State type should match return type
+        Arc::new(vec![DataType::Binary]), // State type should match return type
     )
 }
 
@@ -722,9 +721,7 @@ struct TDigestWrapper {
 
 impl TDigestWrapper {
     fn new() -> Self {
-        Self {
-            values: Vec::new(),
-        }
+        Self { values: Vec::new() }
     }
 
     fn insert(&mut self, value: f64) {
@@ -736,11 +733,7 @@ impl TDigestWrapper {
     }
 
     fn to_digest(&self) -> Option<TDigest> {
-        if self.values.is_empty() {
-            None
-        } else {
-            Some(TDigest::from_values(self.values.clone()))
-        }
+        if self.values.is_empty() { None } else { Some(TDigest::from_values(self.values.clone())) }
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -748,9 +741,7 @@ impl TDigestWrapper {
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let values: Vec<f64> = bincode::decode_from_slice(bytes, bincode::config::standard())
-            .map_err(|e| format!("Failed to deserialize: {}", e))?
-            .0;
+        let values: Vec<f64> = bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|e| format!("Failed to deserialize: {}", e))?.0;
         Ok(Self { values })
     }
 }
@@ -763,9 +754,7 @@ struct PercentileAccumulator {
 
 impl PercentileAccumulator {
     fn new() -> Self {
-        Self {
-            digest: TDigestWrapper::new(),
-        }
+        Self { digest: TDigestWrapper::new() }
     }
 }
 
@@ -821,9 +810,8 @@ impl Accumulator for PercentileAccumulator {
         for i in 0..binary_array.len() {
             if !binary_array.is_null(i) {
                 let bytes = binary_array.value(i);
-                let other_digest = TDigestWrapper::from_bytes(bytes)
-                    .map_err(DataFusionError::Execution)?;
-                
+                let other_digest = TDigestWrapper::from_bytes(bytes).map_err(DataFusionError::Execution)?;
+
                 self.digest.merge(&other_digest);
             }
         }
@@ -847,10 +835,7 @@ struct ApproxPercentileUDF {
 impl ApproxPercentileUDF {
     fn new() -> Self {
         Self {
-            signature: Signature::new(
-                TypeSignature::Exact(vec![DataType::Float64, DataType::Binary]),
-                Volatility::Immutable,
-            ),
+            signature: Signature::new(TypeSignature::Exact(vec![DataType::Float64, DataType::Binary]), Volatility::Immutable),
         }
     }
 }
@@ -914,18 +899,15 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
                 builder.append_null();
             } else {
                 let percentile = percentile_values.value(i);
-                
+
                 // Validate percentile is between 0 and 1
                 if !(0.0..=1.0).contains(&percentile) {
-                    return Err(DataFusionError::Execution(
-                        format!("Percentile must be between 0 and 1, got {}", percentile),
-                    ));
+                    return Err(DataFusionError::Execution(format!("Percentile must be between 0 and 1, got {}", percentile)));
                 }
 
                 let digest_bytes = digest_values.value(i);
-                let wrapper = TDigestWrapper::from_bytes(digest_bytes)
-                    .map_err(DataFusionError::Execution)?;
-                
+                let wrapper = TDigestWrapper::from_bytes(digest_bytes).map_err(DataFusionError::Execution)?;
+
                 match wrapper.to_digest() {
                     Some(digest) => {
                         let value = digest.estimate_quantile(percentile);
@@ -959,7 +941,7 @@ mod tests {
         // Test that empty TDigestWrapper doesn't panic
         let wrapper = TDigestWrapper::new();
         assert!(wrapper.to_digest().is_none());
-        
+
         // Test with values
         let mut wrapper_with_values = TDigestWrapper::new();
         wrapper_with_values.insert(10.0);
@@ -983,7 +965,7 @@ mod tests {
         assert_eq!(parse_interval_to_micros("5 min").unwrap(), 300_000_000);
         assert_eq!(parse_interval_to_micros("5 mins").unwrap(), 300_000_000);
         assert_eq!(parse_interval_to_micros("5 m").unwrap(), 300_000_000);
-        
+
         // Test format without spaces
         assert_eq!(parse_interval_to_micros("1second").unwrap(), 1_000_000);
         assert_eq!(parse_interval_to_micros("5seconds").unwrap(), 5_000_000);

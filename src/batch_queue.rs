@@ -3,8 +3,8 @@ use delta_kernel::arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info};
 
 #[derive(Debug)]

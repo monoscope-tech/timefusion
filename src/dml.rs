@@ -10,16 +10,16 @@ use datafusion::{
     common::{Column, DFSchema, Result},
     error::DataFusionError,
     execution::{
-        context::{QueryPlanner, SessionState},
         SendableRecordBatchStream, TaskContext,
+        context::{QueryPlanner, SessionState},
     },
     logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, WriteOp},
-    physical_plan::{stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties},
+    physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
 use deltalake::DeltaOps;
-use tracing::{error, info, instrument, Instrument};
 use tracing::field::Empty;
+use tracing::{Instrument, error, info, instrument};
 
 use crate::database::Database;
 
@@ -64,11 +64,11 @@ impl QueryPlanner for DmlQueryPlanner {
                 let span = tracing::Span::current();
                 let operation = if matches!(dml.op, WriteOp::Update) { "UPDATE" } else { "DELETE" };
                 span.record("operation", operation);
-                
+
                 let input_exec = self.planner.create_physical_plan(&dml.input, session_state).await?;
                 let is_update = matches!(dml.op, WriteOp::Update);
                 let (table_name, project_id, predicate, assignments) = extract_dml_info(&dml.input, &dml.table_name.to_string(), is_update)?;
-                
+
                 span.record("table.name", &table_name.as_str());
                 span.record("project_id", &project_id.as_str());
 
@@ -321,16 +321,12 @@ impl ExecutionPlan for DmlExec {
             let result = match op_type {
                 DmlOperation::Update => {
                     let update_span = tracing::trace_span!(parent: &span, "delta.update");
-                    perform_delta_update(&database, &table_name, &project_id, predicate, assignments)
-                        .instrument(update_span)
-                        .await
-                },
+                    perform_delta_update(&database, &table_name, &project_id, predicate, assignments).instrument(update_span).await
+                }
                 DmlOperation::Delete => {
                     let delete_span = tracing::trace_span!(parent: &span, "delta.delete");
-                    perform_delta_delete(&database, &table_name, &project_id, predicate)
-                        .instrument(delete_span)
-                        .await
-                },
+                    perform_delta_delete(&database, &table_name, &project_id, predicate).instrument(delete_span).await
+                }
             };
 
             match &result {
@@ -397,11 +393,11 @@ pub async fn perform_delta_update(
             .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta UPDATE: {}", e)))
     })
     .await;
-    
+
     if let Ok(rows) = &result {
         span.record("rows.updated", rows);
     }
-    
+
     result
 }
 
@@ -433,11 +429,11 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
             .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta DELETE: {}", e)))
     })
     .await;
-    
+
     if let Ok(rows) = &result {
         span.record("rows.deleted", rows);
     }
-    
+
     result
 }
 
@@ -477,5 +473,3 @@ fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
         _ => Ok(expr.clone()),
     }
 }
-
-
