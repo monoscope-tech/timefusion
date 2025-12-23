@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use datafusion::arrow::array::Array;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::Statistics;
@@ -93,10 +93,10 @@ impl DeltaStatisticsExtractor {
 
     /// Calculate table-level statistics using add_actions_table
     async fn calculate_table_stats(&self, table: &DeltaTable) -> Result<(u64, u64)> {
-        let snapshot = table.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {}", e))?;
+        let table_uri = table.table_url();
+        let snapshot = table.snapshot().context("Failed to get Delta table snapshot")?;
 
-        // Get add actions as a RecordBatch with flattened schema
-        let actions_batch = snapshot.add_actions_table(true).map_err(|e| anyhow::anyhow!("Failed to get add actions: {}", e))?;
+        let actions_batch = snapshot.add_actions_table(true).with_context(|| format!("Failed to get add actions for table at {}", table_uri))?;
 
         let mut total_rows = 0u64;
         let mut total_bytes = 0u64;
