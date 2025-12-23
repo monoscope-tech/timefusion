@@ -25,8 +25,8 @@ use datafusion::{
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::PartitionFilter;
-use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::datafusion::parquet::file::metadata::SortingColumn;
+use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::operations::create::CreateBuilder;
 use deltalake::{DeltaOps, DeltaTable, DeltaTableBuilder};
@@ -1353,9 +1353,7 @@ impl Database {
         let optimize_result = table_clone
             .optimize()
             .with_filters(&partition_filters)
-            .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(
-                schema.z_order_columns.clone(),
-            ))
+            .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone()))
             .with_target_size(target_size as u64)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))

@@ -93,12 +93,10 @@ impl DeltaStatisticsExtractor {
 
     /// Calculate table-level statistics using add_actions_table
     async fn calculate_table_stats(&self, table: &DeltaTable) -> Result<(u64, u64)> {
-
         let snapshot = table.snapshot().map_err(|e| anyhow::anyhow!("Failed to get snapshot: {}", e))?;
 
         // Get add actions as a RecordBatch with flattened schema
-        let actions_batch = snapshot.add_actions_table(true)
-            .map_err(|e| anyhow::anyhow!("Failed to get add actions: {}", e))?;
+        let actions_batch = snapshot.add_actions_table(true).map_err(|e| anyhow::anyhow!("Failed to get add actions: {}", e))?;
 
         let mut total_rows = 0u64;
         let mut total_bytes = 0u64;
@@ -126,10 +124,7 @@ impl DeltaStatisticsExtractor {
             }
         } else {
             // Fallback: estimate rows based on file count
-            let page_row_limit = std::env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(20_000);
+            let page_row_limit = std::env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20_000);
             total_rows = num_files * page_row_limit;
         }
 
