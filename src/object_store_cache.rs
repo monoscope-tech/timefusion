@@ -4,22 +4,19 @@ use chrono::{DateTime, Utc};
 use dashmap::DashSet;
 use futures::stream::BoxStream;
 use object_store::{
-    path::Path, Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result as ObjectStoreResult,
+    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, Result as ObjectStoreResult, path::Path,
 };
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, instrument, Instrument};
 use tracing::field::Empty;
+use tracing::{Instrument, debug, info, instrument};
 
-use foyer::{
-    BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, 
-    HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder
-};
+use foyer::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
 /// Cache entry with metadata and TTL
@@ -123,10 +120,10 @@ impl Default for FoyerCacheConfig {
             shards: 8,
             file_size_bytes: 16_777_216, // 16MB - good for Parquet files
             enable_stats: true,
-            parquet_metadata_size_hint: 1_048_576,      // 1MB - typical size for parquet metadata
-            metadata_memory_size_bytes: 536_870_912,    // 512MB
-            metadata_disk_size_bytes: 5_368_709_120,    // 5GB
-            metadata_shards: 4,                         // Fewer shards for metadata cache
+            parquet_metadata_size_hint: 1_048_576,   // 1MB - typical size for parquet metadata
+            metadata_memory_size_bytes: 536_870_912, // 512MB
+            metadata_disk_size_bytes: 5_368_709_120, // 5GB
+            metadata_shards: 4,                      // Fewer shards for metadata cache
         }
     }
 }
@@ -253,12 +250,8 @@ impl SharedFoyerCache {
             .storage()
             .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
             .with_engine_config(
-                BlockEngineBuilder::new(
-                    FsDeviceBuilder::new(&config.cache_dir)
-                        .with_capacity(config.disk_size_bytes)
-                        .build()?,
-                )
-                .with_block_size(config.file_size_bytes),
+                BlockEngineBuilder::new(FsDeviceBuilder::new(&config.cache_dir).with_capacity(config.disk_size_bytes).build()?)
+                    .with_block_size(config.file_size_bytes),
             )
             .build()
             .await?;
@@ -271,12 +264,8 @@ impl SharedFoyerCache {
             .storage()
             .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
             .with_engine_config(
-                BlockEngineBuilder::new(
-                    FsDeviceBuilder::new(&metadata_cache_dir)
-                        .with_capacity(config.metadata_disk_size_bytes)
-                        .build()?,
-                )
-                .with_block_size(config.file_size_bytes),
+                BlockEngineBuilder::new(FsDeviceBuilder::new(&metadata_cache_dir).with_capacity(config.metadata_disk_size_bytes).build()?)
+                    .with_block_size(config.file_size_bytes),
             )
             .build()
             .await?;
@@ -307,12 +296,12 @@ impl SharedFoyerCache {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("Shutting down Foyer cache...");
         self.log_stats().await;
-        
+
         // Close the underlying caches
         info!("Closing Foyer caches...");
         self.cache.close().await?;
         self.metadata_cache.close().await?;
-        
+
         Ok(())
     }
 
@@ -396,11 +385,7 @@ impl FoyerObjectStoreCache {
                 GetResultPayload::File(mut file, _) => {
                     use std::io::Read;
                     let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() {
-                        buf
-                    } else {
-                        vec![]
-                    }
+                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
                 }
             };
             if !data.is_empty() {
@@ -474,18 +459,18 @@ impl FoyerObjectStoreCache {
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("Shutting down foyer hybrid cache");
-        
+
         // Cancel all background refresh tasks
         let mut tasks = self.background_tasks.lock().await;
         debug!("Cancelling {} background refresh tasks", tasks.len());
         tasks.abort_all();
         // Wait for all tasks to complete or be cancelled
         while tasks.join_next().await.is_some() {}
-        
+
         // Clear the refreshing set
         self.refreshing.clear();
-        
-        // Note: We don't close the caches here because they're shared 
+
+        // Note: We don't close the caches here because they're shared
         // and owned by SharedFoyerCache
         Ok(())
     }
@@ -510,19 +495,14 @@ impl ObjectStore for FoyerObjectStoreCache {
 
         let payload_size = payload.content_length();
         let is_parquet = location.as_ref().ends_with(".parquet");
-        
-        debug!(
-            "S3 PUT request starting: {} (size: {} bytes, parquet: {})",
-            location,
-            payload_size,
-            is_parquet
-        );
+
+        debug!("S3 PUT request starting: {} (size: {} bytes, parquet: {})", location, payload_size, is_parquet);
 
         // Write to S3 first without removing from cache (to avoid cache stampede)
         let start_time = std::time::Instant::now();
         let result = self.inner.put(location, payload).await?;
         let duration = start_time.elapsed();
-        
+
         debug!(
             "S3 PUT request completed: {} (size: {} bytes, duration: {}ms, parquet: {})",
             location,
@@ -546,11 +526,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 GetResultPayload::File(mut file, _) => {
                     use std::io::Read;
                     let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() {
-                        buf
-                    } else {
-                        vec![]
-                    }
+                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
                 }
             };
             if !data.is_empty() {
@@ -590,11 +566,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 GetResultPayload::File(mut file, _) => {
                     use std::io::Read;
                     let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() {
-                        buf
-                    } else {
-                        vec![]
-                    }
+                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
                 }
             };
             if !data.is_empty() {
@@ -667,11 +639,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                                     GetResultPayload::File(mut file, _) => {
                                         use std::io::Read;
                                         let mut buf = Vec::new();
-                                        if file.read_to_end(&mut buf).is_ok() {
-                                            buf
-                                        } else {
-                                            vec![]
-                                        }
+                                        if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
                                     }
                                 };
                                 if !data.is_empty() {
@@ -680,7 +648,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                             }
                             refreshing.remove(&key);
                         });
-                        
+
                         // Track the background task
                         if let Ok(mut tasks_guard) = tasks.try_lock() {
                             tasks_guard.spawn(async move {
@@ -742,11 +710,9 @@ impl ObjectStore for FoyerObjectStoreCache {
 
         let start_time = std::time::Instant::now();
         let inner_span = tracing::trace_span!(parent: &span, "s3.get", location = %location);
-        let result = self.inner.get(location)
-            .instrument(inner_span)
-            .await?;
+        let result = self.inner.get(location).instrument(inner_span).await?;
         let duration = start_time.elapsed();
-        
+
         debug!(
             "S3 GET request: {} (size: {} bytes, duration: {}ms, parquet: {})",
             location,
@@ -853,7 +819,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 // Check if we have this specific range cached in the metadata cache
                 if let Ok(Some(entry)) = self.metadata_cache.get(&range_cache_key).await {
                     let value = entry.value();
-                    let ttl = self.config.ttl;  // Use unified TTL
+                    let ttl = self.config.ttl; // Use unified TTL
                     if !value.is_expired(ttl) {
                         self.update_metadata_stats(|s| s.hits += 1).await;
                         span.record("cache_hit", true);
@@ -882,17 +848,15 @@ impl ObjectStore for FoyerObjectStoreCache {
                 );
 
                 let start_time = std::time::Instant::now();
-                let inner_span = tracing::trace_span!(parent: &span, "s3.get_range", 
-                    location = %location, 
+                let inner_span = tracing::trace_span!(parent: &span, "s3.get_range",
+                    location = %location,
                     range.start = range.start,
                     range.end = range.end,
                     is_metadata = true
                 );
-                let data = self.inner.get_range(location, range.clone())
-                    .instrument(inner_span)
-                    .await?;
+                let data = self.inner.get_range(location, range.clone()).instrument(inner_span).await?;
                 let duration = start_time.elapsed();
-                
+
                 debug!(
                     "S3 GET_RANGE request (metadata): {} (range: {}..{}, size: {} bytes, duration: {}ms)",
                     location,
@@ -962,18 +926,16 @@ impl ObjectStore for FoyerObjectStoreCache {
             "get_range request for: {} (range: {}..{}, parquet={})",
             location, range.start, range.end, is_parquet
         );
-        
+
         let start_time = std::time::Instant::now();
-        let inner_span = tracing::trace_span!(parent: &span, "s3.get_range", 
+        let inner_span = tracing::trace_span!(parent: &span, "s3.get_range",
             location = %location,
             range.start = range.start,
             range.end = range.end
         );
-        let result = self.inner.get_range(location, range.clone())
-            .instrument(inner_span)
-            .await?;
+        let result = self.inner.get_range(location, range.clone()).instrument(inner_span).await?;
         let duration = start_time.elapsed();
-        
+
         debug!(
             "S3 GET_RANGE request: {} (range: {}..{}, size: {} bytes, duration: {}ms, parquet: {})",
             location,
@@ -983,7 +945,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             duration.as_millis(),
             is_parquet
         );
-        
+
         Ok(result)
     }
 
@@ -1007,19 +969,17 @@ impl ObjectStore for FoyerObjectStoreCache {
                 return Ok(value.meta.clone());
             }
         }
-        
+
         span.record("cache_hit", false);
         let inner_span = tracing::trace_span!(parent: &span, "s3.head", location = %location);
-        self.inner.head(location)
-            .instrument(inner_span)
-            .await
+        self.inner.head(location).instrument(inner_span).await
     }
 
     async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
         self.update_stats(|s| s.inner_puts += 1).await;
         let cache_key = Self::make_cache_key(location);
         self.cache.remove(&cache_key);
-        
+
         // Delete from inner store
         self.inner.delete(location).await?;
 
@@ -1136,10 +1096,10 @@ mod tests {
         assert_eq!(stats.main.misses, 0);
 
         cache.delete(&path).await?;
-        
+
         // Give cache time to process deletion
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        
+
         // After deletion, get should fail
         let get_result = cache.get(&path).await;
         assert!(get_result.is_err(), "Expected error after delete, got: {:?}", get_result);

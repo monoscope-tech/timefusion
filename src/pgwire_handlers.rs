@@ -1,21 +1,21 @@
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
-use datafusion_postgres::pgwire::api::auth::{noop::NoopStartupHandler, StartupHandler};
+use datafusion_postgres::pgwire::api::ClientPortalStore;
+use datafusion_postgres::pgwire::api::auth::{StartupHandler, noop::NoopStartupHandler};
 use datafusion_postgres::pgwire::api::portal::Portal;
 use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use datafusion_postgres::pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
 use datafusion_postgres::pgwire::api::stmt::StoredStatement;
 use datafusion_postgres::pgwire::api::store::PortalStore;
-use datafusion_postgres::pgwire::api::ClientPortalStore;
 use datafusion_postgres::pgwire::api::{ClientInfo, ErrorHandler, PgWireServerHandlers};
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
-use datafusion_postgres::{auth::AuthManager, DfSessionService};
+use datafusion_postgres::{DfSessionService, auth::AuthManager};
 use futures::Sink;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::field::Empty;
-use tracing::{info, instrument, Instrument};
+use tracing::{Instrument, info, instrument};
 
 /// Custom handler factory that creates handlers which log UPDATE queries
 pub struct LoggingHandlerFactory {
@@ -256,4 +256,3 @@ pub async fn serve_with_logging(
 
     Ok(())
 }
-

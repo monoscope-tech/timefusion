@@ -234,10 +234,10 @@ mod sqllogictest_tests {
 
             // Check if a specific test file is requested via environment variable
             let test_filter = std::env::var("SQLLOGICTEST_FILE").ok();
-            
+
             // Pretty output mode
             let pretty_mode = std::env::var("SQLLOGICTEST_PRETTY").is_ok();
-            
+
             if test_dir.is_dir() {
                 for entry in std::fs::read_dir(test_dir)? {
                     let entry = entry?;
@@ -245,9 +245,7 @@ mod sqllogictest_tests {
                     if path.extension().and_then(|s| s.to_str()) == Some("slt") {
                         // If a filter is set, only include files that match
                         if let Some(ref filter) = test_filter {
-                            let filename = path.file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("");
+                            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                             if filename.contains(filter) {
                                 test_files.push(path);
                             }
@@ -265,16 +263,16 @@ mod sqllogictest_tests {
                 println!("\n🧪 SQLLogicTest Runner");
                 println!("{}", "=".repeat(50));
             }
-            
+
             if let Some(ref filter) = test_filter {
                 println!("\n📁 Filtering for test files containing: '{}'", filter);
             }
-            
+
             println!("\n📋 Found {} test files:", test_files.len());
             for file in &test_files {
                 println!("   • {}", file.file_name().unwrap().to_string_lossy());
             }
-            
+
             if test_files.is_empty() {
                 if let Some(ref filter) = test_filter {
                     return Err(anyhow::anyhow!("No test files found matching filter '{}'", filter));
@@ -301,7 +299,7 @@ mod sqllogictest_tests {
                     let drop_sql = format!("DROP TABLE IF EXISTS {}", table);
                     let _ = cleanup_client.execute(&drop_sql, &[]).await;
                 }
-                
+
                 let factory_clone = || async move {
                     let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
                     Ok::<TestDB, TestError>(TestDB { client })
@@ -317,7 +315,7 @@ mod sqllogictest_tests {
                         } else {
                             println!("✓ {} passed", test_path.display());
                         }
-                    },
+                    }
                     Ok(Err(e)) => {
                         if pretty_mode {
                             eprintln!("❌ FAILED: {}", test_path.file_name().unwrap().to_string_lossy());
@@ -349,7 +347,7 @@ mod sqllogictest_tests {
                     println!("❌ Some tests failed");
                 }
             }
-            
+
             if all_passed { Ok(()) } else { Err(anyhow::anyhow!("Some SQLLogicTests failed")) }
         })
         .await

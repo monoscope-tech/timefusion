@@ -7,14 +7,14 @@ use std::{env, sync::Arc};
 use timefusion::batch_queue::BatchQueue;
 use timefusion::database::Database;
 use timefusion::telemetry;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize environment and telemetry
     dotenv().ok();
-    
+
     // Initialize OpenTelemetry with OTLP exporter
     telemetry::init_telemetry()?;
 
@@ -92,9 +92,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     info!("Shutdown complete.");
-    
+
     // Shutdown telemetry to ensure all spans are flushed
     telemetry::shutdown_telemetry();
-    
+
     Ok(())
 }
