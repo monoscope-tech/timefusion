@@ -2,7 +2,7 @@
 mod sqllogictest_tests {
     use anyhow::Result;
     use async_trait::async_trait;
-    use datafusion_postgres::{ServerOptions, auth::AuthManager};
+    use datafusion_postgres::{auth::AuthManager, ServerOptions};
     use dotenv::dotenv;
     use serial_test::serial;
     use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
@@ -69,7 +69,7 @@ mod sqllogictest_tests {
                 if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
                     println!("Statement executed, {} rows affected", affected);
                 }
-                return Ok(DBOutput::StatementComplete(affected as u64));
+                return Ok(DBOutput::StatementComplete(affected));
             }
 
             let rows = self.client.query(sql, &[]).await?;
@@ -348,7 +348,11 @@ mod sqllogictest_tests {
                 }
             }
 
-            if all_passed { Ok(()) } else { Err(anyhow::anyhow!("Some SQLLogicTests failed")) }
+            if all_passed {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("Some SQLLogicTests failed"))
+            }
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 120 seconds"))?
