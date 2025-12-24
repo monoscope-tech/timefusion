@@ -10,7 +10,7 @@ arrow = "57.1.0"
 arrow-json = "57.1.0"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_arrow = { version = "0.13.4", features = ["arrow-55"] }
+serde_arrow = { version = "0.13.7", features = ["arrow-57"] }
 serde_json = "1.0.141"
 serde_with = "3.14"
 serde_yaml = "0.9"
