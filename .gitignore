@@ -6,5 +6,6 @@
 users.json
 data/
 minio
-dis-newstyle 
+dis-newstyle
 *.log
+.DS_Store

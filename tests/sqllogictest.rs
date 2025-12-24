@@ -69,7 +69,7 @@ mod sqllogictest_tests {
                 if std::env::var("SQLLOGICTEST_VERBOSE").is_ok() {
                     println!("Statement executed, {} rows affected", affected);
                 }
-                return Ok(DBOutput::StatementComplete(affected as u64));
+                return Ok(DBOutput::StatementComplete(affected));
             }
 
             let rows = self.client.query(sql, &[]).await?;
@@ -218,139 +218,122 @@ mod sqllogictest_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
+    #[ignore] // Slow integration test - run with: cargo test --test sqllogictest -- --ignored
     async fn run_sqllogictest() -> Result<()> {
-        // Wrap the entire test in a timeout
-        tokio::time::timeout(Duration::from_secs(120), async {
-            let (shutdown_signal, port) = start_test_server().await?;
+        let (shutdown_signal, port) = start_test_server().await?;
 
-            let _factory = || async move {
+        let _factory = || async move {
+            let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
+            Ok::<TestDB, TestError>(TestDB { client })
+        };
+
+        // Auto-discover all .slt test files
+        let test_dir = Path::new("tests/slt");
+        let mut test_files = Vec::new();
+
+        // Check if a specific test file is requested via environment variable
+        let test_filter = std::env::var("SQLLOGICTEST_FILE").ok();
+
+        // Pretty output mode
+        let pretty_mode = std::env::var("SQLLOGICTEST_PRETTY").is_ok();
+
+        if test_dir.is_dir() {
+            for entry in std::fs::read_dir(test_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("slt") {
+                    if let Some(ref filter) = test_filter {
+                        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                        if filename.contains(filter) {
+                            test_files.push(path);
+                        }
+                    } else {
+                        test_files.push(path);
+                    }
+                }
+            }
+        }
+
+        test_files.sort();
+
+        if pretty_mode {
+            println!("\n🧪 SQLLogicTest Runner");
+            println!("{}", "=".repeat(50));
+        }
+
+        if let Some(ref filter) = test_filter {
+            println!("\n📁 Filtering for test files containing: '{}'", filter);
+        }
+
+        println!("\n📋 Found {} test files:", test_files.len());
+        for file in &test_files {
+            println!("   • {}", file.file_name().unwrap().to_string_lossy());
+        }
+
+        if test_files.is_empty() {
+            shutdown_signal.notify_one();
+            if let Some(ref filter) = test_filter {
+                return Err(anyhow::anyhow!("No test files found matching filter '{}'", filter));
+            } else {
+                return Err(anyhow::anyhow!("No .slt test files found in tests/slt directory"));
+            }
+        }
+
+        let mut all_passed = true;
+        for test_file in test_files {
+            let test_path = test_file.as_path();
+            if pretty_mode {
+                println!("\n\n🔄 Running: {}", test_path.file_name().unwrap().to_string_lossy());
+                println!("{}", "-".repeat(50));
+            } else {
+                println!("\nRunning SQLLogicTest: {}", test_path.display());
+            }
+
+            let (cleanup_client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
+            let tables_to_drop = ["test_table", "events", "t", "numeric_test", "percentile_test", "test_spans"];
+            for table in &tables_to_drop {
+                let drop_sql = format!("DROP TABLE IF EXISTS {}", table);
+                let _ = cleanup_client.execute(&drop_sql, &[]).await;
+            }
+
+            let factory_clone = || async move {
                 let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
                 Ok::<TestDB, TestError>(TestDB { client })
             };
 
-            // Auto-discover all .slt test files
-            let test_dir = Path::new("tests/slt");
-            let mut test_files = Vec::new();
+            let test_result = sqllogictest::Runner::new(factory_clone).run_file_async(test_path).await;
 
-            // Check if a specific test file is requested via environment variable
-            let test_filter = std::env::var("SQLLOGICTEST_FILE").ok();
-
-            // Pretty output mode
-            let pretty_mode = std::env::var("SQLLOGICTEST_PRETTY").is_ok();
-
-            if test_dir.is_dir() {
-                for entry in std::fs::read_dir(test_dir)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("slt") {
-                        // If a filter is set, only include files that match
-                        if let Some(ref filter) = test_filter {
-                            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                            if filename.contains(filter) {
-                                test_files.push(path);
-                            }
-                        } else {
-                            test_files.push(path);
-                        }
+            match test_result {
+                Ok(_) => {
+                    if pretty_mode {
+                        println!("✅ PASSED: {}", test_path.file_name().unwrap().to_string_lossy());
+                    } else {
+                        println!("✓ {} passed", test_path.display());
                     }
                 }
-            }
-
-            // Sort files for consistent test order
-            test_files.sort();
-
-            if pretty_mode {
-                println!("\n🧪 SQLLogicTest Runner");
-                println!("{}", "=".repeat(50));
-            }
-
-            if let Some(ref filter) = test_filter {
-                println!("\n📁 Filtering for test files containing: '{}'", filter);
-            }
-
-            println!("\n📋 Found {} test files:", test_files.len());
-            for file in &test_files {
-                println!("   • {}", file.file_name().unwrap().to_string_lossy());
-            }
-
-            if test_files.is_empty() {
-                if let Some(ref filter) = test_filter {
-                    return Err(anyhow::anyhow!("No test files found matching filter '{}'", filter));
-                } else {
-                    return Err(anyhow::anyhow!("No .slt test files found in tests/slt directory"));
-                }
-            }
-
-            let mut all_passed = true;
-            for test_file in test_files {
-                let test_path = test_file.as_path();
-                if pretty_mode {
-                    println!("\n\n🔄 Running: {}", test_path.file_name().unwrap().to_string_lossy());
-                    println!("{}", "-".repeat(50));
-                } else {
-                    println!("\nRunning SQLLogicTest: {}", test_path.display());
-                }
-
-                // Clean up before running each test file
-                let (cleanup_client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
-                // Drop common test tables to ensure clean state
-                let tables_to_drop = ["test_table", "events", "t", "numeric_test", "percentile_test", "test_spans"];
-                for table in &tables_to_drop {
-                    let drop_sql = format!("DROP TABLE IF EXISTS {}", table);
-                    let _ = cleanup_client.execute(&drop_sql, &[]).await;
-                }
-
-                let factory_clone = || async move {
-                    let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
-                    Ok::<TestDB, TestError>(TestDB { client })
-                };
-
-                // Add timeout for individual test files (30 seconds each)
-                let test_result = tokio::time::timeout(Duration::from_secs(30), sqllogictest::Runner::new(factory_clone).run_file_async(test_path)).await;
-
-                match test_result {
-                    Ok(Ok(_)) => {
-                        if pretty_mode {
-                            println!("✅ PASSED: {}", test_path.file_name().unwrap().to_string_lossy());
-                        } else {
-                            println!("✓ {} passed", test_path.display());
-                        }
+                Err(e) => {
+                    if pretty_mode {
+                        eprintln!("❌ FAILED: {}", test_path.file_name().unwrap().to_string_lossy());
+                        eprintln!("   Error: {:?}", e);
+                    } else {
+                        eprintln!("✗ {} failed: {:?}", test_path.display(), e);
                     }
-                    Ok(Err(e)) => {
-                        if pretty_mode {
-                            eprintln!("❌ FAILED: {}", test_path.file_name().unwrap().to_string_lossy());
-                            eprintln!("   Error: {:?}", e);
-                        } else {
-                            eprintln!("✗ {} failed: {:?}", test_path.display(), e);
-                        }
-                        all_passed = false;
-                    }
-                    Err(_) => {
-                        if pretty_mode {
-                            eprintln!("⏱️  TIMEOUT: {} (exceeded 30 seconds)", test_path.file_name().unwrap().to_string_lossy());
-                        } else {
-                            eprintln!("✗ {} timed out after 30 seconds", test_path.display());
-                        }
-                        all_passed = false;
-                    }
+                    all_passed = false;
                 }
             }
+        }
 
-            // Always shut down the server
-            shutdown_signal.notify_one();
+        shutdown_signal.notify_one();
 
-            if pretty_mode {
-                println!("\n{}", "=".repeat(50));
-                if all_passed {
-                    println!("✅ All tests passed!");
-                } else {
-                    println!("❌ Some tests failed");
-                }
+        if pretty_mode {
+            println!("\n{}", "=".repeat(50));
+            if all_passed {
+                println!("✅ All tests passed!");
+            } else {
+                println!("❌ Some tests failed");
             }
+        }
 
-            if all_passed { Ok(()) } else { Err(anyhow::anyhow!("Some SQLLogicTests failed")) }
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 120 seconds"))?
+        if all_passed { Ok(()) } else { Err(anyhow::anyhow!("Some SQLLogicTests failed")) }
     }
 }

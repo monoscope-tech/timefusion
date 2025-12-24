@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --all-features
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AWS_SDK_LOAD_CONFIG: "false"
+      AWS_ENDPOINT_URL: http://127.0.0.1:9000
+      AWS_REGION: us-east-1
+      AWS_S3_BUCKET: timefusion-test
+      AWS_S3_ENDPOINT: http://127.0.0.1:9000
+      AWS_ALLOW_HTTP: "true"
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      PGWIRE_PORT: "12345"
+      PORT: "8080"
+      TIMEFUSION_TABLE_PREFIX: timefusion-ci-test
+      BATCH_INTERVAL_MS: "1000"
+      MAX_BATCH_SIZE: "1000"
+      ENABLE_BATCH_QUEUE: "true"
+      MAX_PG_CONNECTIONS: "100"
+      AWS_S3_LOCKING_PROVIDER: ""
+      TIMEFUSION_FOYER_MEMORY_MB: "256"
+      TIMEFUSION_FOYER_DISK_GB: "10"
+      TIMEFUSION_FOYER_TTL_SECONDS: "300"
+      TIMEFUSION_FOYER_SHARDS: "8"
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Start MinIO
+        run: |
+          docker run -d -p 9000:9000 --name minio \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          sleep 5
+          until curl -sf http://localhost:9000/minio/health/live; do sleep 1; done
+
+      - name: Install AWS CLI
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+
+      - name: Create MinIO bucket
+        run: |
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://timefusion-test || true
+          aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://timefusion-tests || true
+
+      - name: Run all tests
+        run: cargo test --all-features -- --include-ignored

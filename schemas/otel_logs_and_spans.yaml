@@ -1,13 +1,7 @@
 table_name: otel_logs_and_spans
 partitions:
   - date
-sorting_columns:
-  - name: timestamp
-    descending: true
-    nulls_first: false
-  - name: id
-    descending: false
-    nulls_first: false
+sorting_columns: []
 z_order_columns:
   - timestamp
   - resource___service___name
