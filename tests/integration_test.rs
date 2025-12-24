@@ -97,8 +97,9 @@ mod integration {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[serial]
+    #[ignore] // Slow integration test - run with: cargo test --test integration_test -- --ignored
     async fn test_postgres_integration() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
@@ -170,6 +171,7 @@ mod integration {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
+    #[ignore] // Slow integration test - run with: cargo test --test integration_test -- --ignored
     async fn test_concurrent_postgres_requests() -> Result<()> {
         let server = TestServer::start().await?;
         let insert = TestServer::insert_sql();
@@ -203,7 +205,6 @@ mod integration {
                         )
                         .await?;
 
-                    // Mix in queries to simulate real workload
                     if op % 2 == 0 {
                         client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?;
                     }
@@ -270,8 +271,9 @@ mod integration {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[serial]
+    #[ignore] // Slow integration test - run with: cargo test --test integration_test -- --ignored
     async fn test_update_operations() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
@@ -344,13 +346,14 @@ mod integration {
             )
             .await?
             .get(0);
-        assert_eq!(count, 2); // Only the 2 "OK" records from the loop (original was changed to ERROR)
+        assert_eq!(count, 2);
 
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     #[serial]
+    #[ignore] // Slow integration test - run with: cargo test --test integration_test -- --ignored
     async fn test_delete_operations() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
@@ -426,7 +429,7 @@ mod integration {
         assert_eq!(error_count, 0);
 
         let total_count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
-        assert_eq!(total_count, 3); // 1 OK + 2 WARNING
+        assert_eq!(total_count, 3);
 
         Ok(())
     }

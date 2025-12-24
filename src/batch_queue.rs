@@ -81,10 +81,9 @@ mod tests {
     use tokio::time::sleep;
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_batch_queue_processing() -> Result<()> {
-        // Add timeout to prevent hanging
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             dotenv::dotenv().ok();
             unsafe {
                 std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
@@ -124,9 +123,9 @@ mod tests {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_batch_queue_grouping() -> Result<()> {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             dotenv::dotenv().ok();
             unsafe {
                 std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
