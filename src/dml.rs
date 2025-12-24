@@ -17,7 +17,6 @@ use datafusion::{
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
-use deltalake::DeltaOps;
 use tracing::field::Empty;
 use tracing::{Instrument, error, info, instrument};
 
@@ -69,8 +68,8 @@ impl QueryPlanner for DmlQueryPlanner {
                 let is_update = matches!(dml.op, WriteOp::Update);
                 let (table_name, project_id, predicate, assignments) = extract_dml_info(&dml.input, &dml.table_name.to_string(), is_update)?;
 
-                span.record("table.name", &table_name.as_str());
-                span.record("project_id", &project_id.as_str());
+                span.record("table.name", table_name.as_str());
+                span.record("project_id", project_id.as_str());
 
                 Ok(Arc::new(if is_update {
                     DmlExec::update(
@@ -329,11 +328,8 @@ impl ExecutionPlan for DmlExec {
                 }
             };
 
-            match &result {
-                Ok(rows) => {
-                    span.record("rows.affected", rows);
-                }
-                Err(_) => {}
+            if let Ok(rows) = &result {
+                span.record("rows.affected", rows);
             }
 
             result
@@ -377,7 +373,7 @@ pub async fn perform_delta_update(
 
     let span = tracing::Span::current();
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| async move {
-        let mut builder = DeltaOps(delta_table).update();
+        let mut builder = delta_table.update();
 
         if let Some(pred) = predicate {
             builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
@@ -417,7 +413,7 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
 
     let span = tracing::Span::current();
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| async move {
-        let mut builder = DeltaOps(delta_table).delete();
+        let mut builder = delta_table.delete();
 
         if let Some(pred) = predicate {
             builder = builder.with_predicate(convert_expr_to_delta(&pred)?);

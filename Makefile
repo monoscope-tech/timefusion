@@ -1,18 +1,27 @@
-.PHONY: test test-ovh test-minio test-prod run-prod build-prod minio-start minio-stop minio-clean
+.PHONY: test test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio run-prod build-prod minio-start minio-stop minio-clean
 
-# Default test with MinIO/test environment (uses .env)
+# Default test (fast, excludes slow integration tests)
 test:
 	cargo test $${ARGS}
+
+# Run all tests including slow integration tests
+test-all:
+	@export $$(cat .env | grep -v '^#' | xargs) && cargo test -- --include-ignored $${ARGS}
 
 # Explicit test with OVH/S3
 test-ovh:
 	@echo "Testing with OVH/S3..."
 	@export $$(cat .env | grep -v '^#' | xargs) && cargo test $${ARGS}
 
-# Test with MinIO
+# Test with MinIO (fast, excludes slow integration tests)
 test-minio:
 	@echo "Testing with MinIO..."
 	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo test $${ARGS}
+
+# Test with MinIO including all tests (same as CI)
+test-minio-all:
+	@echo "Testing all with MinIO (including integration tests)..."
+	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo test -- --include-ignored $${ARGS}
 
 # Test with production config (be careful!)
 test-prod:
@@ -51,3 +60,14 @@ minio-stop:
 minio-clean:
 	@rm -rf /tmp/minio-data
 	@echo "MinIO data cleaned"
+
+# Run integration tests (postgres wire protocol tests, sqllogictests)
+# These are slower tests that start a full PGWire server
+test-integration:
+	@echo "Running integration tests..."
+	@export $$(cat .env | grep -v '^#' | xargs) && cargo test --test integration_test --test sqllogictest -- --ignored $${ARGS}
+
+# Run integration tests with MinIO
+test-integration-minio:
+	@echo "Running integration tests with MinIO..."
+	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo test --test integration_test --test sqllogictest -- --ignored $${ARGS}

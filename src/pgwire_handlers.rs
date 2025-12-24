@@ -91,7 +91,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
             db.operation = Empty,
         )
     )]
-    async fn do_query<'a, C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response<'a>>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
@@ -129,7 +129,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
             "UPDATE" => query_lower.find(" set").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.to_string()),
             _ => query.to_string(),
         };
-        span.record("query.text", &sanitized_query.as_str());
+        span.record("query.text", sanitized_query.as_str());
 
         // Delegate to inner handler with the span context
         // Use the current span as parent to ensure proper context propagation
@@ -193,7 +193,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
             db.operation = Empty,
         )
     )]
-    async fn do_query<'a, C>(&self, client: &mut C, portal: &Portal<Self::Statement>, max_rows: usize) -> PgWireResult<Response<'a>>
+    async fn do_query<C>(&self, client: &mut C, portal: &Portal<Self::Statement>, max_rows: usize) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore<Statement = Self::Statement>,
@@ -234,7 +234,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
             "UPDATE" => query_lower.find(" set").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.to_string()),
             _ => query.to_string(),
         };
-        span.record("query.text", &sanitized_query.as_str());
+        span.record("query.text", sanitized_query.as_str());
 
         // Delegate to inner handler with the span context
         // Use the current span as parent to ensure proper context propagation
