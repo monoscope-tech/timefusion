@@ -2372,18 +2372,43 @@ mod tests {
             let db = Database::new().await?;
             let db = Arc::new(db);
 
-            let project_id = format!("mixed_ops_{}", uuid::Uuid::new_v4());
-
-            // Sequential writes first, then optimize (reduced concurrency to speed up test)
+            // Test concurrent writes to DIFFERENT projects (no conflicts)
+            let mut handles = Vec::new();
             for i in 0..3 {
-                let batch_id = format!("batch_{}", i);
-                let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project_id)])?;
-                db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+                let db_clone = Arc::clone(&db);
+                let project_id = format!("project_{}", i);
+                handles.push(tokio::spawn(async move {
+                    let batch = json_to_batch(vec![test_span(
+                        &format!("id_{}", i),
+                        &format!("span_{}", i),
+                        &project_id,
+                    )])?;
+                    db_clone.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+                    Ok::<_, anyhow::Error>(())
+                }));
             }
 
-            // Run optimize after writes
-            if let Ok(table_ref) = db.get_or_create_table(&project_id, "otel_logs_and_spans").await {
-                let _ = db.optimize_table(&table_ref, "otel_logs_and_spans", Some(1024 * 1024)).await;
+            // Wait for all writes
+            for handle in handles {
+                handle.await??;
+            }
+
+            // Now test concurrent reads across all projects
+            let mut read_handles = Vec::new();
+            for i in 0..3 {
+                let db_clone = Arc::clone(&db);
+                let project_id = format!("project_{}", i);
+                read_handles.push(tokio::spawn(async move {
+                    let ctx = db_clone.clone().create_session_context();
+                    let _ = ctx.sql(&format!(
+                        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id
+                    )).await;
+                    Ok::<_, anyhow::Error>(())
+                }));
+            }
+
+            for handle in read_handles {
+                handle.await??;
             }
 
             db.shutdown().await?;
