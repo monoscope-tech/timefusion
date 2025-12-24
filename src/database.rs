@@ -61,7 +61,7 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 }
 
 // Constants for optimization and vacuum operations
-const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 72; // 2 weeks
+const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 72; // 3 days
 const DEFAULT_OPTIMIZE_TARGET_SIZE: i64 = 128 * 1024 * 1024; // 512MB
 const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20000;
 const ZSTD_COMPRESSION_LEVEL: i32 = 3; // Balance between compression ratio and speed
@@ -2378,11 +2378,7 @@ mod tests {
                 let db_clone = Arc::clone(&db);
                 let project_id = format!("project_{}", i);
                 handles.push(tokio::spawn(async move {
-                    let batch = json_to_batch(vec![test_span(
-                        &format!("id_{}", i),
-                        &format!("span_{}", i),
-                        &project_id,
-                    )])?;
+                    let batch = json_to_batch(vec![test_span(&format!("id_{}", i), &format!("span_{}", i), &project_id)])?;
                     db_clone.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
                     Ok::<_, anyhow::Error>(())
                 }));
@@ -2400,9 +2396,7 @@ mod tests {
                 let project_id = format!("project_{}", i);
                 read_handles.push(tokio::spawn(async move {
                     let ctx = db_clone.clone().create_session_context();
-                    let _ = ctx.sql(&format!(
-                        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id
-                    )).await;
+                    let _ = ctx.sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await;
                     Ok::<_, anyhow::Error>(())
                 }));
             }
