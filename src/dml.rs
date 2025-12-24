@@ -436,8 +436,8 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
 /// Common Delta operation logic
 async fn perform_delta_operation<F, Fut>(database: &Database, table_name: &str, project_id: &str, operation: F) -> Result<u64>
 where
-    F: FnOnce(deltalake::DeltaTable) -> Fut,
-    Fut: std::future::Future<Output = Result<(deltalake::DeltaTable, u64)>>,
+    F: FnOnce(deltalake::DeltaTable) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(deltalake::DeltaTable, u64)>> + Send,
 {
     let table_key = (project_id.to_string(), table_name.to_string());
     let table_lock = database
@@ -449,7 +449,16 @@ where
         .clone();
 
     let delta_table = table_lock.write().await;
-    let (new_table, rows_affected) = operation(delta_table.clone()).await?;
+    let delta_table_clone = delta_table.clone();
+
+    // Use block_in_place to avoid conflicts with delta-rs's internal executor
+    // This is the same pattern used in insert_records_batch
+    let result = tokio::task::block_in_place(|| {
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(async move { operation(delta_table_clone).await })
+    });
+
+    let (new_table, rows_affected) = result?;
 
     drop(delta_table);
     *table_lock.write().await = new_table;

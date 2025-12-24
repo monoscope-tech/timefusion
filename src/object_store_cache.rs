@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
 use tracing::{Instrument, debug, info, instrument};
 
-use foyer::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder};
+use foyer::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder, RuntimeOptions, TokioRuntimeOptions};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
@@ -242,12 +242,26 @@ impl SharedFoyerCache {
         let metadata_cache_dir = config.cache_dir.join("metadata");
         std::fs::create_dir_all(&metadata_cache_dir)?;
 
+        // Configure a dedicated runtime for Foyer disk IO to avoid blocking the main tokio runtime
+        // This prevents blocking sync disk IO from starving the tokio runtime's network polling
+        let runtime_opts = RuntimeOptions::Separated {
+            read_runtime_options: TokioRuntimeOptions {
+                worker_threads: 2,
+                ..Default::default()
+            },
+            write_runtime_options: TokioRuntimeOptions {
+                worker_threads: 2,
+                ..Default::default()
+            },
+        };
+
         let cache = HybridCacheBuilder::new()
             .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(config.memory_size_bytes)
             .with_shards(config.shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
             .storage()
+            .with_runtime_options(runtime_opts.clone())
             .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
             .with_engine_config(
                 BlockEngineBuilder::new(FsDeviceBuilder::new(&config.cache_dir).with_capacity(config.disk_size_bytes).build()?)
@@ -256,12 +270,24 @@ impl SharedFoyerCache {
             .build()
             .await?;
 
+        let metadata_runtime_opts = RuntimeOptions::Separated {
+            read_runtime_options: TokioRuntimeOptions {
+                worker_threads: 2,
+                ..Default::default()
+            },
+            write_runtime_options: TokioRuntimeOptions {
+                worker_threads: 2,
+                ..Default::default()
+            },
+        };
+
         let metadata_cache = HybridCacheBuilder::new()
             .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(config.metadata_memory_size_bytes)
             .with_shards(config.metadata_shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
             .storage()
+            .with_runtime_options(metadata_runtime_opts)
             .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
             .with_engine_config(
                 BlockEngineBuilder::new(FsDeviceBuilder::new(&metadata_cache_dir).with_capacity(config.metadata_disk_size_bytes).build()?)
