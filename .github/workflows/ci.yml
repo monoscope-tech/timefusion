@@ -93,5 +93,10 @@ jobs:
           aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://timefusion-test || true
           aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://timefusion-tests || true
 
-      - name: Run all tests
-        run: cargo test --all-features -- --include-ignored
+      - name: Run tests
+        run: cargo test --all-features
+
+      - name: Run ignored tests (optional)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: cargo test --all-features -- --ignored

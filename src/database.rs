@@ -974,15 +974,19 @@ impl Database {
         );
 
         // Hold a write lock during table creation to prevent concurrent creation
+        info!("About to acquire write lock on project_configs...");
         let mut configs = self.project_configs.write().await;
+        info!("Write lock acquired on project_configs");
 
         // Double-check after acquiring write lock
         if let Some(table) = configs.get(&(project_id.to_string(), table_name.to_string())) {
             return Ok(Arc::clone(table));
         }
+        info!("Table not in cache, creating object store...");
 
         // Create the base S3 object store
         let base_store = self.create_object_store(&storage_uri, &storage_options).instrument(tracing::trace_span!("create_object_store")).await?;
+        info!("Object store created, proceeding to load/create delta table...");
 
         // Wrap with instrumentation for tracing
         let instrumented_store = instrument_object_store(base_store, "s3");
@@ -1155,13 +1159,16 @@ impl Database {
     async fn create_or_load_delta_table(
         &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<DeltaTable> {
-        DeltaTableBuilder::from_url(Url::parse(storage_uri)?)?
+        info!("create_or_load_delta_table: Starting to load table from {}", storage_uri);
+        let result = DeltaTableBuilder::from_url(Url::parse(storage_uri)?)?
             .with_storage_backend(cached_store.clone(), Url::parse(storage_uri)?)
             .with_storage_options(storage_options.clone())
             .with_allow_http(true)
             .load()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to load table: {}", e));
+        info!("create_or_load_delta_table: Load completed with result: {:?}", result.is_ok());
+        result
     }
 
     #[instrument(
@@ -1222,24 +1229,28 @@ impl Database {
             let mut table = table_ref.write().await;
 
             // Update the table state to get the latest version before writing
-            if let Err(e) = table.update_state().await {
-                debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
-            }
+            let _ = table.update_state().await;
 
-            let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
-            let write_result = async {
-                // Schema evolution enabled: new columns will be automatically added to the table
-                table
-                    .clone()
-                    .write(batches.clone())
-                    .with_partition_columns(schema.partitions.clone())
-                    .with_writer_properties(writer_properties.clone())
-                    .with_save_mode(deltalake::protocol::SaveMode::Append)
-                    .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
-                    .await
-            }
-            .instrument(write_span)
-            .await;
+            // Clone data for the write operation
+            let table_clone = table.clone();
+            let batches_clone = batches.clone();
+            let partitions_clone = schema.partitions.clone();
+            let writer_props_clone = writer_properties.clone();
+
+            // Use block_in_place to allow delta-rs's internal executor to work properly
+            // This prevents conflicts between nested tokio runtimes during PGWire query handling
+            let write_result = tokio::task::block_in_place(|| {
+                let handle = tokio::runtime::Handle::current();
+                handle.block_on(async move {
+                    table_clone
+                        .write(batches_clone)
+                        .with_partition_columns(partitions_clone)
+                        .with_writer_properties(writer_props_clone)
+                        .with_save_mode(deltalake::protocol::SaveMode::Append)
+                        .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
+                        .await
+                })
+            });
 
             match write_result {
                 Ok(new_table) => {
@@ -1248,9 +1259,6 @@ impl Database {
                         // Store the last written version for read-after-write consistency
                         let mut versions = self.last_written_versions.write().await;
                         versions.insert((project_id.clone(), table_name.clone()), version);
-                        debug!("Stored last written version for {}/{}: {}", project_id, table_name, version);
-                    } else {
-                        debug!("WARNING: No version available after write for {}/{}", project_id, table_name);
                     }
 
                     *table = new_table;
@@ -1258,7 +1266,6 @@ impl Database {
                     // Invalidate statistics cache after successful write
                     drop(table); // Release write lock before async operation
                     self.statistics_extractor.invalidate(&project_id, &table_name).await;
-                    debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
 
                     return Ok(());
                 }
@@ -1741,9 +1748,7 @@ impl DataSink for ProjectRoutingTable {
 
         // Collect and group batches by project_id
         while let Some(batch) = data.next().await.transpose()? {
-            let batch_rows = batch.num_rows();
-            debug!("write_all: received batch with {} rows", batch_rows);
-            total_row_count += batch_rows;
+            total_row_count += batch.num_rows();
             let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
             project_batches.entry(project_id).or_default().push(batch);
         }
@@ -1757,13 +1762,7 @@ impl DataSink for ProjectRoutingTable {
 
         // Insert batches for each project
         for (project_id, batches) in project_batches {
-            let batch_count = batches.len();
             let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-            debug!(
-                "write_all: inserting {} batches with {} total rows for project {}",
-                batch_count, row_count, project_id
-            );
-
             let insert_span = tracing::trace_span!(parent: &span, "delta_table.insert", project_id = %project_id, rows = row_count);
             self.database
                 .insert_records_batch(&project_id, &self.table_name, batches, false)
@@ -1772,7 +1771,6 @@ impl DataSink for ProjectRoutingTable {
                 .map_err(|e| DataFusionError::Execution(format!("Insert error for project {} table {}: {}", project_id, self.table_name, e)))?;
         }
 
-        debug!("write_all: completed insertion of {} total rows", total_row_count);
         Ok(total_row_count as u64)
     }
 
@@ -1796,14 +1794,10 @@ impl TableProvider for ProjectRoutingTable {
     }
 
     async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Create a physical plan from the logical plan.
         // Check that the schema of the plan matches the schema of this table.
-        match self.schema().logically_equivalent_names_and_types(&input.schema()) {
-            Ok(_) => debug!("insert_into; Schema validation passed"),
-            Err(e) => {
-                error!("Schema validation failed: {}", e);
-                return Err(e);
-            }
+        if let Err(e) = self.schema().logically_equivalent_names_and_types(&input.schema()) {
+            error!("Schema validation failed: {}", e);
+            return Err(e);
         }
 
         if insert_op != InsertOp::Append {
@@ -1811,10 +1805,7 @@ impl TableProvider for ProjectRoutingTable {
             return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
         }
 
-        // Create sink executor but with additional logging
-        let sink = DataSinkExec::new(input, Arc::new(self.clone()), None);
-
-        Ok(Arc::new(sink))
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(self.clone()), None)))
     }
 
     fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
@@ -2274,6 +2265,45 @@ mod tests {
         .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
     }
 
+    /// Test that simulates the integration test pattern of sequential SQL inserts
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sequential_sql_inserts() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let (db, ctx) = setup_test_database().await?;
+            use datafusion::arrow::array::AsArray;
+
+            let project_id = "seq_test_project";
+
+            // Pre-create table with initial record (like integration test)
+            let batch = json_to_batch(vec![test_span("warmup_id", "warmup_name", project_id)])?;
+            db.insert_records_batch(project_id, "otel_logs_and_spans", vec![batch], true).await?;
+
+            // Do 5 sequential SQL inserts (like the integration test batch inserts)
+            for i in 0..5 {
+                let sql = format!(
+                    "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, hashes, name, level, status_code, summary)
+                     VALUES ('{}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:0{}Z', 'sql_id_{}', ARRAY[], 'sql_name_{}', 'INFO', 'OK', ARRAY['Seq test {}'])",
+                    project_id, i, i, i, i
+                );
+                let result = ctx.sql(&sql).await?.collect().await?;
+                let inserted = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+                assert_eq!(inserted, 1, "Each INSERT should insert 1 row");
+            }
+
+            // Verify all records
+            let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
+            let result = ctx.sql(&sql).await?.collect().await?;
+            let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+            assert_eq!(count, 6, "Expected 1 warmup + 5 SQL inserts = 6 records");
+
+            db.shutdown().await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 120 seconds"))?
+    }
+
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_table_creation() -> Result<()> {
@@ -2406,6 +2436,229 @@ mod tests {
             }
 
             db.shutdown().await?;
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
+    }
+
+    /// Test that mimics the integration test pattern: spawn a task, create DB inside, and use it
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_spawned_database_insert() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            dotenv::dotenv().ok();
+            unsafe {
+                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-spawn-{}", uuid::Uuid::new_v4()));
+            }
+
+            // This mimics the integration test pattern: spawn a task that creates the database
+            let (tx, rx) = tokio::sync::oneshot::channel::<Result<()>>();
+
+            tokio::spawn(async move {
+                let result = async {
+                    println!("Spawned task: Creating database...");
+                    let db = Database::new().await?;
+                    println!("Spawned task: Database created");
+
+                    let db_arc = Arc::new(db.clone());
+                    let mut ctx = db_arc.create_session_context();
+                    db.setup_session_context(&mut ctx)?;
+                    println!("Spawned task: Session context created");
+
+                    // Now try to insert - this is where the integration test hangs
+                    println!("Spawned task: Attempting insert...");
+                    let batch = json_to_batch(vec![test_span("spawn_test", "spawn_span", "spawn_project")])?;
+                    db.insert_records_batch("spawn_project", "otel_logs_and_spans", vec![batch], true).await?;
+                    println!("Spawned task: Insert completed!");
+
+                    // Query to verify
+                    let result = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'spawn_project'").await?.collect().await?;
+                    use datafusion::arrow::array::AsArray;
+                    let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+                    assert_eq!(count, 1, "Expected 1 row after insert");
+                    println!("Spawned task: Query verification passed");
+
+                    db.shutdown().await?;
+                    Ok::<(), anyhow::Error>(())
+                }.await;
+
+                let _ = tx.send(result);
+            });
+
+            // Wait for the spawned task to complete
+            rx.await.map_err(|_| anyhow::anyhow!("Spawned task channel closed"))??;
+            println!("Main task: Spawned task completed successfully");
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
+    }
+
+    /// Test cross-spawn query execution pattern: main task sends queries to spawned task
+    /// This mimics how PGWire handles queries from external clients
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cross_spawn_query_execution() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            dotenv::dotenv().ok();
+            unsafe {
+                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-cross-spawn-{}", uuid::Uuid::new_v4()));
+            }
+
+            // Channel for sending queries from main task to spawned task
+            let (query_tx, mut query_rx) = tokio::sync::mpsc::channel::<(String, tokio::sync::oneshot::Sender<Result<Vec<RecordBatch>>>)>(10);
+            // Signal when the server is ready
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            // Shutdown signal
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            let shutdown_clone = shutdown.clone();
+
+            // Spawn the "server" task that creates DB and handles queries
+            tokio::spawn(async move {
+                println!("Server: Creating database...");
+                let db = Database::new().await.expect("Failed to create database");
+                println!("Server: Database created");
+
+                let db_arc = Arc::new(db.clone());
+                let mut ctx = db_arc.create_session_context();
+                db.setup_session_context(&mut ctx).expect("Failed to setup session context");
+                println!("Server: Session context created");
+
+                // Insert some initial data
+                let batch = json_to_batch(vec![test_span("cross_spawn_test", "test_span", "cross_spawn_project")]).unwrap();
+                db.insert_records_batch("cross_spawn_project", "otel_logs_and_spans", vec![batch], true).await.unwrap();
+                println!("Server: Initial data inserted");
+
+                // Signal that we're ready
+                let _ = ready_tx.send(());
+
+                // Handle queries from the main task (simulating PGWire)
+                loop {
+                    tokio::select! {
+                        _ = shutdown_clone.notified() => {
+                            println!("Server: Shutdown signal received");
+                            break;
+                        }
+                        Some((sql, response_tx)) = query_rx.recv() => {
+                            println!("Server: Received query: {}", sql);
+                            let result = match ctx.sql(&sql).await {
+                                Ok(df) => df.collect().await.map_err(|e| anyhow::anyhow!("Query failed: {}", e)),
+                                Err(e) => Err(anyhow::anyhow!("SQL parse failed: {}", e)),
+                            };
+                            let _ = response_tx.send(result);
+                            println!("Server: Query executed");
+                        }
+                    }
+                }
+
+                db.shutdown().await.unwrap();
+                println!("Server: Shutdown complete");
+            });
+
+            // Wait for server to be ready
+            ready_rx.await.map_err(|_| anyhow::anyhow!("Server failed to start"))?;
+            println!("Main: Server is ready");
+
+            // Now act as a "client" sending queries
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            query_tx.send(("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'cross_spawn_project'".to_string(), result_tx)).await?;
+
+            let result = result_rx.await.map_err(|_| anyhow::anyhow!("Query response channel closed"))??;
+            use datafusion::arrow::array::AsArray;
+            let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+            assert_eq!(count, 1, "Expected 1 row");
+            println!("Main: Query result verified - count = {}", count);
+
+            // Shutdown the server
+            shutdown.notify_one();
+
+            // Give time for shutdown
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
+    }
+
+    /// Test on-demand table creation triggered by cross-spawn INSERT (mimics integration test)
+    /// This is the exact pattern that hangs in integration tests
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cross_spawn_insert_creates_table() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            dotenv::dotenv().ok();
+            unsafe {
+                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-demand-{}", uuid::Uuid::new_v4()));
+            }
+
+            // Channel for sending insert requests from main task to spawned task
+            type InsertRequest = (Vec<serde_json::Value>, tokio::sync::oneshot::Sender<Result<()>>);
+            let (insert_tx, mut insert_rx) = tokio::sync::mpsc::channel::<InsertRequest>(10);
+            // Signal when the server is ready (but NO table created yet)
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            // Shutdown signal
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            let shutdown_clone = shutdown.clone();
+
+            // Spawn the "server" task - creates DB but does NOT create any tables yet
+            tokio::spawn(async move {
+                println!("Server: Creating database...");
+                let db = Database::new().await.expect("Failed to create database");
+                println!("Server: Database created (no tables yet)");
+
+                // Signal that we're ready - but note: no tables have been created!
+                let _ = ready_tx.send(());
+
+                // Handle insert requests from the main task (simulating PGWire INSERT)
+                loop {
+                    tokio::select! {
+                        _ = shutdown_clone.notified() => {
+                            println!("Server: Shutdown signal received");
+                            break;
+                        }
+                        Some((records, response_tx)) = insert_rx.recv() => {
+                            println!("Server: Received insert request with {} records", records.len());
+                            let result = async {
+                                // This is exactly what happens in integration test:
+                                // INSERT comes from outside, triggers table creation
+                                let batch = json_to_batch(records)?;
+                                println!("Server: Batch created, calling insert_records_batch...");
+                                db.insert_records_batch("on_demand_project", "otel_logs_and_spans", vec![batch], true).await?;
+                                println!("Server: insert_records_batch completed!");
+                                Ok::<(), anyhow::Error>(())
+                            }.await;
+                            let _ = response_tx.send(result);
+                            println!("Server: Insert request handled");
+                        }
+                    }
+                }
+
+                db.shutdown().await.unwrap();
+                println!("Server: Shutdown complete");
+            });
+
+            // Wait for server to be ready (no tables created yet)
+            ready_rx.await.map_err(|_| anyhow::anyhow!("Server failed to start"))?;
+            println!("Main: Server is ready (no tables yet)");
+
+            // Now send an INSERT request from outside the spawn
+            // This will trigger on-demand table creation - THIS IS WHERE INTEGRATION TESTS HANG
+            println!("Main: Sending insert request (will trigger table creation)...");
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let records = vec![test_span("on_demand_test", "test_span", "on_demand_project")];
+            insert_tx.send((records, result_tx)).await?;
+
+            println!("Main: Waiting for insert to complete...");
+            result_rx.await.map_err(|_| anyhow::anyhow!("Insert response channel closed"))??;
+            println!("Main: Insert completed successfully!");
+
+            // Shutdown the server
+            shutdown.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
             Ok(())
         })

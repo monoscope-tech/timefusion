@@ -204,7 +204,6 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
 
         // Get query text and determine type
         let query = &portal.statement.statement.0;
-
         let query_lower = query.trim().to_lowercase();
         let (query_type, operation) = if query_lower.starts_with("select") || query_lower.contains(" select ") {
             ("SELECT", "SELECT")
