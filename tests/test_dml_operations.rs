@@ -85,7 +85,7 @@ mod test_dml_operations {
     // UPDATE Tests
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_update_query() -> Result<()> {
         timefusion::test_utils::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -141,7 +141,7 @@ mod test_dml_operations {
     // DELETE Tests
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_with_predicate() -> Result<()> {
         timefusion::test_utils::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -191,7 +191,7 @@ mod test_dml_operations {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_all_matching() -> Result<()> {
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
