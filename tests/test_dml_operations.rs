@@ -65,7 +65,7 @@ mod test_dml_operations {
     // UPDATE Tests
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_update_query() -> Result<()> {
         init_tracing();
         setup_test_env();
@@ -121,7 +121,7 @@ mod test_dml_operations {
     // DELETE Tests
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_with_predicate() -> Result<()> {
         init_tracing();
         setup_test_env();
@@ -171,7 +171,7 @@ mod test_dml_operations {
     }
 
     #[serial]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_delete_all_matching() -> Result<()> {
         setup_test_env();
 
