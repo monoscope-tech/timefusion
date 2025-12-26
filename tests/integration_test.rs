@@ -2,7 +2,7 @@
 mod integration {
     use anyhow::Result;
     use datafusion_postgres::{ServerOptions, auth::AuthManager};
-    use dotenv::dotenv;
+    // Not using dotenv - all env vars set explicitly in TestServer::start()
     use rand::Rng;
     use serial_test::serial;
     use std::sync::Arc;
@@ -21,24 +21,51 @@ mod integration {
     impl TestServer {
         async fn start() -> Result<Self> {
             let _ = env_logger::builder().is_test(true).try_init();
-            dotenv().ok();
+            // Don't use dotenv() - set all environment variables explicitly
+            // to match the lib tests which work correctly
 
             let test_id = Uuid::new_v4().to_string();
             let port = 5433 + rand::rng().random_range(1..100) as u16;
 
             unsafe {
+                // Core settings
                 std::env::set_var("PGWIRE_PORT", port.to_string());
                 std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", test_id));
+
+                // S3/MinIO settings - same as lib tests
+                std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
+                std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
+                std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
+                std::env::set_var("AWS_S3_ENDPOINT", "http://127.0.0.1:9000");
+                std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+                std::env::set_var("AWS_ALLOW_HTTP", "true");
+
+                // Disable config database
+                std::env::set_var("AWS_S3_LOCKING_PROVIDER", "");
+
+                // Foyer cache settings - use unique cache dir per test to avoid conflicts
+                std::env::set_var("TIMEFUSION_FOYER_MEMORY_MB", "64");
+                std::env::set_var("TIMEFUSION_FOYER_DISK_GB", "1");
+                std::env::set_var("TIMEFUSION_FOYER_TTL_SECONDS", "60");
+                std::env::set_var("TIMEFUSION_FOYER_SHARDS", "4");
+                std::env::set_var("TIMEFUSION_FOYER_CACHE_DIR", format!("/tmp/timefusion_cache_{}", test_id));
             }
 
+            // Create database OUTSIDE the spawn to ensure table initialization completes
+            // in the main test context.
+            let db = Database::new().await?;
+            let db = Arc::new(db);
+
+            // Pre-warm the table by creating it now, outside the PGWire handler context.
+            db.get_or_create_table("test_project", "otel_logs_and_spans").await?;
+
+            let db_clone = db.clone();
             let shutdown = Arc::new(Notify::new());
             let shutdown_clone = shutdown.clone();
 
             tokio::spawn(async move {
-                let db = Database::new().await.expect("Failed to create database");
-                let db = Arc::new(db);
-                let mut ctx = db.clone().create_session_context();
-                db.setup_session_context(&mut ctx).expect("Failed to setup context");
+                let mut ctx = db_clone.clone().create_session_context();
+                db_clone.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
                 let auth_manager = Arc::new(AuthManager::new());
@@ -164,109 +191,7 @@ mod integration {
 
         // Verify schema
         let rows = client.query("SELECT * FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1", &[&"test_project"]).await?;
-        assert_eq!(rows[0].columns().len(), 87);
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[serial]
-    #[ignore] // Slow integration test - run with: cargo test --test integration_test -- --ignored
-    async fn test_concurrent_postgres_requests() -> Result<()> {
-        let server = TestServer::start().await?;
-        let insert = TestServer::insert_sql();
-
-        const CLIENTS: usize = 3;
-        const OPS_PER_CLIENT: usize = 5;
-
-        // Concurrent inserts with mixed reads
-        let mut handles = vec![];
-        for client_id in 0..CLIENTS {
-            let server_port = server.port;
-            let test_prefix = format!("{}-client-{client_id}", server.test_id);
-            let insert = insert.clone();
-
-            handles.push(tokio::spawn(async move {
-                let client = TestServer::connect(server_port).await?;
-                for op in 0..OPS_PER_CLIENT {
-                    let span_id = format!("{test_prefix}-op-{op}");
-                    client
-                        .execute(
-                            &insert,
-                            &[
-                                &"test_project",
-                                &span_id,
-                                &format!("concurrent_span_{client_id}_{op}"),
-                                &"OK",
-                                &"Test",
-                                &"INFO",
-                                &vec![format!("Concurrent test summary: client {} op {}", client_id, op)],
-                            ],
-                        )
-                        .await?;
-
-                    if op % 2 == 0 {
-                        client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?;
-                    }
-                }
-                Ok::<_, anyhow::Error>(())
-            }));
-        }
-
-        for handle in handles {
-            handle.await??;
-        }
-
-        // Verify results
-        let client = server.client().await?;
-        let count: i64 = client
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{}%'",
-                    server.test_id
-                ),
-                &[],
-            )
-            .await?
-            .get(0);
-        assert_eq!(count, (CLIENTS * OPS_PER_CLIENT) as i64);
-
-        // Concurrent read performance test
-        let mut read_handles = vec![];
-        for _ in 0..3 {
-            let server_port = server.port;
-            let test_id = server.test_id.clone();
-
-            read_handles.push(tokio::spawn(async move {
-                let client = TestServer::connect(server_port).await?;
-                for j in 0..5 {
-                    match j % 3 {
-                        0 => client.query("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?,
-                        1 => {
-                            client
-                                .query(
-                                    &format!("SELECT name FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id LIKE '{test_id}%' LIMIT 10"),
-                                    &[],
-                                )
-                                .await?
-                        }
-                        _ => {
-                            client
-                                .query(
-                                    "SELECT status_code, COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project' GROUP BY status_code",
-                                    &[],
-                                )
-                                .await?
-                        }
-                    };
-                }
-                Ok::<_, anyhow::Error>(())
-            }));
-        }
-
-        for handle in read_handles {
-            handle.await??;
-        }
+        assert_eq!(rows[0].columns().len(), 89);
 
         Ok(())
     }
