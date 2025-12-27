@@ -690,7 +690,14 @@ impl Database {
             .with_runtime_env(runtime_env)
             .with_default_features()
             .with_physical_optimizer_rule(instrument_rule)
-            .with_query_planner(Arc::new(DmlQueryPlanner::new(self.clone())))
+            .with_query_planner(Arc::new({
+                let planner = DmlQueryPlanner::new(self.clone());
+                if let Some(layer) = self.buffered_layer.as_ref() {
+                    planner.with_buffered_layer(Arc::clone(layer))
+                } else {
+                    planner
+                }
+            }))
             .build();
 
         SessionContext::new_with_state(session_state)

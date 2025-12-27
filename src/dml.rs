@@ -18,8 +18,9 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
 use tracing::field::Empty;
-use tracing::{Instrument, error, info, instrument};
+use tracing::{Instrument, debug, error, info, instrument};
 
+use crate::buffered_write_layer::BufferedWriteLayer;
 use crate::database::Database;
 
 /// Type alias for DML information extracted from logical plan
@@ -29,6 +30,7 @@ type DmlInfo = (String, String, Option<Expr>, Option<Vec<(String, Expr)>>);
 pub struct DmlQueryPlanner {
     planner: DefaultPhysicalPlanner,
     database: Arc<Database>,
+    buffered_layer: Option<Arc<BufferedWriteLayer>>,
 }
 
 impl std::fmt::Debug for DmlQueryPlanner {
@@ -42,7 +44,13 @@ impl DmlQueryPlanner {
         Self {
             planner: DefaultPhysicalPlanner::with_extension_planners(vec![]),
             database,
+            buffered_layer: None,
         }
+    }
+
+    pub fn with_buffered_layer(mut self, layer: Arc<BufferedWriteLayer>) -> Self {
+        self.buffered_layer = Some(layer);
+        self
     }
 }
 
@@ -80,9 +88,10 @@ impl QueryPlanner for DmlQueryPlanner {
                         assignments.unwrap_or_default(),
                         input_exec,
                         self.database.clone(),
+                        self.buffered_layer.clone(),
                     )
                 } else {
-                    DmlExec::delete(table_name, project_id, dml.output_schema.clone(), predicate, input_exec, self.database.clone())
+                    DmlExec::delete(table_name, project_id, dml.output_schema.clone(), predicate, input_exec, self.database.clone(), self.buffered_layer.clone())
                 }))
             }
             _ => self.planner.create_physical_plan(logical_plan, session_state).await,
@@ -180,7 +189,7 @@ fn extract_project_id(expr: &Expr) -> Option<String> {
 }
 
 /// Unified DML execution plan
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DmlExec {
     op_type: DmlOperation,
     table_name: String,
@@ -189,6 +198,19 @@ pub struct DmlExec {
     assignments: Vec<(String, Expr)>,
     input: Arc<dyn ExecutionPlan>,
     database: Arc<Database>,
+    buffered_layer: Option<Arc<BufferedWriteLayer>>,
+}
+
+impl std::fmt::Debug for DmlExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmlExec")
+            .field("op_type", &self.op_type)
+            .field("table_name", &self.table_name)
+            .field("project_id", &self.project_id)
+            .field("predicate", &self.predicate)
+            .field("assignments", &self.assignments)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -200,7 +222,7 @@ enum DmlOperation {
 impl DmlExec {
     fn new(
         op_type: DmlOperation, table_name: String, project_id: String, predicate: Option<Expr>, assignments: Vec<(String, Expr)>,
-        input: Arc<dyn ExecutionPlan>, database: Arc<Database>,
+        input: Arc<dyn ExecutionPlan>, database: Arc<Database>, buffered_layer: Option<Arc<BufferedWriteLayer>>,
     ) -> Self {
         Self {
             op_type,
@@ -210,20 +232,22 @@ impl DmlExec {
             assignments,
             input,
             database,
+            buffered_layer,
         }
     }
 
     pub fn update(
         table_name: String, project_id: String, _table_schema: Arc<DFSchema>, predicate: Option<Expr>, assignments: Vec<(String, Expr)>,
-        input: Arc<dyn ExecutionPlan>, database: Arc<Database>,
+        input: Arc<dyn ExecutionPlan>, database: Arc<Database>, buffered_layer: Option<Arc<BufferedWriteLayer>>,
     ) -> Self {
-        Self::new(DmlOperation::Update, table_name, project_id, predicate, assignments, input, database)
+        Self::new(DmlOperation::Update, table_name, project_id, predicate, assignments, input, database, buffered_layer)
     }
 
     pub fn delete(
         table_name: String, project_id: String, _table_schema: Arc<DFSchema>, predicate: Option<Expr>, input: Arc<dyn ExecutionPlan>, database: Arc<Database>,
+        buffered_layer: Option<Arc<BufferedWriteLayer>>,
     ) -> Self {
-        Self::new(DmlOperation::Delete, table_name, project_id, predicate, vec![], input, database)
+        Self::new(DmlOperation::Delete, table_name, project_id, predicate, vec![], input, database, buffered_layer)
     }
 }
 
@@ -315,16 +339,24 @@ impl ExecutionPlan for DmlExec {
         let assignments = self.assignments.clone();
         let predicate = self.predicate.clone();
         let database = self.database.clone();
+        let buffered_layer = self.buffered_layer.clone();
 
         let future = async move {
             let result = match op_type {
                 DmlOperation::Update => {
-                    let update_span = tracing::trace_span!(parent: &span, "delta.update");
-                    perform_delta_update(&database, &table_name, &project_id, predicate, assignments).instrument(update_span).await
+                    perform_update_with_buffer(
+                        &database,
+                        buffered_layer.as_ref(),
+                        &table_name,
+                        &project_id,
+                        predicate,
+                        assignments,
+                        &span,
+                    )
+                    .await
                 }
                 DmlOperation::Delete => {
-                    let delete_span = tracing::trace_span!(parent: &span, "delta.delete");
-                    perform_delta_delete(&database, &table_name, &project_id, predicate).instrument(delete_span).await
+                    perform_delete_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, &span).await
                 }
             };
 
@@ -339,7 +371,7 @@ impl ExecutionPlan for DmlExec {
                 })
                 .map_err(|e| {
                     error!(
-                        "Delta {} failed: {}",
+                        "{} failed: {}",
                         match op_type {
                             DmlOperation::Update => "UPDATE",
                             DmlOperation::Delete => "DELETE",
@@ -352,6 +384,85 @@ impl ExecutionPlan for DmlExec {
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, futures::stream::once(future))))
     }
+}
+
+/// Perform UPDATE with MemBuffer support - update in memory first, then Delta if needed
+async fn perform_update_with_buffer(
+    database: &Database,
+    buffered_layer: Option<&Arc<BufferedWriteLayer>>,
+    table_name: &str,
+    project_id: &str,
+    predicate: Option<Expr>,
+    assignments: Vec<(String, Expr)>,
+    span: &tracing::Span,
+) -> Result<u64> {
+    let mut total_rows = 0u64;
+
+    // Step 1: Update in MemBuffer if available
+    if let Some(layer) = buffered_layer {
+        let mem_rows = layer.update(project_id, table_name, predicate.as_ref(), &assignments)?;
+        total_rows += mem_rows;
+        debug!("MemBuffer UPDATE: {} rows affected", mem_rows);
+    }
+
+    // Step 2: Check if table exists in Delta - if not, skip Delta operation
+    let table_exists_in_delta = database
+        .project_configs()
+        .read()
+        .await
+        .contains_key(&(project_id.to_string(), table_name.to_string()));
+
+    if table_exists_in_delta {
+        let update_span = tracing::trace_span!(parent: span, "delta.update");
+        let delta_rows = perform_delta_update(database, table_name, project_id, predicate, assignments)
+            .instrument(update_span)
+            .await?;
+        total_rows += delta_rows;
+        debug!("Delta UPDATE: {} rows affected", delta_rows);
+    } else {
+        debug!("Skipping Delta UPDATE - table not yet persisted");
+    }
+
+    Ok(total_rows)
+}
+
+/// Perform DELETE with MemBuffer support - delete from memory first, then Delta if needed
+async fn perform_delete_with_buffer(
+    database: &Database,
+    buffered_layer: Option<&Arc<BufferedWriteLayer>>,
+    table_name: &str,
+    project_id: &str,
+    predicate: Option<Expr>,
+    span: &tracing::Span,
+) -> Result<u64> {
+    let mut total_rows = 0u64;
+
+    // Step 1: Delete from MemBuffer if available
+    if let Some(layer) = buffered_layer {
+        let mem_rows = layer.delete(project_id, table_name, predicate.as_ref())?;
+        total_rows += mem_rows;
+        debug!("MemBuffer DELETE: {} rows affected", mem_rows);
+    }
+
+    // Step 2: Check if table exists in Delta - if not, skip Delta operation
+    let table_exists_in_delta = database
+        .project_configs()
+        .read()
+        .await
+        .contains_key(&(project_id.to_string(), table_name.to_string()));
+
+    if table_exists_in_delta {
+        let delete_span = tracing::trace_span!(parent: span, "delta.delete");
+        let delta_rows = perform_delta_delete(database, table_name, project_id, predicate)
+            .instrument(delete_span)
+            .await?;
+        total_rows += delta_rows;
+        debug!("Delta DELETE: {} rows affected", delta_rows);
+    } else {
+        debug!("Skipping Delta DELETE - table not yet persisted");
+    }
+
+    Ok(total_rows)
 }
 
 /// Perform Delta UPDATE operation

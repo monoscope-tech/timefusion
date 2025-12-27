@@ -374,6 +374,36 @@ impl BufferedWriteLayer {
     pub fn query_partitioned(&self, project_id: &str, table_name: &str) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
         self.mem_buffer.query_partitioned(project_id, table_name)
     }
+
+    /// Check if a table exists in the memory buffer.
+    pub fn has_table(&self, project_id: &str, table_name: &str) -> bool {
+        self.mem_buffer.has_table(project_id, table_name)
+    }
+
+    /// Delete rows matching the predicate from the memory buffer.
+    /// Returns the number of rows deleted.
+    #[instrument(skip(self, predicate), fields(project_id, table_name))]
+    pub fn delete(
+        &self,
+        project_id: &str,
+        table_name: &str,
+        predicate: Option<&datafusion::logical_expr::Expr>,
+    ) -> datafusion::error::Result<u64> {
+        self.mem_buffer.delete(project_id, table_name, predicate)
+    }
+
+    /// Update rows matching the predicate with new values in the memory buffer.
+    /// Returns the number of rows updated.
+    #[instrument(skip(self, predicate, assignments), fields(project_id, table_name))]
+    pub fn update(
+        &self,
+        project_id: &str,
+        table_name: &str,
+        predicate: Option<&datafusion::logical_expr::Expr>,
+        assignments: &[(String, datafusion::logical_expr::Expr)],
+    ) -> datafusion::error::Result<u64> {
+        self.mem_buffer.update(project_id, table_name, predicate, assignments)
+    }
 }
 
 #[cfg(test)]

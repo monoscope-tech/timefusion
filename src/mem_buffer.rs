@@ -1,7 +1,12 @@
-use arrow::array::RecordBatch;
+use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use arrow::compute::filter_record_batch;
 use arrow::datatypes::SchemaRef;
 use dashmap::DashMap;
+use datafusion::common::DFSchema;
+use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
+use datafusion::physical_expr::create_physical_expr;
+use datafusion::physical_expr::execution_props::ExecutionProps;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use tracing::{debug, info, instrument, warn};
@@ -50,6 +55,13 @@ pub struct MemBufferStats {
 
 fn estimate_batch_size(batch: &RecordBatch) -> usize {
     batch.get_array_memory_size()
+}
+
+/// Merge two arrays based on a boolean mask.
+/// For each row: if mask[i] is true, use new_values[i], else use original[i].
+fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray) -> DFResult<ArrayRef> {
+    arrow::compute::kernels::zip::zip(mask, new_values, original)
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
 }
 
 impl MemBuffer {
@@ -323,6 +335,189 @@ impl MemBuffer {
         evicted_count
     }
 
+    /// Check if a table exists in the buffer
+    pub fn has_table(&self, project_id: &str, table_name: &str) -> bool {
+        self.projects
+            .get(project_id)
+            .is_some_and(|project| project.table_buffers.contains_key(table_name))
+    }
+
+    /// Delete rows matching the predicate from the buffer.
+    /// Returns the number of rows deleted.
+    #[instrument(skip(self, predicate), fields(project_id, table_name, rows_deleted))]
+    pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&Expr>) -> DFResult<u64> {
+        let Some(project) = self.projects.get(project_id) else {
+            return Ok(0);
+        };
+        let Some(table) = project.table_buffers.get(table_name) else {
+            return Ok(0);
+        };
+
+        let schema = table.schema();
+        let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
+        let props = ExecutionProps::new();
+
+        let physical_predicate = predicate
+            .map(|p| create_physical_expr(p, &df_schema, &props))
+            .transpose()?;
+
+        let mut total_deleted = 0u64;
+        let mut memory_freed = 0usize;
+
+        for mut bucket_entry in table.buckets.iter_mut() {
+            let bucket = bucket_entry.value_mut();
+            let mut batches = bucket.batches.write().map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("Lock error: {}", e))
+            })?;
+
+            let mut new_batches = Vec::with_capacity(batches.len());
+            for batch in batches.drain(..) {
+                let original_rows = batch.num_rows();
+                let original_size = estimate_batch_size(&batch);
+
+                let filtered_batch = if let Some(ref phys_pred) = physical_predicate {
+                    let result = phys_pred.evaluate(&batch)?;
+                    let mask = result.into_array(batch.num_rows())?;
+                    let bool_mask = mask.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
+                        datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into())
+                    })?;
+                    // Invert mask: keep rows where predicate is FALSE
+                    let inverted = arrow::compute::not(bool_mask)?;
+                    filter_record_batch(&batch, &inverted)?
+                } else {
+                    // No predicate = delete all rows
+                    RecordBatch::new_empty(batch.schema())
+                };
+
+                let deleted = original_rows - filtered_batch.num_rows();
+                total_deleted += deleted as u64;
+
+                if filtered_batch.num_rows() > 0 {
+                    let new_size = estimate_batch_size(&filtered_batch);
+                    memory_freed += original_size.saturating_sub(new_size);
+                    new_batches.push(filtered_batch);
+                } else {
+                    memory_freed += original_size;
+                }
+            }
+
+            *batches = new_batches;
+            let new_row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+            bucket.row_count.store(new_row_count, Ordering::Relaxed);
+        }
+
+        if memory_freed > 0 {
+            self.estimated_bytes.fetch_sub(memory_freed, Ordering::Relaxed);
+        }
+
+        debug!("MemBuffer delete: project={}, table={}, rows_deleted={}", project_id, table_name, total_deleted);
+        Ok(total_deleted)
+    }
+
+    /// Update rows matching the predicate with new values.
+    /// Returns the number of rows updated.
+    #[instrument(skip(self, predicate, assignments), fields(project_id, table_name, rows_updated))]
+    pub fn update(
+        &self,
+        project_id: &str,
+        table_name: &str,
+        predicate: Option<&Expr>,
+        assignments: &[(String, Expr)],
+    ) -> DFResult<u64> {
+        if assignments.is_empty() {
+            return Ok(0);
+        }
+
+        let Some(project) = self.projects.get(project_id) else {
+            return Ok(0);
+        };
+        let Some(table) = project.table_buffers.get(table_name) else {
+            return Ok(0);
+        };
+
+        let schema = table.schema();
+        let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
+        let props = ExecutionProps::new();
+
+        let physical_predicate = predicate
+            .map(|p| create_physical_expr(p, &df_schema, &props))
+            .transpose()?;
+
+        // Pre-compile assignment expressions
+        let physical_assignments: Vec<_> = assignments
+            .iter()
+            .map(|(col, expr)| {
+                let phys_expr = create_physical_expr(expr, &df_schema, &props)?;
+                let col_idx = schema.index_of(col).map_err(|_| {
+                    datafusion::error::DataFusionError::Execution(format!("Column '{}' not found", col))
+                })?;
+                Ok((col_idx, phys_expr))
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+
+        let mut total_updated = 0u64;
+
+        for mut bucket_entry in table.buckets.iter_mut() {
+            let bucket = bucket_entry.value_mut();
+            let mut batches = bucket.batches.write().map_err(|e| {
+                datafusion::error::DataFusionError::Execution(format!("Lock error: {}", e))
+            })?;
+
+            let new_batches: Vec<RecordBatch> = batches
+                .drain(..)
+                .map(|batch| {
+                    let num_rows = batch.num_rows();
+                    if num_rows == 0 {
+                        return Ok(batch);
+                    }
+
+                    // Evaluate predicate to find matching rows
+                    let mask = if let Some(ref phys_pred) = physical_predicate {
+                        let result = phys_pred.evaluate(&batch)?;
+                        let arr = result.into_array(num_rows)?;
+                        arr.as_any().downcast_ref::<BooleanArray>().cloned().ok_or_else(|| {
+                            datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into())
+                        })?
+                    } else {
+                        // No predicate = update all rows
+                        BooleanArray::from(vec![true; num_rows])
+                    };
+
+                    let matching_count = mask.iter().filter(|v| v == &Some(true)).count();
+                    total_updated += matching_count as u64;
+
+                    if matching_count == 0 {
+                        return Ok(batch);
+                    }
+
+                    // Build new columns with updated values
+                    let new_columns: Vec<ArrayRef> = (0..batch.num_columns())
+                        .map(|col_idx| {
+                            // Check if this column has an assignment
+                            if let Some((_, phys_expr)) = physical_assignments.iter().find(|(idx, _)| *idx == col_idx) {
+                                // Evaluate the new value expression
+                                let new_values = phys_expr.evaluate(&batch)?.into_array(num_rows)?;
+                                // Merge: use new value where mask is true, original otherwise
+                                merge_arrays(batch.column(col_idx), &new_values, &mask)
+                            } else {
+                                Ok(batch.column(col_idx).clone())
+                            }
+                        })
+                        .collect::<DFResult<Vec<_>>>()?;
+
+                    RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| {
+                        datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
+                    })
+                })
+                .collect::<DFResult<Vec<_>>>()?;
+
+            *batches = new_batches;
+        }
+
+        debug!("MemBuffer update: project={}, table={}, rows_updated={}", project_id, table_name, total_updated);
+        Ok(total_updated)
+    }
+
     pub fn get_stats(&self) -> MemBufferStats {
         let mut stats = MemBufferStats {
             project_count: self.projects.len(),
@@ -478,5 +673,95 @@ mod tests {
 
         let results = buffer.query("project1", "table1", &[]).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    fn create_multi_row_batch(ids: Vec<i64>, names: Vec<&str>) -> RecordBatch {
+        let ts = chrono::Utc::now().timestamp_micros();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ts_array = TimestampMicrosecondArray::from(vec![ts; ids.len()]).with_timezone("UTC");
+        let id_array = Int64Array::from(ids);
+        let name_array = StringArray::from(names);
+        RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
+    }
+
+    #[test]
+    fn test_delete_all_rows() {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+
+        buffer.insert("project1", "table1", batch, ts).unwrap();
+
+        // Delete all rows (no predicate)
+        let deleted = buffer.delete("project1", "table1", None).unwrap();
+        assert_eq!(deleted, 3);
+
+        let results = buffer.query("project1", "table1", &[]).unwrap();
+        assert!(results.is_empty() || results.iter().all(|b| b.num_rows() == 0));
+    }
+
+    #[test]
+    fn test_delete_with_predicate() {
+        use datafusion::logical_expr::{col, lit};
+
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+
+        buffer.insert("project1", "table1", batch, ts).unwrap();
+
+        // Delete rows where id = 2
+        let predicate = col("id").eq(lit(2i64));
+        let deleted = buffer.delete("project1", "table1", Some(&predicate)).unwrap();
+        assert_eq!(deleted, 1);
+
+        let results = buffer.query("project1", "table1", &[]).unwrap();
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[test]
+    fn test_update_with_predicate() {
+        use datafusion::logical_expr::{col, lit};
+
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+
+        buffer.insert("project1", "table1", batch, ts).unwrap();
+
+        // Update name to "updated" where id = 2
+        let predicate = col("id").eq(lit(2i64));
+        let assignments = vec![("name".to_string(), lit("updated"))];
+        let updated = buffer.update("project1", "table1", Some(&predicate), &assignments).unwrap();
+        assert_eq!(updated, 1);
+
+        // Verify the update
+        let results = buffer.query("project1", "table1", &[]).unwrap();
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 3);
+
+        let name_col = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(name_col.value(0), "a");
+        assert_eq!(name_col.value(1), "updated");
+        assert_eq!(name_col.value(2), "c");
+    }
+
+    #[test]
+    fn test_has_table() {
+        let buffer = MemBuffer::new();
+        assert!(!buffer.has_table("project1", "table1"));
+
+        let ts = chrono::Utc::now().timestamp_micros();
+        buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+
+        assert!(buffer.has_table("project1", "table1"));
+        assert!(!buffer.has_table("project1", "table2"));
+        assert!(!buffer.has_table("project2", "table1"));
     }
 }
