@@ -4,6 +4,8 @@ use arrow::array::RecordBatch;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -66,6 +68,7 @@ pub struct BufferedWriteLayer {
     config: BufferConfig,
     shutdown: CancellationToken,
     delta_write_callback: Option<DeltaWriteCallback>,
+    background_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -88,6 +91,7 @@ impl BufferedWriteLayer {
             config,
             shutdown: CancellationToken::new(),
             delta_write_callback: None,
+            background_tasks: Mutex::new(Vec::new()),
         })
     }
 
@@ -108,8 +112,30 @@ impl BufferedWriteLayer {
         &self.config
     }
 
+    fn max_memory_bytes(&self) -> usize {
+        self.config.max_memory_mb * 1024 * 1024
+    }
+
+    fn is_memory_pressure(&self) -> bool {
+        let current = self.mem_buffer.estimated_memory_bytes();
+        let max = self.max_memory_bytes();
+        current >= max
+    }
+
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
+        // Check memory pressure before insert
+        if self.is_memory_pressure() {
+            warn!(
+                "Memory pressure detected ({}MB >= {}MB), triggering early flush",
+                self.mem_buffer.estimated_memory_bytes() / (1024 * 1024),
+                self.config.max_memory_mb
+            );
+            if let Err(e) = self.flush_completed_buckets().await {
+                error!("Early flush due to memory pressure failed: {}", e);
+            }
+        }
+
         let timestamp_micros = chrono::Utc::now().timestamp_micros();
 
         // Step 1: Write to WAL for durability
@@ -162,15 +188,21 @@ impl BufferedWriteLayer {
 
         // Start flush task
         let flush_this = Arc::clone(&this);
-        tokio::spawn(async move {
+        let flush_handle = tokio::spawn(async move {
             flush_this.run_flush_task().await;
         });
 
         // Start eviction task
         let eviction_this = Arc::clone(&this);
-        tokio::spawn(async move {
+        let eviction_handle = tokio::spawn(async move {
             eviction_this.run_eviction_task().await;
         });
+
+        // Store handles - use blocking lock since this runs at startup
+        if let Ok(mut handles) = this.background_tasks.try_lock() {
+            handles.push(flush_handle);
+            handles.push(eviction_handle);
+        }
 
         info!("BufferedWriteLayer background tasks started");
     }
@@ -224,13 +256,15 @@ impl BufferedWriteLayer {
         for bucket in flushable {
             match self.flush_bucket(&bucket).await {
                 Ok(()) => {
-                    // Drain from MemBuffer after successful flush
-                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
-
-                    // Checkpoint WAL
+                    // Checkpoint WAL BEFORE draining MemBuffer to prevent duplicates on recovery
+                    // If we crash after checkpoint but before drain, MemBuffer data is lost but
+                    // that's acceptable since it was already flushed to Delta
                     if let Err(e) = self.wal.checkpoint(&bucket.project_id, &bucket.table_name) {
                         warn!("WAL checkpoint failed: {}", e);
                     }
+
+                    // Now drain from MemBuffer
+                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
 
                     debug!(
                         "Flushed bucket: project={}, table={}, bucket_id={}, rows={}",
@@ -281,8 +315,19 @@ impl BufferedWriteLayer {
         // Signal background tasks to stop
         self.shutdown.cancel();
 
-        // Wait a bit for tasks to notice
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Wait for background tasks to complete (with timeout)
+        let handles: Vec<JoinHandle<()>> = {
+            let mut guard = self.background_tasks.lock().await;
+            std::mem::take(&mut *guard)
+        };
+
+        for handle in handles {
+            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(Ok(())) => debug!("Background task completed cleanly"),
+                Ok(Err(e)) => warn!("Background task panicked: {}", e),
+                Err(_) => warn!("Background task did not complete within timeout"),
+            }
+        }
 
         // Force flush all remaining data
         let all_buckets = self.mem_buffer.get_all_buckets();
@@ -291,10 +336,11 @@ impl BufferedWriteLayer {
         for bucket in all_buckets {
             match self.flush_bucket(&bucket).await {
                 Ok(()) => {
-                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
+                    // Checkpoint WAL before draining MemBuffer
                     if let Err(e) = self.wal.checkpoint(&bucket.project_id, &bucket.table_name) {
                         warn!("WAL checkpoint on shutdown failed: {}", e);
                     }
+                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
                 }
                 Err(e) => {
                     error!("Shutdown flush failed for bucket {}: {}", bucket.bucket_id, e);
@@ -335,6 +381,7 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use serial_test::serial;
     use tempfile::tempdir;
 
     fn create_test_batch() -> RecordBatch {
@@ -348,8 +395,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_insert_and_query() {
         let dir = tempdir().unwrap();
+
+        // Set WALRUS_DATA_DIR for this test (required by walrus-rust)
+        unsafe {
+            std::env::set_var("WALRUS_DATA_DIR", dir.path().to_string_lossy().to_string());
+        }
+
         let config = BufferConfig {
             wal_data_dir: dir.path().to_path_buf(),
             ..Default::default()
@@ -366,9 +420,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "walrus-rust topic recovery needs investigation"]
+    #[serial]
     async fn test_recovery() {
         let dir = tempdir().unwrap();
+
+        // Set WALRUS_DATA_DIR for this test (required by walrus-rust)
+        unsafe {
+            std::env::set_var("WALRUS_DATA_DIR", dir.path().to_string_lossy().to_string());
+        }
+
         let config = BufferConfig {
             wal_data_dir: dir.path().to_path_buf(),
             retention_mins: 90,
@@ -388,10 +448,10 @@ mod tests {
         {
             let layer = BufferedWriteLayer::new(config).unwrap();
             let stats = layer.recover_from_wal().await.unwrap();
-            assert!(stats.entries_replayed > 0);
+            assert!(stats.entries_replayed > 0, "Expected entries to be replayed from WAL");
 
             let results = layer.query("project1", "table1", &[]).unwrap();
-            assert!(!results.is_empty());
+            assert!(!results.is_empty(), "Expected results after WAL recovery");
         }
     }
 }

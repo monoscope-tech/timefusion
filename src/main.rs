@@ -15,6 +15,13 @@ async fn main() -> anyhow::Result<()> {
     // Initialize environment and telemetry
     dotenv().ok();
 
+    // Set WALRUS_DATA_DIR before any threads spawn (required by walrus-rust)
+    // This must happen before tokio runtime creates worker threads that might read it
+    let wal_dir = env::var("WALRUS_DATA_DIR").unwrap_or_else(|_| "/var/lib/timefusion/wal".to_string());
+    unsafe {
+        env::set_var("WALRUS_DATA_DIR", &wal_dir);
+    }
+
     // Initialize OpenTelemetry with OTLP exporter
     telemetry::init_telemetry()?;
 
