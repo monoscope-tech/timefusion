@@ -147,11 +147,10 @@ impl WalManager {
                 },
                 Ok(None) => break,
                 Err(e) => {
-                    // I/O error - log and continue to try remaining entries
-                    error!("I/O error reading WAL (continuing): {}", e);
+                    // I/O error - break to avoid infinite loop
+                    error!("I/O error reading WAL: {}", e);
                     error_count += 1;
-                    // Try to continue reading - some WAL implementations recover after errors
-                    continue;
+                    break;
                 }
             }
         }
