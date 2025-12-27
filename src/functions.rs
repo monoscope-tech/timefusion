@@ -214,7 +214,7 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
 
     fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         match &arg_types[0] {
-            DataType::Timestamp(unit, _) => Ok(DataType::Timestamp(unit.clone(), None)),
+            DataType::Timestamp(unit, _) => Ok(DataType::Timestamp(*unit, None)),
             _ => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
         }
     }
