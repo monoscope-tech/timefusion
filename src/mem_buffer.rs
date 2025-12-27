@@ -42,9 +42,7 @@ fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
         // Timestamps: ignore timezone metadata
         (DataType::Timestamp(u1, _), DataType::Timestamp(u2, _)) => u1 == u2,
         // Lists: check element types recursively
-        (DataType::List(f1), DataType::List(f2)) | (DataType::LargeList(f1), DataType::LargeList(f2)) => {
-            types_compatible(f1.data_type(), f2.data_type())
-        }
+        (DataType::List(f1), DataType::List(f2)) | (DataType::LargeList(f1), DataType::LargeList(f2)) => types_compatible(f1.data_type(), f2.data_type()),
         // Structs: all existing fields must be compatible
         (DataType::Struct(fields1), DataType::Struct(fields2)) => {
             for f1 in fields1.iter() {
@@ -68,9 +66,7 @@ fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
         (DataType::Decimal256(p1, s1), DataType::Decimal256(p2, s2)) => p1 == p2 && s1 == s2,
         // Fixed size types: size must match
         (DataType::FixedSizeBinary(n1), DataType::FixedSizeBinary(n2)) => n1 == n2,
-        (DataType::FixedSizeList(f1, n1), DataType::FixedSizeList(f2, n2)) => {
-            n1 == n2 && types_compatible(f1.data_type(), f2.data_type())
-        }
+        (DataType::FixedSizeList(f1, n1), DataType::FixedSizeList(f2, n2)) => n1 == n2 && types_compatible(f1.data_type(), f2.data_type()),
         // All other types: exact match
         _ => existing == incoming,
     }
@@ -80,9 +76,10 @@ fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
 /// Returns None if no timestamp column exists or it's empty.
 pub fn extract_min_timestamp(batch: &RecordBatch) -> Option<i64> {
     let schema = batch.schema();
-    let ts_idx = schema.fields().iter().position(|f| {
-        f.name() == "timestamp" && matches!(f.data_type(), DataType::Timestamp(TimeUnit::Microsecond, _))
-    })?;
+    let ts_idx = schema
+        .fields()
+        .iter()
+        .position(|f| f.name() == "timestamp" && matches!(f.data_type(), DataType::Timestamp(TimeUnit::Microsecond, _)))?;
     let ts_col = batch.column(ts_idx);
     let ts_array = ts_col.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
     arrow::compute::min(ts_array)
