@@ -412,24 +412,31 @@ async fn perform_update_with_buffer(
     assignments: Vec<(String, Expr)>, span: &tracing::Span,
 ) -> Result<u64> {
     let mut total_rows = 0u64;
+    let mut has_uncommitted_data = false;
 
-    // Step 1: Update in MemBuffer if available
+    // Step 1: Update in MemBuffer if available (uncommitted data)
     if let Some(layer) = buffered_layer {
-        let mem_rows = layer.update(project_id, table_name, predicate.as_ref(), &assignments)?;
-        total_rows += mem_rows;
-        debug!("MemBuffer UPDATE: {} rows affected", mem_rows);
+        has_uncommitted_data = layer.has_table(project_id, table_name);
+        if has_uncommitted_data {
+            let mem_rows = layer.update(project_id, table_name, predicate.as_ref(), &assignments)?;
+            total_rows += mem_rows;
+            debug!("MemBuffer UPDATE: {} rows affected (uncommitted data)", mem_rows);
+        }
     }
 
-    // Step 2: Check if table exists in Delta - if not, skip Delta operation
-    let table_exists_in_delta = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
+    // Step 2: Check if table has committed data in Delta
+    // Only go to Delta if there's committed data there (table exists in project_configs means it was flushed)
+    let has_committed_data = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
 
-    if table_exists_in_delta {
+    if has_committed_data {
         let update_span = tracing::trace_span!(parent: span, "delta.update");
         let delta_rows = perform_delta_update(database, table_name, project_id, predicate, assignments).instrument(update_span).await?;
         total_rows += delta_rows;
-        debug!("Delta UPDATE: {} rows affected", delta_rows);
+        debug!("Delta UPDATE: {} rows affected (committed data)", delta_rows);
+    } else if !has_uncommitted_data {
+        debug!("Skipping UPDATE - no data found in MemBuffer or Delta");
     } else {
-        debug!("Skipping Delta UPDATE - table not yet persisted");
+        debug!("Skipping Delta UPDATE - all data is uncommitted (in MemBuffer only)");
     }
 
     Ok(total_rows)
@@ -440,24 +447,31 @@ async fn perform_delete_with_buffer(
     database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>, span: &tracing::Span,
 ) -> Result<u64> {
     let mut total_rows = 0u64;
+    let mut has_uncommitted_data = false;
 
-    // Step 1: Delete from MemBuffer if available
+    // Step 1: Delete from MemBuffer if available (uncommitted data)
     if let Some(layer) = buffered_layer {
-        let mem_rows = layer.delete(project_id, table_name, predicate.as_ref())?;
-        total_rows += mem_rows;
-        debug!("MemBuffer DELETE: {} rows affected", mem_rows);
+        has_uncommitted_data = layer.has_table(project_id, table_name);
+        if has_uncommitted_data {
+            let mem_rows = layer.delete(project_id, table_name, predicate.as_ref())?;
+            total_rows += mem_rows;
+            debug!("MemBuffer DELETE: {} rows affected (uncommitted data)", mem_rows);
+        }
     }
 
-    // Step 2: Check if table exists in Delta - if not, skip Delta operation
-    let table_exists_in_delta = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
+    // Step 2: Check if table has committed data in Delta
+    // Only go to Delta if there's committed data there (table exists in project_configs means it was flushed)
+    let has_committed_data = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
 
-    if table_exists_in_delta {
+    if has_committed_data {
         let delete_span = tracing::trace_span!(parent: span, "delta.delete");
         let delta_rows = perform_delta_delete(database, table_name, project_id, predicate).instrument(delete_span).await?;
         total_rows += delta_rows;
-        debug!("Delta DELETE: {} rows affected", delta_rows);
+        debug!("Delta DELETE: {} rows affected (committed data)", delta_rows);
+    } else if !has_uncommitted_data {
+        debug!("Skipping DELETE - no data found in MemBuffer or Delta");
     } else {
-        debug!("Skipping Delta DELETE - table not yet persisted");
+        debug!("Skipping Delta DELETE - all data is uncommitted (in MemBuffer only)");
     }
 
     Ok(total_rows)
