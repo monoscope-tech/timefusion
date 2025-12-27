@@ -63,10 +63,7 @@ jobs:
       MAX_PG_CONNECTIONS: "100"
       AWS_S3_LOCKING_PROVIDER: ""
       WALRUS_DATA_DIR: /tmp/walrus-wal
-      TIMEFUSION_FOYER_MEMORY_MB: "256"
-      TIMEFUSION_FOYER_DISK_GB: "10"
-      TIMEFUSION_FOYER_TTL_SECONDS: "300"
-      TIMEFUSION_FOYER_SHARDS: "8"
+      TIMEFUSION_FOYER_DISABLED: "true"
     services:
       minio:
         image: public.ecr.aws/bitnami/minio:latest
