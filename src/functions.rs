@@ -112,7 +112,7 @@ impl ScalarUDFImpl for ToCharUDF {
                         return Err(DataFusionError::Execution("Format string must be a scalar value".to_string()));
                     }
                 } else {
-                    return Err(DataFusionError::Execution("Format string must be a UTF8 string".to_string()))
+                    return Err(DataFusionError::Execution("Format string must be a UTF8 string".to_string()));
                 }
             }
         };
@@ -248,7 +248,7 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
                         return Err(DataFusionError::Execution("Timezone must be a scalar string value".to_string()));
                     }
                 } else {
-                    return Err(DataFusionError::Execution("Timezone must be a UTF8 string".to_string()))
+                    return Err(DataFusionError::Execution("Timezone must be a UTF8 string".to_string()));
                 }
             }
         };
