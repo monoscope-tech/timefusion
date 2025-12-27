@@ -38,7 +38,7 @@ mod test_json_functions {
         let batch = &results[0];
         let column = batch.column(0);
         let value = column.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().unwrap();
-        assert_eq!(value.value(0), r#""{\"hello\": \"world\"}""#);
+        assert_eq!(value.value(0), r#"{"hello":"world"}"#);
 
         // Test to_json with number
         let df = ctx.sql("SELECT to_json(123) as result").await?;
@@ -112,9 +112,7 @@ mod test_json_functions {
         let batch = &results[0];
         let column = batch.column(0);
         let value = column.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().unwrap();
-        // to_json converts the string to a JSON string (with quotes and escaping)
-        // The JSON string becomes a quoted string in the array
-        assert_eq!(value.value(0), r#"["001","test_span",1500,"\"{\\\"status\\\": \\\"ok\\\"}\""]"#);
+        assert_eq!(value.value(0), r#"["001","test_span",1500,{"status":"ok"}]"#);
 
         Ok(())
     }
