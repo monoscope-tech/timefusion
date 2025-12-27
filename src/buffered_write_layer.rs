@@ -383,12 +383,7 @@ impl BufferedWriteLayer {
     /// Delete rows matching the predicate from the memory buffer.
     /// Returns the number of rows deleted.
     #[instrument(skip(self, predicate), fields(project_id, table_name))]
-    pub fn delete(
-        &self,
-        project_id: &str,
-        table_name: &str,
-        predicate: Option<&datafusion::logical_expr::Expr>,
-    ) -> datafusion::error::Result<u64> {
+    pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>) -> datafusion::error::Result<u64> {
         self.mem_buffer.delete(project_id, table_name, predicate)
     }
 
@@ -396,11 +391,7 @@ impl BufferedWriteLayer {
     /// Returns the number of rows updated.
     #[instrument(skip(self, predicate, assignments), fields(project_id, table_name))]
     pub fn update(
-        &self,
-        project_id: &str,
-        table_name: &str,
-        predicate: Option<&datafusion::logical_expr::Expr>,
-        assignments: &[(String, datafusion::logical_expr::Expr)],
+        &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>, assignments: &[(String, datafusion::logical_expr::Expr)],
     ) -> datafusion::error::Result<u64> {
         self.mem_buffer.update(project_id, table_name, predicate, assignments)
     }

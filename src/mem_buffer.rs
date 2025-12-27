@@ -60,8 +60,7 @@ fn estimate_batch_size(batch: &RecordBatch) -> usize {
 /// Merge two arrays based on a boolean mask.
 /// For each row: if mask[i] is true, use new_values[i], else use original[i].
 fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray) -> DFResult<ArrayRef> {
-    arrow::compute::kernels::zip::zip(mask, new_values, original)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::kernels::zip::zip(mask, new_values, original).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
 }
 
 impl MemBuffer {
@@ -239,7 +238,11 @@ impl MemBuffer {
             if let Ok(batches) = bucket.batches.into_inner() {
                 debug!(
                     "MemBuffer drain: project={}, table={}, bucket={}, batches={}, freed_bytes={}",
-                    project_id, table_name, bucket_id, batches.len(), freed_bytes
+                    project_id,
+                    table_name,
+                    bucket_id,
+                    batches.len(),
+                    freed_bytes
                 );
                 return Some(batches);
             }
@@ -337,9 +340,7 @@ impl MemBuffer {
 
     /// Check if a table exists in the buffer
     pub fn has_table(&self, project_id: &str, table_name: &str) -> bool {
-        self.projects
-            .get(project_id)
-            .is_some_and(|project| project.table_buffers.contains_key(table_name))
+        self.projects.get(project_id).is_some_and(|project| project.table_buffers.contains_key(table_name))
     }
 
     /// Delete rows matching the predicate from the buffer.
@@ -357,18 +358,14 @@ impl MemBuffer {
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let props = ExecutionProps::new();
 
-        let physical_predicate = predicate
-            .map(|p| create_physical_expr(p, &df_schema, &props))
-            .transpose()?;
+        let physical_predicate = predicate.map(|p| create_physical_expr(p, &df_schema, &props)).transpose()?;
 
         let mut total_deleted = 0u64;
         let mut memory_freed = 0usize;
 
         for mut bucket_entry in table.buckets.iter_mut() {
             let bucket = bucket_entry.value_mut();
-            let mut batches = bucket.batches.write().map_err(|e| {
-                datafusion::error::DataFusionError::Execution(format!("Lock error: {}", e))
-            })?;
+            let mut batches = bucket.batches.write().map_err(|e| datafusion::error::DataFusionError::Execution(format!("Lock error: {}", e)))?;
 
             let mut new_batches = Vec::with_capacity(batches.len());
             for batch in batches.drain(..) {
@@ -378,9 +375,10 @@ impl MemBuffer {
                 let filtered_batch = if let Some(ref phys_pred) = physical_predicate {
                     let result = phys_pred.evaluate(&batch)?;
                     let mask = result.into_array(batch.num_rows())?;
-                    let bool_mask = mask.as_any().downcast_ref::<BooleanArray>().ok_or_else(|| {
-                        datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into())
-                    })?;
+                    let bool_mask = mask
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?;
                     // Invert mask: keep rows where predicate is FALSE
                     let inverted = arrow::compute::not(bool_mask)?;
                     filter_record_batch(&batch, &inverted)?
@@ -417,13 +415,7 @@ impl MemBuffer {
     /// Update rows matching the predicate with new values.
     /// Returns the number of rows updated.
     #[instrument(skip(self, predicate, assignments), fields(project_id, table_name, rows_updated))]
-    pub fn update(
-        &self,
-        project_id: &str,
-        table_name: &str,
-        predicate: Option<&Expr>,
-        assignments: &[(String, Expr)],
-    ) -> DFResult<u64> {
+    pub fn update(&self, project_id: &str, table_name: &str, predicate: Option<&Expr>, assignments: &[(String, Expr)]) -> DFResult<u64> {
         if assignments.is_empty() {
             return Ok(0);
         }
@@ -439,18 +431,14 @@ impl MemBuffer {
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let props = ExecutionProps::new();
 
-        let physical_predicate = predicate
-            .map(|p| create_physical_expr(p, &df_schema, &props))
-            .transpose()?;
+        let physical_predicate = predicate.map(|p| create_physical_expr(p, &df_schema, &props)).transpose()?;
 
         // Pre-compile assignment expressions
         let physical_assignments: Vec<_> = assignments
             .iter()
             .map(|(col, expr)| {
                 let phys_expr = create_physical_expr(expr, &df_schema, &props)?;
-                let col_idx = schema.index_of(col).map_err(|_| {
-                    datafusion::error::DataFusionError::Execution(format!("Column '{}' not found", col))
-                })?;
+                let col_idx = schema.index_of(col).map_err(|_| datafusion::error::DataFusionError::Execution(format!("Column '{}' not found", col)))?;
                 Ok((col_idx, phys_expr))
             })
             .collect::<DFResult<Vec<_>>>()?;
@@ -459,9 +447,7 @@ impl MemBuffer {
 
         for mut bucket_entry in table.buckets.iter_mut() {
             let bucket = bucket_entry.value_mut();
-            let mut batches = bucket.batches.write().map_err(|e| {
-                datafusion::error::DataFusionError::Execution(format!("Lock error: {}", e))
-            })?;
+            let mut batches = bucket.batches.write().map_err(|e| datafusion::error::DataFusionError::Execution(format!("Lock error: {}", e)))?;
 
             let new_batches: Vec<RecordBatch> = batches
                 .drain(..)
@@ -475,9 +461,10 @@ impl MemBuffer {
                     let mask = if let Some(ref phys_pred) = physical_predicate {
                         let result = phys_pred.evaluate(&batch)?;
                         let arr = result.into_array(num_rows)?;
-                        arr.as_any().downcast_ref::<BooleanArray>().cloned().ok_or_else(|| {
-                            datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into())
-                        })?
+                        arr.as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .cloned()
+                            .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?
                     } else {
                         // No predicate = update all rows
                         BooleanArray::from(vec![true; num_rows])
@@ -505,9 +492,7 @@ impl MemBuffer {
                         })
                         .collect::<DFResult<Vec<_>>>()?;
 
-                    RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| {
-                        datafusion::error::DataFusionError::ArrowError(Box::new(e), None)
-                    })
+                    RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
                 })
                 .collect::<DFResult<Vec<_>>>()?;
 
