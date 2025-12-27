@@ -39,7 +39,39 @@ fn schemas_compatible(existing: &SchemaRef, incoming: &SchemaRef) -> bool {
 
 fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
     match (existing, incoming) {
-        (DataType::Timestamp(u1, _), DataType::Timestamp(u2, _)) => u1 == u2, // Ignore timezone metadata
+        // Timestamps: ignore timezone metadata
+        (DataType::Timestamp(u1, _), DataType::Timestamp(u2, _)) => u1 == u2,
+        // Lists: check element types recursively
+        (DataType::List(f1), DataType::List(f2)) | (DataType::LargeList(f1), DataType::LargeList(f2)) => {
+            types_compatible(f1.data_type(), f2.data_type())
+        }
+        // Structs: all existing fields must be compatible
+        (DataType::Struct(fields1), DataType::Struct(fields2)) => {
+            for f1 in fields1.iter() {
+                match fields2.iter().find(|f| f.name() == f1.name()) {
+                    Some(f2) => {
+                        if !types_compatible(f1.data_type(), f2.data_type()) {
+                            return false;
+                        }
+                    }
+                    None => return false, // Field missing in incoming
+                }
+            }
+            true
+        }
+        // Maps: check key and value types
+        (DataType::Map(f1, _), DataType::Map(f2, _)) => types_compatible(f1.data_type(), f2.data_type()),
+        // Dictionary: compare value types (key types can differ)
+        (DataType::Dictionary(_, v1), DataType::Dictionary(_, v2)) => types_compatible(v1, v2),
+        // Decimals: precision/scale must match
+        (DataType::Decimal128(p1, s1), DataType::Decimal128(p2, s2)) => p1 == p2 && s1 == s2,
+        (DataType::Decimal256(p1, s1), DataType::Decimal256(p2, s2)) => p1 == p2 && s1 == s2,
+        // Fixed size types: size must match
+        (DataType::FixedSizeBinary(n1), DataType::FixedSizeBinary(n2)) => n1 == n2,
+        (DataType::FixedSizeList(f1, n1), DataType::FixedSizeList(f2, n2)) => {
+            n1 == n2 && types_compatible(f1.data_type(), f2.data_type())
+        }
+        // All other types: exact match
         _ => existing == incoming,
     }
 }
