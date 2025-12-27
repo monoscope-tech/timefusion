@@ -149,10 +149,11 @@ impl WalManager {
         let mut topics = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
             for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if !name.starts_with('.') && entry.path().is_dir() {
-                        topics.push(name.to_string());
-                    }
+                if let Some(name) = entry.file_name().to_str()
+                    && !name.starts_with('.')
+                    && entry.path().is_dir()
+                {
+                    topics.push(name.to_string());
                 }
             }
         }
@@ -223,11 +224,11 @@ fn serialize_record_batch(batch: &RecordBatch) -> anyhow::Result<Vec<u8>> {
 
 fn deserialize_record_batch(data: &[u8]) -> anyhow::Result<RecordBatch> {
     let cursor = Cursor::new(data);
-    let reader = StreamReader::try_new(cursor, None)?;
-    for batch_result in reader {
-        return Ok(batch_result?);
-    }
-    anyhow::bail!("No record batch found in data")
+    let mut reader = StreamReader::try_new(cursor, None)?;
+    reader
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No record batch found in data"))?
+        .map_err(|e| anyhow::anyhow!("Failed to deserialize record batch: {}", e))
 }
 
 fn serialize_wal_entry(entry: &WalEntry) -> anyhow::Result<Vec<u8>> {
