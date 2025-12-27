@@ -140,10 +140,10 @@ trace_root_1 /api/users 250000000
 
 # 7. Log level distribution
 query TI
-SELECT level, COUNT(*) as count FROM otel_logs_and_spans 
+SELECT level, COUNT(*) as count FROM otel_logs_and_spans
 WHERE project_id = 'prod_monitoring' AND level IS NOT NULL
 GROUP BY level
-ORDER BY count DESC
+ORDER BY count DESC, level
 ----
 DEBUG 2
 INFO 2

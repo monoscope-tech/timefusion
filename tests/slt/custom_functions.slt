@@ -47,23 +47,23 @@ December 25, 2024
 
 # Test conversion to different timezones
 # Note: AT TIME ZONE preserves the instant but shows time in target zone
-query T
-SELECT 
+query TT
+SELECT
     to_char(timestamp, 'YYYY-MM-DD HH24:MI:SS') as utc_time,
     to_char(at_time_zone(timestamp, 'America/New_York'), 'YYYY-MM-DD HH24:MI:SS') as ny_time
-FROM otel_logs_and_spans 
+FROM otel_logs_and_spans
 WHERE project_id = 'test_functions' AND id = 'func_test_1'
 ----
-2024-01-15 14:30:45	2024-01-15 14:30:45
+2024-01-15 14:30:45	2024-01-15 09:30:45
 
-query T
-SELECT 
+query TT
+SELECT
     to_char(timestamp, 'YYYY-MM-DD HH24:MI:SS') as utc_time,
     to_char(at_time_zone(timestamp, 'Asia/Tokyo'), 'YYYY-MM-DD HH24:MI:SS') as tokyo_time
-FROM otel_logs_and_spans 
+FROM otel_logs_and_spans
 WHERE project_id = 'test_functions' AND id = 'func_test_1'
 ----
-2024-01-15 14:30:45	2024-01-15 14:30:45
+2024-01-15 14:30:45	2024-01-15 23:30:45
 
 # === Test JSON functions from datafusion-functions-json ===
 
