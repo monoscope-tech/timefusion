@@ -118,9 +118,10 @@ impl WalManager {
     }
 
     #[instrument(skip(self), fields(project_id, table_name))]
-    pub fn read_entries(&self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool) -> anyhow::Result<Vec<(WalEntry, RecordBatch)>> {
+    pub fn read_entries(&self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool) -> anyhow::Result<(Vec<(WalEntry, RecordBatch)>, usize)> {
         let topic = Self::make_topic(project_id, table_name);
         let mut results = Vec::new();
+        let mut error_count = 0usize;
         let cutoff = since_timestamp_micros.unwrap_or(0);
 
         loop {
@@ -131,30 +132,40 @@ impl WalManager {
                             match deserialize_record_batch(&entry.data) {
                                 Ok(batch) => results.push((entry, batch)),
                                 Err(e) => {
-                                    warn!("Failed to deserialize batch from WAL: {}", e);
+                                    warn!("Skipping corrupted batch in WAL: {}", e);
+                                    error_count += 1;
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize WAL entry: {}", e);
+                        warn!("Skipping corrupted WAL entry: {}", e);
+                        error_count += 1;
                     }
                 },
                 Ok(None) => break,
                 Err(e) => {
-                    error!("Error reading WAL: {}", e);
-                    break;
+                    // I/O error - log and continue to try remaining entries
+                    error!("I/O error reading WAL (continuing): {}", e);
+                    error_count += 1;
+                    // Try to continue reading - some WAL implementations recover after errors
+                    continue;
                 }
             }
         }
 
-        debug!("WAL read: topic={}, entries={}", topic, results.len());
-        Ok(results)
+        if error_count > 0 {
+            warn!("WAL read: topic={}, entries={}, errors={}", topic, results.len(), error_count);
+        } else {
+            debug!("WAL read: topic={}, entries={}", topic, results.len());
+        }
+        Ok((results, error_count))
     }
 
     #[instrument(skip(self))]
-    pub fn read_all_entries(&self, since_timestamp_micros: Option<i64>, checkpoint: bool) -> anyhow::Result<Vec<(WalEntry, RecordBatch)>> {
+    pub fn read_all_entries(&self, since_timestamp_micros: Option<i64>, checkpoint: bool) -> anyhow::Result<(Vec<(WalEntry, RecordBatch)>, usize)> {
         let mut all_results = Vec::new();
+        let mut total_errors = 0usize;
         let cutoff = since_timestamp_micros.unwrap_or(0);
 
         let topics = self.list_topics()?;
@@ -162,16 +173,24 @@ impl WalManager {
         for topic in topics {
             if let Some((project_id, table_name)) = Self::parse_topic(&topic) {
                 match self.read_entries(&project_id, &table_name, Some(cutoff), checkpoint) {
-                    Ok(entries) => all_results.extend(entries),
+                    Ok((entries, errors)) => {
+                        all_results.extend(entries);
+                        total_errors += errors;
+                    }
                     Err(e) => {
                         warn!("Failed to read entries for topic {}: {}", topic, e);
+                        total_errors += 1;
                     }
                 }
             }
         }
 
-        info!("WAL read all: total_entries={}, cutoff={}", all_results.len(), cutoff);
-        Ok(all_results)
+        if total_errors > 0 {
+            warn!("WAL read all: total_entries={}, cutoff={}, errors={}", all_results.len(), cutoff, total_errors);
+        } else {
+            info!("WAL read all: total_entries={}, cutoff={}", all_results.len(), cutoff);
+        }
+        Ok((all_results, total_errors))
     }
 
     pub fn list_topics(&self) -> anyhow::Result<Vec<String>> {
@@ -196,13 +215,6 @@ impl WalManager {
             debug!("WAL checkpoint: topic={}, consumed={}", topic, count);
         }
         Ok(())
-    }
-
-    #[instrument(skip(self))]
-    pub fn prune_older_than(&self, _cutoff_timestamp_micros: i64) -> anyhow::Result<u64> {
-        // No-op: entries are consumed during read_entries().
-        // WAL files are managed by walrus-rust internally.
-        Ok(0)
     }
 
     pub fn data_dir(&self) -> &PathBuf {

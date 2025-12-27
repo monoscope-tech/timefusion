@@ -58,6 +58,7 @@ pub struct RecoveryStats {
     pub oldest_entry_timestamp: Option<i64>,
     pub newest_entry_timestamp: Option<i64>,
     pub recovery_duration_ms: u64,
+    pub corrupted_entries_skipped: u64,
 }
 
 pub type DeltaWriteCallback = Arc<dyn Fn(String, String, Vec<RecordBatch>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
@@ -119,14 +120,17 @@ impl BufferedWriteLayer {
     }
 
     fn is_memory_pressure(&self) -> bool {
-        let current = self.mem_buffer.estimated_memory_bytes();
-        let max = self.max_memory_bytes();
-        current >= max
+        self.mem_buffer.estimated_memory_bytes() >= self.max_memory_bytes()
+    }
+
+    fn is_hard_limit_exceeded(&self) -> bool {
+        // Hard limit at 120% of configured max to provide back-pressure
+        self.mem_buffer.estimated_memory_bytes() >= (self.max_memory_bytes() * 120 / 100)
     }
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
-        // Check memory pressure before insert
+        // Check memory pressure and apply back-pressure if needed
         if self.is_memory_pressure() {
             warn!(
                 "Memory pressure detected ({}MB >= {}MB), triggering early flush",
@@ -135,6 +139,17 @@ impl BufferedWriteLayer {
             );
             if let Err(e) = self.flush_completed_buckets().await {
                 error!("Early flush due to memory pressure failed: {}", e);
+            }
+
+            // After flush, check hard limit - reject if still exceeded
+            if self.is_hard_limit_exceeded() {
+                let current_mb = self.mem_buffer.estimated_memory_bytes() / (1024 * 1024);
+                let limit_mb = self.config.max_memory_mb * 120 / 100;
+                anyhow::bail!(
+                    "Memory limit exceeded after flush: {}MB > {}MB. Back-pressure applied.",
+                    current_mb,
+                    limit_mb
+                );
             }
         }
 
@@ -163,9 +178,10 @@ impl BufferedWriteLayer {
 
         // Use checkpoint=false during recovery to prevent data loss.
         // WAL entries are only checkpointed after successful Delta flush.
-        let entries = self.wal.read_all_entries(Some(cutoff), false)?;
+        let (entries, error_count) = self.wal.read_all_entries(Some(cutoff), false)?;
 
         let mut stats = RecoveryStats::default();
+        stats.corrupted_entries_skipped = error_count as u64;
         let mut oldest_ts: Option<i64> = None;
         let mut newest_ts: Option<i64> = None;
 
@@ -183,10 +199,17 @@ impl BufferedWriteLayer {
         stats.newest_entry_timestamp = newest_ts;
         stats.recovery_duration_ms = start.elapsed().as_millis() as u64;
 
-        info!(
-            "WAL recovery complete: entries={}, duration={}ms",
-            stats.entries_replayed, stats.recovery_duration_ms
-        );
+        if stats.corrupted_entries_skipped > 0 {
+            warn!(
+                "WAL recovery complete: entries={}, skipped={}, duration={}ms",
+                stats.entries_replayed, stats.corrupted_entries_skipped, stats.recovery_duration_ms
+            );
+        } else {
+            info!(
+                "WAL recovery complete: entries={}, duration={}ms",
+                stats.entries_replayed, stats.recovery_duration_ms
+            );
+        }
         Ok(stats)
     }
 
@@ -266,15 +289,14 @@ impl BufferedWriteLayer {
         for bucket in flushable {
             match self.flush_bucket(&bucket).await {
                 Ok(()) => {
-                    // Checkpoint WAL BEFORE draining MemBuffer to prevent duplicates on recovery
-                    // If we crash after checkpoint but before drain, MemBuffer data is lost but
-                    // that's acceptable since it was already flushed to Delta
+                    // Order: drain MemBuffer FIRST, then checkpoint WAL
+                    // If crash after drain but before checkpoint: WAL replays on recovery,
+                    // may cause duplicates in Delta but no data loss (prefer duplicates over loss)
+                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
+
                     if let Err(e) = self.wal.checkpoint(&bucket.project_id, &bucket.table_name) {
                         warn!("WAL checkpoint failed: {}", e);
                     }
-
-                    // Now drain from MemBuffer
-                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
 
                     debug!(
                         "Flushed bucket: project={}, table={}, bucket_id={}, rows={}",
@@ -286,7 +308,6 @@ impl BufferedWriteLayer {
                         "Failed to flush bucket: project={}, table={}, bucket_id={}: {}",
                         bucket.project_id, bucket.table_name, bucket.bucket_id, e
                     );
-                    // Keep bucket in MemBuffer for retry next cycle
                 }
             }
         }
@@ -311,11 +332,7 @@ impl BufferedWriteLayer {
         if evicted > 0 {
             debug!("Evicted {} old buckets", evicted);
         }
-
-        // Also prune WAL
-        if let Err(e) = self.wal.prune_older_than(cutoff) {
-            warn!("WAL prune failed: {}", e);
-        }
+        // WAL pruning is handled by checkpointing after successful Delta flush
     }
 
     #[instrument(skip(self))]
@@ -349,11 +366,11 @@ impl BufferedWriteLayer {
         for bucket in all_buckets {
             match self.flush_bucket(&bucket).await {
                 Ok(()) => {
-                    // Checkpoint WAL before draining MemBuffer
+                    // Drain MemBuffer first, then checkpoint WAL (prefer duplicates over data loss)
+                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
                     if let Err(e) = self.wal.checkpoint(&bucket.project_id, &bucket.table_name) {
                         warn!("WAL checkpoint on shutdown failed: {}", e);
                     }
-                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
                 }
                 Err(e) => {
                     error!("Shutdown flush failed for bucket {}: {}", bucket.bucket_id, e);
@@ -418,6 +435,26 @@ mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
 
+    struct EnvGuard(String, Option<String>);
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            // SAFETY: Tests run serially via #[serial] attribute
+            unsafe { std::env::set_var(key, value) };
+            Self(key.to_string(), old)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => unsafe { std::env::set_var(&self.0, v) },
+                None => unsafe { std::env::remove_var(&self.0) },
+            }
+        }
+    }
+
     fn create_test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -432,11 +469,7 @@ mod tests {
     #[serial]
     async fn test_insert_and_query() {
         let dir = tempdir().unwrap();
-
-        // Set WALRUS_DATA_DIR for this test (required by walrus-rust)
-        unsafe {
-            std::env::set_var("WALRUS_DATA_DIR", dir.path().to_string_lossy().to_string());
-        }
+        let _env_guard = EnvGuard::set("WALRUS_DATA_DIR", &dir.path().to_string_lossy());
 
         let config = BufferConfig {
             wal_data_dir: dir.path().to_path_buf(),
@@ -457,11 +490,7 @@ mod tests {
     #[serial]
     async fn test_recovery() {
         let dir = tempdir().unwrap();
-
-        // Set WALRUS_DATA_DIR for this test (required by walrus-rust)
-        unsafe {
-            std::env::set_var("WALRUS_DATA_DIR", dir.path().to_string_lossy().to_string());
-        }
+        let _env_guard = EnvGuard::set("WALRUS_DATA_DIR", &dir.path().to_string_lossy());
 
         let config = BufferConfig {
             wal_data_dir: dir.path().to_path_buf(),

@@ -13,12 +13,41 @@ mod test_dml_operations {
         let _ = tracing::subscriber::set_global_default(subscriber);
     }
 
-    fn setup_test_env() {
-        dotenv::dotenv().ok();
-        unsafe {
-            std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-            std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
+    struct EnvGuard {
+        keys: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let old = std::env::var(key).ok();
+            // SAFETY: Tests run serially via #[serial] attribute
+            unsafe { std::env::set_var(key, value) };
+            Self { keys: vec![(key.to_string(), old)] }
         }
+
+        fn add(&mut self, key: &str, value: &str) {
+            let old = std::env::var(key).ok();
+            unsafe { std::env::set_var(key, value) };
+            self.keys.push((key.to_string(), old));
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, old) in &self.keys {
+                match old {
+                    Some(v) => unsafe { std::env::set_var(key, v) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    fn setup_test_env() -> EnvGuard {
+        dotenv::dotenv().ok();
+        let mut guard = EnvGuard::set("AWS_S3_BUCKET", "timefusion-tests");
+        guard.add("TIMEFUSION_TABLE_PREFIX", &format!("test-{}", uuid::Uuid::new_v4()));
+        guard
     }
 
     // ==========================================================================
@@ -73,7 +102,7 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_update_query() -> Result<()> {
         init_tracing();
-        setup_test_env();
+        let _env_guard = setup_test_env();
 
         let db = Arc::new(Database::new().await?);
         let mut ctx = db.clone().create_session_context();
@@ -129,7 +158,7 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_delete_with_predicate() -> Result<()> {
         init_tracing();
-        setup_test_env();
+        let _env_guard = setup_test_env();
 
         let db = Arc::new(Database::new().await?);
         let mut ctx = db.clone().create_session_context();
@@ -274,7 +303,7 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_update_multiple_columns() -> Result<()> {
         init_tracing();
-        setup_test_env();
+        let _env_guard = setup_test_env();
 
         let db = Arc::new(Database::new().await?);
         let mut ctx = db.clone().create_session_context();
@@ -327,7 +356,7 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_delete_verify_counts() -> Result<()> {
         init_tracing();
-        setup_test_env();
+        let _env_guard = setup_test_env();
 
         let db = Arc::new(Database::new().await?);
         let mut ctx = db.clone().create_session_context();
