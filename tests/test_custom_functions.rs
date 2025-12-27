@@ -77,5 +77,4 @@ mod test_custom_functions {
 
         Ok(())
     }
-
 }
