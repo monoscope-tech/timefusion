@@ -145,11 +145,7 @@ impl BufferedWriteLayer {
             if self.is_hard_limit_exceeded() {
                 let current_mb = self.mem_buffer.estimated_memory_bytes() / (1024 * 1024);
                 let limit_mb = self.config.max_memory_mb * 120 / 100;
-                anyhow::bail!(
-                    "Memory limit exceeded after flush: {}MB > {}MB. Back-pressure applied.",
-                    current_mb,
-                    limit_mb
-                );
+                anyhow::bail!("Memory limit exceeded after flush: {}MB > {}MB. Back-pressure applied.", current_mb, limit_mb);
             }
         }
 
@@ -180,24 +176,26 @@ impl BufferedWriteLayer {
         // WAL entries are only checkpointed after successful Delta flush.
         let (entries, error_count) = self.wal.read_all_entries(Some(cutoff), false)?;
 
-        let mut stats = RecoveryStats::default();
-        stats.corrupted_entries_skipped = error_count as u64;
+        let mut entries_replayed = 0u64;
         let mut oldest_ts: Option<i64> = None;
         let mut newest_ts: Option<i64> = None;
 
         for (entry, batch) in entries {
             self.mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros)?;
 
-            stats.entries_replayed += 1;
-            stats.batches_recovered += 1;
-
+            entries_replayed += 1;
             oldest_ts = Some(oldest_ts.map_or(entry.timestamp_micros, |ts| ts.min(entry.timestamp_micros)));
             newest_ts = Some(newest_ts.map_or(entry.timestamp_micros, |ts| ts.max(entry.timestamp_micros)));
         }
 
-        stats.oldest_entry_timestamp = oldest_ts;
-        stats.newest_entry_timestamp = newest_ts;
-        stats.recovery_duration_ms = start.elapsed().as_millis() as u64;
+        let stats = RecoveryStats {
+            entries_replayed,
+            batches_recovered: entries_replayed,
+            oldest_entry_timestamp: oldest_ts,
+            newest_entry_timestamp: newest_ts,
+            recovery_duration_ms: start.elapsed().as_millis() as u64,
+            corrupted_entries_skipped: error_count as u64,
+        };
 
         if stats.corrupted_entries_skipped > 0 {
             warn!(

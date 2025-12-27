@@ -118,7 +118,9 @@ impl WalManager {
     }
 
     #[instrument(skip(self), fields(project_id, table_name))]
-    pub fn read_entries(&self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool) -> anyhow::Result<(Vec<(WalEntry, RecordBatch)>, usize)> {
+    pub fn read_entries(
+        &self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool,
+    ) -> anyhow::Result<(Vec<(WalEntry, RecordBatch)>, usize)> {
         let topic = Self::make_topic(project_id, table_name);
         let mut results = Vec::new();
         let mut error_count = 0usize;
