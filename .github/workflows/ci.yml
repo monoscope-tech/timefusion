@@ -47,7 +47,7 @@ jobs:
     timeout-minutes: 15
     services:
       minio:
-        image: bitnami/minio:latest
+        image: bitnami/minio:2024
         ports:
           - 9000:9000
         env:
