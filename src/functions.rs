@@ -50,7 +50,41 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
 
 /// Create the to_char UDF for PostgreSQL-compatible timestamp formatting
 fn create_to_char_udf() -> ScalarUDF {
-    let to_char_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
+    ScalarUDF::from(ToCharUDF::new())
+}
+
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct ToCharUDF {
+    signature: Signature,
+}
+
+impl ToCharUDF {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for ToCharUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "to_char"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let args = args.args;
         if args.len() != 2 {
             return Err(DataFusionError::Execution(
                 "to_char requires exactly 2 arguments: timestamp and format string".to_string(),
@@ -66,27 +100,26 @@ fn create_to_char_udf() -> ScalarUDF {
         // Extract format string
         let format_str = match &args[1] {
             ColumnarValue::Scalar(scalar) => match scalar {
-                datafusion::scalar::ScalarValue::Utf8(Some(s)) => s.clone(),
+                ScalarValue::Utf8(Some(s)) => s.clone(),
+                ScalarValue::LargeUtf8(Some(s)) => s.clone(),
                 _ => return Err(DataFusionError::Execution("Format string must be a UTF8 string".to_string())),
             },
-            ColumnarValue::Array(_) => {
-                return Err(DataFusionError::Execution("Format string must be a scalar value".to_string()));
+            ColumnarValue::Array(arr) => {
+                if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                    if str_arr.len() == 1 && !str_arr.is_null(0) {
+                        str_arr.value(0).to_string()
+                    } else {
+                        return Err(DataFusionError::Execution("Format string must be a scalar value".to_string()));
+                    }
+                } else {
+                    return Err(DataFusionError::Execution("Format string must be a UTF8 string".to_string()))
+                }
             }
         };
 
-        // Convert timestamps to formatted strings
         let result = format_timestamps(&timestamp_array, &format_str)?;
-
         Ok(ColumnarValue::Array(result))
-    });
-
-    create_udf(
-        "to_char",
-        vec![DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), DataType::Utf8],
-        DataType::Utf8,
-        Volatility::Immutable,
-        to_char_fn,
-    )
+    }
 }
 
 /// Format timestamps according to PostgreSQL format patterns
@@ -150,7 +183,44 @@ fn postgres_to_chrono_format(pg_format: &str) -> String {
 
 /// Create the AT TIME ZONE UDF for timezone conversion
 fn create_at_time_zone_udf() -> ScalarUDF {
-    let at_time_zone_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
+    ScalarUDF::from(AtTimeZoneUDF::new())
+}
+
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct AtTimeZoneUDF {
+    signature: Signature,
+}
+
+impl AtTimeZoneUDF {
+    fn new() -> Self {
+        Self {
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for AtTimeZoneUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "at_time_zone"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        match &arg_types[0] {
+            DataType::Timestamp(unit, _) => Ok(DataType::Timestamp(unit.clone(), None)),
+            _ => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        }
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let args = args.args;
         if args.len() != 2 {
             return Err(DataFusionError::Execution(
                 "AT TIME ZONE requires exactly 2 arguments: timestamp and timezone".to_string(),
@@ -166,31 +236,33 @@ fn create_at_time_zone_udf() -> ScalarUDF {
         // Extract timezone string
         let tz_str = match &args[1] {
             ColumnarValue::Scalar(scalar) => match scalar {
-                datafusion::scalar::ScalarValue::Utf8(Some(s)) => s.clone(),
+                ScalarValue::Utf8(Some(s)) => s.clone(),
+                ScalarValue::LargeUtf8(Some(s)) => s.clone(),
                 _ => return Err(DataFusionError::Execution("Timezone must be a UTF8 string".to_string())),
             },
-            ColumnarValue::Array(_) => {
-                return Err(DataFusionError::Execution("Timezone must be a scalar value".to_string()));
+            ColumnarValue::Array(arr) => {
+                if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                    if str_arr.len() == 1 && !str_arr.is_null(0) {
+                        str_arr.value(0).to_string()
+                    } else {
+                        return Err(DataFusionError::Execution("Timezone must be a scalar string value".to_string()));
+                    }
+                } else {
+                    return Err(DataFusionError::Execution("Timezone must be a UTF8 string".to_string()))
+                }
             }
         };
 
-        // Convert timestamps to the specified timezone
         let result = convert_timezone(&timestamp_array, &tz_str)?;
-
         Ok(ColumnarValue::Array(result))
-    });
-
-    create_udf(
-        "at_time_zone",
-        vec![DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))), DataType::Utf8],
-        DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
-        Volatility::Immutable,
-        at_time_zone_fn,
-    )
+    }
 }
 
 /// Convert timestamps to a different timezone
+/// This adjusts the timestamp so that when formatted as UTC, it displays the local time
 fn convert_timezone(timestamp_array: &ArrayRef, tz_str: &str) -> datafusion::error::Result<ArrayRef> {
+    use chrono::Offset;
+
     // Parse timezone
     let tz: Tz = tz_str.parse().map_err(|_| DataFusionError::Execution(format!("Invalid timezone: {}", tz_str)))?;
 
@@ -206,11 +278,13 @@ fn convert_timezone(timestamp_array: &ArrayRef, tz_str: &str) -> datafusion::err
                 let datetime =
                     DateTime::<Utc>::from_timestamp_micros(timestamp_us).ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))?;
 
-                // Convert to target timezone (keeping the same instant in time)
-                let converted = datetime.with_timezone(&tz);
-
-                // Convert back to UTC timestamp for storage
-                builder.append_value(converted.timestamp_micros());
+                // Get the local time in target timezone
+                let local_time = datetime.with_timezone(&tz);
+                // Get the offset from UTC in seconds
+                let offset_secs = local_time.offset().fix().local_minus_utc() as i64;
+                // Adjust the timestamp so that when formatted as UTC, it shows local time
+                let adjusted_us = timestamp_us + (offset_secs * 1_000_000);
+                builder.append_value(adjusted_us);
             }
         }
 
@@ -225,11 +299,13 @@ fn convert_timezone(timestamp_array: &ArrayRef, tz_str: &str) -> datafusion::err
                 let timestamp_ns = timestamps.value(i);
                 let datetime = DateTime::<Utc>::from_timestamp_nanos(timestamp_ns);
 
-                // Convert to target timezone (keeping the same instant in time)
-                let converted = datetime.with_timezone(&tz);
-
-                // Convert back to UTC timestamp for storage
-                builder.append_value(converted.timestamp_nanos_opt().unwrap_or(timestamp_ns));
+                // Get the local time in target timezone
+                let local_time = datetime.with_timezone(&tz);
+                // Get the offset from UTC in seconds
+                let offset_secs = local_time.offset().fix().local_minus_utc() as i64;
+                // Adjust the timestamp so that when formatted as UTC, it shows local time
+                let adjusted_ns = timestamp_ns + (offset_secs * 1_000_000_000);
+                builder.append_value(adjusted_ns);
             }
         }
 
@@ -490,7 +566,14 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
                 if string_array.is_null(i) {
                     values.push(JsonValue::Null);
                 } else {
-                    values.push(JsonValue::String(string_array.value(i).to_string()));
+                    let s = string_array.value(i);
+                    // Try to parse as JSON if it looks like JSON
+                    let val = if (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']')) {
+                        serde_json::from_str(s).unwrap_or_else(|_| JsonValue::String(s.to_string()))
+                    } else {
+                        JsonValue::String(s.to_string())
+                    };
+                    values.push(val);
                 }
             }
         }

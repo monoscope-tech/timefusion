@@ -156,10 +156,10 @@ WHERE project_id = 'agg_test' AND status_code = 'OK'
 
 # Test GROUP BY with ORDER BY
 query TI
-SELECT level, COUNT(*) FROM otel_logs_and_spans 
+SELECT level, COUNT(*) FROM otel_logs_and_spans
 WHERE project_id = 'agg_test'
 GROUP BY level
-ORDER BY COUNT(*) DESC
+ORDER BY COUNT(*) DESC, level
 ----
 INFO 3
 ERROR 1

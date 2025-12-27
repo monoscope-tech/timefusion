@@ -199,7 +199,7 @@ SELECT json_build_array(id, name, duration) FROM otel_logs_and_spans WHERE proje
 query T
 SELECT to_json(summary) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1
 ----
-"[{\"status\": \"ok\", \"count\": 5}]"
+[{"count":5,"status":"ok"}]
 
 # Test to_json with different types
 query T
