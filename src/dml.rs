@@ -7,7 +7,7 @@ use datafusion::{
         array::RecordBatch,
         datatypes::{DataType, Field, Schema},
     },
-    common::{Column, DFSchema, Result},
+    common::{Column, Result},
     error::DataFusionError,
     execution::{
         SendableRecordBatchStream, TaskContext,
@@ -80,18 +80,16 @@ impl QueryPlanner for DmlQueryPlanner {
                 span.record("project_id", project_id.as_str());
 
                 Ok(Arc::new(if is_update {
-                    DmlExec::update(
-                        table_name,
-                        project_id,
-                        dml.output_schema.clone(),
-                        predicate,
-                        assignments.unwrap_or_default(),
-                        input_exec,
-                        self.database.clone(),
-                        self.buffered_layer.clone(),
-                    )
+                    DmlExec::update(table_name, project_id, input_exec, self.database.clone())
+                        .predicate(predicate)
+                        .assignments(assignments.unwrap_or_default())
+                        .buffered_layer(self.buffered_layer.clone())
+                        .build()
                 } else {
-                    DmlExec::delete(table_name, project_id, dml.output_schema.clone(), predicate, input_exec, self.database.clone(), self.buffered_layer.clone())
+                    DmlExec::delete(table_name, project_id, input_exec, self.database.clone())
+                        .predicate(predicate)
+                        .buffered_layer(self.buffered_layer.clone())
+                        .build()
                 }))
             }
             _ => self.planner.create_physical_plan(logical_plan, session_state).await,
@@ -219,35 +217,68 @@ enum DmlOperation {
     Delete,
 }
 
-impl DmlExec {
-    fn new(
-        op_type: DmlOperation, table_name: String, project_id: String, predicate: Option<Expr>, assignments: Vec<(String, Expr)>,
-        input: Arc<dyn ExecutionPlan>, database: Arc<Database>, buffered_layer: Option<Arc<BufferedWriteLayer>>,
-    ) -> Self {
+/// Builder for DmlExec
+pub struct DmlExecBuilder {
+    op_type: DmlOperation,
+    table_name: String,
+    project_id: String,
+    predicate: Option<Expr>,
+    assignments: Vec<(String, Expr)>,
+    input: Arc<dyn ExecutionPlan>,
+    database: Arc<Database>,
+    buffered_layer: Option<Arc<BufferedWriteLayer>>,
+}
+
+impl DmlExecBuilder {
+    fn new(op_type: DmlOperation, table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> Self {
         Self {
             op_type,
             table_name,
             project_id,
-            predicate,
-            assignments,
+            predicate: None,
+            assignments: vec![],
             input,
             database,
-            buffered_layer,
+            buffered_layer: None,
         }
     }
 
-    pub fn update(
-        table_name: String, project_id: String, _table_schema: Arc<DFSchema>, predicate: Option<Expr>, assignments: Vec<(String, Expr)>,
-        input: Arc<dyn ExecutionPlan>, database: Arc<Database>, buffered_layer: Option<Arc<BufferedWriteLayer>>,
-    ) -> Self {
-        Self::new(DmlOperation::Update, table_name, project_id, predicate, assignments, input, database, buffered_layer)
+    pub fn predicate(mut self, predicate: Option<Expr>) -> Self {
+        self.predicate = predicate;
+        self
     }
 
-    pub fn delete(
-        table_name: String, project_id: String, _table_schema: Arc<DFSchema>, predicate: Option<Expr>, input: Arc<dyn ExecutionPlan>, database: Arc<Database>,
-        buffered_layer: Option<Arc<BufferedWriteLayer>>,
-    ) -> Self {
-        Self::new(DmlOperation::Delete, table_name, project_id, predicate, vec![], input, database, buffered_layer)
+    pub fn assignments(mut self, assignments: Vec<(String, Expr)>) -> Self {
+        self.assignments = assignments;
+        self
+    }
+
+    pub fn buffered_layer(mut self, layer: Option<Arc<BufferedWriteLayer>>) -> Self {
+        self.buffered_layer = layer;
+        self
+    }
+
+    pub fn build(self) -> DmlExec {
+        DmlExec {
+            op_type: self.op_type,
+            table_name: self.table_name,
+            project_id: self.project_id,
+            predicate: self.predicate,
+            assignments: self.assignments,
+            input: self.input,
+            database: self.database,
+            buffered_layer: self.buffered_layer,
+        }
+    }
+}
+
+impl DmlExec {
+    pub fn update(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> DmlExecBuilder {
+        DmlExecBuilder::new(DmlOperation::Update, table_name, project_id, input, database)
+    }
+
+    pub fn delete(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> DmlExecBuilder {
+        DmlExecBuilder::new(DmlOperation::Delete, table_name, project_id, input, database)
     }
 }
 
@@ -344,20 +375,9 @@ impl ExecutionPlan for DmlExec {
         let future = async move {
             let result = match op_type {
                 DmlOperation::Update => {
-                    perform_update_with_buffer(
-                        &database,
-                        buffered_layer.as_ref(),
-                        &table_name,
-                        &project_id,
-                        predicate,
-                        assignments,
-                        &span,
-                    )
-                    .await
+                    perform_update_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, assignments, &span).await
                 }
-                DmlOperation::Delete => {
-                    perform_delete_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, &span).await
-                }
+                DmlOperation::Delete => perform_delete_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, &span).await,
             };
 
             if let Ok(rows) = &result {
@@ -388,13 +408,8 @@ impl ExecutionPlan for DmlExec {
 
 /// Perform UPDATE with MemBuffer support - update in memory first, then Delta if needed
 async fn perform_update_with_buffer(
-    database: &Database,
-    buffered_layer: Option<&Arc<BufferedWriteLayer>>,
-    table_name: &str,
-    project_id: &str,
-    predicate: Option<Expr>,
-    assignments: Vec<(String, Expr)>,
-    span: &tracing::Span,
+    database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
+    assignments: Vec<(String, Expr)>, span: &tracing::Span,
 ) -> Result<u64> {
     let mut total_rows = 0u64;
 
@@ -406,17 +421,11 @@ async fn perform_update_with_buffer(
     }
 
     // Step 2: Check if table exists in Delta - if not, skip Delta operation
-    let table_exists_in_delta = database
-        .project_configs()
-        .read()
-        .await
-        .contains_key(&(project_id.to_string(), table_name.to_string()));
+    let table_exists_in_delta = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
 
     if table_exists_in_delta {
         let update_span = tracing::trace_span!(parent: span, "delta.update");
-        let delta_rows = perform_delta_update(database, table_name, project_id, predicate, assignments)
-            .instrument(update_span)
-            .await?;
+        let delta_rows = perform_delta_update(database, table_name, project_id, predicate, assignments).instrument(update_span).await?;
         total_rows += delta_rows;
         debug!("Delta UPDATE: {} rows affected", delta_rows);
     } else {
@@ -428,12 +437,7 @@ async fn perform_update_with_buffer(
 
 /// Perform DELETE with MemBuffer support - delete from memory first, then Delta if needed
 async fn perform_delete_with_buffer(
-    database: &Database,
-    buffered_layer: Option<&Arc<BufferedWriteLayer>>,
-    table_name: &str,
-    project_id: &str,
-    predicate: Option<Expr>,
-    span: &tracing::Span,
+    database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>, span: &tracing::Span,
 ) -> Result<u64> {
     let mut total_rows = 0u64;
 
@@ -445,17 +449,11 @@ async fn perform_delete_with_buffer(
     }
 
     // Step 2: Check if table exists in Delta - if not, skip Delta operation
-    let table_exists_in_delta = database
-        .project_configs()
-        .read()
-        .await
-        .contains_key(&(project_id.to_string(), table_name.to_string()));
+    let table_exists_in_delta = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
 
     if table_exists_in_delta {
         let delete_span = tracing::trace_span!(parent: span, "delta.delete");
-        let delta_rows = perform_delta_delete(database, table_name, project_id, predicate)
-            .instrument(delete_span)
-            .await?;
+        let delta_rows = perform_delta_delete(database, table_name, project_id, predicate).instrument(delete_span).await?;
         total_rows += delta_rows;
         debug!("Delta DELETE: {} rows affected", delta_rows);
     } else {
