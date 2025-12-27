@@ -88,4 +88,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run all tests
-        run: cargo test --all-features -- --include-ignored
+        run: cargo test --all-features

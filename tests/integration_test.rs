@@ -126,7 +126,6 @@ mod integration {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    #[ignore] // Slow integration test - run with: cargo test --test integration_test -- --ignored
     async fn test_postgres_integration() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
@@ -198,7 +197,6 @@ mod integration {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    #[ignore] // Slow integration test - run with: cargo test --test integration_test -- --ignored
     async fn test_update_operations() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
@@ -278,7 +276,6 @@ mod integration {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    #[ignore] // Slow integration test - run with: cargo test --test integration_test -- --ignored
     async fn test_delete_operations() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
