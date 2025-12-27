@@ -64,8 +64,7 @@ mod test_custom_functions {
         let batch = &results[0];
         assert_eq!(batch.num_rows(), 1);
 
-        // The at_time_zone function preserves the instant in time
-        // We can verify it works by formatting the result
+        // The at_time_zone function converts to the target timezone
         let sql2 = "SELECT to_char(at_time_zone(TIMESTAMP '2024-01-15 14:30:45 UTC', 'America/New_York'), 'YYYY-MM-DD HH24:MI:SS') as formatted";
 
         let df2 = ctx.sql(sql2).await?;
@@ -76,8 +75,8 @@ mod test_custom_functions {
         let array = batch2.column(0).as_string::<i32>();
         let actual = array.value(0);
 
-        // The time should be the same since AT TIME ZONE preserves the instant
-        assert_eq!(actual, "2024-01-15 14:30:45");
+        // UTC 14:30:45 -> America/New_York (UTC-5 in January) = 09:30:45
+        assert_eq!(actual, "2024-01-15 09:30:45");
 
         Ok(())
     }
