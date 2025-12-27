@@ -1,4 +1,4 @@
-use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats};
+use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, extract_min_timestamp};
 use crate::wal::WalManager;
 use arrow::array::RecordBatch;
 use std::path::PathBuf;
@@ -69,6 +69,7 @@ pub struct BufferedWriteLayer {
     shutdown: CancellationToken,
     delta_write_callback: Option<DeltaWriteCallback>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
+    flush_lock: Mutex<()>, // Serializes flush operations to prevent race conditions
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -92,6 +93,7 @@ impl BufferedWriteLayer {
             shutdown: CancellationToken::new(),
             delta_write_callback: None,
             background_tasks: Mutex::new(Vec::new()),
+            flush_lock: Mutex::new(()),
         })
     }
 
@@ -136,13 +138,16 @@ impl BufferedWriteLayer {
             }
         }
 
-        let timestamp_micros = chrono::Utc::now().timestamp_micros();
-
         // Step 1: Write to WAL for durability
         self.wal.append_batch(project_id, table_name, &batches)?;
 
         // Step 2: Write to MemBuffer for fast queries
-        self.mem_buffer.insert_batches(project_id, table_name, batches, timestamp_micros)?;
+        // Extract event timestamp from batch (falls back to current time if not present)
+        let now = chrono::Utc::now().timestamp_micros();
+        for batch in batches {
+            let timestamp_micros = extract_min_timestamp(&batch).unwrap_or(now);
+            self.mem_buffer.insert(project_id, table_name, batch, timestamp_micros)?;
+        }
 
         debug!("BufferedWriteLayer insert complete: project={}, table={}", project_id, table_name);
         Ok(())
@@ -156,7 +161,9 @@ impl BufferedWriteLayer {
 
         info!("Starting WAL recovery, cutoff={}", cutoff);
 
-        let entries = self.wal.read_all_entries(Some(cutoff))?;
+        // Use checkpoint=false during recovery to prevent data loss.
+        // WAL entries are only checkpointed after successful Delta flush.
+        let entries = self.wal.read_all_entries(Some(cutoff), false)?;
 
         let mut stats = RecoveryStats::default();
         let mut oldest_ts: Option<i64> = None;
@@ -243,6 +250,9 @@ impl BufferedWriteLayer {
 
     #[instrument(skip(self))]
     async fn flush_completed_buckets(&self) -> anyhow::Result<()> {
+        // Acquire flush lock to prevent concurrent flushes (e.g., during shutdown)
+        let _flush_guard = self.flush_lock.lock().await;
+
         let current_bucket = MemBuffer::current_bucket_id();
         let flushable = self.mem_buffer.get_flushable_buckets(current_bucket);
 
@@ -328,6 +338,9 @@ impl BufferedWriteLayer {
                 Err(_) => warn!("Background task did not complete within timeout"),
             }
         }
+
+        // Acquire flush lock - waits for any in-progress flush to complete
+        let _flush_guard = self.flush_lock.lock().await;
 
         // Force flush all remaining data
         let all_buckets = self.mem_buffer.get_all_buckets();

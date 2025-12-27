@@ -1,6 +1,6 @@
-use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray};
 use arrow::compute::filter_record_batch;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use dashmap::DashMap;
 use datafusion::common::DFSchema;
 use datafusion::error::Result as DFResult;
@@ -12,6 +12,49 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use tracing::{debug, info, instrument, warn};
 
 const BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000; // 10 minutes in microseconds
+
+/// Check if two schemas are compatible for merge.
+/// Compatible means: all existing fields must be present in incoming schema with same type,
+/// incoming schema may have additional nullable fields.
+fn schemas_compatible(existing: &SchemaRef, incoming: &SchemaRef) -> bool {
+    for existing_field in existing.fields() {
+        match incoming.field_with_name(existing_field.name()) {
+            Ok(incoming_field) => {
+                // Types must match (ignoring nullability - can become more lenient)
+                if !types_compatible(existing_field.data_type(), incoming_field.data_type()) {
+                    return false;
+                }
+            }
+            Err(_) => return false, // Existing field not found in incoming schema
+        }
+    }
+    // New fields in incoming schema are OK if nullable (for SchemaMode::Merge compatibility)
+    for incoming_field in incoming.fields() {
+        if existing.field_with_name(incoming_field.name()).is_err() && !incoming_field.is_nullable() {
+            return false; // New non-nullable field would break existing data
+        }
+    }
+    true
+}
+
+fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
+    match (existing, incoming) {
+        (DataType::Timestamp(u1, _), DataType::Timestamp(u2, _)) => u1 == u2, // Ignore timezone metadata
+        _ => existing == incoming,
+    }
+}
+
+/// Extract the min timestamp from a batch's "timestamp" column (if present).
+/// Returns None if no timestamp column exists or it's empty.
+pub fn extract_min_timestamp(batch: &RecordBatch) -> Option<i64> {
+    let schema = batch.schema();
+    let ts_idx = schema.fields().iter().position(|f| {
+        f.name() == "timestamp" && matches!(f.data_type(), DataType::Timestamp(TimeUnit::Microsecond, _))
+    })?;
+    let ts_col = batch.column(ts_idx);
+    let ts_array = ts_col.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
+    arrow::compute::min(ts_array)
+}
 
 pub struct MemBuffer {
     projects: DashMap<String, ProjectBuffer>,
@@ -93,19 +136,19 @@ impl MemBuffer {
 
         let project = self.projects.entry(project_id.to_string()).or_insert_with(ProjectBuffer::new);
 
-        // Check if table exists and validate schema
+        // Check if table exists and validate schema compatibility
         if let Some(existing_table) = project.table_buffers.get(table_name) {
             let existing_schema = existing_table.schema();
-            if existing_schema != schema {
+            if !schemas_compatible(&existing_schema, &schema) {
                 warn!(
-                    "Schema mismatch for {}.{}: expected {} fields, got {}",
+                    "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
                     project_id,
                     table_name,
                     existing_schema.fields().len(),
                     schema.fields().len()
                 );
                 anyhow::bail!(
-                    "Schema mismatch for {}.{}: incoming schema does not match existing schema",
+                    "Schema incompatible for {}.{}: field types don't match or new non-nullable field added",
                     project_id,
                     table_name
                 );
