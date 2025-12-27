@@ -4,7 +4,7 @@
 use datafusion_postgres::{ServerOptions, auth::AuthManager};
 use dotenv::dotenv;
 use std::{env, sync::Arc};
-use timefusion::batch_queue::BatchQueue;
+use timefusion::buffered_write_layer::{BufferConfig, BufferedWriteLayer};
 use timefusion::database::Database;
 use timefusion::telemetry;
 use tokio::time::{Duration, sleep};
@@ -24,20 +24,41 @@ async fn main() -> anyhow::Result<()> {
     let mut db = Database::new().await?;
     info!("Database initialized successfully");
 
-    // Setup batch processing with configurable params
-    let interval_ms = env::var("BATCH_INTERVAL_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1000);
-    let max_size = env::var("MAX_BATCH_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
-    let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "true".to_string()) == "true";
-
-    // Create batch queue
-    let batch_queue = Arc::new(BatchQueue::new(Arc::new(db.clone()), interval_ms, max_size));
+    // Initialize BufferedWriteLayer (replaces BatchQueue)
+    let buffer_config = BufferConfig::from_env();
     info!(
-        "Batch queue configured (enabled={}, interval={}ms, max_size={})",
-        enable_queue, interval_ms, max_size
+        "BufferedWriteLayer config: wal_dir={:?}, flush_interval={}s, retention={}min",
+        buffer_config.wal_data_dir, buffer_config.flush_interval_secs, buffer_config.retention_mins
     );
 
-    // Apply and setup
-    db = db.with_batch_queue(Arc::clone(&batch_queue));
+    // Create buffered layer with delta write callback
+    let db_for_callback = db.clone();
+    let delta_write_callback: timefusion::buffered_write_layer::DeltaWriteCallback =
+        Arc::new(move |project_id: String, table_name: String, batches: Vec<arrow::array::RecordBatch>| {
+            let db = db_for_callback.clone();
+            Box::pin(async move {
+                // skip_queue=true to write directly to Delta
+                db.insert_records_batch(&project_id, &table_name, batches, true).await
+            })
+        });
+
+    let buffered_layer = Arc::new(BufferedWriteLayer::new(buffer_config)?.with_delta_writer(delta_write_callback));
+
+    // Recover from WAL on startup
+    info!("Starting WAL recovery...");
+    let recovery_stats = buffered_layer.recover_from_wal().await?;
+    info!(
+        "WAL recovery complete: {} entries replayed in {}ms",
+        recovery_stats.entries_replayed, recovery_stats.recovery_duration_ms
+    );
+
+    // Start background tasks (flush and eviction)
+    buffered_layer.start_background_tasks();
+    info!("BufferedWriteLayer background tasks started");
+
+    // Apply buffered layer to database
+    db = db.with_buffered_layer(Arc::clone(&buffered_layer));
+
     // Start maintenance schedulers for regular optimize and vacuum
     db = db.start_maintenance_schedulers().await?;
     let db = Arc::new(db);
@@ -71,8 +92,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Store database for shutdown
+    // Store references for shutdown
     let db_for_shutdown = db.clone();
+    let buffered_layer_for_shutdown = Arc::clone(&buffered_layer);
 
     // Wait for shutdown signal
     tokio::select! {
@@ -80,9 +102,11 @@ async fn main() -> anyhow::Result<()> {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, initiating shutdown");
 
-            // Shutdown batch queue to flush pending data
-            batch_queue.shutdown().await;
-            sleep(Duration::from_secs(1)).await;
+            // Shutdown buffered layer to flush remaining data to Delta
+            if let Err(e) = buffered_layer_for_shutdown.shutdown().await {
+                error!("Error during buffered layer shutdown: {}", e);
+            }
+            sleep(Duration::from_millis(500)).await;
 
             // Properly shutdown the database including cache
             if let Err(e) = db_for_shutdown.shutdown().await {

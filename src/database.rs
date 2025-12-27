@@ -19,9 +19,11 @@ use datafusion::{
     catalog::Session,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{BinaryExpr, dml::InsertOp},
-    physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
+    logical_expr::{BinaryExpr, col, dml::InsertOp, lit},
+    physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream, union::UnionExec},
 };
+use datafusion_datasource::memory::MemorySourceConfig;
+use datafusion_datasource::source::DataSourceExec;
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
 use deltalake::PartitionFilter;
@@ -98,6 +100,8 @@ pub struct Database {
     // Track last written versions for read-after-write consistency
     // Map of (project_id, table_name) -> last_written_version
     last_written_versions: Arc<RwLock<HashMap<(String, String), i64>>>,
+    // Buffered write layer for WAL + in-memory buffer
+    buffered_layer: Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
 }
 
 impl Clone for Database {
@@ -114,6 +118,7 @@ impl Clone for Database {
             object_store_cache: self.object_store_cache.clone(),
             statistics_extractor: Arc::clone(&self.statistics_extractor),
             last_written_versions: Arc::clone(&self.last_written_versions),
+            buffered_layer: self.buffered_layer.clone(),
         }
     }
 }
@@ -395,6 +400,7 @@ impl Database {
             object_store_cache,
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
+            buffered_layer: None,
         };
 
         // Cache is already initialized above, no need to call with_object_store_cache()
@@ -405,6 +411,17 @@ impl Database {
     pub fn with_batch_queue(mut self, batch_queue: Arc<crate::batch_queue::BatchQueue>) -> Self {
         self.batch_queue = Some(batch_queue);
         self
+    }
+
+    /// Set the buffered write layer for WAL + in-memory buffer
+    pub fn with_buffered_layer(mut self, layer: Arc<crate::buffered_write_layer::BufferedWriteLayer>) -> Self {
+        self.buffered_layer = Some(layer);
+        self
+    }
+
+    /// Get the buffered write layer if configured
+    pub fn buffered_layer(&self) -> Option<&Arc<crate::buffered_write_layer::BufferedWriteLayer>> {
+        self.buffered_layer.as_ref()
     }
 
     /// Enable object store cache with foyer (deprecated - cache is now initialized in new())
@@ -1177,20 +1194,6 @@ impl Database {
     )]
     pub async fn insert_records_batch(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
         let span = tracing::Span::current();
-        let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
-
-        if !skip_queue && enable_queue && self.batch_queue.is_some() {
-            span.record("use_queue", true);
-            let queue = self.batch_queue.as_ref().unwrap();
-            for batch in batches {
-                if let Err(e) = queue.queue(batch) {
-                    return Err(anyhow::anyhow!("Queue error: {}", e));
-                }
-            }
-            return Ok(());
-        }
-
-        span.record("use_queue", false);
 
         // Extract project_id from first batch if not provided
         let project_id = if project_id.is_empty() && !batches.is_empty() {
@@ -1203,6 +1206,29 @@ impl Database {
 
         // Use provided table_name or default to otel_logs_and_spans
         let table_name = if table_name.is_empty() { "otel_logs_and_spans".to_string() } else { table_name.to_string() };
+
+        // If buffered layer is configured and not skipping, use it (WAL → MemBuffer flow)
+        if !skip_queue {
+            if let Some(ref layer) = self.buffered_layer {
+                span.record("use_queue", "buffered_layer");
+                return layer.insert(&project_id, &table_name, batches).await;
+            }
+        }
+
+        // Fallback to legacy batch queue if configured
+        let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
+        if !skip_queue && enable_queue && self.batch_queue.is_some() {
+            span.record("use_queue", true);
+            let queue = self.batch_queue.as_ref().unwrap();
+            for batch in batches {
+                if let Err(e) = queue.queue(batch) {
+                    return Err(anyhow::anyhow!("Queue error: {}", e));
+                }
+            }
+            return Ok(());
+        }
+
+        span.record("use_queue", false);
 
         // Get or create the table
         let table_ref = self.get_or_create_table(&project_id, &table_name).await?;
@@ -1685,23 +1711,71 @@ impl ProjectRoutingTable {
         ProjectIdPushdown::has_project_id_filter(filters)
     }
 
-    ///// Get actual statistics from Delta Lake metadata
-    //async fn get_delta_statistics(&self) -> Result<Statistics> {
-    //    // Get the Delta table for the default project or first available
-    //    let project_id = self.extract_project_id_from_filters(&[]).unwrap_or_else(|| self.default_project.clone());
-    //
-    //    // Try to get the table
-    //    match self.database.resolve_table(&project_id, &self.table_name).await {
-    //        Ok(table_ref) => {
-    //            let table = table_ref.read().await;
-    //            self.database.statistics_extractor.extract_statistics(&table, &project_id, &self.table_name, &self.schema).await
-    //        }
-    //        Err(e) => {
-    //            debug!("Failed to resolve table for statistics: {}", e);
-    //            Err(anyhow::anyhow!("Failed to get table for statistics"))
-    //        }
-    //    }
-    //}
+    /// Create a MemorySourceConfig-based execution plan with multiple partitions
+    fn create_memory_exec(&self, partitions: &[Vec<RecordBatch>], projection: Option<&Vec<usize>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let mem_source =
+            MemorySourceConfig::try_new(partitions, self.schema.clone(), projection.cloned()).map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(Arc::new(DataSourceExec::new(Arc::new(mem_source))))
+    }
+
+    /// Helper to scan Delta only (when no MemBuffer data)
+    async fn scan_delta_only(
+        &self, state: &dyn Session, project_id: &str, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
+        let table = delta_table.read().await;
+        table.scan(state, projection.cloned().as_ref(), filters, limit).await
+    }
+
+    /// Extract time range (min, max) from query filters.
+    /// Returns None if no time constraints found.
+    fn extract_time_range_from_filters(&self, filters: &[Expr]) -> Option<(i64, i64)> {
+        let mut min_ts: Option<i64> = None;
+        let mut max_ts: Option<i64> = None;
+
+        for filter in filters {
+            if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter {
+                // Check if left side is timestamp column
+                let is_timestamp_col = matches!(left.as_ref(), Expr::Column(c) if c.name == "timestamp");
+                if !is_timestamp_col {
+                    continue;
+                }
+
+                // Extract timestamp value from right side
+                let ts_value = match right.as_ref() {
+                    Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
+                    Expr::Literal(ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
+                    Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
+                    Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
+                    _ => None,
+                };
+
+                if let Some(ts) = ts_value {
+                    match op {
+                        Operator::Gt | Operator::GtEq => {
+                            min_ts = Some(min_ts.map_or(ts, |m| m.max(ts)));
+                        }
+                        Operator::Lt | Operator::LtEq => {
+                            max_ts = Some(max_ts.map_or(ts, |m| m.min(ts)));
+                        }
+                        Operator::Eq => {
+                            min_ts = Some(ts);
+                            max_ts = Some(ts);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        match (min_ts, max_ts) {
+            (Some(min), Some(max)) => Some((min, max)),
+            (Some(min), None) => Some((min, i64::MAX)),
+            (None, Some(max)) => Some((i64::MIN, max)),
+            (None, None) => None,
+        }
+    }
 }
 
 // Needed by DataSink
@@ -1841,6 +1915,8 @@ impl TableProvider for ProjectRoutingTable {
             scan.has_limit = limit.is_some(),
             scan.limit = limit.unwrap_or(0),
             scan.has_projection = projection.is_some(),
+            scan.uses_mem_buffer = false,
+            scan.skipped_delta = false,
         )
     )]
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -1853,25 +1929,90 @@ impl TableProvider for ProjectRoutingTable {
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
         span.record("table.project_id", project_id.as_str());
 
-        // Execute query and create plan with optimized filters
+        // Check if buffered layer is configured
+        let Some(ref layer) = self.database.buffered_layer() else {
+            // No buffered layer, query Delta directly
+            return self.scan_delta_only(state, &project_id, projection, &optimized_filters, limit).await;
+        };
+
+        span.record("scan.uses_mem_buffer", true);
+
+        // Get MemBuffer's time range for this project/table
+        let mem_time_range = layer.get_time_range(&project_id, &self.table_name);
+
+        // Extract query time range from filters
+        let query_time_range = self.extract_time_range_from_filters(&optimized_filters);
+
+        // Determine if we can skip Delta (query entirely within MemBuffer range)
+        let skip_delta = match (mem_time_range, query_time_range) {
+            (Some((mem_oldest, _mem_newest)), Some((query_min, query_max))) => {
+                // Skip Delta if query's entire time range is within MemBuffer
+                query_min >= mem_oldest && query_max >= mem_oldest
+            }
+            _ => false,
+        };
+
+        // Query MemBuffer with partitioned data for parallel execution
+        let mem_partitions = match layer.query_partitioned(&project_id, &self.table_name) {
+            Ok(partitions) => partitions,
+            Err(e) => {
+                warn!("Failed to query mem buffer: {}", e);
+                vec![]
+            }
+        };
+
+        // If no mem buffer data, query Delta only
+        if mem_partitions.is_empty() {
+            return self.scan_delta_only(state, &project_id, projection, &optimized_filters, limit).await;
+        }
+
+        // Create MemorySourceConfig with multiple partitions for parallel execution
+        let mem_plan = self.create_memory_exec(&mem_partitions, projection)?;
+
+        // If we can skip Delta, return mem plan directly
+        if skip_delta {
+            span.record("scan.skipped_delta", true);
+            debug!(
+                "Skipping Delta scan - query time range entirely within MemBuffer for {}/{}",
+                project_id, self.table_name
+            );
+            return Ok(mem_plan);
+        }
+
+        // Get oldest timestamp from MemBuffer for time-based exclusion
+        let oldest_mem_ts = mem_time_range.map(|(oldest, _)| oldest);
+
+        // Build Delta filters with time exclusion
+        let delta_filters = if let Some(cutoff) = oldest_mem_ts {
+            let exclusion = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(col("timestamp")),
+                op: Operator::Lt,
+                right: Box::new(lit(ScalarValue::TimestampMicrosecond(Some(cutoff), Some("UTC".into())))),
+            });
+            let mut filters = optimized_filters.clone();
+            filters.push(exclusion);
+            filters
+        } else {
+            optimized_filters.clone()
+        };
+
+        // Execute Delta query
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
         let table = delta_table.read().await;
 
-        // Pass projection directly - delta-rs handles schema mapping internally via SchemaAdapter
-        let mapped_projection = projection.cloned();
-
-        // Create a span for the table scan that will be the parent for all object store operations
         let scan_span = tracing::trace_span!("delta_table.scan",
             table.name = %self.table_name,
             table.project_id = %project_id,
-            partition_filters = ?optimized_filters.iter().filter(|f| matches!(f, Expr::BinaryExpr(_))).count()
+            partition_filters = ?delta_filters.iter().filter(|f| matches!(f, Expr::BinaryExpr(_))).count()
         );
 
-        let plan = table.scan(state, mapped_projection.as_ref(), &optimized_filters, limit).instrument(scan_span).await?;
+        let delta_plan = table.scan(state, projection.cloned().as_ref(), &delta_filters, limit).instrument(scan_span).await?;
 
-        Ok(plan)
+        // Union both plans (mem data first for recency, then Delta for historical)
+        UnionExec::try_new(vec![mem_plan, delta_plan])
     }
+
     fn statistics(&self) -> Option<Statistics> {
         None
         // // Use tokio's block_in_place to run async code in sync context
