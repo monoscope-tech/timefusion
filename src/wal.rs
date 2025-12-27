@@ -1,6 +1,7 @@
 use arrow::array::RecordBatch;
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
+use dashmap::DashSet;
 use std::io::Cursor;
 use std::path::PathBuf;
 use tracing::{debug, error, info, instrument, warn};
@@ -17,21 +18,48 @@ pub struct WalEntry {
 pub struct WalManager {
     wal: Walrus,
     data_dir: PathBuf,
+    known_topics: DashSet<String>,
 }
 
 impl WalManager {
     pub fn new(data_dir: PathBuf) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
-        // SAFETY: We're setting an environment variable before any threads are spawned
-        // that might read it. This is called during initialization.
-        unsafe {
-            std::env::set_var("WALRUS_DATA_DIR", data_dir.to_string_lossy().to_string());
-        }
+        // Note: WALRUS_DATA_DIR must be set before creating WalManager.
+        // This is done in main.rs before any threads spawn.
 
         let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(200))?;
 
-        info!("WAL initialized at {:?}", data_dir);
-        Ok(Self { wal, data_dir })
+        // Load known topics from index file (stored in meta subdirectory to avoid walrus scanning)
+        let meta_dir = data_dir.join(".timefusion_meta");
+        let _ = std::fs::create_dir_all(&meta_dir);
+        let topics_file = meta_dir.join("topics");
+
+        let known_topics = DashSet::new();
+        if topics_file.exists()
+            && let Ok(content) = std::fs::read_to_string(&topics_file)
+        {
+            for line in content.lines() {
+                if !line.is_empty() {
+                    known_topics.insert(line.to_string());
+                }
+            }
+        }
+
+        info!("WAL initialized at {:?}, known topics: {}", data_dir, known_topics.len());
+        Ok(Self { wal, data_dir, known_topics })
+    }
+
+    fn persist_topic(&self, topic: &str) {
+        if self.known_topics.insert(topic.to_string()) {
+            // New topic, persist to file in meta directory
+            let meta_dir = self.data_dir.join(".timefusion_meta");
+            let _ = std::fs::create_dir_all(&meta_dir);
+            let topics_file = meta_dir.join("topics");
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&topics_file) {
+                use std::io::Write;
+                let _ = writeln!(file, "{}", topic);
+            }
+        }
     }
 
     fn make_topic(project_id: &str, table_name: &str) -> String {
@@ -58,6 +86,7 @@ impl WalManager {
         let payload = serialize_wal_entry(&entry)?;
 
         self.wal.append_for_topic(&topic, &payload)?;
+        self.persist_topic(&topic);
 
         debug!("WAL append: topic={}, timestamp={}, rows={}", topic, timestamp_micros, batch.num_rows());
         Ok(())
@@ -68,21 +97,21 @@ impl WalManager {
         let timestamp_micros = chrono::Utc::now().timestamp_micros();
         let topic = Self::make_topic(project_id, table_name);
 
-        let payloads: Vec<Vec<u8>> = batches
-            .iter()
-            .map(|batch| {
-                let entry = WalEntry {
-                    timestamp_micros,
-                    project_id: project_id.to_string(),
-                    table_name: table_name.to_string(),
-                    data: serialize_record_batch(batch).unwrap_or_default(),
-                };
-                serialize_wal_entry(&entry).unwrap_or_default()
-            })
-            .collect();
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let data = serialize_record_batch(batch)?;
+            let entry = WalEntry {
+                timestamp_micros,
+                project_id: project_id.to_string(),
+                table_name: table_name.to_string(),
+                data,
+            };
+            payloads.push(serialize_wal_entry(&entry)?);
+        }
 
         let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
         self.wal.batch_append_for_topic(&topic, &payload_refs)?;
+        self.persist_topic(&topic);
 
         debug!("WAL batch append: topic={}, batches={}", topic, batches.len());
         Ok(())
@@ -94,8 +123,11 @@ impl WalManager {
         let mut results = Vec::new();
         let cutoff = since_timestamp_micros.unwrap_or(0);
 
+        // Use checkpoint=true to consume entries as we read them.
+        // This is safe for recovery because once data is in MemBuffer, we don't need
+        // the WAL entries anymore (flush to Delta will happen before they could be lost).
         loop {
-            match self.wal.read_next(&topic, false) {
+            match self.wal.read_next(&topic, true) {
                 Ok(Some(entry_data)) => match deserialize_wal_entry(&entry_data.data) {
                     Ok(entry) => {
                         if entry.timestamp_micros >= cutoff {
@@ -146,26 +178,16 @@ impl WalManager {
     }
 
     pub fn list_topics(&self) -> anyhow::Result<Vec<String>> {
-        let mut topics = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str()
-                    && !name.starts_with('.')
-                    && entry.path().is_dir()
-                {
-                    topics.push(name.to_string());
-                }
-            }
-        }
-        Ok(topics)
+        Ok(self.known_topics.iter().map(|t| t.clone()).collect())
     }
 
     #[instrument(skip(self))]
     pub fn checkpoint(&self, project_id: &str, table_name: &str) -> anyhow::Result<()> {
         let topic = Self::make_topic(project_id, table_name);
+        let mut count = 0;
         loop {
             match self.wal.read_next(&topic, true) {
-                Ok(Some(_)) => continue,
+                Ok(Some(_)) => count += 1,
                 Ok(None) => break,
                 Err(e) => {
                     warn!("Error during checkpoint for {}: {}", topic, e);
@@ -173,38 +195,17 @@ impl WalManager {
                 }
             }
         }
-        debug!("WAL checkpoint complete for topic={}", topic);
+        if count > 0 {
+            debug!("WAL checkpoint: topic={}, consumed={}", topic, count);
+        }
         Ok(())
     }
 
     #[instrument(skip(self))]
-    pub fn prune_older_than(&self, cutoff_timestamp_micros: i64) -> anyhow::Result<u64> {
-        let mut pruned_count = 0u64;
-        let topics = self.list_topics()?;
-
-        for topic in topics {
-            if let Some((_project_id, _table_name)) = Self::parse_topic(&topic) {
-                loop {
-                    match self.wal.read_next(&topic, false) {
-                        Ok(Some(entry_data)) => {
-                            if let Ok(entry) = deserialize_wal_entry(&entry_data.data) {
-                                if entry.timestamp_micros < cutoff_timestamp_micros {
-                                    let _ = self.wal.read_next(&topic, true);
-                                    pruned_count += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(None) => break,
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-
-        info!("WAL pruned {} entries older than {}", pruned_count, cutoff_timestamp_micros);
-        Ok(pruned_count)
+    pub fn prune_older_than(&self, _cutoff_timestamp_micros: i64) -> anyhow::Result<u64> {
+        // No-op: entries are consumed during read_entries().
+        // WAL files are managed by walrus-rust internally.
+        Ok(0)
     }
 
     pub fn data_dir(&self) -> &PathBuf {

@@ -4,12 +4,13 @@ use dashmap::DashMap;
 use datafusion::logical_expr::Expr;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 const BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000; // 10 minutes in microseconds
 
 pub struct MemBuffer {
     projects: DashMap<String, ProjectBuffer>,
+    estimated_bytes: AtomicUsize,
 }
 
 pub struct ProjectBuffer {
@@ -24,6 +25,7 @@ pub struct TableBuffer {
 pub struct TimeBucket {
     batches: RwLock<Vec<RecordBatch>>,
     row_count: AtomicUsize,
+    memory_bytes: AtomicUsize,
     min_timestamp: AtomicI64,
     max_timestamp: AtomicI64,
 }
@@ -43,11 +45,23 @@ pub struct MemBufferStats {
     pub total_buckets: usize,
     pub total_rows: usize,
     pub total_batches: usize,
+    pub estimated_memory_bytes: usize,
+}
+
+fn estimate_batch_size(batch: &RecordBatch) -> usize {
+    batch.get_array_memory_size()
 }
 
 impl MemBuffer {
     pub fn new() -> Self {
-        Self { projects: DashMap::new() }
+        Self {
+            projects: DashMap::new(),
+            estimated_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.estimated_bytes.load(Ordering::Relaxed)
     }
 
     fn compute_bucket_id(timestamp_micros: i64) -> i64 {
@@ -64,8 +78,28 @@ impl MemBuffer {
         let bucket_id = Self::compute_bucket_id(timestamp_micros);
         let schema = batch.schema();
         let row_count = batch.num_rows();
+        let batch_size = estimate_batch_size(&batch);
 
         let project = self.projects.entry(project_id.to_string()).or_insert_with(ProjectBuffer::new);
+
+        // Check if table exists and validate schema
+        if let Some(existing_table) = project.table_buffers.get(table_name) {
+            let existing_schema = existing_table.schema();
+            if existing_schema != schema {
+                warn!(
+                    "Schema mismatch for {}.{}: expected {} fields, got {}",
+                    project_id,
+                    table_name,
+                    existing_schema.fields().len(),
+                    schema.fields().len()
+                );
+                anyhow::bail!(
+                    "Schema mismatch for {}.{}: incoming schema does not match existing schema",
+                    project_id,
+                    table_name
+                );
+            }
+        }
 
         let table = project.table_buffers.entry(table_name.to_string()).or_insert_with(|| TableBuffer::new(schema.clone()));
 
@@ -77,11 +111,13 @@ impl MemBuffer {
         }
 
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
+        bucket.memory_bytes.fetch_add(batch_size, Ordering::Relaxed);
         bucket.update_timestamps(timestamp_micros);
+        self.estimated_bytes.fetch_add(batch_size, Ordering::Relaxed);
 
         debug!(
-            "MemBuffer insert: project={}, table={}, bucket={}, rows={}",
-            project_id, table_name, bucket_id, row_count
+            "MemBuffer insert: project={}, table={}, bucket={}, rows={}, bytes={}",
+            project_id, table_name, bucket_id, row_count, batch_size
         );
         Ok(())
     }
@@ -185,16 +221,16 @@ impl MemBuffer {
         if let Some(project) = self.projects.get(project_id)
             && let Some(table) = project.table_buffers.get(table_name)
             && let Some((_, bucket)) = table.buckets.remove(&bucket_id)
-            && let Ok(batches) = bucket.batches.into_inner()
         {
-            debug!(
-                "MemBuffer drain: project={}, table={}, bucket={}, batches={}",
-                project_id,
-                table_name,
-                bucket_id,
-                batches.len()
-            );
-            return Some(batches);
+            let freed_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
+            self.estimated_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
+            if let Ok(batches) = bucket.batches.into_inner() {
+                debug!(
+                    "MemBuffer drain: project={}, table={}, bucket={}, batches={}, freed_bytes={}",
+                    project_id, table_name, bucket_id, batches.len(), freed_bytes
+                );
+                return Some(batches);
+            }
         }
         None
     }
@@ -259,21 +295,30 @@ impl MemBuffer {
     pub fn evict_old_data(&self, cutoff_timestamp_micros: i64) -> usize {
         let cutoff_bucket_id = Self::compute_bucket_id(cutoff_timestamp_micros);
         let mut evicted_count = 0;
+        let mut freed_bytes = 0usize;
 
         for project_entry in self.projects.iter() {
             for table_entry in project_entry.table_buffers.iter() {
                 let bucket_ids_to_remove: Vec<i64> = table_entry.buckets.iter().filter(|b| *b.key() < cutoff_bucket_id).map(|b| *b.key()).collect();
 
                 for bucket_id in bucket_ids_to_remove {
-                    if table_entry.buckets.remove(&bucket_id).is_some() {
+                    if let Some((_, bucket)) = table_entry.buckets.remove(&bucket_id) {
+                        freed_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
                         evicted_count += 1;
                     }
                 }
             }
         }
 
+        if freed_bytes > 0 {
+            self.estimated_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
+        }
+
         if evicted_count > 0 {
-            info!("MemBuffer evicted {} buckets older than bucket_id={}", evicted_count, cutoff_bucket_id);
+            info!(
+                "MemBuffer evicted {} buckets older than bucket_id={}, freed {} bytes",
+                evicted_count, cutoff_bucket_id, freed_bytes
+            );
         }
         evicted_count
     }
@@ -281,6 +326,7 @@ impl MemBuffer {
     pub fn get_stats(&self) -> MemBufferStats {
         let mut stats = MemBufferStats {
             project_count: self.projects.len(),
+            estimated_memory_bytes: self.estimated_bytes.load(Ordering::Relaxed),
             ..Default::default()
         };
 
@@ -305,6 +351,7 @@ impl MemBuffer {
 
     pub fn clear(&self) {
         self.projects.clear();
+        self.estimated_bytes.store(0, Ordering::Relaxed);
         info!("MemBuffer cleared");
     }
 }
@@ -339,6 +386,7 @@ impl TimeBucket {
         Self {
             batches: RwLock::new(Vec::new()),
             row_count: AtomicUsize::new(0),
+            memory_bytes: AtomicUsize::new(0),
             min_timestamp: AtomicI64::new(i64::MAX),
             max_timestamp: AtomicI64::new(i64::MIN),
         }
