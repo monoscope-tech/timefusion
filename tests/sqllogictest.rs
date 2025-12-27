@@ -218,7 +218,6 @@ mod sqllogictest_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    #[ignore] // Slow integration test - run with: cargo test --test sqllogictest -- --ignored
     async fn run_sqllogictest() -> Result<()> {
         let (shutdown_signal, port) = start_test_server().await?;
 
