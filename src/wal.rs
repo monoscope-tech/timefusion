@@ -293,7 +293,6 @@ mod tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
-    use tempfile::tempdir;
 
     fn create_test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
