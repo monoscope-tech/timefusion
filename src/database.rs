@@ -1208,11 +1208,9 @@ impl Database {
         let table_name = if table_name.is_empty() { "otel_logs_and_spans".to_string() } else { table_name.to_string() };
 
         // If buffered layer is configured and not skipping, use it (WAL → MemBuffer flow)
-        if !skip_queue {
-            if let Some(ref layer) = self.buffered_layer {
-                span.record("use_queue", "buffered_layer");
-                return layer.insert(&project_id, &table_name, batches).await;
-            }
+        if !skip_queue && let Some(ref layer) = self.buffered_layer {
+            span.record("use_queue", "buffered_layer");
+            return layer.insert(&project_id, &table_name, batches).await;
         }
 
         // Fallback to legacy batch queue if configured
@@ -1930,7 +1928,7 @@ impl TableProvider for ProjectRoutingTable {
         span.record("table.project_id", project_id.as_str());
 
         // Check if buffered layer is configured
-        let Some(ref layer) = self.database.buffered_layer() else {
+        let Some(layer) = self.database.buffered_layer() else {
             // No buffered layer, query Delta directly
             return self.scan_delta_only(state, &project_id, projection, &optimized_filters, limit).await;
         };
