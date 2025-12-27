@@ -118,16 +118,13 @@ impl WalManager {
     }
 
     #[instrument(skip(self), fields(project_id, table_name))]
-    pub fn read_entries(&self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>) -> anyhow::Result<Vec<(WalEntry, RecordBatch)>> {
+    pub fn read_entries(&self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool) -> anyhow::Result<Vec<(WalEntry, RecordBatch)>> {
         let topic = Self::make_topic(project_id, table_name);
         let mut results = Vec::new();
         let cutoff = since_timestamp_micros.unwrap_or(0);
 
-        // Use checkpoint=true to consume entries as we read them.
-        // This is safe for recovery because once data is in MemBuffer, we don't need
-        // the WAL entries anymore (flush to Delta will happen before they could be lost).
         loop {
-            match self.wal.read_next(&topic, true) {
+            match self.wal.read_next(&topic, checkpoint) {
                 Ok(Some(entry_data)) => match deserialize_wal_entry(&entry_data.data) {
                     Ok(entry) => {
                         if entry.timestamp_micros >= cutoff {
@@ -156,7 +153,7 @@ impl WalManager {
     }
 
     #[instrument(skip(self))]
-    pub fn read_all_entries(&self, since_timestamp_micros: Option<i64>) -> anyhow::Result<Vec<(WalEntry, RecordBatch)>> {
+    pub fn read_all_entries(&self, since_timestamp_micros: Option<i64>, checkpoint: bool) -> anyhow::Result<Vec<(WalEntry, RecordBatch)>> {
         let mut all_results = Vec::new();
         let cutoff = since_timestamp_micros.unwrap_or(0);
 
@@ -164,7 +161,7 @@ impl WalManager {
 
         for topic in topics {
             if let Some((project_id, table_name)) = Self::parse_topic(&topic) {
-                match self.read_entries(&project_id, &table_name, Some(cutoff)) {
+                match self.read_entries(&project_id, &table_name, Some(cutoff), checkpoint) {
                     Ok(entries) => all_results.extend(entries),
                     Err(e) => {
                         warn!("Failed to read entries for topic {}: {}", topic, e);

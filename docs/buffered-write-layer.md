@@ -253,7 +253,8 @@ On startup, the system recovers from WAL:
 ```rust
 pub async fn recover_from_wal(&self) -> anyhow::Result<RecoveryStats> {
     let cutoff = now() - retention_duration;
-    let entries = self.wal.read_all_entries(Some(cutoff))?;
+    // checkpoint=false: WAL entries are only removed after successful Delta flush
+    let entries = self.wal.read_all_entries(Some(cutoff), false)?;
 
     for (entry, batch) in entries {
         self.mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros)?;
