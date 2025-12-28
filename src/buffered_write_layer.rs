@@ -10,7 +10,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-const MEMORY_OVERHEAD_MULTIPLIER: f64 = 1.2; // 20% overhead for DashMap, RwLock, schema refs
+// 20% overhead accounts for DashMap internal structures, RwLock wrappers,
+// Arc<Schema> refs, and Arrow buffer alignment padding
+const MEMORY_OVERHEAD_MULTIPLIER: f64 = 1.2;
 
 #[derive(Debug, Default)]
 pub struct RecoveryStats {
@@ -95,6 +97,7 @@ impl BufferedWriteLayer {
         let estimated_size = (batch_size as f64 * MEMORY_OVERHEAD_MULTIPLIER) as usize;
 
         let max_bytes = self.max_memory_bytes();
+        // Hard limit at 120% provides headroom for in-flight writes while preventing OOM
         let hard_limit = max_bytes.saturating_add(max_bytes / 5);
 
         for _ in 0..100 {
