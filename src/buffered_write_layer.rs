@@ -90,13 +90,6 @@ impl BufferedWriteLayer {
         self.effective_memory_bytes() >= self.max_memory_bytes()
     }
 
-    fn is_hard_limit_exceeded(&self) -> bool {
-        // Hard limit at 120% of configured max to provide back-pressure
-        // Use division to avoid overflow: current >= max + max/5
-        let max_bytes = self.max_memory_bytes();
-        self.effective_memory_bytes() >= max_bytes.saturating_add(max_bytes / 5)
-    }
-
     /// Try to reserve memory atomically before a write.
     /// Returns estimated batch size on success, or error if hard limit would be exceeded.
     fn try_reserve_memory(&self, batches: &[RecordBatch]) -> anyhow::Result<usize> {
@@ -176,12 +169,21 @@ impl BufferedWriteLayer {
         let start = std::time::Instant::now();
         let retention_micros = (self.buffer_config().retention_mins() as i64) * 60 * 1_000_000;
         let cutoff = chrono::Utc::now().timestamp_micros() - retention_micros;
+        let corruption_threshold = self.buffer_config().wal_corruption_threshold();
 
-        info!("Starting WAL recovery, cutoff={}", cutoff);
+        info!("Starting WAL recovery, cutoff={}, corruption_threshold={}", cutoff, corruption_threshold);
 
         // Use checkpoint=true to advance the read cursor and consume entries.
         // Entries are replayed to MemBuffer and will be re-persisted on flush.
         let (entries, error_count) = self.wal.read_all_entries(Some(cutoff), true)?;
+
+        // Fail if corruption exceeds threshold (0 = disabled)
+        if corruption_threshold > 0 && error_count > corruption_threshold {
+            anyhow::bail!(
+                "WAL corruption threshold exceeded: {} errors > {} threshold. Data may be compromised.",
+                error_count, corruption_threshold
+            );
+        }
 
         let mut entries_replayed = 0u64;
         let mut oldest_ts: Option<i64> = None;
@@ -206,7 +208,7 @@ impl BufferedWriteLayer {
 
         if stats.corrupted_entries_skipped > 0 {
             warn!(
-                "WAL recovery complete: entries={}, skipped={}, duration={}ms",
+                "WAL recovery complete: entries={}, corrupted_skipped={}, duration={}ms",
                 stats.entries_replayed, stats.corrupted_entries_skipped, stats.recovery_duration_ms
             );
         } else {
@@ -447,7 +449,8 @@ mod tests {
 
     fn init_test_config(wal_dir: &str) {
         // Set WAL dir before config init (tests run in same process, so first one wins)
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", wal_dir); }
+        // SAFETY: Test initialization runs before async runtime
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", wal_dir) };
         let _ = config::init_config();
     }
 

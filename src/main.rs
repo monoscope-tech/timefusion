@@ -3,28 +3,33 @@
 
 use datafusion_postgres::{ServerOptions, auth::AuthManager};
 use dotenv::dotenv;
-use std::{env, sync::Arc};
+use std::sync::Arc;
 use timefusion::buffered_write_layer::BufferedWriteLayer;
-use timefusion::config;
+use timefusion::config::{self, AppConfig};
 use timefusion::database::Database;
 use timefusion::telemetry;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Initialize environment
+fn main() -> anyhow::Result<()> {
+    // Initialize environment before any threads spawn
     dotenv().ok();
 
     // Initialize global config from environment - validates all settings upfront
     let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
 
-    // Set WALRUS_DATA_DIR before any threads spawn (required by walrus-rust)
-    // This is the ONLY env var we must set - walrus-rust reads it directly
-    unsafe {
-        env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir);
-    }
+    // Set WALRUS_DATA_DIR before Tokio runtime starts (required by walrus-rust)
+    // SAFETY: No threads exist yet - we're before tokio::runtime::Builder
+    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir) };
 
+    // Build and run Tokio runtime after env vars are set
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(cfg))
+}
+
+async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Initialize OpenTelemetry with OTLP exporter
     telemetry::init_telemetry(&cfg.telemetry)?;
 

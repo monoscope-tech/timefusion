@@ -162,6 +162,8 @@ pub struct BufferConfig {
     pub timefusion_buffer_max_memory_mb: usize,
     #[serde(default = "default_shutdown_timeout")]
     pub timefusion_shutdown_timeout_secs: u64,
+    #[serde(default = "default_wal_corruption_threshold")]
+    pub timefusion_wal_corruption_threshold: usize,
 }
 
 fn default_flush_interval() -> u64 { 600 }
@@ -169,12 +171,14 @@ fn default_retention_mins() -> u64 { 90 }
 fn default_eviction_interval() -> u64 { 60 }
 fn default_buffer_max_memory() -> usize { 4096 }
 fn default_shutdown_timeout() -> u64 { 5 }
+fn default_wal_corruption_threshold() -> usize { 100 }
 
 impl BufferConfig {
     pub fn flush_interval_secs(&self) -> u64 { self.timefusion_flush_interval_secs.max(1) }
     pub fn retention_mins(&self) -> u64 { self.timefusion_buffer_retention_mins.max(1) }
     pub fn eviction_interval_secs(&self) -> u64 { self.timefusion_eviction_interval_secs.max(1) }
     pub fn max_memory_mb(&self) -> usize { self.timefusion_buffer_max_memory_mb.max(64) }
+    pub fn wal_corruption_threshold(&self) -> usize { self.timefusion_wal_corruption_threshold }
 
     pub fn compute_shutdown_timeout(&self, current_memory_mb: usize) -> Duration {
         let secs = self.timefusion_shutdown_timeout_secs.max(1) + (current_memory_mb / 100) as u64;
@@ -366,6 +370,7 @@ impl Default for AppConfig {
                     timefusion_eviction_interval_secs: default_eviction_interval(),
                     timefusion_buffer_max_memory_mb: default_buffer_max_memory(),
                     timefusion_shutdown_timeout_secs: default_shutdown_timeout(),
+                    timefusion_wal_corruption_threshold: default_wal_corruption_threshold(),
                 },
                 cache: CacheConfig {
                     timefusion_foyer_memory_mb: default_512(),
