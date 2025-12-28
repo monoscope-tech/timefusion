@@ -18,8 +18,12 @@ pub fn config() -> &'static AppConfig {
     CONFIG.get().expect("Config not initialized")
 }
 
-fn default_true() -> bool { true }
-fn default_true_string() -> String { "true".into() }
+fn default_true() -> bool {
+    true
+}
+fn default_true_string() -> String {
+    "true".into()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -63,7 +67,9 @@ pub struct AwsConfig {
     pub dynamodb: DynamoDbConfig,
 }
 
-fn default_s3_endpoint() -> String { "https://s3.amazonaws.com".into() }
+fn default_s3_endpoint() -> String {
+    "https://s3.amazonaws.com".into()
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct DynamoDbConfig {
@@ -141,10 +147,18 @@ pub struct CoreConfig {
     pub timefusion_batch_queue_capacity: usize,
 }
 
-fn default_wal_dir() -> PathBuf { PathBuf::from("/var/lib/timefusion/wal") }
-fn default_pgwire_port() -> u16 { 5432 }
-fn default_table_prefix() -> String { "timefusion".into() }
-fn default_batch_queue_capacity() -> usize { 100_000_000 }
+fn default_wal_dir() -> PathBuf {
+    PathBuf::from("/var/lib/timefusion/wal")
+}
+fn default_pgwire_port() -> u16 {
+    5432
+}
+fn default_table_prefix() -> String {
+    "timefusion".into()
+}
+fn default_batch_queue_capacity() -> usize {
+    100_000_000
+}
 
 // ============================================================================
 // Buffer / WAL Configuration
@@ -166,19 +180,41 @@ pub struct BufferConfig {
     pub timefusion_wal_corruption_threshold: usize,
 }
 
-fn default_flush_interval() -> u64 { 600 }
-fn default_retention_mins() -> u64 { 70 }
-fn default_eviction_interval() -> u64 { 60 }
-fn default_buffer_max_memory() -> usize { 4096 }
-fn default_shutdown_timeout() -> u64 { 5 }
-fn default_wal_corruption_threshold() -> usize { 100 }
+fn default_flush_interval() -> u64 {
+    600
+}
+fn default_retention_mins() -> u64 {
+    70
+}
+fn default_eviction_interval() -> u64 {
+    60
+}
+fn default_buffer_max_memory() -> usize {
+    4096
+}
+fn default_shutdown_timeout() -> u64 {
+    5
+}
+fn default_wal_corruption_threshold() -> usize {
+    100
+}
 
 impl BufferConfig {
-    pub fn flush_interval_secs(&self) -> u64 { self.timefusion_flush_interval_secs.max(1) }
-    pub fn retention_mins(&self) -> u64 { self.timefusion_buffer_retention_mins.max(1) }
-    pub fn eviction_interval_secs(&self) -> u64 { self.timefusion_eviction_interval_secs.max(1) }
-    pub fn max_memory_mb(&self) -> usize { self.timefusion_buffer_max_memory_mb.max(64) }
-    pub fn wal_corruption_threshold(&self) -> usize { self.timefusion_wal_corruption_threshold }
+    pub fn flush_interval_secs(&self) -> u64 {
+        self.timefusion_flush_interval_secs.max(1)
+    }
+    pub fn retention_mins(&self) -> u64 {
+        self.timefusion_buffer_retention_mins.max(1)
+    }
+    pub fn eviction_interval_secs(&self) -> u64 {
+        self.timefusion_eviction_interval_secs.max(1)
+    }
+    pub fn max_memory_mb(&self) -> usize {
+        self.timefusion_buffer_max_memory_mb.max(64)
+    }
+    pub fn wal_corruption_threshold(&self) -> usize {
+        self.timefusion_wal_corruption_threshold
+    }
 
     pub fn compute_shutdown_timeout(&self, current_memory_mb: usize) -> Duration {
         let secs = self.timefusion_shutdown_timeout_secs.max(1) + (current_memory_mb / 100) as u64;
@@ -222,30 +258,60 @@ pub struct CacheConfig {
     pub timefusion_foyer_disabled: bool,
 }
 
-fn default_512() -> usize { 512 }
-fn default_100() -> usize { 100 }
-fn default_ttl() -> u64 { 604_800 } // 7 days
-fn default_cache_dir() -> PathBuf { PathBuf::from("/tmp/timefusion_cache") }
-fn default_8() -> usize { 8 }
-fn default_32() -> usize { 32 }
-fn default_1mb() -> usize { 1_048_576 }
-fn default_5() -> usize { 5 }
-fn default_4() -> usize { 4 }
+fn default_512() -> usize {
+    512
+}
+fn default_100() -> usize {
+    100
+}
+fn default_ttl() -> u64 {
+    604_800
+} // 7 days
+fn default_cache_dir() -> PathBuf {
+    PathBuf::from("/tmp/timefusion_cache")
+}
+fn default_8() -> usize {
+    8
+}
+fn default_32() -> usize {
+    32
+}
+fn default_1mb() -> usize {
+    1_048_576
+}
+fn default_5() -> usize {
+    5
+}
+fn default_4() -> usize {
+    4
+}
 
 impl CacheConfig {
-    pub fn is_disabled(&self) -> bool { self.timefusion_foyer_disabled }
-    pub fn ttl(&self) -> Duration { Duration::from_secs(self.timefusion_foyer_ttl_seconds) }
-    pub fn stats_enabled(&self) -> bool { self.timefusion_foyer_stats.to_lowercase() == "true" }
-
-    pub fn memory_size_bytes(&self) -> usize { self.timefusion_foyer_memory_mb * 1024 * 1024 }
-    pub fn disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_disk_mb.map(|mb| mb * 1024 * 1024)
-            .unwrap_or(self.timefusion_foyer_disk_gb * 1024 * 1024 * 1024)
+    pub fn is_disabled(&self) -> bool {
+        self.timefusion_foyer_disabled
     }
-    pub fn file_size_bytes(&self) -> usize { self.timefusion_foyer_file_size_mb * 1024 * 1024 }
-    pub fn metadata_memory_size_bytes(&self) -> usize { self.timefusion_foyer_metadata_memory_mb * 1024 * 1024 }
+    pub fn ttl(&self) -> Duration {
+        Duration::from_secs(self.timefusion_foyer_ttl_seconds)
+    }
+    pub fn stats_enabled(&self) -> bool {
+        self.timefusion_foyer_stats.to_lowercase() == "true"
+    }
+
+    pub fn memory_size_bytes(&self) -> usize {
+        self.timefusion_foyer_memory_mb * 1024 * 1024
+    }
+    pub fn disk_size_bytes(&self) -> usize {
+        self.timefusion_foyer_disk_mb.map(|mb| mb * 1024 * 1024).unwrap_or(self.timefusion_foyer_disk_gb * 1024 * 1024 * 1024)
+    }
+    pub fn file_size_bytes(&self) -> usize {
+        self.timefusion_foyer_file_size_mb * 1024 * 1024
+    }
+    pub fn metadata_memory_size_bytes(&self) -> usize {
+        self.timefusion_foyer_metadata_memory_mb * 1024 * 1024
+    }
     pub fn metadata_disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_disk_mb.map(|mb| mb * 1024 * 1024)
+        self.timefusion_foyer_metadata_disk_mb
+            .map(|mb| mb * 1024 * 1024)
             .unwrap_or(self.timefusion_foyer_metadata_disk_gb * 1024 * 1024 * 1024)
     }
 }
@@ -270,12 +336,24 @@ pub struct ParquetConfig {
     pub timefusion_stats_cache_size: usize,
 }
 
-fn default_page_rows() -> usize { 20_000 }
-fn default_zstd() -> i32 { 3 }
-fn default_row_group() -> usize { 134_217_728 } // 128MB
-fn default_10() -> u64 { 10 }
-fn default_target_size() -> i64 { 128 * 1024 * 1024 }
-fn default_50() -> usize { 50 }
+fn default_page_rows() -> usize {
+    20_000
+}
+fn default_zstd() -> i32 {
+    3
+}
+fn default_row_group() -> usize {
+    134_217_728
+} // 128MB
+fn default_10() -> u64 {
+    10
+}
+fn default_target_size() -> i64 {
+    128 * 1024 * 1024
+}
+fn default_50() -> usize {
+    50
+}
 
 // ============================================================================
 // Maintenance / Scheduler Configuration
@@ -293,10 +371,18 @@ pub struct MaintenanceConfig {
     pub timefusion_vacuum_schedule: String,
 }
 
-fn default_vacuum_retention() -> u64 { 72 }
-fn default_light_schedule() -> String { "0 */5 * * * *".into() }
-fn default_optimize_schedule() -> String { "0 */30 * * * *".into() }
-fn default_vacuum_schedule() -> String { "0 0 2 * * *".into() }
+fn default_vacuum_retention() -> u64 {
+    72
+}
+fn default_light_schedule() -> String {
+    "0 */5 * * * *".into()
+}
+fn default_optimize_schedule() -> String {
+    "0 */30 * * * *".into()
+}
+fn default_vacuum_schedule() -> String {
+    "0 0 2 * * *".into()
+}
 
 // ============================================================================
 // DataFusion Memory Configuration
@@ -314,11 +400,17 @@ pub struct MemoryConfig {
     pub timefusion_tracing_record_metrics: bool,
 }
 
-fn default_mem_gb() -> usize { 8 }
-fn default_fraction() -> f64 { 0.9 }
+fn default_mem_gb() -> usize {
+    8
+}
+fn default_fraction() -> f64 {
+    0.9
+}
 
 impl MemoryConfig {
-    pub fn memory_limit_bytes(&self) -> usize { self.timefusion_memory_limit_gb * 1024 * 1024 * 1024 }
+    pub fn memory_limit_bytes(&self) -> usize {
+        self.timefusion_memory_limit_gb * 1024 * 1024 * 1024
+    }
 }
 
 // ============================================================================
@@ -337,12 +429,20 @@ pub struct TelemetryConfig {
     pub log_format: Option<String>,
 }
 
-fn default_otlp() -> String { "http://localhost:4317".into() }
-fn default_service() -> String { "timefusion".into() }
-fn default_version() -> String { env!("CARGO_PKG_VERSION").into() }
+fn default_otlp() -> String {
+    "http://localhost:4317".into()
+}
+fn default_service() -> String {
+    "timefusion".into()
+}
+fn default_version() -> String {
+    env!("CARGO_PKG_VERSION").into()
+}
 
 impl TelemetryConfig {
-    pub fn is_json_logging(&self) -> bool { self.log_format.as_deref() == Some("json") }
+    pub fn is_json_logging(&self) -> bool {
+        self.log_format.as_deref() == Some("json")
+    }
 }
 
 // ============================================================================

@@ -23,10 +23,7 @@ fn main() -> anyhow::Result<()> {
     unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir) };
 
     // Build and run Tokio runtime after env vars are set
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?
-        .block_on(async_main(cfg))
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async_main(cfg))
 }
 
 async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {

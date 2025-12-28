@@ -1,8 +1,8 @@
 #![recursion_limit = "512"]
 
 pub mod batch_queue;
-pub mod config;
 pub mod buffered_write_layer;
+pub mod config;
 pub mod database;
 pub mod dml;
 pub mod functions;
