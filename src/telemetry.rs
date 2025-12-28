@@ -1,3 +1,4 @@
+use crate::config::TelemetryConfig;
 use opentelemetry::{KeyValue, trace::TracerProvider};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
@@ -5,27 +6,24 @@ use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
     trace::{RandomIdGenerator, Sampler},
 };
-use std::env;
 use std::time::Duration;
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
-pub fn init_telemetry() -> anyhow::Result<()> {
+pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     // Set global propagator for trace context
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
-    // Get OTLP endpoint from environment or use default
-    let otlp_endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| "http://localhost:4317".to_string());
-
+    let otlp_endpoint = &config.otel_exporter_otlp_endpoint;
     info!("Initializing OpenTelemetry with OTLP endpoint: {}", otlp_endpoint);
 
     // Configure service resource
-    let service_name = env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "timefusion".to_string());
-    let service_version = env::var("OTEL_SERVICE_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
+    let service_name = &config.otel_service_name;
+    let service_version = &config.otel_service_version;
 
     let resource = Resource::builder()
-        .with_attributes([KeyValue::new("service.name", service_name.clone()), KeyValue::new("service.version", service_version)])
+        .with_attributes([KeyValue::new("service.name", service_name.clone()), KeyValue::new("service.version", service_version.clone())])
         .build();
 
     // Create OTLP span exporter
@@ -64,7 +62,7 @@ pub fn init_telemetry() -> anyhow::Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Initialize tracing subscriber with telemetry and formatting layers
-    let is_json = env::var("LOG_FORMAT").unwrap_or_default() == "json";
+    let is_json = config.is_json_logging();
 
     let subscriber = Registry::default().with(env_filter).with(telemetry_layer);
 

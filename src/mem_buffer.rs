@@ -125,7 +125,7 @@ pub struct MemBufferStats {
     pub estimated_memory_bytes: usize,
 }
 
-fn estimate_batch_size(batch: &RecordBatch) -> usize {
+pub fn estimate_batch_size(batch: &RecordBatch) -> usize {
     batch.get_array_memory_size()
 }
 
@@ -165,26 +165,24 @@ impl MemBuffer {
 
         let project = self.projects.entry(project_id.to_string()).or_insert_with(ProjectBuffer::new);
 
-        // Check if table exists and validate schema compatibility
-        if let Some(existing_table) = project.table_buffers.get(table_name) {
-            let existing_schema = existing_table.schema();
-            if !schemas_compatible(&existing_schema, &schema) {
-                warn!(
-                    "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
-                    project_id,
-                    table_name,
-                    existing_schema.fields().len(),
-                    schema.fields().len()
-                );
-                anyhow::bail!(
-                    "Schema incompatible for {}.{}: field types don't match or new non-nullable field added",
-                    project_id,
-                    table_name
-                );
+        // Atomic schema validation and table creation using entry API
+        let table = match project.table_buffers.entry(table_name.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => {
+                let existing_schema = entry.get().schema();
+                if !schemas_compatible(&existing_schema, &schema) {
+                    warn!(
+                        "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
+                        project_id, table_name, existing_schema.fields().len(), schema.fields().len()
+                    );
+                    anyhow::bail!(
+                        "Schema incompatible for {}.{}: field types don't match or new non-nullable field added",
+                        project_id, table_name
+                    );
+                }
+                entry.into_ref().downgrade()
             }
-        }
-
-        let table = project.table_buffers.entry(table_name.to_string()).or_insert_with(|| TableBuffer::new(schema.clone()));
+            dashmap::mapref::entry::Entry::Vacant(entry) => entry.insert(TableBuffer::new(schema.clone())).downgrade(),
+        };
 
         let bucket = table.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
@@ -820,5 +818,72 @@ mod tests {
         assert!(buffer.has_table("project1", "table1"));
         assert!(!buffer.has_table("project1", "table2"));
         assert!(!buffer.has_table("project2", "table1"));
+    }
+
+    #[test]
+    fn test_bucket_boundary_exact() {
+        let buffer = MemBuffer::new();
+
+        // Test timestamps exactly at bucket boundaries
+        let bucket_0_start = 0i64;
+        let bucket_1_start = BUCKET_DURATION_MICROS;
+        let bucket_2_start = BUCKET_DURATION_MICROS * 2;
+
+        assert_eq!(MemBuffer::compute_bucket_id(bucket_0_start), 0);
+        assert_eq!(MemBuffer::compute_bucket_id(bucket_1_start), 1);
+        assert_eq!(MemBuffer::compute_bucket_id(bucket_2_start), 2);
+
+        // Insert at exact boundary
+        buffer.insert("project1", "table1", create_test_batch(bucket_1_start), bucket_1_start).unwrap();
+
+        let stats = buffer.get_stats();
+        assert_eq!(stats.total_buckets, 1);
+    }
+
+    #[test]
+    fn test_bucket_boundary_one_before() {
+        let buffer = MemBuffer::new();
+
+        // Test timestamp one microsecond before bucket boundary
+        let just_before_bucket_1 = BUCKET_DURATION_MICROS - 1;
+        let bucket_1_start = BUCKET_DURATION_MICROS;
+
+        assert_eq!(MemBuffer::compute_bucket_id(just_before_bucket_1), 0);
+        assert_eq!(MemBuffer::compute_bucket_id(bucket_1_start), 1);
+
+        buffer.insert("project1", "table1", create_test_batch(just_before_bucket_1), just_before_bucket_1).unwrap();
+        buffer.insert("project1", "table1", create_test_batch(bucket_1_start), bucket_1_start).unwrap();
+
+        let stats = buffer.get_stats();
+        assert_eq!(stats.total_buckets, 2, "Should have 2 separate buckets");
+    }
+
+    #[test]
+    fn test_schema_compatibility_race_condition() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let buffer = Arc::new(MemBuffer::new());
+        let ts = chrono::Utc::now().timestamp_micros();
+
+        // Create two batches with compatible schemas
+        let batch1 = create_test_batch(ts);
+
+        // Spawn multiple threads trying to insert simultaneously
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let buffer = Arc::clone(&buffer);
+                let batch = batch1.clone();
+                thread::spawn(move || buffer.insert("project1", "table1", batch, ts + i))
+            })
+            .collect();
+
+        // All should succeed since schemas are compatible
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        let results = buffer.query("project1", "table1", &[]).unwrap();
+        assert_eq!(results.len(), 10, "All 10 inserts should succeed");
     }
 }

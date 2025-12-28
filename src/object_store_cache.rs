@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
 use tracing::{Instrument, debug, info, instrument};
 
+use crate::config::CacheConfig;
 use foyer::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -128,43 +129,25 @@ impl Default for FoyerCacheConfig {
     }
 }
 
-impl FoyerCacheConfig {
-    /// Create cache config from environment variables
-    pub fn from_env() -> Self {
-        fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
-            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-        }
-
-        // Support both MB and GB for disk sizes (MB takes precedence for smaller test configs)
-        let disk_size_bytes =
-            if let Ok(mb) = std::env::var("TIMEFUSION_FOYER_DISK_MB").and_then(|v| v.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
-                mb * 1024 * 1024
-            } else {
-                parse_env::<usize>("TIMEFUSION_FOYER_DISK_GB", 100) * 1024 * 1024 * 1024
-            };
-
-        let metadata_disk_size_bytes =
-            if let Ok(mb) = std::env::var("TIMEFUSION_FOYER_METADATA_DISK_MB").and_then(|v| v.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
-                mb * 1024 * 1024
-            } else {
-                parse_env::<usize>("TIMEFUSION_FOYER_METADATA_DISK_GB", 5) * 1024 * 1024 * 1024
-            };
-
+impl From<&CacheConfig> for FoyerCacheConfig {
+    fn from(cfg: &CacheConfig) -> Self {
         Self {
-            memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_MEMORY_MB", 512) * 1024 * 1024,
-            disk_size_bytes,
-            ttl: Duration::from_secs(parse_env("TIMEFUSION_FOYER_TTL_SECONDS", 604800)),
-            cache_dir: PathBuf::from(parse_env("TIMEFUSION_FOYER_CACHE_DIR", "/tmp/timefusion_cache".to_string())),
-            shards: parse_env("TIMEFUSION_FOYER_SHARDS", 8),
-            file_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_FILE_SIZE_MB", 32) * 1024 * 1024,
-            enable_stats: parse_env("TIMEFUSION_FOYER_STATS", "true".to_string()).to_lowercase() == "true",
-            parquet_metadata_size_hint: parse_env("TIMEFUSION_PARQUET_METADATA_SIZE_HINT", 1_048_576),
-            metadata_memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_METADATA_MEMORY_MB", 512) * 1024 * 1024,
-            metadata_disk_size_bytes,
-            metadata_shards: parse_env("TIMEFUSION_FOYER_METADATA_SHARDS", 4),
+            memory_size_bytes: cfg.memory_size_bytes(),
+            disk_size_bytes: cfg.disk_size_bytes(),
+            ttl: cfg.ttl(),
+            cache_dir: cfg.timefusion_foyer_cache_dir.clone(),
+            shards: cfg.timefusion_foyer_shards,
+            file_size_bytes: cfg.file_size_bytes(),
+            enable_stats: cfg.stats_enabled(),
+            parquet_metadata_size_hint: cfg.timefusion_parquet_metadata_size_hint,
+            metadata_memory_size_bytes: cfg.metadata_memory_size_bytes(),
+            metadata_disk_size_bytes: cfg.metadata_disk_size_bytes(),
+            metadata_shards: cfg.timefusion_foyer_metadata_shards,
         }
     }
+}
 
+impl FoyerCacheConfig {
     /// Create a test configuration with sensible defaults for testing
     /// The name parameter is used to create unique cache directories
     pub fn test_config(name: &str) -> Self {

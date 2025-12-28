@@ -1,55 +1,16 @@
-use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, extract_min_timestamp};
+use crate::config::{self, BufferConfig};
+use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp};
 use crate::wal::WalManager;
 use arrow::array::RecordBatch;
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 600; // 10 minutes
-const DEFAULT_RETENTION_MINS: u64 = 90;
-const DEFAULT_EVICTION_INTERVAL_SECS: u64 = 60; // 1 minute
-
-#[derive(Debug, Clone)]
-pub struct BufferConfig {
-    pub wal_data_dir: PathBuf,
-    pub flush_interval_secs: u64,
-    pub retention_mins: u64,
-    pub eviction_interval_secs: u64,
-    pub max_memory_mb: usize,
-}
-
-impl Default for BufferConfig {
-    fn default() -> Self {
-        Self {
-            wal_data_dir: PathBuf::from("/var/lib/timefusion/wal"),
-            flush_interval_secs: DEFAULT_FLUSH_INTERVAL_SECS,
-            retention_mins: DEFAULT_RETENTION_MINS,
-            eviction_interval_secs: DEFAULT_EVICTION_INTERVAL_SECS,
-            max_memory_mb: 4096,
-        }
-    }
-}
-
-impl BufferConfig {
-    pub fn from_env() -> Self {
-        let wal_dir = std::env::var("WALRUS_DATA_DIR").unwrap_or_else(|_| "/var/lib/timefusion/wal".to_string());
-
-        Self {
-            wal_data_dir: PathBuf::from(wal_dir),
-            flush_interval_secs: std::env::var("TIMEFUSION_FLUSH_INTERVAL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_FLUSH_INTERVAL_SECS),
-            retention_mins: std::env::var("TIMEFUSION_BUFFER_RETENTION_MINS").ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_RETENTION_MINS),
-            eviction_interval_secs: std::env::var("TIMEFUSION_EVICTION_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_EVICTION_INTERVAL_SECS),
-            max_memory_mb: std::env::var("TIMEFUSION_BUFFER_MAX_MEMORY_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(4096),
-        }
-    }
-}
+const MEMORY_OVERHEAD_MULTIPLIER: f64 = 1.2; // 20% overhead for DashMap, RwLock, schema refs
 
 #[derive(Debug, Default)]
 pub struct RecoveryStats {
@@ -66,35 +27,36 @@ pub type DeltaWriteCallback = Arc<dyn Fn(String, String, Vec<RecordBatch>) -> fu
 pub struct BufferedWriteLayer {
     wal: Arc<WalManager>,
     mem_buffer: Arc<MemBuffer>,
-    config: BufferConfig,
     shutdown: CancellationToken,
     delta_write_callback: Option<DeltaWriteCallback>,
     background_tasks: Mutex<Vec<JoinHandle<()>>>,
-    flush_lock: Mutex<()>, // Serializes flush operations to prevent race conditions
+    flush_lock: Mutex<()>,
+    reserved_bytes: AtomicUsize, // Memory reserved for in-flight writes
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BufferedWriteLayer")
-            .field("config", &self.config)
             .field("has_callback", &self.delta_write_callback.is_some())
             .finish()
     }
 }
 
 impl BufferedWriteLayer {
-    pub fn new(config: BufferConfig) -> anyhow::Result<Self> {
-        let wal = Arc::new(WalManager::new(config.wal_data_dir.clone())?);
+    /// Create a new BufferedWriteLayer using global config.
+    pub fn new() -> anyhow::Result<Self> {
+        let cfg = config::config();
+        let wal = Arc::new(WalManager::new(cfg.core.walrus_data_dir.clone())?);
         let mem_buffer = Arc::new(MemBuffer::new());
 
         Ok(Self {
             wal,
             mem_buffer,
-            config,
             shutdown: CancellationToken::new(),
             delta_write_callback: None,
             background_tasks: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
+            reserved_bytes: AtomicUsize::new(0),
         })
     }
 
@@ -111,55 +73,100 @@ impl BufferedWriteLayer {
         &self.mem_buffer
     }
 
-    pub fn config(&self) -> &BufferConfig {
-        &self.config
+    fn buffer_config(&self) -> &BufferConfig {
+        &config::config().buffer
     }
 
     fn max_memory_bytes(&self) -> usize {
-        self.config.max_memory_mb * 1024 * 1024
+        self.buffer_config().max_memory_mb() * 1024 * 1024
+    }
+
+    /// Total effective memory including reserved bytes for in-flight writes.
+    fn effective_memory_bytes(&self) -> usize {
+        self.mem_buffer.estimated_memory_bytes() + self.reserved_bytes.load(Ordering::Acquire)
     }
 
     fn is_memory_pressure(&self) -> bool {
-        self.mem_buffer.estimated_memory_bytes() >= self.max_memory_bytes()
+        self.effective_memory_bytes() >= self.max_memory_bytes()
     }
 
     fn is_hard_limit_exceeded(&self) -> bool {
         // Hard limit at 120% of configured max to provide back-pressure
-        self.mem_buffer.estimated_memory_bytes() >= (self.max_memory_bytes() * 120 / 100)
+        // Use division to avoid overflow: current >= max + max/5
+        let max_bytes = self.max_memory_bytes();
+        self.effective_memory_bytes() >= max_bytes.saturating_add(max_bytes / 5)
+    }
+
+    /// Try to reserve memory atomically before a write.
+    /// Returns estimated batch size on success, or error if hard limit would be exceeded.
+    fn try_reserve_memory(&self, batches: &[RecordBatch]) -> anyhow::Result<usize> {
+        let batch_size: usize = batches.iter().map(estimate_batch_size).sum();
+        let estimated_size = (batch_size as f64 * MEMORY_OVERHEAD_MULTIPLIER) as usize;
+
+        let max_bytes = self.max_memory_bytes();
+        let hard_limit = max_bytes.saturating_add(max_bytes / 5);
+
+        loop {
+            let current_reserved = self.reserved_bytes.load(Ordering::Acquire);
+            let current_mem = self.mem_buffer.estimated_memory_bytes();
+            let new_total = current_mem + current_reserved + estimated_size;
+
+            if new_total > hard_limit {
+                anyhow::bail!(
+                    "Memory limit exceeded: {}MB + {}MB reservation > {}MB hard limit",
+                    (current_mem + current_reserved) / (1024 * 1024),
+                    estimated_size / (1024 * 1024),
+                    hard_limit / (1024 * 1024)
+                );
+            }
+
+            match self.reserved_bytes.compare_exchange(current_reserved, current_reserved + estimated_size, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Ok(estimated_size),
+                Err(_) => continue, // Retry on contention
+            }
+        }
+    }
+
+    fn release_reservation(&self, size: usize) {
+        self.reserved_bytes.fetch_sub(size, Ordering::Release);
     }
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
-        // Check memory pressure and apply back-pressure if needed
+        // Check memory pressure and trigger early flush if needed
         if self.is_memory_pressure() {
             warn!(
                 "Memory pressure detected ({}MB >= {}MB), triggering early flush",
-                self.mem_buffer.estimated_memory_bytes() / (1024 * 1024),
-                self.config.max_memory_mb
+                self.effective_memory_bytes() / (1024 * 1024),
+                self.buffer_config().max_memory_mb()
             );
             if let Err(e) = self.flush_completed_buckets().await {
                 error!("Early flush due to memory pressure failed: {}", e);
             }
+        }
 
-            // After flush, check hard limit - reject if still exceeded
-            if self.is_hard_limit_exceeded() {
-                let current_mb = self.mem_buffer.estimated_memory_bytes() / (1024 * 1024);
-                let limit_mb = self.config.max_memory_mb * 120 / 100;
-                anyhow::bail!("Memory limit exceeded after flush: {}MB > {}MB. Back-pressure applied.", current_mb, limit_mb);
+        // Reserve memory atomically before writing - prevents race condition
+        let reserved_size = self.try_reserve_memory(&batches)?;
+
+        // Write WAL and MemBuffer, ensuring reservation is released regardless of outcome
+        let result: anyhow::Result<()> = (|| {
+            // Step 1: Write to WAL for durability
+            self.wal.append_batch(project_id, table_name, &batches)?;
+
+            // Step 2: Write to MemBuffer for fast queries
+            let now = chrono::Utc::now().timestamp_micros();
+            for batch in &batches {
+                let timestamp_micros = extract_min_timestamp(batch).unwrap_or(now);
+                self.mem_buffer.insert(project_id, table_name, batch.clone(), timestamp_micros)?;
             }
-        }
 
-        // Step 1: Write to WAL for durability
-        self.wal.append_batch(project_id, table_name, &batches)?;
+            Ok(())
+        })();
 
-        // Step 2: Write to MemBuffer for fast queries
-        // Extract event timestamp from batch (falls back to current time if not present)
-        let now = chrono::Utc::now().timestamp_micros();
-        for batch in batches {
-            let timestamp_micros = extract_min_timestamp(&batch).unwrap_or(now);
-            self.mem_buffer.insert(project_id, table_name, batch, timestamp_micros)?;
-        }
+        // Release reservation (memory is now tracked by MemBuffer)
+        self.release_reservation(reserved_size);
 
+        result?;
         debug!("BufferedWriteLayer insert complete: project={}, table={}", project_id, table_name);
         Ok(())
     }
@@ -167,7 +174,7 @@ impl BufferedWriteLayer {
     #[instrument(skip(self))]
     pub async fn recover_from_wal(&self) -> anyhow::Result<RecoveryStats> {
         let start = std::time::Instant::now();
-        let retention_micros = (self.config.retention_mins as i64) * 60 * 1_000_000;
+        let retention_micros = (self.buffer_config().retention_mins() as i64) * 60 * 1_000_000;
         let cutoff = chrono::Utc::now().timestamp_micros() - retention_micros;
 
         info!("Starting WAL recovery, cutoff={}", cutoff);
@@ -227,7 +234,8 @@ impl BufferedWriteLayer {
         });
 
         // Store handles - use blocking lock since this runs at startup
-        if let Ok(mut handles) = this.background_tasks.try_lock() {
+        {
+            let mut handles = this.background_tasks.blocking_lock();
             handles.push(flush_handle);
             handles.push(eviction_handle);
         }
@@ -236,7 +244,7 @@ impl BufferedWriteLayer {
     }
 
     async fn run_flush_task(&self) {
-        let flush_interval = Duration::from_secs(self.config.flush_interval_secs);
+        let flush_interval = Duration::from_secs(self.buffer_config().flush_interval_secs());
 
         loop {
             tokio::select! {
@@ -254,7 +262,7 @@ impl BufferedWriteLayer {
     }
 
     async fn run_eviction_task(&self) {
-        let eviction_interval = Duration::from_secs(self.config.eviction_interval_secs);
+        let eviction_interval = Duration::from_secs(self.buffer_config().eviction_interval_secs());
 
         loop {
             tokio::select! {
@@ -323,7 +331,7 @@ impl BufferedWriteLayer {
     }
 
     fn evict_old_data(&self) {
-        let retention_micros = (self.config.retention_mins as i64) * 60 * 1_000_000;
+        let retention_micros = (self.buffer_config().retention_mins() as i64) * 60 * 1_000_000;
         let cutoff = chrono::Utc::now().timestamp_micros() - retention_micros;
 
         let evicted = self.mem_buffer.evict_old_data(cutoff);
@@ -340,6 +348,11 @@ impl BufferedWriteLayer {
         // Signal background tasks to stop
         self.shutdown.cancel();
 
+        // Compute dynamic timeout based on current buffer size
+        let current_memory_mb = self.mem_buffer.estimated_memory_bytes() / (1024 * 1024);
+        let task_timeout = self.buffer_config().compute_shutdown_timeout(current_memory_mb);
+        debug!("Shutdown timeout: {:?} for {}MB buffer", task_timeout, current_memory_mb);
+
         // Wait for background tasks to complete (with timeout)
         let handles: Vec<JoinHandle<()>> = {
             let mut guard = self.background_tasks.lock().await;
@@ -347,10 +360,10 @@ impl BufferedWriteLayer {
         };
 
         for handle in handles {
-            match tokio::time::timeout(Duration::from_secs(5), handle).await {
+            match tokio::time::timeout(task_timeout, handle).await {
                 Ok(Ok(())) => debug!("Background task completed cleanly"),
                 Ok(Err(e)) => warn!("Background task panicked: {}", e),
-                Err(_) => warn!("Background task did not complete within timeout"),
+                Err(_) => warn!("Background task did not complete within timeout ({:?})", task_timeout),
             }
         }
 
@@ -430,27 +443,12 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
-    use serial_test::serial;
     use tempfile::tempdir;
 
-    struct EnvGuard(String, Option<String>);
-
-    impl EnvGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let old = std::env::var(key).ok();
-            // SAFETY: Tests run serially via #[serial] attribute
-            unsafe { std::env::set_var(key, value) };
-            Self(key.to_string(), old)
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.1 {
-                Some(v) => unsafe { std::env::set_var(&self.0, v) },
-                None => unsafe { std::env::remove_var(&self.0) },
-            }
-        }
+    fn init_test_config(wal_dir: &str) {
+        // Set WAL dir before config init (tests run in same process, so first one wins)
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", wal_dir); }
+        let _ = config::init_config();
     }
 
     fn create_test_batch() -> RecordBatch {
@@ -464,17 +462,11 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_insert_and_query() {
         let dir = tempdir().unwrap();
-        let _env_guard = EnvGuard::set("WALRUS_DATA_DIR", &dir.path().to_string_lossy());
+        init_test_config(&dir.path().to_string_lossy());
 
-        let config = BufferConfig {
-            wal_data_dir: dir.path().to_path_buf(),
-            ..Default::default()
-        };
-
-        let layer = BufferedWriteLayer::new(config).unwrap();
+        let layer = BufferedWriteLayer::new().unwrap();
         let batch = create_test_batch();
 
         layer.insert("project1", "table1", vec![batch.clone()]).await.unwrap();
@@ -485,20 +477,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial]
     async fn test_recovery() {
         let dir = tempdir().unwrap();
-        let _env_guard = EnvGuard::set("WALRUS_DATA_DIR", &dir.path().to_string_lossy());
-
-        let config = BufferConfig {
-            wal_data_dir: dir.path().to_path_buf(),
-            retention_mins: 90,
-            ..Default::default()
-        };
+        init_test_config(&dir.path().to_string_lossy());
 
         // First instance - write data
         {
-            let layer = BufferedWriteLayer::new(config.clone()).unwrap();
+            let layer = BufferedWriteLayer::new().unwrap();
             let batch = create_test_batch();
             layer.insert("project1", "table1", vec![batch]).await.unwrap();
             // Give WAL time to sync (uses FsyncSchedule::Milliseconds(200))
@@ -507,12 +492,27 @@ mod tests {
 
         // Second instance - recover from WAL
         {
-            let layer = BufferedWriteLayer::new(config).unwrap();
+            let layer = BufferedWriteLayer::new().unwrap();
             let stats = layer.recover_from_wal().await.unwrap();
             assert!(stats.entries_replayed > 0, "Expected entries to be replayed from WAL");
 
             let results = layer.query("project1", "table1", &[]).unwrap();
             assert!(!results.is_empty(), "Expected results after WAL recovery");
         }
+    }
+
+    #[tokio::test]
+    async fn test_memory_reservation() {
+        let dir = tempdir().unwrap();
+        init_test_config(&dir.path().to_string_lossy());
+
+        let layer = BufferedWriteLayer::new().unwrap();
+
+        // First insert should succeed
+        let batch = create_test_batch();
+        layer.insert("project1", "table1", vec![batch]).await.unwrap();
+
+        // Verify reservation is released (should be 0 after successful insert)
+        assert_eq!(layer.reserved_bytes.load(Ordering::Acquire), 0);
     }
 }
