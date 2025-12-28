@@ -36,9 +36,7 @@ pub struct BufferedWriteLayer {
 
 impl std::fmt::Debug for BufferedWriteLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BufferedWriteLayer")
-            .field("has_callback", &self.delta_write_callback.is_some())
-            .finish()
+        f.debug_struct("BufferedWriteLayer").field("has_callback", &self.delta_write_callback.is_some()).finish()
     }
 }
 
@@ -113,7 +111,10 @@ impl BufferedWriteLayer {
                 );
             }
 
-            match self.reserved_bytes.compare_exchange(current_reserved, current_reserved + estimated_size, Ordering::AcqRel, Ordering::Acquire) {
+            match self
+                .reserved_bytes
+                .compare_exchange(current_reserved, current_reserved + estimated_size, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return Ok(estimated_size),
                 Err(_) => continue, // Retry on contention
             }
@@ -181,7 +182,8 @@ impl BufferedWriteLayer {
         if corruption_threshold > 0 && error_count > corruption_threshold {
             anyhow::bail!(
                 "WAL corruption threshold exceeded: {} errors > {} threshold. Data may be compromised.",
-                error_count, corruption_threshold
+                error_count,
+                corruption_threshold
             );
         }
 

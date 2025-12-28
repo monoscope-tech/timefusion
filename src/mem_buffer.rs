@@ -172,11 +172,15 @@ impl MemBuffer {
                 if !schemas_compatible(&existing_schema, &schema) {
                     warn!(
                         "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
-                        project_id, table_name, existing_schema.fields().len(), schema.fields().len()
+                        project_id,
+                        table_name,
+                        existing_schema.fields().len(),
+                        schema.fields().len()
                     );
                     anyhow::bail!(
                         "Schema incompatible for {}.{}: field types don't match or new non-nullable field added",
-                        project_id, table_name
+                        project_id,
+                        table_name
                     );
                 }
                 entry.into_ref().downgrade()

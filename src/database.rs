@@ -325,8 +325,7 @@ impl Database {
         } else {
             info!(
                 "DynamoDB locking not configured. AWS_S3_LOCKING_PROVIDER={:?}, DELTA_DYNAMO_TABLE_NAME={:?}",
-                cfg.aws.dynamodb.aws_s3_locking_provider,
-                cfg.aws.dynamodb.delta_dynamo_table_name
+                cfg.aws.dynamodb.aws_s3_locking_provider, cfg.aws.dynamodb.delta_dynamo_table_name
             );
         }
 
@@ -1098,13 +1097,19 @@ impl Database {
 
         // Use config values as fallback
         let cfg = config::config();
-        if storage_options.get("aws_access_key_id").is_none() && let Some(ref key) = cfg.aws.aws_access_key_id {
+        if storage_options.get("aws_access_key_id").is_none()
+            && let Some(ref key) = cfg.aws.aws_access_key_id
+        {
             builder = builder.with_access_key_id(key);
         }
-        if storage_options.get("aws_secret_access_key").is_none() && let Some(ref secret) = cfg.aws.aws_secret_access_key {
+        if storage_options.get("aws_secret_access_key").is_none()
+            && let Some(ref secret) = cfg.aws.aws_secret_access_key
+        {
             builder = builder.with_secret_access_key(secret);
         }
-        if storage_options.get("aws_region").is_none() && let Some(ref region) = cfg.aws.aws_default_region {
+        if storage_options.get("aws_region").is_none()
+            && let Some(ref region) = cfg.aws.aws_default_region
+        {
             builder = builder.with_region(region);
         }
 
