@@ -230,7 +230,9 @@ impl MemBuffer {
         {
             for bucket_entry in table.buckets.iter() {
                 if let Ok(batches) = bucket_entry.batches.read() {
-                    // RecordBatch uses Arc internally - clone is O(columns), not O(data)
+                    // RecordBatch clone is cheap: Arc<Schema> + Vec<Arc<Array>>
+                    // Only clones pointers (~100 bytes/batch), NOT the underlying data
+                    // A 4GB buffer query adds ~1MB overhead, not 4GB
                     results.extend(batches.iter().cloned());
                 }
             }
@@ -258,7 +260,7 @@ impl MemBuffer {
                     && let Ok(batches) = bucket.batches.read()
                     && !batches.is_empty()
                 {
-                    // RecordBatch uses Arc internally - clone is O(columns), not O(data)
+                    // RecordBatch clone is cheap (~100 bytes/batch), data is Arc-shared
                     partitions.push(batches.clone());
                 }
             }
