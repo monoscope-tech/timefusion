@@ -172,9 +172,9 @@ impl BufferedWriteLayer {
 
         info!("Starting WAL recovery, cutoff={}", cutoff);
 
-        // Use checkpoint=false during recovery to prevent data loss.
-        // WAL entries are only checkpointed after successful Delta flush.
-        let (entries, error_count) = self.wal.read_all_entries(Some(cutoff), false)?;
+        // Use checkpoint=true to advance the read cursor and consume entries.
+        // Entries are replayed to MemBuffer and will be re-persisted on flush.
+        let (entries, error_count) = self.wal.read_all_entries(Some(cutoff), true)?;
 
         let mut entries_replayed = 0u64;
         let mut oldest_ts: Option<i64> = None;
