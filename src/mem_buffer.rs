@@ -231,7 +231,8 @@ impl MemBuffer {
         {
             for bucket_entry in table.buckets.iter() {
                 if let Ok(batches) = bucket_entry.batches.read() {
-                    results.extend(batches.clone());
+                    // RecordBatch uses Arc internally - clone is O(columns), not O(data)
+                    results.extend(batches.iter().cloned());
                 }
             }
         }
@@ -258,6 +259,7 @@ impl MemBuffer {
                     && let Ok(batches) = bucket.batches.read()
                     && !batches.is_empty()
                 {
+                    // RecordBatch uses Arc internally - clone is O(columns), not O(data)
                     partitions.push(batches.clone());
                 }
             }
