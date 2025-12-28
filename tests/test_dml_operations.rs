@@ -17,14 +17,13 @@ mod test_dml_operations {
         keys: Vec<(String, Option<String>)>,
     }
 
+    // SAFETY: All tests using EnvGuard are marked #[serial], ensuring single-threaded
+    // execution. No other threads read env vars during test execution.
     impl EnvGuard {
         fn set(key: &str, value: &str) -> Self {
             let old = std::env::var(key).ok();
-            // SAFETY: Tests run serially via #[serial] attribute
             unsafe { std::env::set_var(key, value) };
-            Self {
-                keys: vec![(key.to_string(), old)],
-            }
+            Self { keys: vec![(key.to_string(), old)] }
         }
 
         fn add(&mut self, key: &str, value: &str) {

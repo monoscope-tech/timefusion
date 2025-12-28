@@ -11,7 +11,9 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use tracing::{debug, info, instrument, warn};
 
-const BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000; // 10 minutes in microseconds
+// 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
+// longer = larger Delta files. Matches default flush interval for aligned boundaries.
+const BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000;
 
 /// Check if two schemas are compatible for merge.
 /// Compatible means: all existing fields must be present in incoming schema with same type,
