@@ -297,12 +297,6 @@ impl Database {
     }
 
     async fn initialize_cache_with_retry() -> Option<Arc<SharedFoyerCache>> {
-        // Allow disabling cache for testing
-        if env::var("TIMEFUSION_FOYER_DISABLED").is_ok() {
-            info!("Foyer cache disabled via TIMEFUSION_FOYER_DISABLED environment variable");
-            return None;
-        }
-
         let config = FoyerCacheConfig::from_env();
         info!(
             "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, TTL: {}s)",
