@@ -1,6 +1,6 @@
 use crate::config::{self, BufferConfig};
 use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp};
-use crate::wal::WalManager;
+use crate::wal::{WalManager, WalOperation, deserialize_delete_payload, deserialize_update_payload};
 use arrow::array::RecordBatch;
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
@@ -28,6 +28,7 @@ pub struct RecoveryStats {
 /// Callback for writing batches to Delta Lake. The callback MUST:
 /// - Complete the Delta commit (including S3 upload) before returning Ok
 /// - Return Err if the commit fails for any reason
+///
 /// This is critical for WAL checkpoint safety - we only mark entries as consumed after successful commit.
 pub type DeltaWriteCallback = Arc<dyn Fn(String, String, Vec<RecordBatch>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
@@ -183,9 +184,8 @@ impl BufferedWriteLayer {
 
         info!("Starting WAL recovery, cutoff={}, corruption_threshold={}", cutoff, corruption_threshold);
 
-        // Use checkpoint=true to advance the read cursor and consume entries.
-        // Entries are replayed to MemBuffer and will be re-persisted on flush.
-        let (entries, error_count) = self.wal.read_all_entries(Some(cutoff), true)?;
+        // Read all entries sorted by timestamp for correct replay order
+        let (entries, error_count) = self.wal.read_all_entries_raw(Some(cutoff), true)?;
 
         // Fail if corruption exceeds threshold (0 = disabled)
         if corruption_threshold > 0 && error_count > corruption_threshold {
@@ -197,13 +197,50 @@ impl BufferedWriteLayer {
         }
 
         let mut entries_replayed = 0u64;
+        let mut deletes_replayed = 0u64;
+        let mut updates_replayed = 0u64;
         let mut oldest_ts: Option<i64> = None;
         let mut newest_ts: Option<i64> = None;
 
-        for (entry, batch) in entries {
-            self.mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros)?;
-
-            entries_replayed += 1;
+        for entry in entries {
+            match entry.operation {
+                WalOperation::Insert => match WalManager::deserialize_batch(&entry.data) {
+                    Ok(batch) => {
+                        self.mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros)?;
+                        entries_replayed += 1;
+                    }
+                    Err(e) => {
+                        warn!("Skipping corrupted INSERT batch: {}", e);
+                    }
+                },
+                WalOperation::Delete => match deserialize_delete_payload(&entry.data) {
+                    Ok(payload) => {
+                        if let Err(e) = self.mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref()) {
+                            warn!("Failed to replay DELETE: {}", e);
+                        } else {
+                            deletes_replayed += 1;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Skipping corrupted DELETE payload: {}", e);
+                    }
+                },
+                WalOperation::Update => match deserialize_update_payload(&entry.data) {
+                    Ok(payload) => {
+                        if let Err(e) =
+                            self.mem_buffer
+                                .update_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), &payload.assignments)
+                        {
+                            warn!("Failed to replay UPDATE: {}", e);
+                        } else {
+                            updates_replayed += 1;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Skipping corrupted UPDATE payload: {}", e);
+                    }
+                },
+            }
             oldest_ts = Some(oldest_ts.map_or(entry.timestamp_micros, |ts| ts.min(entry.timestamp_micros)));
             newest_ts = Some(newest_ts.map_or(entry.timestamp_micros, |ts| ts.max(entry.timestamp_micros)));
         }
@@ -217,17 +254,10 @@ impl BufferedWriteLayer {
             corrupted_entries_skipped: error_count as u64,
         };
 
-        if stats.corrupted_entries_skipped > 0 {
-            warn!(
-                "WAL recovery complete: entries={}, corrupted_skipped={}, duration={}ms",
-                stats.entries_replayed, stats.corrupted_entries_skipped, stats.recovery_duration_ms
-            );
-        } else {
-            info!(
-                "WAL recovery complete: entries={}, duration={}ms",
-                stats.entries_replayed, stats.recovery_duration_ms
-            );
-        }
+        info!(
+            "WAL recovery complete: inserts={}, deletes={}, updates={}, corrupted={}, duration={}ms",
+            entries_replayed, deletes_replayed, updates_replayed, error_count, stats.recovery_duration_ms
+        );
         Ok(stats)
     }
 
@@ -453,18 +483,31 @@ impl BufferedWriteLayer {
     }
 
     /// Delete rows matching the predicate from the memory buffer.
+    /// Logs the operation to WAL for crash recovery, then applies to MemBuffer.
     /// Returns the number of rows deleted.
     #[instrument(skip(self, predicate), fields(project_id, table_name))]
     pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>) -> datafusion::error::Result<u64> {
+        let predicate_sql = predicate.map(|p| format!("{}", p));
+        // Log to WAL first for durability
+        if let Err(e) = self.wal.append_delete(project_id, table_name, predicate_sql.as_deref()) {
+            warn!("Failed to log DELETE to WAL: {}", e);
+        }
         self.mem_buffer.delete(project_id, table_name, predicate)
     }
 
     /// Update rows matching the predicate with new values in the memory buffer.
+    /// Logs the operation to WAL for crash recovery, then applies to MemBuffer.
     /// Returns the number of rows updated.
     #[instrument(skip(self, predicate, assignments), fields(project_id, table_name))]
     pub fn update(
         &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>, assignments: &[(String, datafusion::logical_expr::Expr)],
     ) -> datafusion::error::Result<u64> {
+        let predicate_sql = predicate.map(|p| format!("{}", p));
+        let assignments_sql: Vec<(String, String)> = assignments.iter().map(|(col, expr)| (col.clone(), format!("{}", expr))).collect();
+        // Log to WAL first for durability
+        if let Err(e) = self.wal.append_update(project_id, table_name, predicate_sql.as_deref(), &assignments_sql) {
+            warn!("Failed to log UPDATE to WAL: {}", e);
+        }
         self.mem_buffer.update(project_id, table_name, predicate, assignments)
     }
 }

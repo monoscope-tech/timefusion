@@ -23,7 +23,9 @@ mod test_dml_operations {
         fn set(key: &str, value: &str) -> Self {
             let old = std::env::var(key).ok();
             unsafe { std::env::set_var(key, value) };
-            Self { keys: vec![(key.to_string(), old)] }
+            Self {
+                keys: vec![(key.to_string(), old)],
+            }
         }
 
         fn add(&mut self, key: &str, value: &str) {
