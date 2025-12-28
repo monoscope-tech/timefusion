@@ -10,6 +10,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
+use crate::config;
+
 /// Cache entry for basic table statistics
 #[derive(Clone, Debug)]
 pub struct CachedStatistics {
@@ -124,7 +126,7 @@ impl DeltaStatisticsExtractor {
             }
         } else {
             // Fallback: estimate rows based on file count
-            let page_row_limit = std::env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(20_000);
+            let page_row_limit = config::config().parquet.timefusion_page_row_count_limit as u64;
             total_rows = num_files * page_row_limit;
         }
 

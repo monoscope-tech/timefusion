@@ -4,7 +4,8 @@
 use datafusion_postgres::{ServerOptions, auth::AuthManager};
 use dotenv::dotenv;
 use std::{env, sync::Arc};
-use timefusion::buffered_write_layer::{BufferConfig, BufferedWriteLayer};
+use timefusion::buffered_write_layer::BufferedWriteLayer;
+use timefusion::config;
 use timefusion::database::Database;
 use timefusion::telemetry;
 use tokio::time::{Duration, sleep};
@@ -12,18 +13,20 @@ use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize environment and telemetry
+    // Initialize environment
     dotenv().ok();
 
+    // Initialize global config from environment - validates all settings upfront
+    let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+
     // Set WALRUS_DATA_DIR before any threads spawn (required by walrus-rust)
-    // This must happen before tokio runtime creates worker threads that might read it
-    let wal_dir = env::var("WALRUS_DATA_DIR").unwrap_or_else(|_| "/var/lib/timefusion/wal".to_string());
+    // This is the ONLY env var we must set - walrus-rust reads it directly
     unsafe {
-        env::set_var("WALRUS_DATA_DIR", &wal_dir);
+        env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir);
     }
 
     // Initialize OpenTelemetry with OTLP exporter
-    telemetry::init_telemetry()?;
+    telemetry::init_telemetry(&cfg.telemetry)?;
 
     info!("Starting TimeFusion application");
 
@@ -31,11 +34,12 @@ async fn main() -> anyhow::Result<()> {
     let mut db = Database::new().await?;
     info!("Database initialized successfully");
 
-    // Initialize BufferedWriteLayer (replaces BatchQueue)
-    let buffer_config = BufferConfig::from_env();
+    // Initialize BufferedWriteLayer using global config
     info!(
         "BufferedWriteLayer config: wal_dir={:?}, flush_interval={}s, retention={}min",
-        buffer_config.wal_data_dir, buffer_config.flush_interval_secs, buffer_config.retention_mins
+        cfg.core.walrus_data_dir,
+        cfg.buffer.flush_interval_secs(),
+        cfg.buffer.retention_mins()
     );
 
     // Create buffered layer with delta write callback
@@ -49,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
             })
         });
 
-    let buffered_layer = Arc::new(BufferedWriteLayer::new(buffer_config)?.with_delta_writer(delta_write_callback));
+    let buffered_layer = Arc::new(BufferedWriteLayer::new()?.with_delta_writer(delta_write_callback));
 
     // Recover from WAL on startup
     info!("Starting WAL recovery...");
@@ -73,20 +77,7 @@ async fn main() -> anyhow::Result<()> {
     db.setup_session_context(&mut session_context)?;
 
     // Start PGWire server
-    let pgwire_port_var = env::var("PGWIRE_PORT");
-    info!("PGWIRE_PORT environment variable: {:?}", pgwire_port_var);
-
-    let pg_port = pgwire_port_var
-        .unwrap_or_else(|_| {
-            info!("PGWIRE_PORT not set, using default port 5432");
-            "5432".to_string()
-        })
-        .parse::<u16>()
-        .unwrap_or_else(|e| {
-            error!("Failed to parse PGWIRE_PORT value: {:?}, using default 5432", e);
-            5432
-        });
-
+    let pg_port = cfg.core.pgwire_port;
     info!("Starting PGWire server on port: {}", pg_port);
 
     let pg_task = tokio::spawn(async move {

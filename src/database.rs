@@ -1,3 +1,4 @@
+use crate::config;
 use crate::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
 use crate::schema_loader::{get_default_schema, get_schema};
 use crate::statistics::DeltaStatisticsExtractor;
@@ -37,7 +38,7 @@ use instrumented_object_store::instrument_object_store;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::fmt;
-use std::{any::Any, collections::HashMap, env, sync::Arc};
+use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::field::Empty;
@@ -62,11 +63,8 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     })
 }
 
-// Constants for optimization and vacuum operations
-const DEFAULT_VACUUM_RETENTION_HOURS: u64 = 72; // 3 days
-const DEFAULT_OPTIMIZE_TARGET_SIZE: i64 = 128 * 1024 * 1024; // 512MB
-const DEFAULT_PAGE_ROW_COUNT_LIMIT: usize = 20000;
-const ZSTD_COMPRESSION_LEVEL: i32 = 3; // Balance between compression ratio and speed
+// Compression level for parquet files - kept for WriterProperties fallback
+const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct StorageConfig {
@@ -146,36 +144,8 @@ impl Database {
 
     /// Build storage options with consistent configuration including DynamoDB locking if enabled
     fn build_storage_options(&self) -> HashMap<String, String> {
-        let mut storage_options = HashMap::new();
-
-        // Add AWS credentials using iterator
-        let aws_vars = [
-            ("AWS_ACCESS_KEY_ID", "aws_access_key_id"),
-            ("AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"),
-            ("AWS_DEFAULT_REGION", "aws_region"),
-        ];
-
-        storage_options.extend(aws_vars.iter().filter_map(|(env_key, opt_key)| env::var(env_key).ok().map(|val| (opt_key.to_string(), val))));
-
-        // Add endpoint if available
-        if let Some(ref endpoint) = self.default_s3_endpoint {
-            storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
-        }
-
-        // Add DynamoDB locking configuration if enabled
-        if env::var("AWS_S3_LOCKING_PROVIDER").ok().as_deref() == Some("dynamodb") {
-            storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
-
-            let dynamo_vars = [
-                ("DELTA_DYNAMO_TABLE_NAME", "delta_dynamo_table_name"),
-                ("AWS_ACCESS_KEY_ID_DYNAMODB", "aws_access_key_id_dynamodb"),
-                ("AWS_SECRET_ACCESS_KEY_DYNAMODB", "aws_secret_access_key_dynamodb"),
-                ("AWS_REGION_DYNAMODB", "aws_region_dynamodb"),
-                ("AWS_ENDPOINT_URL_DYNAMODB", "aws_endpoint_url_dynamodb"),
-            ];
-
-            storage_options.extend(dynamo_vars.iter().filter_map(|(env_key, opt_key)| env::var(env_key).ok().map(|val| (opt_key.to_string(), val))));
-        }
+        let cfg = config::config();
+        let storage_options = cfg.aws.build_storage_options(self.default_s3_endpoint.as_deref());
 
         let safe_options: HashMap<_, _> = storage_options.iter().filter(|(k, _)| !k.contains("secret") && !k.contains("password")).collect();
         info!("Storage options configured: {:?}", safe_options);
@@ -186,15 +156,10 @@ impl Database {
         use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
         use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
 
-        // Get configurable values from environment
-        let page_row_count_limit = env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_PAGE_ROW_COUNT_LIMIT);
-
-        let compression_level = env::var("TIMEFUSION_ZSTD_COMPRESSION_LEVEL").ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(ZSTD_COMPRESSION_LEVEL);
-
-        let max_row_group_size = env::var("TIMEFUSION_MAX_ROW_GROUP_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(134217728); // 128MB
+        let cfg = config::config();
+        let page_row_count_limit = cfg.parquet.timefusion_page_row_count_limit;
+        let compression_level = cfg.parquet.timefusion_zstd_compression_level;
+        let max_row_group_size = cfg.parquet.timefusion_max_row_group_size;
 
         WriterProperties::builder()
             // Use ZSTD compression with high level for maximum compression ratio
@@ -297,16 +262,24 @@ impl Database {
     }
 
     async fn initialize_cache_with_retry() -> Option<Arc<SharedFoyerCache>> {
-        let config = FoyerCacheConfig::from_env();
+        let cfg = config::config();
+
+        // Check if cache is disabled
+        if cfg.cache.is_disabled() {
+            info!("Foyer cache is disabled via TIMEFUSION_FOYER_DISABLED");
+            return None;
+        }
+
+        let foyer_config = FoyerCacheConfig::from(&cfg.cache);
         info!(
             "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, TTL: {}s)",
-            config.memory_size_bytes / 1024 / 1024,
-            config.disk_size_bytes / 1024 / 1024 / 1024,
-            config.ttl.as_secs()
+            foyer_config.memory_size_bytes / 1024 / 1024,
+            foyer_config.disk_size_bytes / 1024 / 1024 / 1024,
+            foyer_config.ttl.as_secs()
         );
 
         for attempt in 1..=3 {
-            match SharedFoyerCache::new(config.clone()).await {
+            match SharedFoyerCache::new(foyer_config.clone()).await {
                 Ok(cache) => {
                     info!("Shared Foyer cache initialized successfully for all tables");
                     return Some(Arc::new(cache));
@@ -325,47 +298,46 @@ impl Database {
     }
 
     pub async fn new() -> Result<Self> {
-        let aws_endpoint = env::var("AWS_S3_ENDPOINT").unwrap_or_else(|_| "https://s3.amazonaws.com".to_string());
-        let aws_url = Url::parse(&aws_endpoint).expect("AWS endpoint must be a valid URL");
+        let cfg = config::config();
+
+        let aws_endpoint = &cfg.aws.aws_s3_endpoint;
+        let aws_url = Url::parse(aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
 
         // Check for DynamoDB locking configuration
-        let locking_provider = env::var("AWS_S3_LOCKING_PROVIDER").ok();
-        let dynamo_table_name = env::var("DELTA_DYNAMO_TABLE_NAME").ok();
-
-        if let (Some(provider), Some(table)) = (&locking_provider, &dynamo_table_name) {
-            if provider == "dynamodb" {
+        if cfg.aws.is_dynamodb_locking_enabled() {
+            if let Some(ref table) = cfg.aws.dynamodb.delta_dynamo_table_name {
                 info!("DynamoDB locking enabled with table: {}", table);
 
-                // Log all relevant DynamoDB environment variables
-                if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL_DYNAMODB") {
+                if let Some(ref endpoint) = cfg.aws.dynamodb.aws_endpoint_url_dynamodb {
                     info!("DynamoDB endpoint: {}", endpoint);
                 }
-                if let Ok(region) = env::var("AWS_REGION_DYNAMODB") {
+                if let Some(ref region) = cfg.aws.dynamodb.aws_region_dynamodb {
                     info!("DynamoDB region: {}", region);
                 }
                 info!(
                     "DynamoDB credentials configured: access_key={}, secret_key={}",
-                    env::var("AWS_ACCESS_KEY_ID_DYNAMODB").is_ok(),
-                    env::var("AWS_SECRET_ACCESS_KEY_DYNAMODB").is_ok()
+                    cfg.aws.dynamodb.aws_access_key_id_dynamodb.is_some(),
+                    cfg.aws.dynamodb.aws_secret_access_key_dynamodb.is_some()
                 );
             }
         } else {
             info!(
                 "DynamoDB locking not configured. AWS_S3_LOCKING_PROVIDER={:?}, DELTA_DYNAMO_TABLE_NAME={:?}",
-                locking_provider, dynamo_table_name
+                cfg.aws.dynamodb.aws_s3_locking_provider,
+                cfg.aws.dynamodb.delta_dynamo_table_name
             );
         }
 
         // Store default S3 settings for unconfigured mode
-        let default_s3_bucket = env::var("AWS_S3_BUCKET").ok();
-        let default_s3_prefix = env::var("TIMEFUSION_TABLE_PREFIX").unwrap_or_else(|_| "timefusion".to_string());
+        let default_s3_bucket = cfg.aws.aws_s3_bucket.clone();
+        let default_s3_prefix = cfg.core.timefusion_table_prefix.clone();
         let default_s3_endpoint = Some(aws_endpoint.clone());
 
         // Try to connect to config database if URL is provided
-        let (config_pool, storage_configs) = match env::var("TIMEFUSION_CONFIG_DATABASE_URL").ok() {
-            Some(db_url) => match PgPoolOptions::new().max_connections(2).connect(&db_url).await {
+        let (config_pool, storage_configs) = match &cfg.core.timefusion_config_database_url {
+            Some(db_url) => match PgPoolOptions::new().max_connections(2).connect(db_url).await {
                 Ok(pool) => {
                     let configs = Self::load_storage_configs(&pool).await.unwrap_or_default();
                     (Some(pool), configs)
@@ -385,7 +357,7 @@ impl Database {
         let object_store_cache = Self::initialize_cache_with_retry().await;
 
         // Initialize statistics extractor with configurable cache size
-        let stats_cache_size = env::var("TIMEFUSION_STATS_CACHE_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(50);
+        let stats_cache_size = cfg.parquet.timefusion_stats_cache_size;
         let statistics_extractor = Arc::new(DeltaStatisticsExtractor::new(stats_cache_size, 300));
 
         let db = Self {
@@ -435,11 +407,12 @@ impl Database {
     pub async fn start_maintenance_schedulers(self) -> Result<Self> {
         use tokio_cron_scheduler::{Job, JobScheduler};
 
+        let cfg = config::config();
         let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
 
         // Light optimize job - every 5 minutes for small recent files
-        let light_optimize_schedule = env::var("TIMEFUSION_LIGHT_OPTIMIZE_SCHEDULE").unwrap_or_else(|_| "0 */5 * * * *".to_string());
+        let light_optimize_schedule = &cfg.maintenance.timefusion_light_optimize_schedule;
 
         if !light_optimize_schedule.is_empty() {
             info!("Light optimize job scheduled with cron expression: {}", light_optimize_schedule);
@@ -470,7 +443,7 @@ impl Database {
         }
 
         // Optimize job - configurable schedule (default: every 30mins)
-        let optimize_schedule = env::var("TIMEFUSION_OPTIMIZE_SCHEDULE").unwrap_or_else(|_| "0 */30 * * * *".to_string());
+        let optimize_schedule = &cfg.maintenance.timefusion_optimize_schedule;
 
         if !optimize_schedule.is_empty() {
             info!(
@@ -499,21 +472,19 @@ impl Database {
         }
 
         // Vacuum job - configurable schedule (default: daily at 2AM)
-        let vacuum_schedule = env::var("TIMEFUSION_VACUUM_SCHEDULE").unwrap_or_else(|_| "0 0 2 * * *".to_string());
+        let vacuum_schedule = &cfg.maintenance.timefusion_vacuum_schedule;
+        let vacuum_retention = cfg.maintenance.timefusion_vacuum_retention_hours;
 
         if !vacuum_schedule.is_empty() {
             info!("Vacuum job scheduled with cron expression: {}", vacuum_schedule);
 
-            let vacuum_job = Job::new_async(&vacuum_schedule, {
+            let vacuum_job = Job::new_async(vacuum_schedule.as_str(), {
                 let db = db.clone();
                 move |_, _| {
                     let db = db.clone();
                     Box::pin(async move {
                         info!("Running scheduled vacuum on all tables");
-                        let retention_hours = env::var("TIMEFUSION_VACUUM_RETENTION_HOURS")
-                            .unwrap_or_else(|_| DEFAULT_VACUUM_RETENTION_HOURS.to_string())
-                            .parse::<u64>()
-                            .unwrap_or(DEFAULT_VACUUM_RETENTION_HOURS);
+                        let retention_hours = vacuum_retention;
 
                         for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
                             info!("Vacuuming project '{}' table '{}' (retention: {}h)", project_id, table_name, retention_hours);
@@ -651,16 +622,10 @@ impl Database {
         let _ = options.set("datafusion.optimizer.max_passes", "5");
 
         // Configure memory limit for DataFusion operations
-        let memory_limit_gb = env::var("TIMEFUSION_MEMORY_LIMIT_GB").unwrap_or_else(|_| "8".to_string()).parse::<usize>().unwrap_or(8);
-
-        // Configure memory fraction (how much of the memory pool to use for execution)
-        let memory_fraction = env::var("TIMEFUSION_MEMORY_FRACTION").unwrap_or_else(|_| "0.9".to_string()).parse::<f64>().unwrap_or(0.9);
-
-        // Configure external sort spill size
-        let sort_spill_reservation_bytes = env::var("TIMEFUSION_SORT_SPILL_RESERVATION_BYTES")
-            .unwrap_or_else(|_| "67108864".to_string()) // Default 64MB
-            .parse::<usize>()
-            .unwrap_or(67108864);
+        let cfg = config::config();
+        let memory_limit_bytes = cfg.memory.memory_limit_bytes();
+        let memory_fraction = cfg.memory.timefusion_memory_fraction;
+        let sort_spill_reservation_bytes = cfg.memory.timefusion_sort_spill_reservation_bytes.unwrap_or(67_108_864);
 
         // Set memory-related configuration options
         let _ = options.set("datafusion.execution.memory_fraction", &memory_fraction.to_string());
@@ -668,14 +633,14 @@ impl Database {
 
         // Create runtime environment with memory limit
         let runtime_env = RuntimeEnvBuilder::new()
-            .with_memory_limit(memory_limit_gb * 1024 * 1024 * 1024, memory_fraction)
+            .with_memory_limit(memory_limit_bytes, memory_fraction)
             .build()
             .expect("Failed to create runtime environment");
 
         let runtime_env = Arc::new(runtime_env);
 
         // Set up tracing options with configurable sampling
-        let record_metrics = env::var("TIMEFUSION_TRACING_RECORD_METRICS").unwrap_or_else(|_| "true".to_string()).parse::<bool>().unwrap_or(true);
+        let record_metrics = cfg.memory.timefusion_tracing_record_metrics;
 
         let tracing_options = InstrumentationOptions::builder().record_metrics(record_metrics).preview_limit(5).build();
 
@@ -950,26 +915,23 @@ impl Database {
             }
 
             // Add DynamoDB locking configuration if enabled (even for project-specific configs)
-            if let Ok(locking_provider) = env::var("AWS_S3_LOCKING_PROVIDER")
-                && locking_provider == "dynamodb"
-            {
+            let cfg = config::config();
+            if cfg.aws.is_dynamodb_locking_enabled() {
                 storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
-                if let Ok(table_name) = env::var("DELTA_DYNAMO_TABLE_NAME") {
-                    storage_options.insert("delta_dynamo_table_name".to_string(), table_name);
+                if let Some(ref table) = cfg.aws.dynamodb.delta_dynamo_table_name {
+                    storage_options.insert("delta_dynamo_table_name".to_string(), table.clone());
                 }
-
-                // Add DynamoDB-specific credentials if available
-                if let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID_DYNAMODB") {
-                    storage_options.insert("aws_access_key_id_dynamodb".to_string(), access_key);
+                if let Some(ref key) = cfg.aws.dynamodb.aws_access_key_id_dynamodb {
+                    storage_options.insert("aws_access_key_id_dynamodb".to_string(), key.clone());
                 }
-                if let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY_DYNAMODB") {
-                    storage_options.insert("aws_secret_access_key_dynamodb".to_string(), secret_key);
+                if let Some(ref secret) = cfg.aws.dynamodb.aws_secret_access_key_dynamodb {
+                    storage_options.insert("aws_secret_access_key_dynamodb".to_string(), secret.clone());
                 }
-                if let Ok(region) = env::var("AWS_REGION_DYNAMODB") {
-                    storage_options.insert("aws_region_dynamodb".to_string(), region);
+                if let Some(ref region) = cfg.aws.dynamodb.aws_region_dynamodb {
+                    storage_options.insert("aws_region_dynamodb".to_string(), region.clone());
                 }
-                if let Ok(endpoint) = env::var("AWS_ENDPOINT_URL_DYNAMODB") {
-                    storage_options.insert("aws_endpoint_url_dynamodb".to_string(), endpoint);
+                if let Some(ref endpoint) = cfg.aws.dynamodb.aws_endpoint_url_dynamodb {
+                    storage_options.insert("aws_endpoint_url_dynamodb".to_string(), endpoint.clone());
                 }
             }
 
@@ -1044,7 +1006,7 @@ impl Database {
 
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
-                    let checkpoint_interval = env::var("TIMEFUSION_CHECKPOINT_INTERVAL").unwrap_or_else(|_| "10".to_string());
+                    let checkpoint_interval = config::config().parquet.timefusion_checkpoint_interval.to_string();
 
                     let mut config = HashMap::new();
                     config.insert("delta.checkpointInterval".to_string(), Some(checkpoint_interval));
@@ -1134,28 +1096,28 @@ impl Database {
             }
         }
 
-        // Use environment variables as fallback
-        if storage_options.get("aws_access_key_id").is_none()
-            && let Ok(access_key) = env::var("AWS_ACCESS_KEY_ID")
-        {
-            builder = builder.with_access_key_id(access_key);
+        // Use config values as fallback
+        let cfg = config::config();
+        if storage_options.get("aws_access_key_id").is_none() {
+            if let Some(ref key) = cfg.aws.aws_access_key_id {
+                builder = builder.with_access_key_id(key);
+            }
         }
-        if storage_options.get("aws_secret_access_key").is_none()
-            && let Ok(secret_key) = env::var("AWS_SECRET_ACCESS_KEY")
-        {
-            builder = builder.with_secret_access_key(secret_key);
+        if storage_options.get("aws_secret_access_key").is_none() {
+            if let Some(ref secret) = cfg.aws.aws_secret_access_key {
+                builder = builder.with_secret_access_key(secret);
+            }
         }
-        if storage_options.get("aws_region").is_none()
-            && let Ok(region) = env::var("AWS_DEFAULT_REGION")
-        {
-            builder = builder.with_region(region);
+        if storage_options.get("aws_region").is_none() {
+            if let Some(ref region) = cfg.aws.aws_default_region {
+                builder = builder.with_region(region);
+            }
         }
 
-        // Check if we need to use environment variable for endpoint and allow HTTP
-        if storage_options.get("aws_endpoint").is_none()
-            && let Ok(endpoint) = env::var("AWS_S3_ENDPOINT")
-        {
-            builder = builder.with_endpoint(&endpoint);
+        // Check if we need to use config for endpoint and allow HTTP
+        if storage_options.get("aws_endpoint").is_none() {
+            let endpoint = &cfg.aws.aws_s3_endpoint;
+            builder = builder.with_endpoint(endpoint);
             if endpoint.starts_with("http://") {
                 builder = builder.with_allow_http(true);
             }
@@ -1221,7 +1183,7 @@ impl Database {
         }
 
         // Fallback to legacy batch queue if configured
-        let enable_queue = env::var("ENABLE_BATCH_QUEUE").unwrap_or_else(|_| "false".to_string()) == "true";
+        let enable_queue = config::config().core.enable_batch_queue;
         if !skip_queue && enable_queue && self.batch_queue.is_some() {
             span.record("use_queue", true);
             let queue = self.batch_queue.as_ref().unwrap();
@@ -1349,10 +1311,7 @@ impl Database {
         };
 
         // Get configurable target size
-        let target_size = env::var("TIMEFUSION_OPTIMIZE_TARGET_SIZE")
-            .unwrap_or_else(|_| DEFAULT_OPTIMIZE_TARGET_SIZE.to_string())
-            .parse::<i64>()
-            .unwrap_or(DEFAULT_OPTIMIZE_TARGET_SIZE);
+        let target_size = config::config().parquet.timefusion_optimize_target_size;
 
         // Calculate dates for filtering - last 2 days (today and yesterday)
         let today = Utc::now().date_naive();
