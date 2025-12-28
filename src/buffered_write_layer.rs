@@ -2,6 +2,7 @@ use crate::config::{self, BufferConfig};
 use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp};
 use crate::wal::WalManager;
 use arrow::array::RecordBatch;
+use futures::stream::{self, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -300,8 +301,19 @@ impl BufferedWriteLayer {
 
         info!("Flushing {} buckets to Delta", flushable.len());
 
-        for bucket in flushable {
-            match self.flush_bucket(&bucket).await {
+        // Flush buckets in parallel with bounded concurrency (4 concurrent flushes)
+        let flush_results: Vec<_> = stream::iter(flushable)
+            .map(|bucket| async move {
+                let result = self.flush_bucket(&bucket).await;
+                (bucket, result)
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await;
+
+        // Process results sequentially: drain MemBuffer and checkpoint WAL for successful flushes
+        for (bucket, result) in flush_results {
+            match result {
                 Ok(()) => {
                     // Order: drain MemBuffer FIRST, then checkpoint WAL
                     // If crash after drain but before checkpoint: WAL replays on recovery,

@@ -176,18 +176,15 @@ impl MemBuffer {
         let table = match project.table_buffers.entry(table_name.to_string()) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 let existing_schema = entry.get().schema();
-                if !schemas_compatible(&existing_schema, &schema) {
+                // Fast path: same Arc pointer means identical schema
+                if !std::sync::Arc::ptr_eq(&existing_schema, &schema) && !schemas_compatible(&existing_schema, &schema) {
                     warn!(
                         "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
-                        project_id,
-                        table_name,
-                        existing_schema.fields().len(),
-                        schema.fields().len()
+                        project_id, table_name, existing_schema.fields().len(), schema.fields().len()
                     );
                     anyhow::bail!(
                         "Schema incompatible for {}.{}: field types don't match or new non-nullable field added",
-                        project_id,
-                        table_name
+                        project_id, table_name
                     );
                 }
                 entry.into_ref().downgrade()
