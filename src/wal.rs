@@ -7,12 +7,49 @@ use std::path::PathBuf;
 use tracing::{debug, error, info, instrument, warn};
 use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
 
+/// Magic bytes to identify new WAL format with DML support
+const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32]; // "WAL2"
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WalOperation {
+    Insert = 0,
+    Delete = 1,
+    Update = 2,
+}
+
+impl TryFrom<u8> for WalOperation {
+    type Error = anyhow::Error;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(WalOperation::Insert),
+            1 => Ok(WalOperation::Delete),
+            2 => Ok(WalOperation::Update),
+            _ => anyhow::bail!("Invalid WAL operation type: {}", value),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct WalEntry {
     pub timestamp_micros: i64,
     pub project_id: String,
     pub table_name: String,
+    pub operation: WalOperation,
     pub data: Vec<u8>,
+}
+
+/// Serialized representation of a DELETE operation
+#[derive(Debug)]
+pub struct DeletePayload {
+    pub predicate_sql: Option<String>,
+}
+
+/// Serialized representation of an UPDATE operation
+#[derive(Debug)]
+pub struct UpdatePayload {
+    pub predicate_sql: Option<String>,
+    pub assignments: Vec<(String, String)>, // (column_name, value_sql)
 }
 
 pub struct WalManager {
@@ -80,6 +117,7 @@ impl WalManager {
             timestamp_micros,
             project_id: project_id.to_string(),
             table_name: table_name.to_string(),
+            operation: WalOperation::Insert,
             data: serialize_record_batch(batch)?,
         };
 
@@ -88,7 +126,7 @@ impl WalManager {
         self.wal.append_for_topic(&topic, &payload)?;
         self.persist_topic(&topic);
 
-        debug!("WAL append: topic={}, timestamp={}, rows={}", topic, timestamp_micros, batch.num_rows());
+        debug!("WAL append INSERT: topic={}, timestamp={}, rows={}", topic, timestamp_micros, batch.num_rows());
         Ok(())
     }
 
@@ -104,6 +142,7 @@ impl WalManager {
                 timestamp_micros,
                 project_id: project_id.to_string(),
                 table_name: table_name.to_string(),
+                operation: WalOperation::Insert,
                 data,
             };
             payloads.push(serialize_wal_entry(&entry)?);
@@ -113,14 +152,69 @@ impl WalManager {
         self.wal.batch_append_for_topic(&topic, &payload_refs)?;
         self.persist_topic(&topic);
 
-        debug!("WAL batch append: topic={}, batches={}", topic, batches.len());
+        debug!("WAL batch append INSERT: topic={}, batches={}", topic, batches.len());
         Ok(())
     }
 
     #[instrument(skip(self), fields(project_id, table_name))]
-    pub fn read_entries(
+    pub fn append_delete(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>) -> anyhow::Result<()> {
+        let timestamp_micros = chrono::Utc::now().timestamp_micros();
+        let topic = Self::make_topic(project_id, table_name);
+
+        let payload = DeletePayload {
+            predicate_sql: predicate_sql.map(String::from),
+        };
+        let entry = WalEntry {
+            timestamp_micros,
+            project_id: project_id.to_string(),
+            table_name: table_name.to_string(),
+            operation: WalOperation::Delete,
+            data: serialize_delete_payload(&payload)?,
+        };
+
+        let serialized = serialize_wal_entry(&entry)?;
+        self.wal.append_for_topic(&topic, &serialized)?;
+        self.persist_topic(&topic);
+
+        debug!("WAL append DELETE: topic={}, predicate={:?}", topic, predicate_sql);
+        Ok(())
+    }
+
+    #[instrument(skip(self, assignments), fields(project_id, table_name))]
+    pub fn append_update(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)]) -> anyhow::Result<()> {
+        let timestamp_micros = chrono::Utc::now().timestamp_micros();
+        let topic = Self::make_topic(project_id, table_name);
+
+        let payload = UpdatePayload {
+            predicate_sql: predicate_sql.map(String::from),
+            assignments: assignments.to_vec(),
+        };
+        let entry = WalEntry {
+            timestamp_micros,
+            project_id: project_id.to_string(),
+            table_name: table_name.to_string(),
+            operation: WalOperation::Update,
+            data: serialize_update_payload(&payload)?,
+        };
+
+        let serialized = serialize_wal_entry(&entry)?;
+        self.wal.append_for_topic(&topic, &serialized)?;
+        self.persist_topic(&topic);
+
+        debug!(
+            "WAL append UPDATE: topic={}, predicate={:?}, assignments={}",
+            topic,
+            predicate_sql,
+            assignments.len()
+        );
+        Ok(())
+    }
+
+    /// Read raw WAL entries (for recovery with DML support)
+    #[instrument(skip(self), fields(project_id, table_name))]
+    pub fn read_entries_raw(
         &self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool,
-    ) -> anyhow::Result<(Vec<(WalEntry, RecordBatch)>, usize)> {
+    ) -> anyhow::Result<(Vec<WalEntry>, usize)> {
         let topic = Self::make_topic(project_id, table_name);
         let mut results = Vec::new();
         let mut error_count = 0usize;
@@ -131,13 +225,7 @@ impl WalManager {
                 Ok(Some(entry_data)) => match deserialize_wal_entry(&entry_data.data) {
                     Ok(entry) => {
                         if entry.timestamp_micros >= cutoff {
-                            match deserialize_record_batch(&entry.data) {
-                                Ok(batch) => results.push((entry, batch)),
-                                Err(e) => {
-                                    warn!("Skipping corrupted batch in WAL: {}", e);
-                                    error_count += 1;
-                                }
-                            }
+                            results.push(entry);
                         }
                     }
                     Err(e) => {
@@ -147,7 +235,6 @@ impl WalManager {
                 },
                 Ok(None) => break,
                 Err(e) => {
-                    // I/O error - break to avoid infinite loop
                     error!("I/O error reading WAL: {}", e);
                     error_count += 1;
                     break;
@@ -163,8 +250,9 @@ impl WalManager {
         Ok((results, error_count))
     }
 
+    /// Read all WAL entries across all topics (for recovery with DML support)
     #[instrument(skip(self))]
-    pub fn read_all_entries(&self, since_timestamp_micros: Option<i64>, checkpoint: bool) -> anyhow::Result<(Vec<(WalEntry, RecordBatch)>, usize)> {
+    pub fn read_all_entries_raw(&self, since_timestamp_micros: Option<i64>, checkpoint: bool) -> anyhow::Result<(Vec<WalEntry>, usize)> {
         let mut all_results = Vec::new();
         let mut total_errors = 0usize;
         let cutoff = since_timestamp_micros.unwrap_or(0);
@@ -173,7 +261,7 @@ impl WalManager {
 
         for topic in topics {
             if let Some((project_id, table_name)) = Self::parse_topic(&topic) {
-                match self.read_entries(&project_id, &table_name, Some(cutoff), checkpoint) {
+                match self.read_entries_raw(&project_id, &table_name, Some(cutoff), checkpoint) {
                     Ok((entries, errors)) => {
                         all_results.extend(entries);
                         total_errors += errors;
@@ -186,12 +274,20 @@ impl WalManager {
             }
         }
 
+        // Sort by timestamp to ensure correct replay order
+        all_results.sort_by_key(|e| e.timestamp_micros);
+
         if total_errors > 0 {
             warn!("WAL read all: total_entries={}, cutoff={}, errors={}", all_results.len(), cutoff, total_errors);
         } else {
             info!("WAL read all: total_entries={}, cutoff={}", all_results.len(), cutoff);
         }
         Ok((all_results, total_errors))
+    }
+
+    /// Deserialize a RecordBatch from WAL entry data (for INSERT operations)
+    pub fn deserialize_batch(data: &[u8]) -> anyhow::Result<RecordBatch> {
+        deserialize_record_batch(data)
     }
 
     pub fn list_topics(&self) -> anyhow::Result<Vec<String>> {
@@ -245,6 +341,10 @@ fn deserialize_record_batch(data: &[u8]) -> anyhow::Result<RecordBatch> {
 fn serialize_wal_entry(entry: &WalEntry) -> anyhow::Result<Vec<u8>> {
     let mut buffer = Vec::new();
 
+    // New format: magic + operation type
+    buffer.extend_from_slice(&WAL_MAGIC);
+    buffer.push(entry.operation as u8);
+
     buffer.extend_from_slice(&entry.timestamp_micros.to_le_bytes());
 
     let project_id_bytes = entry.project_id.as_bytes();
@@ -265,7 +365,16 @@ fn deserialize_wal_entry(data: &[u8]) -> anyhow::Result<WalEntry> {
         anyhow::bail!("WAL entry too short");
     }
 
-    let mut offset = 0;
+    // Check for new format (magic header)
+    let (operation, offset_start) = if data.len() >= 5 && data[0..4] == WAL_MAGIC {
+        // New format with operation type
+        (WalOperation::try_from(data[4])?, 5)
+    } else {
+        // Old format - assume INSERT
+        (WalOperation::Insert, 0)
+    };
+
+    let mut offset = offset_start;
 
     let timestamp_micros = i64::from_le_bytes(data[offset..offset + 8].try_into()?);
     offset += 8;
@@ -294,8 +403,137 @@ fn deserialize_wal_entry(data: &[u8]) -> anyhow::Result<WalEntry> {
         timestamp_micros,
         project_id,
         table_name,
+        operation,
         data: entry_data,
     })
+}
+
+fn serialize_delete_payload(payload: &DeletePayload) -> anyhow::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    match &payload.predicate_sql {
+        Some(sql) => {
+            buffer.push(1); // has predicate
+            let sql_bytes = sql.as_bytes();
+            buffer.extend_from_slice(&(sql_bytes.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(sql_bytes);
+        }
+        None => buffer.push(0), // no predicate (delete all)
+    }
+    Ok(buffer)
+}
+
+pub fn deserialize_delete_payload(data: &[u8]) -> anyhow::Result<DeletePayload> {
+    if data.is_empty() {
+        anyhow::bail!("Delete payload is empty");
+    }
+    let has_predicate = data[0] == 1;
+    let predicate_sql = if has_predicate && data.len() > 5 {
+        let sql_len = u32::from_le_bytes(data[1..5].try_into()?) as usize;
+        if data.len() < 5 + sql_len {
+            anyhow::bail!("Delete payload truncated");
+        }
+        Some(String::from_utf8(data[5..5 + sql_len].to_vec())?)
+    } else {
+        None
+    };
+    Ok(DeletePayload { predicate_sql })
+}
+
+fn serialize_update_payload(payload: &UpdatePayload) -> anyhow::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+
+    // Predicate
+    match &payload.predicate_sql {
+        Some(sql) => {
+            buffer.push(1);
+            let sql_bytes = sql.as_bytes();
+            buffer.extend_from_slice(&(sql_bytes.len() as u32).to_le_bytes());
+            buffer.extend_from_slice(sql_bytes);
+        }
+        None => buffer.push(0),
+    }
+
+    // Assignments count
+    buffer.extend_from_slice(&(payload.assignments.len() as u16).to_le_bytes());
+
+    // Each assignment: (column_name, value_sql)
+    for (col, val) in &payload.assignments {
+        let col_bytes = col.as_bytes();
+        buffer.extend_from_slice(&(col_bytes.len() as u16).to_le_bytes());
+        buffer.extend_from_slice(col_bytes);
+
+        let val_bytes = val.as_bytes();
+        buffer.extend_from_slice(&(val_bytes.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(val_bytes);
+    }
+
+    Ok(buffer)
+}
+
+pub fn deserialize_update_payload(data: &[u8]) -> anyhow::Result<UpdatePayload> {
+    if data.is_empty() {
+        anyhow::bail!("Update payload is empty");
+    }
+
+    let mut offset = 0;
+
+    // Predicate
+    let has_predicate = data[offset] == 1;
+    offset += 1;
+
+    let predicate_sql = if has_predicate {
+        if data.len() < offset + 4 {
+            anyhow::bail!("Update payload truncated at predicate length");
+        }
+        let sql_len = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
+        offset += 4;
+        if data.len() < offset + sql_len {
+            anyhow::bail!("Update payload truncated at predicate");
+        }
+        let sql = String::from_utf8(data[offset..offset + sql_len].to_vec())?;
+        offset += sql_len;
+        Some(sql)
+    } else {
+        None
+    };
+
+    // Assignments
+    if data.len() < offset + 2 {
+        anyhow::bail!("Update payload truncated at assignments count");
+    }
+    let assignment_count = u16::from_le_bytes(data[offset..offset + 2].try_into()?) as usize;
+    offset += 2;
+
+    let mut assignments = Vec::with_capacity(assignment_count);
+    for _ in 0..assignment_count {
+        if data.len() < offset + 2 {
+            anyhow::bail!("Update payload truncated at column name length");
+        }
+        let col_len = u16::from_le_bytes(data[offset..offset + 2].try_into()?) as usize;
+        offset += 2;
+
+        if data.len() < offset + col_len {
+            anyhow::bail!("Update payload truncated at column name");
+        }
+        let col = String::from_utf8(data[offset..offset + col_len].to_vec())?;
+        offset += col_len;
+
+        if data.len() < offset + 4 {
+            anyhow::bail!("Update payload truncated at value length");
+        }
+        let val_len = u32::from_le_bytes(data[offset..offset + 4].try_into()?) as usize;
+        offset += 4;
+
+        if data.len() < offset + val_len {
+            anyhow::bail!("Update payload truncated at value");
+        }
+        let val = String::from_utf8(data[offset..offset + val_len].to_vec())?;
+        offset += val_len;
+
+        assignments.push((col, val));
+    }
+
+    Ok(UpdatePayload { predicate_sql, assignments })
 }
 
 #[cfg(test)]
@@ -330,6 +568,7 @@ mod tests {
             timestamp_micros: 1234567890,
             project_id: "project-123".to_string(),
             table_name: "test_table".to_string(),
+            operation: WalOperation::Insert,
             data: vec![1, 2, 3, 4, 5],
         };
         let serialized = serialize_wal_entry(&entry).unwrap();
@@ -337,6 +576,35 @@ mod tests {
         assert_eq!(entry.timestamp_micros, deserialized.timestamp_micros);
         assert_eq!(entry.project_id, deserialized.project_id);
         assert_eq!(entry.table_name, deserialized.table_name);
+        assert_eq!(entry.operation, deserialized.operation);
         assert_eq!(entry.data, deserialized.data);
+    }
+
+    #[test]
+    fn test_delete_payload_serialization() {
+        let payload = DeletePayload {
+            predicate_sql: Some("id = 1".to_string()),
+        };
+        let serialized = serialize_delete_payload(&payload).unwrap();
+        let deserialized = deserialize_delete_payload(&serialized).unwrap();
+        assert_eq!(payload.predicate_sql, deserialized.predicate_sql);
+
+        // Test no predicate
+        let payload_none = DeletePayload { predicate_sql: None };
+        let serialized_none = serialize_delete_payload(&payload_none).unwrap();
+        let deserialized_none = deserialize_delete_payload(&serialized_none).unwrap();
+        assert_eq!(payload_none.predicate_sql, deserialized_none.predicate_sql);
+    }
+
+    #[test]
+    fn test_update_payload_serialization() {
+        let payload = UpdatePayload {
+            predicate_sql: Some("id = 1".to_string()),
+            assignments: vec![("name".to_string(), "'updated'".to_string())],
+        };
+        let serialized = serialize_update_payload(&payload).unwrap();
+        let deserialized = deserialize_update_payload(&serialized).unwrap();
+        assert_eq!(payload.predicate_sql, deserialized.predicate_sql);
+        assert_eq!(payload.assignments, deserialized.assignments);
     }
 }

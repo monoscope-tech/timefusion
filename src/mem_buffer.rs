@@ -7,6 +7,9 @@ use datafusion::error::Result as DFResult;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_expr::execution_props::ExecutionProps;
+use datafusion::sql::planner::SqlToRel;
+use datafusion::sql::sqlparser::dialect::GenericDialect;
+use datafusion::sql::sqlparser::parser::Parser as SqlParser;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use tracing::{debug, info, instrument, warn};
@@ -144,6 +147,59 @@ fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray)
     arrow::compute::kernels::zip::zip(mask, new_values, original).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
 }
 
+/// Parse a SQL WHERE clause fragment into a DataFusion Expr.
+fn parse_sql_predicate(sql: &str) -> DFResult<Expr> {
+    let dialect = GenericDialect {};
+    let sql_expr = SqlParser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(|e| datafusion::error::DataFusionError::SQL(e.into(), None))?
+        .parse_expr()
+        .map_err(|e| datafusion::error::DataFusionError::SQL(e.into(), None))?;
+    let context_provider = EmptyContextProvider;
+    let planner = SqlToRel::new(&context_provider);
+    planner.sql_to_expr(sql_expr, &DFSchema::empty(), &mut Default::default())
+}
+
+/// Parse a SQL expression (for UPDATE SET values).
+fn parse_sql_expr(sql: &str) -> DFResult<Expr> {
+    // Reuse the same parsing logic
+    parse_sql_predicate(sql)
+}
+
+/// Minimal context provider for SQL parsing (no tables/schemas needed for simple expressions)
+struct EmptyContextProvider;
+
+impl datafusion::sql::planner::ContextProvider for EmptyContextProvider {
+    fn get_table_source(&self, _name: datafusion::sql::TableReference) -> DFResult<std::sync::Arc<dyn datafusion::logical_expr::TableSource>> {
+        Err(datafusion::error::DataFusionError::Plan("No table context available".into()))
+    }
+    fn get_function_meta(&self, _name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::ScalarUDF>> {
+        None
+    }
+    fn get_aggregate_meta(&self, _name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::AggregateUDF>> {
+        None
+    }
+    fn get_window_meta(&self, _name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::WindowUDF>> {
+        None
+    }
+    fn get_variable_type(&self, _var: &[String]) -> Option<DataType> {
+        None
+    }
+    fn options(&self) -> &datafusion::config::ConfigOptions {
+        static OPTIONS: std::sync::LazyLock<datafusion::config::ConfigOptions> = std::sync::LazyLock::new(datafusion::config::ConfigOptions::default);
+        &OPTIONS
+    }
+    fn udf_names(&self) -> Vec<String> {
+        vec![]
+    }
+    fn udaf_names(&self) -> Vec<String> {
+        vec![]
+    }
+    fn udwf_names(&self) -> Vec<String> {
+        vec![]
+    }
+}
+
 impl MemBuffer {
     pub fn new() -> Self {
         Self {
@@ -182,11 +238,15 @@ impl MemBuffer {
                 if !std::sync::Arc::ptr_eq(&existing_schema, &schema) && !schemas_compatible(&existing_schema, &schema) {
                     warn!(
                         "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
-                        project_id, table_name, existing_schema.fields().len(), schema.fields().len()
+                        project_id,
+                        table_name,
+                        existing_schema.fields().len(),
+                        schema.fields().len()
                     );
                     anyhow::bail!(
                         "Schema incompatible for {}.{}: field types don't match or new non-nullable field added",
-                        project_id, table_name
+                        project_id,
+                        table_name
                     );
                 }
                 entry.into_ref().downgrade()
@@ -585,6 +645,26 @@ impl MemBuffer {
 
         debug!("MemBuffer update: project={}, table={}, rows_updated={}", project_id, table_name, total_updated);
         Ok(total_updated)
+    }
+
+    /// Delete rows using a SQL predicate string (for WAL recovery).
+    /// Parses the SQL WHERE clause and delegates to delete().
+    #[instrument(skip(self), fields(project_id, table_name))]
+    pub fn delete_by_sql(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>) -> DFResult<u64> {
+        let predicate = predicate_sql.map(parse_sql_predicate).transpose()?;
+        self.delete(project_id, table_name, predicate.as_ref())
+    }
+
+    /// Update rows using SQL strings (for WAL recovery).
+    /// Parses the SQL WHERE clause and assignment expressions, then delegates to update().
+    #[instrument(skip(self, assignments), fields(project_id, table_name))]
+    pub fn update_by_sql(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)]) -> DFResult<u64> {
+        let predicate = predicate_sql.map(parse_sql_predicate).transpose()?;
+        let parsed_assignments: Vec<(String, Expr)> = assignments
+            .iter()
+            .map(|(col, val_sql)| parse_sql_expr(val_sql).map(|expr| (col.clone(), expr)))
+            .collect::<DFResult<Vec<_>>>()?;
+        self.update(project_id, table_name, predicate.as_ref(), &parsed_assignments)
     }
 
     pub fn get_stats(&self) -> MemBufferStats {
