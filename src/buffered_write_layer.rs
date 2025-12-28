@@ -97,7 +97,7 @@ impl BufferedWriteLayer {
         let max_bytes = self.max_memory_bytes();
         let hard_limit = max_bytes.saturating_add(max_bytes / 5);
 
-        loop {
+        for _ in 0..100 {
             let current_reserved = self.reserved_bytes.load(Ordering::Acquire);
             let current_mem = self.mem_buffer.estimated_memory_bytes();
             let new_total = current_mem + current_reserved + estimated_size;
@@ -111,14 +111,15 @@ impl BufferedWriteLayer {
                 );
             }
 
-            match self
+            if self
                 .reserved_bytes
                 .compare_exchange(current_reserved, current_reserved + estimated_size, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
             {
-                Ok(_) => return Ok(estimated_size),
-                Err(_) => continue, // Retry on contention
+                return Ok(estimated_size);
             }
         }
+        anyhow::bail!("Failed to reserve memory after 100 retries due to contention")
     }
 
     fn release_reservation(&self, size: usize) {

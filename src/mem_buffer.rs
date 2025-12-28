@@ -39,8 +39,13 @@ fn schemas_compatible(existing: &SchemaRef, incoming: &SchemaRef) -> bool {
 
 fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
     match (existing, incoming) {
-        // Timestamps: ignore timezone metadata
-        (DataType::Timestamp(u1, _), DataType::Timestamp(u2, _)) => u1 == u2,
+        // Timestamps: unit must match, timezone differences are allowed but logged
+        (DataType::Timestamp(u1, tz1), DataType::Timestamp(u2, tz2)) => {
+            if u1 == u2 && tz1 != tz2 {
+                tracing::debug!("Timestamp timezone mismatch: {:?} vs {:?} (allowed)", tz1, tz2);
+            }
+            u1 == u2
+        }
         // Lists: check element types recursively
         (DataType::List(f1), DataType::List(f2)) | (DataType::LargeList(f1), DataType::LargeList(f2)) => types_compatible(f1.data_type(), f2.data_type()),
         // Structs: all existing fields must be compatible
