@@ -13,6 +13,8 @@ use tracing::{debug, info, instrument, warn};
 
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
 // longer = larger Delta files. Matches default flush interval for aligned boundaries.
+// Note: Timestamps before 1970 (negative microseconds) produce negative bucket IDs,
+// which is supported but may result in unexpected ordering if mixed with post-1970 data.
 const BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000;
 
 /// Check if two schemas are compatible for merge.
