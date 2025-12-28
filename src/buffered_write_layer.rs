@@ -25,6 +25,10 @@ pub struct RecoveryStats {
     pub corrupted_entries_skipped: u64,
 }
 
+/// Callback for writing batches to Delta Lake. The callback MUST:
+/// - Complete the Delta commit (including S3 upload) before returning Ok
+/// - Return Err if the commit fails for any reason
+/// This is critical for WAL checkpoint safety - we only mark entries as consumed after successful commit.
 pub type DeltaWriteCallback = Arc<dyn Fn(String, String, Vec<RecordBatch>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 pub struct BufferedWriteLayer {
@@ -344,8 +348,12 @@ impl BufferedWriteLayer {
         Ok(())
     }
 
+    /// Flush a bucket to Delta Lake via the configured callback.
+    /// The callback MUST complete the Delta commit before returning Ok - this is critical
+    /// for durability. We only checkpoint WAL after this returns successfully.
     async fn flush_bucket(&self, bucket: &FlushableBucket) -> anyhow::Result<()> {
         if let Some(ref callback) = self.delta_write_callback {
+            // Await ensures Delta commit completes before we return
             callback(bucket.project_id.clone(), bucket.table_name.clone(), bucket.batches.clone()).await?;
         } else {
             warn!("No delta write callback configured, skipping flush");
