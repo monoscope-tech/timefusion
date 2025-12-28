@@ -196,7 +196,7 @@ fn default_shutdown_timeout() -> u64 {
     5
 }
 fn default_wal_corruption_threshold() -> usize {
-    100
+    10
 }
 
 impl BufferConfig {
