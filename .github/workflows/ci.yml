@@ -63,7 +63,12 @@ jobs:
       MAX_PG_CONNECTIONS: "100"
       AWS_S3_LOCKING_PROVIDER: ""
       WALRUS_DATA_DIR: /tmp/walrus-wal
-      TIMEFUSION_FOYER_DISABLED: "true"
+      # Use small cache sizes for CI tests (similar to test_config in object_store_cache.rs)
+      TIMEFUSION_FOYER_MEMORY_MB: "10"
+      TIMEFUSION_FOYER_DISK_MB: "50"
+      TIMEFUSION_FOYER_METADATA_MEMORY_MB: "10"
+      TIMEFUSION_FOYER_METADATA_DISK_MB: "50"
+      TIMEFUSION_FOYER_SHARDS: "2"
     services:
       minio:
         image: public.ecr.aws/bitnami/minio:latest

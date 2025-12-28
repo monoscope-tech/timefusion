@@ -135,9 +135,24 @@ impl FoyerCacheConfig {
             std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
         }
 
+        // Support both MB and GB for disk sizes (MB takes precedence for smaller test configs)
+        let disk_size_bytes =
+            if let Ok(mb) = std::env::var("TIMEFUSION_FOYER_DISK_MB").and_then(|v| v.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
+                mb * 1024 * 1024
+            } else {
+                parse_env::<usize>("TIMEFUSION_FOYER_DISK_GB", 100) * 1024 * 1024 * 1024
+            };
+
+        let metadata_disk_size_bytes =
+            if let Ok(mb) = std::env::var("TIMEFUSION_FOYER_METADATA_DISK_MB").and_then(|v| v.parse::<usize>().map_err(|_| std::env::VarError::NotPresent)) {
+                mb * 1024 * 1024
+            } else {
+                parse_env::<usize>("TIMEFUSION_FOYER_METADATA_DISK_GB", 5) * 1024 * 1024 * 1024
+            };
+
         Self {
             memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_MEMORY_MB", 512) * 1024 * 1024,
-            disk_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_DISK_GB", 100) * 1024 * 1024 * 1024,
+            disk_size_bytes,
             ttl: Duration::from_secs(parse_env("TIMEFUSION_FOYER_TTL_SECONDS", 604800)),
             cache_dir: PathBuf::from(parse_env("TIMEFUSION_FOYER_CACHE_DIR", "/tmp/timefusion_cache".to_string())),
             shards: parse_env("TIMEFUSION_FOYER_SHARDS", 8),
@@ -145,7 +160,7 @@ impl FoyerCacheConfig {
             enable_stats: parse_env("TIMEFUSION_FOYER_STATS", "true".to_string()).to_lowercase() == "true",
             parquet_metadata_size_hint: parse_env("TIMEFUSION_PARQUET_METADATA_SIZE_HINT", 1_048_576),
             metadata_memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_METADATA_MEMORY_MB", 512) * 1024 * 1024,
-            metadata_disk_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_METADATA_DISK_GB", 5) * 1024 * 1024 * 1024,
+            metadata_disk_size_bytes,
             metadata_shards: parse_env("TIMEFUSION_FOYER_METADATA_SHARDS", 4),
         }
     }
