@@ -1909,9 +1909,9 @@ impl TableProvider for ProjectRoutingTable {
 
         // Determine if we can skip Delta (query entirely within MemBuffer range)
         let skip_delta = match (mem_time_range, query_time_range) {
-            (Some((mem_oldest, _mem_newest)), Some((query_min, query_max))) => {
+            (Some((mem_oldest, mem_newest)), Some((query_min, query_max))) => {
                 // Skip Delta if query's entire time range is within MemBuffer
-                query_min >= mem_oldest && query_max >= mem_oldest
+                query_min >= mem_oldest && query_max <= mem_newest
             }
             _ => false,
         };
@@ -1979,26 +1979,6 @@ impl TableProvider for ProjectRoutingTable {
 
     fn statistics(&self) -> Option<Statistics> {
         None
-        // // Use tokio's block_in_place to run async code in sync context
-        // // This is safe here as statistics are cached and the operation is fast
-        // tokio::task::block_in_place(|| {
-        //     let runtime = tokio::runtime::Handle::current();
-        //     runtime.block_on(async {
-        //         // Try to get statistics from Delta Lake
-        //         match self.get_delta_statistics().await {
-        //             Ok(stats) => Some(stats),
-        //             Err(e) => {
-        //                 debug!("Failed to get Delta Lake statistics: {}", e);
-        //                 // Fall back to conservative estimates
-        //                 Some(Statistics {
-        //                     num_rows: Precision::Inexact(1_000_000),
-        //                     total_byte_size: Precision::Inexact(100_000_000),
-        //                     column_statistics: vec![],
-        //                 })
-        //             }
-        //         }
-        //     })
-        // })
     }
 }
 
