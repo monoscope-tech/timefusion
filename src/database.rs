@@ -417,7 +417,7 @@ impl Database {
         if !light_optimize_schedule.is_empty() {
             info!("Light optimize job scheduled with cron expression: {}", light_optimize_schedule);
 
-            let light_optimize_job = Job::new_async(&light_optimize_schedule, {
+            let light_optimize_job = Job::new_async(light_optimize_schedule, {
                 let db = db.clone();
                 move |_, _| {
                     let db = db.clone();
@@ -451,7 +451,7 @@ impl Database {
                 optimize_schedule
             );
 
-            let optimize_job = Job::new_async(&optimize_schedule, {
+            let optimize_job = Job::new_async(optimize_schedule, {
                 let db = db.clone();
                 move |_, _| {
                     let db = db.clone();
@@ -1098,20 +1098,14 @@ impl Database {
 
         // Use config values as fallback
         let cfg = config::config();
-        if storage_options.get("aws_access_key_id").is_none() {
-            if let Some(ref key) = cfg.aws.aws_access_key_id {
-                builder = builder.with_access_key_id(key);
-            }
+        if storage_options.get("aws_access_key_id").is_none() && let Some(ref key) = cfg.aws.aws_access_key_id {
+            builder = builder.with_access_key_id(key);
         }
-        if storage_options.get("aws_secret_access_key").is_none() {
-            if let Some(ref secret) = cfg.aws.aws_secret_access_key {
-                builder = builder.with_secret_access_key(secret);
-            }
+        if storage_options.get("aws_secret_access_key").is_none() && let Some(ref secret) = cfg.aws.aws_secret_access_key {
+            builder = builder.with_secret_access_key(secret);
         }
-        if storage_options.get("aws_region").is_none() {
-            if let Some(ref region) = cfg.aws.aws_default_region {
-                builder = builder.with_region(region);
-            }
+        if storage_options.get("aws_region").is_none() && let Some(ref region) = cfg.aws.aws_default_region {
+            builder = builder.with_region(region);
         }
 
         // Check if we need to use config for endpoint and allow HTTP
