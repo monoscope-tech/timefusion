@@ -167,7 +167,7 @@ pub struct BufferConfig {
 }
 
 fn default_flush_interval() -> u64 { 600 }
-fn default_retention_mins() -> u64 { 90 }
+fn default_retention_mins() -> u64 { 70 }
 fn default_eviction_interval() -> u64 { 60 }
 fn default_buffer_max_memory() -> usize { 4096 }
 fn default_shutdown_timeout() -> u64 { 5 }
