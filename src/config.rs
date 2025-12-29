@@ -10,12 +10,37 @@ pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
     if let Some(cfg) = CONFIG.get() {
         return Ok(cfg);
     }
-    let _ = CONFIG.set(envy::from_env()?);
+    // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
+    // See: https://github.com/softprops/envy/issues/26
+    let config = AppConfig {
+        aws: envy::from_env()?,
+        core: envy::from_env()?,
+        buffer: envy::from_env()?,
+        cache: envy::from_env()?,
+        parquet: envy::from_env()?,
+        maintenance: envy::from_env()?,
+        memory: envy::from_env()?,
+        telemetry: envy::from_env()?,
+    };
+    let _ = CONFIG.set(config);
     Ok(CONFIG.get().unwrap())
 }
 
 pub fn config() -> &'static AppConfig {
-    CONFIG.get().expect("Config not initialized")
+    CONFIG.get_or_init(|| {
+        // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
+        // See: https://github.com/softprops/envy/issues/26
+        AppConfig {
+            aws: envy::from_env().unwrap_or_default(),
+            core: envy::from_env().expect("Failed to parse CoreConfig from environment"),
+            buffer: envy::from_env().expect("Failed to parse BufferConfig from environment"),
+            cache: envy::from_env().expect("Failed to parse CacheConfig from environment"),
+            parquet: envy::from_env().expect("Failed to parse ParquetConfig from environment"),
+            maintenance: envy::from_env().expect("Failed to parse MaintenanceConfig from environment"),
+            memory: envy::from_env().expect("Failed to parse MemoryConfig from environment"),
+            telemetry: envy::from_env().expect("Failed to parse TelemetryConfig from environment"),
+        }
+    })
 }
 
 fn default_true() -> bool {
