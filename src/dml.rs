@@ -405,24 +405,36 @@ async fn perform_update_with_buffer(
 ) -> Result<u64> {
     let assignments_clone = assignments.clone();
     let update_span = tracing::trace_span!(parent: span, "delta.update");
-    DmlContext { database, buffered_layer, table_name, project_id, predicate: predicate.clone() }
-        .execute(
-            |layer, pred| layer.update(project_id, table_name, pred, &assignments_clone),
-            perform_delta_update(database, table_name, project_id, predicate, assignments).instrument(update_span),
-        )
-        .await
+    DmlContext {
+        database,
+        buffered_layer,
+        table_name,
+        project_id,
+        predicate: predicate.clone(),
+    }
+    .execute(
+        |layer, pred| layer.update(project_id, table_name, pred, &assignments_clone),
+        perform_delta_update(database, table_name, project_id, predicate, assignments).instrument(update_span),
+    )
+    .await
 }
 
 async fn perform_delete_with_buffer(
     database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>, span: &tracing::Span,
 ) -> Result<u64> {
     let delete_span = tracing::trace_span!(parent: span, "delta.delete");
-    DmlContext { database, buffered_layer, table_name, project_id, predicate: predicate.clone() }
-        .execute(
-            |layer, pred| layer.delete(project_id, table_name, pred),
-            perform_delta_delete(database, table_name, project_id, predicate).instrument(delete_span),
-        )
-        .await
+    DmlContext {
+        database,
+        buffered_layer,
+        table_name,
+        project_id,
+        predicate: predicate.clone(),
+    }
+    .execute(
+        |layer, pred| layer.delete(project_id, table_name, pred),
+        perform_delta_delete(database, table_name, project_id, predicate).instrument(delete_span),
+    )
+    .await
 }
 
 /// Perform Delta UPDATE operation
