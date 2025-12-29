@@ -75,6 +75,10 @@ bincode = { version = "2.0", features = ["serde"] }
 walrus-rust = "0.2.0"
 thiserror = "2.0"
 strum = { version = "0.27", features = ["derive"] }
+# Parquet Variant support for proper semi-structured data encoding
+parquet-variant = "0.2.0"
+parquet-variant-compute = "0.2.0"
+parquet-variant-json = "0.2.0"
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }

@@ -14,4 +14,5 @@ pub mod schema_loader;
 pub mod statistics;
 pub mod telemetry;
 pub mod test_utils;
+pub mod variant_utils;
 pub mod wal;
