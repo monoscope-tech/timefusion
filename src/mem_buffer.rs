@@ -117,7 +117,7 @@ pub struct MemBuffer {
 
 pub struct TableBuffer {
     buckets: DashMap<i64, TimeBucket>,
-    schema: SchemaRef,  // Immutable after creation - no lock needed
+    schema: SchemaRef, // Immutable after creation - no lock needed
     project_id: Arc<str>,
     table_name: Arc<str>,
 }
@@ -718,7 +718,7 @@ impl TableBuffer {
     }
 
     pub fn schema(&self) -> SchemaRef {
-        self.schema.clone()  // Arc clone is cheap
+        self.schema.clone() // Arc clone is cheap
     }
 
     /// Insert a batch into this table's appropriate time bucket.
