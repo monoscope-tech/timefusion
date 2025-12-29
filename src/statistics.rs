@@ -10,8 +10,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::config;
-
 /// Cache entry for basic table statistics
 #[derive(Clone, Debug)]
 pub struct CachedStatistics {
@@ -20,21 +18,22 @@ pub struct CachedStatistics {
     pub version: i64,
 }
 
-// TODO: delete this file in favor of using:
 /// Simplified statistics extractor for Delta Lake tables
 /// Only extracts basic row count and byte size statistics
 #[derive(Debug)]
 pub struct DeltaStatisticsExtractor {
     cache: Arc<RwLock<LruCache<String, CachedStatistics>>>,
     cache_ttl_seconds: u64,
+    page_row_limit: usize,
 }
 
 impl DeltaStatisticsExtractor {
-    pub fn new(cache_size: usize, cache_ttl_seconds: u64) -> Self {
+    pub fn new(cache_size: usize, cache_ttl_seconds: u64, page_row_limit: usize) -> Self {
         let cache = LruCache::new(NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(50).unwrap()));
         Self {
             cache: Arc::new(RwLock::new(cache)),
             cache_ttl_seconds,
+            page_row_limit,
         }
     }
 
@@ -126,8 +125,7 @@ impl DeltaStatisticsExtractor {
             }
         } else {
             // Fallback: estimate rows based on file count
-            let page_row_limit = config::config().parquet.timefusion_page_row_count_limit as u64;
-            total_rows = num_files * page_row_limit;
+            total_rows = num_files * self.page_row_limit as u64;
         }
 
         Ok((total_rows, total_bytes))
@@ -168,7 +166,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_statistics_cache() {
-        let extractor = DeltaStatisticsExtractor::new(10, 300);
+        let extractor = DeltaStatisticsExtractor::new(10, 300, 20_000);
         assert_eq!(extractor.cache_size().await, 0);
 
         extractor.invalidate("project1", "table1").await;

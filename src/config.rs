@@ -6,13 +6,12 @@ use std::time::Duration;
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
-pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
-    if let Some(cfg) = CONFIG.get() {
-        return Ok(cfg);
-    }
+/// Load config from environment variables.
+/// Returns a new AppConfig instance - caller decides whether to store globally or pass around.
+pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
     // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
     // See: https://github.com/softprops/envy/issues/26
-    let config = AppConfig {
+    Ok(AppConfig {
         aws: envy::from_env()?,
         core: envy::from_env()?,
         buffer: envy::from_env()?,
@@ -21,26 +20,24 @@ pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
         maintenance: envy::from_env()?,
         memory: envy::from_env()?,
         telemetry: envy::from_env()?,
-    };
+    })
+}
+
+/// Initialize global config from environment (for production use).
+/// Returns the static reference. Subsequent calls return the same config.
+pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
+    if let Some(cfg) = CONFIG.get() {
+        return Ok(cfg);
+    }
+    let config = load_config_from_env()?;
     let _ = CONFIG.set(config);
     Ok(CONFIG.get().unwrap())
 }
 
+/// Get global config. Panics if not initialized.
+/// Prefer passing AppConfig explicitly where possible.
 pub fn config() -> &'static AppConfig {
-    CONFIG.get_or_init(|| {
-        // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
-        // See: https://github.com/softprops/envy/issues/26
-        AppConfig {
-            aws: envy::from_env().unwrap_or_default(),
-            core: envy::from_env().expect("Failed to parse CoreConfig from environment"),
-            buffer: envy::from_env().expect("Failed to parse BufferConfig from environment"),
-            cache: envy::from_env().expect("Failed to parse CacheConfig from environment"),
-            parquet: envy::from_env().expect("Failed to parse ParquetConfig from environment"),
-            maintenance: envy::from_env().expect("Failed to parse MaintenanceConfig from environment"),
-            memory: envy::from_env().expect("Failed to parse MemoryConfig from environment"),
-            telemetry: envy::from_env().expect("Failed to parse TelemetryConfig from environment"),
-        }
-    })
+    CONFIG.get().expect("Config not initialized. Call init_config() first.")
 }
 
 fn default_true() -> bool {
@@ -471,10 +468,9 @@ impl TelemetryConfig {
 }
 
 // ============================================================================
-// Test support - just use AppConfig::default() and mutate fields directly
+// Default implementation for testing and programmatic config construction
 // ============================================================================
 
-#[cfg(test)]
 impl Default for AppConfig {
     fn default() -> Self {
         envy::from_iter::<_, Self>(std::iter::empty::<(String, String)>()).unwrap_or_else(|_| {

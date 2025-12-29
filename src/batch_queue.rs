@@ -7,8 +7,6 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info};
 
-use crate::config;
-
 #[derive(Debug)]
 pub struct BatchQueue {
     tx: mpsc::Sender<RecordBatch>,
@@ -17,7 +15,7 @@ pub struct BatchQueue {
 
 impl BatchQueue {
     pub fn new(db: Arc<crate::database::Database>, interval_ms: u64, max_rows: usize) -> Self {
-        let channel_capacity = config::config().core.timefusion_batch_queue_capacity;
+        let channel_capacity = db.config().core.timefusion_batch_queue_capacity;
         let (tx, rx) = mpsc::channel(channel_capacity);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let shutdown_clone = shutdown.clone();

@@ -1,4 +1,4 @@
-use crate::config::{self, BufferConfig};
+use crate::config::{self, AppConfig, BufferConfig};
 use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp};
 use crate::wal::{WalManager, WalOperation, deserialize_delete_payload, deserialize_update_payload};
 use arrow::array::RecordBatch;
@@ -33,6 +33,7 @@ pub struct RecoveryStats {
 pub type DeltaWriteCallback = Arc<dyn Fn(String, String, Vec<RecordBatch>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 pub struct BufferedWriteLayer {
+    config: Arc<AppConfig>,
     wal: Arc<WalManager>,
     mem_buffer: Arc<MemBuffer>,
     shutdown: CancellationToken,
@@ -49,13 +50,13 @@ impl std::fmt::Debug for BufferedWriteLayer {
 }
 
 impl BufferedWriteLayer {
-    /// Create a new BufferedWriteLayer using global config.
-    pub fn new() -> anyhow::Result<Self> {
-        let cfg = config::config();
+    /// Create a new BufferedWriteLayer with explicit config.
+    pub fn with_config(cfg: Arc<AppConfig>) -> anyhow::Result<Self> {
         let wal = Arc::new(WalManager::new(cfg.core.walrus_data_dir.clone())?);
         let mem_buffer = Arc::new(MemBuffer::new());
 
         Ok(Self {
+            config: cfg,
             wal,
             mem_buffer,
             shutdown: CancellationToken::new(),
@@ -64,6 +65,12 @@ impl BufferedWriteLayer {
             flush_lock: Mutex::new(()),
             reserved_bytes: AtomicUsize::new(0),
         })
+    }
+
+    /// Create a new BufferedWriteLayer using global config (for production).
+    pub fn new() -> anyhow::Result<Self> {
+        let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+        Self::with_config(Arc::new(cfg.clone()))
     }
 
     pub fn with_delta_writer(mut self, callback: DeltaWriteCallback) -> Self {
@@ -80,7 +87,7 @@ impl BufferedWriteLayer {
     }
 
     fn buffer_config(&self) -> &BufferConfig {
-        &config::config().buffer
+        &self.config.buffer
     }
 
     fn max_memory_bytes(&self) -> usize {
@@ -517,16 +524,13 @@ mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
-    fn init_test_config(wal_dir: &str) {
-        // Load .env first to get AWS_S3_BUCKET and other required vars
-        // This must happen before config init since OnceLock is process-wide
-        dotenv::dotenv().ok();
-        // Set WAL dir before config init (tests run in same process, so first one wins)
-        // SAFETY: Test initialization runs before async runtime
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", wal_dir) };
-        let _ = config::init_config();
+    fn create_test_config(wal_dir: PathBuf) -> Arc<AppConfig> {
+        let mut cfg = AppConfig::default();
+        cfg.core.walrus_data_dir = wal_dir;
+        Arc::new(cfg)
     }
 
     fn create_test_batch() -> RecordBatch {
@@ -542,14 +546,14 @@ mod tests {
     #[tokio::test]
     async fn test_insert_and_query() {
         let dir = tempdir().unwrap();
-        init_test_config(&dir.path().to_string_lossy());
+        let cfg = create_test_config(dir.path().to_path_buf());
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("p{}", test_id);
         let table = format!("t{}", test_id);
 
-        let layer = BufferedWriteLayer::new().unwrap();
+        let layer = BufferedWriteLayer::with_config(cfg).unwrap();
         let batch = create_test_batch();
 
         layer.insert(&project, &table, vec![batch.clone()]).await.unwrap();
@@ -561,13 +565,12 @@ mod tests {
 
     // NOTE: This test is ignored because walrus-rust creates new files for each instance
     // rather than discovering existing files from previous instances in the same directory.
-    // This is a limitation of the walrus library, not our code. The test passes when run
-    // in isolation but fails in multi-test runs due to OnceLock config sharing.
+    // This is a limitation of the walrus library, not our code.
     #[ignore]
     #[tokio::test]
     async fn test_recovery() {
         let dir = tempdir().unwrap();
-        init_test_config(&dir.path().to_string_lossy());
+        let cfg = create_test_config(dir.path().to_path_buf());
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
@@ -576,7 +579,7 @@ mod tests {
 
         // First instance - write data
         {
-            let layer = BufferedWriteLayer::new().unwrap();
+            let layer = BufferedWriteLayer::with_config(Arc::clone(&cfg)).unwrap();
             let batch = create_test_batch();
             layer.insert(&project, &table, vec![batch]).await.unwrap();
             // Shutdown to ensure WAL is synced
@@ -585,7 +588,7 @@ mod tests {
 
         // Second instance - recover from WAL
         {
-            let layer = BufferedWriteLayer::new().unwrap();
+            let layer = BufferedWriteLayer::with_config(cfg).unwrap();
             let stats = layer.recover_from_wal().await.unwrap();
             assert!(stats.entries_replayed > 0, "Expected entries to be replayed from WAL");
 
@@ -597,14 +600,14 @@ mod tests {
     #[tokio::test]
     async fn test_memory_reservation() {
         let dir = tempdir().unwrap();
-        init_test_config(&dir.path().to_string_lossy());
+        let cfg = create_test_config(dir.path().to_path_buf());
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("m{}", test_id);
         let table = format!("m{}", test_id);
 
-        let layer = BufferedWriteLayer::new().unwrap();
+        let layer = BufferedWriteLayer::with_config(cfg).unwrap();
 
         // First insert should succeed
         let batch = create_test_batch();
