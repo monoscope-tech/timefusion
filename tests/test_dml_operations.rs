@@ -4,7 +4,9 @@ mod test_dml_operations {
     use datafusion::arrow;
     use datafusion::arrow::array::AsArray;
     use serial_test::serial;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use timefusion::config::AppConfig;
     use timefusion::database::Database;
     use tracing::{Level, info};
 
@@ -13,44 +15,18 @@ mod test_dml_operations {
         let _ = tracing::subscriber::set_global_default(subscriber);
     }
 
-    struct EnvGuard {
-        keys: Vec<(String, Option<String>)>,
-    }
-
-    // SAFETY: All tests using EnvGuard are marked #[serial], ensuring single-threaded
-    // execution. No other threads read env vars during test execution.
-    impl EnvGuard {
-        fn set(key: &str, value: &str) -> Self {
-            let old = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            Self {
-                keys: vec![(key.to_string(), old)],
-            }
-        }
-
-        fn add(&mut self, key: &str, value: &str) {
-            let old = std::env::var(key).ok();
-            unsafe { std::env::set_var(key, value) };
-            self.keys.push((key.to_string(), old));
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, old) in &self.keys {
-                match old {
-                    Some(v) => unsafe { std::env::set_var(key, v) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-            }
-        }
-    }
-
-    fn setup_test_env() -> EnvGuard {
-        dotenv::dotenv().ok();
-        let mut guard = EnvGuard::set("AWS_S3_BUCKET", "timefusion-tests");
-        guard.add("TIMEFUSION_TABLE_PREFIX", &format!("test-{}", uuid::Uuid::new_v4()));
-        guard
+    fn create_test_config(test_id: &str) -> Arc<AppConfig> {
+        let mut cfg = AppConfig::default();
+        cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
+        cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
+        cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
+        cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
+        cfg.aws.aws_default_region = Some("us-east-1".to_string());
+        cfg.aws.aws_allow_http = Some("true".to_string());
+        cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
+        cfg.core.walrus_data_dir = PathBuf::from(format!("/tmp/walrus-dml-{}", test_id));
+        cfg.cache.timefusion_foyer_disabled = true;
+        Arc::new(cfg)
     }
 
     // ==========================================================================
@@ -105,9 +81,9 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_update_query() -> Result<()> {
         init_tracing();
-        let _env_guard = setup_test_env();
-
-        let db = Arc::new(Database::new().await?);
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
@@ -161,9 +137,9 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_delete_with_predicate() -> Result<()> {
         init_tracing();
-        let _env_guard = setup_test_env();
-
-        let db = Arc::new(Database::new().await?);
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
@@ -210,9 +186,9 @@ mod test_dml_operations {
     #[serial]
     #[tokio::test]
     async fn test_delete_all_matching() -> Result<()> {
-        setup_test_env();
-
-        let db = Arc::new(Database::new().await?);
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
@@ -306,9 +282,9 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_update_multiple_columns() -> Result<()> {
         init_tracing();
-        let _env_guard = setup_test_env();
-
-        let db = Arc::new(Database::new().await?);
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
@@ -359,9 +335,9 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_delete_verify_counts() -> Result<()> {
         init_tracing();
-        let _env_guard = setup_test_env();
-
-        let db = Arc::new(Database::new().await?);
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
