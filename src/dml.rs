@@ -18,7 +18,7 @@ use datafusion::{
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
 use tracing::field::Empty;
-use tracing::{Instrument, debug, error, info, instrument};
+use tracing::{Instrument, error, info, instrument};
 
 use crate::buffered_write_layer::BufferedWriteLayer;
 use crate::database::Database;
@@ -368,35 +368,35 @@ impl ExecutionPlan for DmlExec {
     }
 }
 
-/// Perform DML with MemBuffer support - operate on memory first, then Delta if needed
-async fn perform_dml_with_buffer<F, Fut>(
-    database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>, op_name: &str,
-    mem_op: F, delta_op: Fut,
-) -> Result<u64>
-where
-    F: FnOnce(&BufferedWriteLayer, Option<&Expr>) -> Result<u64>,
-    Fut: std::future::Future<Output = Result<u64>>,
-{
-    let mut total_rows = 0u64;
-    let has_uncommitted = buffered_layer.is_some_and(|l| l.has_table(project_id, table_name));
+struct DmlContext<'a> {
+    database: &'a Database,
+    buffered_layer: Option<&'a Arc<BufferedWriteLayer>>,
+    table_name: &'a str,
+    project_id: &'a str,
+    predicate: Option<Expr>,
+}
 
-    if let Some(layer) = buffered_layer.filter(|_| has_uncommitted) {
-        let mem_rows = mem_op(layer, predicate.as_ref())?;
-        total_rows += mem_rows;
-        debug!("MemBuffer {}: {} rows affected (uncommitted data)", op_name, mem_rows);
+impl<'a> DmlContext<'a> {
+    async fn execute<F, Fut>(self, mem_op: F, delta_op: Fut) -> Result<u64>
+    where
+        F: FnOnce(&BufferedWriteLayer, Option<&Expr>) -> Result<u64>,
+        Fut: std::future::Future<Output = Result<u64>>,
+    {
+        let mut total_rows = 0u64;
+        let has_uncommitted = self.buffered_layer.is_some_and(|l| l.has_table(self.project_id, self.table_name));
+
+        if let Some(layer) = self.buffered_layer.filter(|_| has_uncommitted) {
+            total_rows += mem_op(layer, self.predicate.as_ref())?;
+        }
+
+        let has_committed = self.database.project_configs().read().await.contains_key(&(self.project_id.to_string(), self.table_name.to_string()));
+
+        if has_committed {
+            total_rows += delta_op.await?;
+        }
+
+        Ok(total_rows)
     }
-
-    let has_committed = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
-
-    if has_committed {
-        let delta_rows = delta_op.await?;
-        total_rows += delta_rows;
-        debug!("Delta {}: {} rows affected (committed data)", op_name, delta_rows);
-    } else if !has_uncommitted {
-        debug!("Skipping {} - no data found in MemBuffer or Delta", op_name);
-    }
-
-    Ok(total_rows)
 }
 
 async fn perform_update_with_buffer(
@@ -405,34 +405,24 @@ async fn perform_update_with_buffer(
 ) -> Result<u64> {
     let assignments_clone = assignments.clone();
     let update_span = tracing::trace_span!(parent: span, "delta.update");
-    perform_dml_with_buffer(
-        database,
-        buffered_layer,
-        table_name,
-        project_id,
-        predicate.clone(),
-        "UPDATE",
-        |layer, pred| layer.update(project_id, table_name, pred, &assignments_clone),
-        perform_delta_update(database, table_name, project_id, predicate, assignments).instrument(update_span),
-    )
-    .await
+    DmlContext { database, buffered_layer, table_name, project_id, predicate: predicate.clone() }
+        .execute(
+            |layer, pred| layer.update(project_id, table_name, pred, &assignments_clone),
+            perform_delta_update(database, table_name, project_id, predicate, assignments).instrument(update_span),
+        )
+        .await
 }
 
 async fn perform_delete_with_buffer(
     database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>, span: &tracing::Span,
 ) -> Result<u64> {
     let delete_span = tracing::trace_span!(parent: span, "delta.delete");
-    perform_dml_with_buffer(
-        database,
-        buffered_layer,
-        table_name,
-        project_id,
-        predicate.clone(),
-        "DELETE",
-        |layer, pred| layer.delete(project_id, table_name, pred),
-        perform_delta_delete(database, table_name, project_id, predicate).instrument(delete_span),
-    )
-    .await
+    DmlContext { database, buffered_layer, table_name, project_id, predicate: predicate.clone() }
+        .execute(
+            |layer, pred| layer.delete(project_id, table_name, pred),
+            perform_delta_delete(database, table_name, project_id, predicate).instrument(delete_span),
+        )
+        .await
 }
 
 /// Perform Delta UPDATE operation
