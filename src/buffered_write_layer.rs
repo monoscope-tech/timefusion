@@ -352,22 +352,11 @@ impl BufferedWriteLayer {
             .collect()
             .await;
 
-        // Process results sequentially: checkpoint WAL and drain MemBuffer for successful flushes
+        // Process results: checkpoint WAL and drain MemBuffer for successful flushes
         for (bucket, result) in flush_results {
             match result {
                 Ok(()) => {
-                    // Order: checkpoint WAL first, then drain MemBuffer
-                    // 1. Data is now in Delta (flush succeeded)
-                    // 2. Checkpoint WAL to prevent replay (durability step)
-                    // 3. Drain MemBuffer (cleanup - it's volatile/in-RAM anyway)
-                    // If crash after checkpoint: MemBuffer lost but data safe in Delta
-                    // If crash before checkpoint: WAL replays → duplicates (prefer over loss)
-                    if let Err(e) = self.wal.checkpoint(&bucket.project_id, &bucket.table_name) {
-                        warn!("WAL checkpoint failed: {}", e);
-                    }
-
-                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
-
+                    self.checkpoint_and_drain(&bucket);
                     debug!(
                         "Flushed bucket: project={}, table={}, bucket_id={}, rows={}",
                         bucket.project_id, bucket.table_name, bucket.bucket_id, bucket.row_count
@@ -409,6 +398,13 @@ impl BufferedWriteLayer {
         // WAL pruning is handled by checkpointing after successful Delta flush
     }
 
+    fn checkpoint_and_drain(&self, bucket: &FlushableBucket) {
+        if let Err(e) = self.wal.checkpoint(&bucket.project_id, &bucket.table_name) {
+            warn!("WAL checkpoint failed: {}", e);
+        }
+        self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
+    }
+
     #[instrument(skip(self))]
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("BufferedWriteLayer shutdown initiated");
@@ -444,16 +440,8 @@ impl BufferedWriteLayer {
 
         for bucket in all_buckets {
             match self.flush_bucket(&bucket).await {
-                Ok(()) => {
-                    // Checkpoint WAL first (durability), then drain MemBuffer (cleanup)
-                    if let Err(e) = self.wal.checkpoint(&bucket.project_id, &bucket.table_name) {
-                        warn!("WAL checkpoint on shutdown failed: {}", e);
-                    }
-                    self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
-                }
-                Err(e) => {
-                    error!("Shutdown flush failed for bucket {}: {}", bucket.bucket_id, e);
-                }
+                Ok(()) => self.checkpoint_and_drain(&bucket),
+                Err(e) => error!("Shutdown flush failed for bucket {}: {}", bucket.bucket_id, e),
             }
         }
 

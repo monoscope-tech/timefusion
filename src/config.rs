@@ -39,15 +39,51 @@ pub fn config() -> &'static AppConfig {
 
 // Macro to generate const default functions for serde
 macro_rules! const_default {
-    ($name:ident: bool = $val:expr) => { fn $name() -> bool { $val } };
-    ($name:ident: u64 = $val:expr) => { fn $name() -> u64 { $val } };
-    ($name:ident: u16 = $val:expr) => { fn $name() -> u16 { $val } };
-    ($name:ident: i32 = $val:expr) => { fn $name() -> i32 { $val } };
-    ($name:ident: i64 = $val:expr) => { fn $name() -> i64 { $val } };
-    ($name:ident: usize = $val:expr) => { fn $name() -> usize { $val } };
-    ($name:ident: f64 = $val:expr) => { fn $name() -> f64 { $val } };
-    ($name:ident: String = $val:expr) => { fn $name() -> String { $val.into() } };
-    ($name:ident: PathBuf = $val:expr) => { fn $name() -> PathBuf { PathBuf::from($val) } };
+    ($name:ident: bool = $val:expr) => {
+        fn $name() -> bool {
+            $val
+        }
+    };
+    ($name:ident: u64 = $val:expr) => {
+        fn $name() -> u64 {
+            $val
+        }
+    };
+    ($name:ident: u16 = $val:expr) => {
+        fn $name() -> u16 {
+            $val
+        }
+    };
+    ($name:ident: i32 = $val:expr) => {
+        fn $name() -> i32 {
+            $val
+        }
+    };
+    ($name:ident: i64 = $val:expr) => {
+        fn $name() -> i64 {
+            $val
+        }
+    };
+    ($name:ident: usize = $val:expr) => {
+        fn $name() -> usize {
+            $val
+        }
+    };
+    ($name:ident: f64 = $val:expr) => {
+        fn $name() -> f64 {
+            $val
+        }
+    };
+    ($name:ident: String = $val:expr) => {
+        fn $name() -> String {
+            $val.into()
+        }
+    };
+    ($name:ident: PathBuf = $val:expr) => {
+        fn $name() -> PathBuf {
+            PathBuf::from($val)
+        }
+    };
 }
 
 // All default value functions using the macro
@@ -88,7 +124,9 @@ const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
-fn d_service_version() -> String { env!("CARGO_PKG_VERSION").into() }
+fn d_service_version() -> String {
+    env!("CARGO_PKG_VERSION").into()
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -150,35 +188,27 @@ impl AwsConfig {
     }
 
     pub fn build_storage_options(&self, endpoint_override: Option<&str>) -> HashMap<String, String> {
+        macro_rules! insert_opt {
+            ($opts:expr, $key:expr, $val:expr) => {
+                if let Some(ref v) = $val {
+                    $opts.insert($key.into(), v.clone());
+                }
+            };
+        }
+
         let mut opts = HashMap::new();
-        if let Some(ref key) = self.aws_access_key_id {
-            opts.insert("aws_access_key_id".into(), key.clone());
-        }
-        if let Some(ref secret) = self.aws_secret_access_key {
-            opts.insert("aws_secret_access_key".into(), secret.clone());
-        }
-        if let Some(ref region) = self.aws_default_region {
-            opts.insert("aws_region".into(), region.clone());
-        }
+        insert_opt!(opts, "aws_access_key_id", self.aws_access_key_id);
+        insert_opt!(opts, "aws_secret_access_key", self.aws_secret_access_key);
+        insert_opt!(opts, "aws_region", self.aws_default_region);
         opts.insert("aws_endpoint".into(), endpoint_override.unwrap_or(&self.aws_s3_endpoint).to_string());
 
         if self.is_dynamodb_locking_enabled() {
             opts.insert("aws_s3_locking_provider".into(), "dynamodb".into());
-            if let Some(ref t) = self.dynamodb.delta_dynamo_table_name {
-                opts.insert("delta_dynamo_table_name".into(), t.clone());
-            }
-            if let Some(ref k) = self.dynamodb.aws_access_key_id_dynamodb {
-                opts.insert("aws_access_key_id_dynamodb".into(), k.clone());
-            }
-            if let Some(ref s) = self.dynamodb.aws_secret_access_key_dynamodb {
-                opts.insert("aws_secret_access_key_dynamodb".into(), s.clone());
-            }
-            if let Some(ref r) = self.dynamodb.aws_region_dynamodb {
-                opts.insert("aws_region_dynamodb".into(), r.clone());
-            }
-            if let Some(ref e) = self.dynamodb.aws_endpoint_url_dynamodb {
-                opts.insert("aws_endpoint_url_dynamodb".into(), e.clone());
-            }
+            insert_opt!(opts, "delta_dynamo_table_name", self.dynamodb.delta_dynamo_table_name);
+            insert_opt!(opts, "aws_access_key_id_dynamodb", self.dynamodb.aws_access_key_id_dynamodb);
+            insert_opt!(opts, "aws_secret_access_key_dynamodb", self.dynamodb.aws_secret_access_key_dynamodb);
+            insert_opt!(opts, "aws_region_dynamodb", self.dynamodb.aws_region_dynamodb);
+            insert_opt!(opts, "aws_endpoint_url_dynamodb", self.dynamodb.aws_endpoint_url_dynamodb);
         }
         opts
     }
@@ -217,11 +247,21 @@ pub struct BufferConfig {
 }
 
 impl BufferConfig {
-    pub fn flush_interval_secs(&self) -> u64 { self.timefusion_flush_interval_secs.max(1) }
-    pub fn retention_mins(&self) -> u64 { self.timefusion_buffer_retention_mins.max(1) }
-    pub fn eviction_interval_secs(&self) -> u64 { self.timefusion_eviction_interval_secs.max(1) }
-    pub fn max_memory_mb(&self) -> usize { self.timefusion_buffer_max_memory_mb.max(64) }
-    pub fn wal_corruption_threshold(&self) -> usize { self.timefusion_wal_corruption_threshold }
+    pub fn flush_interval_secs(&self) -> u64 {
+        self.timefusion_flush_interval_secs.max(1)
+    }
+    pub fn retention_mins(&self) -> u64 {
+        self.timefusion_buffer_retention_mins.max(1)
+    }
+    pub fn eviction_interval_secs(&self) -> u64 {
+        self.timefusion_eviction_interval_secs.max(1)
+    }
+    pub fn max_memory_mb(&self) -> usize {
+        self.timefusion_buffer_max_memory_mb.max(64)
+    }
+    pub fn wal_corruption_threshold(&self) -> usize {
+        self.timefusion_wal_corruption_threshold
+    }
 
     pub fn compute_shutdown_timeout(&self, current_memory_mb: usize) -> Duration {
         let secs = self.timefusion_shutdown_timeout_secs.max(1) + (current_memory_mb / 100) as u64;
@@ -262,17 +302,30 @@ pub struct CacheConfig {
 }
 
 impl CacheConfig {
-    pub fn is_disabled(&self) -> bool { self.timefusion_foyer_disabled }
-    pub fn ttl(&self) -> Duration { Duration::from_secs(self.timefusion_foyer_ttl_seconds) }
-    pub fn stats_enabled(&self) -> bool { self.timefusion_foyer_stats.eq_ignore_ascii_case("true") }
-    pub fn memory_size_bytes(&self) -> usize { self.timefusion_foyer_memory_mb * 1024 * 1024 }
+    pub fn is_disabled(&self) -> bool {
+        self.timefusion_foyer_disabled
+    }
+    pub fn ttl(&self) -> Duration {
+        Duration::from_secs(self.timefusion_foyer_ttl_seconds)
+    }
+    pub fn stats_enabled(&self) -> bool {
+        self.timefusion_foyer_stats.eq_ignore_ascii_case("true")
+    }
+    pub fn memory_size_bytes(&self) -> usize {
+        self.timefusion_foyer_memory_mb * 1024 * 1024
+    }
     pub fn disk_size_bytes(&self) -> usize {
         self.timefusion_foyer_disk_mb.map_or(self.timefusion_foyer_disk_gb * 1024 * 1024 * 1024, |mb| mb * 1024 * 1024)
     }
-    pub fn file_size_bytes(&self) -> usize { self.timefusion_foyer_file_size_mb * 1024 * 1024 }
-    pub fn metadata_memory_size_bytes(&self) -> usize { self.timefusion_foyer_metadata_memory_mb * 1024 * 1024 }
+    pub fn file_size_bytes(&self) -> usize {
+        self.timefusion_foyer_file_size_mb * 1024 * 1024
+    }
+    pub fn metadata_memory_size_bytes(&self) -> usize {
+        self.timefusion_foyer_metadata_memory_mb * 1024 * 1024
+    }
     pub fn metadata_disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_disk_mb.map_or(self.timefusion_foyer_metadata_disk_gb * 1024 * 1024 * 1024, |mb| mb * 1024 * 1024)
+        self.timefusion_foyer_metadata_disk_mb
+            .map_or(self.timefusion_foyer_metadata_disk_gb * 1024 * 1024 * 1024, |mb| mb * 1024 * 1024)
     }
 }
 
@@ -317,7 +370,9 @@ pub struct MemoryConfig {
 }
 
 impl MemoryConfig {
-    pub fn memory_limit_bytes(&self) -> usize { self.timefusion_memory_limit_gb * 1024 * 1024 * 1024 }
+    pub fn memory_limit_bytes(&self) -> usize {
+        self.timefusion_memory_limit_gb * 1024 * 1024 * 1024
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -333,13 +388,14 @@ pub struct TelemetryConfig {
 }
 
 impl TelemetryConfig {
-    pub fn is_json_logging(&self) -> bool { self.log_format.as_deref() == Some("json") }
+    pub fn is_json_logging(&self) -> bool {
+        self.log_format.as_deref() == Some("json")
+    }
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        envy::from_iter::<_, Self>(std::iter::empty::<(String, String)>())
-            .expect("Default config should always succeed with serde defaults")
+        envy::from_iter::<_, Self>(std::iter::empty::<(String, String)>()).expect("Default config should always succeed with serde defaults")
     }
 }
 

@@ -61,6 +61,18 @@ pub struct WalEntry {
     pub data: Vec<u8>,
 }
 
+impl WalEntry {
+    fn new(project_id: &str, table_name: &str, operation: WalOperation, data: Vec<u8>) -> Self {
+        Self {
+            timestamp_micros: chrono::Utc::now().timestamp_micros(),
+            project_id: project_id.into(),
+            table_name: table_name.into(),
+            operation,
+            data,
+        }
+    }
+}
+
 #[derive(Debug, Encode, Decode)]
 pub struct DeletePayload {
     pub predicate_sql: Option<String>,
@@ -122,13 +134,7 @@ impl WalManager {
     #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
     pub fn append(&self, project_id: &str, table_name: &str, batch: &RecordBatch) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
-        let entry = WalEntry {
-            timestamp_micros: chrono::Utc::now().timestamp_micros(),
-            project_id: project_id.to_string(),
-            table_name: table_name.to_string(),
-            operation: WalOperation::Insert,
-            data: serialize_record_batch(batch)?,
-        };
+        let entry = WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?);
         self.wal.append_for_topic(&topic, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
         debug!("WAL append INSERT: topic={}, rows={}", topic, batch.num_rows());
@@ -137,21 +143,10 @@ impl WalManager {
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub fn append_batch(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) -> Result<(), WalError> {
-        let timestamp_micros = chrono::Utc::now().timestamp_micros();
         let topic = Self::make_topic(project_id, table_name);
-
         let payloads: Vec<Vec<u8>> = batches
             .iter()
-            .map(|batch| {
-                let entry = WalEntry {
-                    timestamp_micros,
-                    project_id: project_id.to_string(),
-                    table_name: table_name.to_string(),
-                    operation: WalOperation::Insert,
-                    data: serialize_record_batch(batch)?,
-                };
-                serialize_wal_entry(&entry)
-            })
+            .map(|batch| serialize_wal_entry(&WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?)))
             .collect::<Result<_, _>>()?;
 
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
@@ -164,13 +159,13 @@ impl WalManager {
     #[instrument(skip(self), fields(project_id, table_name))]
     pub fn append_delete(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
-        let entry = WalEntry {
-            timestamp_micros: chrono::Utc::now().timestamp_micros(),
-            project_id: project_id.to_string(),
-            table_name: table_name.to_string(),
-            operation: WalOperation::Delete,
-            data: bincode::encode_to_vec(&DeletePayload { predicate_sql: predicate_sql.map(String::from) }, BINCODE_CONFIG)?,
-        };
+        let data = bincode::encode_to_vec(
+            &DeletePayload {
+                predicate_sql: predicate_sql.map(String::from),
+            },
+            BINCODE_CONFIG,
+        )?;
+        let entry = WalEntry::new(project_id, table_name, WalOperation::Delete, data);
         self.wal.append_for_topic(&topic, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
         debug!("WAL append DELETE: topic={}, predicate={:?}", topic, predicate_sql);
@@ -184,21 +179,22 @@ impl WalManager {
             predicate_sql: predicate_sql.map(String::from),
             assignments: assignments.to_vec(),
         };
-        let entry = WalEntry {
-            timestamp_micros: chrono::Utc::now().timestamp_micros(),
-            project_id: project_id.to_string(),
-            table_name: table_name.to_string(),
-            operation: WalOperation::Update,
-            data: bincode::encode_to_vec(&payload, BINCODE_CONFIG)?,
-        };
+        let entry = WalEntry::new(project_id, table_name, WalOperation::Update, bincode::encode_to_vec(&payload, BINCODE_CONFIG)?);
         self.wal.append_for_topic(&topic, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
-        debug!("WAL append UPDATE: topic={}, predicate={:?}, assignments={}", topic, predicate_sql, assignments.len());
+        debug!(
+            "WAL append UPDATE: topic={}, predicate={:?}, assignments={}",
+            topic,
+            predicate_sql,
+            assignments.len()
+        );
         Ok(())
     }
 
     #[instrument(skip(self), fields(project_id, table_name))]
-    pub fn read_entries_raw(&self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool) -> Result<(Vec<WalEntry>, usize), WalError> {
+    pub fn read_entries_raw(
+        &self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool,
+    ) -> Result<(Vec<WalEntry>, usize), WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let cutoff = since_timestamp_micros.unwrap_or(0);
         let mut results = Vec::new();
@@ -235,11 +231,9 @@ impl WalManager {
     pub fn read_all_entries_raw(&self, since_timestamp_micros: Option<i64>, checkpoint: bool) -> Result<(Vec<WalEntry>, usize), WalError> {
         let cutoff = since_timestamp_micros.unwrap_or(0);
 
-        let (mut all_results, total_errors) = self
-            .list_topics()?
-            .into_iter()
-            .filter_map(|topic| Self::parse_topic(&topic).map(|(p, t)| (topic, p, t)))
-            .fold((Vec::new(), 0usize), |(mut results, mut errors), (topic, project_id, table_name)| {
+        let (mut all_results, total_errors) = self.list_topics()?.into_iter().filter_map(|topic| Self::parse_topic(&topic).map(|(p, t)| (topic, p, t))).fold(
+            (Vec::new(), 0usize),
+            |(mut results, mut errors), (topic, project_id, table_name)| {
                 match self.read_entries_raw(&project_id, &table_name, Some(cutoff), checkpoint) {
                     Ok((entries, err_count)) => {
                         results.extend(entries);
@@ -251,7 +245,8 @@ impl WalManager {
                     }
                 }
                 (results, errors)
-            });
+            },
+        );
 
         all_results.sort_by_key(|e| e.timestamp_micros);
 
@@ -305,10 +300,7 @@ fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
 }
 
 fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
-    StreamReader::try_new(Cursor::new(data), None)?
-        .next()
-        .ok_or(WalError::EmptyBatch)?
-        .map_err(WalError::ArrowIpc)
+    StreamReader::try_new(Cursor::new(data), None)?.next().ok_or(WalError::EmptyBatch)?.map_err(WalError::ArrowIpc)
 }
 
 fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, WalError> {
@@ -325,7 +317,7 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
 
     // Check for new format (magic header)
     if data[0..4] == WAL_MAGIC {
-        let _op = WalOperation::try_from(data[4])?;
+        WalOperation::try_from(data[4])?; // Validate operation type
         let (entry, _): (WalEntry, _) = bincode::decode_from_slice(&data[5..], BINCODE_CONFIG)?;
         Ok(entry)
     } else {
@@ -358,7 +350,11 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
         ]));
-        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(StringArray::from(vec!["a", "b", "c"]))]).unwrap()
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -390,7 +386,9 @@ mod tests {
 
     #[test]
     fn test_delete_payload_serialization() {
-        let payload = DeletePayload { predicate_sql: Some("id = 1".to_string()) };
+        let payload = DeletePayload {
+            predicate_sql: Some("id = 1".to_string()),
+        };
         let serialized = bincode::encode_to_vec(&payload, BINCODE_CONFIG).unwrap();
         let deserialized = deserialize_delete_payload(&serialized).unwrap();
         assert_eq!(payload.predicate_sql, deserialized.predicate_sql);

@@ -216,6 +216,10 @@ impl MemBuffer {
         timestamp_micros / BUCKET_DURATION_MICROS
     }
 
+    fn with_table<T>(&self, project_id: &str, table_name: &str, f: impl FnOnce(&TableBuffer) -> T) -> Option<T> {
+        self.projects.get(project_id).and_then(|p| p.table_buffers.get(table_name).map(|t| f(&t)))
+    }
+
     pub fn current_bucket_id() -> i64 {
         let now_micros = chrono::Utc::now().timestamp_micros();
         Self::compute_bucket_id(now_micros)
@@ -344,30 +348,26 @@ impl MemBuffer {
     }
 
     pub fn get_oldest_timestamp(&self, project_id: &str, table_name: &str) -> Option<i64> {
-        self.projects.get(project_id).and_then(|project| {
-            project.table_buffers.get(table_name).map(|table| {
-                table
-                    .buckets
-                    .iter()
-                    .map(|b| b.min_timestamp.load(Ordering::Relaxed))
-                    .filter(|&ts| ts != i64::MAX)
-                    .min()
-                    .unwrap_or(i64::MAX)
-            })
+        self.with_table(project_id, table_name, |table| {
+            table
+                .buckets
+                .iter()
+                .map(|b| b.min_timestamp.load(Ordering::Relaxed))
+                .filter(|&ts| ts != i64::MAX)
+                .min()
+                .unwrap_or(i64::MAX)
         })
     }
 
     pub fn get_newest_timestamp(&self, project_id: &str, table_name: &str) -> Option<i64> {
-        self.projects.get(project_id).and_then(|project| {
-            project.table_buffers.get(table_name).map(|table| {
-                table
-                    .buckets
-                    .iter()
-                    .map(|b| b.max_timestamp.load(Ordering::Relaxed))
-                    .filter(|&ts| ts != i64::MIN)
-                    .max()
-                    .unwrap_or(i64::MIN)
-            })
+        self.with_table(project_id, table_name, |table| {
+            table
+                .buckets
+                .iter()
+                .map(|b| b.max_timestamp.load(Ordering::Relaxed))
+                .filter(|&ts| ts != i64::MIN)
+                .max()
+                .unwrap_or(i64::MIN)
         })
     }
 
@@ -412,18 +412,17 @@ impl MemBuffer {
                 let table_name = table.key().clone();
                 for bucket in table.buckets.iter() {
                     let bucket_id = *bucket.key();
-                    if filter(bucket_id) {
-                        if let Ok(batches) = bucket.batches.read() {
-                            if !batches.is_empty() {
-                                result.push(FlushableBucket {
-                                    project_id: project_id.clone(),
-                                    table_name: table_name.clone(),
-                                    bucket_id,
-                                    batches: batches.clone(),
-                                    row_count: bucket.row_count.load(Ordering::Relaxed),
-                                });
-                            }
-                        }
+                    if filter(bucket_id)
+                        && let Ok(batches) = bucket.batches.read()
+                        && !batches.is_empty()
+                    {
+                        result.push(FlushableBucket {
+                            project_id: project_id.clone(),
+                            table_name: table_name.clone(),
+                            bucket_id,
+                            batches: batches.clone(),
+                            row_count: bucket.row_count.load(Ordering::Relaxed),
+                        });
                     }
                 }
             }
