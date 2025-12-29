@@ -1997,8 +1997,9 @@ mod tests {
     use crate::test_utils::test_helpers::*;
     use serial_test::serial;
 
-    async fn setup_test_database() -> Result<(Database, SessionContext)> {
+    async fn setup_test_database() -> Result<(Database, SessionContext, String)> {
         dotenv::dotenv().ok();
+        let test_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
         unsafe {
             std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
             std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
@@ -2008,27 +2009,36 @@ mod tests {
         let mut ctx = db_arc.create_session_context();
         datafusion_functions_json::register_all(&mut ctx)?;
         db.setup_session_context(&mut ctx)?;
-        Ok((db, ctx))
+        Ok((db, ctx, test_prefix))
     }
 
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_insert_and_query() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx) = setup_test_database().await?;
+            let (db, ctx, prefix) = setup_test_database().await?;
+            let project_id = format!("project_{}", prefix);
 
             // Test basic insert
-            let batch = json_to_batch(vec![test_span("test1", "span1", "project1")])?;
-            db.insert_records_batch("project1", "otel_logs_and_spans", vec![batch], true).await?;
+            let batch = json_to_batch(vec![test_span("test1", "span1", &project_id)])?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
 
             // Verify count
-            let result = ctx.sql("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'project1'").await?.collect().await?;
+            let result = ctx
+                .sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
+                .await?
+                .collect()
+                .await?;
             use datafusion::arrow::array::AsArray;
             let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
             assert_eq!(count, 1);
 
             // Test field selection
-            let result = ctx.sql("SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project1'").await?.collect().await?;
+            let result = ctx
+                .sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
+                .await?
+                .collect()
+                .await?;
             assert_eq!(result[0].num_rows(), 1);
             assert_eq!(result[0].column(0).as_string::<i32>().value(0), "test1");
             assert_eq!(result[0].column(1).as_string::<i32>().value(0), "span1");
@@ -2046,17 +2056,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_multiple_projects() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx) = setup_test_database().await?;
+            let (db, ctx, prefix) = setup_test_database().await?;
+            let projects: Vec<String> = (1..=3).map(|i| format!("proj{}_{}", i, prefix)).collect();
 
             // Insert data for multiple projects
-            for project in ["project1", "project2", "project3"] {
+            for project in &projects {
                 let batch = json_to_batch(vec![test_span(&format!("id_{}", project), &format!("span_{}", project), project)])?;
                 db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true).await?;
             }
 
             // Verify project isolation
             use datafusion::arrow::array::AsArray;
-            for project in ["project1", "project2", "project3"] {
+            for project in &projects {
                 let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}'", project);
                 let result = ctx.sql(&sql).await?.collect().await?;
                 assert_eq!(result[0].num_rows(), 1);
@@ -2065,7 +2076,7 @@ mod tests {
 
             // Verify total count - need to check across all projects
             let mut total_count = 0;
-            for project in ["project1", "project2", "project3"] {
+            for project in &projects {
                 let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project);
                 let result = ctx.sql(&sql).await?.collect().await?;
                 let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
@@ -2086,7 +2097,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_filtering() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx) = setup_test_database().await?;
+            let (db, ctx, prefix) = setup_test_database().await?;
+            let project_id = format!("filter_proj_{}", prefix);
             use chrono::Utc;
             use datafusion::arrow::array::AsArray;
             use serde_json::json;
@@ -2097,7 +2109,7 @@ mod tests {
                     "timestamp": now.timestamp_micros(),
                     "id": "span1",
                     "name": "test_span_1",
-                    "project_id": "test_project",
+                    "project_id": &project_id,
                     "level": "INFO",
                     "status_code": "OK",
                     "duration": 100_000_000,
@@ -2109,7 +2121,7 @@ mod tests {
                     "timestamp": (now + chrono::Duration::minutes(10)).timestamp_micros(),
                     "id": "span2",
                     "name": "test_span_2",
-                    "project_id": "test_project",
+                    "project_id": &project_id,
                     "level": "ERROR",
                     "status_code": "ERROR",
                     "status_message": "Error occurred",
@@ -2121,11 +2133,14 @@ mod tests {
             ];
 
             let batch = json_to_batch(records)?;
-            db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
 
             // Test filtering by level
             let result = ctx
-                .sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'")
+                .sql(&format!(
+                    "SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND level = 'ERROR'",
+                    project_id
+                ))
                 .await?
                 .collect()
                 .await?;
@@ -2134,7 +2149,10 @@ mod tests {
 
             // Test filtering by duration
             let result = ctx
-                .sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test_project' AND duration > 150000000")
+                .sql(&format!(
+                    "SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND duration > 150000000",
+                    project_id
+                ))
                 .await?
                 .collect()
                 .await?;
@@ -2143,7 +2161,10 @@ mod tests {
 
             // Test compound filtering
             let result = ctx
-                .sql("SELECT id, status_message FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'")
+                .sql(&format!(
+                    "SELECT id, status_message FROM otel_logs_and_spans WHERE project_id = '{}' AND level = 'ERROR'",
+                    project_id
+                ))
                 .await?
                 .collect()
                 .await?;
@@ -2163,26 +2184,31 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_sql_insert() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx) = setup_test_database().await?;
+            let (db, ctx, prefix) = setup_test_database().await?;
+            let proj1 = format!("default_{}", prefix);
+            let proj2 = format!("proj2_{}", prefix);
             use datafusion::arrow::array::AsArray;
 
             // Insert via API first
-            let batch = json_to_batch(vec![test_span("id1", "name1", "default")])?;
-            db.insert_records_batch("default", "otel_logs_and_spans", vec![batch], true).await?;
+            let batch = json_to_batch(vec![test_span("id1", "name1", &proj1)])?;
+            db.insert_records_batch(&proj1, "otel_logs_and_spans", vec![batch], true).await?;
 
             // Insert via SQL
-            let sql = "INSERT INTO otel_logs_and_spans (
+            let sql = format!(
+                "INSERT INTO otel_logs_and_spans (
                        project_id, date, timestamp, id, hashes, name, level, status_code, summary
                      ) VALUES (
-                       'project2', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z',
+                       '{}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z',
                        'sql_id', ARRAY[], 'sql_name', 'INFO', 'OK', ARRAY['SQL inserted test span']
-                     )";
-            let result = ctx.sql(sql).await?.collect().await?;
+                     )",
+                proj2
+            );
+            let result = ctx.sql(&sql).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 1);
 
             // Verify both records exist - need to check both projects
             let mut total_count = 0;
-            for project in ["default", "project2"] {
+            for project in [&proj1, &proj2] {
                 let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project);
                 let result = ctx.sql(&sql).await?.collect().await?;
                 let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
@@ -2192,7 +2218,10 @@ mod tests {
 
             // Verify SQL-inserted record
             let result = ctx
-                .sql("SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project2' AND id = 'sql_id'")
+                .sql(&format!(
+                    "SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'sql_id'",
+                    proj2
+                ))
                 .await?
                 .collect()
                 .await?;
@@ -2210,30 +2239,32 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_multi_row_sql_insert() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx) = setup_test_database().await?;
+            let (db, ctx, prefix) = setup_test_database().await?;
+            let project_id = format!("multirow_{}", prefix);
             use datafusion::arrow::array::AsArray;
 
             // Test multi-row INSERT
-            let sql = "INSERT INTO otel_logs_and_spans (
+            let sql = format!("INSERT INTO otel_logs_and_spans (
                        project_id, date, timestamp, id, hashes, name, level, status_code, summary
                      ) VALUES
-                     ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'id1', ARRAY[], 'name1', 'INFO', 'OK', ARRAY['Multi-row insert test 1']),
-                     ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK', ARRAY['Multi-row insert test 2']),
-                     ('project1', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR', ARRAY['Multi-row insert test 3 - ERROR'])";
+                     ('{}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T10:00:00Z', 'id1', ARRAY[], 'name1', 'INFO', 'OK', ARRAY['Multi-row insert test 1']),
+                     ('{}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T11:00:00Z', 'id2', ARRAY[], 'name2', 'INFO', 'OK', ARRAY['Multi-row insert test 2']),
+                     ('{}', TIMESTAMP '2023-01-01', TIMESTAMP '2023-01-01T12:00:00Z', 'id3', ARRAY[], 'name3', 'ERROR', 'ERROR', ARRAY['Multi-row insert test 3 - ERROR'])",
+                     project_id, project_id, project_id);
 
             // Multi-row INSERT returns a count of rows inserted
-            let result = ctx.sql(sql).await?.collect().await?;
+            let result = ctx.sql(&sql).await?.collect().await?;
             let inserted_count = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
             assert_eq!(inserted_count, 3);
 
             // Verify all 3 records exist
-            let sql = "SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'project1'";
-            let result = ctx.sql(sql).await?.collect().await?;
+            let sql = format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
+            let result = ctx.sql(&sql).await?.collect().await?;
             let count = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
             assert_eq!(count, 3);
 
             // Verify individual records
-            let result = ctx.sql("SELECT id, name FROM otel_logs_and_spans WHERE project_id = 'project1' ORDER BY id").await?.collect().await?;
+            let result = ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY id", project_id)).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 3);
             assert_eq!(result[0].column(0).as_string::<i32>().value(0), "id1");
             assert_eq!(result[0].column(0).as_string::<i32>().value(1), "id2");
@@ -2252,7 +2283,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_timestamp_operations() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            let (db, ctx) = setup_test_database().await?;
+            let (db, ctx, prefix) = setup_test_database().await?;
+            let project_id = format!("ts_test_{}", prefix);
             use chrono::Utc;
             use datafusion::arrow::array::AsArray;
             use serde_json::json;
@@ -2263,7 +2295,7 @@ mod tests {
                     "timestamp": base_time.timestamp_micros(),
                     "id": "early",
                     "name": "early_span",
-                    "project_id": "test",
+                    "project_id": &project_id,
                     "date": base_time.date_naive().to_string(),
                     "hashes": [],
                     "summary": ["Early span for timestamp test"]
@@ -2272,7 +2304,7 @@ mod tests {
                     "timestamp": (base_time + chrono::Duration::hours(2)).timestamp_micros(),
                     "id": "late",
                     "name": "late_span",
-                    "project_id": "test",
+                    "project_id": &project_id,
                     "date": base_time.date_naive().to_string(),
                     "hashes": [],
                     "summary": ["Late span for timestamp test"]
@@ -2280,15 +2312,22 @@ mod tests {
             ];
 
             let batch = json_to_batch(records)?;
-            db.insert_records_batch("test", "otel_logs_and_spans", vec![batch], true).await?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
 
             // First check if any records were inserted - need to specify project_id
-            let all_records = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test'").await?.collect().await?;
+            let all_records = ctx
+                .sql(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
+                .await?
+                .collect()
+                .await?;
             assert!(!all_records.is_empty(), "No records found in table");
 
             // Test timestamp filtering - need to include project_id
             let result = ctx
-                .sql("SELECT id FROM otel_logs_and_spans WHERE project_id = 'test' AND timestamp > '2023-01-01T11:00:00Z'")
+                .sql(&format!(
+                    "SELECT id FROM otel_logs_and_spans WHERE project_id = '{}' AND timestamp > '2023-01-01T11:00:00Z'",
+                    project_id
+                ))
                 .await?
                 .collect()
                 .await?;
@@ -2298,7 +2337,10 @@ mod tests {
 
             // Test timestamp formatting - need to include project_id
             let result = ctx
-                .sql("SELECT id, to_char(timestamp, '%Y-%m-%d %H:%M') as ts FROM otel_logs_and_spans WHERE project_id = 'test' ORDER BY timestamp")
+                .sql(&format!(
+                    "SELECT id, to_char(timestamp, '%Y-%m-%d %H:%M') as ts FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY timestamp",
+                    project_id
+                ))
                 .await?
                 .collect()
                 .await?;
