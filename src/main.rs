@@ -69,7 +69,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     );
 
     // Start background tasks (flush and eviction)
-    buffered_layer.start_background_tasks();
+    buffered_layer.start_background_tasks().await;
     info!("BufferedWriteLayer background tasks started");
 
     // Apply buffered layer to database
