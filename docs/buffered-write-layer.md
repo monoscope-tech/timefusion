@@ -65,34 +65,47 @@ INSERT → WAL.append() → MemBuffer.insert() → Response to client
 
 ### 2. In-Memory Buffer - `src/mem_buffer.rs`
 
-Hierarchical, time-bucketed storage for recent data.
+Flattened, time-bucketed storage for recent data optimized for high insert throughput.
 
 ```rust
-pub struct MemBuffer {
-    projects: DashMap<String, ProjectBuffer>,  // project_id → ProjectBuffer
-}
+/// Composite key using Arc<str> for efficient cloning
+pub type TableKey = (Arc<str>, Arc<str>);  // (project_id, table_name)
 
-pub struct ProjectBuffer {
-    table_buffers: DashMap<String, TableBuffer>,  // table_name → TableBuffer
+pub struct MemBuffer {
+    tables: DashMap<TableKey, Arc<TableBuffer>>,  // Flattened: 1 lookup instead of 2
+    estimated_bytes: AtomicUsize,
 }
 
 pub struct TableBuffer {
     buckets: DashMap<i64, TimeBucket>,  // bucket_id → TimeBucket
-    schema: SchemaRef,
+    schema: RwLock<SchemaRef>,
+    project_id: Arc<str>,
+    table_name: Arc<str>,
 }
 
 pub struct TimeBucket {
     batches: RwLock<Vec<RecordBatch>>,
     row_count: AtomicUsize,
+    memory_bytes: AtomicUsize,
     min_timestamp: AtomicI64,
     max_timestamp: AtomicI64,
 }
 ```
 
+**Design rationale:**
+- Flattened from 3-level hierarchy (project → table → bucket) to 2-level (table → bucket)
+- `Arc<str>` keys avoid string cloning on every lookup
+- `Arc<TableBuffer>` enables handle caching for batch operations
+
 **Time bucketing:**
 - Bucket duration: 10 minutes
 - `bucket_id = timestamp_micros / (10 * 60 * 1_000_000)`
 - Mirrors Delta Lake's date partitioning for efficient queries
+
+**Insert methods:**
+- `get_or_create_table()` - Returns `Arc<TableBuffer>` for caching across batch operations
+- `TableBuffer::insert_batch()` - Direct bucket insertion, bypasses table lookup
+- `insert_batches()` - Caches table handle internally for the batch loop
 
 **Query methods:**
 - `query()` - Returns all batches as a flat `Vec<RecordBatch>`
@@ -212,6 +225,9 @@ Since MemBuffer uses `UnknownPartitioning` (time buckets) and Delta uses file-ba
 
 | Optimization | Impact |
 |-------------|--------|
+| Flattened MemBuffer structure | Reduced from 3 hash lookups to 1-2 per insert |
+| `Arc<str>` composite keys | Avoids string cloning on every table lookup |
+| `Arc<TableBuffer>` handle caching | Amortizes lookup cost across batch operations |
 | Partitioned MemBuffer queries | Multi-core parallel execution for in-memory data |
 | Time-range filter extraction | Skip Delta entirely for recent-data queries |
 | Direct MemorySourceConfig | Avoids extra data copying through MemTable |
@@ -230,11 +246,12 @@ Since MemBuffer uses `UnknownPartitioning` (time buckets) and Delta uses file-ba
 
 | Component | Lock Type | Contention |
 |-----------|-----------|------------|
-| `MemBuffer.projects` | DashMap (lock-free reads) | Very low |
+| `MemBuffer.tables` | DashMap (lock-free reads) | Very low |
 | `TableBuffer.buckets` | DashMap (lock-free reads) | Very low |
+| `TableBuffer.schema` | RwLock | Very low (rarely changes) |
 | `TimeBucket.batches` | RwLock | Low (read-heavy workload) |
 
-**Key insight:** Query path uses read locks only. Write path acquires write lock briefly per bucket.
+**Key insight:** Query path uses read locks only. Write path acquires write lock briefly per bucket. Handle caching (`Arc<TableBuffer>`) further reduces contention by avoiding repeated table lookups.
 
 ## Configuration
 
@@ -284,6 +301,21 @@ pub async fn shutdown(&self) -> anyhow::Result<()> {
 ```
 
 ## Tradeoffs
+
+### Chosen Approach: Flattened 2-Level Hierarchy
+
+**Pros:**
+- Single hash lookup for table access (was 2 lookups with project → table)
+- `Arc<str>` keys are cheap to clone and compare
+- `Arc<TableBuffer>` enables handle caching for batch operations
+- Simpler iteration for flush/eviction (no nested loops)
+
+**Cons:**
+- Can't efficiently iterate "all tables for project X" without scanning all entries
+- Composite key tuple slightly larger than single string
+
+**Alternative considered:** 3-level hierarchy (project → table → bucket)
+- Rejected: Extra hash lookup on every insert not worth the organizational benefit
 
 ### Chosen Approach: Time-Based Exclusion
 
@@ -336,7 +368,7 @@ pub async fn shutdown(&self) -> anyhow::Result<()> {
 ## Future Improvements
 
 1. **Adaptive bucket sizing** - Adjust bucket duration based on write rate
-2. **Memory pressure handling** - Force flush when approaching memory limit
-3. **Predicate pushdown to MemBuffer** - Apply filters during query, not after
-4. **Compression in MemBuffer** - Reduce memory footprint for string-heavy data
-5. **Metrics and observability** - Expose buffer stats, flush latency, skip rates
+2. **Predicate pushdown to MemBuffer** - Apply filters during query, not after
+3. **Compression in MemBuffer** - Reduce memory footprint for string-heavy data
+4. **Metrics and observability** - Expose buffer stats, flush latency, skip rates
+5. **Ring buffer for ultra-high throughput** - Lock-free writes if >100K inserts/sec needed

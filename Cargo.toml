@@ -74,6 +74,7 @@ tdigests = "1.0"
 bincode = { version = "2.0", features = ["serde"] }
 walrus-rust = "0.2.0"
 thiserror = "2.0"
+strum = { version = "0.27", features = ["derive"] }
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }

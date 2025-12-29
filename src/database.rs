@@ -78,49 +78,21 @@ struct StorageConfig {
     s3_endpoint: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Database {
     config: Arc<AppConfig>,
     project_configs: ProjectConfigs,
     batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
-    // PostgreSQL pool for configuration (optional)
     config_pool: Option<PgPool>,
-    // Cached storage configurations
     storage_configs: Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
-    // Default S3 settings for unconfigured mode
     default_s3_bucket: Option<String>,
     default_s3_prefix: Option<String>,
     default_s3_endpoint: Option<String>,
-    // Object store cache (optional)
     object_store_cache: Option<Arc<SharedFoyerCache>>,
-    // Statistics extractor for Delta Lake tables
     statistics_extractor: Arc<DeltaStatisticsExtractor>,
-    // Track last written versions for read-after-write consistency
-    // Map of (project_id, table_name) -> last_written_version
     last_written_versions: Arc<RwLock<HashMap<(String, String), i64>>>,
-    // Buffered write layer for WAL + in-memory buffer
     buffered_layer: Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
-}
-
-impl Clone for Database {
-    fn clone(&self) -> Self {
-        Self {
-            config: Arc::clone(&self.config),
-            project_configs: Arc::clone(&self.project_configs),
-            batch_queue: self.batch_queue.clone(),
-            maintenance_shutdown: Arc::clone(&self.maintenance_shutdown),
-            config_pool: self.config_pool.clone(),
-            storage_configs: Arc::clone(&self.storage_configs),
-            default_s3_bucket: self.default_s3_bucket.clone(),
-            default_s3_prefix: self.default_s3_prefix.clone(),
-            default_s3_endpoint: self.default_s3_endpoint.clone(),
-            object_store_cache: self.object_store_cache.clone(),
-            statistics_extractor: Arc::clone(&self.statistics_extractor),
-            last_written_versions: Arc::clone(&self.last_written_versions),
-            buffered_layer: self.buffered_layer.clone(),
-        }
-    }
 }
 
 impl Database {
@@ -1557,8 +1529,6 @@ impl ProjectRoutingTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        // For now, return the YAML schema.
-        // TODO: Consider caching the actual Delta schema to handle evolution better
         self.schema.clone()
     }
 

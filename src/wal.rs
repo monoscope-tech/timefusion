@@ -112,6 +112,9 @@ impl WalManager {
         Ok(Self { wal, data_dir, known_topics })
     }
 
+    // Persist topic to index file. Called after WAL append - if crash occurs between
+    // append and persist, orphan entries are still recovered via read_all_entries_raw
+    // which scans all WAL topics in the directory regardless of index.
     fn persist_topic(&self, topic: &str) {
         if self.known_topics.insert(topic.to_string()) {
             let meta_dir = self.data_dir.join(".timefusion_meta");
