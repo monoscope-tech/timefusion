@@ -260,7 +260,7 @@ impl BufferedWriteLayer {
         Ok(stats)
     }
 
-    pub fn start_background_tasks(self: &Arc<Self>) {
+    pub async fn start_background_tasks(self: &Arc<Self>) {
         let this = Arc::clone(self);
 
         // Start flush task
@@ -275,9 +275,9 @@ impl BufferedWriteLayer {
             eviction_this.run_eviction_task().await;
         });
 
-        // Store handles - use blocking lock since this runs at startup
+        // Store handles
         {
-            let mut handles = this.background_tasks.blocking_lock();
+            let mut handles = this.background_tasks.lock().await;
             handles.push(flush_handle);
             handles.push(eviction_handle);
         }
