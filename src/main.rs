@@ -32,11 +32,14 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     info!("Starting TimeFusion application");
 
-    // Initialize database (will auto-detect config mode)
-    let mut db = Database::new().await?;
+    // Create Arc<AppConfig> for passing to components
+    let cfg_arc = Arc::new(cfg.clone());
+
+    // Initialize database with explicit config
+    let mut db = Database::with_config(Arc::clone(&cfg_arc)).await?;
     info!("Database initialized successfully");
 
-    // Initialize BufferedWriteLayer using global config
+    // Initialize BufferedWriteLayer with explicit config
     info!(
         "BufferedWriteLayer config: wal_dir={:?}, flush_interval={}s, retention={}min",
         cfg.core.walrus_data_dir,
@@ -55,7 +58,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             })
         });
 
-    let buffered_layer = Arc::new(BufferedWriteLayer::new()?.with_delta_writer(delta_write_callback));
+    let buffered_layer = Arc::new(BufferedWriteLayer::with_config(cfg_arc)?.with_delta_writer(delta_write_callback));
 
     // Recover from WAL on startup
     info!("Starting WAL recovery...");

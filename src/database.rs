@@ -1,4 +1,4 @@
-use crate::config;
+use crate::config::{self, AppConfig};
 use crate::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
 use crate::schema_loader::{get_default_schema, get_schema};
 use crate::statistics::DeltaStatisticsExtractor;
@@ -80,6 +80,7 @@ struct StorageConfig {
 
 #[derive(Debug)]
 pub struct Database {
+    config: Arc<AppConfig>,
     project_configs: ProjectConfigs,
     batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
@@ -105,6 +106,7 @@ pub struct Database {
 impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
+            config: Arc::clone(&self.config),
             project_configs: Arc::clone(&self.project_configs),
             batch_queue: self.batch_queue.clone(),
             maintenance_shutdown: Arc::clone(&self.maintenance_shutdown),
@@ -122,6 +124,11 @@ impl Clone for Database {
 }
 
 impl Database {
+    /// Get the config for this database instance
+    pub fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
     /// Get the project configs for direct access
     pub fn project_configs(&self) -> &ProjectConfigs {
         &self.project_configs
@@ -144,22 +151,21 @@ impl Database {
 
     /// Build storage options with consistent configuration including DynamoDB locking if enabled
     fn build_storage_options(&self) -> HashMap<String, String> {
-        let cfg = config::config();
-        let storage_options = cfg.aws.build_storage_options(self.default_s3_endpoint.as_deref());
+        let storage_options = self.config.aws.build_storage_options(self.default_s3_endpoint.as_deref());
 
         let safe_options: HashMap<_, _> = storage_options.iter().filter(|(k, _)| !k.contains("secret") && !k.contains("password")).collect();
         info!("Storage options configured: {:?}", safe_options);
         storage_options
     }
+
     /// Creates standard writer properties used across different operations
-    fn create_writer_properties(sorting_columns: Vec<SortingColumn>) -> WriterProperties {
+    fn create_writer_properties(&self, sorting_columns: Vec<SortingColumn>) -> WriterProperties {
         use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
         use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
 
-        let cfg = config::config();
-        let page_row_count_limit = cfg.parquet.timefusion_page_row_count_limit;
-        let compression_level = cfg.parquet.timefusion_zstd_compression_level;
-        let max_row_group_size = cfg.parquet.timefusion_max_row_group_size;
+        let page_row_count_limit = self.config.parquet.timefusion_page_row_count_limit;
+        let compression_level = self.config.parquet.timefusion_zstd_compression_level;
+        let max_row_group_size = self.config.parquet.timefusion_max_row_group_size;
 
         WriterProperties::builder()
             // Use ZSTD compression with high level for maximum compression ratio
@@ -261,9 +267,7 @@ impl Database {
         Ok(map)
     }
 
-    async fn initialize_cache_with_retry() -> Option<Arc<SharedFoyerCache>> {
-        let cfg = config::config();
-
+    async fn initialize_cache_with_retry(cfg: &AppConfig) -> Option<Arc<SharedFoyerCache>> {
         // Check if cache is disabled
         if cfg.cache.is_disabled() {
             info!("Foyer cache is disabled via TIMEFUSION_FOYER_DISABLED");
@@ -297,9 +301,9 @@ impl Database {
         None
     }
 
-    pub async fn new() -> Result<Self> {
-        let cfg = config::config();
-
+    /// Create a new Database with explicit config.
+    /// Prefer this over `new()` for better testability.
+    pub async fn with_config(cfg: Arc<AppConfig>) -> Result<Self> {
         let aws_endpoint = &cfg.aws.aws_s3_endpoint;
         let aws_url = Url::parse(aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
@@ -353,13 +357,15 @@ impl Database {
 
         // Initialize object store cache BEFORE creating any tables
         // This ensures all tables benefit from caching
-        let object_store_cache = Self::initialize_cache_with_retry().await;
+        let object_store_cache = Self::initialize_cache_with_retry(&cfg).await;
 
         // Initialize statistics extractor with configurable cache size
         let stats_cache_size = cfg.parquet.timefusion_stats_cache_size;
-        let statistics_extractor = Arc::new(DeltaStatisticsExtractor::new(stats_cache_size, 300));
+        let page_row_limit = cfg.parquet.timefusion_page_row_count_limit;
+        let statistics_extractor = Arc::new(DeltaStatisticsExtractor::new(stats_cache_size, 300, page_row_limit));
 
         let db = Self {
+            config: cfg,
             project_configs: Arc::new(RwLock::new(project_configs)),
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
@@ -374,8 +380,17 @@ impl Database {
             buffered_layer: None,
         };
 
-        // Cache is already initialized above, no need to call with_object_store_cache()
         Ok(db)
+    }
+
+    /// Create a new Database using global config (for production).
+    /// For tests, prefer `with_config()` to pass config explicitly.
+    pub async fn new() -> Result<Self> {
+        let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+        // Convert &'static to Arc - it's fine since static lives forever
+        // We clone the config to create an owned Arc
+        let cfg_arc = Arc::new(cfg.clone());
+        Self::with_config(cfg_arc).await
     }
 
     /// Set the batch queue to use for insert operations
@@ -406,12 +421,11 @@ impl Database {
     pub async fn start_maintenance_schedulers(self) -> Result<Self> {
         use tokio_cron_scheduler::{Job, JobScheduler};
 
-        let cfg = config::config();
         let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
 
         // Light optimize job - every 5 minutes for small recent files
-        let light_optimize_schedule = &cfg.maintenance.timefusion_light_optimize_schedule;
+        let light_optimize_schedule = &self.config.maintenance.timefusion_light_optimize_schedule;
 
         if !light_optimize_schedule.is_empty() {
             info!("Light optimize job scheduled with cron expression: {}", light_optimize_schedule);
@@ -442,7 +456,7 @@ impl Database {
         }
 
         // Optimize job - configurable schedule (default: every 30mins)
-        let optimize_schedule = &cfg.maintenance.timefusion_optimize_schedule;
+        let optimize_schedule = &self.config.maintenance.timefusion_optimize_schedule;
 
         if !optimize_schedule.is_empty() {
             info!(
@@ -471,8 +485,8 @@ impl Database {
         }
 
         // Vacuum job - configurable schedule (default: daily at 2AM)
-        let vacuum_schedule = &cfg.maintenance.timefusion_vacuum_schedule;
-        let vacuum_retention = cfg.maintenance.timefusion_vacuum_retention_hours;
+        let vacuum_schedule = &self.config.maintenance.timefusion_vacuum_schedule;
+        let vacuum_retention = self.config.maintenance.timefusion_vacuum_retention_hours;
 
         if !vacuum_schedule.is_empty() {
             info!("Vacuum job scheduled with cron expression: {}", vacuum_schedule);
@@ -621,10 +635,9 @@ impl Database {
         let _ = options.set("datafusion.optimizer.max_passes", "5");
 
         // Configure memory limit for DataFusion operations
-        let cfg = config::config();
-        let memory_limit_bytes = cfg.memory.memory_limit_bytes();
-        let memory_fraction = cfg.memory.timefusion_memory_fraction;
-        let sort_spill_reservation_bytes = cfg.memory.timefusion_sort_spill_reservation_bytes.unwrap_or(67_108_864);
+        let memory_limit_bytes = self.config.memory.memory_limit_bytes();
+        let memory_fraction = self.config.memory.timefusion_memory_fraction;
+        let sort_spill_reservation_bytes = self.config.memory.timefusion_sort_spill_reservation_bytes.unwrap_or(67_108_864);
 
         // Set memory-related configuration options
         let _ = options.set("datafusion.execution.memory_fraction", &memory_fraction.to_string());
@@ -639,7 +652,7 @@ impl Database {
         let runtime_env = Arc::new(runtime_env);
 
         // Set up tracing options with configurable sampling
-        let record_metrics = cfg.memory.timefusion_tracing_record_metrics;
+        let record_metrics = self.config.memory.timefusion_tracing_record_metrics;
 
         let tracing_options = InstrumentationOptions::builder().record_metrics(record_metrics).preview_limit(5).build();
 
@@ -914,22 +927,21 @@ impl Database {
             }
 
             // Add DynamoDB locking configuration if enabled (even for project-specific configs)
-            let cfg = config::config();
-            if cfg.aws.is_dynamodb_locking_enabled() {
+            if self.config.aws.is_dynamodb_locking_enabled() {
                 storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
-                if let Some(ref table) = cfg.aws.dynamodb.delta_dynamo_table_name {
+                if let Some(ref table) = self.config.aws.dynamodb.delta_dynamo_table_name {
                     storage_options.insert("delta_dynamo_table_name".to_string(), table.clone());
                 }
-                if let Some(ref key) = cfg.aws.dynamodb.aws_access_key_id_dynamodb {
+                if let Some(ref key) = self.config.aws.dynamodb.aws_access_key_id_dynamodb {
                     storage_options.insert("aws_access_key_id_dynamodb".to_string(), key.clone());
                 }
-                if let Some(ref secret) = cfg.aws.dynamodb.aws_secret_access_key_dynamodb {
+                if let Some(ref secret) = self.config.aws.dynamodb.aws_secret_access_key_dynamodb {
                     storage_options.insert("aws_secret_access_key_dynamodb".to_string(), secret.clone());
                 }
-                if let Some(ref region) = cfg.aws.dynamodb.aws_region_dynamodb {
+                if let Some(ref region) = self.config.aws.dynamodb.aws_region_dynamodb {
                     storage_options.insert("aws_region_dynamodb".to_string(), region.clone());
                 }
-                if let Some(ref endpoint) = cfg.aws.dynamodb.aws_endpoint_url_dynamodb {
+                if let Some(ref endpoint) = self.config.aws.dynamodb.aws_endpoint_url_dynamodb {
                     storage_options.insert("aws_endpoint_url_dynamodb".to_string(), endpoint.clone());
                 }
             }
@@ -1005,7 +1017,7 @@ impl Database {
 
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
 
-                    let checkpoint_interval = config::config().parquet.timefusion_checkpoint_interval.to_string();
+                    let checkpoint_interval = self.config.parquet.timefusion_checkpoint_interval.to_string();
 
                     let mut config = HashMap::new();
                     config.insert("delta.checkpointInterval".to_string(), Some(checkpoint_interval));
@@ -1096,26 +1108,25 @@ impl Database {
         }
 
         // Use config values as fallback
-        let cfg = config::config();
         if storage_options.get("aws_access_key_id").is_none()
-            && let Some(ref key) = cfg.aws.aws_access_key_id
+            && let Some(ref key) = self.config.aws.aws_access_key_id
         {
             builder = builder.with_access_key_id(key);
         }
         if storage_options.get("aws_secret_access_key").is_none()
-            && let Some(ref secret) = cfg.aws.aws_secret_access_key
+            && let Some(ref secret) = self.config.aws.aws_secret_access_key
         {
             builder = builder.with_secret_access_key(secret);
         }
         if storage_options.get("aws_region").is_none()
-            && let Some(ref region) = cfg.aws.aws_default_region
+            && let Some(ref region) = self.config.aws.aws_default_region
         {
             builder = builder.with_region(region);
         }
 
         // Check if we need to use config for endpoint and allow HTTP
         if storage_options.get("aws_endpoint").is_none() {
-            let endpoint = &cfg.aws.aws_s3_endpoint;
+            let endpoint = &self.config.aws.aws_s3_endpoint;
             builder = builder.with_endpoint(endpoint);
             if endpoint.starts_with("http://") {
                 builder = builder.with_allow_http(true);
@@ -1182,7 +1193,7 @@ impl Database {
         }
 
         // Fallback to legacy batch queue if configured
-        let enable_queue = config::config().core.enable_batch_queue;
+        let enable_queue = self.config.core.enable_batch_queue;
         if !skip_queue && enable_queue && self.batch_queue.is_some() {
             span.record("use_queue", true);
             let queue = self.batch_queue.as_ref().unwrap();
@@ -1202,7 +1213,7 @@ impl Database {
         // Get the appropriate schema for this table
         let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
 
-        let writer_properties = Self::create_writer_properties(schema.sorting_columns());
+        let writer_properties = self.create_writer_properties(schema.sorting_columns());
 
         // Retry logic for concurrent writes
         let max_retries = 5;
@@ -1310,7 +1321,7 @@ impl Database {
         };
 
         // Get configurable target size
-        let target_size = config::config().parquet.timefusion_optimize_target_size;
+        let target_size = self.config.parquet.timefusion_optimize_target_size;
 
         // Calculate dates for filtering - last 2 days (today and yesterday)
         let today = Utc::now().date_naive();
@@ -1325,7 +1336,7 @@ impl Database {
 
         // Z-order files for better query performance on timestamp and service_name filters
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let writer_properties = Self::create_writer_properties(schema.sorting_columns());
+        let writer_properties = self.create_writer_properties(schema.sorting_columns());
 
         let optimize_result = table_clone
             .optimize()
@@ -1390,7 +1401,7 @@ impl Database {
             .with_filters(&partition_filters)
             .with_type(deltalake::operations::optimize::OptimizeType::Compact)
             .with_target_size(16 * 1024 * 1024)
-            .with_writer_properties(Self::create_writer_properties(schema.sorting_columns()))
+            .with_writer_properties(self.create_writer_properties(schema.sorting_columns()))
             .with_min_commit_interval(tokio::time::Duration::from_secs(30)) // 1 minute min interval
             .await;
 
@@ -1994,17 +2005,32 @@ impl Drop for Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
     use crate::test_utils::test_helpers::*;
     use serial_test::serial;
+    use std::path::PathBuf;
+
+    fn create_test_config(test_id: &str) -> Arc<AppConfig> {
+        let mut cfg = AppConfig::default();
+        // S3/MinIO settings
+        cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
+        cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
+        cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
+        cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
+        cfg.aws.aws_default_region = Some("us-east-1".to_string());
+        cfg.aws.aws_allow_http = Some("true".to_string());
+        // Core settings - unique per test
+        cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
+        cfg.core.walrus_data_dir = PathBuf::from(format!("/tmp/walrus-db-{}", test_id));
+        // Disable Foyer cache for tests
+        cfg.cache.timefusion_foyer_disabled = true;
+        Arc::new(cfg)
+    }
 
     async fn setup_test_database() -> Result<(Database, SessionContext, String)> {
-        dotenv::dotenv().ok();
         let test_prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        unsafe {
-            std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-            std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
-        }
-        let db = Database::new().await?;
+        let cfg = create_test_config(&test_prefix);
+        let db = Database::with_config(cfg).await?;
         let db_arc = Arc::new(db.clone());
         let mut ctx = db_arc.create_session_context();
         datafusion_functions_json::register_all(&mut ctx)?;
