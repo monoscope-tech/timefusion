@@ -395,59 +395,40 @@ impl MemBuffer {
     }
 
     pub fn get_flushable_buckets(&self, cutoff_bucket_id: i64) -> Vec<FlushableBucket> {
-        let mut flushable = Vec::new();
-
-        for project_entry in self.projects.iter() {
-            let project_id = project_entry.key().clone();
-            for table_entry in project_entry.table_buffers.iter() {
-                let table_name = table_entry.key().clone();
-                for bucket_entry in table_entry.buckets.iter() {
-                    let bucket_id = *bucket_entry.key();
-                    if bucket_id < cutoff_bucket_id
-                        && let Ok(batches) = bucket_entry.batches.read()
-                        && !batches.is_empty()
-                    {
-                        flushable.push(FlushableBucket {
-                            project_id: project_id.clone(),
-                            table_name: table_name.clone(),
-                            bucket_id,
-                            batches: batches.clone(),
-                            row_count: bucket_entry.row_count.load(Ordering::Relaxed),
-                        });
-                    }
-                }
-            }
-        }
-
+        let flushable = self.collect_buckets(|bucket_id| bucket_id < cutoff_bucket_id);
         info!("MemBuffer flushable buckets: count={}, cutoff={}", flushable.len(), cutoff_bucket_id);
         flushable
     }
 
     pub fn get_all_buckets(&self) -> Vec<FlushableBucket> {
-        let mut all_buckets = Vec::new();
+        self.collect_buckets(|_| true)
+    }
 
-        for project_entry in self.projects.iter() {
-            let project_id = project_entry.key().clone();
-            for table_entry in project_entry.table_buffers.iter() {
-                let table_name = table_entry.key().clone();
-                for bucket_entry in table_entry.buckets.iter() {
-                    let bucket_id = *bucket_entry.key();
-                    if let Ok(batches) = bucket_entry.batches.read()
-                        && !batches.is_empty()
-                    {
-                        all_buckets.push(FlushableBucket {
-                            project_id: project_id.clone(),
-                            table_name: table_name.clone(),
-                            bucket_id,
-                            batches: batches.clone(),
-                            row_count: bucket_entry.row_count.load(Ordering::Relaxed),
-                        });
+    fn collect_buckets(&self, filter: impl Fn(i64) -> bool) -> Vec<FlushableBucket> {
+        let mut result = Vec::new();
+        for project in self.projects.iter() {
+            let project_id = project.key().clone();
+            for table in project.table_buffers.iter() {
+                let table_name = table.key().clone();
+                for bucket in table.buckets.iter() {
+                    let bucket_id = *bucket.key();
+                    if filter(bucket_id) {
+                        if let Ok(batches) = bucket.batches.read() {
+                            if !batches.is_empty() {
+                                result.push(FlushableBucket {
+                                    project_id: project_id.clone(),
+                                    table_name: table_name.clone(),
+                                    bucket_id,
+                                    batches: batches.clone(),
+                                    row_count: bucket.row_count.load(Ordering::Relaxed),
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
-
-        all_buckets
+        result
     }
 
     #[instrument(skip(self))]
@@ -668,25 +649,23 @@ impl MemBuffer {
     }
 
     pub fn get_stats(&self) -> MemBufferStats {
-        let mut stats = MemBufferStats {
-            project_count: self.projects.len(),
-            estimated_memory_bytes: self.estimated_bytes.load(Ordering::Relaxed),
-            ..Default::default()
-        };
-
-        for project_entry in self.projects.iter() {
-            for table_entry in project_entry.table_buffers.iter() {
-                stats.total_buckets += table_entry.buckets.len();
-                for bucket_entry in table_entry.buckets.iter() {
-                    stats.total_rows += bucket_entry.row_count.load(Ordering::Relaxed);
-                    if let Ok(batches) = bucket_entry.batches.read() {
-                        stats.total_batches += batches.len();
-                    }
+        let (mut total_buckets, mut total_rows, mut total_batches) = (0, 0, 0);
+        for project in self.projects.iter() {
+            for table in project.table_buffers.iter() {
+                total_buckets += table.buckets.len();
+                for bucket in table.buckets.iter() {
+                    total_rows += bucket.row_count.load(Ordering::Relaxed);
+                    total_batches += bucket.batches.read().map(|b| b.len()).unwrap_or(0);
                 }
             }
         }
-
-        stats
+        MemBufferStats {
+            project_count: self.projects.len(),
+            total_buckets,
+            total_rows,
+            total_batches,
+            estimated_memory_bytes: self.estimated_bytes.load(Ordering::Relaxed),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
