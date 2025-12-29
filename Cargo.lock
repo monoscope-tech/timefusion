@@ -6818,6 +6818,7 @@ dependencies = [
  "sqlx",
  "tdigests",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-cron-scheduler",
  "tokio-postgres",

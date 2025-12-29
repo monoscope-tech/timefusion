@@ -7,7 +7,6 @@ use std::time::Duration;
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
 /// Load config from environment variables.
-/// Returns a new AppConfig instance - caller decides whether to store globally or pass around.
 pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
     // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
     // See: https://github.com/softprops/envy/issues/26
@@ -24,7 +23,6 @@ pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
 }
 
 /// Initialize global config from environment (for production use).
-/// Returns the static reference. Subsequent calls return the same config.
 pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
     if let Some(cfg) = CONFIG.get() {
         return Ok(cfg);
@@ -35,17 +33,62 @@ pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
 }
 
 /// Get global config. Panics if not initialized.
-/// Prefer passing AppConfig explicitly where possible.
 pub fn config() -> &'static AppConfig {
     CONFIG.get().expect("Config not initialized. Call init_config() first.")
 }
 
-fn default_true() -> bool {
-    true
+// Macro to generate const default functions for serde
+macro_rules! const_default {
+    ($name:ident: bool = $val:expr) => { fn $name() -> bool { $val } };
+    ($name:ident: u64 = $val:expr) => { fn $name() -> u64 { $val } };
+    ($name:ident: u16 = $val:expr) => { fn $name() -> u16 { $val } };
+    ($name:ident: i32 = $val:expr) => { fn $name() -> i32 { $val } };
+    ($name:ident: i64 = $val:expr) => { fn $name() -> i64 { $val } };
+    ($name:ident: usize = $val:expr) => { fn $name() -> usize { $val } };
+    ($name:ident: f64 = $val:expr) => { fn $name() -> f64 { $val } };
+    ($name:ident: String = $val:expr) => { fn $name() -> String { $val.into() } };
+    ($name:ident: PathBuf = $val:expr) => { fn $name() -> PathBuf { PathBuf::from($val) } };
 }
-fn default_true_string() -> String {
-    "true".into()
-}
+
+// All default value functions using the macro
+const_default!(d_true: bool = true);
+const_default!(d_s3_endpoint: String = "https://s3.amazonaws.com");
+const_default!(d_wal_dir: PathBuf = "/var/lib/timefusion/wal");
+const_default!(d_pgwire_port: u16 = 5432);
+const_default!(d_table_prefix: String = "timefusion");
+const_default!(d_batch_queue_capacity: usize = 100_000_000);
+const_default!(d_flush_interval: u64 = 600);
+const_default!(d_retention_mins: u64 = 70);
+const_default!(d_eviction_interval: u64 = 60);
+const_default!(d_buffer_max_memory: usize = 4096);
+const_default!(d_shutdown_timeout: u64 = 5);
+const_default!(d_wal_corruption_threshold: usize = 10);
+const_default!(d_foyer_memory_mb: usize = 512);
+const_default!(d_foyer_disk_gb: usize = 100);
+const_default!(d_foyer_ttl: u64 = 604_800); // 7 days
+const_default!(d_cache_dir: PathBuf = "/tmp/timefusion_cache");
+const_default!(d_foyer_shards: usize = 8);
+const_default!(d_foyer_file_size_mb: usize = 32);
+const_default!(d_foyer_stats: String = "true");
+const_default!(d_metadata_size_hint: usize = 1_048_576);
+const_default!(d_metadata_memory_mb: usize = 512);
+const_default!(d_metadata_disk_gb: usize = 5);
+const_default!(d_metadata_shards: usize = 4);
+const_default!(d_page_rows: usize = 20_000);
+const_default!(d_zstd_level: i32 = 3);
+const_default!(d_row_group_size: usize = 134_217_728); // 128MB
+const_default!(d_checkpoint_interval: u64 = 10);
+const_default!(d_optimize_target: i64 = 128 * 1024 * 1024);
+const_default!(d_stats_cache_size: usize = 50);
+const_default!(d_vacuum_retention: u64 = 72);
+const_default!(d_light_schedule: String = "0 */5 * * * *");
+const_default!(d_optimize_schedule: String = "0 */30 * * * *");
+const_default!(d_vacuum_schedule: String = "0 0 2 * * *");
+const_default!(d_mem_gb: usize = 8);
+const_default!(d_mem_fraction: f64 = 0.9);
+const_default!(d_otlp_endpoint: String = "http://localhost:4317");
+const_default!(d_service_name: String = "timefusion");
+fn d_service_version() -> String { env!("CARGO_PKG_VERSION").into() }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
@@ -67,10 +110,6 @@ pub struct AppConfig {
     pub telemetry: TelemetryConfig,
 }
 
-// ============================================================================
-// AWS / S3 Configuration
-// ============================================================================
-
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AwsConfig {
     #[serde(default)]
@@ -79,7 +118,7 @@ pub struct AwsConfig {
     pub aws_secret_access_key: Option<String>,
     #[serde(default)]
     pub aws_default_region: Option<String>,
-    #[serde(default = "default_s3_endpoint")]
+    #[serde(default = "d_s3_endpoint")]
     pub aws_s3_endpoint: String,
     #[serde(default)]
     pub aws_s3_bucket: Option<String>,
@@ -87,10 +126,6 @@ pub struct AwsConfig {
     pub aws_allow_http: Option<String>,
     #[serde(flatten)]
     pub dynamodb: DynamoDbConfig,
-}
-
-fn default_s3_endpoint() -> String {
-    "https://s3.amazonaws.com".into()
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -149,94 +184,44 @@ impl AwsConfig {
     }
 }
 
-// ============================================================================
-// Core Application Configuration
-// ============================================================================
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
-    #[serde(default = "default_wal_dir")]
+    #[serde(default = "d_wal_dir")]
     pub walrus_data_dir: PathBuf,
-    #[serde(default = "default_pgwire_port")]
+    #[serde(default = "d_pgwire_port")]
     pub pgwire_port: u16,
-    #[serde(default = "default_table_prefix")]
+    #[serde(default = "d_table_prefix")]
     pub timefusion_table_prefix: String,
     #[serde(default)]
     pub timefusion_config_database_url: Option<String>,
     #[serde(default)]
     pub enable_batch_queue: bool,
-    #[serde(default = "default_batch_queue_capacity")]
+    #[serde(default = "d_batch_queue_capacity")]
     pub timefusion_batch_queue_capacity: usize,
 }
 
-fn default_wal_dir() -> PathBuf {
-    PathBuf::from("/var/lib/timefusion/wal")
-}
-fn default_pgwire_port() -> u16 {
-    5432
-}
-fn default_table_prefix() -> String {
-    "timefusion".into()
-}
-fn default_batch_queue_capacity() -> usize {
-    100_000_000
-}
-
-// ============================================================================
-// Buffer / WAL Configuration
-// ============================================================================
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct BufferConfig {
-    #[serde(default = "default_flush_interval")]
+    #[serde(default = "d_flush_interval")]
     pub timefusion_flush_interval_secs: u64,
-    #[serde(default = "default_retention_mins")]
+    #[serde(default = "d_retention_mins")]
     pub timefusion_buffer_retention_mins: u64,
-    #[serde(default = "default_eviction_interval")]
+    #[serde(default = "d_eviction_interval")]
     pub timefusion_eviction_interval_secs: u64,
-    #[serde(default = "default_buffer_max_memory")]
+    #[serde(default = "d_buffer_max_memory")]
     pub timefusion_buffer_max_memory_mb: usize,
-    #[serde(default = "default_shutdown_timeout")]
+    #[serde(default = "d_shutdown_timeout")]
     pub timefusion_shutdown_timeout_secs: u64,
-    #[serde(default = "default_wal_corruption_threshold")]
+    #[serde(default = "d_wal_corruption_threshold")]
     pub timefusion_wal_corruption_threshold: usize,
 }
 
-fn default_flush_interval() -> u64 {
-    600
-}
-fn default_retention_mins() -> u64 {
-    70
-}
-fn default_eviction_interval() -> u64 {
-    60
-}
-fn default_buffer_max_memory() -> usize {
-    4096
-}
-fn default_shutdown_timeout() -> u64 {
-    5
-}
-fn default_wal_corruption_threshold() -> usize {
-    10
-}
-
 impl BufferConfig {
-    pub fn flush_interval_secs(&self) -> u64 {
-        self.timefusion_flush_interval_secs.max(1)
-    }
-    pub fn retention_mins(&self) -> u64 {
-        self.timefusion_buffer_retention_mins.max(1)
-    }
-    pub fn eviction_interval_secs(&self) -> u64 {
-        self.timefusion_eviction_interval_secs.max(1)
-    }
-    pub fn max_memory_mb(&self) -> usize {
-        self.timefusion_buffer_max_memory_mb.max(64)
-    }
-    pub fn wal_corruption_threshold(&self) -> usize {
-        self.timefusion_wal_corruption_threshold
-    }
+    pub fn flush_interval_secs(&self) -> u64 { self.timefusion_flush_interval_secs.max(1) }
+    pub fn retention_mins(&self) -> u64 { self.timefusion_buffer_retention_mins.max(1) }
+    pub fn eviction_interval_secs(&self) -> u64 { self.timefusion_eviction_interval_secs.max(1) }
+    pub fn max_memory_mb(&self) -> usize { self.timefusion_buffer_max_memory_mb.max(64) }
+    pub fn wal_corruption_threshold(&self) -> usize { self.timefusion_wal_corruption_threshold }
 
     pub fn compute_shutdown_timeout(&self, current_memory_mb: usize) -> Duration {
         let secs = self.timefusion_shutdown_timeout_secs.max(1) + (current_memory_mb / 100) as u64;
@@ -244,299 +229,117 @@ impl BufferConfig {
     }
 }
 
-// ============================================================================
-// Foyer Cache Configuration
-// ============================================================================
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
-    #[serde(default = "default_512")]
+    #[serde(default = "d_foyer_memory_mb")]
     pub timefusion_foyer_memory_mb: usize,
     #[serde(default)]
     pub timefusion_foyer_disk_mb: Option<usize>,
-    #[serde(default = "default_100")]
+    #[serde(default = "d_foyer_disk_gb")]
     pub timefusion_foyer_disk_gb: usize,
-    #[serde(default = "default_ttl")]
+    #[serde(default = "d_foyer_ttl")]
     pub timefusion_foyer_ttl_seconds: u64,
-    #[serde(default = "default_cache_dir")]
+    #[serde(default = "d_cache_dir")]
     pub timefusion_foyer_cache_dir: PathBuf,
-    #[serde(default = "default_8")]
+    #[serde(default = "d_foyer_shards")]
     pub timefusion_foyer_shards: usize,
-    #[serde(default = "default_32")]
+    #[serde(default = "d_foyer_file_size_mb")]
     pub timefusion_foyer_file_size_mb: usize,
-    #[serde(default = "default_true_string")]
+    #[serde(default = "d_foyer_stats")]
     pub timefusion_foyer_stats: String,
-    #[serde(default = "default_1mb")]
+    #[serde(default = "d_metadata_size_hint")]
     pub timefusion_parquet_metadata_size_hint: usize,
-    #[serde(default = "default_512")]
+    #[serde(default = "d_metadata_memory_mb")]
     pub timefusion_foyer_metadata_memory_mb: usize,
     #[serde(default)]
     pub timefusion_foyer_metadata_disk_mb: Option<usize>,
-    #[serde(default = "default_5")]
+    #[serde(default = "d_metadata_disk_gb")]
     pub timefusion_foyer_metadata_disk_gb: usize,
-    #[serde(default = "default_4")]
+    #[serde(default = "d_metadata_shards")]
     pub timefusion_foyer_metadata_shards: usize,
     #[serde(default)]
     pub timefusion_foyer_disabled: bool,
 }
 
-fn default_512() -> usize {
-    512
-}
-fn default_100() -> usize {
-    100
-}
-fn default_ttl() -> u64 {
-    604_800
-} // 7 days
-fn default_cache_dir() -> PathBuf {
-    PathBuf::from("/tmp/timefusion_cache")
-}
-fn default_8() -> usize {
-    8
-}
-fn default_32() -> usize {
-    32
-}
-fn default_1mb() -> usize {
-    1_048_576
-}
-fn default_5() -> usize {
-    5
-}
-fn default_4() -> usize {
-    4
-}
-
 impl CacheConfig {
-    pub fn is_disabled(&self) -> bool {
-        self.timefusion_foyer_disabled
-    }
-    pub fn ttl(&self) -> Duration {
-        Duration::from_secs(self.timefusion_foyer_ttl_seconds)
-    }
-    pub fn stats_enabled(&self) -> bool {
-        self.timefusion_foyer_stats.to_lowercase() == "true"
-    }
-
-    pub fn memory_size_bytes(&self) -> usize {
-        self.timefusion_foyer_memory_mb * 1024 * 1024
-    }
+    pub fn is_disabled(&self) -> bool { self.timefusion_foyer_disabled }
+    pub fn ttl(&self) -> Duration { Duration::from_secs(self.timefusion_foyer_ttl_seconds) }
+    pub fn stats_enabled(&self) -> bool { self.timefusion_foyer_stats.eq_ignore_ascii_case("true") }
+    pub fn memory_size_bytes(&self) -> usize { self.timefusion_foyer_memory_mb * 1024 * 1024 }
     pub fn disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_disk_mb.map(|mb| mb * 1024 * 1024).unwrap_or(self.timefusion_foyer_disk_gb * 1024 * 1024 * 1024)
+        self.timefusion_foyer_disk_mb.map_or(self.timefusion_foyer_disk_gb * 1024 * 1024 * 1024, |mb| mb * 1024 * 1024)
     }
-    pub fn file_size_bytes(&self) -> usize {
-        self.timefusion_foyer_file_size_mb * 1024 * 1024
-    }
-    pub fn metadata_memory_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_memory_mb * 1024 * 1024
-    }
+    pub fn file_size_bytes(&self) -> usize { self.timefusion_foyer_file_size_mb * 1024 * 1024 }
+    pub fn metadata_memory_size_bytes(&self) -> usize { self.timefusion_foyer_metadata_memory_mb * 1024 * 1024 }
     pub fn metadata_disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_disk_mb
-            .map(|mb| mb * 1024 * 1024)
-            .unwrap_or(self.timefusion_foyer_metadata_disk_gb * 1024 * 1024 * 1024)
+        self.timefusion_foyer_metadata_disk_mb.map_or(self.timefusion_foyer_metadata_disk_gb * 1024 * 1024 * 1024, |mb| mb * 1024 * 1024)
     }
 }
-
-// ============================================================================
-// Parquet / Writer Configuration
-// ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParquetConfig {
-    #[serde(default = "default_page_rows")]
+    #[serde(default = "d_page_rows")]
     pub timefusion_page_row_count_limit: usize,
-    #[serde(default = "default_zstd")]
+    #[serde(default = "d_zstd_level")]
     pub timefusion_zstd_compression_level: i32,
-    #[serde(default = "default_row_group")]
+    #[serde(default = "d_row_group_size")]
     pub timefusion_max_row_group_size: usize,
-    #[serde(default = "default_10")]
+    #[serde(default = "d_checkpoint_interval")]
     pub timefusion_checkpoint_interval: u64,
-    #[serde(default = "default_target_size")]
+    #[serde(default = "d_optimize_target")]
     pub timefusion_optimize_target_size: i64,
-    #[serde(default = "default_50")]
+    #[serde(default = "d_stats_cache_size")]
     pub timefusion_stats_cache_size: usize,
 }
 
-fn default_page_rows() -> usize {
-    20_000
-}
-fn default_zstd() -> i32 {
-    3
-}
-fn default_row_group() -> usize {
-    134_217_728
-} // 128MB
-fn default_10() -> u64 {
-    10
-}
-fn default_target_size() -> i64 {
-    128 * 1024 * 1024
-}
-fn default_50() -> usize {
-    50
-}
-
-// ============================================================================
-// Maintenance / Scheduler Configuration
-// ============================================================================
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct MaintenanceConfig {
-    #[serde(default = "default_vacuum_retention")]
+    #[serde(default = "d_vacuum_retention")]
     pub timefusion_vacuum_retention_hours: u64,
-    #[serde(default = "default_light_schedule")]
+    #[serde(default = "d_light_schedule")]
     pub timefusion_light_optimize_schedule: String,
-    #[serde(default = "default_optimize_schedule")]
+    #[serde(default = "d_optimize_schedule")]
     pub timefusion_optimize_schedule: String,
-    #[serde(default = "default_vacuum_schedule")]
+    #[serde(default = "d_vacuum_schedule")]
     pub timefusion_vacuum_schedule: String,
 }
 
-fn default_vacuum_retention() -> u64 {
-    72
-}
-fn default_light_schedule() -> String {
-    "0 */5 * * * *".into()
-}
-fn default_optimize_schedule() -> String {
-    "0 */30 * * * *".into()
-}
-fn default_vacuum_schedule() -> String {
-    "0 0 2 * * *".into()
-}
-
-// ============================================================================
-// DataFusion Memory Configuration
-// ============================================================================
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
-    #[serde(default = "default_mem_gb")]
+    #[serde(default = "d_mem_gb")]
     pub timefusion_memory_limit_gb: usize,
-    #[serde(default = "default_fraction")]
+    #[serde(default = "d_mem_fraction")]
     pub timefusion_memory_fraction: f64,
     #[serde(default)]
     pub timefusion_sort_spill_reservation_bytes: Option<usize>,
-    #[serde(default = "default_true")]
+    #[serde(default = "d_true")]
     pub timefusion_tracing_record_metrics: bool,
 }
 
-fn default_mem_gb() -> usize {
-    8
-}
-fn default_fraction() -> f64 {
-    0.9
-}
-
 impl MemoryConfig {
-    pub fn memory_limit_bytes(&self) -> usize {
-        self.timefusion_memory_limit_gb * 1024 * 1024 * 1024
-    }
+    pub fn memory_limit_bytes(&self) -> usize { self.timefusion_memory_limit_gb * 1024 * 1024 * 1024 }
 }
-
-// ============================================================================
-// Telemetry / OpenTelemetry Configuration
-// ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
-    #[serde(default = "default_otlp")]
+    #[serde(default = "d_otlp_endpoint")]
     pub otel_exporter_otlp_endpoint: String,
-    #[serde(default = "default_service")]
+    #[serde(default = "d_service_name")]
     pub otel_service_name: String,
-    #[serde(default = "default_version")]
+    #[serde(default = "d_service_version")]
     pub otel_service_version: String,
     #[serde(default)]
     pub log_format: Option<String>,
 }
 
-fn default_otlp() -> String {
-    "http://localhost:4317".into()
-}
-fn default_service() -> String {
-    "timefusion".into()
-}
-fn default_version() -> String {
-    env!("CARGO_PKG_VERSION").into()
-}
-
 impl TelemetryConfig {
-    pub fn is_json_logging(&self) -> bool {
-        self.log_format.as_deref() == Some("json")
-    }
+    pub fn is_json_logging(&self) -> bool { self.log_format.as_deref() == Some("json") }
 }
-
-// ============================================================================
-// Default implementation for testing and programmatic config construction
-// ============================================================================
 
 impl Default for AppConfig {
     fn default() -> Self {
-        envy::from_iter::<_, Self>(std::iter::empty::<(String, String)>()).unwrap_or_else(|_| {
-            // Fallback with manual defaults if envy fails
-            Self {
-                aws: AwsConfig::default(),
-                core: CoreConfig {
-                    walrus_data_dir: default_wal_dir(),
-                    pgwire_port: default_pgwire_port(),
-                    timefusion_table_prefix: default_table_prefix(),
-                    timefusion_config_database_url: None,
-                    enable_batch_queue: false,
-                    timefusion_batch_queue_capacity: default_batch_queue_capacity(),
-                },
-                buffer: BufferConfig {
-                    timefusion_flush_interval_secs: default_flush_interval(),
-                    timefusion_buffer_retention_mins: default_retention_mins(),
-                    timefusion_eviction_interval_secs: default_eviction_interval(),
-                    timefusion_buffer_max_memory_mb: default_buffer_max_memory(),
-                    timefusion_shutdown_timeout_secs: default_shutdown_timeout(),
-                    timefusion_wal_corruption_threshold: default_wal_corruption_threshold(),
-                },
-                cache: CacheConfig {
-                    timefusion_foyer_memory_mb: default_512(),
-                    timefusion_foyer_disk_mb: None,
-                    timefusion_foyer_disk_gb: default_100(),
-                    timefusion_foyer_ttl_seconds: default_ttl(),
-                    timefusion_foyer_cache_dir: default_cache_dir(),
-                    timefusion_foyer_shards: default_8(),
-                    timefusion_foyer_file_size_mb: default_32(),
-                    timefusion_foyer_stats: default_true_string(),
-                    timefusion_parquet_metadata_size_hint: default_1mb(),
-                    timefusion_foyer_metadata_memory_mb: default_512(),
-                    timefusion_foyer_metadata_disk_mb: None,
-                    timefusion_foyer_metadata_disk_gb: default_5(),
-                    timefusion_foyer_metadata_shards: default_4(),
-                    timefusion_foyer_disabled: false,
-                },
-                parquet: ParquetConfig {
-                    timefusion_page_row_count_limit: default_page_rows(),
-                    timefusion_zstd_compression_level: default_zstd(),
-                    timefusion_max_row_group_size: default_row_group(),
-                    timefusion_checkpoint_interval: default_10(),
-                    timefusion_optimize_target_size: default_target_size(),
-                    timefusion_stats_cache_size: default_50(),
-                },
-                maintenance: MaintenanceConfig {
-                    timefusion_vacuum_retention_hours: default_vacuum_retention(),
-                    timefusion_light_optimize_schedule: default_light_schedule(),
-                    timefusion_optimize_schedule: default_optimize_schedule(),
-                    timefusion_vacuum_schedule: default_vacuum_schedule(),
-                },
-                memory: MemoryConfig {
-                    timefusion_memory_limit_gb: default_mem_gb(),
-                    timefusion_memory_fraction: default_fraction(),
-                    timefusion_sort_spill_reservation_bytes: None,
-                    timefusion_tracing_record_metrics: true,
-                },
-                telemetry: TelemetryConfig {
-                    otel_exporter_otlp_endpoint: default_otlp(),
-                    otel_service_name: default_service(),
-                    otel_service_version: default_version(),
-                    log_format: None,
-                },
-            }
-        })
+        envy::from_iter::<_, Self>(std::iter::empty::<(String, String)>())
+            .expect("Default config should always succeed with serde defaults")
     }
 }
 
@@ -556,7 +359,7 @@ mod tests {
     fn test_buffer_min_enforcement() {
         let mut config = AppConfig::default();
         config.buffer.timefusion_buffer_max_memory_mb = 10;
-        assert_eq!(config.buffer.max_memory_mb(), 64); // min enforced
+        assert_eq!(config.buffer.max_memory_mb(), 64);
     }
 
     #[test]

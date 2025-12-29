@@ -79,18 +79,15 @@ impl QueryPlanner for DmlQueryPlanner {
                 span.record("table.name", table_name.as_str());
                 span.record("project_id", project_id.as_str());
 
-                Ok(Arc::new(if is_update {
+                let exec = if is_update {
                     DmlExec::update(table_name, project_id, input_exec, self.database.clone())
                         .predicate(predicate)
                         .assignments(assignments.unwrap_or_default())
-                        .buffered_layer(self.buffered_layer.clone())
-                        .build()
                 } else {
                     DmlExec::delete(table_name, project_id, input_exec, self.database.clone())
                         .predicate(predicate)
-                        .buffered_layer(self.buffered_layer.clone())
-                        .build()
-                }))
+                };
+                Ok(Arc::new(exec.buffered_layer(self.buffered_layer.clone())))
             }
             _ => self.planner.create_physical_plan(logical_plan, session_state).await,
         }
@@ -217,69 +214,22 @@ enum DmlOperation {
     Delete,
 }
 
-/// Builder for DmlExec
-pub struct DmlExecBuilder {
-    op_type: DmlOperation,
-    table_name: String,
-    project_id: String,
-    predicate: Option<Expr>,
-    assignments: Vec<(String, Expr)>,
-    input: Arc<dyn ExecutionPlan>,
-    database: Arc<Database>,
-    buffered_layer: Option<Arc<BufferedWriteLayer>>,
-}
-
-impl DmlExecBuilder {
-    fn new(op_type: DmlOperation, table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> Self {
-        Self {
-            op_type,
-            table_name,
-            project_id,
-            predicate: None,
-            assignments: vec![],
-            input,
-            database,
-            buffered_layer: None,
-        }
-    }
-
-    pub fn predicate(mut self, predicate: Option<Expr>) -> Self {
-        self.predicate = predicate;
-        self
-    }
-
-    pub fn assignments(mut self, assignments: Vec<(String, Expr)>) -> Self {
-        self.assignments = assignments;
-        self
-    }
-
-    pub fn buffered_layer(mut self, layer: Option<Arc<BufferedWriteLayer>>) -> Self {
-        self.buffered_layer = layer;
-        self
-    }
-
-    pub fn build(self) -> DmlExec {
-        DmlExec {
-            op_type: self.op_type,
-            table_name: self.table_name,
-            project_id: self.project_id,
-            predicate: self.predicate,
-            assignments: self.assignments,
-            input: self.input,
-            database: self.database,
-            buffered_layer: self.buffered_layer,
-        }
-    }
-}
-
 impl DmlExec {
-    pub fn update(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> DmlExecBuilder {
-        DmlExecBuilder::new(DmlOperation::Update, table_name, project_id, input, database)
+    fn new(op_type: DmlOperation, table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> Self {
+        Self { op_type, table_name, project_id, predicate: None, assignments: vec![], input, database, buffered_layer: None }
     }
 
-    pub fn delete(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> DmlExecBuilder {
-        DmlExecBuilder::new(DmlOperation::Delete, table_name, project_id, input, database)
+    pub fn update(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> Self {
+        Self::new(DmlOperation::Update, table_name, project_id, input, database)
     }
+
+    pub fn delete(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> Self {
+        Self::new(DmlOperation::Delete, table_name, project_id, input, database)
+    }
+
+    pub fn predicate(mut self, predicate: Option<Expr>) -> Self { self.predicate = predicate; self }
+    pub fn assignments(mut self, assignments: Vec<(String, Expr)>) -> Self { self.assignments = assignments; self }
+    pub fn buffered_layer(mut self, layer: Option<Arc<BufferedWriteLayer>>) -> Self { self.buffered_layer = layer; self }
 }
 
 impl DisplayAs for DmlExec {
@@ -406,75 +356,65 @@ impl ExecutionPlan for DmlExec {
     }
 }
 
-/// Perform UPDATE with MemBuffer support - update in memory first, then Delta if needed
-async fn perform_update_with_buffer(
-    database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
-    assignments: Vec<(String, Expr)>, span: &tracing::Span,
-) -> Result<u64> {
+/// Perform DML with MemBuffer support - operate on memory first, then Delta if needed
+async fn perform_dml_with_buffer<F, Fut>(
+    database: &Database,
+    buffered_layer: Option<&Arc<BufferedWriteLayer>>,
+    table_name: &str,
+    project_id: &str,
+    predicate: Option<Expr>,
+    op_name: &str,
+    mem_op: F,
+    delta_op: Fut,
+) -> Result<u64>
+where
+    F: FnOnce(&BufferedWriteLayer, Option<&Expr>) -> Result<u64>,
+    Fut: std::future::Future<Output = Result<u64>>,
+{
     let mut total_rows = 0u64;
-    let mut has_uncommitted_data = false;
+    let has_uncommitted = buffered_layer.is_some_and(|l| l.has_table(project_id, table_name));
 
-    // Step 1: Update in MemBuffer if available (uncommitted data)
-    if let Some(layer) = buffered_layer {
-        has_uncommitted_data = layer.has_table(project_id, table_name);
-        if has_uncommitted_data {
-            let mem_rows = layer.update(project_id, table_name, predicate.as_ref(), &assignments)?;
-            total_rows += mem_rows;
-            debug!("MemBuffer UPDATE: {} rows affected (uncommitted data)", mem_rows);
-        }
+    if let Some(layer) = buffered_layer.filter(|_| has_uncommitted) {
+        let mem_rows = mem_op(layer, predicate.as_ref())?;
+        total_rows += mem_rows;
+        debug!("MemBuffer {}: {} rows affected (uncommitted data)", op_name, mem_rows);
     }
 
-    // Step 2: Check if table has committed data in Delta
-    // Only go to Delta if there's committed data there (table exists in project_configs means it was flushed)
-    let has_committed_data = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
+    let has_committed = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
 
-    if has_committed_data {
-        let update_span = tracing::trace_span!(parent: span, "delta.update");
-        let delta_rows = perform_delta_update(database, table_name, project_id, predicate, assignments).instrument(update_span).await?;
+    if has_committed {
+        let delta_rows = delta_op.await?;
         total_rows += delta_rows;
-        debug!("Delta UPDATE: {} rows affected (committed data)", delta_rows);
-    } else if !has_uncommitted_data {
-        debug!("Skipping UPDATE - no data found in MemBuffer or Delta");
-    } else {
-        debug!("Skipping Delta UPDATE - all data is uncommitted (in MemBuffer only)");
+        debug!("Delta {}: {} rows affected (committed data)", op_name, delta_rows);
+    } else if !has_uncommitted {
+        debug!("Skipping {} - no data found in MemBuffer or Delta", op_name);
     }
 
     Ok(total_rows)
 }
 
-/// Perform DELETE with MemBuffer support - delete from memory first, then Delta if needed
+async fn perform_update_with_buffer(
+    database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
+    assignments: Vec<(String, Expr)>, span: &tracing::Span,
+) -> Result<u64> {
+    let assignments_clone = assignments.clone();
+    let update_span = tracing::trace_span!(parent: span, "delta.update");
+    perform_dml_with_buffer(
+        database, buffered_layer, table_name, project_id, predicate.clone(), "UPDATE",
+        |layer, pred| layer.update(project_id, table_name, pred, &assignments_clone),
+        perform_delta_update(database, table_name, project_id, predicate, assignments).instrument(update_span),
+    ).await
+}
+
 async fn perform_delete_with_buffer(
     database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>, span: &tracing::Span,
 ) -> Result<u64> {
-    let mut total_rows = 0u64;
-    let mut has_uncommitted_data = false;
-
-    // Step 1: Delete from MemBuffer if available (uncommitted data)
-    if let Some(layer) = buffered_layer {
-        has_uncommitted_data = layer.has_table(project_id, table_name);
-        if has_uncommitted_data {
-            let mem_rows = layer.delete(project_id, table_name, predicate.as_ref())?;
-            total_rows += mem_rows;
-            debug!("MemBuffer DELETE: {} rows affected (uncommitted data)", mem_rows);
-        }
-    }
-
-    // Step 2: Check if table has committed data in Delta
-    // Only go to Delta if there's committed data there (table exists in project_configs means it was flushed)
-    let has_committed_data = database.project_configs().read().await.contains_key(&(project_id.to_string(), table_name.to_string()));
-
-    if has_committed_data {
-        let delete_span = tracing::trace_span!(parent: span, "delta.delete");
-        let delta_rows = perform_delta_delete(database, table_name, project_id, predicate).instrument(delete_span).await?;
-        total_rows += delta_rows;
-        debug!("Delta DELETE: {} rows affected (committed data)", delta_rows);
-    } else if !has_uncommitted_data {
-        debug!("Skipping DELETE - no data found in MemBuffer or Delta");
-    } else {
-        debug!("Skipping Delta DELETE - all data is uncommitted (in MemBuffer only)");
-    }
-
-    Ok(total_rows)
+    let delete_span = tracing::trace_span!(parent: span, "delta.delete");
+    perform_dml_with_buffer(
+        database, buffered_layer, table_name, project_id, predicate.clone(), "DELETE",
+        |layer, pred| layer.delete(project_id, table_name, pred),
+        perform_delta_delete(database, table_name, project_id, predicate).instrument(delete_span),
+    ).await
 }
 
 /// Perform Delta UPDATE operation
