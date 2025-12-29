@@ -207,24 +207,17 @@ impl std::fmt::Debug for DmlExec {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, strum::Display, strum::AsRefStr)]
 enum DmlOperation {
     Update,
     Delete,
 }
 
 impl DmlOperation {
-    fn name(&self) -> &'static str {
+    fn as_uppercase(&self) -> &'static str {
         match self {
-            DmlOperation::Update => "UPDATE",
-            DmlOperation::Delete => "DELETE",
-        }
-    }
-
-    fn display_name(&self) -> &'static str {
-        match self {
-            DmlOperation::Update => "Update",
-            DmlOperation::Delete => "Delete",
+            Self::Update => "UPDATE",
+            Self::Delete => "DELETE",
         }
     }
 }
@@ -269,13 +262,7 @@ impl DisplayAs for DmlExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "Delta{}Exec: table={}, project_id={}",
-                    self.op_type.display_name(),
-                    self.table_name,
-                    self.project_id
-                )?;
+                write!(f, "Delta{}Exec: table={}, project_id={}", self.op_type, self.table_name, self.project_id)?;
                 if self.op_type == DmlOperation::Update && !self.assignments.is_empty() {
                     write!(
                         f,
@@ -288,7 +275,7 @@ impl DisplayAs for DmlExec {
                 }
                 Ok(())
             }
-            _ => write!(f, "Delta{}Exec", self.op_type.display_name()),
+            _ => write!(f, "Delta{}Exec", self.op_type),
         }
     }
 }
@@ -325,7 +312,7 @@ impl ExecutionPlan for DmlExec {
         }))
     }
 
-    #[instrument(name = "dml.execute", skip_all, fields(operation = self.op_type.name(), table.name = %self.table_name, project_id = %self.project_id, has_predicate = self.predicate.is_some(), rows.affected = Empty))]
+    #[instrument(name = "dml.execute", skip_all, fields(operation = self.op_type.as_uppercase(), table.name = %self.table_name, project_id = %self.project_id, has_predicate = self.predicate.is_some(), rows.affected = Empty))]
     fn execute(&self, _partition: usize, _context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let span = tracing::Span::current();
         let field_name = if self.op_type == DmlOperation::Update { "rows_updated" } else { "rows_deleted" };
@@ -359,7 +346,7 @@ impl ExecutionPlan for DmlExec {
                         .map_err(|e| DataFusionError::External(Box::new(e)))
                 })
                 .map_err(|e| {
-                    error!("{} failed: {}", op_type.name(), e);
+                    error!("{} failed: {}", op_type.as_uppercase(), e);
                     e
                 })
         };

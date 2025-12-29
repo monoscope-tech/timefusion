@@ -99,6 +99,7 @@ const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
 const_default!(d_shutdown_timeout: u64 = 5);
 const_default!(d_wal_corruption_threshold: usize = 10);
+const_default!(d_flush_parallelism: usize = 4);
 const_default!(d_foyer_memory_mb: usize = 512);
 const_default!(d_foyer_disk_gb: usize = 100);
 const_default!(d_foyer_ttl: u64 = 604_800); // 7 days
@@ -244,6 +245,8 @@ pub struct BufferConfig {
     pub timefusion_shutdown_timeout_secs: u64,
     #[serde(default = "d_wal_corruption_threshold")]
     pub timefusion_wal_corruption_threshold: usize,
+    #[serde(default = "d_flush_parallelism")]
+    pub timefusion_flush_parallelism: usize,
 }
 
 impl BufferConfig {
@@ -262,10 +265,12 @@ impl BufferConfig {
     pub fn wal_corruption_threshold(&self) -> usize {
         self.timefusion_wal_corruption_threshold
     }
+    pub fn flush_parallelism(&self) -> usize {
+        self.timefusion_flush_parallelism.max(1)
+    }
 
     pub fn compute_shutdown_timeout(&self, current_memory_mb: usize) -> Duration {
-        let secs = self.timefusion_shutdown_timeout_secs.max(1) + (current_memory_mb / 100) as u64;
-        Duration::from_secs(secs.min(300))
+        Duration::from_secs((self.timefusion_shutdown_timeout_secs.max(1) + (current_memory_mb / 100) as u64).min(300))
     }
 }
 

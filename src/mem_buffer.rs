@@ -10,8 +10,8 @@ use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::sql::planner::SqlToRel;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser as SqlParser;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
@@ -36,10 +36,17 @@ fn schemas_compatible(existing: &SchemaRef, incoming: &SchemaRef) -> bool {
         }
     }
     // New fields in incoming schema are OK if nullable (for SchemaMode::Merge compatibility)
+    let mut new_fields = 0;
     for incoming_field in incoming.fields() {
-        if existing.field_with_name(incoming_field.name()).is_err() && !incoming_field.is_nullable() {
-            return false; // New non-nullable field would break existing data
+        if existing.field_with_name(incoming_field.name()).is_err() {
+            if !incoming_field.is_nullable() {
+                return false; // New non-nullable field would break existing data
+            }
+            new_fields += 1;
         }
+    }
+    if new_fields > 0 {
+        info!("Schema evolution: {} new nullable field(s) added", new_fields);
     }
     true
 }
@@ -97,18 +104,22 @@ pub fn extract_min_timestamp(batch: &RecordBatch) -> Option<i64> {
     arrow::compute::min(ts_array)
 }
 
-pub struct MemBuffer {
-    projects: DashMap<String, ProjectBuffer>,
-    estimated_bytes: AtomicUsize,
-}
+/// Table key type using Arc<str> for efficient cloning and comparison.
+/// Composite key of (project_id, table_name) for flattened lookup.
+pub type TableKey = (Arc<str>, Arc<str>);
 
-pub struct ProjectBuffer {
-    table_buffers: DashMap<String, TableBuffer>,
+pub struct MemBuffer {
+    /// Flattened structure: (project_id, table_name) → TableBuffer
+    /// Reduces 3 hash lookups to 1 for table access.
+    tables: DashMap<TableKey, Arc<TableBuffer>>,
+    estimated_bytes: AtomicUsize,
 }
 
 pub struct TableBuffer {
     buckets: DashMap<i64, TimeBucket>,
-    schema: SchemaRef,
+    schema: RwLock<SchemaRef>,
+    project_id: Arc<str>,
+    table_name: Arc<str>,
 }
 
 pub struct TimeBucket {
@@ -170,24 +181,24 @@ fn parse_sql_expr(sql: &str) -> DFResult<Expr> {
 struct EmptyContextProvider;
 
 impl datafusion::sql::planner::ContextProvider for EmptyContextProvider {
-    fn get_table_source(&self, _name: datafusion::sql::TableReference) -> DFResult<std::sync::Arc<dyn datafusion::logical_expr::TableSource>> {
-        Err(datafusion::error::DataFusionError::Plan("No table context available".into()))
+    fn get_table_source(&self, _: datafusion::sql::TableReference) -> DFResult<std::sync::Arc<dyn datafusion::logical_expr::TableSource>> {
+        Err(datafusion::error::DataFusionError::Plan("No table context".into()))
     }
-    fn get_function_meta(&self, _name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::ScalarUDF>> {
+    fn get_function_meta(&self, _: &str) -> Option<std::sync::Arc<datafusion::logical_expr::ScalarUDF>> {
         None
     }
-    fn get_aggregate_meta(&self, _name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::AggregateUDF>> {
+    fn get_aggregate_meta(&self, _: &str) -> Option<std::sync::Arc<datafusion::logical_expr::AggregateUDF>> {
         None
     }
-    fn get_window_meta(&self, _name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::WindowUDF>> {
+    fn get_window_meta(&self, _: &str) -> Option<std::sync::Arc<datafusion::logical_expr::WindowUDF>> {
         None
     }
-    fn get_variable_type(&self, _var: &[String]) -> Option<DataType> {
+    fn get_variable_type(&self, _: &[String]) -> Option<DataType> {
         None
     }
     fn options(&self) -> &datafusion::config::ConfigOptions {
-        static OPTIONS: std::sync::LazyLock<datafusion::config::ConfigOptions> = std::sync::LazyLock::new(datafusion::config::ConfigOptions::default);
-        &OPTIONS
+        static O: std::sync::LazyLock<datafusion::config::ConfigOptions> = std::sync::LazyLock::new(Default::default);
+        &O
     }
     fn udf_names(&self) -> Vec<String> {
         vec![]
@@ -203,7 +214,7 @@ impl datafusion::sql::planner::ContextProvider for EmptyContextProvider {
 impl MemBuffer {
     pub fn new() -> Self {
         Self {
-            projects: DashMap::new(),
+            tables: DashMap::new(),
             estimated_bytes: AtomicUsize::new(0),
         }
     }
@@ -212,12 +223,13 @@ impl MemBuffer {
         self.estimated_bytes.load(Ordering::Relaxed)
     }
 
-    fn compute_bucket_id(timestamp_micros: i64) -> i64 {
+    pub fn compute_bucket_id(timestamp_micros: i64) -> i64 {
         timestamp_micros / BUCKET_DURATION_MICROS
     }
 
-    fn with_table<T>(&self, project_id: &str, table_name: &str, f: impl FnOnce(&TableBuffer) -> T) -> Option<T> {
-        self.projects.get(project_id).and_then(|p| p.table_buffers.get(table_name).map(|t| f(&t)))
+    #[inline]
+    fn make_key(project_id: &str, table_name: &str) -> TableKey {
+        (Arc::from(project_id), Arc::from(table_name))
     }
 
     pub fn current_bucket_id() -> i64 {
@@ -225,63 +237,83 @@ impl MemBuffer {
         Self::compute_bucket_id(now_micros)
     }
 
-    #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
-    pub fn insert(&self, project_id: &str, table_name: &str, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<()> {
-        let bucket_id = Self::compute_bucket_id(timestamp_micros);
-        let schema = batch.schema();
-        let row_count = batch.num_rows();
-        let batch_size = estimate_batch_size(&batch);
+    /// Get or create a TableBuffer, returning a cached Arc reference.
+    /// This is the preferred entry point for batch operations - cache the returned
+    /// Arc<TableBuffer> and call insert_batch() directly to avoid repeated lookups.
+    pub fn get_or_create_table(&self, project_id: &str, table_name: &str, schema: &SchemaRef) -> anyhow::Result<Arc<TableBuffer>> {
+        let key = Self::make_key(project_id, table_name);
 
-        let project = self.projects.entry(project_id.to_string()).or_insert_with(ProjectBuffer::new);
+        // Fast path: table exists
+        if let Some(table) = self.tables.get(&key) {
+            let existing_schema = table.schema();
+            if !Arc::ptr_eq(&existing_schema, schema) && !schemas_compatible(&existing_schema, schema) {
+                warn!(
+                    "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
+                    project_id,
+                    table_name,
+                    existing_schema.fields().len(),
+                    schema.fields().len()
+                );
+                anyhow::bail!(
+                    "Schema incompatible for {}.{}: field types don't match or new non-nullable field added",
+                    project_id,
+                    table_name
+                );
+            }
+            return Ok(Arc::clone(&table));
+        }
 
-        // Atomic schema validation and table creation using entry API
-        let table = match project.table_buffers.entry(table_name.to_string()) {
+        // Slow path: create table using entry API
+        let table = match self.tables.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(entry) => {
                 let existing_schema = entry.get().schema();
-                // Fast path: same Arc pointer means identical schema
-                if !std::sync::Arc::ptr_eq(&existing_schema, &schema) && !schemas_compatible(&existing_schema, &schema) {
-                    warn!(
-                        "Schema incompatible for {}.{}: existing has {} fields, incoming has {}",
-                        project_id,
-                        table_name,
-                        existing_schema.fields().len(),
-                        schema.fields().len()
-                    );
+                if !Arc::ptr_eq(&existing_schema, schema) && !schemas_compatible(&existing_schema, schema) {
                     anyhow::bail!(
                         "Schema incompatible for {}.{}: field types don't match or new non-nullable field added",
                         project_id,
                         table_name
                     );
                 }
-                entry.into_ref().downgrade()
+                Arc::clone(entry.get())
             }
-            dashmap::mapref::entry::Entry::Vacant(entry) => entry.insert(TableBuffer::new(schema.clone())).downgrade(),
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let new_table = Arc::new(TableBuffer::new(schema.clone(), Arc::from(project_id), Arc::from(table_name)));
+                entry.insert(Arc::clone(&new_table));
+                new_table
+            }
         };
 
-        let bucket = table.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
+        Ok(table)
+    }
 
-        {
-            let mut batches = bucket.batches.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on bucket: {}", e))?;
-            batches.push(batch);
-        }
+    /// Get a TableBuffer if it exists (for read operations).
+    fn get_table(&self, project_id: &str, table_name: &str) -> Option<Arc<TableBuffer>> {
+        let key = Self::make_key(project_id, table_name);
+        self.tables.get(&key).map(|t| Arc::clone(&t))
+    }
 
-        bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
-        bucket.memory_bytes.fetch_add(batch_size, Ordering::Relaxed);
-        bucket.update_timestamps(timestamp_micros);
+    #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
+    pub fn insert(&self, project_id: &str, table_name: &str, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<()> {
+        let schema = batch.schema();
+        let table = self.get_or_create_table(project_id, table_name, &schema)?;
+        let batch_size = table.insert_batch(batch, timestamp_micros)?;
         self.estimated_bytes.fetch_add(batch_size, Ordering::Relaxed);
-
-        debug!(
-            "MemBuffer insert: project={}, table={}, bucket={}, rows={}, bytes={}",
-            project_id, table_name, bucket_id, row_count, batch_size
-        );
         Ok(())
     }
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub fn insert_batches(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, timestamp_micros: i64) -> anyhow::Result<()> {
-        for batch in batches {
-            self.insert(project_id, table_name, batch, timestamp_micros)?;
+        if batches.is_empty() {
+            return Ok(());
         }
+        let schema = batches[0].schema();
+        let table = self.get_or_create_table(project_id, table_name, &schema)?;
+
+        let mut total_size = 0usize;
+        for batch in batches {
+            total_size += table.insert_batch(batch, timestamp_micros)?;
+        }
+        self.estimated_bytes.fetch_add(total_size, Ordering::Relaxed);
         Ok(())
     }
 
@@ -289,9 +321,7 @@ impl MemBuffer {
     pub fn query(&self, project_id: &str, table_name: &str, _filters: &[Expr]) -> anyhow::Result<Vec<RecordBatch>> {
         let mut results = Vec::new();
 
-        if let Some(project) = self.projects.get(project_id)
-            && let Some(table) = project.table_buffers.get(table_name)
-        {
+        if let Some(table) = self.get_table(project_id, table_name) {
             for bucket_entry in table.buckets.iter() {
                 if let Ok(batches) = bucket_entry.batches.read() {
                     // RecordBatch clone is cheap: Arc<Schema> + Vec<Arc<Array>>
@@ -312,9 +342,7 @@ impl MemBuffer {
     pub fn query_partitioned(&self, project_id: &str, table_name: &str) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
         let mut partitions = Vec::new();
 
-        if let Some(project) = self.projects.get(project_id)
-            && let Some(table) = project.table_buffers.get(table_name)
-        {
+        if let Some(table) = self.get_table(project_id, table_name) {
             // Sort buckets by bucket_id for consistent ordering
             let mut bucket_ids: Vec<i64> = table.buckets.iter().map(|b| *b.key()).collect();
             bucket_ids.sort();
@@ -348,7 +376,7 @@ impl MemBuffer {
     }
 
     pub fn get_oldest_timestamp(&self, project_id: &str, table_name: &str) -> Option<i64> {
-        self.with_table(project_id, table_name, |table| {
+        self.get_table(project_id, table_name).map(|table| {
             table
                 .buckets
                 .iter()
@@ -360,7 +388,7 @@ impl MemBuffer {
     }
 
     pub fn get_newest_timestamp(&self, project_id: &str, table_name: &str) -> Option<i64> {
-        self.with_table(project_id, table_name, |table| {
+        self.get_table(project_id, table_name).map(|table| {
             table
                 .buckets
                 .iter()
@@ -373,8 +401,7 @@ impl MemBuffer {
 
     #[instrument(skip(self), fields(project_id, table_name, bucket_id))]
     pub fn drain_bucket(&self, project_id: &str, table_name: &str, bucket_id: i64) -> Option<Vec<RecordBatch>> {
-        if let Some(project) = self.projects.get(project_id)
-            && let Some(table) = project.table_buffers.get(table_name)
+        if let Some(table) = self.get_table(project_id, table_name)
             && let Some((_, bucket)) = table.buckets.remove(&bucket_id)
         {
             let freed_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
@@ -406,24 +433,22 @@ impl MemBuffer {
 
     fn collect_buckets(&self, filter: impl Fn(i64) -> bool) -> Vec<FlushableBucket> {
         let mut result = Vec::new();
-        for project in self.projects.iter() {
-            let project_id = project.key().clone();
-            for table in project.table_buffers.iter() {
-                let table_name = table.key().clone();
-                for bucket in table.buckets.iter() {
-                    let bucket_id = *bucket.key();
-                    if filter(bucket_id)
-                        && let Ok(batches) = bucket.batches.read()
-                        && !batches.is_empty()
-                    {
-                        result.push(FlushableBucket {
-                            project_id: project_id.clone(),
-                            table_name: table_name.clone(),
-                            bucket_id,
-                            batches: batches.clone(),
-                            row_count: bucket.row_count.load(Ordering::Relaxed),
-                        });
-                    }
+        for table_entry in self.tables.iter() {
+            let (project_id, table_name) = table_entry.key();
+            let table = table_entry.value();
+            for bucket in table.buckets.iter() {
+                let bucket_id = *bucket.key();
+                if filter(bucket_id)
+                    && let Ok(batches) = bucket.batches.read()
+                    && !batches.is_empty()
+                {
+                    result.push(FlushableBucket {
+                        project_id: project_id.to_string(),
+                        table_name: table_name.to_string(),
+                        bucket_id,
+                        batches: batches.clone(),
+                        row_count: bucket.row_count.load(Ordering::Relaxed),
+                    });
                 }
             }
         }
@@ -436,15 +461,14 @@ impl MemBuffer {
         let mut evicted_count = 0;
         let mut freed_bytes = 0usize;
 
-        for project_entry in self.projects.iter() {
-            for table_entry in project_entry.table_buffers.iter() {
-                let bucket_ids_to_remove: Vec<i64> = table_entry.buckets.iter().filter(|b| *b.key() < cutoff_bucket_id).map(|b| *b.key()).collect();
+        for table_entry in self.tables.iter() {
+            let table = table_entry.value();
+            let bucket_ids_to_remove: Vec<i64> = table.buckets.iter().filter(|b| *b.key() < cutoff_bucket_id).map(|b| *b.key()).collect();
 
-                for bucket_id in bucket_ids_to_remove {
-                    if let Some((_, bucket)) = table_entry.buckets.remove(&bucket_id) {
-                        freed_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
-                        evicted_count += 1;
-                    }
+            for bucket_id in bucket_ids_to_remove {
+                if let Some((_, bucket)) = table.buckets.remove(&bucket_id) {
+                    freed_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
+                    evicted_count += 1;
                 }
             }
         }
@@ -464,17 +488,15 @@ impl MemBuffer {
 
     /// Check if a table exists in the buffer
     pub fn has_table(&self, project_id: &str, table_name: &str) -> bool {
-        self.projects.get(project_id).is_some_and(|project| project.table_buffers.contains_key(table_name))
+        let key = Self::make_key(project_id, table_name);
+        self.tables.contains_key(&key)
     }
 
     /// Delete rows matching the predicate from the buffer.
     /// Returns the number of rows deleted.
     #[instrument(skip(self, predicate), fields(project_id, table_name, rows_deleted))]
     pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&Expr>) -> DFResult<u64> {
-        let Some(project) = self.projects.get(project_id) else {
-            return Ok(0);
-        };
-        let Some(table) = project.table_buffers.get(table_name) else {
+        let Some(table) = self.get_table(project_id, table_name) else {
             return Ok(0);
         };
 
@@ -544,10 +566,7 @@ impl MemBuffer {
             return Ok(0);
         }
 
-        let Some(project) = self.projects.get(project_id) else {
-            return Ok(0);
-        };
-        let Some(table) = project.table_buffers.get(table_name) else {
+        let Some(table) = self.get_table(project_id, table_name) else {
             return Ok(0);
         };
 
@@ -649,17 +668,21 @@ impl MemBuffer {
 
     pub fn get_stats(&self) -> MemBufferStats {
         let (mut total_buckets, mut total_rows, mut total_batches) = (0, 0, 0);
-        for project in self.projects.iter() {
-            for table in project.table_buffers.iter() {
-                total_buckets += table.buckets.len();
-                for bucket in table.buckets.iter() {
-                    total_rows += bucket.row_count.load(Ordering::Relaxed);
-                    total_batches += bucket.batches.read().map(|b| b.len()).unwrap_or(0);
-                }
+        let mut project_ids = std::collections::HashSet::new();
+
+        for table_entry in self.tables.iter() {
+            let (project_id, _) = table_entry.key();
+            project_ids.insert(project_id.clone());
+
+            let table = table_entry.value();
+            total_buckets += table.buckets.len();
+            for bucket in table.buckets.iter() {
+                total_rows += bucket.row_count.load(Ordering::Relaxed);
+                total_batches += bucket.batches.read().map(|b| b.len()).unwrap_or(0);
             }
         }
         MemBufferStats {
-            project_count: self.projects.len(),
+            project_count: project_ids.len(),
             total_buckets,
             total_rows,
             total_batches,
@@ -668,11 +691,11 @@ impl MemBuffer {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.projects.is_empty()
+        self.tables.is_empty()
     }
 
     pub fn clear(&self) {
-        self.projects.clear();
+        self.tables.clear();
         self.estimated_bytes.store(0, Ordering::Relaxed);
         info!("MemBuffer cleared");
     }
@@ -684,22 +707,43 @@ impl Default for MemBuffer {
     }
 }
 
-impl ProjectBuffer {
-    fn new() -> Self {
-        Self { table_buffers: DashMap::new() }
-    }
-}
-
 impl TableBuffer {
-    fn new(schema: SchemaRef) -> Self {
+    fn new(schema: SchemaRef, project_id: Arc<str>, table_name: Arc<str>) -> Self {
         Self {
             buckets: DashMap::new(),
-            schema,
+            schema: RwLock::new(schema),
+            project_id,
+            table_name,
         }
     }
 
     pub fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        self.schema.read().unwrap().clone()
+    }
+
+    /// Insert a batch into this table's appropriate time bucket.
+    /// Returns the batch size in bytes for memory tracking.
+    pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<usize> {
+        let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
+        let row_count = batch.num_rows();
+        let batch_size = estimate_batch_size(&batch);
+
+        let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
+
+        {
+            let mut batches = bucket.batches.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on bucket: {}", e))?;
+            batches.push(batch);
+        }
+
+        bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
+        bucket.memory_bytes.fetch_add(batch_size, Ordering::Relaxed);
+        bucket.update_timestamps(timestamp_micros);
+
+        debug!(
+            "TableBuffer insert: project={}, table={}, bucket={}, rows={}, bytes={}",
+            self.project_id, self.table_name, bucket_id, row_count, batch_size
+        );
+        Ok(batch_size)
     }
 }
 
@@ -957,5 +1001,25 @@ mod tests {
 
         let results = buffer.query("project1", "table1", &[]).unwrap();
         assert_eq!(results.len(), 10, "All 10 inserts should succeed");
+    }
+
+    #[test]
+    fn test_negative_bucket_ids_pre_1970() {
+        // Integer division truncates toward zero: -1 / N = 0, -N / N = -1
+        assert_eq!(MemBuffer::compute_bucket_id(-1), 0); // Just before epoch -> bucket 0
+        assert_eq!(MemBuffer::compute_bucket_id(-BUCKET_DURATION_MICROS), -1);
+        assert_eq!(MemBuffer::compute_bucket_id(-BUCKET_DURATION_MICROS - 1), -1);
+        assert_eq!(MemBuffer::compute_bucket_id(-BUCKET_DURATION_MICROS * 2), -2);
+
+        let buffer = MemBuffer::new();
+        let pre_1970_ts = -BUCKET_DURATION_MICROS * 2; // 20 minutes before epoch
+
+        buffer.insert("project1", "table1", create_test_batch(pre_1970_ts), pre_1970_ts).unwrap();
+
+        let results = buffer.query("project1", "table1", &[]).unwrap();
+        assert_eq!(results.len(), 1);
+
+        let bucket_id = MemBuffer::compute_bucket_id(pre_1970_ts);
+        assert_eq!(bucket_id, -2, "20 minutes before epoch should be bucket -2");
     }
 }

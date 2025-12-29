@@ -1,4 +1,4 @@
-use crate::config::{self, AppConfig, BufferConfig};
+use crate::config::{self, AppConfig};
 use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp};
 use crate::wal::{WalManager, WalOperation, deserialize_delete_payload, deserialize_update_payload};
 use arrow::array::RecordBatch;
@@ -78,20 +78,8 @@ impl BufferedWriteLayer {
         self
     }
 
-    pub fn wal(&self) -> &Arc<WalManager> {
-        &self.wal
-    }
-
-    pub fn mem_buffer(&self) -> &Arc<MemBuffer> {
-        &self.mem_buffer
-    }
-
-    fn buffer_config(&self) -> &BufferConfig {
-        &self.config.buffer
-    }
-
     fn max_memory_bytes(&self) -> usize {
-        self.buffer_config().max_memory_mb() * 1024 * 1024
+        self.config.buffer.max_memory_mb() * 1024 * 1024
     }
 
     /// Total effective memory including reserved bytes for in-flight writes.
@@ -104,7 +92,8 @@ impl BufferedWriteLayer {
     }
 
     /// Try to reserve memory atomically before a write.
-    /// Returns estimated batch size on success, or error if hard limit would be exceeded.
+    /// Returns estimated batch size on success, or error if hard limit exceeded.
+    /// Callers MUST implement retry logic - hard failures may cause data loss.
     fn try_reserve_memory(&self, batches: &[RecordBatch]) -> anyhow::Result<usize> {
         let batch_size: usize = batches.iter().map(estimate_batch_size).sum();
         let estimated_size = (batch_size as f64 * MEMORY_OVERHEAD_MULTIPLIER) as usize;
@@ -149,7 +138,7 @@ impl BufferedWriteLayer {
             warn!(
                 "Memory pressure detected ({}MB >= {}MB), triggering early flush",
                 self.effective_memory_bytes() / (1024 * 1024),
-                self.buffer_config().max_memory_mb()
+                self.config.buffer.max_memory_mb()
             );
             if let Err(e) = self.flush_completed_buckets().await {
                 error!("Early flush due to memory pressure failed: {}", e);
@@ -159,7 +148,9 @@ impl BufferedWriteLayer {
         // Reserve memory atomically before writing - prevents race condition
         let reserved_size = self.try_reserve_memory(&batches)?;
 
-        // Write WAL and MemBuffer, ensuring reservation is released regardless of outcome
+        // Write WAL and MemBuffer, ensuring reservation is released regardless of outcome.
+        // Reservation covers the window between WAL write and MemBuffer insert;
+        // once MemBuffer tracks the data, reservation is released.
         let result: anyhow::Result<()> = (|| {
             // Step 1: Write to WAL for durability
             self.wal.append_batch(project_id, table_name, &batches)?;
@@ -185,19 +176,19 @@ impl BufferedWriteLayer {
     #[instrument(skip(self))]
     pub async fn recover_from_wal(&self) -> anyhow::Result<RecoveryStats> {
         let start = std::time::Instant::now();
-        let retention_micros = (self.buffer_config().retention_mins() as i64) * 60 * 1_000_000;
+        let retention_micros = (self.config.buffer.retention_mins() as i64) * 60 * 1_000_000;
         let cutoff = chrono::Utc::now().timestamp_micros() - retention_micros;
-        let corruption_threshold = self.buffer_config().wal_corruption_threshold();
+        let corruption_threshold = self.config.buffer.wal_corruption_threshold();
 
         info!("Starting WAL recovery, cutoff={}, corruption_threshold={}", cutoff, corruption_threshold);
 
         // Read all entries sorted by timestamp for correct replay order
         let (entries, error_count) = self.wal.read_all_entries_raw(Some(cutoff), true)?;
 
-        // Fail if corruption exceeds threshold (0 = disabled)
-        if corruption_threshold > 0 && error_count > corruption_threshold {
+        // Fail if corruption meets or exceeds threshold (0 = disabled)
+        if corruption_threshold > 0 && error_count >= corruption_threshold {
             anyhow::bail!(
-                "WAL corruption threshold exceeded: {} errors > {} threshold. Data may be compromised.",
+                "WAL corruption threshold exceeded: {} errors >= {} threshold. Data may be compromised.",
                 error_count,
                 corruption_threshold
             );
@@ -248,8 +239,9 @@ impl BufferedWriteLayer {
                     }
                 },
             }
-            oldest_ts = Some(oldest_ts.map_or(entry.timestamp_micros, |ts| ts.min(entry.timestamp_micros)));
-            newest_ts = Some(newest_ts.map_or(entry.timestamp_micros, |ts| ts.max(entry.timestamp_micros)));
+            let ts = entry.timestamp_micros;
+            oldest_ts = Some(oldest_ts.map_or(ts, |o| o.min(ts)));
+            newest_ts = Some(newest_ts.map_or(ts, |n| n.max(ts)));
         }
 
         let stats = RecoveryStats {
@@ -294,7 +286,7 @@ impl BufferedWriteLayer {
     }
 
     async fn run_flush_task(&self) {
-        let flush_interval = Duration::from_secs(self.buffer_config().flush_interval_secs());
+        let flush_interval = Duration::from_secs(self.config.buffer.flush_interval_secs());
 
         loop {
             tokio::select! {
@@ -312,7 +304,7 @@ impl BufferedWriteLayer {
     }
 
     async fn run_eviction_task(&self) {
-        let eviction_interval = Duration::from_secs(self.buffer_config().eviction_interval_secs());
+        let eviction_interval = Duration::from_secs(self.config.buffer.eviction_interval_secs());
 
         loop {
             tokio::select! {
@@ -342,13 +334,14 @@ impl BufferedWriteLayer {
 
         info!("Flushing {} buckets to Delta", flushable.len());
 
-        // Flush buckets in parallel with bounded concurrency (4 concurrent flushes)
+        // Flush buckets in parallel with bounded concurrency
+        let parallelism = self.config.buffer.flush_parallelism();
         let flush_results: Vec<_> = stream::iter(flushable)
             .map(|bucket| async move {
                 let result = self.flush_bucket(&bucket).await;
                 (bucket, result)
             })
-            .buffer_unordered(4)
+            .buffer_unordered(parallelism)
             .collect()
             .await;
 
@@ -388,7 +381,7 @@ impl BufferedWriteLayer {
     }
 
     fn evict_old_data(&self) {
-        let retention_micros = (self.buffer_config().retention_mins() as i64) * 60 * 1_000_000;
+        let retention_micros = (self.config.buffer.retention_mins() as i64) * 60 * 1_000_000;
         let cutoff = chrono::Utc::now().timestamp_micros() - retention_micros;
 
         let evicted = self.mem_buffer.evict_old_data(cutoff);
@@ -414,7 +407,7 @@ impl BufferedWriteLayer {
 
         // Compute dynamic timeout based on current buffer size
         let current_memory_mb = self.mem_buffer.estimated_memory_bytes() / (1024 * 1024);
-        let task_timeout = self.buffer_config().compute_shutdown_timeout(current_memory_mb);
+        let task_timeout = self.config.buffer.compute_shutdown_timeout(current_memory_mb);
         debug!("Shutdown timeout: {:?} for {}MB buffer", task_timeout, current_memory_mb);
 
         // Wait for background tasks to complete (with timeout)
