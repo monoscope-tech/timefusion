@@ -117,7 +117,7 @@ pub struct MemBuffer {
 
 pub struct TableBuffer {
     buckets: DashMap<i64, TimeBucket>,
-    schema: RwLock<SchemaRef>,
+    schema: SchemaRef,  // Immutable after creation - no lock needed
     project_id: Arc<str>,
     table_name: Arc<str>,
 }
@@ -711,14 +711,14 @@ impl TableBuffer {
     fn new(schema: SchemaRef, project_id: Arc<str>, table_name: Arc<str>) -> Self {
         Self {
             buckets: DashMap::new(),
-            schema: RwLock::new(schema),
+            schema,
             project_id,
             table_name,
         }
     }
 
     pub fn schema(&self) -> SchemaRef {
-        self.schema.read().unwrap().clone()
+        self.schema.clone()  // Arc clone is cheap
     }
 
     /// Insert a batch into this table's appropriate time bucket.

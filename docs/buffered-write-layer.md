@@ -78,7 +78,7 @@ pub struct MemBuffer {
 
 pub struct TableBuffer {
     buckets: DashMap<i64, TimeBucket>,  // bucket_id → TimeBucket
-    schema: RwLock<SchemaRef>,
+    schema: SchemaRef,  // Immutable after creation
     project_id: Arc<str>,
     table_name: Arc<str>,
 }
@@ -248,7 +248,7 @@ Since MemBuffer uses `UnknownPartitioning` (time buckets) and Delta uses file-ba
 |-----------|-----------|------------|
 | `MemBuffer.tables` | DashMap (lock-free reads) | Very low |
 | `TableBuffer.buckets` | DashMap (lock-free reads) | Very low |
-| `TableBuffer.schema` | RwLock | Very low (rarely changes) |
+| `TableBuffer.schema` | None (immutable `Arc<Schema>`) | None |
 | `TimeBucket.batches` | RwLock | Low (read-heavy workload) |
 
 **Key insight:** Query path uses read locks only. Write path acquires write lock briefly per bucket. Handle caching (`Arc<TableBuffer>`) further reduces contention by avoiding repeated table lookups.
