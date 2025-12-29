@@ -4,7 +4,9 @@ mod test_dml_operations {
     use datafusion::arrow;
     use datafusion::arrow::array::AsArray;
     use serial_test::serial;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use timefusion::config::AppConfig;
     use timefusion::database::Database;
     use tracing::{Level, info};
 
@@ -13,13 +15,24 @@ mod test_dml_operations {
         let _ = tracing::subscriber::set_global_default(subscriber);
     }
 
-    fn setup_test_env() {
-        dotenv::dotenv().ok();
-        unsafe {
-            std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-            std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", uuid::Uuid::new_v4()));
-        }
+    fn create_test_config(test_id: &str) -> Arc<AppConfig> {
+        let mut cfg = AppConfig::default();
+        cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
+        cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
+        cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
+        cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
+        cfg.aws.aws_default_region = Some("us-east-1".to_string());
+        cfg.aws.aws_allow_http = Some("true".to_string());
+        cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
+        cfg.core.walrus_data_dir = PathBuf::from(format!("/tmp/walrus-dml-{}", test_id));
+        cfg.cache.timefusion_foyer_disabled = true;
+        Arc::new(cfg)
     }
+
+    // ==========================================================================
+    // Delta-Only DML Tests (no buffered layer - operations go directly to Delta)
+    // These tests verify that UPDATE/DELETE work correctly on Delta Lake tables.
+    // ==========================================================================
 
     fn create_test_records(now: chrono::DateTime<chrono::Utc>) -> Vec<serde_json::Value> {
         vec![
@@ -68,9 +81,9 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_update_query() -> Result<()> {
         init_tracing();
-        setup_test_env();
-
-        let db = Arc::new(Database::new().await?);
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
@@ -124,9 +137,9 @@ mod test_dml_operations {
     #[tokio::test]
     async fn test_delete_with_predicate() -> Result<()> {
         init_tracing();
-        setup_test_env();
-
-        let db = Arc::new(Database::new().await?);
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
@@ -173,9 +186,9 @@ mod test_dml_operations {
     #[serial]
     #[tokio::test]
     async fn test_delete_all_matching() -> Result<()> {
-        setup_test_env();
-
-        let db = Arc::new(Database::new().await?);
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;
 
@@ -257,6 +270,128 @@ mod test_dml_operations {
 
         assert_eq!(id_col.value(0), "2");
         assert_eq!(level_col.value(0), "INFO");
+
+        Ok(())
+    }
+
+    // ==========================================================================
+    // Delta UPDATE with multiple columns test
+    // ==========================================================================
+
+    #[serial]
+    #[tokio::test]
+    async fn test_update_multiple_columns() -> Result<()> {
+        init_tracing();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let records = create_test_records(now);
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+
+        // Insert directly to Delta (skip_queue=true)
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+
+        // Update multiple columns at once
+        info!("Executing multi-column UPDATE query");
+        let df = ctx
+            .sql("UPDATE otel_logs_and_spans SET duration = 999, level = 'WARN' WHERE project_id = 'test_project' AND name = 'Alice'")
+            .await?;
+        let result = df.collect().await?;
+
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
+
+        // Verify both columns were updated
+        let df = ctx
+            .sql("SELECT name, duration, level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Alice'")
+            .await?;
+        let results = df.collect().await?;
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let duration_idx = batch.schema().fields().iter().position(|f| f.name() == "duration").unwrap();
+        let level_idx = batch.schema().fields().iter().position(|f| f.name() == "level").unwrap();
+
+        let duration_col = batch.column(duration_idx).as_primitive::<arrow::datatypes::Int64Type>();
+        let level_col = batch.column(level_idx).as_string::<i32>();
+
+        assert_eq!(duration_col.value(0), 999, "Duration should be updated to 999");
+        assert_eq!(level_col.value(0), "WARN", "Level should be updated to WARN");
+
+        Ok(())
+    }
+
+    // ==========================================================================
+    // Delta DELETE then verify row counts test
+    // ==========================================================================
+
+    #[serial]
+    #[tokio::test]
+    async fn test_delete_verify_counts() -> Result<()> {
+        init_tracing();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+
+        // Create 5 records
+        let records = vec![
+            serde_json::json!({
+                "id": "1", "name": "R1", "project_id": "test_project",
+                "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
+                "duration": 100, "date": now.date_naive().to_string(), "hashes": [], "summary": []
+            }),
+            serde_json::json!({
+                "id": "2", "name": "R2", "project_id": "test_project",
+                "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
+                "duration": 200, "date": now.date_naive().to_string(), "hashes": [], "summary": []
+            }),
+            serde_json::json!({
+                "id": "3", "name": "R3", "project_id": "test_project",
+                "timestamp": now.timestamp_micros(), "level": "ERROR", "status_code": "ERROR",
+                "duration": 300, "date": now.date_naive().to_string(), "hashes": [], "summary": []
+            }),
+            serde_json::json!({
+                "id": "4", "name": "R4", "project_id": "test_project",
+                "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
+                "duration": 400, "date": now.date_naive().to_string(), "hashes": [], "summary": []
+            }),
+            serde_json::json!({
+                "id": "5", "name": "R5", "project_id": "test_project",
+                "timestamp": now.timestamp_micros(), "level": "ERROR", "status_code": "ERROR",
+                "duration": 500, "date": now.date_naive().to_string(), "hashes": [], "summary": []
+            }),
+        ];
+
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+
+        // Verify initial count
+        let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
+        let results = df.collect().await?;
+        let initial_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(initial_count, 5, "Should have 5 rows initially");
+
+        // Delete ERROR records
+        let df = ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?;
+        let result = df.collect().await?;
+        let rows_deleted = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(rows_deleted, 2, "Should delete 2 ERROR records");
+
+        // Verify final count
+        let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
+        let results = df.collect().await?;
+        let final_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(final_count, 3, "Should have 3 rows after delete");
 
         Ok(())
     }
