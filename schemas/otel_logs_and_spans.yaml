@@ -49,7 +49,7 @@ fields:
     data_type: Int32
     nullable: true
   - name: body
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: duration
     data_type: Int64
@@ -61,7 +61,7 @@ fields:
     data_type: 'Timestamp(Microsecond, Some("UTC"))'
     nullable: true
   - name: context
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: context___trace_id
     data_type: Utf8
@@ -79,13 +79,13 @@ fields:
     data_type: Utf8
     nullable: true
   - name: events
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: links
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: attributes
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: attributes___client___address
     data_type: Utf8
@@ -235,7 +235,7 @@ fields:
     data_type: Utf8
     nullable: true
   - name: resource
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: resource___service___name
     data_type: Utf8
@@ -268,7 +268,7 @@ fields:
     data_type: "List(Utf8)"
     nullable: false
   - name: errors
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: log_pattern
     data_type: Utf8

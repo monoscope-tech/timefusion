@@ -90,6 +90,21 @@ impl TableSchema {
             })
             .collect()
     }
+
+    /// Check if this schema contains any Variant type columns
+    pub fn has_variant_columns(&self) -> bool {
+        self.fields.iter().any(|f| f.data_type == "Variant")
+    }
+}
+
+/// Get the Arrow DataType for Variant (Struct with metadata and value BinaryView fields)
+/// Uses BinaryView to match parquet-variant-compute output
+pub fn variant_arrow_type() -> ArrowDataType {
+    use arrow::datatypes::Fields;
+    ArrowDataType::Struct(Fields::from(vec![
+        Arc::new(Field::new("metadata", ArrowDataType::BinaryView, false)),
+        Arc::new(Field::new("value", ArrowDataType::BinaryView, false)),
+    ]))
 }
 
 fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
@@ -103,8 +118,15 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8, true))),
         "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        "Variant" => variant_arrow_type(),
         _ => anyhow::bail!("Unknown type: {}", s),
     })
+}
+
+/// Create a proper Delta Variant type using delta-kernel's unshredded_variant()
+/// This represents a Struct<metadata: Binary, value: Binary> that delta-kernel recognizes as Variant
+fn variant_delta_type() -> DeltaDataType {
+    DeltaDataType::unshredded_variant()
 }
 
 fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
@@ -115,6 +137,7 @@ fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
         "Int32" | "UInt32" => DeltaDataType::Primitive(Integer),
         "Int64" | "UInt64" => DeltaDataType::Primitive(Long),
         "List(Utf8)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(String), true))),
+        "Variant" => variant_delta_type(),
         _ if s.starts_with("Timestamp") => DeltaDataType::Primitive(Timestamp),
         _ => anyhow::bail!("Unknown type: {}", s),
     })

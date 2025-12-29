@@ -31,6 +31,7 @@ use deltalake::PartitionFilter;
 use deltalake::datafusion::parquet::file::metadata::SortingColumn;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
+use deltalake::kernel::{Action, Protocol};
 use deltalake::operations::create::CreateBuilder;
 use deltalake::{DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
@@ -65,6 +66,23 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 
 // Compression level for parquet files - kept for WriterProperties fallback
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+
+/// Create a Protocol with variantType feature enabled.
+/// Required for tables with Variant columns per Delta Lake protocol spec.
+/// Note: Currently unused because delta-rs ProtocolChecker doesn't support variantType yet.
+/// When delta-rs adds support, this can be enabled in the CreateBuilder.with_actions() call.
+#[allow(dead_code)]
+fn create_variant_protocol() -> Protocol {
+    // Protocol::try_new is pub(crate) in delta-kernel, so we use serde_json
+    // to create it (same approach used internally by delta-rs)
+    serde_json::from_value(serde_json::json!({
+        "minReaderVersion": 3,
+        "minWriterVersion": 7,
+        "readerFeatures": ["variantType"],
+        "writerFeatures": ["variantType"]
+    }))
+    .expect("Valid protocol JSON")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct StorageConfig {
@@ -765,10 +783,13 @@ impl Database {
         ctx.register_udf(set_config_udf);
     }
 
-    /// Register JSON functions from datafusion-functions-json
+    /// Register JSON functions from datafusion-functions-json with Variant-aware wrappers
     pub fn register_json_functions(&self, ctx: &mut SessionContext) {
         datafusion_functions_json::register_all(ctx).expect("Failed to register JSON functions");
-        info!("Registered JSON functions with SessionContext");
+        // Register variant-aware wrappers that override the standard JSON functions
+        // These handle both Variant (Struct) and Utf8 inputs transparently
+        crate::variant_utils::register_variant_json_functions(ctx);
+        info!("Registered JSON functions with Variant support");
     }
 
     #[instrument(
@@ -993,7 +1014,15 @@ impl Database {
 
                     let mut config = HashMap::new();
                     config.insert("delta.checkpointInterval".to_string(), Some(checkpoint_interval));
-                    config.insert("delta.checkpointPolicy".to_string(), Some("v2".to_string()));
+                    // Note: v2 checkpoint policy requires v2Checkpoint feature which delta-rs doesn't support yet
+                    // config.insert("delta.checkpointPolicy".to_string(), Some("v2".to_string()));
+
+                    // Note: delta-rs doesn't yet support variantType in its ProtocolChecker.
+                    // Variant columns are stored as Struct<metadata: BinaryView, value: BinaryView>
+                    // which is the correct binary representation per Parquet Variant spec.
+                    // When delta-rs adds variantType support, we can enable the Protocol action.
+                    // See: https://github.com/delta-io/delta-rs/blob/main/crates/core/src/kernel/transaction/protocol.rs
+                    let actions: Vec<Action> = vec![];
 
                     match CreateBuilder::new()
                         .with_location(&storage_uri)
@@ -1002,6 +1031,7 @@ impl Database {
                         .with_storage_options(storage_options.clone())
                         .with_commit_properties(commit_properties)
                         .with_configuration(config)
+                        .with_actions(actions)
                         .await
                     {
                         Ok(table) => break table,
@@ -2004,6 +2034,7 @@ mod tests {
         let db_arc = Arc::new(db.clone());
         let mut ctx = db_arc.create_session_context();
         datafusion_functions_json::register_all(&mut ctx)?;
+        crate::variant_utils::register_variant_json_functions(&mut ctx);
         db.setup_session_context(&mut ctx)?;
         Ok((db, ctx, test_prefix))
     }
