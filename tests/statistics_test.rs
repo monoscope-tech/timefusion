@@ -4,7 +4,7 @@ use timefusion::statistics::DeltaStatisticsExtractor;
 #[tokio::test]
 async fn test_statistics_extractor_cache() -> Result<()> {
     // Test basic cache functionality
-    let extractor = DeltaStatisticsExtractor::new(10, 300);
+    let extractor = DeltaStatisticsExtractor::new(10, 300, 20_000);
 
     // Initially cache should be empty
     assert_eq!(extractor.cache_size().await, 0);
