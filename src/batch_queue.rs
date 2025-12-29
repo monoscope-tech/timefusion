@@ -15,12 +15,7 @@ pub struct BatchQueue {
 
 impl BatchQueue {
     pub fn new(db: Arc<crate::database::Database>, interval_ms: u64, max_rows: usize) -> Self {
-        // Make channel capacity configurable via environment variable
-        let channel_capacity = std::env::var("TIMEFUSION_BATCH_QUEUE_CAPACITY")
-            .unwrap_or_else(|_| "100000000".to_string())
-            .parse::<usize>()
-            .unwrap_or(100_000_000);
-
+        let channel_capacity = db.config().core.timefusion_batch_queue_capacity;
         let (tx, rx) = mpsc::channel(channel_capacity);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let shutdown_clone = shutdown.clone();

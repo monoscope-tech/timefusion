@@ -2,15 +2,37 @@
 mod integration {
     use anyhow::Result;
     use datafusion_postgres::{ServerOptions, auth::AuthManager};
-    // Not using dotenv - all env vars set explicitly in TestServer::start()
     use rand::Rng;
     use serial_test::serial;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
+    use timefusion::config::AppConfig;
     use timefusion::database::Database;
     use tokio::sync::Notify;
     use tokio_postgres::{Client, NoTls};
     use uuid::Uuid;
+
+    fn create_test_config(test_id: &str) -> Arc<AppConfig> {
+        let mut cfg = AppConfig::default();
+
+        // S3/MinIO settings
+        cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
+        cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
+        cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
+        cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
+        cfg.aws.aws_default_region = Some("us-east-1".to_string());
+        cfg.aws.aws_allow_http = Some("true".to_string());
+
+        // Core settings - unique per test
+        cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
+        cfg.core.walrus_data_dir = PathBuf::from(format!("/tmp/walrus-{}", test_id));
+
+        // Disable Foyer cache for integration tests
+        cfg.cache.timefusion_foyer_disabled = true;
+
+        Arc::new(cfg)
+    }
 
     struct TestServer {
         port: u16,
@@ -21,39 +43,14 @@ mod integration {
     impl TestServer {
         async fn start() -> Result<Self> {
             let _ = env_logger::builder().is_test(true).try_init();
-            // Don't use dotenv() - set all environment variables explicitly
-            // to match the lib tests which work correctly
 
             let test_id = Uuid::new_v4().to_string();
             let port = 5433 + rand::rng().random_range(1..100) as u16;
 
-            unsafe {
-                // Core settings
-                std::env::set_var("PGWIRE_PORT", port.to_string());
-                std::env::set_var("TIMEFUSION_TABLE_PREFIX", format!("test-{}", test_id));
+            let cfg = create_test_config(&test_id);
 
-                // S3/MinIO settings - same as lib tests
-                std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
-                std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
-                std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
-                std::env::set_var("AWS_S3_ENDPOINT", "http://127.0.0.1:9000");
-                std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
-                std::env::set_var("AWS_ALLOW_HTTP", "true");
-
-                // Disable config database
-                std::env::set_var("AWS_S3_LOCKING_PROVIDER", "");
-
-                // Foyer cache settings - use unique cache dir per test to avoid conflicts
-                std::env::set_var("TIMEFUSION_FOYER_MEMORY_MB", "64");
-                std::env::set_var("TIMEFUSION_FOYER_DISK_GB", "1");
-                std::env::set_var("TIMEFUSION_FOYER_TTL_SECONDS", "60");
-                std::env::set_var("TIMEFUSION_FOYER_SHARDS", "4");
-                std::env::set_var("TIMEFUSION_FOYER_CACHE_DIR", format!("/tmp/timefusion_cache_{}", test_id));
-            }
-
-            // Create database OUTSIDE the spawn to ensure table initialization completes
-            // in the main test context.
-            let db = Database::new().await?;
+            // Create database with explicit config - no global state
+            let db = Database::with_config(cfg).await?;
             let db = Arc::new(db);
 
             // Pre-warm the table by creating it now, outside the PGWire handler context.
