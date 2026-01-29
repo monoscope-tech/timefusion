@@ -1,9 +1,21 @@
 use anyhow::Result;
-use datafusion::arrow::array::AsArray;
+use datafusion::arrow::array::{Array, AsArray, LargeStringArray, StringArray, StringViewArray};
 use serial_test::serial;
 use std::sync::Arc;
 use timefusion::database::Database;
 use timefusion::test_utils::test_helpers::*;
+
+fn get_str(array: &dyn Array, idx: usize) -> String {
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        arr.value(idx).to_string()
+    } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+        arr.value(idx).to_string()
+    } else if let Some(arr) = array.as_any().downcast_ref::<StringViewArray>() {
+        arr.value(idx).to_string()
+    } else {
+        panic!("Unsupported string array type: {:?}", array.data_type())
+    }
+}
 
 async fn setup_test_database() -> Result<(Database, datafusion::prelude::SessionContext)> {
     dotenv::dotenv().ok();
@@ -58,7 +70,7 @@ async fn test_partition_column_ordering() -> Result<()> {
         .await?;
 
     assert_eq!(result[0].num_rows(), 1);
-    assert_eq!(result[0].column(0).as_string::<i32>().value(0), "partition_project");
+    assert_eq!(get_str(result[0].column(0).as_ref(), 0), "partition_project");
 
     db.shutdown().await?;
     Ok(())

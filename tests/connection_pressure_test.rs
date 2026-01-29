@@ -26,7 +26,7 @@ mod connection_pressure {
 
     impl PressureTestServer {
         async fn start() -> Result<Self> {
-            let _ = env_logger::builder().is_test(true).try_init();
+            timefusion::test_utils::init_test_logging();
             dotenv().ok();
 
             let test_id = Uuid::new_v4().to_string();
