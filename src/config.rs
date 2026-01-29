@@ -93,6 +93,7 @@ const_default!(d_wal_dir: PathBuf = "/var/lib/timefusion/wal");
 const_default!(d_pgwire_port: u16 = 5432);
 const_default!(d_table_prefix: String = "timefusion");
 const_default!(d_batch_queue_capacity: usize = 100_000_000);
+const_default!(d_pgwire_user: String = "postgres");
 const_default!(d_flush_interval: u64 = 600);
 const_default!(d_retention_mins: u64 = 70);
 const_default!(d_eviction_interval: u64 = 60);
@@ -230,6 +231,10 @@ pub struct CoreConfig {
     pub enable_batch_queue: bool,
     #[serde(default = "d_batch_queue_capacity")]
     pub timefusion_batch_queue_capacity: usize,
+    #[serde(default = "d_pgwire_user")]
+    pub pgwire_user: String,
+    #[serde(default)]
+    pub pgwire_password: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

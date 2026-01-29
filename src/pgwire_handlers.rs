@@ -1,51 +1,90 @@
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
-use datafusion_postgres::pgwire::api::ClientPortalStore;
-use datafusion_postgres::pgwire::api::auth::{StartupHandler, noop::NoopStartupHandler};
+use datafusion_postgres::pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
+use datafusion_postgres::pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler};
 use datafusion_postgres::pgwire::api::portal::Portal;
 use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use datafusion_postgres::pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
 use datafusion_postgres::pgwire::api::stmt::StoredStatement;
 use datafusion_postgres::pgwire::api::store::PortalStore;
-use datafusion_postgres::pgwire::api::{ClientInfo, ErrorHandler, PgWireServerHandlers};
+use datafusion_postgres::pgwire::api::{ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers};
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
-use datafusion_postgres::{DfSessionService, auth::AuthManager};
+use datafusion_postgres::DfSessionService;
 use futures::Sink;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::field::Empty;
-use tracing::{Instrument, info, instrument};
+use tracing::{info, instrument, Instrument};
 
-/// Custom handler factory that creates handlers which log UPDATE queries
+/// Auth configuration for PgWire server
+#[derive(Debug, Clone)]
+pub struct AuthConfig {
+    pub username: String,
+    pub password: Option<String>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self { username: "postgres".into(), password: None }
+    }
+}
+
+/// AuthSource that validates against configured credentials
+#[derive(Debug, Clone)]
+pub struct ConfigAuthSource {
+    config: AuthConfig,
+}
+
+impl ConfigAuthSource {
+    pub fn new(config: AuthConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait]
+impl AuthSource for ConfigAuthSource {
+    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
+        let username = login.user().unwrap_or("");
+        if username == self.config.username {
+            let pw = self.config.password.clone().unwrap_or_default();
+            Ok(Password::new(None, pw.into_bytes()))
+        } else {
+            Err(PgWireError::UserError(Box::new(datafusion_postgres::pgwire::error::ErrorInfo::new(
+                "FATAL".into(),
+                "28P01".into(),
+                format!("password authentication failed for user \"{username}\""),
+            ))))
+        }
+    }
+}
+
+/// Custom handler factory that creates handlers with logging and auth
 pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
-    auth_manager: Arc<AuthManager>,
+    auth_config: AuthConfig,
 }
 
 impl LoggingHandlerFactory {
-    pub fn new(session_context: Arc<SessionContext>, auth_manager: Arc<AuthManager>) -> Self {
-        Self { session_context, auth_manager }
+    pub fn new(session_context: Arc<SessionContext>, auth_config: AuthConfig) -> Self {
+        Self { session_context, auth_config }
     }
 }
 
-/// Simple startup handler for authentication
-pub struct SimpleStartupHandler;
-
-#[async_trait]
-impl NoopStartupHandler for SimpleStartupHandler {}
-
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        Arc::new(LoggingSimpleQueryHandler::new(self.session_context.clone(), self.auth_manager.clone()))
+        Arc::new(LoggingSimpleQueryHandler::new(self.session_context.clone()))
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        Arc::new(LoggingExtendedQueryHandler::new(self.session_context.clone(), self.auth_manager.clone()))
+        Arc::new(LoggingExtendedQueryHandler::new(self.session_context.clone()))
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(SimpleStartupHandler)
+        Arc::new(CleartextPasswordAuthStartupHandler::new(
+            ConfigAuthSource::new(self.auth_config.clone()),
+            DefaultServerParameterProvider::default(),
+        ))
     }
 
     fn error_handler(&self) -> Arc<impl ErrorHandler> {
@@ -53,7 +92,6 @@ impl PgWireServerHandlers for LoggingHandlerFactory {
     }
 }
 
-/// Error handler that logs errors
 struct LoggingErrorHandler;
 
 impl ErrorHandler for LoggingErrorHandler {
@@ -65,18 +103,44 @@ impl ErrorHandler for LoggingErrorHandler {
     }
 }
 
-/// Simple query handler that logs UPDATE queries
+/// Simple query handler with tracing
 pub struct LoggingSimpleQueryHandler {
     inner: DfSessionService,
 }
 
 impl LoggingSimpleQueryHandler {
-    /// Create a new LoggingSimpleQueryHandler.
-    /// Note: auth_manager is unused since datafusion-postgres 0.14.0 moved auth to server level.
-    pub fn new(session_context: Arc<SessionContext>, _auth_manager: Arc<AuthManager>) -> Self {
-        Self {
-            inner: DfSessionService::new(session_context),
-        }
+    pub fn new(session_context: Arc<SessionContext>) -> Self {
+        Self { inner: DfSessionService::new(session_context) }
+    }
+}
+
+fn classify_query(query: &str) -> (&'static str, &'static str) {
+    let q = query.trim().to_lowercase();
+    if q.starts_with("select") || q.contains(" select ") {
+        ("SELECT", "SELECT")
+    } else if q.starts_with("update") || q.contains(" update ") {
+        ("DML", "UPDATE")
+    } else if q.starts_with("delete") || q.contains(" delete ") {
+        ("DML", "DELETE")
+    } else if q.starts_with("insert") || q.contains(" insert ") {
+        ("DML", "INSERT")
+    } else if q.starts_with("create") || q.contains(" create ") {
+        ("DDL", "CREATE")
+    } else if q.starts_with("drop") || q.contains(" drop ") {
+        ("DDL", "DROP")
+    } else if q.starts_with("alter") || q.contains(" alter ") {
+        ("DDL", "ALTER")
+    } else {
+        ("OTHER", "UNKNOWN")
+    }
+}
+
+fn sanitize_query(query: &str, operation: &str) -> String {
+    let lower = query.to_lowercase();
+    match operation {
+        "INSERT" => lower.find(" values").map(|i| format!("{} VALUES ...", &query[..i])).unwrap_or_else(|| query.into()),
+        "UPDATE" => lower.find(" set").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.into()),
+        _ => query.into(),
     }
 }
 
@@ -85,13 +149,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
     #[instrument(
         name = "postgres.query.simple",
         skip_all,
-        fields(
-            query.text = Empty,
-            query.type = Empty,
-            query.operation = Empty,
-            db.system = "postgresql",
-            db.operation = Empty,
-        )
+        fields(query.text = Empty, query.type = Empty, query.operation = Empty, db.system = "postgresql", db.operation = Empty)
     )]
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
@@ -100,58 +158,25 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let span = tracing::Span::current();
-
-        // Determine query type and operation
-        let query_lower = query.trim().to_lowercase();
-        let (query_type, operation) = if query_lower.starts_with("select") || query_lower.contains(" select ") {
-            ("SELECT", "SELECT")
-        } else if query_lower.starts_with("update") || query_lower.contains(" update ") {
-            ("DML", "UPDATE")
-        } else if query_lower.starts_with("delete") || query_lower.contains(" delete ") {
-            ("DML", "DELETE")
-        } else if query_lower.starts_with("insert") || query_lower.contains(" insert ") {
-            ("DML", "INSERT")
-        } else if query_lower.starts_with("create") || query_lower.contains(" create ") {
-            ("DDL", "CREATE")
-        } else if query_lower.starts_with("drop") || query_lower.contains(" drop ") {
-            ("DDL", "DROP")
-        } else if query_lower.starts_with("alter") || query_lower.contains(" alter ") {
-            ("DDL", "ALTER")
-        } else {
-            ("OTHER", "UNKNOWN")
-        };
-
+        let (query_type, operation) = classify_query(query);
         span.record("query.type", query_type);
         span.record("query.operation", operation);
         span.record("db.operation", operation);
+        span.record("query.text", sanitize_query(query, operation).as_str());
 
-        // Truncate sensitive data from DML queries
-        let sanitized_query = match operation {
-            "INSERT" => query_lower.find(" values").map(|i| format!("{} VALUES ...", &query[..i])).unwrap_or_else(|| query.to_string()),
-            "UPDATE" => query_lower.find(" set").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.to_string()),
-            _ => query.to_string(),
-        };
-        span.record("query.text", sanitized_query.as_str());
-
-        // Delegate to inner handler with the span context
-        // Use the current span as parent to ensure proper context propagation
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span).await
     }
 }
 
-/// Extended query handler that logs UPDATE queries
+/// Extended query handler with tracing
 pub struct LoggingExtendedQueryHandler {
     inner: DfSessionService,
 }
 
 impl LoggingExtendedQueryHandler {
-    /// Create a new LoggingExtendedQueryHandler.
-    /// Note: auth_manager is unused since datafusion-postgres 0.14.0 moved auth to server level.
-    pub fn new(session_context: Arc<SessionContext>, _auth_manager: Arc<AuthManager>) -> Self {
-        Self {
-            inner: DfSessionService::new(session_context),
-        }
+    pub fn new(session_context: Arc<SessionContext>) -> Self {
+        Self { inner: DfSessionService::new(session_context) }
     }
 }
 
@@ -187,15 +212,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
     #[instrument(
         name = "postgres.query.extended",
         skip_all,
-        fields(
-            query.text = Empty,
-            query.type = Empty,
-            query.operation = Empty,
-            query.portal = %portal.name,
-            query.max_rows = max_rows,
-            db.system = "postgresql",
-            db.operation = Empty,
-        )
+        fields(query.text = Empty, query.type = Empty, query.operation = Empty, query.portal = %portal.name, query.max_rows = max_rows, db.system = "postgresql", db.operation = Empty)
     )]
     async fn do_query<C>(&self, client: &mut C, portal: &Portal<Self::Statement>, max_rows: usize) -> PgWireResult<Response>
     where
@@ -205,58 +222,25 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let span = tracing::Span::current();
-
-        // Get query text and determine type
         let query = &portal.statement.statement.0;
-
-        let query_lower = query.trim().to_lowercase();
-        let (query_type, operation) = if query_lower.starts_with("select") || query_lower.contains(" select ") {
-            ("SELECT", "SELECT")
-        } else if query_lower.starts_with("update") || query_lower.contains(" update ") {
-            ("DML", "UPDATE")
-        } else if query_lower.starts_with("delete") || query_lower.contains(" delete ") {
-            ("DML", "DELETE")
-        } else if query_lower.starts_with("insert") || query_lower.contains(" insert ") {
-            ("DML", "INSERT")
-        } else if query_lower.starts_with("create") || query_lower.contains(" create ") {
-            ("DDL", "CREATE")
-        } else if query_lower.starts_with("drop") || query_lower.contains(" drop ") {
-            ("DDL", "DROP")
-        } else if query_lower.starts_with("alter") || query_lower.contains(" alter ") {
-            ("DDL", "ALTER")
-        } else {
-            ("OTHER", "UNKNOWN")
-        };
-
+        let (query_type, operation) = classify_query(query);
         span.record("query.type", query_type);
         span.record("query.operation", operation);
         span.record("db.operation", operation);
+        span.record("query.text", sanitize_query(query, operation).as_str());
 
-        // Truncate sensitive data from DML queries
-        let sanitized_query = match operation {
-            "INSERT" => query_lower.find(" values").map(|i| format!("{} VALUES ...", &query[..i])).unwrap_or_else(|| query.to_string()),
-            "UPDATE" => query_lower.find(" set").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.to_string()),
-            _ => query.to_string(),
-        };
-        span.record("query.text", sanitized_query.as_str());
-
-        // Delegate to inner handler with the span context
-        // Use the current span as parent to ensure proper context propagation
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
-        <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows)
-            .instrument(execute_span)
-            .await
+        <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span).await
     }
 }
 
-/// Start the server with custom handlers that log UPDATE queries
+/// Start the server with custom handlers
 pub async fn serve_with_logging(
-    session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_manager: Arc<AuthManager>,
+    session_context: Arc<SessionContext>,
+    options: &datafusion_postgres::ServerOptions,
+    auth_config: AuthConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_manager));
-
-    // Use datafusion-postgres's serve_with_handlers
+    let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_config));
     datafusion_postgres::serve_with_handlers(handlers, options).await?;
-
     Ok(())
 }

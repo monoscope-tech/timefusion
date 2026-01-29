@@ -1,7 +1,7 @@
 // main.rs
 #![recursion_limit = "512"]
 
-use datafusion_postgres::{ServerOptions, auth::AuthManager};
+use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use std::sync::Arc;
 use timefusion::buffered_write_layer::BufferedWriteLayer;
@@ -85,12 +85,15 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let pg_port = cfg.core.pgwire_port;
     info!("Starting PGWire server on port: {}", pg_port);
 
+    let auth_config = timefusion::pgwire_handlers::AuthConfig {
+        username: cfg.core.pgwire_user.clone(),
+        password: cfg.core.pgwire_password.clone(),
+    };
+
     let pg_task = tokio::spawn(async move {
         let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
-        let auth_manager = Arc::new(AuthManager::new());
 
-        // Use our custom handlers that log UPDATE queries
-        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(Arc::new(session_context), &opts, auth_manager).await {
+        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(Arc::new(session_context), &opts, auth_config).await {
             error!("PGWire server error: {}", e);
         }
     });
