@@ -530,7 +530,9 @@ where
 }
 
 /// Convert DataFusion Expr to Delta-compatible format.
-/// Only strips table qualifiers from columns - Utf8View is kept for consistency.
+/// Recursively walks the expression tree and strips table qualifiers from Column references
+/// (e.g., `table.column` becomes just `column`). All other expression types (literals,
+/// binary ops, functions, etc.) pass through unchanged, preserving types like Utf8View.
 fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
     use datafusion::common::tree_node::TreeNode;
     expr.clone()
