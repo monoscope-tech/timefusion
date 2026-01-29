@@ -125,22 +125,26 @@ impl CompactColumn {
     }
 
     fn to_array_data(&self, data_type: &DataType, len: usize) -> arrow::array::ArrayData {
-        let null_buffer = self.null_bitmap.as_ref().map(|b| {
-            NullBuffer::new(arrow::buffer::BooleanBuffer::new(Buffer::from(b.as_slice()), 0, len))
-        });
+        let null_buffer = self
+            .null_bitmap
+            .as_ref()
+            .map(|b| NullBuffer::new(arrow::buffer::BooleanBuffer::new(Buffer::from(b.as_slice()), 0, len)));
         let buffers: Vec<Buffer> = self.buffers.iter().map(|b| Buffer::from(b.as_slice())).collect();
 
         let child_data: Vec<arrow::array::ArrayData> = match data_type {
-            DataType::List(field) => {
-                self.children.iter().zip(&self.child_lens)
-                    .map(|(child, &child_len)| child.to_array_data(field.data_type(), child_len))
-                    .collect()
-            }
-            DataType::Struct(fields) => {
-                self.children.iter().zip(fields.iter()).zip(&self.child_lens)
-                    .map(|((child, field), &child_len)| child.to_array_data(field.data_type(), child_len))
-                    .collect()
-            }
+            DataType::List(field) => self
+                .children
+                .iter()
+                .zip(&self.child_lens)
+                .map(|(child, &child_len)| child.to_array_data(field.data_type(), child_len))
+                .collect(),
+            DataType::Struct(fields) => self
+                .children
+                .iter()
+                .zip(fields.iter())
+                .zip(&self.child_lens)
+                .map(|((child, field), &child_len)| child.to_array_data(field.data_type(), child_len))
+                .collect(),
             _ => vec![],
         };
 
@@ -207,8 +211,9 @@ impl WalManager {
 
     /// Short hash for walrus topic key (walrus has 62-byte metadata limit)
     fn walrus_topic_key(project_id: &str, table_name: &str) -> String {
+        use ahash::AHasher;
         use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = AHasher::default();
         project_id.hash(&mut hasher);
         table_name.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
@@ -351,9 +356,7 @@ impl WalManager {
     }
 
     pub fn deserialize_batch(data: &[u8], table_name: &str) -> Result<RecordBatch, WalError> {
-        let schema = get_schema(table_name)
-            .map(|s| s.schema_ref())
-            .unwrap_or_else(|| get_default_schema().schema_ref());
+        let schema = get_schema(table_name).map(|s| s.schema_ref()).unwrap_or_else(|| get_default_schema().schema_ref());
         deserialize_record_batch(data, &schema)
     }
 
@@ -398,7 +401,9 @@ fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
 fn deserialize_record_batch(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
     let (compact, _): (CompactBatch, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
 
-    let arrays: Vec<ArrayRef> = compact.columns.iter()
+    let arrays: Vec<ArrayRef> = compact
+        .columns
+        .iter()
         .zip(schema.fields())
         .map(|(col, field)| {
             let array_data = col.to_array_data(field.data_type(), compact.num_rows);

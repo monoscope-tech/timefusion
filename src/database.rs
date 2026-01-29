@@ -7,15 +7,15 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::arrow::array::Array;
-use datafusion::physical_expr::expressions::{CastExpr, Column as PhysicalColumn};
-use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::common::not_impl_err;
 use datafusion::common::{SchemaExt, Statistics};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
+use datafusion::physical_expr::expressions::{CastExpr, Column as PhysicalColumn};
 use datafusion::physical_plan::DisplayAs;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     catalog::Session,
@@ -734,18 +734,7 @@ impl Database {
             "search_path",
         ];
 
-        let settings: Vec<&str> = vec![
-            "UTC",
-            "UTF8",
-            "ISO, MDY",
-            "notice",
-            "C",
-            "C",
-            "C",
-            "on",
-            "TimeFusion",
-            "public",
-        ];
+        let settings: Vec<&str> = vec!["UTC", "UTF8", "ISO, MDY", "notice", "C", "C", "C", "on", "TimeFusion", "public"];
 
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -1150,7 +1139,9 @@ impl Database {
         // Set env vars from storage_options for delta-rs credential resolution
         for (key, value) in &storage_options {
             if key.starts_with("AWS_") {
-                unsafe { std::env::set_var(key, value); }
+                unsafe {
+                    std::env::set_var(key, value);
+                }
             }
         }
 
@@ -1743,7 +1734,9 @@ impl ProjectRoutingTable {
 
         // Determine target schema based on projection
         let target_schema = if let Some(proj) = projection {
-            Arc::new(arrow_schema::Schema::new(proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>()))
+            Arc::new(arrow_schema::Schema::new(
+                proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>(),
+            ))
         } else {
             self.schema.clone()
         };
@@ -2089,7 +2082,9 @@ impl TableProvider for ProjectRoutingTable {
 
         // Determine target schema based on projection
         let target_schema = if let Some(proj) = projection {
-            Arc::new(arrow_schema::Schema::new(proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>()))
+            Arc::new(arrow_schema::Schema::new(
+                proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>(),
+            ))
         } else {
             self.schema.clone()
         };
@@ -2158,7 +2153,7 @@ mod tests {
 
     /// Helper function to extract string value from array column, handling different string array types
     fn get_str(array: &dyn Array, idx: usize) -> String {
-        use datafusion::arrow::array::{StringArray, LargeStringArray, StringViewArray};
+        use datafusion::arrow::array::{LargeStringArray, StringArray, StringViewArray};
         if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
             arr.value(idx).to_string()
         } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {

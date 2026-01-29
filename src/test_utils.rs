@@ -33,7 +33,10 @@ pub mod test_helpers {
 
     impl TestConfigBuilder {
         pub fn new(test_name: &str) -> Self {
-            Self { test_name: test_name.to_string(), buffer_mode: BufferMode::Enabled }
+            Self {
+                test_name: test_name.to_string(),
+                buffer_mode: BufferMode::Enabled,
+            }
         }
 
         pub fn with_buffer_mode(mut self, mode: BufferMode) -> Self {
@@ -69,9 +72,7 @@ pub mod test_helpers {
                 .map(|f| {
                     let data_type = match f.data_type() {
                         DataType::Utf8View => DataType::Utf8,
-                        DataType::List(inner) if inner.data_type() == &DataType::Utf8View => {
-                            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
-                        }
+                        DataType::List(inner) if inner.data_type() == &DataType::Utf8View => DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                         other => other.clone(),
                     };
                     Field::new(f.name(), data_type, f.is_nullable())

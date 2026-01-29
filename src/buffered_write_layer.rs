@@ -459,7 +459,10 @@ impl BufferedWriteLayer {
     pub async fn flush_all_now(&self) -> anyhow::Result<FlushStats> {
         let _flush_guard = self.flush_lock.lock().await;
         let all_buckets = self.mem_buffer.get_all_buckets();
-        let mut stats = FlushStats { total_rows: all_buckets.iter().map(|b| b.row_count as u64).sum(), ..Default::default() };
+        let mut stats = FlushStats {
+            total_rows: all_buckets.iter().map(|b| b.row_count as u64).sum(),
+            ..Default::default()
+        };
 
         for bucket in all_buckets {
             match self.flush_bucket(&bucket).await {
