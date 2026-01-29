@@ -560,8 +560,8 @@ impl BufferedWriteLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringViewArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use crate::test_utils::test_helpers::{json_to_batch, test_span};
+    use serial_test::serial;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -571,14 +571,14 @@ mod tests {
         Arc::new(cfg)
     }
 
-    fn create_test_batch() -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8View, false),
-        ]));
-        let id_array = Int64Array::from(vec![1, 2, 3]);
-        let name_array = StringViewArray::from(vec!["a", "b", "c"]);
-        RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)]).unwrap()
+    fn create_test_batch(project_id: &str) -> RecordBatch {
+        // Use test_span helper which creates data matching the default schema
+        json_to_batch(vec![
+            test_span("test1", "span1", project_id),
+            test_span("test2", "span2", project_id),
+            test_span("test3", "span3", project_id),
+        ])
+        .unwrap()
     }
 
     #[tokio::test]
@@ -592,7 +592,7 @@ mod tests {
         let table = format!("t{}", test_id);
 
         let layer = BufferedWriteLayer::with_config(cfg).unwrap();
-        let batch = create_test_batch();
+        let batch = create_test_batch(&project);
 
         layer.insert(&project, &table, vec![batch.clone()]).await.unwrap();
 
@@ -601,14 +601,15 @@ mod tests {
         assert_eq!(results[0].num_rows(), 3);
     }
 
-    // NOTE: This test is ignored because walrus-rust creates new files for each instance
-    // rather than discovering existing files from previous instances in the same directory.
-    // This is a limitation of the walrus library, not our code.
-    #[ignore]
+    #[serial]
     #[tokio::test]
     async fn test_recovery() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
+
+        // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment. We use #[serial]
+        // to prevent concurrent access to this process-global state.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir) };
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
@@ -618,10 +619,9 @@ mod tests {
         // First instance - write data
         {
             let layer = BufferedWriteLayer::with_config(Arc::clone(&cfg)).unwrap();
-            let batch = create_test_batch();
+            let batch = create_test_batch(&project);
             layer.insert(&project, &table, vec![batch]).await.unwrap();
-            // Shutdown to ensure WAL is synced
-            layer.shutdown().await.unwrap();
+            // Layer drops here - WAL data should be persisted
         }
 
         // Second instance - recover from WAL
@@ -648,7 +648,7 @@ mod tests {
         let layer = BufferedWriteLayer::with_config(cfg).unwrap();
 
         // First insert should succeed
-        let batch = create_test_batch();
+        let batch = create_test_batch(&project);
         layer.insert(&project, &table, vec![batch]).await.unwrap();
 
         // Verify reservation is released (should be 0 after successful insert)

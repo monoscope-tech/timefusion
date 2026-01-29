@@ -1736,7 +1736,9 @@ impl ProjectRoutingTable {
 
         // Determine target schema based on projection
         let target_schema = match projection {
-            Some(proj) => Arc::new(arrow_schema::Schema::new(proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>())),
+            Some(proj) => Arc::new(arrow_schema::Schema::new(
+                proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>(),
+            )),
             None => self.schema.clone(),
         };
 

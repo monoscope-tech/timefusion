@@ -210,10 +210,18 @@ impl WalManager {
     fn persist_topic(&self, topic: &str) {
         if self.known_topics.insert(topic.to_string()) {
             let meta_dir = self.data_dir.join(".timefusion_meta");
-            let _ = std::fs::create_dir_all(&meta_dir);
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(meta_dir.join("topics")) {
-                use std::io::Write;
-                let _ = writeln!(file, "{}", topic);
+            if let Err(e) = std::fs::create_dir_all(&meta_dir) {
+                warn!("Failed to create WAL meta dir {:?}: {}", meta_dir, e);
+                return;
+            }
+            match std::fs::OpenOptions::new().create(true).append(true).open(meta_dir.join("topics")) {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    if let Err(e) = writeln!(file, "{}", topic) {
+                        warn!("Failed to write topic '{}' to index: {}", topic, e);
+                    }
+                }
+                Err(e) => warn!("Failed to open topics file: {}", e),
             }
         }
     }
@@ -414,7 +422,10 @@ fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
 
 fn deserialize_record_batch(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
     if data.len() > MAX_BATCH_SIZE {
-        return Err(WalError::BatchTooLarge { size: data.len(), max: MAX_BATCH_SIZE });
+        return Err(WalError::BatchTooLarge {
+            size: data.len(),
+            max: MAX_BATCH_SIZE,
+        });
     }
 
     let (compact, _): (CompactBatch, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
@@ -451,7 +462,10 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
                 return Err(WalError::TooShort { len: data.len() });
             }
             if data[4] != WAL_VERSION {
-                return Err(WalError::UnsupportedVersion { version: data[4], expected: WAL_VERSION });
+                return Err(WalError::UnsupportedVersion {
+                    version: data[4],
+                    expected: WAL_VERSION,
+                });
             }
             WalOperation::try_from(data[5])?;
             let (entry, _): (WalEntry, _) = bincode::decode_from_slice(&data[6..], BINCODE_CONFIG)?;
