@@ -1,5 +1,5 @@
 use anyhow::Result;
-use datafusion::arrow::array::{Array, AsArray, StringArray, LargeStringArray, StringViewArray};
+use datafusion::arrow::array::{Array, AsArray, LargeStringArray, StringArray, StringViewArray};
 use serial_test::serial;
 use std::sync::Arc;
 use timefusion::database::Database;

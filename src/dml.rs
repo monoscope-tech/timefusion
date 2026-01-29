@@ -9,7 +9,10 @@ use datafusion::{
     },
     common::{Column, Result},
     error::DataFusionError,
-    execution::{SendableRecordBatchStream, TaskContext, context::{QueryPlanner, SessionState}},
+    execution::{
+        SendableRecordBatchStream, TaskContext,
+        context::{QueryPlanner, SessionState},
+    },
     logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, WriteOp},
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},

@@ -18,11 +18,7 @@ async fn setup_db_with_buffer(mode: BufferMode) -> Result<(Arc<Database>, Arc<Bu
     // Set WALRUS_DATA_DIR env var so walrus-rust uses the correct path
     unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir) };
     let layer = Arc::new(BufferedWriteLayer::with_config(Arc::clone(&cfg))?);
-    let db = Arc::new(
-        Database::with_config(cfg)
-            .await?
-            .with_buffered_layer(Arc::clone(&layer)),
-    );
+    let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
     let project_id = format!("proj_{}", uuid::Uuid::new_v4().to_string()[..8].to_string());
     Ok((db, layer, project_id))
 }
@@ -277,10 +273,7 @@ async fn test_delta_only_query() -> Result<()> {
 
     // Delta-only query should return only Delta data (30 rows)
     let delta_result = db
-        .query_delta_only(&format!(
-            "SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'",
-            project_id
-        ))
+        .query_delta_only(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
         .await?;
 
     let delta_count = delta_result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
