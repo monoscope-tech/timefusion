@@ -2,8 +2,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringBuilder, TimestampMicrosecondArray,
-    TimestampNanosecondArray,
+    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringViewArray, StringViewBuilder,
+    TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{DataFusionError, ScalarValue, not_impl_err};
@@ -80,7 +80,7 @@ impl ScalarUDFImpl for ToCharUDF {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Utf8)
+        Ok(DataType::Utf8View)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
@@ -101,11 +101,18 @@ impl ScalarUDFImpl for ToCharUDF {
         let format_str = match &args[1] {
             ColumnarValue::Scalar(scalar) => match scalar {
                 ScalarValue::Utf8(Some(s)) => s.clone(),
+                ScalarValue::Utf8View(Some(s)) => s.clone(),
                 ScalarValue::LargeUtf8(Some(s)) => s.clone(),
                 _ => return Err(DataFusionError::Execution("Format string must be a UTF8 string".to_string())),
             },
             ColumnarValue::Array(arr) => {
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
+                    if str_arr.len() == 1 && !str_arr.is_null(0) {
+                        str_arr.value(0).to_string()
+                    } else {
+                        return Err(DataFusionError::Execution("Format string must be a scalar value".to_string()));
+                    }
+                } else if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
                     if str_arr.len() == 1 && !str_arr.is_null(0) {
                         str_arr.value(0).to_string()
                     } else {
@@ -125,7 +132,7 @@ impl ScalarUDFImpl for ToCharUDF {
 /// Format timestamps according to PostgreSQL format patterns
 fn format_timestamps(timestamp_array: &ArrayRef, format_str: &str) -> datafusion::error::Result<ArrayRef> {
     let chrono_format = postgres_to_chrono_format(format_str);
-    let mut builder = StringBuilder::new();
+    let mut builder = StringViewBuilder::new();
 
     let format_fn = |timestamp_us: i64| -> datafusion::error::Result<String> {
         DateTime::<Utc>::from_timestamp_micros(timestamp_us)
@@ -237,11 +244,18 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
         let tz_str = match &args[1] {
             ColumnarValue::Scalar(scalar) => match scalar {
                 ScalarValue::Utf8(Some(s)) => s.clone(),
+                ScalarValue::Utf8View(Some(s)) => s.clone(),
                 ScalarValue::LargeUtf8(Some(s)) => s.clone(),
                 _ => return Err(DataFusionError::Execution("Timezone must be a UTF8 string".to_string())),
             },
             ColumnarValue::Array(arr) => {
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
+                if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
+                    if str_arr.len() == 1 && !str_arr.is_null(0) {
+                        str_arr.value(0).to_string()
+                    } else {
+                        return Err(DataFusionError::Execution("Timezone must be a scalar string value".to_string()));
+                    }
+                } else if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
                     if str_arr.len() == 1 && !str_arr.is_null(0) {
                         str_arr.value(0).to_string()
                     } else {
@@ -332,8 +346,8 @@ fn create_jsonb_array_elements_udf() -> ScalarUDF {
 
     create_udf(
         "jsonb_array_elements",
-        vec![DataType::Utf8],
-        DataType::Utf8,
+        vec![DataType::Utf8View],
+        DataType::Utf8View,
         Volatility::Immutable,
         jsonb_array_elements_fn,
     )
@@ -371,14 +385,14 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Utf8)
+        Ok(DataType::Utf8View)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let args = args.args;
         if args.is_empty() {
             // Empty array case
-            let mut builder = StringBuilder::with_capacity(1, 1024);
+            let mut builder = StringViewBuilder::with_capacity(1);
             builder.append_value("[]");
             return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
         }
@@ -389,7 +403,7 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
             ColumnarValue::Scalar(_) => 1,
         };
 
-        let mut builder = StringBuilder::with_capacity(num_rows, 1024);
+        let mut builder = StringViewBuilder::with_capacity(num_rows);
 
         for row_idx in 0..num_rows {
             let mut row_values = Vec::new();
@@ -449,7 +463,7 @@ impl ScalarUDFImpl for ToJsonUDF {
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
-        Ok(DataType::Utf8)
+        Ok(DataType::Utf8View)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
@@ -464,7 +478,7 @@ impl ScalarUDFImpl for ToJsonUDF {
         };
 
         let json_values = array_to_json_values(&array)?;
-        let mut builder = StringBuilder::with_capacity(json_values.len(), 1024);
+        let mut builder = StringViewBuilder::with_capacity(json_values.len());
 
         for value in json_values {
             builder.append_value(value.to_string());
@@ -557,11 +571,11 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
     let mut values = Vec::with_capacity(array.len());
 
     match array.data_type() {
-        DataType::Utf8 => {
+        DataType::Utf8View => {
             let string_array = array
                 .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to StringArray".to_string()))?;
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to StringViewArray".to_string()))?;
             for i in 0..string_array.len() {
                 if string_array.is_null(i) {
                     values.push(JsonValue::Null);
@@ -650,7 +664,7 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
         }
         _ => {
             // For other types, try to convert to string
-            let string_array = datafusion::arrow::compute::cast(array, &DataType::Utf8)?;
+            let string_array = datafusion::arrow::compute::cast(array, &DataType::Utf8View)?;
             return array_to_json_values(&string_array);
         }
     }
@@ -695,7 +709,7 @@ fn create_time_bucket_udf() -> ScalarUDF {
 
     create_udf(
         "time_bucket",
-        vec![DataType::Utf8, DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))],
+        vec![DataType::Utf8View, DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC")))],
         DataType::Timestamp(TimeUnit::Microsecond, Some(Arc::from("UTC"))),
         Volatility::Immutable,
         time_bucket_fn,

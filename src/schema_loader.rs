@@ -94,13 +94,14 @@ impl TableSchema {
 
 fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
     Ok(match s {
-        "Utf8" => ArrowDataType::Utf8,
+        // Use Utf8View for better performance with zero-copy string operations
+        "Utf8" => ArrowDataType::Utf8View,
         "Date32" => ArrowDataType::Date32,
         "Int32" => ArrowDataType::Int32,
         "Int64" => ArrowDataType::Int64,
         "UInt32" => ArrowDataType::UInt32,
         "UInt64" => ArrowDataType::UInt64,
-        "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8, true))),
+        "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8View, true))),
         "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
         _ => anyhow::bail!("Unknown type: {}", s),

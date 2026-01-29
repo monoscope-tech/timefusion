@@ -14,6 +14,14 @@ use tracing::{debug, error, info, instrument, warn};
 // 20% overhead accounts for DashMap internal structures, RwLock wrappers,
 // Arc<Schema> refs, and Arrow buffer alignment padding
 const MEMORY_OVERHEAD_MULTIPLIER: f64 = 1.2;
+/// Hard limit multiplier (120%) provides headroom for in-flight writes while preventing OOM
+const HARD_LIMIT_MULTIPLIER: usize = 5; // max_bytes + max_bytes/5 = 120%
+/// Maximum CAS retry attempts before failing
+const MAX_CAS_RETRIES: u32 = 100;
+/// Base backoff delay in microseconds for CAS retries
+const CAS_BACKOFF_BASE_MICROS: u64 = 1;
+/// Maximum backoff exponent (caps delay at ~1ms)
+const CAS_BACKOFF_MAX_EXPONENT: u32 = 10;
 
 #[derive(Debug, Default)]
 pub struct RecoveryStats {
@@ -23,6 +31,13 @@ pub struct RecoveryStats {
     pub newest_entry_timestamp: Option<i64>,
     pub recovery_duration_ms: u64,
     pub corrupted_entries_skipped: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct FlushStats {
+    pub buckets_flushed: u64,
+    pub buckets_failed: u64,
+    pub total_rows: u64,
 }
 
 /// Callback for writing batches to Delta Lake. The callback MUST:
@@ -93,16 +108,15 @@ impl BufferedWriteLayer {
 
     /// Try to reserve memory atomically before a write.
     /// Returns estimated batch size on success, or error if hard limit exceeded.
-    /// Callers MUST implement retry logic - hard failures may cause data loss.
+    /// Uses exponential backoff to reduce CPU thrashing under contention.
     fn try_reserve_memory(&self, batches: &[RecordBatch]) -> anyhow::Result<usize> {
         let batch_size: usize = batches.iter().map(estimate_batch_size).sum();
         let estimated_size = (batch_size as f64 * MEMORY_OVERHEAD_MULTIPLIER) as usize;
 
         let max_bytes = self.max_memory_bytes();
-        // Hard limit at 120% provides headroom for in-flight writes while preventing OOM
-        let hard_limit = max_bytes.saturating_add(max_bytes / 5);
+        let hard_limit = max_bytes.saturating_add(max_bytes / HARD_LIMIT_MULTIPLIER);
 
-        for _ in 0..100 {
+        for attempt in 0..MAX_CAS_RETRIES {
             let current_reserved = self.reserved_bytes.load(Ordering::Acquire);
             let current_mem = self.mem_buffer.estimated_memory_bytes();
             let new_total = current_mem + current_reserved + estimated_size;
@@ -123,8 +137,20 @@ impl BufferedWriteLayer {
             {
                 return Ok(estimated_size);
             }
+
+            // Exponential backoff: spin_loop for first few attempts, then brief sleep.
+            // Note: Using std::thread::sleep in this sync function called from async context.
+            // This is acceptable because: (1) max sleep is ~1ms, (2) only under high contention,
+            // (3) converting to async would require spawn_blocking which adds more overhead.
+            if attempt < 5 {
+                std::hint::spin_loop();
+            } else {
+                // Max backoff = 1μs << 10 = 1024μs ≈ 1ms
+                let backoff_micros = CAS_BACKOFF_BASE_MICROS << attempt.min(CAS_BACKOFF_MAX_EXPONENT);
+                std::thread::sleep(std::time::Duration::from_micros(backoff_micros));
+            }
         }
-        anyhow::bail!("Failed to reserve memory after 100 retries due to contention")
+        anyhow::bail!("Failed to reserve memory after {} retries due to contention", MAX_CAS_RETRIES)
     }
 
     fn release_reservation(&self, size: usize) {
@@ -169,6 +195,12 @@ impl BufferedWriteLayer {
         self.release_reservation(reserved_size);
 
         result?;
+
+        // Immediate flush mode: flush after every insert
+        if self.config.buffer.flush_immediately() {
+            self.flush_all_now().await?;
+        }
+
         debug!("BufferedWriteLayer insert complete: project={}, table={}", project_id, table_name);
         Ok(())
     }
@@ -202,7 +234,7 @@ impl BufferedWriteLayer {
 
         for entry in entries {
             match entry.operation {
-                WalOperation::Insert => match WalManager::deserialize_batch(&entry.data) {
+                WalOperation::Insert => match WalManager::deserialize_batch(&entry.data, &entry.table_name) {
                     Ok(batch) => {
                         self.mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros)?;
                         entries_replayed += 1;
@@ -332,7 +364,7 @@ impl BufferedWriteLayer {
             return Ok(());
         }
 
-        info!("Flushing {} buckets to Delta", flushable.len());
+        debug!("Flushing {} buckets to Delta", flushable.len());
 
         // Flush buckets in parallel with bounded concurrency
         let parallelism = self.config.buffer.flush_parallelism();
@@ -442,6 +474,35 @@ impl BufferedWriteLayer {
         Ok(())
     }
 
+    /// Force flush all buffered data to Delta immediately.
+    pub async fn flush_all_now(&self) -> anyhow::Result<FlushStats> {
+        let _flush_guard = self.flush_lock.lock().await;
+        let all_buckets = self.mem_buffer.get_all_buckets();
+        let mut stats = FlushStats {
+            total_rows: all_buckets.iter().map(|b| b.row_count as u64).sum(),
+            ..Default::default()
+        };
+
+        for bucket in all_buckets {
+            match self.flush_bucket(&bucket).await {
+                Ok(()) => {
+                    self.checkpoint_and_drain(&bucket);
+                    stats.buckets_flushed += 1;
+                }
+                Err(e) => {
+                    error!("flush_all_now: failed bucket {}: {}", bucket.bucket_id, e);
+                    stats.buckets_failed += 1;
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Check if buffer is empty (all data flushed).
+    pub fn is_empty(&self) -> bool {
+        self.mem_buffer.get_stats().total_rows == 0
+    }
+
     pub fn get_stats(&self) -> MemBufferStats {
         self.mem_buffer.get_stats()
     }
@@ -503,8 +564,8 @@ impl BufferedWriteLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use crate::test_utils::test_helpers::{json_to_batch, test_span};
+    use serial_test::serial;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -514,14 +575,14 @@ mod tests {
         Arc::new(cfg)
     }
 
-    fn create_test_batch() -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-        ]));
-        let id_array = Int64Array::from(vec![1, 2, 3]);
-        let name_array = StringArray::from(vec!["a", "b", "c"]);
-        RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)]).unwrap()
+    fn create_test_batch(project_id: &str) -> RecordBatch {
+        // Use test_span helper which creates data matching the default schema
+        json_to_batch(vec![
+            test_span("test1", "span1", project_id),
+            test_span("test2", "span2", project_id),
+            test_span("test3", "span3", project_id),
+        ])
+        .unwrap()
     }
 
     #[tokio::test]
@@ -535,7 +596,7 @@ mod tests {
         let table = format!("t{}", test_id);
 
         let layer = BufferedWriteLayer::with_config(cfg).unwrap();
-        let batch = create_test_batch();
+        let batch = create_test_batch(&project);
 
         layer.insert(&project, &table, vec![batch.clone()]).await.unwrap();
 
@@ -544,14 +605,15 @@ mod tests {
         assert_eq!(results[0].num_rows(), 3);
     }
 
-    // NOTE: This test is ignored because walrus-rust creates new files for each instance
-    // rather than discovering existing files from previous instances in the same directory.
-    // This is a limitation of the walrus library, not our code.
-    #[ignore]
+    #[serial]
     #[tokio::test]
     async fn test_recovery() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
+
+        // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment. We use #[serial]
+        // to prevent concurrent access to this process-global state.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir) };
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
@@ -561,10 +623,9 @@ mod tests {
         // First instance - write data
         {
             let layer = BufferedWriteLayer::with_config(Arc::clone(&cfg)).unwrap();
-            let batch = create_test_batch();
+            let batch = create_test_batch(&project);
             layer.insert(&project, &table, vec![batch]).await.unwrap();
-            // Shutdown to ensure WAL is synced
-            layer.shutdown().await.unwrap();
+            // Layer drops here - WAL data should be persisted
         }
 
         // Second instance - recover from WAL
@@ -591,7 +652,7 @@ mod tests {
         let layer = BufferedWriteLayer::with_config(cfg).unwrap();
 
         // First insert should succeed
-        let batch = create_test_batch();
+        let batch = create_test_batch(&project);
         layer.insert(&project, &table, vec![batch]).await.unwrap();
 
         // Verify reservation is released (should be 0 after successful insert)

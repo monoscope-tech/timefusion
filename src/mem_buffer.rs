@@ -155,7 +155,13 @@ pub fn estimate_batch_size(batch: &RecordBatch) -> usize {
 /// Merge two arrays based on a boolean mask.
 /// For each row: if mask[i] is true, use new_values[i], else use original[i].
 fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray) -> DFResult<ArrayRef> {
-    arrow::compute::kernels::zip::zip(mask, new_values, original).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    // Cast new_values to match original's type if they differ (e.g., Utf8 -> Utf8View)
+    let new_values = if original.data_type() != new_values.data_type() {
+        arrow::compute::cast(new_values, original.data_type()).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+    } else {
+        new_values.clone()
+    };
+    arrow::compute::kernels::zip::zip(mask, &new_values, original).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// Parse a SQL WHERE clause fragment into a DataFusion Expr.
@@ -423,7 +429,7 @@ impl MemBuffer {
 
     pub fn get_flushable_buckets(&self, cutoff_bucket_id: i64) -> Vec<FlushableBucket> {
         let flushable = self.collect_buckets(|bucket_id| bucket_id < cutoff_bucket_id);
-        info!("MemBuffer flushable buckets: count={}, cutoff={}", flushable.len(), cutoff_bucket_id);
+        debug!("MemBuffer flushable buckets: count={}, cutoff={}", flushable.len(), cutoff_bucket_id);
         flushable
     }
 
@@ -478,7 +484,7 @@ impl MemBuffer {
         }
 
         if evicted_count > 0 {
-            info!(
+            debug!(
                 "MemBuffer evicted {} buckets older than bucket_id={}, freed {} bytes",
                 evicted_count, cutoff_bucket_id, freed_bytes
             );
@@ -697,7 +703,7 @@ impl MemBuffer {
     pub fn clear(&self) {
         self.tables.clear();
         self.estimated_bytes.store(0, Ordering::Relaxed);
-        info!("MemBuffer cleared");
+        debug!("MemBuffer cleared");
     }
 }
 
@@ -767,7 +773,7 @@ impl TimeBucket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+    use arrow::array::{Int64Array, StringViewArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use std::sync::Arc;
 
@@ -775,11 +781,11 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
             Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8View, false),
         ]));
         let ts_array = TimestampMicrosecondArray::from(vec![timestamp_micros]).with_timezone("UTC");
         let id_array = Int64Array::from(vec![1]);
-        let name_array = StringArray::from(vec!["test"]);
+        let name_array = StringViewArray::from(vec!["test"]);
         RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
     }
 
@@ -851,11 +857,11 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![
             Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
             Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8View, false),
         ]));
         let ts_array = TimestampMicrosecondArray::from(vec![ts; ids.len()]).with_timezone("UTC");
         let id_array = Int64Array::from(ids);
-        let name_array = StringArray::from(names);
+        let name_array = StringViewArray::from(names);
         RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
     }
 
@@ -917,7 +923,7 @@ mod tests {
         let batch = &results[0];
         assert_eq!(batch.num_rows(), 3);
 
-        let name_col = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let name_col = batch.column(2).as_any().downcast_ref::<StringViewArray>().unwrap();
         assert_eq!(name_col.value(0), "a");
         assert_eq!(name_col.value(1), "updated");
         assert_eq!(name_col.value(2), "c");

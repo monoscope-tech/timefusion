@@ -1,9 +1,20 @@
 #[cfg(test)]
 mod test_custom_functions {
     use anyhow::Result;
-    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::array::{Array, StringArray, StringViewArray};
     use datafusion::prelude::*;
     use timefusion::functions::register_custom_functions;
+
+    /// Helper to get string value from either Utf8View or Utf8 array
+    fn get_str(arr: &dyn Array, idx: usize) -> String {
+        if let Some(sv) = arr.as_any().downcast_ref::<StringViewArray>() {
+            sv.value(idx).to_string()
+        } else if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+            s.value(idx).to_string()
+        } else {
+            panic!("Expected string array but got {:?}", arr.data_type());
+        }
+    }
 
     #[tokio::test]
     async fn test_to_char_function() -> Result<()> {
@@ -34,8 +45,7 @@ mod test_custom_functions {
             let batch = &results[0];
             assert_eq!(batch.num_rows(), 1);
 
-            let array = batch.column(0).as_string::<i32>();
-            let actual = array.value(0);
+            let actual = get_str(batch.column(0).as_ref(), 0);
 
             assert_eq!(actual, expected, "Format '{}' failed", format);
         }
@@ -69,8 +79,7 @@ mod test_custom_functions {
 
         assert_eq!(results2.len(), 1);
         let batch2 = &results2[0];
-        let array = batch2.column(0).as_string::<i32>();
-        let actual = array.value(0);
+        let actual = get_str(batch2.column(0).as_ref(), 0);
 
         // UTC 14:30:45 -> America/New_York (UTC-5 in January) = 09:30:45
         assert_eq!(actual, "2024-01-15 09:30:45");

@@ -71,9 +71,11 @@ pub struct LoggingSimpleQueryHandler {
 }
 
 impl LoggingSimpleQueryHandler {
-    pub fn new(session_context: Arc<SessionContext>, auth_manager: Arc<AuthManager>) -> Self {
+    /// Create a new LoggingSimpleQueryHandler.
+    /// Note: auth_manager is unused since datafusion-postgres 0.14.0 moved auth to server level.
+    pub fn new(session_context: Arc<SessionContext>, _auth_manager: Arc<AuthManager>) -> Self {
         Self {
-            inner: DfSessionService::new(session_context, auth_manager),
+            inner: DfSessionService::new(session_context),
         }
     }
 }
@@ -144,9 +146,11 @@ pub struct LoggingExtendedQueryHandler {
 }
 
 impl LoggingExtendedQueryHandler {
-    pub fn new(session_context: Arc<SessionContext>, auth_manager: Arc<AuthManager>) -> Self {
+    /// Create a new LoggingExtendedQueryHandler.
+    /// Note: auth_manager is unused since datafusion-postgres 0.14.0 moved auth to server level.
+    pub fn new(session_context: Arc<SessionContext>, _auth_manager: Arc<AuthManager>) -> Self {
         Self {
-            inner: DfSessionService::new(session_context, auth_manager),
+            inner: DfSessionService::new(session_context),
         }
     }
 }
