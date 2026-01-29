@@ -138,10 +138,14 @@ impl BufferedWriteLayer {
                 return Ok(estimated_size);
             }
 
-            // Exponential backoff: spin_loop for first few attempts, then yield
+            // Exponential backoff: spin_loop for first few attempts, then brief sleep.
+            // Note: Using std::thread::sleep in this sync function called from async context.
+            // This is acceptable because: (1) max sleep is ~1ms, (2) only under high contention,
+            // (3) converting to async would require spawn_blocking which adds more overhead.
             if attempt < 5 {
                 std::hint::spin_loop();
             } else {
+                // Max backoff = 1μs << 10 = 1024μs ≈ 1ms
                 let backoff_micros = CAS_BACKOFF_BASE_MICROS << attempt.min(CAS_BACKOFF_MAX_EXPONENT);
                 std::thread::sleep(std::time::Duration::from_micros(backoff_micros));
             }

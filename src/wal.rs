@@ -118,7 +118,7 @@ impl CompactColumn {
         Self {
             null_bitmap: data.nulls().map(|n| n.buffer().as_slice().to_vec()),
             buffers: data.buffers().iter().map(|b| b.as_slice().to_vec()).collect(),
-            children: data.child_data().iter().map(|c| Self::from_array_data(c)).collect(),
+            children: data.child_data().iter().map(Self::from_array_data).collect(),
             null_count: data.null_count(),
             child_lens: data.child_data().iter().map(|c| c.len()).collect(),
         }
@@ -128,7 +128,7 @@ impl CompactColumn {
         Self {
             null_bitmap: data.nulls().map(|n| n.buffer().as_slice().to_vec()),
             buffers: data.buffers().iter().map(|b| b.as_slice().to_vec()).collect(),
-            children: data.child_data().iter().map(|c| Self::from_array_data(c)).collect(),
+            children: data.child_data().iter().map(Self::from_array_data).collect(),
             null_count: data.null_count(),
             child_lens: data.child_data().iter().map(|c| c.len()).collect(),
         }
@@ -454,9 +454,11 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
     }
 
     if data[0..4] == WAL_MAGIC {
-        // v1+ format: data[4] is version byte (>= 1), data[5] is operation
-        // v0 format: data[4] is operation (0-2), no version byte
-        // Distinguish: if data[4] > 2, it must be a version byte
+        // WAL format detection based on byte 4:
+        // - v0 (legacy): data[4] is operation byte (0=Insert, 1=Delete, 2=Update)
+        // - v1+ (current): data[4] is version byte (>=128), data[5] is operation
+        // Since WalOperation values are 0-2 and WAL_VERSION is 128, we can safely
+        // distinguish formats: if data[4] > 2, it must be a version byte, not an operation.
         if data[4] > 2 {
             if data.len() < 6 {
                 return Err(WalError::TooShort { len: data.len() });
