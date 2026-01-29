@@ -13,8 +13,12 @@ use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
 pub enum WalError {
     #[error("WAL entry too short: {len} bytes")]
     TooShort { len: usize },
+    #[error("Batch too large: {size} bytes exceeds max {max}")]
+    BatchTooLarge { size: usize, max: usize },
     #[error("Invalid WAL operation type: {0}")]
     InvalidOperation(u8),
+    #[error("Unsupported WAL version: {version} (expected {expected})")]
+    UnsupportedVersion { version: u8, expected: u8 },
     #[error("Bincode decode error: {0}")]
     BincodeDecode(#[from] bincode::error::DecodeError),
     #[error("Bincode encode error: {0}")]
@@ -29,7 +33,13 @@ pub enum WalError {
 
 /// Magic bytes to identify new WAL format with DML support
 const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32]; // "WAL2"
+/// Version byte must be > 2 to distinguish from legacy operation bytes (0=Insert, 1=Delete, 2=Update)
+const WAL_VERSION: u8 = 128;
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
+/// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
+const MAX_BATCH_SIZE: usize = 100 * 1024 * 1024;
+/// Fsync schedule interval in milliseconds - balances durability with performance
+const FSYNC_SCHEDULE_MS: u64 = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
 #[repr(u8)]
@@ -124,15 +134,15 @@ impl CompactColumn {
         }
     }
 
-    fn to_array_data(&self, data_type: &DataType, len: usize) -> arrow::array::ArrayData {
+    fn to_array_data(&self, data_type: &DataType, len: usize) -> Result<arrow::array::ArrayData, WalError> {
         let null_buffer = self
             .null_bitmap
             .as_ref()
             .map(|b| NullBuffer::new(arrow::buffer::BooleanBuffer::new(Buffer::from(b.as_slice()), 0, len)));
         let buffers: Vec<Buffer> = self.buffers.iter().map(|b| Buffer::from(b.as_slice())).collect();
 
-        let child_data: Vec<arrow::array::ArrayData> = match data_type {
-            DataType::List(field) => self
+        let child_data: Result<Vec<arrow::array::ArrayData>, WalError> = match data_type {
+            DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => self
                 .children
                 .iter()
                 .zip(&self.child_lens)
@@ -145,20 +155,24 @@ impl CompactColumn {
                 .zip(&self.child_lens)
                 .map(|((child, field), &child_len)| child.to_array_data(field.data_type(), child_len))
                 .collect(),
-            _ => vec![],
+            DataType::Map(field, _) => self
+                .children
+                .iter()
+                .zip(&self.child_lens)
+                .map(|(child, &child_len)| child.to_array_data(field.data_type(), child_len))
+                .collect(),
+            _ => Ok(vec![]),
         };
 
-        unsafe {
-            arrow::array::ArrayData::new_unchecked(
-                data_type.clone(),
-                len,
-                Some(self.null_count),
-                null_buffer.map(|n| n.into_inner().into_inner()),
-                0,
-                buffers,
-                child_data,
-            )
-        }
+        arrow::array::ArrayData::try_new(
+            data_type.clone(),
+            len,
+            null_buffer.map(|n| n.into_inner().into_inner()),
+            0,
+            buffers,
+            child_data?,
+        )
+        .map_err(WalError::ArrowIpc)
     }
 }
 
@@ -172,7 +186,7 @@ impl WalManager {
     pub fn new(data_dir: PathBuf) -> Result<Self, WalError> {
         std::fs::create_dir_all(&data_dir)?;
 
-        let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(200))?;
+        let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(FSYNC_SCHEDULE_MS))?;
 
         // Load known topics from index file
         let meta_dir = data_dir.join(".timefusion_meta");
@@ -399,23 +413,25 @@ fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
 }
 
 fn deserialize_record_batch(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
+    if data.len() > MAX_BATCH_SIZE {
+        return Err(WalError::BatchTooLarge { size: data.len(), max: MAX_BATCH_SIZE });
+    }
+
     let (compact, _): (CompactBatch, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
 
-    let arrays: Vec<ArrayRef> = compact
+    let arrays: Result<Vec<ArrayRef>, WalError> = compact
         .columns
         .iter()
         .zip(schema.fields())
-        .map(|(col, field)| {
-            let array_data = col.to_array_data(field.data_type(), compact.num_rows);
-            make_array(array_data)
-        })
+        .map(|(col, field)| Ok(make_array(col.to_array_data(field.data_type(), compact.num_rows)?)))
         .collect();
 
-    RecordBatch::try_new(schema.clone(), arrays).map_err(WalError::ArrowIpc)
+    RecordBatch::try_new(schema.clone(), arrays?).map_err(WalError::ArrowIpc)
 }
 
 fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, WalError> {
     let mut buffer = WAL_MAGIC.to_vec();
+    buffer.push(WAL_VERSION);
     buffer.push(entry.operation as u8);
     buffer.extend(bincode::encode_to_vec(entry, BINCODE_CONFIG)?);
     Ok(buffer)
@@ -426,13 +442,28 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
         return Err(WalError::TooShort { len: data.len() });
     }
 
-    // Check for new format (magic header)
     if data[0..4] == WAL_MAGIC {
-        WalOperation::try_from(data[4])?; // Validate operation type
-        let (entry, _): (WalEntry, _) = bincode::decode_from_slice(&data[5..], BINCODE_CONFIG)?;
-        Ok(entry)
+        // v1+ format: data[4] is version byte (>= 1), data[5] is operation
+        // v0 format: data[4] is operation (0-2), no version byte
+        // Distinguish: if data[4] > 2, it must be a version byte
+        if data[4] > 2 {
+            if data.len() < 6 {
+                return Err(WalError::TooShort { len: data.len() });
+            }
+            if data[4] != WAL_VERSION {
+                return Err(WalError::UnsupportedVersion { version: data[4], expected: WAL_VERSION });
+            }
+            WalOperation::try_from(data[5])?;
+            let (entry, _): (WalEntry, _) = bincode::decode_from_slice(&data[6..], BINCODE_CONFIG)?;
+            Ok(entry)
+        } else {
+            // Legacy v0: magic + operation + data
+            WalOperation::try_from(data[4])?;
+            let (entry, _): (WalEntry, _) = bincode::decode_from_slice(&data[5..], BINCODE_CONFIG)?;
+            Ok(entry)
+        }
     } else {
-        // Old format - decode without magic header, assume INSERT
+        // Ancient format - no magic header, assume INSERT
         let (mut entry, _): (WalEntry, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
         entry.operation = WalOperation::Insert;
         Ok(entry)
