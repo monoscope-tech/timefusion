@@ -1131,12 +1131,18 @@ impl Database {
         Ok(Arc::new(store))
     }
 
-    /// Creates or loads a DeltaTable with proper configuration
-    /// Sets environment variables from storage_options to ensure delta-rs credential resolution works
+    /// Creates or loads a DeltaTable with proper configuration.
+    /// Sets environment variables from storage_options to ensure delta-rs credential resolution works.
     async fn create_or_load_delta_table(
         &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<DeltaTable> {
-        // Set env vars from storage_options for delta-rs credential resolution
+        // SAFETY: delta-rs internally uses std::env::var() for AWS credential resolution.
+        // While set_var is unsafe in multi-threaded contexts (potential data races with concurrent
+        // env reads), this is acceptable here because:
+        // 1. We only set AWS_* vars which are read by the AWS SDK during client initialization
+        // 2. The values are consistent across calls (same credentials for same storage_options)
+        // 3. Delta table creation happens early in request processing, before parallel query execution
+        // 4. The alternative (forking processes or thread-local storage) adds significant complexity
         for (key, value) in &storage_options {
             if key.starts_with("AWS_") {
                 unsafe {
@@ -1695,13 +1701,11 @@ impl ProjectRoutingTable {
         Ok(Arc::new(DataSourceExec::new(Arc::new(mem_source))))
     }
 
-    /// Helper to scan Delta only (when no MemBuffer data)
-    async fn scan_delta_only(
-        &self, state: &dyn Session, project_id: &str, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
+    /// Scan a Delta table and coerce output schema to match our expected types.
+    /// Handles object store registration, projection translation, and type coercion (e.g., Utf8 -> Utf8View).
+    async fn scan_delta_table(
+        &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
-        let table = delta_table.read().await;
-
         // Register the object store with DataFusion's runtime so table_provider().scan() can access it
         let log_store = table.log_store();
         let root_store = log_store.root_object_store(None);
@@ -1715,16 +1719,14 @@ impl ProjectRoutingTable {
 
         let provider = table.table_provider().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Translate projection indices from our schema to delta table's schema
-        // The projection indices from DataFusion are based on ProjectRoutingTable.schema,
-        // but the delta table provider expects indices based on its own schema
+        // Translate projection indices from our schema to delta table's schema.
+        // DataFusion passes indices based on ProjectRoutingTable.schema, but the
+        // delta table provider expects indices based on its own schema.
         let delta_schema = provider.schema();
         let translated_projection = projection.map(|proj| {
             proj.iter()
                 .filter_map(|&idx| {
-                    // Get column name from our schema
                     let col_name = self.schema.field(idx).name();
-                    // Find column index in delta schema
                     delta_schema.fields().iter().position(|f| f.name() == col_name)
                 })
                 .collect::<Vec<_>>()
@@ -1733,46 +1735,58 @@ impl ProjectRoutingTable {
         let delta_plan = provider.scan(state, translated_projection.as_ref(), filters, limit).await?;
 
         // Determine target schema based on projection
-        let target_schema = if let Some(proj) = projection {
-            Arc::new(arrow_schema::Schema::new(
-                proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>(),
-            ))
-        } else {
-            self.schema.clone()
+        let target_schema = match projection {
+            Some(proj) => Arc::new(arrow_schema::Schema::new(proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>())),
+            None => self.schema.clone(),
         };
 
-        // Coerce delta output schema to match our expected schema (e.g., Utf8 -> Utf8View)
-        let delta_output_schema = delta_plan.schema();
-        if delta_output_schema.fields().len() == target_schema.fields().len() {
-            let needs_coercion = delta_output_schema
-                .fields()
-                .iter()
-                .zip(target_schema.fields())
-                .any(|(delta_field, target_field)| delta_field.data_type() != target_field.data_type());
+        Self::coerce_plan_to_schema(delta_plan, &target_schema)
+    }
 
-            if needs_coercion {
-                // Create cast expressions for each column
-                let cast_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = delta_output_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .zip(target_schema.fields())
-                    .map(|((idx, delta_field), target_field)| {
-                        let col_expr = Arc::new(PhysicalColumn::new(delta_field.name(), idx)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>;
-                        let expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = if delta_field.data_type() != target_field.data_type() {
-                            Arc::new(CastExpr::new(col_expr, target_field.data_type().clone(), None))
-                        } else {
-                            col_expr
-                        };
-                        (expr, target_field.name().clone())
-                    })
-                    .collect();
-
-                return Ok(Arc::new(ProjectionExec::try_new(cast_exprs, delta_plan)?));
-            }
+    /// Wrap an execution plan with type coercion if the output schema doesn't match the target.
+    /// This handles cases like Delta returning Utf8 when we expect Utf8View.
+    fn coerce_plan_to_schema(plan: Arc<dyn ExecutionPlan>, target_schema: &SchemaRef) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let plan_schema = plan.schema();
+        if plan_schema.fields().len() != target_schema.fields().len() {
+            return Ok(plan);
         }
 
-        Ok(delta_plan)
+        let needs_coercion = plan_schema
+            .fields()
+            .iter()
+            .zip(target_schema.fields())
+            .any(|(plan_field, target_field)| plan_field.data_type() != target_field.data_type());
+
+        if !needs_coercion {
+            return Ok(plan);
+        }
+
+        let cast_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = plan_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .zip(target_schema.fields())
+            .map(|((idx, plan_field), target_field)| {
+                let col_expr = Arc::new(PhysicalColumn::new(plan_field.name(), idx)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>;
+                let expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = if plan_field.data_type() != target_field.data_type() {
+                    Arc::new(CastExpr::new(col_expr, target_field.data_type().clone(), None))
+                } else {
+                    col_expr
+                };
+                (expr, target_field.name().clone())
+            })
+            .collect();
+
+        Ok(Arc::new(ProjectionExec::try_new(cast_exprs, plan)?))
+    }
+
+    /// Helper to scan Delta only (when no MemBuffer data)
+    async fn scan_delta_only(
+        &self, state: &dyn Session, project_id: &str, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
+        let table = delta_table.read().await;
+        self.scan_delta_table(&table, state, projection, filters, limit).await
     }
 
     /// Extract time range (min, max) from query filters.
@@ -2047,82 +2061,7 @@ impl TableProvider for ProjectRoutingTable {
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
         let table = delta_table.read().await;
-
-        // Register the object store with DataFusion's runtime so table_provider().scan() can access it
-        let log_store = table.log_store();
-        let root_store = log_store.root_object_store(None);
-        let bucket_url = {
-            let table_url = table.table_url();
-            let scheme = table_url.scheme();
-            let bucket = table_url.host_str().unwrap_or("");
-            Url::parse(&format!("{}://{}/", scheme, bucket)).expect("valid bucket URL")
-        };
-        state.runtime_env().register_object_store(&bucket_url, root_store);
-
-        let scan_span = tracing::trace_span!("delta_table.scan",
-            table.name = %self.table_name,
-            table.project_id = %project_id,
-            partition_filters = ?delta_filters.iter().filter(|f| matches!(f, Expr::BinaryExpr(_))).count()
-        );
-
-        let provider = table.table_provider().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        // Translate projection indices from our schema to delta table's schema
-        let delta_schema = provider.schema();
-        let translated_projection = projection.map(|proj| {
-            proj.iter()
-                .filter_map(|&idx| {
-                    let col_name = self.schema.field(idx).name();
-                    delta_schema.fields().iter().position(|f| f.name() == col_name)
-                })
-                .collect::<Vec<_>>()
-        });
-
-        let delta_plan = provider.scan(state, translated_projection.as_ref(), &delta_filters, limit).instrument(scan_span).await?;
-
-        // Determine target schema based on projection
-        let target_schema = if let Some(proj) = projection {
-            Arc::new(arrow_schema::Schema::new(
-                proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>(),
-            ))
-        } else {
-            self.schema.clone()
-        };
-
-        // Coerce delta output schema to match our expected schema (e.g., Utf8 -> Utf8View)
-        let delta_output_schema = delta_plan.schema();
-        let delta_plan = if delta_output_schema.fields().len() == target_schema.fields().len() {
-            let needs_coercion = delta_output_schema
-                .fields()
-                .iter()
-                .zip(target_schema.fields())
-                .any(|(delta_field, target_field)| delta_field.data_type() != target_field.data_type());
-
-            if needs_coercion {
-                // Create cast expressions for each column
-                let cast_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = delta_output_schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .zip(target_schema.fields())
-                    .map(|((idx, delta_field), target_field)| {
-                        let col_expr = Arc::new(PhysicalColumn::new(delta_field.name(), idx)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>;
-                        let expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = if delta_field.data_type() != target_field.data_type() {
-                            Arc::new(CastExpr::new(col_expr, target_field.data_type().clone(), None))
-                        } else {
-                            col_expr
-                        };
-                        (expr, target_field.name().clone())
-                    })
-                    .collect();
-
-                Arc::new(ProjectionExec::try_new(cast_exprs, delta_plan)?) as Arc<dyn ExecutionPlan>
-            } else {
-                delta_plan
-            }
-        } else {
-            delta_plan
-        };
+        let delta_plan = self.scan_delta_table(&table, state, projection, &delta_filters, limit).await?;
 
         // Union both plans (mem data first for recency, then Delta for historical)
         UnionExec::try_new(vec![mem_plan, delta_plan])
