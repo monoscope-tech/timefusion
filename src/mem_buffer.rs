@@ -12,7 +12,7 @@ use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser as SqlParser;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
 // longer = larger Delta files. Matches default flush interval for aligned boundaries.
@@ -46,7 +46,7 @@ fn schemas_compatible(existing: &SchemaRef, incoming: &SchemaRef) -> bool {
         }
     }
     if new_fields > 0 {
-        debug!("Schema evolution: {} new nullable field(s) added", new_fields);
+        info!("Schema evolution: {} new nullable field(s) added", new_fields);
     }
     true
 }

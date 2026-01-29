@@ -36,15 +36,25 @@ use deltalake::operations::create::CreateBuilder;
 use deltalake::{DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use instrumented_object_store::instrument_object_store;
+use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::fmt;
+use std::sync::OnceLock;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::field::Empty;
 use tracing::{Instrument, debug, error, info, instrument, warn};
 use url::Url;
+
+/// Mutex to serialize access to environment variable modifications.
+/// Required because delta-rs uses std::env::var() for AWS credential resolution,
+/// and std::env::set_var is unsafe in multi-threaded contexts.
+static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+fn env_mutex() -> &'static Mutex<()> {
+    ENV_MUTEX.get_or_init(|| Mutex::new(()))
+}
 
 // Changed to support multiple tables per project: (project_id, table_name) -> DeltaTable
 pub type ProjectConfigs = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
@@ -1136,17 +1146,18 @@ impl Database {
     async fn create_or_load_delta_table(
         &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<DeltaTable> {
-        // SAFETY: delta-rs internally uses std::env::var() for AWS credential resolution.
-        // While set_var is unsafe in multi-threaded contexts (potential data races with concurrent
-        // env reads), this is acceptable here because:
-        // 1. We only set AWS_* vars which are read by the AWS SDK during client initialization
-        // 2. The values are consistent across calls (same credentials for same storage_options)
-        // 3. Delta table creation happens early in request processing, before parallel query execution
-        // 4. The alternative (forking processes or thread-local storage) adds significant complexity
-        for (key, value) in &storage_options {
-            if key.starts_with("AWS_") {
-                unsafe {
-                    std::env::set_var(key, value);
+        // delta-rs uses std::env::var() for AWS credential resolution.
+        // We serialize access with ENV_MUTEX to prevent data races from concurrent set_var calls.
+        {
+            let _guard = env_mutex().lock();
+            for (key, value) in &storage_options {
+                if key.starts_with("AWS_") {
+                    // SAFETY: Protected by ENV_MUTEX. set_var is only unsafe due to potential
+                    // concurrent reads, which we prevent by holding the mutex during the entire
+                    // block. The mutex ensures only one thread modifies env vars at a time.
+                    unsafe {
+                        std::env::set_var(key, value);
+                    }
                 }
             }
         }
@@ -1194,9 +1205,8 @@ impl Database {
 
         // Fallback to legacy batch queue if configured
         let enable_queue = self.config.core.enable_batch_queue;
-        if !skip_queue && enable_queue && self.batch_queue.is_some() {
+        if !skip_queue && enable_queue && let Some(ref queue) = self.batch_queue {
             span.record("use_queue", true);
-            let queue = self.batch_queue.as_ref().unwrap();
             for batch in batches {
                 if let Err(e) = queue.queue(batch) {
                     return Err(anyhow::anyhow!("Queue error: {}", e));
@@ -1724,12 +1734,19 @@ impl ProjectRoutingTable {
         // delta table provider expects indices based on its own schema.
         let delta_schema = provider.schema();
         let translated_projection = projection.map(|proj| {
-            proj.iter()
-                .filter_map(|&idx| {
-                    let col_name = self.schema.field(idx).name();
-                    delta_schema.fields().iter().position(|f| f.name() == col_name)
-                })
-                .collect::<Vec<_>>()
+            let mut translated = Vec::with_capacity(proj.len());
+            for &idx in proj {
+                let col_name = self.schema.field(idx).name();
+                if let Some(delta_idx) = delta_schema.fields().iter().position(|f| f.name() == col_name) {
+                    translated.push(delta_idx);
+                } else {
+                    warn!(
+                        "Column '{}' requested in projection but not found in Delta schema for table '{}'",
+                        col_name, self.table_name
+                    );
+                }
+            }
+            translated
         });
 
         let delta_plan = provider.scan(state, translated_projection.as_ref(), filters, limit).await?;
