@@ -14,6 +14,14 @@ use tracing::{debug, error, info, instrument, warn};
 // 20% overhead accounts for DashMap internal structures, RwLock wrappers,
 // Arc<Schema> refs, and Arrow buffer alignment padding
 const MEMORY_OVERHEAD_MULTIPLIER: f64 = 1.2;
+/// Hard limit multiplier (120%) provides headroom for in-flight writes while preventing OOM
+const HARD_LIMIT_MULTIPLIER: usize = 5; // max_bytes + max_bytes/5 = 120%
+/// Maximum CAS retry attempts before failing
+const MAX_CAS_RETRIES: u32 = 100;
+/// Base backoff delay in microseconds for CAS retries
+const CAS_BACKOFF_BASE_MICROS: u64 = 1;
+/// Maximum backoff exponent (caps delay at ~1ms)
+const CAS_BACKOFF_MAX_EXPONENT: u32 = 10;
 
 #[derive(Debug, Default)]
 pub struct RecoveryStats {
@@ -100,16 +108,15 @@ impl BufferedWriteLayer {
 
     /// Try to reserve memory atomically before a write.
     /// Returns estimated batch size on success, or error if hard limit exceeded.
-    /// Callers MUST implement retry logic - hard failures may cause data loss.
+    /// Uses exponential backoff to reduce CPU thrashing under contention.
     fn try_reserve_memory(&self, batches: &[RecordBatch]) -> anyhow::Result<usize> {
         let batch_size: usize = batches.iter().map(estimate_batch_size).sum();
         let estimated_size = (batch_size as f64 * MEMORY_OVERHEAD_MULTIPLIER) as usize;
 
         let max_bytes = self.max_memory_bytes();
-        // Hard limit at 120% provides headroom for in-flight writes while preventing OOM
-        let hard_limit = max_bytes.saturating_add(max_bytes / 5);
+        let hard_limit = max_bytes.saturating_add(max_bytes / HARD_LIMIT_MULTIPLIER);
 
-        for _ in 0..100 {
+        for attempt in 0..MAX_CAS_RETRIES {
             let current_reserved = self.reserved_bytes.load(Ordering::Acquire);
             let current_mem = self.mem_buffer.estimated_memory_bytes();
             let new_total = current_mem + current_reserved + estimated_size;
@@ -130,8 +137,16 @@ impl BufferedWriteLayer {
             {
                 return Ok(estimated_size);
             }
+
+            // Exponential backoff: spin_loop for first few attempts, then yield
+            if attempt < 5 {
+                std::hint::spin_loop();
+            } else {
+                let backoff_micros = CAS_BACKOFF_BASE_MICROS << attempt.min(CAS_BACKOFF_MAX_EXPONENT);
+                std::thread::sleep(std::time::Duration::from_micros(backoff_micros));
+            }
         }
-        anyhow::bail!("Failed to reserve memory after 100 retries due to contention")
+        anyhow::bail!("Failed to reserve memory after {} retries due to contention", MAX_CAS_RETRIES)
     }
 
     fn release_reservation(&self, size: usize) {
