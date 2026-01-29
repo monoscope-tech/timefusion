@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod integration {
     use anyhow::Result;
-    use datafusion_postgres::{ServerOptions, auth::AuthManager};
+    use datafusion_postgres::ServerOptions;
     use rand::Rng;
     use serial_test::serial;
     use std::path::PathBuf;
@@ -65,11 +65,11 @@ mod integration {
                 db_clone.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
-                let auth_manager = Arc::new(AuthManager::new());
+                let auth_config = timefusion::pgwire_handlers::AuthConfig::default();
 
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
-                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth_manager) => {
+                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth_config) => {
                         if let Err(e) = res {
                             eprintln!("Server error: {:?}", e);
                         }
