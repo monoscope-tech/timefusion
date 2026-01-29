@@ -198,18 +198,19 @@ impl AwsConfig {
         }
 
         let mut opts = HashMap::new();
-        insert_opt!(opts, "aws_access_key_id", self.aws_access_key_id);
-        insert_opt!(opts, "aws_secret_access_key", self.aws_secret_access_key);
-        insert_opt!(opts, "aws_region", self.aws_default_region);
-        opts.insert("aws_endpoint".into(), endpoint_override.unwrap_or(&self.aws_s3_endpoint).to_string());
+        insert_opt!(opts, "AWS_ACCESS_KEY_ID", self.aws_access_key_id);
+        insert_opt!(opts, "AWS_SECRET_ACCESS_KEY", self.aws_secret_access_key);
+        insert_opt!(opts, "AWS_REGION", self.aws_default_region);
+        insert_opt!(opts, "AWS_ALLOW_HTTP", self.aws_allow_http);
+        opts.insert("AWS_ENDPOINT_URL".into(), endpoint_override.unwrap_or(&self.aws_s3_endpoint).to_string());
 
         if self.is_dynamodb_locking_enabled() {
-            opts.insert("aws_s3_locking_provider".into(), "dynamodb".into());
-            insert_opt!(opts, "delta_dynamo_table_name", self.dynamodb.delta_dynamo_table_name);
-            insert_opt!(opts, "aws_access_key_id_dynamodb", self.dynamodb.aws_access_key_id_dynamodb);
-            insert_opt!(opts, "aws_secret_access_key_dynamodb", self.dynamodb.aws_secret_access_key_dynamodb);
-            insert_opt!(opts, "aws_region_dynamodb", self.dynamodb.aws_region_dynamodb);
-            insert_opt!(opts, "aws_endpoint_url_dynamodb", self.dynamodb.aws_endpoint_url_dynamodb);
+            opts.insert("AWS_S3_LOCKING_PROVIDER".into(), "dynamodb".into());
+            insert_opt!(opts, "DELTA_DYNAMO_TABLE_NAME", self.dynamodb.delta_dynamo_table_name);
+            insert_opt!(opts, "AWS_ACCESS_KEY_ID_DYNAMODB", self.dynamodb.aws_access_key_id_dynamodb);
+            insert_opt!(opts, "AWS_SECRET_ACCESS_KEY_DYNAMODB", self.dynamodb.aws_secret_access_key_dynamodb);
+            insert_opt!(opts, "AWS_REGION_DYNAMODB", self.dynamodb.aws_region_dynamodb);
+            insert_opt!(opts, "AWS_ENDPOINT_URL_DYNAMODB", self.dynamodb.aws_endpoint_url_dynamodb);
         }
         opts
     }
@@ -247,6 +248,8 @@ pub struct BufferConfig {
     pub timefusion_wal_corruption_threshold: usize,
     #[serde(default = "d_flush_parallelism")]
     pub timefusion_flush_parallelism: usize,
+    #[serde(default)]
+    pub timefusion_flush_immediately: bool,
 }
 
 impl BufferConfig {
@@ -267,6 +270,9 @@ impl BufferConfig {
     }
     pub fn flush_parallelism(&self) -> usize {
         self.timefusion_flush_parallelism.max(1)
+    }
+    pub fn flush_immediately(&self) -> bool {
+        self.timefusion_flush_immediately
     }
 
     pub fn compute_shutdown_timeout(&self, current_memory_mb: usize) -> Duration {

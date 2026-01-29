@@ -668,7 +668,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             if value.is_expired(ttl) {
                 self.update_stats(|s| s.ttl_expirations += 1).await;
                 self.cache.remove(&cache_key);
-                info!(
+                debug!(
                     "Foyer cache EXPIRED for: {} (TTL: {}s, age: {}ms)",
                     location,
                     ttl.as_secs(),

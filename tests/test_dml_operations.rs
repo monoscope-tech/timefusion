@@ -2,17 +2,23 @@
 mod test_dml_operations {
     use anyhow::Result;
     use datafusion::arrow;
-    use datafusion::arrow::array::AsArray;
+    use datafusion::arrow::array::{Array, AsArray, StringArray, StringViewArray};
     use serial_test::serial;
     use std::path::PathBuf;
     use std::sync::Arc;
     use timefusion::config::AppConfig;
     use timefusion::database::Database;
-    use tracing::{Level, info};
+    use tracing::info;
 
-    fn init_tracing() {
-        let subscriber = tracing_subscriber::fmt().with_max_level(Level::INFO).with_target(false).finish();
-        let _ = tracing::subscriber::set_global_default(subscriber);
+    /// Helper function to get string value from either Utf8View or Utf8 array
+    fn get_str(arr: &dyn Array, idx: usize) -> String {
+        if let Some(sv) = arr.as_any().downcast_ref::<StringViewArray>() {
+            sv.value(idx).to_string()
+        } else if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+            s.value(idx).to_string()
+        } else {
+            panic!("Expected string array but got {:?}", arr.data_type());
+        }
     }
 
     fn create_test_config(test_id: &str) -> Arc<AppConfig> {
@@ -80,7 +86,7 @@ mod test_dml_operations {
     #[serial]
     #[tokio::test]
     async fn test_update_query() -> Result<()> {
-        init_tracing();
+        timefusion::test_utils::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -116,11 +122,11 @@ mod test_dml_operations {
         let name_col_idx = batch.schema().fields().iter().position(|f| f.name() == "name").unwrap();
         let duration_col_idx = batch.schema().fields().iter().position(|f| f.name() == "duration").unwrap();
 
-        let name_col = batch.column(name_col_idx).as_string::<i32>();
+        let name_col = batch.column(name_col_idx).as_ref();
         let duration_col = batch.column(duration_col_idx).as_primitive::<arrow::datatypes::Int64Type>();
 
         for i in 0..batch.num_rows() {
-            match name_col.value(i) {
+            match get_str(name_col, i).as_str() {
                 "Bob" => assert_eq!(duration_col.value(i), 500, "Bob's duration should be updated to 500"),
                 "Alice" => assert_eq!(duration_col.value(i), 100, "Alice's duration should remain 100"),
                 "Charlie" => assert_eq!(duration_col.value(i), 300, "Charlie's duration should remain 300"),
@@ -136,7 +142,7 @@ mod test_dml_operations {
     #[serial]
     #[tokio::test]
     async fn test_delete_with_predicate() -> Result<()> {
-        init_tracing();
+        timefusion::test_utils::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -172,13 +178,13 @@ mod test_dml_operations {
         let id_col_idx = batch.schema().fields().iter().position(|f| f.name() == "id").unwrap();
         let name_col_idx = batch.schema().fields().iter().position(|f| f.name() == "name").unwrap();
 
-        let id_col = batch.column(id_col_idx).as_string::<i32>();
-        let name_col = batch.column(name_col_idx).as_string::<i32>();
+        let id_col = batch.column(id_col_idx).as_ref();
+        let name_col = batch.column(name_col_idx).as_ref();
 
-        assert_eq!(id_col.value(0), "1");
-        assert_eq!(name_col.value(0), "Alice");
-        assert_eq!(id_col.value(1), "3");
-        assert_eq!(name_col.value(1), "Charlie");
+        assert_eq!(get_str(id_col, 0), "1");
+        assert_eq!(get_str(name_col, 0), "Alice");
+        assert_eq!(get_str(id_col, 1), "3");
+        assert_eq!(get_str(name_col, 1), "Charlie");
 
         Ok(())
     }
@@ -265,11 +271,11 @@ mod test_dml_operations {
         let results = df.collect().await?;
         let batch = &results[0];
 
-        let id_col = batch.column(0).as_string::<i32>();
-        let level_col = batch.column(1).as_string::<i32>();
+        let id_col = batch.column(0).as_ref();
+        let level_col = batch.column(1).as_ref();
 
-        assert_eq!(id_col.value(0), "2");
-        assert_eq!(level_col.value(0), "INFO");
+        assert_eq!(get_str(id_col, 0), "2");
+        assert_eq!(get_str(level_col, 0), "INFO");
 
         Ok(())
     }
@@ -281,7 +287,7 @@ mod test_dml_operations {
     #[serial]
     #[tokio::test]
     async fn test_update_multiple_columns() -> Result<()> {
-        init_tracing();
+        timefusion::test_utils::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);
@@ -319,10 +325,10 @@ mod test_dml_operations {
         let level_idx = batch.schema().fields().iter().position(|f| f.name() == "level").unwrap();
 
         let duration_col = batch.column(duration_idx).as_primitive::<arrow::datatypes::Int64Type>();
-        let level_col = batch.column(level_idx).as_string::<i32>();
+        let level_col = batch.column(level_idx).as_ref();
 
         assert_eq!(duration_col.value(0), 999, "Duration should be updated to 999");
-        assert_eq!(level_col.value(0), "WARN", "Level should be updated to WARN");
+        assert_eq!(get_str(level_col, 0), "WARN", "Level should be updated to WARN");
 
         Ok(())
     }
@@ -334,7 +340,7 @@ mod test_dml_operations {
     #[serial]
     #[tokio::test]
     async fn test_delete_verify_counts() -> Result<()> {
-        init_tracing();
+        timefusion::test_utils::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let cfg = create_test_config(&test_id);
         let db = Arc::new(Database::with_config(cfg).await?);

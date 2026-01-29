@@ -1,7 +1,19 @@
 #[cfg(test)]
 mod test_json_functions {
     use anyhow::Result;
+    use datafusion::arrow::array::{Array, StringArray, StringViewArray};
     use timefusion::database::Database;
+
+    /// Helper to extract string value from either Utf8View or Utf8 array
+    fn get_str(arr: &dyn Array, idx: usize) -> String {
+        if let Some(sv) = arr.as_any().downcast_ref::<StringViewArray>() {
+            sv.value(idx).to_string()
+        } else if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+            s.value(idx).to_string()
+        } else {
+            panic!("Expected string array but got {:?}", arr.data_type());
+        }
+    }
 
     #[tokio::test]
     async fn test_json_build_array() -> Result<()> {
@@ -17,8 +29,7 @@ mod test_json_functions {
         assert_eq!(results.len(), 1);
         let batch = &results[0];
         let column = batch.column(0);
-        let value = column.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().unwrap();
-        assert_eq!(value.value(0), r#"["a","b","c"]"#);
+        assert_eq!(get_str(column.as_ref(), 0), r#"["a","b","c"]"#);
 
         Ok(())
     }
@@ -37,8 +48,7 @@ mod test_json_functions {
         assert_eq!(results.len(), 1);
         let batch = &results[0];
         let column = batch.column(0);
-        let value = column.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().unwrap();
-        assert_eq!(value.value(0), r#"{"hello":"world"}"#);
+        assert_eq!(get_str(column.as_ref(), 0), r#"{"hello":"world"}"#);
 
         // Test to_json with number
         let df = ctx.sql("SELECT to_json(123) as result").await?;
@@ -46,8 +56,7 @@ mod test_json_functions {
         assert_eq!(results.len(), 1);
         let batch = &results[0];
         let column = batch.column(0);
-        let value = column.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().unwrap();
-        assert_eq!(value.value(0), "123");
+        assert_eq!(get_str(column.as_ref(), 0), "123");
 
         Ok(())
     }
@@ -87,8 +96,7 @@ mod test_json_functions {
         assert_eq!(results.len(), 1);
         let batch = &results[0];
         let column = batch.column(0);
-        let value = column.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().unwrap();
-        assert_eq!(value.value(0), "2025-08-07 10:00:00");
+        assert_eq!(get_str(column.as_ref(), 0), "2025-08-07 10:00:00");
 
         Ok(())
     }
@@ -111,8 +119,7 @@ mod test_json_functions {
         assert_eq!(results.len(), 1);
         let batch = &results[0];
         let column = batch.column(0);
-        let value = column.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().unwrap();
-        assert_eq!(value.value(0), r#"["001","test_span",1500,{"status":"ok"}]"#);
+        assert_eq!(get_str(column.as_ref(), 0), r#"["001","test_span",1500,{"status":"ok"}]"#);
 
         Ok(())
     }

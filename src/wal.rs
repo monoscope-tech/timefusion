@@ -1,9 +1,9 @@
-use arrow::array::RecordBatch;
-use arrow::ipc::reader::StreamReader;
-use arrow::ipc::writer::StreamWriter;
+use crate::schema_loader::{get_default_schema, get_schema};
+use arrow::array::{Array, ArrayRef, RecordBatch, make_array};
+use arrow::buffer::{Buffer, NullBuffer};
+use arrow::datatypes::{DataType, SchemaRef};
 use bincode::{Decode, Encode};
 use dashmap::DashSet;
-use std::io::Cursor;
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
@@ -84,6 +84,80 @@ pub struct UpdatePayload {
     pub assignments: Vec<(String, String)>,
 }
 
+/// Compact representation of a column's raw Arrow buffers (no schema embedded)
+#[derive(Debug, Encode, Decode)]
+struct CompactColumn {
+    null_bitmap: Option<Vec<u8>>,
+    buffers: Vec<Vec<u8>>,
+    children: Vec<CompactColumn>,
+    null_count: usize,
+    /// Length of child arrays (needed for List types where child length != parent length)
+    child_lens: Vec<usize>,
+}
+
+/// Compact batch without schema - just raw column data
+#[derive(Debug, Encode, Decode)]
+struct CompactBatch {
+    num_rows: usize,
+    columns: Vec<CompactColumn>,
+}
+
+impl CompactColumn {
+    fn from_array(array: &dyn Array) -> Self {
+        let data = array.to_data();
+        Self {
+            null_bitmap: data.nulls().map(|n| n.buffer().as_slice().to_vec()),
+            buffers: data.buffers().iter().map(|b| b.as_slice().to_vec()).collect(),
+            children: data.child_data().iter().map(|c| Self::from_array_data(c)).collect(),
+            null_count: data.null_count(),
+            child_lens: data.child_data().iter().map(|c| c.len()).collect(),
+        }
+    }
+
+    fn from_array_data(data: &arrow::array::ArrayData) -> Self {
+        Self {
+            null_bitmap: data.nulls().map(|n| n.buffer().as_slice().to_vec()),
+            buffers: data.buffers().iter().map(|b| b.as_slice().to_vec()).collect(),
+            children: data.child_data().iter().map(|c| Self::from_array_data(c)).collect(),
+            null_count: data.null_count(),
+            child_lens: data.child_data().iter().map(|c| c.len()).collect(),
+        }
+    }
+
+    fn to_array_data(&self, data_type: &DataType, len: usize) -> arrow::array::ArrayData {
+        let null_buffer = self.null_bitmap.as_ref().map(|b| {
+            NullBuffer::new(arrow::buffer::BooleanBuffer::new(Buffer::from(b.as_slice()), 0, len))
+        });
+        let buffers: Vec<Buffer> = self.buffers.iter().map(|b| Buffer::from(b.as_slice())).collect();
+
+        let child_data: Vec<arrow::array::ArrayData> = match data_type {
+            DataType::List(field) => {
+                self.children.iter().zip(&self.child_lens)
+                    .map(|(child, &child_len)| child.to_array_data(field.data_type(), child_len))
+                    .collect()
+            }
+            DataType::Struct(fields) => {
+                self.children.iter().zip(fields.iter()).zip(&self.child_lens)
+                    .map(|((child, field), &child_len)| child.to_array_data(field.data_type(), child_len))
+                    .collect()
+            }
+            _ => vec![],
+        };
+
+        unsafe {
+            arrow::array::ArrayData::new_unchecked(
+                data_type.clone(),
+                len,
+                Some(self.null_count),
+                null_buffer.map(|n| n.into_inner().into_inner()),
+                0,
+                buffers,
+                child_data,
+            )
+        }
+    }
+}
+
 pub struct WalManager {
     wal: Walrus,
     data_dir: PathBuf,
@@ -126,8 +200,18 @@ impl WalManager {
         }
     }
 
+    /// Human-readable topic identifier for metadata/logging
     fn make_topic(project_id: &str, table_name: &str) -> String {
         format!("{}:{}", project_id, table_name)
+    }
+
+    /// Short hash for walrus topic key (walrus has 62-byte metadata limit)
+    fn walrus_topic_key(project_id: &str, table_name: &str) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        project_id.hash(&mut hasher);
+        table_name.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
     }
 
     fn parse_topic(topic: &str) -> Option<(String, String)> {
@@ -137,8 +221,9 @@ impl WalManager {
     #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
     pub fn append(&self, project_id: &str, table_name: &str, batch: &RecordBatch) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name);
         let entry = WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?);
-        self.wal.append_for_topic(&topic, &serialize_wal_entry(&entry)?)?;
+        self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
         debug!("WAL append INSERT: topic={}, rows={}", topic, batch.num_rows());
         Ok(())
@@ -147,13 +232,14 @@ impl WalManager {
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub fn append_batch(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name);
         let payloads: Vec<Vec<u8>> = batches
             .iter()
             .map(|batch| serialize_wal_entry(&WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?)))
             .collect::<Result<_, _>>()?;
 
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-        self.wal.batch_append_for_topic(&topic, &payload_refs)?;
+        self.wal.batch_append_for_topic(&walrus_key, &payload_refs)?;
         self.persist_topic(&topic);
         debug!("WAL batch append INSERT: topic={}, batches={}", topic, batches.len());
         Ok(())
@@ -162,6 +248,7 @@ impl WalManager {
     #[instrument(skip(self), fields(project_id, table_name))]
     pub fn append_delete(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name);
         let data = bincode::encode_to_vec(
             &DeletePayload {
                 predicate_sql: predicate_sql.map(String::from),
@@ -169,7 +256,7 @@ impl WalManager {
             BINCODE_CONFIG,
         )?;
         let entry = WalEntry::new(project_id, table_name, WalOperation::Delete, data);
-        self.wal.append_for_topic(&topic, &serialize_wal_entry(&entry)?)?;
+        self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
         debug!("WAL append DELETE: topic={}, predicate={:?}", topic, predicate_sql);
         Ok(())
@@ -178,12 +265,13 @@ impl WalManager {
     #[instrument(skip(self, assignments), fields(project_id, table_name))]
     pub fn append_update(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)]) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name);
         let payload = UpdatePayload {
             predicate_sql: predicate_sql.map(String::from),
             assignments: assignments.to_vec(),
         };
         let entry = WalEntry::new(project_id, table_name, WalOperation::Update, bincode::encode_to_vec(&payload, BINCODE_CONFIG)?);
-        self.wal.append_for_topic(&topic, &serialize_wal_entry(&entry)?)?;
+        self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
         debug!(
             "WAL append UPDATE: topic={}, predicate={:?}, assignments={}",
@@ -199,12 +287,13 @@ impl WalManager {
         &self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool,
     ) -> Result<(Vec<WalEntry>, usize), WalError> {
         let topic = Self::make_topic(project_id, table_name);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name);
         let cutoff = since_timestamp_micros.unwrap_or(0);
         let mut results = Vec::new();
         let mut error_count = 0usize;
 
         loop {
-            match self.wal.read_next(&topic, checkpoint) {
+            match self.wal.read_next(&walrus_key, checkpoint) {
                 Ok(Some(entry_data)) => match deserialize_wal_entry(&entry_data.data) {
                     Ok(entry) if entry.timestamp_micros >= cutoff => results.push(entry),
                     Ok(_) => {} // Skip old entries
@@ -261,8 +350,11 @@ impl WalManager {
         Ok((all_results, total_errors))
     }
 
-    pub fn deserialize_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
-        deserialize_record_batch(data)
+    pub fn deserialize_batch(data: &[u8], table_name: &str) -> Result<RecordBatch, WalError> {
+        let schema = get_schema(table_name)
+            .map(|s| s.schema_ref())
+            .unwrap_or_else(|| get_default_schema().schema_ref());
+        deserialize_record_batch(data, &schema)
     }
 
     pub fn list_topics(&self) -> Result<Vec<String>, WalError> {
@@ -272,9 +364,10 @@ impl WalManager {
     #[instrument(skip(self))]
     pub fn checkpoint(&self, project_id: &str, table_name: &str) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name);
         let mut count = 0;
         loop {
-            match self.wal.read_next(&topic, true) {
+            match self.wal.read_next(&walrus_key, true) {
                 Ok(Some(_)) => count += 1,
                 Ok(None) => break,
                 Err(e) => {
@@ -295,15 +388,25 @@ impl WalManager {
 }
 
 fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
-    let mut buffer = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut buffer, &batch.schema())?;
-    writer.write(batch)?;
-    writer.finish()?;
-    Ok(buffer)
+    let compact = CompactBatch {
+        num_rows: batch.num_rows(),
+        columns: batch.columns().iter().map(|c| CompactColumn::from_array(c.as_ref())).collect(),
+    };
+    bincode::encode_to_vec(&compact, BINCODE_CONFIG).map_err(WalError::BincodeEncode)
 }
 
-fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
-    StreamReader::try_new(Cursor::new(data), None)?.next().ok_or(WalError::EmptyBatch)?.map_err(WalError::ArrowIpc)
+fn deserialize_record_batch(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
+    let (compact, _): (CompactBatch, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
+
+    let arrays: Vec<ArrayRef> = compact.columns.iter()
+        .zip(schema.fields())
+        .map(|(col, field)| {
+            let array_data = col.to_array_data(field.data_type(), compact.num_rows);
+            make_array(array_data)
+        })
+        .collect();
+
+    RecordBatch::try_new(schema.clone(), arrays).map_err(WalError::ArrowIpc)
 }
 
 fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, WalError> {
@@ -344,18 +447,18 @@ pub fn deserialize_update_payload(data: &[u8]) -> Result<UpdatePayload, WalError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Int64Array, StringViewArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
     fn create_test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8View, false),
         ]));
         RecordBatch::try_new(
             schema,
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3])), Arc::new(StringViewArray::from(vec!["a", "b", "c"]))],
         )
         .unwrap()
     }
@@ -363,8 +466,9 @@ mod tests {
     #[test]
     fn test_record_batch_serialization() {
         let batch = create_test_batch();
+        let schema = batch.schema();
         let serialized = serialize_record_batch(&batch).unwrap();
-        let deserialized = deserialize_record_batch(&serialized).unwrap();
+        let deserialized = deserialize_record_batch(&serialized, &schema).unwrap();
         assert_eq!(batch.num_rows(), deserialized.num_rows());
         assert_eq!(batch.num_columns(), deserialized.num_columns());
     }
