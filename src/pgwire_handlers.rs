@@ -71,9 +71,9 @@ pub struct LoggingSimpleQueryHandler {
 }
 
 impl LoggingSimpleQueryHandler {
-    pub fn new(session_context: Arc<SessionContext>, auth_manager: Arc<AuthManager>) -> Self {
+    pub fn new(session_context: Arc<SessionContext>, _auth_manager: Arc<AuthManager>) -> Self {
         Self {
-            inner: DfSessionService::new(session_context, auth_manager),
+            inner: DfSessionService::new(session_context),
         }
     }
 }
@@ -144,9 +144,9 @@ pub struct LoggingExtendedQueryHandler {
 }
 
 impl LoggingExtendedQueryHandler {
-    pub fn new(session_context: Arc<SessionContext>, auth_manager: Arc<AuthManager>) -> Self {
+    pub fn new(session_context: Arc<SessionContext>, _auth_manager: Arc<AuthManager>) -> Self {
         Self {
-            inner: DfSessionService::new(session_context, auth_manager),
+            inner: DfSessionService::new(session_context),
         }
     }
 }

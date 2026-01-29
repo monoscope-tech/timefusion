@@ -6,14 +6,15 @@ use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use chrono::Utc;
-use datafusion::arrow::array::{Array, AsArray};
+use datafusion::arrow::array::Array;
+use datafusion::physical_expr::expressions::{CastExpr, Column as PhysicalColumn};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::common::not_impl_err;
 use datafusion::common::{SchemaExt, Statistics};
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-// Removed unused imports
 use datafusion::physical_plan::DisplayAs;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
@@ -56,10 +57,18 @@ pub async fn get_delta_table(project_configs: &ProjectConfigs, project_id: &str,
 
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
+    use datafusion::arrow::array::{StringArray, StringViewArray};
+
     batch.schema().fields().iter().position(|f| f.name() == "project_id").and_then(|idx| {
         let column = batch.column(idx);
-        let string_array = column.as_string::<i32>();
-        (string_array.len() > 0 && !string_array.is_null(0)).then(|| string_array.value(0).to_string())
+        // Try Utf8View first (our preferred type), then fall back to Utf8
+        if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+            (arr.len() > 0 && !arr.is_null(0)).then(|| arr.value(0).to_string())
+        } else if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+            (arr.len() > 0 && !arr.is_null(0)).then(|| arr.value(0).to_string())
+        } else {
+            None
+        }
     })
 }
 
@@ -382,6 +391,17 @@ impl Database {
         self.buffered_layer.as_ref()
     }
 
+    /// Query Delta tables directly, bypassing the in-memory buffer (for testing).
+    pub async fn query_delta_only(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let mut db_clone = self.clone();
+        db_clone.buffered_layer = None;
+        let db_arc = Arc::new(db_clone);
+        let mut ctx = Arc::clone(&db_arc).create_session_context();
+        datafusion_functions_json::register_all(&mut ctx)?;
+        db_arc.setup_session_context(&mut ctx)?;
+        Ok(ctx.sql(sql).await?.collect().await?)
+    }
+
     /// Enable object store cache with foyer (deprecated - cache is now initialized in new())
     /// This method is kept for backward compatibility but is now a no-op
     pub async fn with_object_store_cache(self) -> Result<Self> {
@@ -560,6 +580,10 @@ impl Database {
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.catalog.information_schema", "true");
 
+        // Ensure Utf8View handling for consistent string types across DataFusion and Delta
+        let _ = options.set("datafusion.execution.parquet.schema_force_view_types", "true");
+        let _ = options.set("datafusion.sql_parser.map_string_types_to_utf8view", "true");
+
         // Enable Parquet statistics for better query optimization with Delta Lake
         // These settings ensure DataFusion uses file and column statistics for pruning
         let _ = options.set("datafusion.execution.parquet.statistics_enabled", "page");
@@ -688,44 +712,45 @@ impl Database {
 
     /// Register PostgreSQL settings table for compatibility
     pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
-        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::array::StringViewArray;
         use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::arrow::record_batch::RecordBatch;
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-            Field::new("setting", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8View, false),
+            Field::new("setting", DataType::Utf8View, false),
         ]));
 
-        let names = vec![
-            "TimeZone".to_string(),
-            "client_encoding".to_string(),
-            "datestyle".to_string(),
-            "client_min_messages".to_string(),
-            // Add more PostgreSQL settings that clients might try to set
-            "lc_monetary".to_string(),
-            "lc_numeric".to_string(),
-            "lc_time".to_string(),
-            "standard_conforming_strings".to_string(),
-            "application_name".to_string(),
-            "search_path".to_string(),
+        let names: Vec<&str> = vec![
+            "TimeZone",
+            "client_encoding",
+            "datestyle",
+            "client_min_messages",
+            "lc_monetary",
+            "lc_numeric",
+            "lc_time",
+            "standard_conforming_strings",
+            "application_name",
+            "search_path",
         ];
 
-        let settings = vec![
-            "UTC".to_string(),
-            "UTF8".to_string(),
-            "ISO, MDY".to_string(),
-            "notice".to_string(),
-            // Default values for the additional settings
-            "C".to_string(),
-            "C".to_string(),
-            "C".to_string(),
-            "on".to_string(),
-            "TimeFusion".to_string(),
-            "public".to_string(),
+        let settings: Vec<&str> = vec![
+            "UTC",
+            "UTF8",
+            "ISO, MDY",
+            "notice",
+            "C",
+            "C",
+            "C",
+            "on",
+            "TimeFusion",
+            "public",
         ];
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(names)), Arc::new(StringArray::from(settings))])?;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringViewArray::from(names)), Arc::new(StringViewArray::from(settings))],
+        )?;
 
         ctx.register_batch("pg_settings", batch)?;
         Ok(())
@@ -733,17 +758,17 @@ impl Database {
 
     /// Register set_config UDF for PostgreSQL compatibility
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
-        use datafusion::arrow::array::{StringArray, StringBuilder};
+        use datafusion::arrow::array::{StringViewArray, StringViewBuilder};
         use datafusion::arrow::datatypes::DataType;
         use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
-                ColumnarValue::Array(array) => array.as_any().downcast_ref::<StringArray>().expect("set_config second arg must be a StringArray"),
+                ColumnarValue::Array(array) => array.as_any().downcast_ref::<StringViewArray>().expect("set_config second arg must be a StringViewArray"),
                 _ => panic!("set_config second arg must be an array"),
             };
 
-            let mut builder = StringBuilder::new();
+            let mut builder = StringViewBuilder::new();
             for i in 0..param_value_array.len() {
                 if param_value_array.is_null(i) {
                     builder.append_null();
@@ -756,8 +781,8 @@ impl Database {
 
         let set_config_udf = create_udf(
             "set_config",
-            vec![DataType::Utf8, DataType::Utf8, DataType::Boolean],
-            DataType::Utf8,
+            vec![DataType::Utf8View, DataType::Utf8View, DataType::Boolean],
+            DataType::Utf8View,
             Volatility::Volatile,
             set_config_fn,
         );
@@ -891,30 +916,30 @@ impl Database {
             );
 
             let mut storage_options = HashMap::new();
-            storage_options.insert("aws_access_key_id".to_string(), config.s3_access_key_id.clone());
-            storage_options.insert("aws_secret_access_key".to_string(), config.s3_secret_access_key.clone());
-            storage_options.insert("aws_region".to_string(), config.s3_region.clone());
+            storage_options.insert("AWS_ACCESS_KEY_ID".to_string(), config.s3_access_key_id.clone());
+            storage_options.insert("AWS_SECRET_ACCESS_KEY".to_string(), config.s3_secret_access_key.clone());
+            storage_options.insert("AWS_REGION".to_string(), config.s3_region.clone());
             if let Some(ref endpoint) = config.s3_endpoint {
-                storage_options.insert("aws_endpoint".to_string(), endpoint.clone());
+                storage_options.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone());
             }
 
             // Add DynamoDB locking configuration if enabled (even for project-specific configs)
             if self.config.aws.is_dynamodb_locking_enabled() {
-                storage_options.insert("aws_s3_locking_provider".to_string(), "dynamodb".to_string());
+                storage_options.insert("AWS_S3_LOCKING_PROVIDER".to_string(), "dynamodb".to_string());
                 if let Some(ref table) = self.config.aws.dynamodb.delta_dynamo_table_name {
-                    storage_options.insert("delta_dynamo_table_name".to_string(), table.clone());
+                    storage_options.insert("DELTA_DYNAMO_TABLE_NAME".to_string(), table.clone());
                 }
                 if let Some(ref key) = self.config.aws.dynamodb.aws_access_key_id_dynamodb {
-                    storage_options.insert("aws_access_key_id_dynamodb".to_string(), key.clone());
+                    storage_options.insert("AWS_ACCESS_KEY_ID_DYNAMODB".to_string(), key.clone());
                 }
                 if let Some(ref secret) = self.config.aws.dynamodb.aws_secret_access_key_dynamodb {
-                    storage_options.insert("aws_secret_access_key_dynamodb".to_string(), secret.clone());
+                    storage_options.insert("AWS_SECRET_ACCESS_KEY_DYNAMODB".to_string(), secret.clone());
                 }
                 if let Some(ref region) = self.config.aws.dynamodb.aws_region_dynamodb {
-                    storage_options.insert("aws_region_dynamodb".to_string(), region.clone());
+                    storage_options.insert("AWS_REGION_DYNAMODB".to_string(), region.clone());
                 }
                 if let Some(ref endpoint) = self.config.aws.dynamodb.aws_endpoint_url_dynamodb {
-                    storage_options.insert("aws_endpoint_url_dynamodb".to_string(), endpoint.clone());
+                    storage_options.insert("AWS_ENDPOINT_URL_DYNAMODB".to_string(), endpoint.clone());
                 }
             }
 
@@ -1062,16 +1087,16 @@ impl Database {
         let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
 
         // Apply storage options
-        if let Some(access_key) = storage_options.get("aws_access_key_id") {
+        if let Some(access_key) = storage_options.get("AWS_ACCESS_KEY_ID") {
             builder = builder.with_access_key_id(access_key);
         }
-        if let Some(secret_key) = storage_options.get("aws_secret_access_key") {
+        if let Some(secret_key) = storage_options.get("AWS_SECRET_ACCESS_KEY") {
             builder = builder.with_secret_access_key(secret_key);
         }
-        if let Some(region) = storage_options.get("aws_region") {
+        if let Some(region) = storage_options.get("AWS_REGION") {
             builder = builder.with_region(region);
         }
-        if let Some(endpoint) = storage_options.get("aws_endpoint") {
+        if let Some(endpoint) = storage_options.get("AWS_ENDPOINT_URL") {
             builder = builder.with_endpoint(endpoint);
             // If endpoint is HTTP, allow HTTP connections
             if endpoint.starts_with("http://") {
@@ -1080,24 +1105,24 @@ impl Database {
         }
 
         // Use config values as fallback
-        if storage_options.get("aws_access_key_id").is_none()
+        if storage_options.get("AWS_ACCESS_KEY_ID").is_none()
             && let Some(ref key) = self.config.aws.aws_access_key_id
         {
             builder = builder.with_access_key_id(key);
         }
-        if storage_options.get("aws_secret_access_key").is_none()
+        if storage_options.get("AWS_SECRET_ACCESS_KEY").is_none()
             && let Some(ref secret) = self.config.aws.aws_secret_access_key
         {
             builder = builder.with_secret_access_key(secret);
         }
-        if storage_options.get("aws_region").is_none()
+        if storage_options.get("AWS_REGION").is_none()
             && let Some(ref region) = self.config.aws.aws_default_region
         {
             builder = builder.with_region(region);
         }
 
         // Check if we need to use config for endpoint and allow HTTP
-        if storage_options.get("aws_endpoint").is_none() {
+        if storage_options.get("AWS_ENDPOINT_URL").is_none() {
             let endpoint = &self.config.aws.aws_s3_endpoint;
             builder = builder.with_endpoint(endpoint);
             if endpoint.starts_with("http://") {
@@ -1108,8 +1133,8 @@ impl Database {
         let store = builder.build()?;
 
         // Log if DynamoDB locking is enabled for this store
-        if storage_options.get("aws_s3_locking_provider") == Some(&"dynamodb".to_string())
-            && let Some(table_name) = storage_options.get("delta_dynamo_table_name")
+        if storage_options.get("AWS_S3_LOCKING_PROVIDER") == Some(&"dynamodb".to_string())
+            && let Some(table_name) = storage_options.get("DELTA_DYNAMO_TABLE_NAME")
         {
             debug!("Object store configured with DynamoDB locking using table: {}", table_name);
         }
@@ -1118,11 +1143,17 @@ impl Database {
     }
 
     /// Creates or loads a DeltaTable with proper configuration
-    /// When DynamoDB locking is enabled, we have to use the standard DeltaTableBuilder
-    /// without custom storage backend to ensure proper log store initialization
+    /// Sets environment variables from storage_options to ensure delta-rs credential resolution works
     async fn create_or_load_delta_table(
         &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<DeltaTable> {
+        // Set env vars from storage_options for delta-rs credential resolution
+        for (key, value) in &storage_options {
+            if key.starts_with("AWS_") {
+                unsafe { std::env::set_var(key, value); }
+            }
+        }
+
         DeltaTableBuilder::from_url(Url::parse(storage_uri)?)?
             .with_storage_backend(cached_store.clone(), Url::parse(storage_uri)?)
             .with_storage_options(storage_options.clone())
@@ -1536,15 +1567,25 @@ impl ProjectRoutingTable {
     fn extract_project_id(&self, expr: &Expr) -> Option<String> {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
-                if let (Expr::Column(col), Expr::Literal(ScalarValue::Utf8(Some(value)), None)) = (left.as_ref(), right.as_ref())
+                // Check column = value (both Utf8 and Utf8View)
+                if let Expr::Column(col) = left.as_ref()
                     && col.name == "project_id"
                 {
-                    return Some(value.clone());
+                    match right.as_ref() {
+                        Expr::Literal(ScalarValue::Utf8(Some(v)), _) => return Some(v.clone()),
+                        Expr::Literal(ScalarValue::Utf8View(Some(v)), _) => return Some(v.clone()),
+                        _ => {}
+                    }
                 }
-                if let (Expr::Literal(ScalarValue::Utf8(Some(value)), None), Expr::Column(col)) = (left.as_ref(), right.as_ref())
+                // Check value = column (both Utf8 and Utf8View)
+                if let Expr::Column(col) = right.as_ref()
                     && col.name == "project_id"
                 {
-                    return Some(value.clone());
+                    match left.as_ref() {
+                        Expr::Literal(ScalarValue::Utf8(Some(v)), _) => return Some(v.clone()),
+                        Expr::Literal(ScalarValue::Utf8View(Some(v)), _) => return Some(v.clone()),
+                        _ => {}
+                    }
                 }
                 None
             }
@@ -1669,7 +1710,76 @@ impl ProjectRoutingTable {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
         let table = delta_table.read().await;
-        table.scan(state, projection.cloned().as_ref(), filters, limit).await
+
+        // Register the object store with DataFusion's runtime so table_provider().scan() can access it
+        let log_store = table.log_store();
+        let root_store = log_store.root_object_store(None);
+        let bucket_url = {
+            let table_url = table.table_url();
+            let scheme = table_url.scheme();
+            let bucket = table_url.host_str().unwrap_or("");
+            Url::parse(&format!("{}://{}/", scheme, bucket)).expect("valid bucket URL")
+        };
+        state.runtime_env().register_object_store(&bucket_url, root_store);
+
+        let provider = table.table_provider().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Translate projection indices from our schema to delta table's schema
+        // The projection indices from DataFusion are based on ProjectRoutingTable.schema,
+        // but the delta table provider expects indices based on its own schema
+        let delta_schema = provider.schema();
+        let translated_projection = projection.map(|proj| {
+            proj.iter()
+                .filter_map(|&idx| {
+                    // Get column name from our schema
+                    let col_name = self.schema.field(idx).name();
+                    // Find column index in delta schema
+                    delta_schema.fields().iter().position(|f| f.name() == col_name)
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let delta_plan = provider.scan(state, translated_projection.as_ref(), filters, limit).await?;
+
+        // Determine target schema based on projection
+        let target_schema = if let Some(proj) = projection {
+            Arc::new(arrow_schema::Schema::new(proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>()))
+        } else {
+            self.schema.clone()
+        };
+
+        // Coerce delta output schema to match our expected schema (e.g., Utf8 -> Utf8View)
+        let delta_output_schema = delta_plan.schema();
+        if delta_output_schema.fields().len() == target_schema.fields().len() {
+            let needs_coercion = delta_output_schema
+                .fields()
+                .iter()
+                .zip(target_schema.fields())
+                .any(|(delta_field, target_field)| delta_field.data_type() != target_field.data_type());
+
+            if needs_coercion {
+                // Create cast expressions for each column
+                let cast_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = delta_output_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .zip(target_schema.fields())
+                    .map(|((idx, delta_field), target_field)| {
+                        let col_expr = Arc::new(PhysicalColumn::new(delta_field.name(), idx)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>;
+                        let expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = if delta_field.data_type() != target_field.data_type() {
+                            Arc::new(CastExpr::new(col_expr, target_field.data_type().clone(), None))
+                        } else {
+                            col_expr
+                        };
+                        (expr, target_field.name().clone())
+                    })
+                    .collect();
+
+                return Ok(Arc::new(ProjectionExec::try_new(cast_exprs, delta_plan)?));
+            }
+        }
+
+        Ok(delta_plan)
     }
 
     /// Extract time range (min, max) from query filters.
@@ -1945,13 +2055,79 @@ impl TableProvider for ProjectRoutingTable {
         let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
         let table = delta_table.read().await;
 
+        // Register the object store with DataFusion's runtime so table_provider().scan() can access it
+        let log_store = table.log_store();
+        let root_store = log_store.root_object_store(None);
+        let bucket_url = {
+            let table_url = table.table_url();
+            let scheme = table_url.scheme();
+            let bucket = table_url.host_str().unwrap_or("");
+            Url::parse(&format!("{}://{}/", scheme, bucket)).expect("valid bucket URL")
+        };
+        state.runtime_env().register_object_store(&bucket_url, root_store);
+
         let scan_span = tracing::trace_span!("delta_table.scan",
             table.name = %self.table_name,
             table.project_id = %project_id,
             partition_filters = ?delta_filters.iter().filter(|f| matches!(f, Expr::BinaryExpr(_))).count()
         );
 
-        let delta_plan = table.scan(state, projection.cloned().as_ref(), &delta_filters, limit).instrument(scan_span).await?;
+        let provider = table.table_provider().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // Translate projection indices from our schema to delta table's schema
+        let delta_schema = provider.schema();
+        let translated_projection = projection.map(|proj| {
+            proj.iter()
+                .filter_map(|&idx| {
+                    let col_name = self.schema.field(idx).name();
+                    delta_schema.fields().iter().position(|f| f.name() == col_name)
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let delta_plan = provider.scan(state, translated_projection.as_ref(), &delta_filters, limit).instrument(scan_span).await?;
+
+        // Determine target schema based on projection
+        let target_schema = if let Some(proj) = projection {
+            Arc::new(arrow_schema::Schema::new(proj.iter().map(|&idx| self.schema.field(idx).clone()).collect::<Vec<_>>()))
+        } else {
+            self.schema.clone()
+        };
+
+        // Coerce delta output schema to match our expected schema (e.g., Utf8 -> Utf8View)
+        let delta_output_schema = delta_plan.schema();
+        let delta_plan = if delta_output_schema.fields().len() == target_schema.fields().len() {
+            let needs_coercion = delta_output_schema
+                .fields()
+                .iter()
+                .zip(target_schema.fields())
+                .any(|(delta_field, target_field)| delta_field.data_type() != target_field.data_type());
+
+            if needs_coercion {
+                // Create cast expressions for each column
+                let cast_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = delta_output_schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .zip(target_schema.fields())
+                    .map(|((idx, delta_field), target_field)| {
+                        let col_expr = Arc::new(PhysicalColumn::new(delta_field.name(), idx)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>;
+                        let expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = if delta_field.data_type() != target_field.data_type() {
+                            Arc::new(CastExpr::new(col_expr, target_field.data_type().clone(), None))
+                        } else {
+                            col_expr
+                        };
+                        (expr, target_field.name().clone())
+                    })
+                    .collect();
+
+                Arc::new(ProjectionExec::try_new(cast_exprs, delta_plan)?) as Arc<dyn ExecutionPlan>
+            } else {
+                delta_plan
+            }
+        } else {
+            delta_plan
+        };
 
         // Union both plans (mem data first for recency, then Delta for historical)
         UnionExec::try_new(vec![mem_plan, delta_plan])
@@ -1979,6 +2155,20 @@ mod tests {
     use crate::test_utils::test_helpers::*;
     use serial_test::serial;
     use std::path::PathBuf;
+
+    /// Helper function to extract string value from array column, handling different string array types
+    fn get_str(array: &dyn Array, idx: usize) -> String {
+        use datafusion::arrow::array::{StringArray, LargeStringArray, StringViewArray};
+        if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+            arr.value(idx).to_string()
+        } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+            arr.value(idx).to_string()
+        } else if let Some(arr) = array.as_any().downcast_ref::<StringViewArray>() {
+            arr.value(idx).to_string()
+        } else {
+            panic!("Unsupported string array type: {:?}", array.data_type())
+        }
+    }
 
     fn create_test_config(test_id: &str) -> Arc<AppConfig> {
         let mut cfg = AppConfig::default();
@@ -2036,8 +2226,8 @@ mod tests {
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(result[0].column(0).as_string::<i32>().value(0), "test1");
-            assert_eq!(result[0].column(1).as_string::<i32>().value(0), "span1");
+            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "test1");
+            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "span1");
 
             // Shutdown database
             db.shutdown().await?;
@@ -2067,7 +2257,7 @@ mod tests {
                 let sql = format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{}'", project);
                 let result = ctx.sql(&sql).await?.collect().await?;
                 assert_eq!(result[0].num_rows(), 1);
-                assert_eq!(result[0].column(0).as_string::<i32>().value(0), format!("id_{}", project));
+                assert_eq!(get_str(result[0].column(0).as_ref(), 0), format!("id_{}", project));
             }
 
             // Verify total count - need to check across all projects
@@ -2096,7 +2286,6 @@ mod tests {
             let (db, ctx, prefix) = setup_test_database().await?;
             let project_id = format!("filter_proj_{}", prefix);
             use chrono::Utc;
-            use datafusion::arrow::array::AsArray;
             use serde_json::json;
 
             let now = Utc::now();
@@ -2141,7 +2330,7 @@ mod tests {
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(result[0].column(0).as_string::<i32>().value(0), "span2");
+            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "span2");
 
             // Test filtering by duration
             let result = ctx
@@ -2153,7 +2342,7 @@ mod tests {
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(result[0].column(0).as_string::<i32>().value(0), "span2");
+            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "span2");
 
             // Test compound filtering
             let result = ctx
@@ -2165,7 +2354,7 @@ mod tests {
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(result[0].column(1).as_string::<i32>().value(0), "Error occurred");
+            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "Error occurred");
 
             // Shutdown database to ensure proper cleanup
             db.shutdown().await?;
@@ -2222,7 +2411,7 @@ mod tests {
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(result[0].column(1).as_string::<i32>().value(0), "sql_name");
+            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "sql_name");
 
             db.shutdown().await?;
             Ok(())
@@ -2262,9 +2451,9 @@ mod tests {
             // Verify individual records
             let result = ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY id", project_id)).await?.collect().await?;
             assert_eq!(result[0].num_rows(), 3);
-            assert_eq!(result[0].column(0).as_string::<i32>().value(0), "id1");
-            assert_eq!(result[0].column(0).as_string::<i32>().value(1), "id2");
-            assert_eq!(result[0].column(0).as_string::<i32>().value(2), "id3");
+            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "id1");
+            assert_eq!(get_str(result[0].column(0).as_ref(), 1), "id2");
+            assert_eq!(get_str(result[0].column(0).as_ref(), 2), "id3");
 
             // Shutdown database
             db.shutdown().await?;
@@ -2282,7 +2471,6 @@ mod tests {
             let (db, ctx, prefix) = setup_test_database().await?;
             let project_id = format!("ts_test_{}", prefix);
             use chrono::Utc;
-            use datafusion::arrow::array::AsArray;
             use serde_json::json;
 
             let base_time = chrono::DateTime::parse_from_rfc3339("2023-01-01T10:00:00Z").unwrap().with_timezone(&Utc);
@@ -2329,7 +2517,7 @@ mod tests {
                 .await?;
             assert!(!result.is_empty(), "Query returned no results");
             assert_eq!(result[0].num_rows(), 1);
-            assert_eq!(result[0].column(0).as_string::<i32>().value(0), "late");
+            assert_eq!(get_str(result[0].column(0).as_ref(), 0), "late");
 
             // Test timestamp formatting - need to include project_id
             let result = ctx
@@ -2341,8 +2529,8 @@ mod tests {
                 .collect()
                 .await?;
             assert_eq!(result[0].num_rows(), 2);
-            assert_eq!(result[0].column(1).as_string::<i32>().value(0), "2023-01-01 10:00");
-            assert_eq!(result[0].column(1).as_string::<i32>().value(1), "2023-01-01 12:00");
+            assert_eq!(get_str(result[0].column(1).as_ref(), 0), "2023-01-01 10:00");
+            assert_eq!(get_str(result[0].column(1).as_ref(), 1), "2023-01-01 12:00");
 
             // Shutdown database to ensure proper cleanup
             db.shutdown().await?;

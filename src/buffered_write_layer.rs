@@ -25,6 +25,13 @@ pub struct RecoveryStats {
     pub corrupted_entries_skipped: u64,
 }
 
+#[derive(Debug, Default)]
+pub struct FlushStats {
+    pub buckets_flushed: u64,
+    pub buckets_failed: u64,
+    pub total_rows: u64,
+}
+
 /// Callback for writing batches to Delta Lake. The callback MUST:
 /// - Complete the Delta commit (including S3 upload) before returning Ok
 /// - Return Err if the commit fails for any reason
@@ -169,6 +176,12 @@ impl BufferedWriteLayer {
         self.release_reservation(reserved_size);
 
         result?;
+
+        // Immediate flush mode: flush after every insert
+        if self.config.buffer.flush_immediately() {
+            self.flush_all_now().await?;
+        }
+
         debug!("BufferedWriteLayer insert complete: project={}, table={}", project_id, table_name);
         Ok(())
     }
@@ -202,7 +215,7 @@ impl BufferedWriteLayer {
 
         for entry in entries {
             match entry.operation {
-                WalOperation::Insert => match WalManager::deserialize_batch(&entry.data) {
+                WalOperation::Insert => match WalManager::deserialize_batch(&entry.data, &entry.table_name) {
                     Ok(batch) => {
                         self.mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros)?;
                         entries_replayed += 1;
@@ -332,7 +345,7 @@ impl BufferedWriteLayer {
             return Ok(());
         }
 
-        info!("Flushing {} buckets to Delta", flushable.len());
+        debug!("Flushing {} buckets to Delta", flushable.len());
 
         // Flush buckets in parallel with bounded concurrency
         let parallelism = self.config.buffer.flush_parallelism();
@@ -442,6 +455,32 @@ impl BufferedWriteLayer {
         Ok(())
     }
 
+    /// Force flush all buffered data to Delta immediately.
+    pub async fn flush_all_now(&self) -> anyhow::Result<FlushStats> {
+        let _flush_guard = self.flush_lock.lock().await;
+        let all_buckets = self.mem_buffer.get_all_buckets();
+        let mut stats = FlushStats { total_rows: all_buckets.iter().map(|b| b.row_count as u64).sum(), ..Default::default() };
+
+        for bucket in all_buckets {
+            match self.flush_bucket(&bucket).await {
+                Ok(()) => {
+                    self.checkpoint_and_drain(&bucket);
+                    stats.buckets_flushed += 1;
+                }
+                Err(e) => {
+                    error!("flush_all_now: failed bucket {}: {}", bucket.bucket_id, e);
+                    stats.buckets_failed += 1;
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Check if buffer is empty (all data flushed).
+    pub fn is_empty(&self) -> bool {
+        self.mem_buffer.get_stats().total_rows == 0
+    }
+
     pub fn get_stats(&self) -> MemBufferStats {
         self.mem_buffer.get_stats()
     }
@@ -503,7 +542,7 @@ impl BufferedWriteLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::{Int64Array, StringViewArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -517,10 +556,10 @@ mod tests {
     fn create_test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
+            Field::new("name", DataType::Utf8View, false),
         ]));
         let id_array = Int64Array::from(vec![1, 2, 3]);
-        let name_array = StringArray::from(vec!["a", "b", "c"]);
+        let name_array = StringViewArray::from(vec!["a", "b", "c"]);
         RecordBatch::try_new(schema, vec![Arc::new(id_array), Arc::new(name_array)]).unwrap()
     }
 

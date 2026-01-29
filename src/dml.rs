@@ -9,10 +9,7 @@ use datafusion::{
     },
     common::{Column, Result},
     error::DataFusionError,
-    execution::{
-        SendableRecordBatchStream, TaskContext,
-        context::{QueryPlanner, SessionState},
-    },
+    execution::{SendableRecordBatchStream, TaskContext, context::{QueryPlanner, SessionState}},
     logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, WriteOp},
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
@@ -443,6 +440,7 @@ pub async fn perform_delta_update(
 
     let span = tracing::Span::current();
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| async move {
+        // delta-rs handles Utf8View automatically with schema_force_view_types=true (default in DF52+)
         let mut builder = delta_table.update();
 
         if let Some(pred) = predicate {
@@ -483,6 +481,7 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
 
     let span = tracing::Span::current();
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| async move {
+        // delta-rs handles Utf8View automatically with schema_force_view_types=true (default in DF52+)
         let mut builder = delta_table.delete();
 
         if let Some(pred) = predicate {
@@ -527,15 +526,15 @@ where
     Ok(rows_affected)
 }
 
-/// Convert DataFusion Expr to Delta-compatible format
+/// Convert DataFusion Expr to Delta-compatible format.
+/// Only strips table qualifiers from columns - Utf8View is kept for consistency.
 fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
-    match expr {
-        Expr::Column(col) => Ok(Expr::Column(Column::from_name(&col.name))),
-        Expr::BinaryExpr(binary) => Ok(Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(convert_expr_to_delta(&binary.left)?),
-            op: binary.op,
-            right: Box::new(convert_expr_to_delta(&binary.right)?),
-        })),
-        _ => Ok(expr.clone()),
-    }
+    use datafusion::common::tree_node::TreeNode;
+    expr.clone()
+        .transform(|e| match &e {
+            Expr::Column(col) => Ok(datafusion::common::tree_node::Transformed::yes(Expr::Column(Column::from_name(&col.name)))),
+            _ => Ok(datafusion::common::tree_node::Transformed::no(e)),
+        })
+        .map(|t| t.data)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to convert expression: {}", e)))
 }

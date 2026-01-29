@@ -42,7 +42,7 @@ mod integration {
 
     impl TestServer {
         async fn start() -> Result<Self> {
-            let _ = env_logger::builder().is_test(true).try_init();
+            timefusion::test_utils::init_test_logging();
 
             let test_id = Uuid::new_v4().to_string();
             let port = 5433 + rand::rng().random_range(1..100) as u16;
