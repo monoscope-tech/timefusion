@@ -2521,6 +2521,7 @@ dependencies = [
 [[package]]
 name = "datafusion-variant"
 version = "0.1.0"
+source = "git+https://github.com/tonyalaribe/datafusion-variant.git?rev=8b6b270#8b6b270f0f45693f6ccf39115d12bec9e9626012"
 dependencies = [
  "arrow",
  "arrow-schema",
@@ -2586,6 +2587,7 @@ dependencies = [
 [[package]]
 name = "deltalake"
 version = "0.30.1"
+source = "git+https://github.com/tonyalaribe/delta-rs.git?rev=ba769136c5dd9b84a7335ea67e42b67884bfcce3#ba769136c5dd9b84a7335ea67e42b67884bfcce3"
 dependencies = [
  "ctor",
  "delta_kernel",
@@ -2596,6 +2598,7 @@ dependencies = [
 [[package]]
 name = "deltalake-aws"
 version = "0.13.0"
+source = "git+https://github.com/tonyalaribe/delta-rs.git?rev=ba769136c5dd9b84a7335ea67e42b67884bfcce3#ba769136c5dd9b84a7335ea67e42b67884bfcce3"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2621,6 +2624,7 @@ dependencies = [
 [[package]]
 name = "deltalake-core"
 version = "0.30.1"
+source = "git+https://github.com/tonyalaribe/delta-rs.git?rev=ba769136c5dd9b84a7335ea67e42b67884bfcce3#ba769136c5dd9b84a7335ea67e42b67884bfcce3"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -2673,6 +2677,7 @@ dependencies = [
 [[package]]
 name = "deltalake-derive"
 version = "0.30.0"
+source = "git+https://github.com/tonyalaribe/delta-rs.git?rev=ba769136c5dd9b84a7335ea67e42b67884bfcce3#ba769136c5dd9b84a7335ea67e42b67884bfcce3"
 dependencies = [
  "convert_case",
  "itertools 0.14.0",
