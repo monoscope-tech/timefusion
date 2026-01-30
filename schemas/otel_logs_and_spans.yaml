@@ -40,7 +40,7 @@ fields:
     data_type: Utf8
     nullable: true
   - name: severity
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: severity___severity_text
     data_type: Utf8
@@ -49,7 +49,7 @@ fields:
     data_type: Int32
     nullable: true
   - name: body
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: duration
     data_type: Int64
@@ -82,7 +82,7 @@ fields:
     data_type: Variant
     nullable: true
   - name: links
-    data_type: Variant
+    data_type: Utf8
     nullable: true
   - name: attributes
     data_type: Variant
@@ -187,7 +187,7 @@ fields:
     data_type: Int32
     nullable: true
   - name: attributes___http___request___body___size
-    data_type: Int32
+    data_type: Int64
     nullable: true
   - name: attributes___session___id
     data_type: Utf8
@@ -268,8 +268,11 @@ fields:
     data_type: "List(Utf8)"
     nullable: false
   - name: errors
-    data_type: Utf8
+    data_type: Variant
     nullable: true
   - name: log_pattern
+    data_type: Utf8
+    nullable: true
+  - name: summary_pattern
     data_type: Utf8
     nullable: true
