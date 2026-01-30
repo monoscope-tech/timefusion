@@ -36,10 +36,10 @@ use deltalake::operations::create::CreateBuilder;
 use deltalake::{DeltaTable, DeltaTableBuilder};
 use futures::StreamExt;
 use instrumented_object_store::instrument_object_store;
-use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::fmt;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -99,7 +99,9 @@ pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) ->
         if idx >= columns.len() {
             warn!(
                 "Schema mismatch: target schema has field '{}' at index {} but batch only has {} columns",
-                target_field.name(), idx, columns.len()
+                target_field.name(),
+                idx,
+                columns.len()
             );
             continue;
         }
@@ -1283,7 +1285,10 @@ impl Database {
 
         // Fallback to legacy batch queue if configured
         let enable_queue = self.config.core.enable_batch_queue;
-        if !skip_queue && enable_queue && let Some(ref queue) = self.batch_queue {
+        if !skip_queue
+            && enable_queue
+            && let Some(ref queue) = self.batch_queue
+        {
             span.record("use_queue", true);
             for batch in batches {
                 if let Err(e) = queue.queue(batch) {

@@ -9,8 +9,8 @@ use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use datafusion::common::{DFSchema, DataFusionError, ExprSchema, ScalarValue, not_impl_err};
 use datafusion::logical_expr::ExprSchemable;
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, ColumnarValue, Expr, ScalarFunctionArgs, ScalarFunctionImplementation,
-    ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility, create_udaf, create_udf,
+    Accumulator, AggregateUDF, ColumnarValue, Expr, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility, create_udaf, create_udf,
     expr::{Alias, ScalarFunction},
     planner::{ExprPlanner, PlannerResult, RawBinaryExpr},
 };
@@ -121,23 +121,25 @@ fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
 fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
     match expr {
         // Direct column reference
-        Expr::Column(col) => schema
-            .field_from_column(col)
-            .map(|f| is_variant_type(f.data_type()))
-            .unwrap_or(false),
+        Expr::Column(col) => schema.field_from_column(col).map(|f| is_variant_type(f.data_type())).unwrap_or(false),
         // Unwrap aliases
         Expr::Alias(alias) => is_variant_column(&alias.expr, schema),
         // Check if it's a call to a variant-producing function
         Expr::ScalarFunction(func) => {
             let name = func.func.name();
-            matches!(name, "json_to_variant" | "variant_get" | "cast_to_variant"
-                | "variant_object_construct" | "variant_list_construct"
-                | "variant_object_insert" | "variant_list_insert")
+            matches!(
+                name,
+                "json_to_variant"
+                    | "variant_get"
+                    | "cast_to_variant"
+                    | "variant_object_construct"
+                    | "variant_list_construct"
+                    | "variant_object_insert"
+                    | "variant_list_insert"
+            )
         }
         // Try to get the type for other expressions
-        _ => expr.get_type(schema)
-            .map(|dt| is_variant_type(&dt))
-            .unwrap_or(false),
+        _ => expr.get_type(schema).map(|dt| is_variant_type(&dt)).unwrap_or(false),
     }
 }
 
@@ -1272,8 +1274,7 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
         };
 
         // Parse the JSONPath expression
-        let json_path = serde_json_path::JsonPath::parse(&path_str)
-            .map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {}", e)))?;
+        let json_path = serde_json_path::JsonPath::parse(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {}", e)))?;
 
         // Process based on input type
         let result = if is_variant_type(json_array.data_type()) {
