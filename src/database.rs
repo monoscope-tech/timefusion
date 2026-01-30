@@ -97,6 +97,10 @@ pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) ->
             continue;
         }
         if idx >= columns.len() {
+            warn!(
+                "Schema mismatch: target schema has field '{}' at index {} but batch only has {} columns",
+                target_field.name(), idx, columns.len()
+            );
             continue;
         }
 
