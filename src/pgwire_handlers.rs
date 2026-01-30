@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
+use datafusion_postgres::DfSessionService;
 use datafusion_postgres::pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
 use datafusion_postgres::pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler};
 use datafusion_postgres::pgwire::api::portal::Portal;
@@ -10,12 +11,11 @@ use datafusion_postgres::pgwire::api::store::PortalStore;
 use datafusion_postgres::pgwire::api::{ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers};
 use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
 use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
-use datafusion_postgres::DfSessionService;
 use futures::Sink;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::field::Empty;
-use tracing::{info, instrument, Instrument};
+use tracing::{Instrument, info, instrument};
 
 /// Auth configuration for PgWire server
 #[derive(Debug, Clone)]
@@ -26,7 +26,10 @@ pub struct AuthConfig {
 
 impl Default for AuthConfig {
     fn default() -> Self {
-        Self { username: "postgres".into(), password: None }
+        Self {
+            username: "postgres".into(),
+            password: None,
+        }
     }
 }
 
@@ -110,7 +113,9 @@ pub struct LoggingSimpleQueryHandler {
 
 impl LoggingSimpleQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
-        Self { inner: DfSessionService::new(session_context) }
+        Self {
+            inner: DfSessionService::new(session_context),
+        }
     }
 }
 
@@ -176,7 +181,9 @@ pub struct LoggingExtendedQueryHandler {
 
 impl LoggingExtendedQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
-        Self { inner: DfSessionService::new(session_context) }
+        Self {
+            inner: DfSessionService::new(session_context),
+        }
     }
 }
 
@@ -230,15 +237,15 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         span.record("query.text", sanitize_query(query, operation).as_str());
 
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
-        <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span).await
+        <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows)
+            .instrument(execute_span)
+            .await
     }
 }
 
 /// Start the server with custom handlers
 pub async fn serve_with_logging(
-    session_context: Arc<SessionContext>,
-    options: &datafusion_postgres::ServerOptions,
-    auth_config: AuthConfig,
+    session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_config));
     datafusion_postgres::serve_with_handlers(handlers, options).await?;
