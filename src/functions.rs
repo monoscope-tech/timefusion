@@ -22,6 +22,14 @@ use tdigests::TDigest;
 
 use crate::schema_loader::is_variant_type;
 
+/// Extract a String from any ScalarValue string type (Utf8, Utf8View, LargeUtf8)
+fn scalar_to_string(scalar: &ScalarValue) -> Option<String> {
+    match scalar {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 // ============================================================================
 // Variant-Aware Expression Planner
 // ============================================================================
@@ -286,12 +294,8 @@ impl ScalarUDFImpl for ToCharUDF {
 
         // Extract format string
         let format_str = match &args[1] {
-            ColumnarValue::Scalar(scalar) => match scalar {
-                ScalarValue::Utf8(Some(s)) => s.clone(),
-                ScalarValue::Utf8View(Some(s)) => s.clone(),
-                ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => return Err(DataFusionError::Execution("Format string must be a UTF8 string".to_string())),
-            },
+            ColumnarValue::Scalar(scalar) => scalar_to_string(scalar)
+                .ok_or_else(|| DataFusionError::Execution("Format string must be a UTF8 string".to_string()))?,
             ColumnarValue::Array(arr) => {
                 if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
                     if str_arr.len() == 1 && !str_arr.is_null(0) {
@@ -429,12 +433,8 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
 
         // Extract timezone string
         let tz_str = match &args[1] {
-            ColumnarValue::Scalar(scalar) => match scalar {
-                ScalarValue::Utf8(Some(s)) => s.clone(),
-                ScalarValue::Utf8View(Some(s)) => s.clone(),
-                ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => return Err(DataFusionError::Execution("Timezone must be a UTF8 string".to_string())),
-            },
+            ColumnarValue::Scalar(scalar) => scalar_to_string(scalar)
+                .ok_or_else(|| DataFusionError::Execution("Timezone must be a UTF8 string".to_string()))?,
             ColumnarValue::Array(arr) => {
                 if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
                     if str_arr.len() == 1 && !str_arr.is_null(0) {
@@ -870,12 +870,8 @@ fn create_time_bucket_udf() -> ScalarUDF {
 
         // Extract interval string
         let interval_str = match &args[0] {
-            ColumnarValue::Scalar(scalar) => match scalar {
-                datafusion::scalar::ScalarValue::Utf8(Some(s))
-                | datafusion::scalar::ScalarValue::Utf8View(Some(s))
-                | datafusion::scalar::ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => return Err(DataFusionError::Execution("Interval must be a UTF8 string".to_string())),
-            },
+            ColumnarValue::Scalar(scalar) => scalar_to_string(scalar)
+                .ok_or_else(|| DataFusionError::Execution("Interval must be a UTF8 string".to_string()))?,
             ColumnarValue::Array(_) => {
                 return Err(DataFusionError::Execution("Interval must be a scalar value".to_string()));
             }
@@ -1264,10 +1260,8 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
         };
 
         let path_str = match &args.args[1] {
-            ColumnarValue::Scalar(scalar) => match scalar {
-                ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => return Err(DataFusionError::Execution("JSONPath must be a string".to_string())),
-            },
+            ColumnarValue::Scalar(scalar) => scalar_to_string(scalar)
+                .ok_or_else(|| DataFusionError::Execution("JSONPath must be a string".to_string()))?,
             ColumnarValue::Array(_) => {
                 return Err(DataFusionError::Execution("JSONPath must be a scalar string".to_string()));
             }

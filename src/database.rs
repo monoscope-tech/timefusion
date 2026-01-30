@@ -97,8 +97,8 @@ pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) ->
             continue;
         }
         if idx >= columns.len() {
-            warn!(
-                "Schema mismatch: target schema has field '{}' at index {} but batch only has {} columns",
+            error!(
+                "Schema mismatch: target expects '{}' at index {} but batch has only {} columns (possible schema evolution issue)",
                 target_field.name(),
                 idx,
                 columns.len()
@@ -112,16 +112,22 @@ pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) ->
         // Only convert if source is a string type and target is Variant
         let converted: Option<ArrayRef> = match col_type {
             DataType::Utf8View => {
-                let arr = col.as_any().downcast_ref::<StringViewArray>().unwrap();
-                Some(Arc::new(json_strings_to_variant(arr.iter())))
+                let arr = col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| {
+                    DataFusionError::Execution(format!("Expected StringViewArray for field '{}' but downcast failed", target_field.name()))
+                })?;
+                Some(Arc::new(json_strings_to_variant(arr.iter())?))
             }
             DataType::Utf8 => {
-                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
-                Some(Arc::new(json_strings_to_variant(arr.iter())))
+                let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+                    DataFusionError::Execution(format!("Expected StringArray for field '{}' but downcast failed", target_field.name()))
+                })?;
+                Some(Arc::new(json_strings_to_variant(arr.iter())?))
             }
             DataType::LargeUtf8 => {
-                let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                Some(Arc::new(json_strings_to_variant(arr.iter())))
+                let arr = col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| {
+                    DataFusionError::Execution(format!("Expected LargeStringArray for field '{}' but downcast failed", target_field.name()))
+                })?;
+                Some(Arc::new(json_strings_to_variant(arr.iter())?))
             }
             _ => None, // Already Variant or other type, skip
         };
@@ -136,27 +142,25 @@ pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) ->
     RecordBatch::try_new(new_schema, columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-/// Convert an iterator of optional JSON strings to a Variant StructArray
-fn json_strings_to_variant<'a>(iter: impl Iterator<Item = Option<&'a str>>) -> datafusion::arrow::array::StructArray {
+/// Convert an iterator of optional JSON strings to a Variant StructArray.
+/// Fails fast on invalid JSON to ensure data integrity.
+fn json_strings_to_variant<'a>(iter: impl Iterator<Item = Option<&'a str>>) -> DFResult<datafusion::arrow::array::StructArray> {
     use parquet_variant_compute::VariantArrayBuilder;
     use parquet_variant_json::JsonToVariant;
 
     let items: Vec<_> = iter.collect();
     let mut builder = VariantArrayBuilder::new(items.len());
 
-    for item in items {
+    for (row_idx, item) in items.into_iter().enumerate() {
         match item {
-            Some(json_str) => {
-                if let Err(e) = builder.append_json(json_str) {
-                    warn!("Failed to parse JSON '{}': {}, inserting as null", json_str, e);
-                    builder.append_null();
-                }
-            }
+            Some(json_str) => builder.append_json(json_str).map_err(|e| {
+                DataFusionError::Execution(format!("Invalid JSON at row {}: {} (value: '{}')", row_idx, e, json_str))
+            })?,
             None => builder.append_null(),
         }
     }
 
-    builder.build().into()
+    Ok(builder.build().into())
 }
 
 // Compression level for parquet files - kept for WriterProperties fallback
@@ -790,11 +794,11 @@ impl Database {
         self.register_pg_settings_table(ctx)?;
         self.register_set_config_udf(ctx);
 
-        // Register custom PostgreSQL-compatible functions BEFORE JSON functions
-        // so VariantAwareExprPlanner gets first chance at -> and ->> operators
+        // CRITICAL: Register custom functions BEFORE JSON functions to ensure VariantAwareExprPlanner
+        // intercepts -> and ->> operators on Variant columns before JsonExprPlanner handles them as strings
         crate::functions::register_custom_functions(ctx).map_err(|e| DataFusionError::Execution(format!("Failed to register custom functions: {}", e)))?;
 
-        // JSON functions (includes JsonExprPlanner for -> and ->> on string columns)
+        // JSON functions (JsonExprPlanner for -> and ->> on string columns - must come after Variant handlers)
         self.register_json_functions(ctx);
 
         Ok(())
