@@ -6,18 +6,198 @@ use datafusion::arrow::array::{
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::{DataFusionError, ScalarValue, not_impl_err};
+use datafusion::common::{DFSchema, DataFusionError, ExprSchema, ScalarValue, not_impl_err};
+use datafusion::logical_expr::ExprSchemable;
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, ColumnarValue, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-    create_udaf, create_udf,
+    Accumulator, AggregateUDF, ColumnarValue, Expr, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+    Volatility, create_udaf, create_udf,
+    expr::{Alias, ScalarFunction},
+    planner::{ExprPlanner, PlannerResult, RawBinaryExpr},
 };
+use datafusion::sql::sqlparser::ast::BinaryOperator;
 use serde_json::{Value as JsonValue, json};
 use std::any::Any;
 use std::sync::Arc;
 use tdigests::TDigest;
 
+use crate::schema_loader::is_variant_type;
+
+/// Extract a String from any ScalarValue string type (Utf8, Utf8View, LargeUtf8)
+fn scalar_to_string(scalar: &ScalarValue) -> Option<String> {
+    match scalar {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+// ============================================================================
+// Variant-Aware Expression Planner
+// ============================================================================
+
+/// ExprPlanner that intercepts -> and ->> operators on Variant columns
+/// and rewrites them to efficient variant_get calls with flattened dot-paths.
+#[derive(Debug, Default)]
+pub struct VariantAwareExprPlanner;
+
+/// Path component for building variant_get paths
+#[derive(Debug, Clone)]
+enum PathComponent {
+    Field(String),
+    Index(i64),
+}
+
+impl ExprPlanner for VariantAwareExprPlanner {
+    fn plan_binary_op(&self, expr: RawBinaryExpr, schema: &DFSchema) -> datafusion::error::Result<PlannerResult<RawBinaryExpr>> {
+        let is_long_arrow = match &expr.op {
+            BinaryOperator::Arrow => false,
+            BinaryOperator::LongArrow => true,
+            _ => return Ok(PlannerResult::Original(expr)),
+        };
+
+        // Recursively collect path components from chained operators
+        let (base_expr, mut path_parts) = collect_arrow_chain(&expr.left);
+        if let Some(component) = extract_path_component(&expr.right) {
+            path_parts.push(component);
+        } else {
+            return Ok(PlannerResult::Original(expr));
+        }
+
+        // Check if base column is Variant type
+        if !is_variant_column(&base_expr, schema) {
+            return Ok(PlannerResult::Original(expr)); // Let JSON planner handle
+        }
+
+        // Build dot-path: ["user", "name"] → "user.name", ["items", Index(0)] → "items[0]"
+        let full_path = build_variant_path(&path_parts);
+
+        // Create variant_get function call
+        let variant_get_udf = ScalarUDF::from(datafusion_variant::VariantGetUdf::default());
+        let path_literal = Expr::Literal(ScalarValue::Utf8(Some(full_path.clone())), None);
+        let variant_get_call = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(variant_get_udf),
+            args: vec![base_expr.clone(), path_literal],
+        });
+
+        // For ->> wrap with variant_to_json for text output
+        let result = if is_long_arrow {
+            let variant_to_json_udf = ScalarUDF::from(datafusion_variant::VariantToJsonUdf::default());
+            Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(variant_to_json_udf),
+                args: vec![variant_get_call],
+            })
+        } else {
+            variant_get_call
+        };
+
+        // Create alias to preserve original SQL representation
+        let op_str = if is_long_arrow { "->>" } else { "->" };
+        let alias_name = format!("{} {} {}", expr_repr(&base_expr), op_str, path_repr(&path_parts));
+        Ok(PlannerResult::Planned(Expr::Alias(Alias::new(result, None::<&str>, alias_name))))
+    }
+}
+
+/// Recursively collect chained arrow expressions into base + path components
+fn collect_arrow_chain(expr: &Expr) -> (Expr, Vec<PathComponent>) {
+    match expr {
+        Expr::BinaryExpr(binary) if matches!(binary.op, datafusion::logical_expr::Operator::Arrow) => {
+            let (base, mut parts) = collect_arrow_chain(&binary.left);
+            if let Some(component) = extract_path_component(&binary.right) {
+                parts.push(component);
+            }
+            (base, parts)
+        }
+        Expr::Alias(alias) => collect_arrow_chain(&alias.expr),
+        _ => (expr.clone(), vec![]),
+    }
+}
+
+/// Extract path component from expression (string literal or integer)
+fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
+    match expr {
+        Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Some(PathComponent::Field(s.clone())),
+        Expr::Literal(ScalarValue::Utf8View(Some(s)), _) => Some(PathComponent::Field(s.clone())),
+        Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => Some(PathComponent::Field(s.clone())),
+        Expr::Literal(ScalarValue::Int64(Some(i)), _) => Some(PathComponent::Index(*i)),
+        Expr::Literal(ScalarValue::Int32(Some(i)), _) => Some(PathComponent::Index(*i as i64)),
+        Expr::Literal(ScalarValue::UInt64(Some(i)), _) => Some(PathComponent::Index(*i as i64)),
+        Expr::Literal(ScalarValue::UInt32(Some(i)), _) => Some(PathComponent::Index(*i as i64)),
+        _ => None,
+    }
+}
+
+/// Check if expression evaluates to a Variant type
+fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
+    match expr {
+        // Direct column reference
+        Expr::Column(col) => schema.field_from_column(col).map(|f| is_variant_type(f.data_type())).unwrap_or(false),
+        // Unwrap aliases
+        Expr::Alias(alias) => is_variant_column(&alias.expr, schema),
+        // Check if it's a call to a variant-producing function
+        Expr::ScalarFunction(func) => {
+            let name = func.func.name();
+            matches!(
+                name,
+                "json_to_variant"
+                    | "variant_get"
+                    | "cast_to_variant"
+                    | "variant_object_construct"
+                    | "variant_list_construct"
+                    | "variant_object_insert"
+                    | "variant_list_insert"
+            )
+        }
+        // Try to get the type for other expressions
+        _ => expr.get_type(schema).map(|dt| is_variant_type(&dt)).unwrap_or(false),
+    }
+}
+
+/// Build variant_get path string from components
+fn build_variant_path(parts: &[PathComponent]) -> String {
+    let mut path = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        match part {
+            PathComponent::Field(name) => {
+                if i > 0 {
+                    path.push('.');
+                }
+                path.push_str(name);
+            }
+            PathComponent::Index(idx) => {
+                path.push('[');
+                path.push_str(&idx.to_string());
+                path.push(']');
+            }
+        }
+    }
+    path
+}
+
+/// Generate SQL-like representation for expression (for alias)
+fn expr_repr(expr: &Expr) -> String {
+    match expr {
+        Expr::Column(col) => col.name.clone(),
+        Expr::Alias(alias) => alias.name.clone(),
+        _ => "expr".to_string(),
+    }
+}
+
+/// Generate path representation for alias
+fn path_repr(parts: &[PathComponent]) -> String {
+    parts
+        .iter()
+        .map(|p| match p {
+            PathComponent::Field(s) => format!("'{}'", s),
+            PathComponent::Index(i) => i.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("->")
+}
+
 /// Register all custom PostgreSQL-compatible functions
 pub fn register_custom_functions(ctx: &mut datafusion::execution::context::SessionContext) -> Result<()> {
+    // Register Variant-aware expr planner (must be before JSON planner for priority)
+    datafusion::execution::FunctionRegistry::register_expr_planner(ctx, Arc::new(VariantAwareExprPlanner))?;
+
     // Register to_char function
     ctx.register_udf(create_to_char_udf());
 
@@ -44,6 +224,21 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
 
     // Register approx_percentile scalar function
     ctx.register_udf(create_approx_percentile_udf());
+
+    // Register variant functions from datafusion-variant
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::JsonToVariantUdf::default()));
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantToJsonUdf::default()));
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantGetUdf::default()));
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::CastToVariantUdf::default()));
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::IsVariantNullUdf::default()));
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantPretty::default()));
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantListConstruct::default()));
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantListInsert::default()));
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantObjectConstruct::default()));
+    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantObjectInsert::default()));
+
+    // Register jsonb_path_exists for JSONPath queries on Variant columns
+    ctx.register_udf(create_jsonb_path_exists_udf());
 
     Ok(())
 }
@@ -99,12 +294,9 @@ impl ScalarUDFImpl for ToCharUDF {
 
         // Extract format string
         let format_str = match &args[1] {
-            ColumnarValue::Scalar(scalar) => match scalar {
-                ScalarValue::Utf8(Some(s)) => s.clone(),
-                ScalarValue::Utf8View(Some(s)) => s.clone(),
-                ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => return Err(DataFusionError::Execution("Format string must be a UTF8 string".to_string())),
-            },
+            ColumnarValue::Scalar(scalar) => {
+                scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("Format string must be a UTF8 string".to_string()))?
+            }
             ColumnarValue::Array(arr) => {
                 if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
                     if str_arr.len() == 1 && !str_arr.is_null(0) {
@@ -242,12 +434,9 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
 
         // Extract timezone string
         let tz_str = match &args[1] {
-            ColumnarValue::Scalar(scalar) => match scalar {
-                ScalarValue::Utf8(Some(s)) => s.clone(),
-                ScalarValue::Utf8View(Some(s)) => s.clone(),
-                ScalarValue::LargeUtf8(Some(s)) => s.clone(),
-                _ => return Err(DataFusionError::Execution("Timezone must be a UTF8 string".to_string())),
-            },
+            ColumnarValue::Scalar(scalar) => {
+                scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("Timezone must be a UTF8 string".to_string()))?
+            }
             ColumnarValue::Array(arr) => {
                 if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
                     if str_arr.len() == 1 && !str_arr.is_null(0) {
@@ -683,10 +872,9 @@ fn create_time_bucket_udf() -> ScalarUDF {
 
         // Extract interval string
         let interval_str = match &args[0] {
-            ColumnarValue::Scalar(scalar) => match scalar {
-                datafusion::scalar::ScalarValue::Utf8(Some(s)) => s.clone(),
-                _ => return Err(DataFusionError::Execution("Interval must be a UTF8 string".to_string())),
-            },
+            ColumnarValue::Scalar(scalar) => {
+                scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("Interval must be a UTF8 string".to_string()))?
+            }
             ColumnarValue::Array(_) => {
                 return Err(DataFusionError::Execution("Interval must be a scalar value".to_string()));
             }
@@ -1020,6 +1208,220 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
 
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
     }
+}
+
+// ============================================================================
+// jsonb_path_exists UDF for JSONPath queries on Variant/JSON columns
+// ============================================================================
+
+/// Create the jsonb_path_exists UDF for PostgreSQL-compatible JSONPath queries
+fn create_jsonb_path_exists_udf() -> ScalarUDF {
+    ScalarUDF::from(JsonbPathExistsUDF::new())
+}
+
+#[derive(Debug, Hash, Eq, PartialEq)]
+struct JsonbPathExistsUDF {
+    signature: Signature,
+}
+
+impl JsonbPathExistsUDF {
+    fn new() -> Self {
+        Self {
+            // Accept Variant struct or JSON string as first arg, path string as second
+            signature: Signature::any(2, Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for JsonbPathExistsUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "jsonb_path_exists"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        if args.args.len() != 2 {
+            return Err(DataFusionError::Execution(
+                "jsonb_path_exists requires exactly 2 arguments: json/variant and jsonpath".to_string(),
+            ));
+        }
+
+        let json_array = match &args.args[0] {
+            ColumnarValue::Array(array) => array.clone(),
+            ColumnarValue::Scalar(scalar) => scalar.to_array()?,
+        };
+
+        let path_str = match &args.args[1] {
+            ColumnarValue::Scalar(scalar) => scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("JSONPath must be a string".to_string()))?,
+            ColumnarValue::Array(_) => {
+                return Err(DataFusionError::Execution("JSONPath must be a scalar string".to_string()));
+            }
+        };
+
+        // Parse the JSONPath expression
+        let json_path = serde_json_path::JsonPath::parse(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {}", e)))?;
+
+        // Process based on input type
+        let result = if is_variant_type(json_array.data_type()) {
+            // Handle Variant struct type
+            evaluate_jsonpath_on_variant(&json_array, &json_path)?
+        } else {
+            // Handle JSON string type
+            evaluate_jsonpath_on_json_string(&json_array, &json_path)?
+        };
+
+        Ok(ColumnarValue::Array(result))
+    }
+}
+
+const MAX_VARIANT_DEPTH: usize = 100;
+
+/// Convert parquet_variant::Variant to serde_json::Value with depth limit to prevent stack overflow
+fn variant_to_serde_json(variant: &parquet_variant::Variant, depth: usize) -> Result<JsonValue, DataFusionError> {
+    use base64::Engine;
+    use parquet_variant::Variant;
+
+    if depth > MAX_VARIANT_DEPTH {
+        return Err(DataFusionError::Execution(format!(
+            "Variant nesting depth exceeds limit of {}",
+            MAX_VARIANT_DEPTH
+        )));
+    }
+
+    Ok(match variant {
+        Variant::Null => JsonValue::Null,
+        Variant::BooleanTrue => JsonValue::Bool(true),
+        Variant::BooleanFalse => JsonValue::Bool(false),
+        Variant::Int8(v) => json!(*v),
+        Variant::Int16(v) => json!(*v),
+        Variant::Int32(v) => json!(*v),
+        Variant::Int64(v) => json!(*v),
+        Variant::Float(v) => json!(*v),
+        Variant::Double(v) => json!(*v),
+        Variant::Decimal4(d) => json!(d.to_string()),
+        Variant::Decimal8(d) => json!(d.to_string()),
+        Variant::Decimal16(d) => json!(d.to_string()),
+        Variant::Date(v) => json!(*v),
+        Variant::Time(v) => json!(*v),
+        Variant::Uuid(v) => json!(v.to_string()),
+        Variant::TimestampMicros(v) => json!(*v),
+        Variant::TimestampNtzMicros(v) => json!(*v),
+        Variant::TimestampNanos(v) => json!(*v),
+        Variant::TimestampNtzNanos(v) => json!(*v),
+        Variant::Binary(bytes) => json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
+        Variant::String(s) => JsonValue::String(s.to_string()),
+        Variant::ShortString(s) => JsonValue::String(s.to_string()),
+        Variant::Object(obj) => {
+            let mut map = serde_json::Map::new();
+            for (key, value) in obj.iter() {
+                map.insert(key.to_string(), variant_to_serde_json(&value, depth + 1)?);
+            }
+            JsonValue::Object(map)
+        }
+        Variant::List(list) => {
+            let items: Vec<JsonValue> = list.iter().map(|v| variant_to_serde_json(&v, depth + 1)).collect::<Result<_, _>>()?;
+            JsonValue::Array(items)
+        }
+    })
+}
+
+/// Evaluate JSONPath on a Variant (Struct) array
+fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &serde_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
+    use datafusion::arrow::array::StructArray;
+    use parquet_variant::Variant;
+
+    let struct_array = array
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| DataFusionError::Execution("Expected Variant struct array".to_string()))?;
+
+    let metadata_col = struct_array
+        .column_by_name("metadata")
+        .ok_or_else(|| DataFusionError::Execution("Variant missing metadata column".to_string()))?;
+    let value_col = struct_array
+        .column_by_name("value")
+        .ok_or_else(|| DataFusionError::Execution("Variant missing value column".to_string()))?;
+
+    let metadata_binary = metadata_col
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::BinaryViewArray>()
+        .ok_or_else(|| DataFusionError::Execution("Variant metadata not BinaryView".to_string()))?;
+    let value_binary = value_col
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::BinaryViewArray>()
+        .ok_or_else(|| DataFusionError::Execution("Variant value not BinaryView".to_string()))?;
+
+    let mut builder = BooleanArray::builder(struct_array.len());
+
+    for i in 0..struct_array.len() {
+        if struct_array.is_null(i) {
+            builder.append_null();
+            continue;
+        }
+
+        let metadata = metadata_binary.value(i);
+        let value = value_binary.value(i);
+
+        // Decode Variant to JSON
+        let variant = Variant::new(metadata, value);
+        let json_value = variant_to_serde_json(&variant, 0)?;
+
+        // Apply JSONPath and check if any matches exist
+        builder.append_value(!json_path.query(&json_value).is_empty());
+    }
+
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Evaluate JSONPath on a JSON string array
+fn evaluate_jsonpath_on_json_string(array: &ArrayRef, json_path: &serde_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
+    let mut builder = BooleanArray::builder(array.len());
+
+    // Handle different string types
+    if let Some(string_array) = array.as_any().downcast_ref::<StringViewArray>() {
+        for i in 0..string_array.len() {
+            if string_array.is_null(i) {
+                builder.append_null();
+            } else {
+                let json_str = string_array.value(i);
+                let result = match serde_json::from_str::<JsonValue>(json_str) {
+                    Ok(json_value) => !json_path.query(&json_value).is_empty(),
+                    Err(_) => false, // Invalid JSON returns false
+                };
+                builder.append_value(result);
+            }
+        }
+    } else if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
+        for i in 0..string_array.len() {
+            if string_array.is_null(i) {
+                builder.append_null();
+            } else {
+                let json_str = string_array.value(i);
+                let result = match serde_json::from_str::<JsonValue>(json_str) {
+                    Ok(json_value) => !json_path.query(&json_value).is_empty(),
+                    Err(_) => false,
+                };
+                builder.append_value(result);
+            }
+        }
+    } else {
+        return Err(DataFusionError::Execution(
+            "jsonb_path_exists requires JSON string or Variant input".to_string(),
+        ));
+    }
+
+    Ok(Arc::new(builder.finish()))
 }
 
 #[cfg(test)]

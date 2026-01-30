@@ -57,7 +57,7 @@ INSERT INTO otel_logs_and_spans (
     name, resource___service___name, level, status_message, summary
 ) VALUES (
     'prod_monitoring', TIMESTAMP '2023-01-01T10:10:00Z', 'log_1', ARRAY[]::VARCHAR[], DATE '2023-01-01',
-    'application.startup', 'user-service', 'INFO', ARRAY['Service started successfully'], ARRAY['Application startup log - INFO level']
+    'application.startup', 'user-service', 'INFO', 'Service started successfully', ARRAY['Application startup log - INFO level']
 )
 
 statement ok

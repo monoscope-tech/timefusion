@@ -6,10 +6,10 @@ INSERT INTO otel_logs_and_spans (
     project_id, timestamp, id, hashes, date,
     parent_id, name, kind, resource___service___name,
     status_code, status_message, level, duration, summary
-) VALUES 
+) VALUES
     ('test_funcs', TIMESTAMP '2024-01-15T14:30:45.123456Z', 'func_test_1', ARRAY['hash1']::VARCHAR[], DATE '2024-01-15',
      NULL, 'test_json', 'SERVER', 'test-service',
-     'OK', ARRAY['Test message'], 'INFO', 1000000, ARRAY['Test functions'])
+     'OK', 'Test message', 'INFO', 1000000, ARRAY['Test functions'])
 
 # === Test EXTRACT function (should work - DataFusion built-in) ===
 

@@ -104,6 +104,15 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8View, true))),
         "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        // Variant Binary Encoding: Struct with metadata and value binary fields
+        // Using BinaryView for compatibility with datafusion-variant/parquet-variant-compute
+        "Variant" => ArrowDataType::Struct(
+            vec![
+                Arc::new(Field::new("metadata", ArrowDataType::BinaryView, false)),
+                Arc::new(Field::new("value", ArrowDataType::BinaryView, false)),
+            ]
+            .into(),
+        ),
         _ => anyhow::bail!("Unknown type: {}", s),
     })
 }
@@ -116,6 +125,7 @@ fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
         "Int32" | "UInt32" => DeltaDataType::Primitive(Integer),
         "Int64" | "UInt64" => DeltaDataType::Primitive(Long),
         "List(Utf8)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(String), true))),
+        "Variant" => DeltaDataType::unshredded_variant(),
         _ if s.starts_with("Timestamp") => DeltaDataType::Primitive(Timestamp),
         _ => anyhow::bail!("Unknown type: {}", s),
     })
@@ -179,4 +189,20 @@ pub fn get_schema(table_name: &str) -> Option<&'static TableSchema> {
 // Get the default schema (for backward compatibility)
 pub fn get_default_schema() -> &'static TableSchema {
     registry().get_default().expect("No schemas available in registry")
+}
+
+/// Returns true if the given Arrow DataType represents a Variant type (Struct with metadata + value BinaryView fields)
+pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
+    match data_type {
+        ArrowDataType::Struct(fields) if fields.len() == 2 => {
+            fields.iter().any(|f| f.name() == "metadata" && matches!(f.data_type(), ArrowDataType::BinaryView))
+                && fields.iter().any(|f| f.name() == "value" && matches!(f.data_type(), ArrowDataType::BinaryView))
+        }
+        _ => false,
+    }
+}
+
+/// Get indices of Variant columns in a schema
+pub fn get_variant_column_indices(schema: &SchemaRef) -> Vec<usize> {
+    schema.fields().iter().enumerate().filter(|(_, f)| is_variant_type(f.data_type())).map(|(i, _)| i).collect()
 }
