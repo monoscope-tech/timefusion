@@ -1293,7 +1293,10 @@ fn variant_to_serde_json(variant: &parquet_variant::Variant, depth: usize) -> Re
     use parquet_variant::Variant;
 
     if depth > MAX_VARIANT_DEPTH {
-        return Err(DataFusionError::Execution(format!("Variant nesting depth exceeds limit of {}", MAX_VARIANT_DEPTH)));
+        return Err(DataFusionError::Execution(format!(
+            "Variant nesting depth exceeds limit of {}",
+            MAX_VARIANT_DEPTH
+        )));
     }
 
     Ok(match variant {
