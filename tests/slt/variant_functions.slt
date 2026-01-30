@@ -1,0 +1,269 @@
+# Test Variant type functions in TimeFusion
+# This tests the Parquet Variant binary encoding and extraction functions
+
+# === Basic Variant Functions ===
+
+# Test json_to_variant / variant_to_json round-trip with simple object
+query T
+SELECT variant_to_json(json_to_variant('{"key": "value"}'));
+----
+{"key":"value"}
+
+# Test round-trip with nested object
+query T
+SELECT variant_to_json(json_to_variant('{"user": {"name": "Alice", "age": 30}}'));
+----
+{"user":{"age":30,"name":"Alice"}}
+
+# Test round-trip with array
+query T
+SELECT variant_to_json(json_to_variant('[1, 2, 3, "four"]'));
+----
+[1,2,3,"four"]
+
+# Test round-trip with primitives
+query T
+SELECT variant_to_json(json_to_variant('123'));
+----
+123
+
+query T
+SELECT variant_to_json(json_to_variant('"hello"'));
+----
+"hello"
+
+query T
+SELECT variant_to_json(json_to_variant('true'));
+----
+true
+
+query T
+SELECT variant_to_json(json_to_variant('null'));
+----
+null
+
+# === variant_get with path extraction ===
+
+# Simple field extraction
+query T
+SELECT variant_to_json(variant_get(json_to_variant('{"name": "test", "value": 42}'), 'name'));
+----
+"test"
+
+# Nested path extraction
+query T
+SELECT variant_to_json(variant_get(json_to_variant('{"a": {"b": {"c": "deep"}}}'), 'a.b.c'));
+----
+"deep"
+
+# Array index extraction
+query T
+SELECT variant_to_json(variant_get(json_to_variant('{"items": [10, 20, 30]}'), 'items[0]'));
+----
+10
+
+query T
+SELECT variant_to_json(variant_get(json_to_variant('{"items": [10, 20, 30]}'), 'items[2]'));
+----
+30
+
+# Non-existent path returns JSON null (via variant_to_json)
+query T
+SELECT variant_to_json(variant_get(json_to_variant('{"a": 1}'), 'nonexistent'));
+----
+null
+
+# === is_variant_null ===
+
+query B
+SELECT is_variant_null(json_to_variant('null'));
+----
+true
+
+query B
+SELECT is_variant_null(json_to_variant('{"a": 1}'));
+----
+false
+
+query B
+SELECT is_variant_null(json_to_variant('0'));
+----
+false
+
+query B
+SELECT is_variant_null(json_to_variant('""'));
+----
+false
+
+# === variant_pretty for debugging ===
+
+query T
+SELECT variant_pretty(json_to_variant('123'));
+----
+Int8(123)
+
+# === jsonb_path_exists with literal variant ===
+
+# Basic JSONPath query - check if path exists
+query B
+SELECT jsonb_path_exists(json_to_variant('{"user": {"name": "Alice"}}'), '$.user.name');
+----
+true
+
+# Check for non-existent path
+query B
+SELECT jsonb_path_exists(json_to_variant('{"user": {"name": "Alice"}}'), '$.nonexistent');
+----
+false
+
+# Array wildcard query - check if any item has 'name' field
+query B
+SELECT jsonb_path_exists(json_to_variant('{"items": [{"name": "a"}, {"name": "b"}]}'), '$.items[*].name');
+----
+true
+
+# Array wildcard with value check (RFC 9535 style)
+query B
+SELECT jsonb_path_exists(json_to_variant('[1, 2, 3]'), '$[*]');
+----
+true
+
+# JSONPath on null variant
+query B
+SELECT jsonb_path_exists(json_to_variant('null'), '$.any');
+----
+false
+
+# JSONPath on JSON string (not Variant)
+query B
+SELECT jsonb_path_exists('{"a": 1}', '$.a');
+----
+true
+
+# JSONPath on JSON string - non-existent
+query B
+SELECT jsonb_path_exists('{"a": 1}', '$.b');
+----
+false
+
+# === PostgreSQL-style Arrow Operators on Variant ===
+
+# Test -> operator (returns Variant)
+query T
+SELECT variant_to_json(json_to_variant('{"user": {"name": "Alice", "id": 123}}')->'user');
+----
+{"id":123,"name":"Alice"}
+
+# Test chained -> operators (should be flattened to single variant_get)
+query T
+SELECT variant_to_json(json_to_variant('{"user": {"name": "Alice", "id": 123}}')->'user'->'name');
+----
+"Alice"
+
+# Test ->> operator (returns text via variant_to_json)
+query T
+SELECT json_to_variant('{"user": {"name": "Alice", "id": 123}}')->'user'->>'name';
+----
+"Alice"
+
+# Test array index access with -> operator
+query T
+SELECT variant_to_json(json_to_variant('{"items": [{"name": "item1", "qty": 5}, {"name": "item2", "qty": 10}]}')->'items'->0);
+----
+{"name":"item1","qty":5}
+
+# Test chained array access with ->> for text
+query T
+SELECT json_to_variant('{"items": [{"name": "item1"}, {"name": "item2"}]}')->'items'->0->>'name';
+----
+"item1"
+
+# Test accessing second array element
+query T
+SELECT json_to_variant('{"items": [{"qty": 5}, {"qty": 10}]}')->'items'->1->>'qty';
+----
+10
+
+# Test deep nesting with arrow operators
+query T
+SELECT json_to_variant('{"a": {"b": {"c": {"d": "deep"}}}}')->'a'->'b'->'c'->>'d';
+----
+"deep"
+
+# Test numeric extraction via ->>
+query T
+SELECT json_to_variant('{"count": 42}')->>'count';
+----
+42
+
+# Test boolean extraction via ->>
+query T
+SELECT json_to_variant('{"active": true}')->>'active';
+----
+true
+
+# Test -> on non-existent field returns null variant
+query T
+SELECT variant_to_json(json_to_variant('{"a": 1}')->'nonexistent');
+----
+null
+
+# Test array with mixed types
+query T
+SELECT variant_to_json(json_to_variant('[1, "two", true, null]')->0);
+----
+1
+
+query T
+SELECT json_to_variant('[1, "two", true, null]')->1->>'';
+----
+"two"
+
+# Test complex nested structure
+query T
+SELECT json_to_variant('{"users": [{"profile": {"email": "alice@example.com"}}]}')->'users'->0->'profile'->>'email';
+----
+"alice@example.com"
+
+# Test -> followed by variant_get (mixed usage)
+query T
+SELECT variant_to_json(variant_get(json_to_variant('{"data": {"nested": {"value": 123}}}')->'data', 'nested.value'));
+----
+123
+
+# === Regex on extracted text (DataFusion native ~* operator) ===
+
+query B
+SELECT json_to_variant('{"name": "Alice"}')->>'name' ~* 'ali.*';
+----
+true
+
+query B
+SELECT json_to_variant('{"message": "Error: Connection timeout"}')->>'message' ~* 'error.*timeout';
+----
+true
+
+query B
+SELECT json_to_variant('{"message": "Success"}')->>'message' ~* 'error';
+----
+false
+
+# === Arrow operators on JSON strings (via datafusion-functions-json) ===
+
+# Arrow operators on JSON strings
+query T
+SELECT '{"user": {"name": "Eve"}}'->'user'->>'name';
+----
+Eve
+
+# Chained arrows on JSON string
+query T
+SELECT '{"a": {"b": {"c": "deep"}}}'->'a'->'b'->>'c';
+----
+deep
+
+# Array access on JSON string with ->>
+query T
+SELECT '{"items": [10, 20, 30]}'->>'items';
+----
+[10, 20, 30]

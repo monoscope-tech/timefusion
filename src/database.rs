@@ -1,9 +1,9 @@
 use crate::config::{self, AppConfig};
 use crate::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
-use crate::schema_loader::{get_default_schema, get_schema};
+use crate::schema_loader::{get_default_schema, get_schema, is_variant_type};
 use crate::statistics::DeltaStatisticsExtractor;
 use anyhow::Result;
-use arrow_schema::SchemaRef;
+use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::arrow::array::Array;
@@ -80,6 +80,77 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
             None
         }
     })
+}
+
+/// Convert string columns to Variant binary format where the target schema expects Variant type.
+/// This enables automatic JSON string → Variant conversion during INSERT.
+pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
+    use datafusion::arrow::array::{ArrayRef, LargeStringArray, StringArray, StringViewArray};
+    use datafusion::arrow::datatypes::{DataType, Field};
+
+    let batch_schema = batch.schema();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    let mut new_fields: Vec<Arc<Field>> = batch_schema.fields().iter().cloned().collect();
+
+    for (idx, target_field) in target_schema.fields().iter().enumerate() {
+        if !is_variant_type(target_field.data_type()) {
+            continue;
+        }
+        if idx >= columns.len() {
+            continue;
+        }
+
+        let col = &columns[idx];
+        let col_type = col.data_type();
+
+        // Only convert if source is a string type and target is Variant
+        let converted: Option<ArrayRef> = match col_type {
+            DataType::Utf8View => {
+                let arr = col.as_any().downcast_ref::<StringViewArray>().unwrap();
+                Some(Arc::new(json_strings_to_variant(arr.iter())))
+            }
+            DataType::Utf8 => {
+                let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                Some(Arc::new(json_strings_to_variant(arr.iter())))
+            }
+            DataType::LargeUtf8 => {
+                let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                Some(Arc::new(json_strings_to_variant(arr.iter())))
+            }
+            _ => None, // Already Variant or other type, skip
+        };
+
+        if let Some(variant_array) = converted {
+            columns[idx] = variant_array;
+            new_fields[idx] = target_field.clone();
+        }
+    }
+
+    let new_schema = Arc::new(Schema::new(new_fields));
+    RecordBatch::try_new(new_schema, columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// Convert an iterator of optional JSON strings to a Variant StructArray
+fn json_strings_to_variant<'a>(iter: impl Iterator<Item = Option<&'a str>>) -> datafusion::arrow::array::StructArray {
+    use parquet_variant_compute::VariantArrayBuilder;
+    use parquet_variant_json::JsonToVariant;
+
+    let items: Vec<_> = iter.collect();
+    let mut builder = VariantArrayBuilder::new(items.len());
+
+    for item in items {
+        match item {
+            Some(json_str) => {
+                if let Err(e) = builder.append_json(json_str) {
+                    warn!("Failed to parse JSON '{}': {}, inserting as null", json_str, e);
+                    builder.append_null();
+                }
+            }
+            None => builder.append_null(),
+        }
+    }
+
+    builder.build().into()
 }
 
 // Compression level for parquet files - kept for WriterProperties fallback
@@ -712,10 +783,13 @@ impl Database {
 
         self.register_pg_settings_table(ctx)?;
         self.register_set_config_udf(ctx);
-        self.register_json_functions(ctx);
 
-        // Register custom PostgreSQL-compatible functions
+        // Register custom PostgreSQL-compatible functions BEFORE JSON functions
+        // so VariantAwareExprPlanner gets first chance at -> and ->> operators
         crate::functions::register_custom_functions(ctx).map_err(|e| DataFusionError::Execution(format!("Failed to register custom functions: {}", e)))?;
+
+        // JSON functions (includes JsonExprPlanner for -> and ->> on string columns)
+        self.register_json_functions(ctx);
 
         Ok(())
     }
@@ -1892,14 +1966,18 @@ impl DataSink for ProjectRoutingTable {
         let span = tracing::Span::current();
         let mut total_row_count = 0;
         let mut project_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
+        let target_schema = self.schema();
 
-        // Collect and group batches by project_id
+        // Collect and group batches by project_id, converting variant columns
         while let Some(batch) = data.next().await.transpose()? {
             let batch_rows = batch.num_rows();
             debug!("write_all: received batch with {} rows", batch_rows);
             total_row_count += batch_rows;
             let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
-            project_batches.entry(project_id).or_default().push(batch);
+
+            // Convert string columns to Variant where target schema expects Variant
+            let converted_batch = convert_variant_columns(batch, &target_schema)?;
+            project_batches.entry(project_id).or_default().push(converted_batch);
         }
 
         span.record("rows.count", total_row_count);

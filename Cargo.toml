@@ -20,8 +20,8 @@ log = "0.4.27"
 color-eyre = "0.6.5"
 arrow-schema = "57.1.0"
 regex = "1.11.1"
-# Updated to delta-rs with datafusion 52 Utf8View fixes (includes commits 987e535f, ffb794ba)
-deltalake = { git = "https://github.com/delta-io/delta-rs.git", rev = "ffb794ba0745394fc4b747a4ef2e11c2d4ec086a", features = [
+# Updated to delta-rs with Variant type support (adds variantType feature detection)
+deltalake = { path = "/Users/tonyalaribe/Projects/apitoolkit/datafusion-projects/delta-rs/crates/deltalake", features = [
   "datafusion",
   "s3",
 ] }
@@ -75,6 +75,12 @@ bincode = { version = "2.0", features = ["serde"] }
 walrus-rust = "0.2.0"
 thiserror = "2.0"
 strum = { version = "0.27", features = ["derive"] }
+datafusion-variant = { path = "/Users/tonyalaribe/Projects/apitoolkit/datafusion-projects/datafusion-variant" }
+parquet-variant-compute = "57.2.0"
+parquet-variant-json = "57.2.0"
+parquet-variant = "57.2.0"
+serde_json_path = "0.7"
+base64 = "0.22"
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }

@@ -197,7 +197,10 @@ mod sqllogictest_tests {
             db.setup_session_context(&mut session_context).expect("Failed to setup session context");
 
             let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
-            let auth_config = timefusion::pgwire_handlers::AuthConfig::default();
+            let auth_config = timefusion::pgwire_handlers::AuthConfig {
+                username: "postgres".into(),
+                password: Some("postgres".into()),
+            };
 
             // Wait for shutdown signal or server termination
             tokio::select! {
