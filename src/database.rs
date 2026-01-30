@@ -96,13 +96,9 @@ pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) ->
         if !is_variant_type(target_field.data_type()) {
             continue;
         }
+        // Skip columns beyond batch length - this is normal for INSERT with fewer columns than table schema
+        // (e.g., columns with defaults or nullable columns omitted from INSERT)
         if idx >= columns.len() {
-            error!(
-                "Schema mismatch: target expects '{}' at index {} but batch has only {} columns (possible schema evolution issue)",
-                target_field.name(),
-                idx,
-                columns.len()
-            );
             continue;
         }
 

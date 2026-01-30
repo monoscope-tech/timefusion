@@ -1285,12 +1285,18 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
     }
 }
 
-/// Convert parquet_variant::Variant to serde_json::Value
-fn variant_to_serde_json(variant: &parquet_variant::Variant) -> JsonValue {
+const MAX_VARIANT_DEPTH: usize = 100;
+
+/// Convert parquet_variant::Variant to serde_json::Value with depth limit to prevent stack overflow
+fn variant_to_serde_json(variant: &parquet_variant::Variant, depth: usize) -> Result<JsonValue, DataFusionError> {
     use base64::Engine;
     use parquet_variant::Variant;
 
-    match variant {
+    if depth > MAX_VARIANT_DEPTH {
+        return Err(DataFusionError::Execution(format!("Variant nesting depth exceeds limit of {}", MAX_VARIANT_DEPTH)));
+    }
+
+    Ok(match variant {
         Variant::Null => JsonValue::Null,
         Variant::BooleanTrue => JsonValue::Bool(true),
         Variant::BooleanFalse => JsonValue::Bool(false),
@@ -1312,19 +1318,19 @@ fn variant_to_serde_json(variant: &parquet_variant::Variant) -> JsonValue {
         Variant::TimestampNtzNanos(v) => json!(*v),
         Variant::Binary(bytes) => json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
         Variant::String(s) => JsonValue::String(s.to_string()),
-        Variant::ShortString(s) => JsonValue::String(s.as_str().to_string()),
+        Variant::ShortString(s) => JsonValue::String(s.to_string()),
         Variant::Object(obj) => {
             let mut map = serde_json::Map::new();
             for (key, value) in obj.iter() {
-                map.insert(key.to_string(), variant_to_serde_json(&value));
+                map.insert(key.to_string(), variant_to_serde_json(&value, depth + 1)?);
             }
             JsonValue::Object(map)
         }
         Variant::List(list) => {
-            let items: Vec<JsonValue> = list.iter().map(|v| variant_to_serde_json(&v)).collect();
+            let items: Vec<JsonValue> = list.iter().map(|v| variant_to_serde_json(&v, depth + 1)).collect::<Result<_, _>>()?;
             JsonValue::Array(items)
         }
-    }
+    })
 }
 
 /// Evaluate JSONPath on a Variant (Struct) array
@@ -1366,11 +1372,10 @@ fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &serde_json_path::J
 
         // Decode Variant to JSON
         let variant = Variant::new(metadata, value);
-        let json_value = variant_to_serde_json(&variant);
+        let json_value = variant_to_serde_json(&variant, 0)?;
 
         // Apply JSONPath and check if any matches exist
-        let matches = json_path.query(&json_value);
-        builder.append_value(!matches.is_empty());
+        builder.append_value(!json_path.query(&json_value).is_empty());
     }
 
     Ok(Arc::new(builder.finish()))
