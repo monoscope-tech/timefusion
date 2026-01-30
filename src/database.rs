@@ -110,27 +110,29 @@ pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) ->
         let col_type = col.data_type();
 
         // Only convert if source is a string type and target is Variant
-        let converted: Option<ArrayRef> = match col_type {
-            DataType::Utf8View => {
-                let arr = col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| {
-                    DataFusionError::Execution(format!("Expected StringViewArray for field '{}' but downcast failed", target_field.name()))
-                })?;
-                Some(Arc::new(json_strings_to_variant(arr.iter())?))
-            }
-            DataType::Utf8 => {
-                let arr = col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                    DataFusionError::Execution(format!("Expected StringArray for field '{}' but downcast failed", target_field.name()))
-                })?;
-                Some(Arc::new(json_strings_to_variant(arr.iter())?))
-            }
-            DataType::LargeUtf8 => {
-                let arr = col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| {
-                    DataFusionError::Execution(format!("Expected LargeStringArray for field '{}' but downcast failed", target_field.name()))
-                })?;
-                Some(Arc::new(json_strings_to_variant(arr.iter())?))
-            }
-            _ => None, // Already Variant or other type, skip
-        };
+        let converted: Option<ArrayRef> =
+            match col_type {
+                DataType::Utf8View => {
+                    let arr = col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| {
+                        DataFusionError::Execution(format!("Expected StringViewArray for field '{}' but downcast failed", target_field.name()))
+                    })?;
+                    Some(Arc::new(json_strings_to_variant(arr.iter())?))
+                }
+                DataType::Utf8 => {
+                    let arr = col
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| DataFusionError::Execution(format!("Expected StringArray for field '{}' but downcast failed", target_field.name())))?;
+                    Some(Arc::new(json_strings_to_variant(arr.iter())?))
+                }
+                DataType::LargeUtf8 => {
+                    let arr = col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| {
+                        DataFusionError::Execution(format!("Expected LargeStringArray for field '{}' but downcast failed", target_field.name()))
+                    })?;
+                    Some(Arc::new(json_strings_to_variant(arr.iter())?))
+                }
+                _ => None, // Already Variant or other type, skip
+            };
 
         if let Some(variant_array) = converted {
             columns[idx] = variant_array;
@@ -153,9 +155,9 @@ fn json_strings_to_variant<'a>(iter: impl Iterator<Item = Option<&'a str>>) -> D
 
     for (row_idx, item) in items.into_iter().enumerate() {
         match item {
-            Some(json_str) => builder.append_json(json_str).map_err(|e| {
-                DataFusionError::Execution(format!("Invalid JSON at row {}: {} (value: '{}')", row_idx, e, json_str))
-            })?,
+            Some(json_str) => builder
+                .append_json(json_str)
+                .map_err(|e| DataFusionError::Execution(format!("Invalid JSON at row {}: {} (value: '{}')", row_idx, e, json_str)))?,
             None => builder.append_null(),
         }
     }
