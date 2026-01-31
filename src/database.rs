@@ -1,6 +1,6 @@
 use crate::config::{self, AppConfig};
 use crate::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
-use crate::schema_loader::{get_default_schema, get_schema, is_variant_type};
+use crate::schema_loader::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type};
 use crate::statistics::DeltaStatisticsExtractor;
 use anyhow::Result;
 use arrow_schema::{Schema, SchemaRef};
@@ -14,8 +14,11 @@ use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::{CastExpr, Column as PhysicalColumn};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::DisplayAs;
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::{ExecutionPlanProperties, PlanProperties};
+use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     catalog::Session,
@@ -159,6 +162,114 @@ fn json_strings_to_variant<'a>(iter: impl Iterator<Item = Option<&'a str>>) -> D
     }
 
     Ok(builder.build().into())
+}
+
+/// Check if input schema is compatible with target schema for INSERT operations.
+/// This allows string types (Utf8, Utf8View, LargeUtf8) to be inserted into Variant columns,
+/// since convert_variant_columns() will handle the conversion in write_all().
+fn is_schema_compatible_for_insert(input_schema: &SchemaRef, target_schema: &SchemaRef) -> DFResult<()> {
+    use datafusion::arrow::datatypes::DataType;
+
+    if input_schema.fields().len() != target_schema.fields().len() {
+        return Err(DataFusionError::Plan(format!(
+            "Schema field count mismatch: input has {} fields, target has {} fields",
+            input_schema.fields().len(),
+            target_schema.fields().len()
+        )));
+    }
+
+    for (input_field, target_field) in input_schema.fields().iter().zip(target_schema.fields()) {
+        let input_type = input_field.data_type();
+        let target_type = target_field.data_type();
+
+        // Same type is always compatible
+        if input_type == target_type {
+            continue;
+        }
+
+        // Allow string types to be inserted into Variant columns
+        // (convert_variant_columns will handle the conversion)
+        let is_string_to_variant = matches!(
+            input_type,
+            DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
+        ) && is_variant_type(target_type);
+
+        if is_string_to_variant {
+            continue;
+        }
+
+        // Check logical equivalence for other types
+        if !input_type.equals_datatype(target_type) {
+            return Err(DataFusionError::Plan(format!(
+                "Schema mismatch for field '{}': input type {:?} is not compatible with target type {:?}",
+                input_field.name(),
+                input_type,
+                target_type
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Custom execution plan that converts string columns to Variant type.
+/// This wraps an input plan and transforms string columns to Variant in the output.
+#[derive(Debug)]
+struct VariantConversionExec {
+    input: Arc<dyn ExecutionPlan>,
+    target_schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl VariantConversionExec {
+    fn new(input: Arc<dyn ExecutionPlan>, target_schema: SchemaRef) -> Self {
+        let properties = PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(target_schema.clone()),
+            input.output_partitioning().clone(),
+            input.pipeline_behavior(),
+            Boundedness::Bounded,
+        );
+        Self { input, target_schema, properties }
+    }
+}
+
+impl DisplayAs for VariantConversionExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "VariantConversionExec")
+    }
+}
+
+impl ExecutionPlan for VariantConversionExec {
+    fn name(&self) -> &str {
+        "VariantConversionExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(VariantConversionExec::new(children[0].clone(), self.target_schema.clone())))
+    }
+
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let target_schema = self.target_schema.clone();
+
+        let converted_stream = input_stream.map(move |batch_result| {
+            batch_result.and_then(|batch| convert_variant_columns(batch, &target_schema))
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(self.target_schema.clone(), converted_stream)))
+    }
 }
 
 // Compression level for parquet files - kept for WriterProperties fallback
@@ -344,7 +455,7 @@ impl Database {
             return None;
         }
 
-        let foyer_config = FoyerCacheConfig::from(&cfg.cache);
+        let foyer_config = FoyerCacheConfig::from_app_config(&cfg);
         info!(
             "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, TTL: {}s)",
             foyer_config.memory_size_bytes / 1024 / 1024,
@@ -747,10 +858,19 @@ impl Database {
         );
 
         // Create session state with tracing rule and DML support
+        // IMPORTANT: VariantInsertRewriter must run BEFORE TypeCoercion to rewrite
+        // string literals into json_to_variant() calls before type checking happens
+        let analyzer_rules: Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> = vec![
+            Arc::new(datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction::new()),
+            Arc::new(crate::optimizers::VariantInsertRewriter),
+            Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
+        ];
+
         let session_state = SessionStateBuilder::new()
             .with_config(options.into())
             .with_runtime_env(runtime_env)
             .with_default_features()
+            .with_analyzer_rules(analyzer_rules)
             .with_physical_optimizer_rule(instrument_rule)
             .with_query_planner(Arc::new({
                 let planner = DmlQueryPlanner::new(self.clone());
@@ -1652,6 +1772,14 @@ impl ProjectRoutingTable {
     }
 
     fn schema(&self) -> SchemaRef {
+        // Return INSERT-compatible schema where Variant columns appear as Utf8View.
+        // This allows INSERT statements with JSON strings to pass DataFusion's type validation.
+        // VariantConversionExec handles the actual string->Variant conversion during write.
+        create_insert_compatible_schema(&self.schema)
+    }
+
+    /// Return the actual schema with Variant types (for internal use)
+    fn real_schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
@@ -2039,10 +2167,10 @@ impl TableProvider for ProjectRoutingTable {
     }
 
     async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Create a physical plan from the logical plan.
-        // Check that the schema of the plan matches the schema of this table.
-        match self.schema().logically_equivalent_names_and_types(&input.schema()) {
-            Ok(_) => debug!("insert_into; Schema validation passed"),
+        // Check that the schema of the plan is compatible with this table.
+        // Use custom compatibility check that allows string -> Variant conversion.
+        match is_schema_compatible_for_insert(&input.schema(), &self.schema()) {
+            Ok(_) => debug!("insert_into; Schema validation passed (with Variant compatibility)"),
             Err(e) => {
                 error!("Schema validation failed: {}", e);
                 return Err(e);
@@ -2054,8 +2182,14 @@ impl TableProvider for ProjectRoutingTable {
             return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
         }
 
-        // Create sink executor but with additional logging
-        let sink = DataSinkExec::new(input, Arc::new(self.clone()), None);
+        // Wrap input with VariantConversionExec to convert string columns to Variant
+        // before they reach the sink. This prevents DataFusion from trying to cast
+        // Utf8 -> Struct(Variant) which would fail.
+        // Use real_schema() to get the actual Variant types for proper conversion.
+        let converted_input: Arc<dyn ExecutionPlan> = Arc::new(VariantConversionExec::new(input, self.real_schema()));
+
+        // Create sink executor with the converted input
+        let sink = DataSinkExec::new(converted_input, Arc::new(self.clone()), None);
 
         Ok(Arc::new(sink))
     }
@@ -2223,7 +2357,7 @@ mod tests {
         cfg.aws.aws_allow_http = Some("true".to_string());
         // Core settings - unique per test
         cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
-        cfg.core.walrus_data_dir = PathBuf::from(format!("/tmp/walrus-db-{}", test_id));
+        cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-db-{}", test_id));
         // Disable Foyer cache for tests
         cfg.cache.timefusion_foyer_disabled = true;
         Arc::new(cfg)

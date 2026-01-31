@@ -89,7 +89,7 @@ macro_rules! const_default {
 // All default value functions using the macro
 const_default!(d_true: bool = true);
 const_default!(d_s3_endpoint: String = "https://s3.amazonaws.com");
-const_default!(d_wal_dir: PathBuf = "/var/lib/timefusion/wal");
+const_default!(d_data_dir: PathBuf = "./data");
 const_default!(d_pgwire_port: u16 = 5432);
 const_default!(d_table_prefix: String = "timefusion");
 const_default!(d_batch_queue_capacity: usize = 100_000_000);
@@ -104,7 +104,6 @@ const_default!(d_flush_parallelism: usize = 4);
 const_default!(d_foyer_memory_mb: usize = 512);
 const_default!(d_foyer_disk_gb: usize = 100);
 const_default!(d_foyer_ttl: u64 = 604_800); // 7 days
-const_default!(d_cache_dir: PathBuf = "/tmp/timefusion_cache");
 const_default!(d_foyer_shards: usize = 8);
 const_default!(d_foyer_file_size_mb: usize = 32);
 const_default!(d_foyer_stats: String = "true");
@@ -219,8 +218,8 @@ impl AwsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
-    #[serde(default = "d_wal_dir")]
-    pub walrus_data_dir: PathBuf,
+    #[serde(default = "d_data_dir")]
+    pub timefusion_data_dir: PathBuf,
     #[serde(default = "d_pgwire_port")]
     pub pgwire_port: u16,
     #[serde(default = "d_table_prefix")]
@@ -235,6 +234,15 @@ pub struct CoreConfig {
     pub pgwire_user: String,
     #[serde(default)]
     pub pgwire_password: Option<String>,
+}
+
+impl CoreConfig {
+    pub fn wal_dir(&self) -> PathBuf {
+        self.timefusion_data_dir.join("wal")
+    }
+    pub fn cache_dir(&self) -> PathBuf {
+        self.timefusion_data_dir.join("cache")
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -295,8 +303,6 @@ pub struct CacheConfig {
     pub timefusion_foyer_disk_gb: usize,
     #[serde(default = "d_foyer_ttl")]
     pub timefusion_foyer_ttl_seconds: u64,
-    #[serde(default = "d_cache_dir")]
-    pub timefusion_foyer_cache_dir: PathBuf,
     #[serde(default = "d_foyer_shards")]
     pub timefusion_foyer_shards: usize,
     #[serde(default = "d_foyer_file_size_mb")]

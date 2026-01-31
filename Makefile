@@ -1,4 +1,4 @@
-.PHONY: test test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio run-prod build-prod minio-start minio-stop minio-clean
+.PHONY: test test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio run-prod run-minio build-prod minio-start minio-stop minio-clean
 
 # Default test (fast, excludes slow integration tests)
 test:
@@ -39,6 +39,11 @@ run-prod:
 build-prod:
 	@echo "Building release with PRODUCTION configuration..."
 	@export $$(cat .env.prod | grep -v '^#' | xargs) && cargo build --release
+
+# Run with MinIO configuration (local development with prod-like settings)
+run-minio:
+	@echo "Running with MinIO configuration..."
+	@export $$(cat .env.minio.prod | grep -v '^#' | xargs) && cargo run
 
 # Start MinIO server
 minio-start:

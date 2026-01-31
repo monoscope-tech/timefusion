@@ -141,11 +141,16 @@ fn classify_query(query: &str) -> (&'static str, &'static str) {
 }
 
 fn sanitize_query(query: &str, operation: &str) -> String {
+    const MAX_LEN: usize = 120;
     let lower = query.to_lowercase();
     match operation {
-        "INSERT" => lower.find(" values").map(|i| format!("{} VALUES ...", &query[..i])).unwrap_or_else(|| query.into()),
-        "UPDATE" => lower.find(" set").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.into()),
-        _ => query.into(),
+        "INSERT" => {
+            let table_end = lower.find('(').or_else(|| lower.find("values")).unwrap_or(lower.len());
+            let table_part = query[..table_end].trim_end();
+            format!("{} (...) VALUES ...", table_part)
+        }
+        "UPDATE" => lower.find(" set ").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.into()),
+        _ => if query.len() > MAX_LEN { format!("{}...", &query[..MAX_LEN]) } else { query.into() },
     }
 }
 
@@ -181,9 +186,7 @@ pub struct LoggingExtendedQueryHandler {
 
 impl LoggingExtendedQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
-        Self {
-            inner: DfSessionService::new(session_context),
-        }
+        Self { inner: DfSessionService::new(session_context) }
     }
 }
 

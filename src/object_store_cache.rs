@@ -14,7 +14,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
 use tracing::{Instrument, debug, info, instrument};
 
-use crate::config::CacheConfig;
 use foyer::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -129,25 +128,23 @@ impl Default for FoyerCacheConfig {
     }
 }
 
-impl From<&CacheConfig> for FoyerCacheConfig {
-    fn from(cfg: &CacheConfig) -> Self {
+impl FoyerCacheConfig {
+    pub fn from_app_config(cfg: &crate::config::AppConfig) -> Self {
         Self {
-            memory_size_bytes: cfg.memory_size_bytes(),
-            disk_size_bytes: cfg.disk_size_bytes(),
-            ttl: cfg.ttl(),
-            cache_dir: cfg.timefusion_foyer_cache_dir.clone(),
-            shards: cfg.timefusion_foyer_shards,
-            file_size_bytes: cfg.file_size_bytes(),
-            enable_stats: cfg.stats_enabled(),
-            parquet_metadata_size_hint: cfg.timefusion_parquet_metadata_size_hint,
-            metadata_memory_size_bytes: cfg.metadata_memory_size_bytes(),
-            metadata_disk_size_bytes: cfg.metadata_disk_size_bytes(),
-            metadata_shards: cfg.timefusion_foyer_metadata_shards,
+            memory_size_bytes: cfg.cache.memory_size_bytes(),
+            disk_size_bytes: cfg.cache.disk_size_bytes(),
+            ttl: cfg.cache.ttl(),
+            cache_dir: cfg.core.cache_dir(),
+            shards: cfg.cache.timefusion_foyer_shards,
+            file_size_bytes: cfg.cache.file_size_bytes(),
+            enable_stats: cfg.cache.stats_enabled(),
+            parquet_metadata_size_hint: cfg.cache.timefusion_parquet_metadata_size_hint,
+            metadata_memory_size_bytes: cfg.cache.metadata_memory_size_bytes(),
+            metadata_disk_size_bytes: cfg.cache.metadata_disk_size_bytes(),
+            metadata_shards: cfg.cache.timefusion_foyer_metadata_shards,
         }
     }
-}
 
-impl FoyerCacheConfig {
     /// Create a test configuration with sensible defaults for testing
     /// The name parameter is used to create unique cache directories
     pub fn test_config(name: &str) -> Self {

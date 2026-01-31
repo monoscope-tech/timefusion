@@ -54,7 +54,7 @@ pub mod test_helpers {
             cfg.aws.aws_default_region = Some("us-east-1".to_string());
             cfg.aws.aws_allow_http = Some("true".to_string());
             cfg.core.timefusion_table_prefix = format!("test-{}-{}", self.test_name, uuid);
-            cfg.core.walrus_data_dir = PathBuf::from(format!("/tmp/walrus-{}-{}", self.test_name, uuid));
+            cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-{}-{}", self.test_name, uuid));
             cfg.cache.timefusion_foyer_disabled = true;
             cfg.buffer.timefusion_flush_immediately = self.buffer_mode == BufferMode::FlushImmediately;
             Arc::new(cfg)
