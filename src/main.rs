@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
 
     // Set WALRUS_DATA_DIR before Tokio runtime starts (required by walrus-rust)
     // SAFETY: No threads exist yet - we're before tokio::runtime::Builder
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir) };
+    unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
     // Build and run Tokio runtime after env vars are set
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(async_main(cfg))
@@ -42,7 +42,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Initialize BufferedWriteLayer with explicit config
     info!(
         "BufferedWriteLayer config: wal_dir={:?}, flush_interval={}s, retention={}min",
-        cfg.core.walrus_data_dir,
+        cfg.core.wal_dir(),
         cfg.buffer.flush_interval_secs(),
         cfg.buffer.retention_mins()
     );

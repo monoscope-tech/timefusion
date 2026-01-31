@@ -206,3 +206,21 @@ pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
 pub fn get_variant_column_indices(schema: &SchemaRef) -> Vec<usize> {
     schema.fields().iter().enumerate().filter(|(_, f)| is_variant_type(f.data_type())).map(|(i, _)| i).collect()
 }
+
+/// Create an INSERT-compatible schema where Variant columns are presented as Utf8View.
+/// This allows INSERT statements with JSON strings to pass DataFusion's type validation.
+/// The actual conversion from Utf8View to Variant happens in VariantConversionExec during write.
+pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
+    let new_fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if is_variant_type(f.data_type()) {
+                Arc::new(Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable()))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    Arc::new(Schema::new(new_fields))
+}

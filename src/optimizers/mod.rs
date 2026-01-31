@@ -1,3 +1,7 @@
+mod variant_insert_rewriter;
+
+pub use variant_insert_rewriter::VariantInsertRewriter;
+
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
 

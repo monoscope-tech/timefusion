@@ -67,7 +67,7 @@ impl std::fmt::Debug for BufferedWriteLayer {
 impl BufferedWriteLayer {
     /// Create a new BufferedWriteLayer with explicit config.
     pub fn with_config(cfg: Arc<AppConfig>) -> anyhow::Result<Self> {
-        let wal = Arc::new(WalManager::new(cfg.core.walrus_data_dir.clone())?);
+        let wal = Arc::new(WalManager::new(cfg.core.wal_dir())?);
         let mem_buffer = Arc::new(MemBuffer::new());
 
         Ok(Self {
@@ -569,9 +569,9 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::tempdir;
 
-    fn create_test_config(wal_dir: PathBuf) -> Arc<AppConfig> {
+    fn create_test_config(data_dir: PathBuf) -> Arc<AppConfig> {
         let mut cfg = AppConfig::default();
-        cfg.core.walrus_data_dir = wal_dir;
+        cfg.core.timefusion_data_dir = data_dir;
         Arc::new(cfg)
     }
 
@@ -613,7 +613,7 @@ mod tests {
 
         // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment. We use #[serial]
         // to prevent concurrent access to this process-global state.
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir) };
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
