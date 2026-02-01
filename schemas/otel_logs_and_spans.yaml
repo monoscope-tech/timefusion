@@ -1,5 +1,6 @@
 table_name: otel_logs_and_spans
 partitions:
+  - project_id
   - date
 sorting_columns: []
 z_order_columns:

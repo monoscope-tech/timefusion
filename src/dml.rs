@@ -376,7 +376,13 @@ impl<'a> DmlContext<'a> {
             total_rows += mem_op(layer, self.predicate.as_ref())?;
         }
 
-        let has_committed = self.database.project_configs().read().await.contains_key(&(self.project_id.to_string(), self.table_name.to_string()));
+        // Check if there's committed data: either in custom project tables or unified tables
+        let has_committed = {
+            let custom_tables = self.database.custom_project_tables().read().await;
+            let unified_tables = self.database.unified_tables().read().await;
+            custom_tables.contains_key(&(self.project_id.to_string(), self.table_name.to_string()))
+                || unified_tables.contains_key(self.table_name)
+        };
 
         if has_committed {
             total_rows += delta_op.await?;
@@ -511,14 +517,11 @@ where
     F: FnOnce(deltalake::DeltaTable) -> Fut,
     Fut: std::future::Future<Output = Result<(deltalake::DeltaTable, u64)>>,
 {
-    let table_key = (project_id.to_string(), table_name.to_string());
+    // Use resolve_table which routes to unified or custom table based on storage config
     let table_lock = database
-        .project_configs()
-        .read()
+        .resolve_table(project_id, table_name)
         .await
-        .get(&table_key)
-        .ok_or_else(|| DataFusionError::Execution(format!("Table not found: {} for project {}", table_name, project_id)))?
-        .clone();
+        .map_err(|e| DataFusionError::Execution(format!("Table not found: {} for project {}: {}", table_name, project_id, e)))?;
 
     let delta_table = table_lock.write().await;
     let (new_table, rows_affected) = operation(delta_table.clone()).await?;
