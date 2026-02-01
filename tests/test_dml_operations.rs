@@ -30,7 +30,7 @@ mod test_dml_operations {
         cfg.aws.aws_default_region = Some("us-east-1".to_string());
         cfg.aws.aws_allow_http = Some("true".to_string());
         cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
-        cfg.core.walrus_data_dir = PathBuf::from(format!("/tmp/walrus-dml-{}", test_id));
+        cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-dml-{}", test_id));
         cfg.cache.timefusion_foyer_disabled = true;
         Arc::new(cfg)
     }

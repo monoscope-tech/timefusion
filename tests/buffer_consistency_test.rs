@@ -18,7 +18,7 @@ async fn setup_db_with_buffer(mode: BufferMode) -> Result<(Arc<Database>, Arc<Bu
     // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment. We use #[serial] on all tests
     // to prevent concurrent access to this process-global state. This is inherently racy but
     // acceptable for tests since they run sequentially.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.walrus_data_dir) };
+    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
     let layer = Arc::new(BufferedWriteLayer::with_config(Arc::clone(&cfg))?);
     let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);

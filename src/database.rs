@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::arrow::array::Array;
 use datafusion::common::not_impl_err;
-use datafusion::common::{SchemaExt, Statistics};
+use datafusion::common::Statistics;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
@@ -59,13 +59,22 @@ fn env_mutex() -> &'static Mutex<()> {
     ENV_MUTEX.get_or_init(|| Mutex::new(()))
 }
 
-// Changed to support multiple tables per project: (project_id, table_name) -> DeltaTable
-pub type ProjectConfigs = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
+// Unified tables: one Delta table per schema (table_name -> DeltaTable)
+// All default projects share the same table, with project_id as a partition column
+pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
 
-/// Get a Delta table by project_id and table_name
-pub async fn get_delta_table(project_configs: &ProjectConfigs, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
-    let table_key = (project_id.to_string(), table_name.to_string());
-    project_configs.read().await.get(&table_key).cloned()
+// Custom project tables: projects with their own S3 bucket get isolated tables
+// Key: (project_id, table_name) -> DeltaTable
+pub type CustomProjectTables = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
+
+/// Get a Delta table from custom project tables by project_id and table_name
+pub async fn get_custom_delta_table(custom_tables: &CustomProjectTables, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
+    custom_tables.read().await.get(&(project_id.to_string(), table_name.to_string())).cloned()
+}
+
+/// Get a Delta table from unified tables by table_name
+pub async fn get_unified_delta_table(unified_tables: &UnifiedTables, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
+    unified_tables.read().await.get(table_name).cloned()
 }
 
 // Helper function to extract project_id from a batch
@@ -164,6 +173,128 @@ fn json_strings_to_variant<'a>(iter: impl Iterator<Item = Option<&'a str>>) -> D
     Ok(builder.build().into())
 }
 
+/// Convert Variant columns to JSON strings for SELECT output.
+/// This enables pgwire to properly encode Variant data as JSON text.
+pub fn variant_columns_to_json(batch: RecordBatch, real_schema: &SchemaRef) -> DFResult<RecordBatch> {
+    use datafusion::arrow::array::{ArrayRef, StructArray};
+    use datafusion::arrow::datatypes::{DataType, Field};
+
+    let batch_schema = batch.schema();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    let mut new_fields: Vec<Arc<Field>> = batch_schema.fields().iter().cloned().collect();
+
+    // Iterate over batch columns (which may be projected) and look up by name in real schema
+    for (idx, batch_field) in batch_schema.fields().iter().enumerate() {
+        let is_variant = real_schema
+            .column_with_name(batch_field.name())
+            .is_some_and(|(_, f)| is_variant_type(f.data_type()));
+        if !is_variant {
+            continue;
+        }
+
+        let col = &columns[idx];
+        if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() {
+            let json_arr = variant_struct_to_json(struct_arr)?;
+            columns[idx] = Arc::new(json_arr);
+            new_fields[idx] = Arc::new(Field::new(batch_field.name(), DataType::Utf8, batch_field.is_nullable()));
+        }
+    }
+
+    let new_schema = Arc::new(Schema::new(new_fields));
+    RecordBatch::try_new(new_schema, columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+}
+
+/// Convert a Variant StructArray to a StringArray of JSON values.
+fn variant_struct_to_json(arr: &datafusion::arrow::array::StructArray) -> DFResult<datafusion::arrow::array::StringArray> {
+    use datafusion::arrow::array::StringBuilder;
+    use parquet_variant_compute::VariantArray;
+    use parquet_variant_json::VariantToJson;
+
+    let variant_arr = VariantArray::try_new(arr)
+        .map_err(|e| DataFusionError::Execution(format!("Failed to create VariantArray: {}", e)))?;
+
+    let mut builder = StringBuilder::new();
+    for i in 0..variant_arr.len() {
+        if variant_arr.is_null(i) {
+            builder.append_null();
+        } else {
+            let variant = variant_arr.value(i);
+            let json = variant.to_json_string()
+                .map_err(|e| DataFusionError::Execution(format!("Failed to convert variant to JSON: {}", e)))?;
+            builder.append_value(&json);
+        }
+    }
+    Ok(builder.finish())
+}
+
+/// Custom execution plan that converts Variant columns to JSON strings for SELECT.
+#[derive(Debug)]
+struct VariantToJsonExec {
+    input: Arc<dyn ExecutionPlan>,
+    real_schema: SchemaRef,
+    output_schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl VariantToJsonExec {
+    fn new(input: Arc<dyn ExecutionPlan>, real_schema: SchemaRef) -> Self {
+        use datafusion::arrow::datatypes::{DataType, Field};
+        // Output schema: for each column in input, convert Variant to Utf8
+        let input_schema = input.schema();
+        let output_fields: Vec<Arc<Field>> = input_schema
+            .fields()
+            .iter()
+            .map(|f| {
+                let is_variant = real_schema
+                    .column_with_name(f.name())
+                    .is_some_and(|(_, rf)| is_variant_type(rf.data_type()));
+                if is_variant {
+                    Arc::new(Field::new(f.name(), DataType::Utf8, f.is_nullable()))
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        let output_schema = Arc::new(Schema::new(output_fields));
+        let properties = PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(output_schema.clone()),
+            input.output_partitioning().clone(),
+            input.pipeline_behavior(),
+            Boundedness::Bounded,
+        );
+        Self { input, real_schema, output_schema, properties }
+    }
+}
+
+impl DisplayAs for VariantToJsonExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "VariantToJsonExec")
+    }
+}
+
+impl ExecutionPlan for VariantToJsonExec {
+    fn name(&self) -> &str { "VariantToJsonExec" }
+    fn as_any(&self) -> &dyn Any { self }
+    fn properties(&self) -> &PlanProperties { &self.properties }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
+
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(VariantToJsonExec::new(children[0].clone(), self.real_schema.clone())))
+    }
+
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let real_schema = self.real_schema.clone();
+        let output_schema = self.output_schema.clone();
+
+        let converted_stream = input_stream.map(move |batch_result| {
+            batch_result.and_then(|batch| variant_columns_to_json(batch, &real_schema))
+        });
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, converted_stream)))
+    }
+}
+
 /// Check if input schema is compatible with target schema for INSERT operations.
 /// This allows string types (Utf8, Utf8View, LargeUtf8) to be inserted into Variant columns,
 /// since convert_variant_columns() will handle the conversion in write_all().
@@ -178,33 +309,42 @@ fn is_schema_compatible_for_insert(input_schema: &SchemaRef, target_schema: &Sch
         )));
     }
 
+    fn is_string_type(dt: &DataType) -> bool {
+        matches!(dt, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8)
+    }
+
+    fn types_compatible(input: &DataType, target: &DataType) -> bool {
+        if input == target {
+            return true;
+        }
+        if is_string_type(input) && is_string_type(target) {
+            return true;
+        }
+        // String -> Variant (string will be converted to variant)
+        if is_string_type(input) && is_variant_type(target) {
+            return true;
+        }
+        // Variant -> Utf8View (INSERT-compatible schema uses Utf8View for Variant cols)
+        if is_variant_type(input) && is_string_type(target) {
+            return true;
+        }
+        // List types with compatible element types
+        if let (DataType::List(in_f), DataType::List(tgt_f)) = (input, target) {
+            return types_compatible(in_f.data_type(), tgt_f.data_type());
+        }
+        if let (DataType::LargeList(in_f), DataType::LargeList(tgt_f)) = (input, target) {
+            return types_compatible(in_f.data_type(), tgt_f.data_type());
+        }
+        input.equals_datatype(target)
+    }
+
     for (input_field, target_field) in input_schema.fields().iter().zip(target_schema.fields()) {
-        let input_type = input_field.data_type();
-        let target_type = target_field.data_type();
-
-        // Same type is always compatible
-        if input_type == target_type {
-            continue;
-        }
-
-        // Allow string types to be inserted into Variant columns
-        // (convert_variant_columns will handle the conversion)
-        let is_string_to_variant = matches!(
-            input_type,
-            DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8
-        ) && is_variant_type(target_type);
-
-        if is_string_to_variant {
-            continue;
-        }
-
-        // Check logical equivalence for other types
-        if !input_type.equals_datatype(target_type) {
+        if !types_compatible(input_field.data_type(), target_field.data_type()) {
             return Err(DataFusionError::Plan(format!(
                 "Schema mismatch for field '{}': input type {:?} is not compatible with target type {:?}",
                 input_field.name(),
-                input_type,
-                target_type
+                input_field.data_type(),
+                target_field.data_type()
             )));
         }
     }
@@ -290,7 +430,10 @@ struct StorageConfig {
 #[derive(Debug, Clone)]
 pub struct Database {
     config: Arc<AppConfig>,
-    project_configs: ProjectConfigs,
+    /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
+    unified_tables: UnifiedTables,
+    /// Custom project tables: isolated tables for projects with their own S3 bucket
+    custom_project_tables: CustomProjectTables,
     batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
     config_pool: Option<PgPool>,
@@ -310,9 +453,14 @@ impl Database {
         &self.config
     }
 
-    /// Get the project configs for direct access
-    pub fn project_configs(&self) -> &ProjectConfigs {
-        &self.project_configs
+    /// Get the unified tables cache for direct access
+    pub fn unified_tables(&self) -> &UnifiedTables {
+        &self.unified_tables
+    }
+
+    /// Get the custom project tables cache for direct access
+    pub fn custom_project_tables(&self) -> &CustomProjectTables {
+        &self.custom_project_tables
     }
 
     /// Perform a Delta table UPDATE operation
@@ -534,8 +682,6 @@ impl Database {
             None => (None, HashMap::new()),
         };
 
-        let project_configs = HashMap::new();
-
         // Initialize object store cache BEFORE creating any tables
         // This ensures all tables benefit from caching
         let object_store_cache = Self::initialize_cache_with_retry(&cfg).await;
@@ -547,7 +693,8 @@ impl Database {
 
         let db = Self {
             config: cfg,
-            project_configs: Arc::new(RwLock::new(project_configs)),
+            unified_tables: Arc::new(RwLock::new(HashMap::new())),
+            custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
             config_pool,
@@ -628,14 +775,18 @@ impl Database {
                     let db = db.clone();
                     Box::pin(async move {
                         info!("Running scheduled light optimize on recent small files");
-                        for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
+                        // Optimize unified tables
+                        for (table_name, table) in db.unified_tables.read().await.iter() {
                             match db.optimize_table_light(table, table_name).await {
-                                Ok(_) => {
-                                    info!("Light optimize completed for project '{}' table '{}'", project_id, table_name);
-                                }
-                                Err(e) => {
-                                    error!("Light optimize failed for project '{}' table '{}': {}", project_id, table_name, e);
-                                }
+                                Ok(_) => info!("Light optimize completed for unified table '{}'", table_name),
+                                Err(e) => error!("Light optimize failed for unified table '{}': {}", table_name, e),
+                            }
+                        }
+                        // Optimize custom project tables
+                        for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                            match db.optimize_table_light(table, table_name).await {
+                                Ok(_) => info!("Light optimize completed for custom project '{}' table '{}'", project_id, table_name),
+                                Err(e) => error!("Light optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e),
                             }
                         }
                     })
@@ -662,9 +813,16 @@ impl Database {
                     let db = db.clone();
                     Box::pin(async move {
                         info!("Running scheduled optimize on all tables");
-                        for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
+                        // Optimize unified tables
+                        for (table_name, table) in db.unified_tables.read().await.iter() {
                             if let Err(e) = db.optimize_table(table, table_name, None).await {
-                                error!("Optimize failed for project '{}' table '{}': {}", project_id, table_name, e);
+                                error!("Optimize failed for unified table '{}': {}", table_name, e);
+                            }
+                        }
+                        // Optimize custom project tables
+                        for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                            if let Err(e) = db.optimize_table(table, table_name, None).await {
+                                error!("Optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e);
                             }
                         }
                     })
@@ -691,8 +849,14 @@ impl Database {
                         info!("Running scheduled vacuum on all tables");
                         let retention_hours = vacuum_retention;
 
-                        for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
-                            info!("Vacuuming project '{}' table '{}' (retention: {}h)", project_id, table_name, retention_hours);
+                        // Vacuum unified tables
+                        for (table_name, table) in db.unified_tables.read().await.iter() {
+                            info!("Vacuuming unified table '{}' (retention: {}h)", table_name, retention_hours);
+                            db.vacuum_table(table, retention_hours).await;
+                        }
+                        // Vacuum custom project tables
+                        for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                            info!("Vacuuming custom project '{}' table '{}' (retention: {}h)", project_id, table_name, retention_hours);
                             db.vacuum_table(table, retention_hours).await;
                         }
                     })
@@ -733,12 +897,23 @@ impl Database {
                     info!("Refreshing Delta Lake statistics cache");
                     db.statistics_extractor.clear_cache().await;
 
-                    // Pre-warm cache for active tables
-                    for ((project_id, table_name), table) in db.project_configs.read().await.iter() {
+                    // Pre-warm cache for unified tables
+                    for (table_name, table) in db.unified_tables.read().await.iter() {
                         let table = table.read().await;
                         let current_version = table.version().unwrap_or(0);
-
-                        // Always refresh statistics after clearing cache
+                        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
+                        let schema = schema_def.schema_ref();
+                        // Use empty string for project_id since unified tables are shared
+                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, "", table_name, &schema).await {
+                            error!("Failed to refresh statistics for unified table '{}': {}", table_name, e);
+                        } else {
+                            debug!("Refreshed statistics for unified table '{}' (version {})", table_name, current_version);
+                        }
+                    }
+                    // Pre-warm cache for custom project tables
+                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                        let table = table.read().await;
+                        let current_version = table.version().unwrap_or(0);
                         let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
                         let schema = schema_def.schema_ref();
                         if let Err(e) = db.statistics_extractor.extract_statistics(&table, project_id, table_name, &schema).await {
@@ -858,12 +1033,13 @@ impl Database {
         );
 
         // Create session state with tracing rule and DML support
-        // IMPORTANT: VariantInsertRewriter must run BEFORE TypeCoercion to rewrite
-        // string literals into json_to_variant() calls before type checking happens
+        // Rule ordering: VariantInsertRewriter runs BEFORE TypeCoercion (rewrites string->json_to_variant)
+        //                VariantSelectRewriter runs AFTER TypeCoercion (wraps Variant cols with variant_to_json)
         let analyzer_rules: Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> = vec![
             Arc::new(datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction::new()),
             Arc::new(crate::optimizers::VariantInsertRewriter),
             Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
+            Arc::new(crate::optimizers::VariantSelectRewriter),
         ];
 
         let session_state = SessionStateBuilder::new()
@@ -997,6 +1173,11 @@ impl Database {
         info!("Registered JSON functions with SessionContext");
     }
 
+    /// Check if a project has custom storage configuration (their own S3 bucket)
+    async fn has_custom_storage(&self, project_id: &str, table_name: &str) -> bool {
+        self.storage_configs.read().await.contains_key(&(project_id.to_string(), table_name.to_string()))
+    }
+
     #[instrument(
         name = "database.resolve_table",
         skip(self),
@@ -1004,97 +1185,13 @@ impl Database {
             project_id = %project_id,
             table.name = %table_name,
             cache_hit = Empty,
+            is_custom = Empty,
         )
     )]
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         let span = tracing::Span::current();
-        // First check if table already exists
-        {
-            let project_configs = self.project_configs.read().await;
-            debug!(
-                "Checking cache for project '{}' table '{}', cache contains {} entries",
-                project_id,
-                table_name,
-                project_configs.len()
-            );
-            if let Some(table) = project_configs.get(&(project_id.to_string(), table_name.to_string())) {
-                debug!("Found table in cache for project '{}' table '{}'", project_id, table_name);
-                span.record("cache_hit", true);
-                // Check if we have a recent write that might not be visible yet
-                let last_written_version = {
-                    let versions = self.last_written_versions.read().await;
-                    versions.get(&(project_id.to_string(), table_name.to_string())).cloned()
-                };
 
-                // Check current version without holding the lock too long
-                let current_version = table.read().await.version();
-
-                // Only update if we don't have a recent write or if the table version is behind
-                let should_update = match (current_version, last_written_version) {
-                    (Some(current), Some(last)) => {
-                        let needs_update = current < last;
-                        debug!(
-                            "Version check for {}/{}: current={}, last_written={}, needs_update={}",
-                            project_id, table_name, current, last, needs_update
-                        );
-                        needs_update
-                    }
-                    (None, Some(last)) => {
-                        debug!(
-                            "No current version for {}/{}, but last_written={}, will skip update",
-                            project_id, table_name, last
-                        );
-                        // If we have a last written version but no current version, it means
-                        // we just wrote to a new table and it hasn't been loaded yet
-                        false
-                    }
-                    (Some(current), None) => {
-                        debug!("Current version {} for {}/{}, no last written, will update", current, project_id, table_name);
-                        true
-                    }
-                    (None, None) => {
-                        debug!("No version info for {}/{}, will update", project_id, table_name);
-                        true
-                    }
-                };
-
-                if should_update {
-                    self.update_table(table, project_id, table_name)
-                        .await
-                        .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
-                } else {
-                    debug!("Skipping update for {}/{} - using cached version", project_id, table_name);
-                }
-
-                return Ok(Arc::clone(table));
-            }
-        }
-
-        // Table doesn't exist, try to create it
-        debug!("Table not found in cache for project '{}' table '{}', creating/loading", project_id, table_name);
-        span.record("cache_hit", false);
-        self.get_or_create_table(project_id, table_name)
-            .await
-            .map_err(|e| DataFusionError::Execution(format!("Failed to get or create table: {}", e)))
-    }
-
-    #[instrument(
-        name = "database.get_or_create_table",
-        skip(self),
-        fields(
-            project_id = %project_id,
-            table.name = %table_name,
-        )
-    )]
-    pub async fn get_or_create_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
-        // Check if table already exists before trying to create
-        {
-            let configs = self.project_configs.read().await;
-            if let Some(table) = configs.get(&(project_id.to_string(), table_name.to_string())) {
-                return Ok(Arc::clone(table));
-            }
-        }
-        // Try to reload configs from database if we have a pool (lazy loading)
+        // Try to reload custom configs from database if we have a pool (lazy loading)
         if let Some(ref pool) = self.config_pool
             && let Ok(new_configs) = Self::load_storage_configs(pool).await
         {
@@ -1102,119 +1199,233 @@ impl Database {
             *configs = new_configs;
         }
 
-        // Check if we have specific config for this project
-        let configs = self.storage_configs.read().await;
-        let (storage_uri, storage_options) = if let Some(config) = configs.get(&(project_id.to_string(), table_name.to_string())) {
-            // Use project-specific S3 settings
-            let storage_uri = format!(
-                "s3://{}/{}/?endpoint={}",
-                config.s3_bucket,
-                config.s3_prefix,
-                config
-                    .s3_endpoint
-                    .as_ref()
-                    .unwrap_or(&self.default_s3_endpoint.clone().unwrap_or_else(|| "https://s3.amazonaws.com".to_string()))
-            );
+        // Check if project has custom storage config → use isolated table
+        if self.has_custom_storage(project_id, table_name).await {
+            span.record("is_custom", true);
+            return self.resolve_custom_table(project_id, table_name).await;
+        }
 
-            let mut storage_options = HashMap::new();
-            storage_options.insert("AWS_ACCESS_KEY_ID".to_string(), config.s3_access_key_id.clone());
-            storage_options.insert("AWS_SECRET_ACCESS_KEY".to_string(), config.s3_secret_access_key.clone());
-            storage_options.insert("AWS_REGION".to_string(), config.s3_region.clone());
-            if let Some(ref endpoint) = config.s3_endpoint {
-                storage_options.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone());
+        span.record("is_custom", false);
+        // Default: use unified table (all projects share the same table, partitioned by project_id)
+        self.resolve_unified_table(table_name).await
+    }
+
+    /// Resolve a unified table (shared by all default projects, partitioned by project_id)
+    async fn resolve_unified_table(&self, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
+        // Check unified_tables cache first
+        {
+            let tables = self.unified_tables.read().await;
+            if let Some(table) = tables.get(table_name) {
+                debug!("Found unified table '{}' in cache", table_name);
+                // For unified tables, we use table_name as the key for version tracking
+                let last_written_version = {
+                    let versions = self.last_written_versions.read().await;
+                    // Use empty string for project_id since unified tables aren't project-specific
+                    versions.get(&("".to_string(), table_name.to_string())).cloned()
+                };
+
+                let current_version = table.read().await.version();
+                let should_update = match (current_version, last_written_version) {
+                    (Some(current), Some(last)) => current < last,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+
+                if should_update {
+                    self.update_table(table, "", table_name)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
+                }
+
+                return Ok(Arc::clone(table));
             }
+        }
 
-            // Add DynamoDB locking configuration if enabled (even for project-specific configs)
-            if self.config.aws.is_dynamodb_locking_enabled() {
-                storage_options.insert("AWS_S3_LOCKING_PROVIDER".to_string(), "dynamodb".to_string());
-                if let Some(ref table) = self.config.aws.dynamodb.delta_dynamo_table_name {
-                    storage_options.insert("DELTA_DYNAMO_TABLE_NAME".to_string(), table.clone());
+        // Not in cache, create/load it
+        self.get_or_create_unified_table(table_name)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("Failed to get or create unified table: {}", e)))
+    }
+
+    /// Resolve a custom project table (isolated table for projects with their own S3 bucket)
+    async fn resolve_custom_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
+        // Check custom_project_tables cache first
+        {
+            let tables = self.custom_project_tables.read().await;
+            if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
+                debug!("Found custom table for project '{}' table '{}' in cache", project_id, table_name);
+                let last_written_version = {
+                    let versions = self.last_written_versions.read().await;
+                    versions.get(&(project_id.to_string(), table_name.to_string())).cloned()
+                };
+
+                let current_version = table.read().await.version();
+                let should_update = match (current_version, last_written_version) {
+                    (Some(current), Some(last)) => current < last,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+
+                if should_update {
+                    self.update_table(table, project_id, table_name)
+                        .await
+                        .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
                 }
-                if let Some(ref key) = self.config.aws.dynamodb.aws_access_key_id_dynamodb {
-                    storage_options.insert("AWS_ACCESS_KEY_ID_DYNAMODB".to_string(), key.clone());
-                }
-                if let Some(ref secret) = self.config.aws.dynamodb.aws_secret_access_key_dynamodb {
-                    storage_options.insert("AWS_SECRET_ACCESS_KEY_DYNAMODB".to_string(), secret.clone());
-                }
-                if let Some(ref region) = self.config.aws.dynamodb.aws_region_dynamodb {
-                    storage_options.insert("AWS_REGION_DYNAMODB".to_string(), region.clone());
-                }
-                if let Some(ref endpoint) = self.config.aws.dynamodb.aws_endpoint_url_dynamodb {
-                    storage_options.insert("AWS_ENDPOINT_URL_DYNAMODB".to_string(), endpoint.clone());
-                }
+
+                return Ok(Arc::clone(table));
             }
+        }
 
-            (storage_uri, storage_options)
-        } else if let Some(ref bucket) = self.default_s3_bucket {
-            // No specific config, use default bucket with environment credentials
-            let prefix = self.default_s3_prefix.as_ref().unwrap();
-            let endpoint = self.default_s3_endpoint.as_ref().unwrap();
-            let storage_uri = format!("s3://{}/{}/projects/{}/{}/?endpoint={}", bucket, prefix, project_id, table_name, endpoint);
+        // Not in cache, create/load it
+        self.get_or_create_custom_table(project_id, table_name)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("Failed to get or create custom table: {}", e)))
+    }
 
-            // Populate storage options with AWS credentials and DynamoDB locking if enabled
-            let storage_options = self.build_storage_options();
+    #[instrument(
+        name = "database.get_or_create_unified_table",
+        skip(self),
+        fields(table.name = %table_name)
+    )]
+    pub async fn get_or_create_unified_table(&self, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
+        // Check cache first
+        {
+            let tables = self.unified_tables.read().await;
+            if let Some(table) = tables.get(table_name) {
+                return Ok(Arc::clone(table));
+            }
+        }
 
-            (storage_uri, storage_options)
-        } else {
-            return Err(anyhow::anyhow!(
-                "No configuration for project '{}' table '{}' and no default S3 bucket set",
-                project_id,
-                table_name
-            ));
+        let Some(ref bucket) = self.default_s3_bucket else {
+            return Err(anyhow::anyhow!("No default S3 bucket configured for unified table '{}'", table_name));
         };
 
-        info!(
-            "Creating or loading table for project '{}' table '{}' at: {}",
-            project_id, table_name, storage_uri
-        );
+        let prefix = self.default_s3_prefix.as_ref().unwrap();
+        let endpoint = self.default_s3_endpoint.as_ref().unwrap();
+        // Unified table path: s3://{bucket}/{prefix}/{table_name}/ (NO project_id subdirectory)
+        let storage_uri = format!("s3://{}/{}/{}/?endpoint={}", bucket, prefix, table_name, endpoint);
+        let storage_options = self.build_storage_options();
 
-        // Hold a write lock during table creation to prevent concurrent creation
-        let mut configs = self.project_configs.write().await;
+        info!("Creating or loading unified table '{}' at: {}", table_name, storage_uri);
+
+        // Hold write lock during table creation
+        let mut tables = self.unified_tables.write().await;
 
         // Double-check after acquiring write lock
-        if let Some(table) = configs.get(&(project_id.to_string(), table_name.to_string())) {
+        if let Some(table) = tables.get(table_name) {
             return Ok(Arc::clone(table));
         }
 
-        // Create the base S3 object store
-        let base_store = self.create_object_store(&storage_uri, &storage_options).instrument(tracing::trace_span!("create_object_store")).await?;
+        let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
+        let table_arc = Arc::new(RwLock::new(table));
+        tables.insert(table_name.to_string(), Arc::clone(&table_arc));
+        info!("Cached unified table '{}', cache now contains {} entries", table_name, tables.len());
 
-        // Wrap with instrumentation for tracing
+        Ok(table_arc)
+    }
+
+    #[instrument(
+        name = "database.get_or_create_custom_table",
+        skip(self),
+        fields(project_id = %project_id, table.name = %table_name)
+    )]
+    pub async fn get_or_create_custom_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
+        // Check cache first
+        {
+            let tables = self.custom_project_tables.read().await;
+            if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
+                return Ok(Arc::clone(table));
+            }
+        }
+
+        // Get custom storage config for this project
+        let configs = self.storage_configs.read().await;
+        let config = configs.get(&(project_id.to_string(), table_name.to_string()))
+            .ok_or_else(|| anyhow::anyhow!("No storage config found for project '{}' table '{}'", project_id, table_name))?
+            .clone();
+        drop(configs);
+
+        let storage_uri = format!(
+            "s3://{}/{}/?endpoint={}",
+            config.s3_bucket,
+            config.s3_prefix,
+            config.s3_endpoint.as_ref().unwrap_or(&self.default_s3_endpoint.clone().unwrap_or_else(|| "https://s3.amazonaws.com".to_string()))
+        );
+
+        let mut storage_options = HashMap::new();
+        storage_options.insert("AWS_ACCESS_KEY_ID".to_string(), config.s3_access_key_id.clone());
+        storage_options.insert("AWS_SECRET_ACCESS_KEY".to_string(), config.s3_secret_access_key.clone());
+        storage_options.insert("AWS_REGION".to_string(), config.s3_region.clone());
+        if let Some(ref endpoint) = config.s3_endpoint {
+            storage_options.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone());
+        }
+
+        // Add DynamoDB locking configuration if enabled
+        if self.config.aws.is_dynamodb_locking_enabled() {
+            storage_options.insert("AWS_S3_LOCKING_PROVIDER".to_string(), "dynamodb".to_string());
+            if let Some(ref table) = self.config.aws.dynamodb.delta_dynamo_table_name {
+                storage_options.insert("DELTA_DYNAMO_TABLE_NAME".to_string(), table.clone());
+            }
+            if let Some(ref key) = self.config.aws.dynamodb.aws_access_key_id_dynamodb {
+                storage_options.insert("AWS_ACCESS_KEY_ID_DYNAMODB".to_string(), key.clone());
+            }
+            if let Some(ref secret) = self.config.aws.dynamodb.aws_secret_access_key_dynamodb {
+                storage_options.insert("AWS_SECRET_ACCESS_KEY_DYNAMODB".to_string(), secret.clone());
+            }
+            if let Some(ref region) = self.config.aws.dynamodb.aws_region_dynamodb {
+                storage_options.insert("AWS_REGION_DYNAMODB".to_string(), region.clone());
+            }
+            if let Some(ref endpoint) = self.config.aws.dynamodb.aws_endpoint_url_dynamodb {
+                storage_options.insert("AWS_ENDPOINT_URL_DYNAMODB".to_string(), endpoint.clone());
+            }
+        }
+
+        info!("Creating or loading custom table for project '{}' table '{}' at: {}", project_id, table_name, storage_uri);
+
+        // Hold write lock during table creation
+        let mut tables = self.custom_project_tables.write().await;
+
+        // Double-check after acquiring write lock
+        if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
+            return Ok(Arc::clone(table));
+        }
+
+        let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
+        let table_arc = Arc::new(RwLock::new(table));
+        tables.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
+        info!("Cached custom table for project '{}' table '{}', cache now contains {} entries", project_id, table_name, tables.len());
+
+        Ok(table_arc)
+    }
+
+    /// Internal helper to create/load a Delta table with caching and retry logic
+    async fn create_delta_table_internal(&self, storage_uri: &str, storage_options: &HashMap<String, String>, table_name: &str) -> Result<DeltaTable> {
+        // Create the base S3 object store
+        let base_store = self.create_object_store(storage_uri, storage_options).instrument(tracing::trace_span!("create_object_store")).await?;
         let instrumented_store = instrument_object_store(base_store, "s3");
 
-        // Wrap with the shared Foyer cache if available, otherwise use base store
         let cached_store = if let Some(ref shared_cache) = self.object_store_cache {
-            // Create a new wrapper around the instrumented store using our shared cache
-            // This allows the same cache to be used across all tables
-            // Note: We don't double-instrument with instrument_object_store here since FoyerObjectStoreCache
-            // already has its own instrumentation that properly propagates parent spans
             Arc::new(FoyerObjectStoreCache::new_with_shared_cache(instrumented_store.clone(), shared_cache)) as Arc<dyn object_store::ObjectStore>
         } else {
             warn!("Shared Foyer cache not initialized, using uncached object store");
             instrumented_store
         };
 
-        // Try to load or create the table with the cached object store
-        let table = match self.create_or_load_delta_table(&storage_uri, storage_options.clone(), cached_store.clone()).await {
+        // Try to load existing table
+        match self.create_or_load_delta_table(storage_uri, storage_options.clone(), cached_store.clone()).await {
             Ok(table) => {
-                info!("Loaded existing table for project '{}' table '{}'", project_id, table_name);
-                table
+                info!("Loaded existing table '{}'", table_name);
+                Ok(table)
             }
             Err(load_err) => {
-                info!(
-                    "Table doesn't exist for project '{}' table '{}', creating new table. err: {:?}",
-                    project_id, table_name, load_err
-                );
+                info!("Table '{}' doesn't exist, creating new table. err: {:?}", table_name, load_err);
 
                 let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-
-                // Try to create the table with retry logic for concurrent creation
                 let mut create_attempts = 0;
+
                 loop {
                     create_attempts += 1;
-
                     let commit_properties = CommitProperties::default().with_create_checkpoint(true).with_cleanup_expired_logs(Some(true));
-
                     let checkpoint_interval = self.config.parquet.timefusion_checkpoint_interval.to_string();
 
                     let mut config = HashMap::new();
@@ -1222,7 +1433,7 @@ impl Database {
                     config.insert("delta.checkpointPolicy".to_string(), Some("v2".to_string()));
 
                     match CreateBuilder::new()
-                        .with_location(&storage_uri)
+                        .with_location(storage_uri)
                         .with_columns(schema.columns().unwrap_or_default())
                         .with_partition_columns(schema.partitions.clone())
                         .with_storage_options(storage_options.clone())
@@ -1230,50 +1441,46 @@ impl Database {
                         .with_configuration(config)
                         .await
                     {
-                        Ok(table) => break table,
+                        Ok(table) => break Ok(table),
                         Err(create_err) => {
                             let err_str = create_err.to_string();
                             if (err_str.contains("already exists") || err_str.contains("version 0") || err_str.contains("ConditionalCheckFailedException"))
                                 && create_attempts < 3
                             {
-                                // Table was created by another process or DynamoDB lock conflict, try to load it
-                                debug!(
-                                    "Table creation conflict (possibly DynamoDB lock), attempting to load existing table (attempt {})",
-                                    create_attempts
-                                );
-                                // Exponential backoff
+                                debug!("Table creation conflict, attempting to load existing table (attempt {})", create_attempts);
                                 let backoff_ms = 100 * (2_u64.pow(create_attempts.min(5)));
                                 tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
 
-                                // Try to load the table that was just created
-                                match self.create_or_load_delta_table(&storage_uri, storage_options.clone(), cached_store.clone()).await {
-                                    Ok(table) => break table,
+                                match self.create_or_load_delta_table(storage_uri, storage_options.clone(), cached_store.clone()).await {
+                                    Ok(table) => break Ok(table),
                                     Err(reload_err) => {
                                         debug!("Failed to load table after creation conflict: {:?}", reload_err);
                                         continue;
                                     }
                                 }
                             } else {
-                                return Err(anyhow::anyhow!("Failed to create table: {}", create_err));
+                                break Err(anyhow::anyhow!("Failed to create table: {}", create_err));
                             }
                         }
                     }
                 }
             }
-        };
+        }
+    }
 
-        let table_arc = Arc::new(RwLock::new(table));
-
-        // Store in cache (we already have the write lock)
-        configs.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
-        info!(
-            "Cached table for project '{}' table '{}', cache now contains {} entries",
-            project_id,
-            table_name,
-            configs.len()
-        );
-
-        Ok(table_arc)
+    /// Legacy method for backward compatibility - routes to unified or custom table
+    #[instrument(
+        name = "database.get_or_create_table",
+        skip(self),
+        fields(project_id = %project_id, table.name = %table_name)
+    )]
+    pub async fn get_or_create_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
+        // Route to appropriate table based on whether project has custom storage
+        if self.has_custom_storage(project_id, table_name).await {
+            self.get_or_create_custom_table(project_id, table_name).await
+        } else {
+            self.get_or_create_unified_table(table_name).await
+        }
     }
 
     /// Create an object store for the given URI and storage options
@@ -1774,7 +1981,8 @@ impl ProjectRoutingTable {
     fn schema(&self) -> SchemaRef {
         // Return INSERT-compatible schema where Variant columns appear as Utf8View.
         // This allows INSERT statements with JSON strings to pass DataFusion's type validation.
-        // VariantConversionExec handles the actual string->Variant conversion during write.
+        // VariantConversionExec handles string->Variant conversion during write.
+        // The pgwire layer handles Variant->JSON conversion during read via VariantJsonExec.
         create_insert_compatible_schema(&self.schema)
     }
 
@@ -2182,10 +2390,7 @@ impl TableProvider for ProjectRoutingTable {
             return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
         }
 
-        // Wrap input with VariantConversionExec to convert string columns to Variant
-        // before they reach the sink. This prevents DataFusion from trying to cast
-        // Utf8 -> Struct(Variant) which would fail.
-        // Use real_schema() to get the actual Variant types for proper conversion.
+        // Wrap input with VariantConversionExec to convert string columns to Variant.
         let converted_input: Arc<dyn ExecutionPlan> = Arc::new(VariantConversionExec::new(input, self.real_schema()));
 
         // Create sink executor with the converted input
@@ -2232,10 +2437,19 @@ impl TableProvider for ProjectRoutingTable {
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
         span.record("table.project_id", project_id.as_str());
 
+        // Helper to wrap result with VariantToJsonExec for proper pgwire encoding
+        let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(VariantToJsonExec::new(plan, self.real_schema())))
+        };
+
         // Check if buffered layer is configured
+        let has_layer = self.database.buffered_layer().is_some();
+        debug!("ProjectRoutingTable::scan - buffered_layer present: {}, project_id: {}", has_layer, project_id);
         let Some(layer) = self.database.buffered_layer() else {
             // No buffered layer, query Delta directly
-            return self.scan_delta_only(state, &project_id, projection, &optimized_filters, limit).await;
+            debug!("No buffered layer, querying Delta only");
+            let plan = self.scan_delta_only(state, &project_id, projection, &optimized_filters, limit).await?;
+            return wrap_result(plan);
         };
 
         span.record("scan.uses_mem_buffer", true);
@@ -2265,8 +2479,11 @@ impl TableProvider for ProjectRoutingTable {
         };
 
         // If no mem buffer data, query Delta only
+        debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
         if mem_partitions.is_empty() {
-            return self.scan_delta_only(state, &project_id, projection, &optimized_filters, limit).await;
+            debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
+            let plan = self.scan_delta_only(state, &project_id, projection, &optimized_filters, limit).await?;
+            return wrap_result(plan);
         }
 
         // Create MemorySourceConfig with multiple partitions for parallel execution
@@ -2279,7 +2496,7 @@ impl TableProvider for ProjectRoutingTable {
                 "Skipping Delta scan - query time range entirely within MemBuffer for {}/{}",
                 project_id, self.table_name
             );
-            return Ok(mem_plan);
+            return wrap_result(mem_plan);
         }
 
         // Get oldest timestamp from MemBuffer for time-based exclusion
@@ -2306,7 +2523,7 @@ impl TableProvider for ProjectRoutingTable {
         let delta_plan = self.scan_delta_table(&table, state, projection, &delta_filters, limit).await?;
 
         // Union both plans (mem data first for recency, then Delta for historical)
-        UnionExec::try_new(vec![mem_plan, delta_plan])
+        wrap_result(UnionExec::try_new(vec![mem_plan, delta_plan])?)
     }
 
     fn statistics(&self) -> Option<Statistics> {

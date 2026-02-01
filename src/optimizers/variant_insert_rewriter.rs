@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::{
@@ -42,43 +41,33 @@ fn rewrite_insert_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
         debug!("VariantInsertRewriter: INSERT into {}", dml.table_name);
 
-        // Get target table schema to find variant column names
         let target_schema = dml.target.schema();
-        let variant_column_names: HashSet<String> = target_schema
-            .fields()
-            .iter()
-            .filter(|f| is_variant_type(f.data_type()))
-            .map(|f| f.name().clone())
-            .collect();
-
-        if variant_column_names.is_empty() {
-            return Ok(Transformed::no(plan));
-        }
-
-        // Get input schema to find which positions correspond to variant columns
         let input_schema = dml.input.schema();
 
-
+        // For each input field, check if the TARGET column (by name) is Variant
         let variant_indices: Vec<usize> = input_schema
             .fields()
             .iter()
             .enumerate()
-            .filter(|(_, f)| variant_column_names.contains(f.name()))
+            .filter(|(_, input_field)| {
+                // Look up the target column by name and check if it's Variant
+                target_schema
+                    .column_with_name(input_field.name())
+                    .map(|(_, f)| is_variant_type(f.data_type()))
+                    .unwrap_or(false)
+            })
             .map(|(i, _)| i)
             .collect();
-
 
         if variant_indices.is_empty() {
             return Ok(Transformed::no(plan));
         }
 
         debug!(
-            "VariantInsertRewriter: Found {} variant columns in INSERT: {:?}",
+            "VariantInsertRewriter: Found {} variant columns at positions {:?} (names: {:?})",
             variant_indices.len(),
-            input_schema.fields().iter().enumerate()
-                .filter(|(i, _)| variant_indices.contains(i))
-                .map(|(_, f)| f.name())
-                .collect::<Vec<_>>()
+            variant_indices,
+            variant_indices.iter().filter_map(|i| input_schema.fields().get(*i).map(|f| f.name())).collect::<Vec<_>>()
         );
 
         let new_input = rewrite_input_for_variant(&dml.input, &variant_indices)?;

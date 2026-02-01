@@ -1,6 +1,10 @@
 mod variant_insert_rewriter;
+mod variant_select_rewriter;
 
 pub use variant_insert_rewriter::VariantInsertRewriter;
+pub use variant_select_rewriter::VariantSelectRewriter;
+
+// Remove unused imports warning - these are used by the submodules indirectly
 
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
