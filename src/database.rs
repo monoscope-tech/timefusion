@@ -178,8 +178,10 @@ fn json_strings_to_variant<'a>(iter: impl Iterator<Item = Option<&'a str>>) -> D
 pub fn variant_columns_to_json(batch: RecordBatch, real_schema: &SchemaRef) -> DFResult<RecordBatch> {
     use datafusion::arrow::array::{ArrayRef, StructArray};
     use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::arrow::record_batch::RecordBatchOptions;
 
     let batch_schema = batch.schema();
+    let row_count = batch.num_rows();
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     let mut new_fields: Vec<Arc<Field>> = batch_schema.fields().iter().cloned().collect();
 
@@ -201,7 +203,9 @@ pub fn variant_columns_to_json(batch: RecordBatch, real_schema: &SchemaRef) -> D
     }
 
     let new_schema = Arc::new(Schema::new(new_fields));
-    RecordBatch::try_new(new_schema, columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    // Use try_new_with_options to preserve row count for empty-column batches (e.g., COUNT(*) queries)
+    RecordBatch::try_new_with_options(new_schema, columns, &RecordBatchOptions::new().with_row_count(Some(row_count)))
+        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// Convert a Variant StructArray to a StringArray of JSON values.
