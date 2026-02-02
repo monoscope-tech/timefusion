@@ -1490,13 +1490,34 @@ impl Database {
     /// Create an object store for the given URI and storage options
     async fn create_object_store(&self, storage_uri: &str, storage_options: &HashMap<String, String>) -> Result<Arc<dyn object_store::ObjectStore>> {
         use object_store::aws::AmazonS3Builder;
+        use object_store::{ClientOptions, RetryConfig, BackoffConfig};
+        use std::time::Duration;
 
         // Parse the S3 URI to extract bucket and prefix
         let url = Url::parse(storage_uri)?;
         let bucket = url.host_str().ok_or_else(|| anyhow::anyhow!("Invalid S3 URI: missing bucket"))?;
 
+        // Configure retry with exponential backoff for transient network errors
+        let retry_config = RetryConfig {
+            max_retries: 5,
+            retry_timeout: Duration::from_secs(180),
+            backoff: BackoffConfig {
+                init_backoff: Duration::from_millis(100),
+                max_backoff: Duration::from_secs(15),
+                base: 2.0,
+            },
+        };
+
+        // Configure HTTP client with reasonable timeouts
+        let client_options = ClientOptions::new()
+            .with_connect_timeout(Duration::from_secs(30))
+            .with_timeout(Duration::from_secs(300));
+
         // Build S3 configuration
-        let mut builder = AmazonS3Builder::new().with_bucket_name(bucket);
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_retry(retry_config)
+            .with_client_options(client_options);
 
         // Apply storage options
         if let Some(access_key) = storage_options.get("AWS_ACCESS_KEY_ID") {
