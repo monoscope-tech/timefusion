@@ -42,22 +42,12 @@ use instrumented_object_store::instrument_object_store;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::fmt;
-use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::field::Empty;
 use tracing::{Instrument, debug, error, info, instrument, warn};
 use url::Url;
-
-/// Mutex to serialize access to environment variable modifications.
-/// Required because delta-rs uses std::env::var() for AWS credential resolution,
-/// and std::env::set_var is unsafe in multi-threaded contexts.
-static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-fn env_mutex() -> &'static Mutex<()> {
-    ENV_MUTEX.get_or_init(|| Mutex::new(()))
-}
 
 // Unified tables: one Delta table per schema (table_name -> DeltaTable)
 // All default projects share the same table, with project_id as a partition column
@@ -513,6 +503,10 @@ impl Database {
             .set_dictionary_page_size_limit(8388608) // 8MB
             // Enable statistics for better query optimization
             .set_statistics_enabled(EnabledStatistics::Page)
+            // Enable bloom filters for predicate pushdown (read-side already enabled)
+            .set_bloom_filter_enabled(!self.config.parquet.timefusion_bloom_filter_disabled)
+            .set_bloom_filter_fpp(0.01)
+            .set_bloom_filter_ndv(100_000)
             // Set page row count limit for better compression
             .set_data_page_row_count_limit(page_row_count_limit)
             // Set sorting columns for better query performance on sorted data
@@ -1577,26 +1571,9 @@ impl Database {
     }
 
     /// Creates or loads a DeltaTable with proper configuration.
-    /// Sets environment variables from storage_options to ensure delta-rs credential resolution works.
     async fn create_or_load_delta_table(
         &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<DeltaTable> {
-        // delta-rs uses std::env::var() for AWS credential resolution.
-        // We serialize access with ENV_MUTEX to prevent data races from concurrent set_var calls.
-        {
-            let _guard = env_mutex().lock();
-            for (key, value) in &storage_options {
-                if key.starts_with("AWS_") {
-                    // SAFETY: Protected by ENV_MUTEX. set_var is only unsafe due to potential
-                    // concurrent reads, which we prevent by holding the mutex during the entire
-                    // block. The mutex ensures only one thread modifies env vars at a time.
-                    unsafe {
-                        std::env::set_var(key, value);
-                    }
-                }
-            }
-        }
-
         DeltaTableBuilder::from_url(Url::parse(storage_uri)?)?
             .with_storage_backend(cached_store.clone(), Url::parse(storage_uri)?)
             .with_storage_options(storage_options.clone())
@@ -1786,7 +1763,11 @@ impl Database {
         let optimize_result = table_clone
             .optimize()
             .with_filters(&partition_filters)
-            .with_type(deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone()))
+            .with_type(if schema.z_order_columns.is_empty() {
+                deltalake::operations::optimize::OptimizeType::Compact
+            } else {
+                deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone())
+            })
             .with_target_size(target_size as u64)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
@@ -2451,9 +2432,9 @@ impl TableProvider for ProjectRoutingTable {
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
         span.record("table.project_id", project_id.as_str());
 
-        // Helper to wrap result with VariantToJsonExec for proper pgwire encoding
+        let has_variant_columns = self.real_schema().fields().iter().any(|f| is_variant_type(f.data_type()));
         let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> {
-            Ok(Arc::new(VariantToJsonExec::new(plan, self.real_schema())))
+            if has_variant_columns { Ok(Arc::new(VariantToJsonExec::new(plan, self.real_schema()))) } else { Ok(plan) }
         };
 
         // Check if buffered layer is configured

@@ -327,6 +327,16 @@ impl BufferedWriteLayer {
                     if let Err(e) = self.flush_completed_buckets().await {
                         error!("Flush task error: {}", e);
                     }
+                    // WAL monitoring: check file accumulation
+                    let (file_count, total_bytes) = self.wal.wal_stats();
+                    info!("WAL stats: {} files, {}MB", file_count, total_bytes / (1024 * 1024));
+                    let max_files = self.config.buffer.wal_max_file_count();
+                    if max_files > 0 && file_count > max_files {
+                        warn!("WAL file count {} exceeds threshold {}, triggering emergency flush", file_count, max_files);
+                        if let Err(e) = self.flush_all_now().await {
+                            error!("Emergency WAL flush failed: {}", e);
+                        }
+                    }
                 }
                 _ = self.shutdown.cancelled() => {
                     info!("Flush task shutting down");

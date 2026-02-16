@@ -102,6 +102,7 @@ const_default!(d_shutdown_timeout: u64 = 5);
 const_default!(d_wal_corruption_threshold: usize = 10);
 const_default!(d_flush_parallelism: usize = 4);
 const_default!(d_wal_fsync_ms: u64 = 200);
+const_default!(d_wal_max_files: usize = 200);
 const_default!(d_foyer_memory_mb: usize = 512);
 const_default!(d_foyer_disk_gb: usize = 100);
 const_default!(d_foyer_ttl: u64 = 604_800); // 7 days
@@ -269,6 +270,8 @@ pub struct BufferConfig {
     pub timefusion_flush_immediately: bool,
     #[serde(default = "d_wal_fsync_ms")]
     pub timefusion_wal_fsync_ms: u64,
+    #[serde(default = "d_wal_max_files")]
+    pub timefusion_wal_max_file_count: usize,
 }
 
 impl BufferConfig {
@@ -295,6 +298,9 @@ impl BufferConfig {
     }
     pub fn wal_fsync_ms(&self) -> u64 {
         self.timefusion_wal_fsync_ms.max(1)
+    }
+    pub fn wal_max_file_count(&self) -> usize {
+        self.timefusion_wal_max_file_count
     }
 
     pub fn compute_shutdown_timeout(&self, current_memory_mb: usize) -> Duration {
@@ -374,6 +380,8 @@ pub struct ParquetConfig {
     pub timefusion_optimize_target_size: i64,
     #[serde(default = "d_stats_cache_size")]
     pub timefusion_stats_cache_size: usize,
+    #[serde(default)]
+    pub timefusion_bloom_filter_disabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
