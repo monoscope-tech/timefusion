@@ -184,9 +184,13 @@ pub struct WalManager {
 
 impl WalManager {
     pub fn new(data_dir: PathBuf) -> Result<Self, WalError> {
+        Self::with_fsync_ms(data_dir, FSYNC_SCHEDULE_MS)
+    }
+
+    pub fn with_fsync_ms(data_dir: PathBuf, fsync_ms: u64) -> Result<Self, WalError> {
         std::fs::create_dir_all(&data_dir)?;
 
-        let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(FSYNC_SCHEDULE_MS))?;
+        let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(fsync_ms))?;
 
         // Load known topics from index file
         let meta_dir = data_dir.join(".timefusion_meta");

@@ -1018,9 +1018,10 @@ impl Database {
         let _ = options.set("datafusion.execution.memory_fraction", &memory_fraction.to_string());
         let _ = options.set("datafusion.execution.sort_spill_reservation_bytes", &sort_spill_reservation_bytes.to_string());
 
-        // Create runtime environment with memory limit
+        // Create runtime environment with FairSpillPool for per-query memory fairness
+        let pool_size = (memory_limit_bytes as f64 * memory_fraction) as usize;
         let runtime_env = RuntimeEnvBuilder::new()
-            .with_memory_limit(memory_limit_bytes, memory_fraction)
+            .with_memory_pool(Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)))
             .build()
             .expect("Failed to create runtime environment");
 
@@ -2495,7 +2496,7 @@ impl TableProvider for ProjectRoutingTable {
         };
 
         // Query MemBuffer with partitioned data for parallel execution
-        let mem_partitions = match layer.query_partitioned(&project_id, &self.table_name) {
+        let mem_partitions = match layer.query_partitioned(&project_id, &self.table_name, &optimized_filters) {
             Ok(partitions) => partitions,
             Err(e) => {
                 warn!("Failed to query mem buffer: {}", e);

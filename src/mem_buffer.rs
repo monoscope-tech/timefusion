@@ -217,6 +217,60 @@ impl datafusion::sql::planner::ContextProvider for EmptyContextProvider {
     }
 }
 
+/// Extract min/max timestamp bounds from filter expressions for bucket pruning.
+fn extract_timestamp_range(filters: &[Expr]) -> (Option<i64>, Option<i64>) {
+    let (mut min_ts, mut max_ts) = (None, None);
+    for filter in filters {
+        if let Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr { left, op, right }) = filter {
+            let is_ts = matches!(left.as_ref(), Expr::Column(c) if c.name == "timestamp");
+            if !is_ts {
+                continue;
+            }
+            let ts = match right.as_ref() {
+                Expr::Literal(datafusion::scalar::ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
+                Expr::Literal(datafusion::scalar::ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
+                Expr::Literal(datafusion::scalar::ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
+                Expr::Literal(datafusion::scalar::ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
+                _ => None,
+            };
+            if let Some(ts) = ts {
+                match op {
+                    datafusion::logical_expr::Operator::Gt | datafusion::logical_expr::Operator::GtEq => {
+                        min_ts = Some(min_ts.map_or(ts, |m: i64| m.max(ts)));
+                    }
+                    datafusion::logical_expr::Operator::Lt | datafusion::logical_expr::Operator::LtEq => {
+                        max_ts = Some(max_ts.map_or(ts, |m: i64| m.min(ts)));
+                    }
+                    datafusion::logical_expr::Operator::Eq => {
+                        min_ts = Some(ts);
+                        max_ts = Some(ts);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    (min_ts, max_ts)
+}
+
+/// Check if a bucket's time range overlaps with the query range.
+fn bucket_overlaps_range(bucket: &TimeBucket, range: &(Option<i64>, Option<i64>)) -> bool {
+    let (min_filter, max_filter) = range;
+    if let Some(max) = max_filter {
+        let bucket_min = bucket.min_timestamp.load(Ordering::Relaxed);
+        if bucket_min != i64::MAX && bucket_min > *max {
+            return false;
+        }
+    }
+    if let Some(min) = min_filter {
+        let bucket_max = bucket.max_timestamp.load(Ordering::Relaxed);
+        if bucket_max != i64::MIN && bucket_max < *min {
+            return false;
+        }
+    }
+    true
+}
+
 impl MemBuffer {
     pub fn new() -> Self {
         Self {
@@ -323,16 +377,18 @@ impl MemBuffer {
         Ok(())
     }
 
-    #[instrument(skip(self, _filters), fields(project_id, table_name))]
-    pub fn query(&self, project_id: &str, table_name: &str, _filters: &[Expr]) -> anyhow::Result<Vec<RecordBatch>> {
+    #[instrument(skip(self, filters), fields(project_id, table_name))]
+    pub fn query(&self, project_id: &str, table_name: &str, filters: &[Expr]) -> anyhow::Result<Vec<RecordBatch>> {
         let mut results = Vec::new();
+        let ts_range = extract_timestamp_range(filters);
 
         if let Some(table) = self.get_table(project_id, table_name) {
             for bucket_entry in table.buckets.iter() {
-                if let Ok(batches) = bucket_entry.batches.read() {
-                    // RecordBatch clone is cheap: Arc<Schema> + Vec<Arc<Array>>
-                    // Only clones pointers (~100 bytes/batch), NOT the underlying data
-                    // A 4GB buffer query adds ~1MB overhead, not 4GB
+                let bucket = bucket_entry.value();
+                if !bucket_overlaps_range(bucket, &ts_range) {
+                    continue;
+                }
+                if let Ok(batches) = bucket.batches.read() {
                     results.extend(batches.iter().cloned());
                 }
             }
@@ -344,21 +400,22 @@ impl MemBuffer {
 
     /// Query and return partitioned data - one partition per time bucket.
     /// This enables parallel execution across time buckets.
-    #[instrument(skip(self), fields(project_id, table_name))]
-    pub fn query_partitioned(&self, project_id: &str, table_name: &str) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+    /// Optional filters enable timestamp-based bucket pruning.
+    #[instrument(skip(self, filters), fields(project_id, table_name))]
+    pub fn query_partitioned(&self, project_id: &str, table_name: &str, filters: &[Expr]) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
         let mut partitions = Vec::new();
+        let ts_range = extract_timestamp_range(filters);
 
         if let Some(table) = self.get_table(project_id, table_name) {
-            // Sort buckets by bucket_id for consistent ordering
             let mut bucket_ids: Vec<i64> = table.buckets.iter().map(|b| *b.key()).collect();
             bucket_ids.sort();
 
             for bucket_id in bucket_ids {
                 if let Some(bucket) = table.buckets.get(&bucket_id)
+                    && bucket_overlaps_range(&bucket, &ts_range)
                     && let Ok(batches) = bucket.batches.read()
                     && !batches.is_empty()
                 {
-                    // RecordBatch clone is cheap (~100 bytes/batch), data is Arc-shared
                     partitions.push(batches.clone());
                 }
             }
@@ -554,6 +611,8 @@ impl MemBuffer {
             *batches = new_batches;
             let new_row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
             bucket.row_count.store(new_row_count, Ordering::Relaxed);
+            let new_memory: usize = batches.iter().map(|b| estimate_batch_size(b)).sum();
+            bucket.memory_bytes.store(new_memory, Ordering::Relaxed);
         }
 
         if memory_freed > 0 {
@@ -593,11 +652,13 @@ impl MemBuffer {
             .collect::<DFResult<Vec<_>>>()?;
 
         let mut total_updated = 0u64;
+        let mut memory_delta = 0i64;
 
         for mut bucket_entry in table.buckets.iter_mut() {
             let bucket = bucket_entry.value_mut();
             let mut batches = bucket.batches.write().map_err(|e| datafusion::error::DataFusionError::Execution(format!("Lock error: {}", e)))?;
 
+            let old_memory: usize = batches.iter().map(|b| estimate_batch_size(b)).sum();
             let new_batches: Vec<RecordBatch> = batches
                 .drain(..)
                 .map(|batch| {
@@ -646,6 +707,17 @@ impl MemBuffer {
                 .collect::<DFResult<Vec<_>>>()?;
 
             *batches = new_batches;
+            let new_memory: usize = batches.iter().map(|b| estimate_batch_size(b)).sum();
+            bucket.memory_bytes.store(new_memory, Ordering::Relaxed);
+            memory_delta += new_memory as i64 - old_memory as i64;
+        }
+
+        if memory_delta != 0 {
+            if memory_delta > 0 {
+                self.estimated_bytes.fetch_add(memory_delta as usize, Ordering::Relaxed);
+            } else {
+                self.estimated_bytes.fetch_sub((-memory_delta) as usize, Ordering::Relaxed);
+            }
         }
 
         debug!("MemBuffer update: project={}, table={}, rows_updated={}", project_id, table_name, total_updated);
