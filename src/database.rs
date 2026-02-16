@@ -98,9 +98,8 @@ pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) ->
         if !is_variant_type(target_field.data_type()) {
             continue;
         }
-        // Skip columns beyond batch length - this is normal for INSERT with fewer columns than table schema
-        // (e.g., columns with defaults or nullable columns omitted from INSERT)
         if idx >= columns.len() {
+            debug!("Column index {} exceeds batch length {}, skipping", idx, columns.len());
             continue;
         }
 
@@ -460,16 +459,17 @@ impl Database {
     /// Perform a Delta table UPDATE operation
     pub async fn perform_delta_update(
         &self, table_name: &str, project_id: &str, predicate: Option<datafusion::logical_expr::Expr>,
-        assignments: Vec<(String, datafusion::logical_expr::Expr)>,
+        assignments: Vec<(String, datafusion::logical_expr::Expr)>, session: Arc<dyn datafusion::catalog::Session>,
     ) -> Result<u64, DataFusionError> {
-        crate::dml::perform_delta_update(self, table_name, project_id, predicate, assignments).await
+        crate::dml::perform_delta_update(self, table_name, project_id, predicate, assignments, session).await
     }
 
     /// Perform a Delta table DELETE operation
     pub async fn perform_delta_delete(
         &self, table_name: &str, project_id: &str, predicate: Option<datafusion::logical_expr::Expr>,
+        session: Arc<dyn datafusion::catalog::Session>,
     ) -> Result<u64, DataFusionError> {
-        crate::dml::perform_delta_delete(self, table_name, project_id, predicate).await
+        crate::dml::perform_delta_delete(self, table_name, project_id, predicate, session).await
     }
 
     /// Build storage options with consistent configuration including DynamoDB locking if enabled
@@ -2132,16 +2132,7 @@ impl ProjectRoutingTable {
     async fn scan_delta_table(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Register the object store with DataFusion's runtime so table_provider().scan() can access it
-        let log_store = table.log_store();
-        let root_store = log_store.root_object_store(None);
-        let bucket_url = {
-            let table_url = table.table_url();
-            let scheme = table_url.scheme();
-            let bucket = table_url.host_str().unwrap_or("");
-            Url::parse(&format!("{}://{}/", scheme, bucket)).expect("valid bucket URL")
-        };
-        state.runtime_env().register_object_store(&bucket_url, root_store);
+        table.update_datafusion_session(state).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let provider = table.table_provider().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
 

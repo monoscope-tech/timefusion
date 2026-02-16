@@ -2,7 +2,7 @@
 mod integration {
     use anyhow::Result;
     use datafusion_postgres::ServerOptions;
-    use rand::Rng;
+    use rand::{Rng, RngExt};
     use serial_test::serial;
     use std::path::PathBuf;
     use std::sync::Arc;
