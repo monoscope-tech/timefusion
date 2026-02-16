@@ -67,7 +67,7 @@ impl std::fmt::Debug for BufferedWriteLayer {
 impl BufferedWriteLayer {
     /// Create a new BufferedWriteLayer with explicit config.
     pub fn with_config(cfg: Arc<AppConfig>) -> anyhow::Result<Self> {
-        let wal = Arc::new(WalManager::new(cfg.core.wal_dir())?);
+        let wal = Arc::new(WalManager::with_fsync_ms(cfg.core.wal_dir(), cfg.buffer.wal_fsync_ms())?);
         let mem_buffer = Arc::new(MemBuffer::new());
 
         Ok(Self {
@@ -109,7 +109,7 @@ impl BufferedWriteLayer {
     /// Try to reserve memory atomically before a write.
     /// Returns estimated batch size on success, or error if hard limit exceeded.
     /// Uses exponential backoff to reduce CPU thrashing under contention.
-    fn try_reserve_memory(&self, batches: &[RecordBatch]) -> anyhow::Result<usize> {
+    async fn try_reserve_memory(&self, batches: &[RecordBatch]) -> anyhow::Result<usize> {
         let batch_size: usize = batches.iter().map(estimate_batch_size).sum();
         let estimated_size = (batch_size as f64 * MEMORY_OVERHEAD_MULTIPLIER) as usize;
 
@@ -138,16 +138,11 @@ impl BufferedWriteLayer {
                 return Ok(estimated_size);
             }
 
-            // Exponential backoff: spin_loop for first few attempts, then brief sleep.
-            // Note: Using std::thread::sleep in this sync function called from async context.
-            // This is acceptable because: (1) max sleep is ~1ms, (2) only under high contention,
-            // (3) converting to async would require spawn_blocking which adds more overhead.
             if attempt < 5 {
                 std::hint::spin_loop();
             } else {
-                // Max backoff = 1μs << 10 = 1024μs ≈ 1ms
                 let backoff_micros = CAS_BACKOFF_BASE_MICROS << attempt.min(CAS_BACKOFF_MAX_EXPONENT);
-                std::thread::sleep(std::time::Duration::from_micros(backoff_micros));
+                tokio::time::sleep(std::time::Duration::from_micros(backoff_micros)).await;
             }
         }
         anyhow::bail!("Failed to reserve memory after {} retries due to contention", MAX_CAS_RETRIES)
@@ -172,7 +167,7 @@ impl BufferedWriteLayer {
         }
 
         // Reserve memory atomically before writing - prevents race condition
-        let reserved_size = self.try_reserve_memory(&batches)?;
+        let reserved_size = self.try_reserve_memory(&batches).await?;
 
         // Write WAL and MemBuffer, ensuring reservation is released regardless of outcome.
         // Reservation covers the window between WAL write and MemBuffer insert;
@@ -236,11 +231,17 @@ impl BufferedWriteLayer {
             match entry.operation {
                 WalOperation::Insert => match WalManager::deserialize_batch(&entry.data, &entry.table_name) {
                     Ok(batch) => {
-                        self.mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros)?;
-                        entries_replayed += 1;
+                        if batch.num_rows() == 0 {
+                            warn!("Skipping empty batch during WAL recovery for {}.{}", entry.project_id, entry.table_name);
+                            continue;
+                        }
+                        match self.mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros) {
+                            Ok(()) => entries_replayed += 1,
+                            Err(e) => warn!("Skipping incompatible WAL entry for {}.{}: {}", entry.project_id, entry.table_name, e),
+                        }
                     }
                     Err(e) => {
-                        warn!("Skipping corrupted INSERT batch: {}", e);
+                        warn!("Skipping corrupted INSERT batch for {}.{}: {}", entry.project_id, entry.table_name, e);
                     }
                 },
                 WalOperation::Delete => match deserialize_delete_payload(&entry.data) {
@@ -522,8 +523,8 @@ impl BufferedWriteLayer {
 
     /// Query and return partitioned data - one partition per time bucket.
     /// This enables parallel execution across time buckets in DataFusion.
-    pub fn query_partitioned(&self, project_id: &str, table_name: &str) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
-        self.mem_buffer.query_partitioned(project_id, table_name)
+    pub fn query_partitioned(&self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr]) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+        self.mem_buffer.query_partitioned(project_id, table_name, filters)
     }
 
     /// Check if a table exists in the memory buffer.
