@@ -8,6 +8,7 @@ tokio = { version = "1.48", features = ["full"] }
 datafusion = "52.1.0"
 datafusion-datasource = "52.1.0"
 arrow = "57.1.0"
+arrow-ipc = "57.1.0"
 arrow-json = "57.1.0"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }

@@ -505,11 +505,17 @@ impl MemBuffer {
                     && let Ok(batches) = bucket.batches.read()
                     && !batches.is_empty()
                 {
+                    // Compact multiple small batches into one before flush
+                    let compacted = if batches.len() > 1 {
+                        arrow::compute::concat_batches(&table.schema, &*batches).map_or_else(|_| batches.clone(), |single| vec![single])
+                    } else {
+                        batches.clone()
+                    };
                     result.push(FlushableBucket {
                         project_id: project_id.to_string(),
                         table_name: table_name.to_string(),
                         bucket_id,
-                        batches: batches.clone(),
+                        batches: compacted,
                         row_count: bucket.row_count.load(Ordering::Relaxed),
                     });
                 }
@@ -1079,6 +1085,30 @@ mod tests {
 
         let results = buffer.query("project1", "table1", &[]).unwrap();
         assert_eq!(results.len(), 10, "All 10 inserts should succeed");
+    }
+
+    #[test]
+    fn test_batch_compaction_on_flush() {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+
+        // Insert 10 small batches into the same bucket
+        let total_rows = 10;
+        for i in 0..total_rows {
+            let batch = create_multi_row_batch(vec![i as i64], vec!["test"]);
+            buffer.insert("project1", "table1", batch, ts).unwrap();
+        }
+
+        let stats = buffer.get_stats();
+        assert_eq!(stats.total_batches, total_rows);
+
+        // get_flushable_buckets should compact into 1 batch
+        let cutoff = MemBuffer::compute_bucket_id(ts) + 1;
+        let flushable = buffer.get_flushable_buckets(cutoff);
+        assert_eq!(flushable.len(), 1);
+        assert_eq!(flushable[0].batches.len(), 1);
+        assert_eq!(flushable[0].row_count, total_rows);
+        assert_eq!(flushable[0].batches[0].num_rows(), total_rows);
     }
 
     #[test]

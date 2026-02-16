@@ -1758,31 +1758,28 @@ impl Database {
     /// Optimize the Delta table using Z-ordering on timestamp and id columns
     /// This improves query performance for time-based queries
     pub async fn optimize_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, _target_size: Option<i64>) -> Result<()> {
-        // Log the start of the optimization operation
         let start_time = std::time::Instant::now();
-        info!("Starting Delta table optimization with Z-ordering (last 28 hours only)");
+        let window_hours = self.config.maintenance.timefusion_optimize_window_hours.max(1);
+        info!("Starting Delta table optimization with Z-ordering (last {} hours)", window_hours);
 
-        // Get a clone of the table to avoid holding the lock during the operation
         let table_clone = {
             let table = table_ref.read().await;
             table.clone()
         };
 
-        // Get configurable target size
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
-        // Calculate dates for filtering - last 2 days (today and yesterday)
-        let today = Utc::now().date_naive();
-        let yesterday = (Utc::now() - chrono::Duration::days(1)).date_naive();
-        info!("Optimizing files from dates: {} and {}", yesterday, today);
+        // Generate partition filters for each date in the configurable window
+        let now = Utc::now();
+        let num_days = (window_hours / 24).max(1);
+        let partition_filters: Vec<PartitionFilter> = (0..=num_days)
+            .filter_map(|days_ago| {
+                let date = (now - chrono::Duration::days(days_ago as i64)).date_naive();
+                PartitionFilter::try_from(("date", "=", date.to_string().as_str())).ok()
+            })
+            .collect();
+        info!("Optimizing files from {} date partitions", partition_filters.len());
 
-        // Create partition filters for the last 2 days
-        let partition_filters = vec![
-            PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?,
-            PartitionFilter::try_from(("date", "=", yesterday.to_string().as_str()))?,
-        ];
-
-        // Z-order files for better query performance on timestamp and service_name filters
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let writer_properties = self.create_writer_properties(schema.sorting_columns());
 
@@ -1797,27 +1794,22 @@ impl Database {
 
         match optimize_result {
             Ok((new_table, metrics)) => {
+                let min_files = self.config.maintenance.timefusion_compact_min_files;
+                if metrics.total_considered_files < min_files {
+                    debug!("Skipping optimization commit: {} files < min threshold {}", metrics.total_considered_files, min_files);
+                    return Ok(());
+                }
                 let duration = start_time.elapsed();
                 info!(
                     "Optimization completed in {:?}: {} files removed, {} files added, {} partitions optimized, {} total files considered, {} files skipped",
-                    duration,
-                    metrics.num_files_removed,
-                    metrics.num_files_added,
-                    metrics.partitions_optimized,
-                    metrics.total_considered_files,
-                    metrics.total_files_skipped
+                    duration, metrics.num_files_removed, metrics.num_files_added, metrics.partitions_optimized, metrics.total_considered_files, metrics.total_files_skipped
                 );
-
-                // Log performance metrics for monitoring
                 if metrics.num_files_removed > 0 {
                     let compression_ratio = metrics.num_files_removed as f64 / metrics.num_files_added as f64;
                     info!("Optimization compression ratio: {:.2}x", compression_ratio);
                 }
-
-                // Update the table reference with the optimized version
                 let mut table = table_ref.write().await;
                 *table = new_table;
-
                 Ok(())
             }
             Err(e) => {
@@ -1827,11 +1819,8 @@ impl Database {
         }
     }
 
-    /// Light optimization for small recent files
-    /// Targets files < 10MB from today's partition only
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         let start_time = std::time::Instant::now();
-        // Get a clone of the table to avoid holding the lock during the operation
         let table_clone = {
             let table = table_ref.read().await;
             table.clone()
@@ -1840,31 +1829,30 @@ impl Database {
         let today = Utc::now().date_naive();
         info!("Light optimizing files from date: {}", today);
 
-        // Create partition filter for today only
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?];
+        let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let optimize_result = table_clone
             .optimize()
             .with_filters(&partition_filters)
             .with_type(deltalake::operations::optimize::OptimizeType::Compact)
-            .with_target_size(16 * 1024 * 1024)
+            .with_target_size(target_size as u64)
             .with_writer_properties(self.create_writer_properties(schema.sorting_columns()))
-            .with_min_commit_interval(tokio::time::Duration::from_secs(30)) // 1 minute min interval
+            .with_min_commit_interval(tokio::time::Duration::from_secs(30))
             .await;
 
         match optimize_result {
             Ok((new_table, metrics)) => {
+                let min_files = self.config.maintenance.timefusion_compact_min_files;
+                if metrics.total_considered_files < min_files {
+                    debug!("Skipping light optimization commit: {} files < min threshold {}", metrics.total_considered_files, min_files);
+                    return Ok(());
+                }
                 let duration = start_time.elapsed();
-                info!(
-                    "Light optimization completed in {:?}: {} files removed, {} files added",
-                    duration, metrics.num_files_removed, metrics.num_files_added,
-                );
-
-                // Update the table reference with the optimized version
+                info!("Light optimization completed in {:?}: {} files removed, {} files added", duration, metrics.num_files_removed, metrics.num_files_added);
                 let mut table = table_ref.write().await;
                 *table = new_table;
-
                 Ok(())
             }
             Err(e) => {
