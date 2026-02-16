@@ -2,6 +2,8 @@ use crate::schema_loader::{get_default_schema, get_schema};
 use arrow::array::{Array, ArrayRef, RecordBatch, make_array};
 use arrow::buffer::{Buffer, NullBuffer};
 use arrow::datatypes::{DataType, SchemaRef};
+use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
 use bincode::{Decode, Encode};
 use dashmap::DashSet;
 use std::path::PathBuf;
@@ -35,6 +37,8 @@ pub enum WalError {
 const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32]; // "WAL2"
 /// Version byte must be > 2 to distinguish from legacy operation bytes (0=Insert, 1=Delete, 2=Update)
 const WAL_VERSION: u8 = 128;
+/// Version 129: Arrow IPC format - embeds schema, handles all Arrow types automatically
+const WAL_VERSION_IPC: u8 = 129;
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 /// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
 const MAX_BATCH_SIZE: usize = 100 * 1024 * 1024;
@@ -112,6 +116,7 @@ struct CompactBatch {
     columns: Vec<CompactColumn>,
 }
 
+#[allow(dead_code)] // Kept for legacy WAL v128 test coverage
 impl CompactColumn {
     fn from_array(array: &dyn Array) -> Self {
         let data = array.to_data();
@@ -382,8 +387,11 @@ impl WalManager {
     }
 
     pub fn deserialize_batch(data: &[u8], table_name: &str) -> Result<RecordBatch, WalError> {
-        let schema = get_schema(table_name).map(|s| s.schema_ref()).unwrap_or_else(|| get_default_schema().schema_ref());
-        deserialize_record_batch(data, &schema)
+        // Try IPC first (v129+), fall back to legacy CompactBatch (v128)
+        deserialize_record_batch_ipc(data).or_else(|_| {
+            let schema = get_schema(table_name).map(|s| s.schema_ref()).unwrap_or_else(|| get_default_schema().schema_ref());
+            deserialize_record_batch_legacy(data, &schema)
+        })
     }
 
     pub fn list_topics(&self) -> Result<Vec<String>, WalError> {
@@ -417,36 +425,44 @@ impl WalManager {
 }
 
 fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
-    let compact = CompactBatch {
-        num_rows: batch.num_rows(),
-        columns: batch.columns().iter().map(|c| CompactColumn::from_array(c.as_ref())).collect(),
-    };
-    bincode::encode_to_vec(&compact, BINCODE_CONFIG).map_err(WalError::BincodeEncode)
+    let mut buf = Vec::new();
+    let options = IpcWriteOptions::default();
+    let mut writer = StreamWriter::try_new_with_options(&mut buf, &batch.schema(), options)?;
+    writer.write(batch)?;
+    writer.finish()?;
+    drop(writer);
+    Ok(buf)
 }
 
-fn deserialize_record_batch(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
+fn deserialize_record_batch_ipc(data: &[u8]) -> Result<RecordBatch, WalError> {
     if data.len() > MAX_BATCH_SIZE {
-        return Err(WalError::BatchTooLarge {
-            size: data.len(),
-            max: MAX_BATCH_SIZE,
-        });
+        return Err(WalError::BatchTooLarge { size: data.len(), max: MAX_BATCH_SIZE });
     }
+    let reader = StreamReader::try_new(std::io::Cursor::new(data), None)?;
+    for batch in reader {
+        return Ok(batch?);
+    }
+    Err(WalError::EmptyBatch)
+}
 
+/// Legacy CompactBatch deserialization for WAL version 128
+fn deserialize_record_batch_legacy(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
+    if data.len() > MAX_BATCH_SIZE {
+        return Err(WalError::BatchTooLarge { size: data.len(), max: MAX_BATCH_SIZE });
+    }
     let (compact, _): (CompactBatch, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
-
     let arrays: Result<Vec<ArrayRef>, WalError> = compact
         .columns
         .iter()
         .zip(schema.fields())
         .map(|(col, field)| Ok(make_array(col.to_array_data(field.data_type(), compact.num_rows)?)))
         .collect();
-
     RecordBatch::try_new(schema.clone(), arrays?).map_err(WalError::ArrowIpc)
 }
 
 fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, WalError> {
     let mut buffer = WAL_MAGIC.to_vec();
-    buffer.push(WAL_VERSION);
+    buffer.push(WAL_VERSION_IPC);
     buffer.push(entry.operation as u8);
     buffer.extend(bincode::encode_to_vec(entry, BINCODE_CONFIG)?);
     Ok(buffer)
@@ -467,10 +483,10 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
             if data.len() < 6 {
                 return Err(WalError::TooShort { len: data.len() });
             }
-            if data[4] != WAL_VERSION {
+            if data[4] != WAL_VERSION && data[4] != WAL_VERSION_IPC {
                 return Err(WalError::UnsupportedVersion {
                     version: data[4],
-                    expected: WAL_VERSION,
+                    expected: WAL_VERSION_IPC,
                 });
             }
             WalOperation::try_from(data[5])?;
@@ -520,11 +536,25 @@ mod tests {
     }
 
     #[test]
-    fn test_record_batch_serialization() {
+    fn test_record_batch_ipc_serialization() {
+        let batch = create_test_batch();
+        let serialized = serialize_record_batch(&batch).unwrap();
+        let deserialized = deserialize_record_batch_ipc(&serialized).unwrap();
+        assert_eq!(batch.num_rows(), deserialized.num_rows());
+        assert_eq!(batch.num_columns(), deserialized.num_columns());
+    }
+
+    #[test]
+    fn test_record_batch_legacy_serialization() {
         let batch = create_test_batch();
         let schema = batch.schema();
-        let serialized = serialize_record_batch(&batch).unwrap();
-        let deserialized = deserialize_record_batch(&serialized, &schema).unwrap();
+        // Serialize using legacy CompactBatch format
+        let compact = CompactBatch {
+            num_rows: batch.num_rows(),
+            columns: batch.columns().iter().map(|c| CompactColumn::from_array(c.as_ref())).collect(),
+        };
+        let serialized = bincode::encode_to_vec(&compact, BINCODE_CONFIG).unwrap();
+        let deserialized = deserialize_record_batch_legacy(&serialized, &schema).unwrap();
         assert_eq!(batch.num_rows(), deserialized.num_rows());
         assert_eq!(batch.num_columns(), deserialized.num_columns());
     }

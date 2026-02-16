@@ -119,6 +119,9 @@ const_default!(d_checkpoint_interval: u64 = 10);
 const_default!(d_optimize_target: i64 = 128 * 1024 * 1024);
 const_default!(d_stats_cache_size: usize = 50);
 const_default!(d_vacuum_retention: u64 = 72);
+const_default!(d_optimize_window_hours: u64 = 48);
+const_default!(d_compact_min_files: usize = 5);
+const_default!(d_light_optimize_target: i64 = 16 * 1024 * 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 const_default!(d_vacuum_schedule: String = "0 0 2 * * *");
@@ -377,6 +380,12 @@ pub struct ParquetConfig {
 pub struct MaintenanceConfig {
     #[serde(default = "d_vacuum_retention")]
     pub timefusion_vacuum_retention_hours: u64,
+    #[serde(default = "d_optimize_window_hours")]
+    pub timefusion_optimize_window_hours: u64,
+    #[serde(default = "d_compact_min_files")]
+    pub timefusion_compact_min_files: usize,
+    #[serde(default = "d_light_optimize_target")]
+    pub timefusion_light_optimize_target_size: i64,
     #[serde(default = "d_light_schedule")]
     pub timefusion_light_optimize_schedule: String,
     #[serde(default = "d_optimize_schedule")]
