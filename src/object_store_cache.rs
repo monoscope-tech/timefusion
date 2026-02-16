@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::field::Empty;
 use tracing::{Instrument, debug, info, instrument};
 
-use foyer::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder};
+use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, PsyncIoEngineConfig};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
@@ -243,9 +243,9 @@ impl SharedFoyerCache {
             .with_shards(config.shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
             .storage()
-            .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
+            .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
-                BlockEngineBuilder::new(FsDeviceBuilder::new(&config.cache_dir).with_capacity(config.disk_size_bytes).build()?)
+                BlockEngineConfig::new(FsDeviceBuilder::new(&config.cache_dir).with_capacity(config.disk_size_bytes).build()?)
                     .with_block_size(config.file_size_bytes),
             )
             .build()
@@ -257,9 +257,9 @@ impl SharedFoyerCache {
             .with_shards(config.metadata_shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
             .storage()
-            .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
+            .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
-                BlockEngineBuilder::new(FsDeviceBuilder::new(&metadata_cache_dir).with_capacity(config.metadata_disk_size_bytes).build()?)
+                BlockEngineConfig::new(FsDeviceBuilder::new(&metadata_cache_dir).with_capacity(config.metadata_disk_size_bytes).build()?)
                     .with_block_size(config.file_size_bytes),
             )
             .build()
