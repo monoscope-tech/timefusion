@@ -92,6 +92,11 @@ scopeguard = "1.2.0"
 rand = "0.9.2"
 tempfile = "3"
 test-case = "3.3"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "core_benchmarks"
+harness = false
 
 [features]
 default = []

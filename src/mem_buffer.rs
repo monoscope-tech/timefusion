@@ -10,8 +10,9 @@ use datafusion::physical_expr::execution_props::ExecutionProps;
 use datafusion::sql::planner::SqlToRel;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser as SqlParser;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tracing::{debug, info, instrument, warn};
 
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
@@ -19,6 +20,7 @@ use tracing::{debug, info, instrument, warn};
 // Note: Timestamps before 1970 (negative microseconds) produce negative bucket IDs,
 // which is supported but may result in unexpected ordering if mixed with post-1970 data.
 const BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000;
+
 
 /// Check if two schemas are compatible for merge.
 /// Compatible means: all existing fields must be present in incoming schema with same type,
@@ -123,7 +125,7 @@ pub struct TableBuffer {
 }
 
 pub struct TimeBucket {
-    batches: RwLock<Vec<RecordBatch>>,
+    batches: Mutex<Vec<RecordBatch>>,
     row_count: AtomicUsize,
     memory_bytes: AtomicUsize,
     min_timestamp: AtomicI64,
@@ -388,9 +390,14 @@ impl MemBuffer {
                 if !bucket_overlaps_range(bucket, &ts_range) {
                     continue;
                 }
-                if let Ok(batches) = bucket.batches.read() {
-                    results.extend(batches.iter().cloned());
+                let mut batches = bucket.batches.lock();
+                if batches.len() > 1 {
+                    if let Ok(single) = arrow::compute::concat_batches(&table.schema, &*batches) {
+                        batches.clear();
+                        batches.push(single);
+                    }
                 }
+                results.extend(batches.iter().cloned());
             }
         }
 
@@ -413,10 +420,17 @@ impl MemBuffer {
             for bucket_id in bucket_ids {
                 if let Some(bucket) = table.buckets.get(&bucket_id)
                     && bucket_overlaps_range(&bucket, &ts_range)
-                    && let Ok(batches) = bucket.batches.read()
-                    && !batches.is_empty()
                 {
-                    partitions.push(batches.clone());
+                    let mut batches = bucket.batches.lock();
+                    if !batches.is_empty() {
+                        if batches.len() > 1 {
+                            if let Ok(single) = arrow::compute::concat_batches(&table.schema, &*batches) {
+                                batches.clear();
+                                batches.push(single);
+                            }
+                        }
+                        partitions.push(batches.clone());
+                    }
                 }
             }
         }
@@ -469,17 +483,12 @@ impl MemBuffer {
         {
             let freed_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
             self.estimated_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
-            if let Ok(batches) = bucket.batches.into_inner() {
-                debug!(
-                    "MemBuffer drain: project={}, table={}, bucket={}, batches={}, freed_bytes={}",
-                    project_id,
-                    table_name,
-                    bucket_id,
-                    batches.len(),
-                    freed_bytes
-                );
-                return Some(batches);
-            }
+            let batches = bucket.batches.into_inner();
+            debug!(
+                "MemBuffer drain: project={}, table={}, bucket={}, batches={}, freed_bytes={}",
+                project_id, table_name, bucket_id, batches.len(), freed_bytes
+            );
+            return Some(batches);
         }
         None
     }
@@ -501,23 +510,22 @@ impl MemBuffer {
             let table = table_entry.value();
             for bucket in table.buckets.iter() {
                 let bucket_id = *bucket.key();
-                if filter(bucket_id)
-                    && let Ok(batches) = bucket.batches.read()
-                    && !batches.is_empty()
-                {
-                    // Compact multiple small batches into one before flush
-                    let compacted = if batches.len() > 1 {
-                        arrow::compute::concat_batches(&table.schema, &*batches).map_or_else(|_| batches.clone(), |single| vec![single])
-                    } else {
-                        batches.clone()
-                    };
-                    result.push(FlushableBucket {
-                        project_id: project_id.to_string(),
-                        table_name: table_name.to_string(),
-                        bucket_id,
-                        batches: compacted,
-                        row_count: bucket.row_count.load(Ordering::Relaxed),
-                    });
+                if filter(bucket_id) {
+                    let batches = bucket.batches.lock();
+                    if !batches.is_empty() {
+                        let compacted = if batches.len() > 1 {
+                            arrow::compute::concat_batches(&table.schema, &*batches).map_or_else(|_| batches.clone(), |single| vec![single])
+                        } else {
+                            batches.clone()
+                        };
+                        result.push(FlushableBucket {
+                            project_id: project_id.to_string(),
+                            table_name: table_name.to_string(),
+                            bucket_id,
+                            batches: compacted,
+                            row_count: bucket.row_count.load(Ordering::Relaxed),
+                        });
+                    }
                 }
             }
         }
@@ -580,7 +588,7 @@ impl MemBuffer {
 
         for mut bucket_entry in table.buckets.iter_mut() {
             let bucket = bucket_entry.value_mut();
-            let mut batches = bucket.batches.write().map_err(|e| datafusion::error::DataFusionError::Execution(format!("Lock error: {}", e)))?;
+            let mut batches = bucket.batches.lock();
 
             let mut new_batches = Vec::with_capacity(batches.len());
             for batch in batches.drain(..) {
@@ -662,7 +670,7 @@ impl MemBuffer {
 
         for mut bucket_entry in table.buckets.iter_mut() {
             let bucket = bucket_entry.value_mut();
-            let mut batches = bucket.batches.write().map_err(|e| datafusion::error::DataFusionError::Execution(format!("Lock error: {}", e)))?;
+            let mut batches = bucket.batches.lock();
 
             let old_memory: usize = batches.iter().map(|b| estimate_batch_size(b)).sum();
             let new_batches: Vec<RecordBatch> = batches
@@ -762,7 +770,7 @@ impl MemBuffer {
             total_buckets += table.buckets.len();
             for bucket in table.buckets.iter() {
                 total_rows += bucket.row_count.load(Ordering::Relaxed);
-                total_batches += bucket.batches.read().map(|b| b.len()).unwrap_or(0);
+                total_batches += bucket.batches.lock().len();
             }
         }
         MemBufferStats {
@@ -814,10 +822,7 @@ impl TableBuffer {
 
         let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
-        {
-            let mut batches = bucket.batches.write().map_err(|e| anyhow::anyhow!("Failed to acquire write lock on bucket: {}", e))?;
-            batches.push(batch);
-        }
+        bucket.batches.lock().push(batch);
 
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
         bucket.memory_bytes.fetch_add(batch_size, Ordering::Relaxed);
@@ -834,7 +839,7 @@ impl TableBuffer {
 impl TimeBucket {
     fn new() -> Self {
         Self {
-            batches: RwLock::new(Vec::new()),
+            batches: Mutex::new(Vec::new()),
             row_count: AtomicUsize::new(0),
             memory_bytes: AtomicUsize::new(0),
             min_timestamp: AtomicI64::new(i64::MAX),
@@ -1084,7 +1089,8 @@ mod tests {
         }
 
         let results = buffer.query("project1", "table1", &[]).unwrap();
-        assert_eq!(results.len(), 10, "All 10 inserts should succeed");
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 10, "All 10 inserts should succeed");
     }
 
     #[test]

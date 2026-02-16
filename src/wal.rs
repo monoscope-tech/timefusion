@@ -3,7 +3,6 @@ use arrow::array::{Array, ArrayRef, RecordBatch, make_array};
 use arrow::buffer::{Buffer, NullBuffer};
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow_ipc::reader::StreamReader;
-use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
 use bincode::{Decode, Encode};
 use dashmap::DashSet;
 use std::path::PathBuf;
@@ -116,7 +115,6 @@ struct CompactBatch {
     columns: Vec<CompactColumn>,
 }
 
-#[allow(dead_code)] // Kept for legacy WAL v128 test coverage
 impl CompactColumn {
     fn from_array(array: &dyn Array) -> Self {
         let data = array.to_data();
@@ -387,11 +385,9 @@ impl WalManager {
     }
 
     pub fn deserialize_batch(data: &[u8], table_name: &str) -> Result<RecordBatch, WalError> {
-        // Try IPC first (v129+), fall back to legacy CompactBatch (v128)
-        deserialize_record_batch_ipc(data).or_else(|_| {
-            let schema = get_schema(table_name).map(|s| s.schema_ref()).unwrap_or_else(|| get_default_schema().schema_ref());
-            deserialize_record_batch_legacy(data, &schema)
-        })
+        let schema = get_schema(table_name).map(|s| s.schema_ref()).unwrap_or_else(|| get_default_schema().schema_ref());
+        // Try CompactBatch (v128) first, fall back to IPC (v129) for backward compat
+        deserialize_record_batch(data, &schema).or_else(|_| deserialize_record_batch_ipc(data))
     }
 
     pub fn list_topics(&self) -> Result<Vec<String>, WalError> {
@@ -422,16 +418,31 @@ impl WalManager {
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
     }
+
+    /// Returns WAL file count and total size in bytes by scanning the data directory.
+    pub fn wal_stats(&self) -> (usize, u64) {
+        let mut file_count = 0usize;
+        let mut total_bytes = 0u64;
+        if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        file_count += 1;
+                        total_bytes += meta.len();
+                    }
+                }
+            }
+        }
+        (file_count, total_bytes)
+    }
 }
 
 fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
-    let mut buf = Vec::new();
-    let options = IpcWriteOptions::default();
-    let mut writer = StreamWriter::try_new_with_options(&mut buf, &batch.schema(), options)?;
-    writer.write(batch)?;
-    writer.finish()?;
-    drop(writer);
-    Ok(buf)
+    let compact = CompactBatch {
+        num_rows: batch.num_rows(),
+        columns: batch.columns().iter().map(|c| CompactColumn::from_array(c.as_ref())).collect(),
+    };
+    bincode::encode_to_vec(&compact, BINCODE_CONFIG).map_err(WalError::BincodeEncode)
 }
 
 fn deserialize_record_batch_ipc(data: &[u8]) -> Result<RecordBatch, WalError> {
@@ -446,7 +457,7 @@ fn deserialize_record_batch_ipc(data: &[u8]) -> Result<RecordBatch, WalError> {
 }
 
 /// Legacy CompactBatch deserialization for WAL version 128
-fn deserialize_record_batch_legacy(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
+fn deserialize_record_batch(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
     if data.len() > MAX_BATCH_SIZE {
         return Err(WalError::BatchTooLarge { size: data.len(), max: MAX_BATCH_SIZE });
     }
@@ -462,7 +473,7 @@ fn deserialize_record_batch_legacy(data: &[u8], schema: &SchemaRef) -> Result<Re
 
 fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, WalError> {
     let mut buffer = WAL_MAGIC.to_vec();
-    buffer.push(WAL_VERSION_IPC);
+    buffer.push(WAL_VERSION);
     buffer.push(entry.operation as u8);
     buffer.extend(bincode::encode_to_vec(entry, BINCODE_CONFIG)?);
     Ok(buffer)
@@ -536,25 +547,11 @@ mod tests {
     }
 
     #[test]
-    fn test_record_batch_ipc_serialization() {
-        let batch = create_test_batch();
-        let serialized = serialize_record_batch(&batch).unwrap();
-        let deserialized = deserialize_record_batch_ipc(&serialized).unwrap();
-        assert_eq!(batch.num_rows(), deserialized.num_rows());
-        assert_eq!(batch.num_columns(), deserialized.num_columns());
-    }
-
-    #[test]
-    fn test_record_batch_legacy_serialization() {
+    fn test_record_batch_serialization() {
         let batch = create_test_batch();
         let schema = batch.schema();
-        // Serialize using legacy CompactBatch format
-        let compact = CompactBatch {
-            num_rows: batch.num_rows(),
-            columns: batch.columns().iter().map(|c| CompactColumn::from_array(c.as_ref())).collect(),
-        };
-        let serialized = bincode::encode_to_vec(&compact, BINCODE_CONFIG).unwrap();
-        let deserialized = deserialize_record_batch_legacy(&serialized, &schema).unwrap();
+        let serialized = serialize_record_batch(&batch).unwrap();
+        let deserialized = deserialize_record_batch(&serialized, &schema).unwrap();
         assert_eq!(batch.num_rows(), deserialized.num_rows());
         assert_eq!(batch.num_columns(), deserialized.num_columns());
     }
