@@ -14,8 +14,9 @@ RUN apt-get update && \
 # Copy Cargo manifests and cache dependencies
 COPY Cargo.toml Cargo.lock ./
 
-# Create a dummy main file to allow dependency caching
-RUN mkdir src && echo "fn main() {}" > src/main.rs
+# Create dummy files to allow dependency caching
+RUN mkdir src && echo "fn main() {}" > src/main.rs && \
+    mkdir benches && echo "fn main() {}" > benches/core_benchmarks.rs
 
 # Build a dummy release binary (to cache dependencies)
 RUN cargo build --release
