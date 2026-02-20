@@ -482,36 +482,42 @@ impl Database {
     }
 
     /// Creates standard writer properties used across different operations
-    fn create_writer_properties(&self, sorting_columns: Vec<SortingColumn>) -> WriterProperties {
-        use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
+    fn create_writer_properties(&self, sorting_columns: Vec<SortingColumn>, fields: &[crate::schema_loader::FieldDef]) -> WriterProperties {
+        use deltalake::datafusion::parquet::basic::{Compression, Encoding, ZstdLevel};
         use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
+        use deltalake::datafusion::parquet::schema::types::ColumnPath;
 
         let page_row_count_limit = self.config.parquet.timefusion_page_row_count_limit;
         let compression_level = self.config.parquet.timefusion_zstd_compression_level;
         let max_row_group_size = self.config.parquet.timefusion_max_row_group_size;
 
-        WriterProperties::builder()
-            // Use ZSTD compression with high level for maximum compression ratio
+        let mut builder = WriterProperties::builder()
             .set_compression(Compression::ZSTD(
                 ZstdLevel::try_new(compression_level).unwrap_or_else(|_| ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()),
             ))
-            // Set max row group size for better compression and query performance
             .set_max_row_group_size(max_row_group_size)
-            // Enable dictionary encoding for better compression of repetitive values
             .set_dictionary_enabled(true)
-            // Dictionary page size - 8MB allows larger dictionaries for better compression
-            .set_dictionary_page_size_limit(8388608) // 8MB
-            // Enable statistics for better query optimization
+            .set_dictionary_page_size_limit(8388608)
             .set_statistics_enabled(EnabledStatistics::Page)
-            // Enable bloom filters for predicate pushdown (read-side already enabled)
             .set_bloom_filter_enabled(!self.config.parquet.timefusion_bloom_filter_disabled)
             .set_bloom_filter_fpp(0.01)
             .set_bloom_filter_ndv(100_000)
-            // Set page row count limit for better compression
             .set_data_page_row_count_limit(page_row_count_limit)
-            // Set sorting columns for better query performance on sorted data
-            .set_sorting_columns(if sorting_columns.is_empty() { None } else { Some(sorting_columns) })
-            .build()
+            .set_sorting_columns(if sorting_columns.is_empty() { None } else { Some(sorting_columns) });
+
+        for field in fields {
+            let dt = field.data_type.as_str();
+            let col = ColumnPath::from(field.name.as_str());
+            if dt.starts_with("Timestamp") || dt == "Date32" {
+                builder = builder
+                    .set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED)
+                    .set_column_dictionary_enabled(col, false);
+            } else if matches!(dt, "Int32" | "Int64" | "UInt32" | "UInt64") {
+                builder = builder.set_column_encoding(col, Encoding::DELTA_BINARY_PACKED);
+            }
+        }
+
+        builder.build()
     }
 
     /// Updates a DeltaTable and handles errors consistently
@@ -977,7 +983,7 @@ impl Database {
 
         // Time-series optimized settings
         // Larger batch size for better throughput with time-series data
-        let _ = options.set("datafusion.execution.batch_size", "8192");
+        let _ = options.set("datafusion.execution.batch_size", "65536");
 
         // Optimize for sorted data (timestamps are typically sorted)
         let _ = options.set("datafusion.optimizer.prefer_existing_sort", "true");
@@ -998,7 +1004,7 @@ impl Database {
 
         // Memory management for large time-series queries
         let _ = options.set("datafusion.execution.coalesce_batches", "true");
-        let _ = options.set("datafusion.execution.coalesce_target_batch_size", "8192");
+        let _ = options.set("datafusion.execution.coalesce_target_batch_size", "65536");
 
         // Enable all optimizer rules for maximum optimization
         let _ = options.set("datafusion.optimizer.max_passes", "5");
@@ -1638,7 +1644,7 @@ impl Database {
         // Get the appropriate schema for this table
         let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
 
-        let writer_properties = self.create_writer_properties(schema.sorting_columns());
+        let writer_properties = self.create_writer_properties(schema.sorting_columns(), &schema.fields);
 
         // Retry logic for concurrent writes
         let max_retries = 5;
@@ -1758,7 +1764,7 @@ impl Database {
         info!("Optimizing files from {} date partitions", partition_filters.len());
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let writer_properties = self.create_writer_properties(schema.sorting_columns());
+        let writer_properties = self.create_writer_properties(schema.sorting_columns(), &schema.fields);
 
         let optimize_result = table_clone
             .optimize()
@@ -1819,7 +1825,7 @@ impl Database {
             .with_filters(&partition_filters)
             .with_type(deltalake::operations::optimize::OptimizeType::Compact)
             .with_target_size(target_size as u64)
-            .with_writer_properties(self.create_writer_properties(schema.sorting_columns()))
+            .with_writer_properties(self.create_writer_properties(schema.sorting_columns(), &schema.fields))
             .with_min_commit_interval(tokio::time::Duration::from_secs(30))
             .await;
 
