@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use datafusion::{
-    common::{Result, tree_node::{Transformed, TreeNode}},
-    config::ConfigOptions,
-    logical_expr::{
-        DmlStatement, Expr, LogicalPlan, Projection, Values, WriteOp,
-        expr::ScalarFunction,
+    common::{
+        Result,
+        tree_node::{Transformed, TreeNode},
     },
+    config::ConfigOptions,
+    logical_expr::{DmlStatement, Expr, LogicalPlan, Projection, Values, WriteOp, expr::ScalarFunction},
     optimizer::AnalyzerRule,
     scalar::ScalarValue,
 };
@@ -51,10 +51,7 @@ fn rewrite_insert_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             .enumerate()
             .filter(|(_, input_field)| {
                 // Look up the target column by name and check if it's Variant
-                target_schema
-                    .column_with_name(input_field.name())
-                    .map(|(_, f)| is_variant_type(f.data_type()))
-                    .unwrap_or(false)
+                target_schema.column_with_name(input_field.name()).map(|(_, f)| is_variant_type(f.data_type())).unwrap_or(false)
             })
             .map(|(i, _)| i)
             .collect();

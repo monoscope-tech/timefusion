@@ -189,10 +189,12 @@ mod integration {
         assert_eq!(total, 6);
 
         // Verify we can query specific columns (SELECT * fails due to Variant column encoding)
-        let row = client.query_one(
-            "SELECT id, name, status_code, level FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1",
-            &[&"test_project"]
-        ).await?;
+        let row = client
+            .query_one(
+                "SELECT id, name, status_code, level FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1",
+                &[&"test_project"],
+            )
+            .await?;
         assert_eq!(row.columns().len(), 4);
 
         Ok(())

@@ -38,7 +38,6 @@ fn minio_flush_config(name: &str) -> Arc<AppConfig> {
     Arc::new(cfg)
 }
 
-
 fn is_minio_available() -> bool {
     std::net::TcpStream::connect("127.0.0.1:9000").is_ok()
 }
@@ -79,11 +78,10 @@ async fn setup_s3_bench(name: &str) -> (SessionContext, Arc<Database>, String) {
 
     let db_for_cb = Database::with_config(Arc::clone(&cfg)).await.unwrap();
     let db_clone = db_for_cb.clone();
-    let delta_cb: timefusion::buffered_write_layer::DeltaWriteCallback =
-        Arc::new(move |project_id, table_name, batches| {
-            let db = db_clone.clone();
-            Box::pin(async move { db.insert_records_batch(&project_id, &table_name, batches, true).await })
-        });
+    let delta_cb: timefusion::buffered_write_layer::DeltaWriteCallback = Arc::new(move |project_id, table_name, batches| {
+        let db = db_clone.clone();
+        Box::pin(async move { db.insert_records_batch(&project_id, &table_name, batches, true).await })
+    });
     let layer = Arc::new(BufferedWriteLayer::with_config(Arc::clone(&cfg)).unwrap().with_delta_writer(delta_cb));
     let db = db_for_cb.with_buffered_layer(Arc::clone(&layer));
 
@@ -179,7 +177,8 @@ fn bench_inmemory_writes(c: &mut Criterion) {
                     futures::future::join_all(sqls.iter().map(|s| {
                         let (ctx, s) = (ctx.clone(), s.clone());
                         async move { ctx.sql(&s).await.unwrap().collect().await.unwrap() }
-                    })).await;
+                    }))
+                    .await;
                 }
             })
         });
@@ -205,9 +204,7 @@ fn bench_reads(c: &mut Criterion) {
     let (ctx, _db, pid) = rt.block_on(setup_read_bench("read", 1000));
 
     group.bench_function("sql_select_count", |b| {
-        let (ctx, sql) = (ctx.clone(), format!(
-            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{pid}'"
-        ));
+        let (ctx, sql) = (ctx.clone(), format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{pid}'"));
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }
@@ -215,9 +212,10 @@ fn bench_reads(c: &mut Criterion) {
     });
 
     group.bench_function("sql_select_filter_level", |b| {
-        let (ctx, sql) = (ctx.clone(), format!(
-            "SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{pid}' AND level = 'ERROR'"
-        ));
+        let (ctx, sql) = (
+            ctx.clone(),
+            format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{pid}' AND level = 'ERROR'"),
+        );
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }
@@ -226,9 +224,10 @@ fn bench_reads(c: &mut Criterion) {
 
     group.bench_function("sql_select_time_range", |b| {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        let (ctx, sql) = (ctx.clone(), format!(
-            "SELECT id, name, timestamp FROM otel_logs_and_spans WHERE project_id = '{pid}' AND timestamp <= TIMESTAMP '{now}' LIMIT 100"
-        ));
+        let (ctx, sql) = (
+            ctx.clone(),
+            format!("SELECT id, name, timestamp FROM otel_logs_and_spans WHERE project_id = '{pid}' AND timestamp <= TIMESTAMP '{now}' LIMIT 100"),
+        );
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }
@@ -236,9 +235,10 @@ fn bench_reads(c: &mut Criterion) {
     });
 
     group.bench_function("sql_select_aggregation", |b| {
-        let (ctx, sql) = (ctx.clone(), format!(
-            "SELECT level, COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{pid}' GROUP BY level"
-        ));
+        let (ctx, sql) = (
+            ctx.clone(),
+            format!("SELECT level, COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{pid}' GROUP BY level"),
+        );
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }
@@ -297,9 +297,7 @@ fn bench_s3_reads(c: &mut Criterion) {
     rt.block_on(async { ctx.sql(&insert).await.unwrap().collect().await.unwrap() });
 
     group.bench_function("s3_select_count", |b| {
-        let (ctx, sql) = (ctx.clone(), format!(
-            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{pid}'"
-        ));
+        let (ctx, sql) = (ctx.clone(), format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{pid}'"));
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }
@@ -307,9 +305,10 @@ fn bench_s3_reads(c: &mut Criterion) {
     });
 
     group.bench_function("s3_select_filter", |b| {
-        let (ctx, sql) = (ctx.clone(), format!(
-            "SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{pid}' AND level = 'INFO'"
-        ));
+        let (ctx, sql) = (
+            ctx.clone(),
+            format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{pid}' AND level = 'INFO'"),
+        );
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }
@@ -318,9 +317,10 @@ fn bench_s3_reads(c: &mut Criterion) {
 
     group.bench_function("s3_select_time_range", |b| {
         let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        let (ctx, sql) = (ctx.clone(), format!(
-            "SELECT id, name, timestamp FROM otel_logs_and_spans WHERE project_id = '{pid}' AND timestamp <= TIMESTAMP '{now}' LIMIT 100"
-        ));
+        let (ctx, sql) = (
+            ctx.clone(),
+            format!("SELECT id, name, timestamp FROM otel_logs_and_spans WHERE project_id = '{pid}' AND timestamp <= TIMESTAMP '{now}' LIMIT 100"),
+        );
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }

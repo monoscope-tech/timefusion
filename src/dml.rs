@@ -240,7 +240,9 @@ impl DmlOperation {
 }
 
 impl DmlExec {
-    fn new(op_type: DmlOperation, table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>) -> Self {
+    fn new(
+        op_type: DmlOperation, table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>,
+    ) -> Self {
         let properties = PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(input.schema()),
             datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
@@ -357,9 +359,21 @@ impl ExecutionPlan for DmlExec {
         let future = async move {
             let result = match op_type {
                 DmlOperation::Update => {
-                    perform_update_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, assignments, session, &span).await
+                    perform_update_with_buffer(
+                        &database,
+                        buffered_layer.as_ref(),
+                        &table_name,
+                        &project_id,
+                        predicate,
+                        assignments,
+                        session,
+                        &span,
+                    )
+                    .await
                 }
-                DmlOperation::Delete => perform_delete_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, session, &span).await,
+                DmlOperation::Delete => {
+                    perform_delete_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, session, &span).await
+                }
             };
 
             if let Ok(rows) = &result {
@@ -406,8 +420,7 @@ impl<'a> DmlContext<'a> {
         let has_committed = {
             let custom_tables = self.database.custom_project_tables().read().await;
             let unified_tables = self.database.unified_tables().read().await;
-            custom_tables.contains_key(&(self.project_id.to_string(), self.table_name.to_string()))
-                || unified_tables.contains_key(self.table_name)
+            custom_tables.contains_key(&(self.project_id.to_string(), self.table_name.to_string())) || unified_tables.contains_key(self.table_name)
         };
 
         if has_committed {
@@ -470,8 +483,7 @@ async fn perform_delete_with_buffer(
     )
 )]
 pub async fn perform_delta_update(
-    database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>,
-    session: Arc<dyn Session>,
+    database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>, session: Arc<dyn Session>,
 ) -> Result<u64> {
     info!("Performing Delta UPDATE on table {} for project {}", table_name, project_id);
 
@@ -551,7 +563,10 @@ where
 
     let mut delta_table = table_lock.write().await;
     // Refresh snapshot so DML sees the latest committed version
-    delta_table.update_state().await.map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
+    delta_table
+        .update_state()
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
     let (new_table, rows_affected) = operation(delta_table.clone()).await?;
 
     drop(delta_table);

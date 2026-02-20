@@ -11,8 +11,8 @@ use datafusion::sql::planner::SqlToRel;
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser as SqlParser;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use tracing::{debug, info, instrument, warn};
 
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
@@ -20,7 +20,6 @@ use tracing::{debug, info, instrument, warn};
 // Note: Timestamps before 1970 (negative microseconds) produce negative bucket IDs,
 // which is supported but may result in unexpected ordering if mixed with post-1970 data.
 const BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000;
-
 
 /// Check if two schemas are compatible for merge.
 /// Compatible means: all existing fields must be present in incoming schema with same type,
@@ -486,7 +485,11 @@ impl MemBuffer {
             let batches = bucket.batches.into_inner();
             debug!(
                 "MemBuffer drain: project={}, table={}, bucket={}, batches={}, freed_bytes={}",
-                project_id, table_name, bucket_id, batches.len(), freed_bytes
+                project_id,
+                table_name,
+                bucket_id,
+                batches.len(),
+                freed_bytes
             );
             return Some(batches);
         }

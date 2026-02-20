@@ -7,18 +7,18 @@ use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::arrow::array::Array;
-use datafusion::common::not_impl_err;
 use datafusion::common::Statistics;
+use datafusion::common::not_impl_err;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::{CastExpr, Column as PhysicalColumn};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::DisplayAs;
-use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::{ExecutionPlanProperties, PlanProperties};
 use datafusion::physical_plan::execution_plan::Boundedness;
+use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{ExecutionPlanProperties, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     catalog::Session,
@@ -176,9 +176,7 @@ pub fn variant_columns_to_json(batch: RecordBatch, real_schema: &SchemaRef) -> D
 
     // Iterate over batch columns (which may be projected) and look up by name in real schema
     for (idx, batch_field) in batch_schema.fields().iter().enumerate() {
-        let is_variant = real_schema
-            .column_with_name(batch_field.name())
-            .is_some_and(|(_, f)| is_variant_type(f.data_type()));
+        let is_variant = real_schema.column_with_name(batch_field.name()).is_some_and(|(_, f)| is_variant_type(f.data_type()));
         if !is_variant {
             continue;
         }
@@ -203,8 +201,7 @@ fn variant_struct_to_json(arr: &datafusion::arrow::array::StructArray) -> DFResu
     use parquet_variant_compute::VariantArray;
     use parquet_variant_json::VariantToJson;
 
-    let variant_arr = VariantArray::try_new(arr)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to create VariantArray: {}", e)))?;
+    let variant_arr = VariantArray::try_new(arr).map_err(|e| DataFusionError::Execution(format!("Failed to create VariantArray: {}", e)))?;
 
     let mut builder = StringBuilder::new();
     for i in 0..variant_arr.len() {
@@ -212,8 +209,7 @@ fn variant_struct_to_json(arr: &datafusion::arrow::array::StructArray) -> DFResu
             builder.append_null();
         } else {
             let variant = variant_arr.value(i);
-            let json = variant.to_json_string()
-                .map_err(|e| DataFusionError::Execution(format!("Failed to convert variant to JSON: {}", e)))?;
+            let json = variant.to_json_string().map_err(|e| DataFusionError::Execution(format!("Failed to convert variant to JSON: {}", e)))?;
             builder.append_value(&json);
         }
     }
@@ -238,14 +234,8 @@ impl VariantToJsonExec {
             .fields()
             .iter()
             .map(|f| {
-                let is_variant = real_schema
-                    .column_with_name(f.name())
-                    .is_some_and(|(_, rf)| is_variant_type(rf.data_type()));
-                if is_variant {
-                    Arc::new(Field::new(f.name(), DataType::Utf8, f.is_nullable()))
-                } else {
-                    f.clone()
-                }
+                let is_variant = real_schema.column_with_name(f.name()).is_some_and(|(_, rf)| is_variant_type(rf.data_type()));
+                if is_variant { Arc::new(Field::new(f.name(), DataType::Utf8, f.is_nullable())) } else { f.clone() }
             })
             .collect();
         let output_schema = Arc::new(Schema::new(output_fields));
@@ -255,7 +245,12 @@ impl VariantToJsonExec {
             input.pipeline_behavior(),
             Boundedness::Bounded,
         );
-        Self { input, real_schema, output_schema, properties }
+        Self {
+            input,
+            real_schema,
+            output_schema,
+            properties,
+        }
     }
 }
 
@@ -266,10 +261,18 @@ impl DisplayAs for VariantToJsonExec {
 }
 
 impl ExecutionPlan for VariantToJsonExec {
-    fn name(&self) -> &str { "VariantToJsonExec" }
-    fn as_any(&self) -> &dyn Any { self }
-    fn properties(&self) -> &PlanProperties { &self.properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
+    fn name(&self) -> &str {
+        "VariantToJsonExec"
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
 
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(VariantToJsonExec::new(children[0].clone(), self.real_schema.clone())))
@@ -280,9 +283,7 @@ impl ExecutionPlan for VariantToJsonExec {
         let real_schema = self.real_schema.clone();
         let output_schema = self.output_schema.clone();
 
-        let converted_stream = input_stream.map(move |batch_result| {
-            batch_result.and_then(|batch| variant_columns_to_json(batch, &real_schema))
-        });
+        let converted_stream = input_stream.map(move |batch_result| batch_result.and_then(|batch| variant_columns_to_json(batch, &real_schema)));
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, converted_stream)))
     }
@@ -362,7 +363,11 @@ impl VariantConversionExec {
             input.pipeline_behavior(),
             Boundedness::Bounded,
         );
-        Self { input, target_schema, properties }
+        Self {
+            input,
+            target_schema,
+            properties,
+        }
     }
 }
 
@@ -397,9 +402,7 @@ impl ExecutionPlan for VariantConversionExec {
         let input_stream = self.input.execute(partition, context)?;
         let target_schema = self.target_schema.clone();
 
-        let converted_stream = input_stream.map(move |batch_result| {
-            batch_result.and_then(|batch| convert_variant_columns(batch, &target_schema))
-        });
+        let converted_stream = input_stream.map(move |batch_result| batch_result.and_then(|batch| convert_variant_columns(batch, &target_schema)));
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(self.target_schema.clone(), converted_stream)))
     }
@@ -466,8 +469,7 @@ impl Database {
 
     /// Perform a Delta table DELETE operation
     pub async fn perform_delta_delete(
-        &self, table_name: &str, project_id: &str, predicate: Option<datafusion::logical_expr::Expr>,
-        session: Arc<dyn datafusion::catalog::Session>,
+        &self, table_name: &str, project_id: &str, predicate: Option<datafusion::logical_expr::Expr>, session: Arc<dyn datafusion::catalog::Session>,
     ) -> Result<u64, DataFusionError> {
         crate::dml::perform_delta_delete(self, table_name, project_id, predicate, session).await
     }
@@ -509,9 +511,7 @@ impl Database {
             let dt = field.data_type.as_str();
             let col = ColumnPath::from(field.name.as_str());
             if dt.starts_with("Timestamp") || dt == "Date32" {
-                builder = builder
-                    .set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED)
-                    .set_column_dictionary_enabled(col, false);
+                builder = builder.set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED).set_column_dictionary_enabled(col, false);
             } else if matches!(dt, "Int32" | "Int64" | "UInt32" | "UInt64") {
                 builder = builder.set_column_encoding(col, Encoding::DELTA_BINARY_PACKED);
             }
@@ -860,7 +860,10 @@ impl Database {
                         }
                         // Vacuum custom project tables
                         for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                            info!("Vacuuming custom project '{}' table '{}' (retention: {}h)", project_id, table_name, retention_hours);
+                            info!(
+                                "Vacuuming custom project '{}' table '{}' (retention: {}h)",
+                                project_id, table_name, retention_hours
+                            );
                             db.vacuum_table(table, retention_hours).await;
                         }
                     })
@@ -1345,7 +1348,8 @@ impl Database {
 
         // Get custom storage config for this project
         let configs = self.storage_configs.read().await;
-        let config = configs.get(&(project_id.to_string(), table_name.to_string()))
+        let config = configs
+            .get(&(project_id.to_string(), table_name.to_string()))
             .ok_or_else(|| anyhow::anyhow!("No storage config found for project '{}' table '{}'", project_id, table_name))?
             .clone();
         drop(configs);
@@ -1354,7 +1358,10 @@ impl Database {
             "s3://{}/{}/?endpoint={}",
             config.s3_bucket,
             config.s3_prefix,
-            config.s3_endpoint.as_ref().unwrap_or(&self.default_s3_endpoint.clone().unwrap_or_else(|| "https://s3.amazonaws.com".to_string()))
+            config
+                .s3_endpoint
+                .as_ref()
+                .unwrap_or(&self.default_s3_endpoint.clone().unwrap_or_else(|| "https://s3.amazonaws.com".to_string()))
         );
 
         let mut storage_options = HashMap::new();
@@ -1385,7 +1392,10 @@ impl Database {
             }
         }
 
-        info!("Creating or loading custom table for project '{}' table '{}' at: {}", project_id, table_name, storage_uri);
+        info!(
+            "Creating or loading custom table for project '{}' table '{}' at: {}",
+            project_id, table_name, storage_uri
+        );
 
         // Hold write lock during table creation
         let mut tables = self.custom_project_tables.write().await;
@@ -1398,7 +1408,12 @@ impl Database {
         let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
         let table_arc = Arc::new(RwLock::new(table));
         tables.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
-        info!("Cached custom table for project '{}' table '{}', cache now contains {} entries", project_id, table_name, tables.len());
+        info!(
+            "Cached custom table for project '{}' table '{}', cache now contains {} entries",
+            project_id,
+            table_name,
+            tables.len()
+        );
 
         Ok(table_arc)
     }
@@ -1491,7 +1506,7 @@ impl Database {
     /// Create an object store for the given URI and storage options
     async fn create_object_store(&self, storage_uri: &str, storage_options: &HashMap<String, String>) -> Result<Arc<dyn object_store::ObjectStore>> {
         use object_store::aws::AmazonS3Builder;
-        use object_store::{ClientOptions, RetryConfig, BackoffConfig};
+        use object_store::{BackoffConfig, ClientOptions, RetryConfig};
         use std::time::Duration;
 
         // Parse the S3 URI to extract bucket and prefix
@@ -1510,15 +1525,10 @@ impl Database {
         };
 
         // Configure HTTP client with reasonable timeouts
-        let client_options = ClientOptions::new()
-            .with_connect_timeout(Duration::from_secs(30))
-            .with_timeout(Duration::from_secs(300));
+        let client_options = ClientOptions::new().with_connect_timeout(Duration::from_secs(30)).with_timeout(Duration::from_secs(300));
 
         // Build S3 configuration
-        let mut builder = AmazonS3Builder::new()
-            .with_bucket_name(bucket)
-            .with_retry(retry_config)
-            .with_client_options(client_options);
+        let mut builder = AmazonS3Builder::new().with_bucket_name(bucket).with_retry(retry_config).with_client_options(client_options);
 
         // Apply storage options
         if let Some(access_key) = storage_options.get("AWS_ACCESS_KEY_ID") {
@@ -1783,13 +1793,21 @@ impl Database {
             Ok((new_table, metrics)) => {
                 let min_files = self.config.maintenance.timefusion_compact_min_files;
                 if metrics.total_considered_files < min_files {
-                    debug!("Skipping optimization commit: {} files < min threshold {}", metrics.total_considered_files, min_files);
+                    debug!(
+                        "Skipping optimization commit: {} files < min threshold {}",
+                        metrics.total_considered_files, min_files
+                    );
                     return Ok(());
                 }
                 let duration = start_time.elapsed();
                 info!(
                     "Optimization completed in {:?}: {} files removed, {} files added, {} partitions optimized, {} total files considered, {} files skipped",
-                    duration, metrics.num_files_removed, metrics.num_files_added, metrics.partitions_optimized, metrics.total_considered_files, metrics.total_files_skipped
+                    duration,
+                    metrics.num_files_removed,
+                    metrics.num_files_added,
+                    metrics.partitions_optimized,
+                    metrics.total_considered_files,
+                    metrics.total_files_skipped
                 );
                 if metrics.num_files_removed > 0 {
                     let compression_ratio = metrics.num_files_removed as f64 / metrics.num_files_added as f64;
@@ -1833,11 +1851,17 @@ impl Database {
             Ok((new_table, metrics)) => {
                 let min_files = self.config.maintenance.timefusion_compact_min_files;
                 if metrics.total_considered_files < min_files {
-                    debug!("Skipping light optimization commit: {} files < min threshold {}", metrics.total_considered_files, min_files);
+                    debug!(
+                        "Skipping light optimization commit: {} files < min threshold {}",
+                        metrics.total_considered_files, min_files
+                    );
                     return Ok(());
                 }
                 let duration = start_time.elapsed();
-                info!("Light optimization completed in {:?}: {} files removed, {} files added", duration, metrics.num_files_removed, metrics.num_files_added);
+                info!(
+                    "Light optimization completed in {:?}: {} files removed, {} files added",
+                    duration, metrics.num_files_removed, metrics.num_files_added
+                );
                 let mut table = table_ref.write().await;
                 *table = new_table;
                 Ok(())
@@ -2431,7 +2455,11 @@ impl TableProvider for ProjectRoutingTable {
 
         let has_variant_columns = self.real_schema().fields().iter().any(|f| is_variant_type(f.data_type()));
         let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> {
-            if has_variant_columns { Ok(Arc::new(VariantToJsonExec::new(plan, self.real_schema()))) } else { Ok(plan) }
+            if has_variant_columns {
+                Ok(Arc::new(VariantToJsonExec::new(plan, self.real_schema())))
+            } else {
+                Ok(plan)
+            }
         };
 
         // Check if buffered layer is configured
