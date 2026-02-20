@@ -447,7 +447,10 @@ fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
 
 fn deserialize_record_batch_ipc(data: &[u8]) -> Result<RecordBatch, WalError> {
     if data.len() > MAX_BATCH_SIZE {
-        return Err(WalError::BatchTooLarge { size: data.len(), max: MAX_BATCH_SIZE });
+        return Err(WalError::BatchTooLarge {
+            size: data.len(),
+            max: MAX_BATCH_SIZE,
+        });
     }
     let reader = StreamReader::try_new(std::io::Cursor::new(data), None)?;
     for batch in reader {
@@ -459,7 +462,10 @@ fn deserialize_record_batch_ipc(data: &[u8]) -> Result<RecordBatch, WalError> {
 /// Legacy CompactBatch deserialization for WAL version 128
 fn deserialize_record_batch(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
     if data.len() > MAX_BATCH_SIZE {
-        return Err(WalError::BatchTooLarge { size: data.len(), max: MAX_BATCH_SIZE });
+        return Err(WalError::BatchTooLarge {
+            size: data.len(),
+            max: MAX_BATCH_SIZE,
+        });
     }
     let (compact, _): (CompactBatch, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
     let arrays: Result<Vec<ArrayRef>, WalError> = compact

@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use datafusion::{
-    common::{DFSchema, Result, tree_node::{Transformed, TreeNode}},
+    common::{
+        DFSchema, Result,
+        tree_node::{Transformed, TreeNode},
+    },
     config::ConfigOptions,
     logical_expr::{Expr, ExprSchemable, LogicalPlan, Projection, expr::ScalarFunction},
     optimizer::AnalyzerRule,
@@ -32,18 +35,24 @@ fn rewrite_select_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         let variant_to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonUdf::default()));
         let mut modified = false;
 
-        let new_exprs: Vec<Expr> = proj.expr.iter().map(|expr| {
-            if is_variant_expr(expr, input_schema) {
-                modified = true;
-                wrap_with_variant_to_json(expr, &variant_to_json)
-            } else {
-                expr.clone()
-            }
-        }).collect();
+        let new_exprs: Vec<Expr> = proj
+            .expr
+            .iter()
+            .map(|expr| {
+                if is_variant_expr(expr, input_schema) {
+                    modified = true;
+                    wrap_with_variant_to_json(expr, &variant_to_json)
+                } else {
+                    expr.clone()
+                }
+            })
+            .collect();
 
         if modified {
-            debug!("VariantSelectRewriter: Wrapped {} Variant columns with variant_to_json()",
-                new_exprs.iter().filter(|e| matches!(e, Expr::ScalarFunction(_))).count());
+            debug!(
+                "VariantSelectRewriter: Wrapped {} Variant columns with variant_to_json()",
+                new_exprs.iter().filter(|e| matches!(e, Expr::ScalarFunction(_))).count()
+            );
             return Ok(Transformed::yes(LogicalPlan::Projection(Projection::try_new(new_exprs, proj.input.clone())?)));
         }
     }
