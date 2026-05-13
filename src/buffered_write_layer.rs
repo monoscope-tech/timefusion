@@ -97,6 +97,13 @@ impl BufferedWriteLayer {
         self.config.buffer.max_memory_mb() * 1024 * 1024
     }
 
+    /// MemBuffer fill ratio (0..=100). Used by ingress to emit soft
+    /// backpressure before hitting the hard reservation limit.
+    pub fn pressure_pct(&self) -> u32 {
+        let max = self.max_memory_bytes().max(1);
+        ((self.effective_memory_bytes() as u128 * 100 / max as u128).min(100)) as u32
+    }
+
     /// Total effective memory including reserved bytes for in-flight writes.
     fn effective_memory_bytes(&self) -> usize {
         self.mem_buffer.estimated_memory_bytes() + self.reserved_bytes.load(Ordering::Acquire)
@@ -648,6 +655,24 @@ mod tests {
             let results = layer.query(&project, &table, &[]).unwrap();
             assert!(!results.is_empty(), "Expected results after WAL recovery");
         }
+    }
+
+    #[tokio::test]
+    async fn test_pressure_pct() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("p{}", test_id);
+        let table = format!("t{}", test_id);
+
+        let layer = BufferedWriteLayer::with_config(cfg).unwrap();
+        assert_eq!(layer.pressure_pct(), 0, "empty layer should report 0%");
+
+        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+        let pct = layer.pressure_pct();
+        assert!(pct <= 100, "pressure must be bounded 0..=100, got {pct}");
+        // Tiny batch on 4GB default budget — should be effectively 0%.
+        assert!(pct < 5, "expected ~0% after tiny insert, got {pct}");
     }
 
     #[tokio::test]

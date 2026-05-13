@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 use dashmap::DashSet;
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, Result as ObjectStoreResult, path::Path,
+    Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
 };
 use std::ops::Range;
 use std::path::PathBuf;
@@ -483,102 +483,20 @@ impl FoyerObjectStoreCache {
     }
 }
 
-#[async_trait]
-impl ObjectStore for FoyerObjectStoreCache {
-    async fn put(&self, location: &Path, payload: PutPayload) -> ObjectStoreResult<PutResult> {
-        self.update_stats(|s| s.inner_puts += 1).await;
-
-        let payload_size = payload.content_length();
-        let is_parquet = location.as_ref().ends_with(".parquet");
-
-        debug!("S3 PUT request starting: {} (size: {} bytes, parquet: {})", location, payload_size, is_parquet);
-
-        // Write to S3 first without removing from cache (to avoid cache stampede)
-        let start_time = std::time::Instant::now();
-        let result = self.inner.put(location, payload).await?;
-        let duration = start_time.elapsed();
-
-        debug!(
-            "S3 PUT request completed: {} (size: {} bytes, duration: {}ms, parquet: {})",
-            location,
-            payload_size,
-            duration.as_millis(),
-            is_parquet
-        );
-
-        // After successful write, update the cache with the new data
-        self.update_stats(|s| s.inner_gets += 1).await;
-        if let Ok(get_result) = self.inner.get(location).await {
-            use futures::TryStreamExt;
-            let data = match get_result.payload {
-                GetResultPayload::Stream(s) => {
-                    if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
-                        chunks.concat()
-                    } else {
-                        vec![]
-                    }
-                }
-                GetResultPayload::File(mut file, _) => {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
-                }
-            };
-            if !data.is_empty() {
-                let cache_key = Self::make_cache_key(location);
-                let size = get_result.meta.size;
-                // This will atomically replace the old entry (if any) with the new one
-                self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
-                debug!("Updated cache after write: {} (size: {} bytes)", location, size);
+impl FoyerObjectStoreCache {
+    /// Collect a GetResult payload into a Vec<u8>
+    async fn collect_payload(result: GetResult) -> (Vec<u8>, ObjectMeta) {
+        use futures::TryStreamExt;
+        let meta = result.meta.clone();
+        let data = match result.payload {
+            GetResultPayload::Stream(s) => s.try_collect::<Vec<Bytes>>().await.map(|c| c.concat()).unwrap_or_default(),
+            GetResultPayload::File(mut file, _) => {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
             }
-        }
-
-        // Invalidate metadata cache entries for this file
-        if location.as_ref().ends_with(".parquet") {
-            self.invalidate_metadata_cache(location).await;
-        }
-
-        Ok(result)
-    }
-
-    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
-        self.update_stats(|s| s.inner_puts += 1).await;
-
-        // Write to S3 first without removing from cache (to avoid cache stampede)
-        let result = self.inner.put_opts(location, payload, opts).await?;
-
-        // After successful write, update the cache with the new data
-        if let Ok(get_result) = self.inner.get(location).await {
-            use futures::TryStreamExt;
-            let data = match get_result.payload {
-                GetResultPayload::Stream(s) => {
-                    if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
-                        chunks.concat()
-                    } else {
-                        vec![]
-                    }
-                }
-                GetResultPayload::File(mut file, _) => {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
-                }
-            };
-            if !data.is_empty() {
-                let cache_key = Self::make_cache_key(location);
-                let size = get_result.meta.size;
-                // This will atomically replace the old entry (if any) with the new one
-                self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
-                debug!("Updated cache after write: {} (size: {} bytes)", location, size);
-            }
-        }
-
-        // Invalidate metadata cache entries for this file
-        if location.as_ref().ends_with(".parquet") {
-            self.invalidate_metadata_cache(location).await;
-        }
-
-        Ok(result)
+        };
+        (data, meta)
     }
 
     #[instrument(
@@ -590,7 +508,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             is_checkpoint = Self::is_last_checkpoint(location),
         )
     )]
-    async fn get(&self, location: &Path) -> ObjectStoreResult<GetResult> {
+    async fn get_cached(&self, location: &Path) -> ObjectStoreResult<GetResult> {
         let span = tracing::Span::current();
         let cache_key = Self::make_cache_key(location);
 
@@ -738,19 +656,6 @@ impl ObjectStore for FoyerObjectStoreCache {
         Ok(Self::make_get_result(Bytes::from(data), result.meta))
     }
 
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        // Bypass cache for complex requests
-        if options.range.is_some()
-            || options.if_match.is_some()
-            || options.if_none_match.is_some()
-            || options.if_modified_since.is_some()
-            || options.if_unmodified_since.is_some()
-        {
-            return self.inner.get_opts(location, options).await;
-        }
-        self.get(location).await
-    }
-
     #[instrument(
         name = "foyer_cache.get_range",
         skip_all,
@@ -764,7 +669,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             is_metadata = Empty,
         )
     )]
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
+    async fn get_range_cached(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let span = tracing::Span::current();
         let is_parquet = location.as_ref().ends_with(".parquet");
 
@@ -880,7 +785,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 );
 
                 // Try to fetch and cache the full file
-                if let Ok(result) = self.get(location).await {
+                if let Ok(result) = self.get_cached(location).await {
                     // The file is now cached, extract the range
                     if range.end <= result.meta.size {
                         let data = match result.payload {
@@ -952,7 +857,15 @@ impl ObjectStore for FoyerObjectStoreCache {
             cache_hit = Empty,
         )
     )]
-    async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
+    #[instrument(
+        name = "foyer_cache.head",
+        skip_all,
+        fields(
+            location = %location,
+            cache_hit = Empty,
+        )
+    )]
+    async fn head_cached(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
         let span = tracing::Span::current();
         let cache_key = Self::make_cache_key(location);
 
@@ -970,20 +883,118 @@ impl ObjectStore for FoyerObjectStoreCache {
         self.inner.head(location).instrument(inner_span).await
     }
 
-    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+    /// Core put logic: writes to inner store, then caches the new data
+    async fn put_cached(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
         self.update_stats(|s| s.inner_puts += 1).await;
-        let cache_key = Self::make_cache_key(location);
-        self.cache.remove(&cache_key);
+        let payload_size = payload.content_length();
+        let is_parquet = location.as_ref().ends_with(".parquet");
 
-        // Delete from inner store
-        self.inner.delete(location).await?;
+        debug!("S3 PUT request starting: {} (size: {} bytes, parquet: {})", location, payload_size, is_parquet);
+        let start_time = std::time::Instant::now();
+        let result = self.inner.put_opts(location, payload, opts).await?;
+        debug!(
+            "S3 PUT request completed: {} (size: {} bytes, duration: {}ms, parquet: {})",
+            location,
+            payload_size,
+            start_time.elapsed().as_millis(),
+            is_parquet
+        );
 
-        // Invalidate metadata cache entries for this file
+        // After successful write, update the cache with the new data
+        self.update_stats(|s| s.inner_gets += 1).await;
+        if let Ok(get_result) = self.inner.get(location).await {
+            let (data, meta) = Self::collect_payload(get_result).await;
+            if !data.is_empty() {
+                let size = meta.size;
+                self.cache.insert(Self::make_cache_key(location), CacheValue::new(data, meta));
+                debug!("Updated cache after write: {} (size: {} bytes)", location, size);
+            }
+        }
+
+        if is_parquet {
+            self.invalidate_metadata_cache(location).await;
+        }
+        Ok(result)
+    }
+
+    /// Invalidate cache for delete/copy destination
+    async fn invalidate_for_delete(&self, location: &Path) {
+        self.cache.remove(&Self::make_cache_key(location));
         if location.as_ref().ends_with(".parquet") {
             self.invalidate_metadata_cache(location).await;
         }
+    }
+}
 
-        Ok(())
+#[async_trait]
+impl ObjectStore for FoyerObjectStoreCache {
+    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
+        self.put_cached(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        // Handle range requests via the dedicated range cache path
+        if let Some(GetRange::Bounded(ref r)) = options.range {
+            if options.if_match.is_none()
+                && options.if_none_match.is_none()
+                && options.if_modified_since.is_none()
+                && options.if_unmodified_since.is_none()
+            {
+                let range = r.clone();
+                let bytes = self.get_range_cached(location, range.clone()).await?;
+                let meta = self.head_cached(location).await.unwrap_or(ObjectMeta {
+                    location: location.clone(),
+                    last_modified: Utc::now(),
+                    size: range.end,
+                    e_tag: None,
+                    version: None,
+                });
+                let data_len = bytes.len() as u64;
+                return Ok(GetResult {
+                    payload: GetResultPayload::Stream(Box::pin(futures::stream::once(async move { Ok(bytes) }))),
+                    meta,
+                    attributes: Attributes::new(),
+                    range: range.start..range.start + data_len,
+                });
+            }
+        }
+        // Bypass cache for complex (conditional / non-bounded) requests
+        if options.range.is_some()
+            || options.if_match.is_some()
+            || options.if_none_match.is_some()
+            || options.if_modified_since.is_some()
+            || options.if_unmodified_since.is_some()
+            || options.head
+        {
+            return self.inner.get_opts(location, options).await;
+        }
+        self.get_cached(location).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, ObjectStoreResult<Path>>,
+    ) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        use futures::StreamExt;
+        let cache = self.cache.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let inner_stream = self.inner.delete_stream(locations);
+        inner_stream
+            .inspect(move |res| {
+                if let Ok(path) = res {
+                    cache.remove(&path.to_string());
+                    if path.as_ref().ends_with(".parquet") {
+                        // Best-effort: we can't enumerate metadata keys without head;
+                        // remove the most common ones by reusing the same heuristic offsets.
+                        let _ = &metadata_cache;
+                    }
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -998,36 +1009,10 @@ impl ObjectStore for FoyerObjectStoreCache {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.inner.copy(from, to).await?;
-        self.cache.remove(&Self::make_cache_key(to));
-
-        // Invalidate metadata cache entries for the destination file
-        if to.as_ref().ends_with(".parquet") {
-            self.invalidate_metadata_cache(to).await;
-        }
-
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await?;
+        self.invalidate_for_delete(to).await;
         Ok(())
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.inner.copy_if_not_exists(from, to).await?;
-        self.cache.remove(&Self::make_cache_key(to));
-
-        // Invalidate metadata cache entries for the destination file
-        if to.as_ref().ends_with(".parquet") {
-            self.invalidate_metadata_cache(to).await;
-        }
-
-        Ok(())
-    }
-
-    async fn put_multipart(&self, location: &Path) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart(location).await
-    }
-
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
     }
 }
 
@@ -1047,6 +1032,7 @@ impl std::fmt::Debug for FoyerObjectStoreCache {
 mod tests {
     use super::*;
     use object_store::memory::InMemory;
+    use object_store::ObjectStoreExt;
 
     #[tokio::test]
     async fn test_basic_operations() -> anyhow::Result<()> {

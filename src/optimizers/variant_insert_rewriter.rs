@@ -83,22 +83,15 @@ fn rewrite_insert_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     Ok(Transformed::no(plan))
 }
 
+/// Rewrite only the immediate child of the Dml node. `variant_indices` are
+/// positions in `dml.input.schema()` (i.e. target table order) — they're only
+/// valid for that single plan. Recursing into nested projections with the same
+/// indices would mis-wrap unrelated columns whose positions happen to align.
 fn rewrite_input_for_variant(input: &LogicalPlan, variant_indices: &[usize]) -> Result<Option<LogicalPlan>> {
     match input {
         LogicalPlan::Values(values) => rewrite_values_for_variant(values, variant_indices),
         LogicalPlan::Projection(proj) => rewrite_projection_for_variant(proj, variant_indices),
-        _ => {
-            if let Some(child) = input.inputs().first() {
-                if let Some(new_child) = rewrite_input_for_variant(child, variant_indices)? {
-                    let new_inputs = vec![new_child];
-                    Ok(Some(input.with_new_exprs(input.expressions(), new_inputs)?))
-                } else {
-                    Ok(None)
-                }
-            } else {
-                Ok(None)
-            }
-        }
+        _ => Ok(None),
     }
 }
 
@@ -153,22 +146,19 @@ fn rewrite_projection_for_variant(proj: &Projection, variant_indices: &[usize]) 
         .collect();
 
     if modified {
-        let new_input = rewrite_input_for_variant(&proj.input, variant_indices)?;
-        let input = new_input.map(Arc::new).unwrap_or_else(|| proj.input.clone());
-        Ok(Some(LogicalPlan::Projection(Projection::try_new(new_exprs, input)?)))
+        Ok(Some(LogicalPlan::Projection(Projection::try_new(new_exprs, proj.input.clone())?)))
     } else {
-        let new_input = rewrite_input_for_variant(&proj.input, variant_indices)?;
-        if let Some(new_input) = new_input {
-            Ok(Some(LogicalPlan::Projection(Projection::try_new(proj.expr.clone(), Arc::new(new_input))?)))
-        } else {
-            Ok(None)
-        }
+        Ok(None)
     }
 }
 
 fn is_utf8_expr(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(ScalarValue::Utf8(_), _) | Expr::Literal(ScalarValue::Utf8View(_), _) | Expr::Literal(ScalarValue::LargeUtf8(_), _) => true,
+        // Only non-null Utf8 literals should be wrapped with json_to_variant.
+        // NULL literals must pass through (otherwise json_to_variant tries to parse "" and fails).
+        Expr::Literal(ScalarValue::Utf8(Some(_)), _)
+        | Expr::Literal(ScalarValue::Utf8View(Some(_)), _)
+        | Expr::Literal(ScalarValue::LargeUtf8(Some(_)), _) => true,
         Expr::Cast(cast) => is_utf8_expr(&cast.expr),
         _ => false,
     }

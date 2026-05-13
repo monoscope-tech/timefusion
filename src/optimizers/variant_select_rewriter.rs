@@ -25,6 +25,11 @@ impl AnalyzerRule for VariantSelectRewriter {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        // Only wrap Variant outputs for read paths. INSERT/UPDATE/DELETE plans contain projections
+        // whose outputs are written to Delta (Variant struct expected), not returned to pgwire.
+        if matches!(plan, LogicalPlan::Dml(_)) {
+            return Ok(plan);
+        }
         plan.transform_up(rewrite_select_node).map(|t| t.data)
     }
 }

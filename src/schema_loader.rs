@@ -104,12 +104,12 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8View, true))),
         "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
-        // Variant Binary Encoding: Struct with metadata and value binary fields
-        // Using BinaryView for compatibility with datafusion-variant/parquet-variant-compute
+        // Variant Binary Encoding: must use Binary (not BinaryView) to match
+        // delta_kernel's unshredded_variant() representation.
         "Variant" => ArrowDataType::Struct(
             vec![
-                Arc::new(Field::new("metadata", ArrowDataType::BinaryView, false)),
-                Arc::new(Field::new("value", ArrowDataType::BinaryView, false)),
+                Arc::new(Field::new("metadata", ArrowDataType::Binary, false)),
+                Arc::new(Field::new("value", ArrowDataType::Binary, false)),
             ]
             .into(),
         ),
@@ -191,25 +191,34 @@ pub fn get_default_schema() -> &'static TableSchema {
     registry().get_default().expect("No schemas available in registry")
 }
 
-/// Returns true if the given Arrow DataType represents a Variant type (Struct with metadata + value BinaryView fields)
+/// Returns true if the given Arrow DataType structurally matches a Variant
+/// (Struct with `metadata` + `value` binary/binaryview fields).
 pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
     match data_type {
         ArrowDataType::Struct(fields) if fields.len() == 2 => {
-            fields.iter().any(|f| f.name() == "metadata" && matches!(f.data_type(), ArrowDataType::BinaryView))
-                && fields.iter().any(|f| f.name() == "value" && matches!(f.data_type(), ArrowDataType::BinaryView))
+            fields.iter().any(|f| f.name() == "metadata" && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
+                && fields.iter().any(|f| f.name() == "value" && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
         }
         _ => false,
     }
 }
 
-/// Get indices of Variant columns in a schema
-pub fn get_variant_column_indices(schema: &SchemaRef) -> Vec<usize> {
-    schema.fields().iter().enumerate().filter(|(_, f)| is_variant_type(f.data_type())).map(|(i, _)| i).collect()
-}
-
-/// Create an INSERT-compatible schema where Variant columns are presented as Utf8View.
-/// This allows INSERT statements with JSON strings to pass DataFusion's type validation.
-/// The actual conversion from Utf8View to Variant happens in VariantConversionExec during write.
+/// Replaces Variant fields with Utf8View on a schema. This is the schema we hand to the
+/// SQL planner via `TableProvider::schema()` whenever the table contains Variant columns.
+///
+/// Background: `INSERT INTO t (v) VALUES ('{"a":1}')` fails inside
+/// `LogicalPlanBuilder::values` because `arrow_cast::can_cast_types(Utf8, Struct{Binary,Binary})`
+/// is false. The check is hardcoded in datafusion-expr; there is no extension hook to
+/// register a Utf8→Variant coercion (datafusion exposes `ExprPlanner` for binary ops,
+/// field access, etc., but not for the values-type check). Patching arrow-cast or
+/// datafusion-expr is the only "fundamental" fix and is out of scope.
+///
+/// So we keep two views of the schema:
+/// - SQL-facing view (this function): Utf8View for variant cols → planner accepts JSON literals.
+/// - Storage view (`real_schema()`): the actual Struct{Binary, Binary} variant type.
+///
+/// `DataSink::write_all` converts inbound Utf8/Utf8View → Variant struct (via
+/// `parquet_variant_compute::VariantArrayBuilder`) before the Delta write.
 pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
     let new_fields: Vec<FieldRef> = schema
         .fields()
@@ -224,3 +233,4 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
         .collect();
     Arc::new(Schema::new(new_fields))
 }
+

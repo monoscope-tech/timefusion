@@ -1,5 +1,5 @@
 use anyhow::Result;
-use delta_kernel::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
