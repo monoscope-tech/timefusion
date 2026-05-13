@@ -1,7 +1,7 @@
 use futures::TryStreamExt;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;

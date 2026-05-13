@@ -98,6 +98,19 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Start gRPC ingestion server alongside PGWire
+    let grpc_port = cfg.core.grpc_port;
+    let grpc_token = cfg.core.grpc_token.clone();
+    let db_for_grpc = Arc::clone(&db);
+    let grpc_task = tokio::spawn(async move {
+        let addr = format!("0.0.0.0:{grpc_port}").parse().expect("valid grpc addr");
+        info!("Starting gRPC ingestion server on port: {}", grpc_port);
+        let svc = timefusion::grpc_handlers::IngestService::new(db_for_grpc, grpc_token).into_server();
+        if let Err(e) = tonic::transport::Server::builder().add_service(svc).serve(addr).await {
+            error!("gRPC server error: {}", e);
+        }
+    });
+
     // Store references for shutdown
     let db_for_shutdown = db.clone();
     let buffered_layer_for_shutdown = Arc::clone(&buffered_layer);
@@ -105,6 +118,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Wait for shutdown signal
     tokio::select! {
         _ = pg_task => {error!("PGWire server task failed")},
+        _ = grpc_task => {error!("gRPC server task failed")},
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, initiating shutdown");
 

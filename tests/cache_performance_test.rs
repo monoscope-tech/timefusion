@@ -1,6 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
-use object_store::{ObjectStore, PutPayload, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path};
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;

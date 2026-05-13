@@ -15,7 +15,7 @@ use tracing::{debug, info};
 pub struct CachedStatistics {
     pub stats: Statistics,
     pub timestamp: std::time::Instant,
-    pub version: i64,
+    pub version: u64,
 }
 
 /// Simplified statistics extractor for Delta Lake tables
@@ -46,7 +46,7 @@ impl DeltaStatisticsExtractor {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.peek(&cache_key) {
                 let elapsed = cached.timestamp.elapsed().as_secs();
-                let current_version = table.version().unwrap_or(-1);
+                let current_version = table.version().unwrap_or(0);
 
                 if elapsed < self.cache_ttl_seconds && cached.version == current_version {
                     debug!("Statistics cache hit for {} (version {})", cache_key, current_version);

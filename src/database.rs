@@ -3,7 +3,7 @@ use crate::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedF
 use crate::schema_loader::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type};
 use crate::statistics::DeltaStatisticsExtractor;
 use anyhow::Result;
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use chrono::Utc;
 use datafusion::arrow::array::Array;
@@ -15,10 +15,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::{CastExpr, Column as PhysicalColumn};
 use datafusion::physical_plan::DisplayAs;
-use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{ExecutionPlanProperties, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use datafusion::{
     catalog::Session,
@@ -30,7 +27,7 @@ use datafusion::{
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_functions_json;
-use delta_kernel::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::RecordBatch;
 use deltalake::PartitionFilter;
 use deltalake::datafusion::parquet::file::metadata::SortingColumn;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
@@ -84,327 +81,167 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     })
 }
 
-/// Convert string columns to Variant binary format where the target schema expects Variant type.
-/// This enables automatic JSON string → Variant conversion during INSERT.
-pub fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
-    use datafusion::arrow::array::{ArrayRef, LargeStringArray, StringArray, StringViewArray};
+/// Convert Utf8/Utf8View/LargeUtf8 columns to Variant binary StructArrays where the target
+/// schema expects Variant. Called from `DataSink::write_all` so that INSERT statements (where
+/// the table provider presents Variant cols as Utf8View for the SQL planner's type check) can
+/// land their JSON-string values in the underlying Delta storage which expects Variant structs.
+fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
+    use datafusion::arrow::array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray, StructArray};
+    use datafusion::arrow::compute::cast;
     use datafusion::arrow::datatypes::{DataType, Field};
+    use parquet_variant_compute::VariantArrayBuilder;
+    use parquet_variant_json::JsonToVariant;
 
     let batch_schema = batch.schema();
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
     let mut new_fields: Vec<Arc<Field>> = batch_schema.fields().iter().cloned().collect();
 
+    let utf8_to_variant = |iter: Box<dyn Iterator<Item = Option<&str>> + '_>| -> DFResult<StructArray> {
+        let items: Vec<_> = iter.collect();
+        let mut builder = VariantArrayBuilder::new(items.len());
+        for (idx, item) in items.into_iter().enumerate() {
+            match item {
+                Some(s) => builder
+                    .append_json(s)
+                    .map_err(|e| DataFusionError::Execution(format!("Invalid JSON at row {idx}: {e} (value: '{s}')")))?,
+                None => builder.append_null(),
+            }
+        }
+        // VariantArrayBuilder emits BinaryView; delta_kernel's unshredded_variant() expects Binary.
+        let arr: StructArray = builder.build().into();
+        let metadata = cast(arr.column(0), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let value = cast(arr.column(1), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let fields = vec![
+            Arc::new(Field::new("metadata", DataType::Binary, false)),
+            Arc::new(Field::new("value", DataType::Binary, false)),
+        ];
+        Ok(StructArray::new(fields.into(), vec![metadata, value], arr.nulls().cloned()))
+    };
+
     for (idx, target_field) in target_schema.fields().iter().enumerate() {
-        if !is_variant_type(target_field.data_type()) {
+        if !is_variant_type(target_field.data_type()) || idx >= columns.len() {
             continue;
         }
-        if idx >= columns.len() {
-            debug!("Column index {} exceeds batch length {}, skipping", idx, columns.len());
-            continue;
-        }
-
         let col = &columns[idx];
-        let col_type = col.data_type();
-
-        // Only convert if source is a string type and target is Variant
-        let converted: Option<ArrayRef> =
-            match col_type {
-                DataType::Utf8View => {
-                    let arr = col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| {
-                        DataFusionError::Execution(format!("Expected StringViewArray for field '{}' but downcast failed", target_field.name()))
-                    })?;
-                    Some(Arc::new(json_strings_to_variant(arr.iter())?))
-                }
-                DataType::Utf8 => {
-                    let arr = col
-                        .as_any()
-                        .downcast_ref::<StringArray>()
-                        .ok_or_else(|| DataFusionError::Execution(format!("Expected StringArray for field '{}' but downcast failed", target_field.name())))?;
-                    Some(Arc::new(json_strings_to_variant(arr.iter())?))
-                }
-                DataType::LargeUtf8 => {
-                    let arr = col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| {
-                        DataFusionError::Execution(format!("Expected LargeStringArray for field '{}' but downcast failed", target_field.name()))
-                    })?;
-                    Some(Arc::new(json_strings_to_variant(arr.iter())?))
-                }
-                _ => None, // Already Variant or other type, skip
-            };
-
-        if let Some(variant_array) = converted {
-            columns[idx] = variant_array;
+        let converted: Option<ArrayRef> = match col.data_type() {
+            DataType::Utf8View => Some(Arc::new(utf8_to_variant(Box::new(
+                col.as_any().downcast_ref::<StringViewArray>().unwrap().iter(),
+            ))?) as ArrayRef),
+            DataType::Utf8 => Some(Arc::new(utf8_to_variant(Box::new(
+                col.as_any().downcast_ref::<StringArray>().unwrap().iter(),
+            ))?) as ArrayRef),
+            DataType::LargeUtf8 => Some(Arc::new(utf8_to_variant(Box::new(
+                col.as_any().downcast_ref::<LargeStringArray>().unwrap().iter(),
+            ))?) as ArrayRef),
+            _ => None, // already Variant struct
+        };
+        if let Some(arr) = converted {
+            columns[idx] = arr;
             new_fields[idx] = target_field.clone();
         }
     }
 
-    let new_schema = Arc::new(Schema::new(new_fields));
+    let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
     RecordBatch::try_new(new_schema, columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-/// Convert an iterator of optional JSON strings to a Variant StructArray.
-/// Fails fast on invalid JSON to ensure data integrity.
-fn json_strings_to_variant<'a>(iter: impl Iterator<Item = Option<&'a str>>) -> DFResult<datafusion::arrow::array::StructArray> {
-    use parquet_variant_compute::VariantArrayBuilder;
-    use parquet_variant_json::JsonToVariant;
-
-    let items: Vec<_> = iter.collect();
-    let mut builder = VariantArrayBuilder::new(items.len());
-
-    for (row_idx, item) in items.into_iter().enumerate() {
-        match item {
-            Some(json_str) => builder
-                .append_json(json_str)
-                .map_err(|e| DataFusionError::Execution(format!("Invalid JSON at row {}: {} (value: '{}')", row_idx, e, json_str)))?,
-            None => builder.append_null(),
-        }
-    }
-
-    Ok(builder.build().into())
-}
-
-/// Convert Variant columns to JSON strings for SELECT output.
-/// This enables pgwire to properly encode Variant data as JSON text.
-pub fn variant_columns_to_json(batch: RecordBatch, real_schema: &SchemaRef) -> DFResult<RecordBatch> {
-    use datafusion::arrow::array::{ArrayRef, StructArray};
-    use datafusion::arrow::datatypes::{DataType, Field};
-    use datafusion::arrow::record_batch::RecordBatchOptions;
-
-    let batch_schema = batch.schema();
-    let row_count = batch.num_rows();
-    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-    let mut new_fields: Vec<Arc<Field>> = batch_schema.fields().iter().cloned().collect();
-
-    // Iterate over batch columns (which may be projected) and look up by name in real schema
-    for (idx, batch_field) in batch_schema.fields().iter().enumerate() {
-        let is_variant = real_schema.column_with_name(batch_field.name()).is_some_and(|(_, f)| is_variant_type(f.data_type()));
-        if !is_variant {
-            continue;
-        }
-
-        let col = &columns[idx];
-        if let Some(struct_arr) = col.as_any().downcast_ref::<StructArray>() {
-            let json_arr = variant_struct_to_json(struct_arr)?;
-            columns[idx] = Arc::new(json_arr);
-            new_fields[idx] = Arc::new(Field::new(batch_field.name(), DataType::Utf8, batch_field.is_nullable()));
-        }
-    }
-
-    let new_schema = Arc::new(Schema::new(new_fields));
-    // Use try_new_with_options to preserve row count for empty-column batches (e.g., COUNT(*) queries)
-    RecordBatch::try_new_with_options(new_schema, columns, &RecordBatchOptions::new().with_row_count(Some(row_count)))
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-}
-
-/// Convert a Variant StructArray to a StringArray of JSON values.
-fn variant_struct_to_json(arr: &datafusion::arrow::array::StructArray) -> DFResult<datafusion::arrow::array::StringArray> {
-    use datafusion::arrow::array::StringBuilder;
-    use parquet_variant_compute::VariantArray;
-    use parquet_variant_json::VariantToJson;
-
-    let variant_arr = VariantArray::try_new(arr).map_err(|e| DataFusionError::Execution(format!("Failed to create VariantArray: {}", e)))?;
-
-    let mut builder = StringBuilder::new();
-    for i in 0..variant_arr.len() {
-        if variant_arr.is_null(i) {
-            builder.append_null();
-        } else {
-            let variant = variant_arr.value(i);
-            let json = variant.to_json_string().map_err(|e| DataFusionError::Execution(format!("Failed to convert variant to JSON: {}", e)))?;
-            builder.append_value(&json);
-        }
-    }
-    Ok(builder.finish())
-}
-
-/// Custom execution plan that converts Variant columns to JSON strings for SELECT.
+/// Stream-level wrap that converts Variant columns to JSON strings for SELECT output.
+/// Used at the scan() boundary so downstream operators (Aggregate, Filter, etc.) see
+/// Utf8 instead of Struct{Binary,Binary} for Variant cols — needed for GROUP BY/HAVING
+/// over non-variant cols in tables that contain variant cols, since DataFusion's
+/// physical planning and delta-rs's kernel scan path otherwise mis-resolve adjacent
+/// columns whose names share the variant column's prefix (e.g. `resource___service___name`
+/// next to a `resource` variant column).
 #[derive(Debug)]
 struct VariantToJsonExec {
     input: Arc<dyn ExecutionPlan>,
     real_schema: SchemaRef,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<datafusion::physical_plan::PlanProperties>,
 }
 
 impl VariantToJsonExec {
     fn new(input: Arc<dyn ExecutionPlan>, real_schema: SchemaRef) -> Self {
         use datafusion::arrow::datatypes::{DataType, Field};
-        // Output schema: for each column in input, convert Variant to Utf8
+        use datafusion::physical_plan::{ExecutionPlanProperties, PlanProperties, execution_plan::Boundedness};
         let input_schema = input.schema();
         let output_fields: Vec<Arc<Field>> = input_schema
             .fields()
             .iter()
             .map(|f| {
-                let is_variant = real_schema.column_with_name(f.name()).is_some_and(|(_, rf)| is_variant_type(rf.data_type()));
-                if is_variant { Arc::new(Field::new(f.name(), DataType::Utf8, f.is_nullable())) } else { f.clone() }
+                let is_variant = real_schema.column_with_name(f.name()).is_some_and(|(_, rf)| crate::schema_loader::is_variant_type(rf.data_type()));
+                if is_variant {
+                    Arc::new(Field::new(f.name(), DataType::Utf8, f.is_nullable()))
+                } else {
+                    f.clone()
+                }
             })
             .collect();
-        let output_schema = Arc::new(Schema::new(output_fields));
-        let properties = PlanProperties::new(
+        let output_schema = Arc::new(arrow_schema::Schema::new(output_fields));
+        let properties = Arc::new(PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(output_schema.clone()),
             input.output_partitioning().clone(),
             input.pipeline_behavior(),
             Boundedness::Bounded,
-        );
-        Self {
-            input,
-            real_schema,
-            output_schema,
-            properties,
+        ));
+        Self { input, real_schema, output_schema, properties }
+    }
+
+    fn convert_batch(batch: RecordBatch, real_schema: &SchemaRef) -> DFResult<RecordBatch> {
+        use datafusion::arrow::array::{ArrayRef, StringBuilder, StructArray};
+        use datafusion::arrow::datatypes::{DataType, Field};
+        use datafusion::arrow::record_batch::RecordBatchOptions;
+        use parquet_variant_compute::VariantArray;
+        use parquet_variant_json::VariantToJson;
+        let batch_schema = batch.schema();
+        let row_count = batch.num_rows();
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        let mut new_fields: Vec<Arc<Field>> = batch_schema.fields().iter().cloned().collect();
+        for (idx, batch_field) in batch_schema.fields().iter().enumerate() {
+            let is_variant = real_schema.column_with_name(batch_field.name()).is_some_and(|(_, f)| crate::schema_loader::is_variant_type(f.data_type()));
+            if !is_variant {
+                continue;
+            }
+            if let Some(struct_arr) = columns[idx].as_any().downcast_ref::<StructArray>() {
+                let variant_arr = VariantArray::try_new(struct_arr).map_err(|e| DataFusionError::Execution(format!("VariantArray::try_new failed: {e}")))?;
+                let mut b = StringBuilder::new();
+                for i in 0..variant_arr.len() {
+                    if variant_arr.is_null(i) {
+                        b.append_null();
+                    } else {
+                        b.append_value(&variant_arr.value(i).to_json_string().map_err(|e| DataFusionError::Execution(format!("variant→json: {e}")))?);
+                    }
+                }
+                columns[idx] = Arc::new(b.finish());
+                new_fields[idx] = Arc::new(Field::new(batch_field.name(), DataType::Utf8, batch_field.is_nullable()));
+            }
         }
+        let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
+        RecordBatch::try_new_with_options(new_schema, columns, &RecordBatchOptions::new().with_row_count(Some(row_count)))
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 }
 
-impl DisplayAs for VariantToJsonExec {
+impl datafusion::physical_plan::DisplayAs for VariantToJsonExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "VariantToJsonExec")
     }
 }
 
 impl ExecutionPlan for VariantToJsonExec {
-    fn name(&self) -> &str {
-        "VariantToJsonExec"
-    }
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
+    fn name(&self) -> &str { "VariantToJsonExec" }
+    fn as_any(&self) -> &dyn Any { self }
+    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> { &self.properties }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(VariantToJsonExec::new(children[0].clone(), self.real_schema.clone())))
     }
-
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
         let real_schema = self.real_schema.clone();
         let output_schema = self.output_schema.clone();
-
-        let converted_stream = input_stream.map(move |batch_result| batch_result.and_then(|batch| variant_columns_to_json(batch, &real_schema)));
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(output_schema, converted_stream)))
-    }
-}
-
-/// Check if input schema is compatible with target schema for INSERT operations.
-/// This allows string types (Utf8, Utf8View, LargeUtf8) to be inserted into Variant columns,
-/// since convert_variant_columns() will handle the conversion in write_all().
-fn is_schema_compatible_for_insert(input_schema: &SchemaRef, target_schema: &SchemaRef) -> DFResult<()> {
-    use datafusion::arrow::datatypes::DataType;
-
-    if input_schema.fields().len() != target_schema.fields().len() {
-        return Err(DataFusionError::Plan(format!(
-            "Schema field count mismatch: input has {} fields, target has {} fields",
-            input_schema.fields().len(),
-            target_schema.fields().len()
-        )));
-    }
-
-    fn is_string_type(dt: &DataType) -> bool {
-        matches!(dt, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8)
-    }
-
-    fn types_compatible(input: &DataType, target: &DataType) -> bool {
-        if input == target {
-            return true;
-        }
-        if is_string_type(input) && is_string_type(target) {
-            return true;
-        }
-        // String -> Variant (string will be converted to variant)
-        if is_string_type(input) && is_variant_type(target) {
-            return true;
-        }
-        // Variant -> Utf8View (INSERT-compatible schema uses Utf8View for Variant cols)
-        if is_variant_type(input) && is_string_type(target) {
-            return true;
-        }
-        // List types with compatible element types
-        if let (DataType::List(in_f), DataType::List(tgt_f)) = (input, target) {
-            return types_compatible(in_f.data_type(), tgt_f.data_type());
-        }
-        if let (DataType::LargeList(in_f), DataType::LargeList(tgt_f)) = (input, target) {
-            return types_compatible(in_f.data_type(), tgt_f.data_type());
-        }
-        input.equals_datatype(target)
-    }
-
-    for (input_field, target_field) in input_schema.fields().iter().zip(target_schema.fields()) {
-        if !types_compatible(input_field.data_type(), target_field.data_type()) {
-            return Err(DataFusionError::Plan(format!(
-                "Schema mismatch for field '{}': input type {:?} is not compatible with target type {:?}",
-                input_field.name(),
-                input_field.data_type(),
-                target_field.data_type()
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-/// Custom execution plan that converts string columns to Variant type.
-/// This wraps an input plan and transforms string columns to Variant in the output.
-#[derive(Debug)]
-struct VariantConversionExec {
-    input: Arc<dyn ExecutionPlan>,
-    target_schema: SchemaRef,
-    properties: PlanProperties,
-}
-
-impl VariantConversionExec {
-    fn new(input: Arc<dyn ExecutionPlan>, target_schema: SchemaRef) -> Self {
-        let properties = PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(target_schema.clone()),
-            input.output_partitioning().clone(),
-            input.pipeline_behavior(),
-            Boundedness::Bounded,
-        );
-        Self {
-            input,
-            target_schema,
-            properties,
-        }
-    }
-}
-
-impl DisplayAs for VariantConversionExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "VariantConversionExec")
-    }
-}
-
-impl ExecutionPlan for VariantConversionExec {
-    fn name(&self) -> &str {
-        "VariantConversionExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(VariantConversionExec::new(children[0].clone(), self.target_schema.clone())))
-    }
-
-    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
-        let target_schema = self.target_schema.clone();
-
-        let converted_stream = input_stream.map(move |batch_result| batch_result.and_then(|batch| convert_variant_columns(batch, &target_schema)));
-
-        Ok(Box::pin(RecordBatchStreamAdapter::new(self.target_schema.clone(), converted_stream)))
+        let s = input_stream.map(move |b| b.and_then(|batch| Self::convert_batch(batch, &real_schema)));
+        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(output_schema, s)))
     }
 }
 
@@ -439,7 +276,7 @@ pub struct Database {
     default_s3_endpoint: Option<String>,
     object_store_cache: Option<Arc<SharedFoyerCache>>,
     statistics_extractor: Arc<DeltaStatisticsExtractor>,
-    last_written_versions: Arc<RwLock<HashMap<(String, String), i64>>>,
+    last_written_versions: Arc<RwLock<HashMap<(String, String), u64>>>,
     buffered_layer: Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
 }
 
@@ -497,7 +334,7 @@ impl Database {
             .set_compression(Compression::ZSTD(
                 ZstdLevel::try_new(compression_level).unwrap_or_else(|_| ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()),
             ))
-            .set_max_row_group_size(max_row_group_size)
+            .set_max_row_group_row_count(Some(max_row_group_size))
             .set_dictionary_enabled(true)
             .set_dictionary_page_size_limit(8388608)
             .set_statistics_enabled(EnabledStatistics::Page)
@@ -962,8 +799,9 @@ impl Database {
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.catalog.information_schema", "true");
 
-        // Ensure Utf8View handling for consistent string types across DataFusion and Delta
-        let _ = options.set("datafusion.execution.parquet.schema_force_view_types", "true");
+        // Must be false: delta_kernel's unshredded_variant() schema uses Binary (not BinaryView).
+        // Forcing view types causes UPDATE/DELETE rewrites to fail schema validation against variant columns.
+        let _ = options.set("datafusion.execution.parquet.schema_force_view_types", "false");
         let _ = options.set("datafusion.sql_parser.map_string_types_to_utf8view", "true");
 
         // Enable Parquet statistics for better query optimization with Delta Lake
@@ -1450,7 +1288,10 @@ impl Database {
 
                     let mut config = HashMap::new();
                     config.insert("delta.checkpointInterval".to_string(), Some(checkpoint_interval));
-                    config.insert("delta.checkpointPolicy".to_string(), Some("v2".to_string()));
+                    // Default of 32 leaf columns isn't enough for our wide schema (90+ fields);
+                    // -1 = index all columns. Needed so kernel data-skipping can evaluate
+                    // predicates on columns beyond the first 32 without "No such field" errors.
+                    config.insert("delta.dataSkippingNumIndexedCols".to_string(), Some("-1".to_string()));
 
                     match CreateBuilder::new()
                         .with_location(storage_uri)
@@ -1784,7 +1625,7 @@ impl Database {
             } else {
                 deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone())
             })
-            .with_target_size(target_size as u64)
+            .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
             .await;
@@ -1842,7 +1683,7 @@ impl Database {
             .optimize()
             .with_filters(&partition_filters)
             .with_type(deltalake::operations::optimize::OptimizeType::Compact)
-            .with_target_size(target_size as u64)
+            .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
             .with_writer_properties(self.create_writer_properties(schema.sorting_columns(), &schema.fields))
             .with_min_commit_interval(tokio::time::Duration::from_secs(30))
             .await;
@@ -2004,14 +1845,13 @@ impl ProjectRoutingTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        // Return INSERT-compatible schema where Variant columns appear as Utf8View.
-        // This allows INSERT statements with JSON strings to pass DataFusion's type validation.
-        // VariantConversionExec handles string->Variant conversion during write.
-        // The pgwire layer handles Variant->JSON conversion during read via VariantJsonExec.
+        // Present Variant cols as Utf8View at the table-provider boundary so the SQL planner's
+        // INSERT VALUES type check accepts JSON string literals (arrow has no Utf8→Struct cast).
+        // `write_all` converts these Utf8 columns back to Variant structs before the Delta write.
         create_insert_compatible_schema(&self.schema)
     }
 
-    /// Return the actual schema with Variant types (for internal use)
+    /// Real (Variant-typed) schema for internal use.
     fn real_schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -2329,18 +2169,17 @@ impl DataSink for ProjectRoutingTable {
         let span = tracing::Span::current();
         let mut total_row_count = 0;
         let mut project_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
-        let target_schema = self.schema();
-
-        // Collect and group batches by project_id, converting variant columns
+        let target_schema = self.real_schema();
+        // Collect and group batches by project_id, converting Utf8/Utf8View columns into
+        // Variant structs where the target schema expects Variant (INSERT path: schema()
+        // presented Variant cols as Utf8View, so the inbound batches may carry strings).
         while let Some(batch) = data.next().await.transpose()? {
             let batch_rows = batch.num_rows();
             debug!("write_all: received batch with {} rows", batch_rows);
             total_row_count += batch_rows;
             let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
-
-            // Convert string columns to Variant where target schema expects Variant
-            let converted_batch = convert_variant_columns(batch, &target_schema)?;
-            project_batches.entry(project_id).or_default().push(converted_batch);
+            let converted = convert_variant_columns(batch, &target_schema)?;
+            project_batches.entry(project_id).or_default().push(converted);
         }
 
         span.record("rows.count", total_row_count);
@@ -2391,28 +2230,11 @@ impl TableProvider for ProjectRoutingTable {
     }
 
     async fn insert_into(&self, _state: &dyn Session, input: Arc<dyn ExecutionPlan>, insert_op: InsertOp) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Check that the schema of the plan is compatible with this table.
-        // Use custom compatibility check that allows string -> Variant conversion.
-        match is_schema_compatible_for_insert(&input.schema(), &self.schema()) {
-            Ok(_) => debug!("insert_into; Schema validation passed (with Variant compatibility)"),
-            Err(e) => {
-                error!("Schema validation failed: {}", e);
-                return Err(e);
-            }
-        }
-
         if insert_op != InsertOp::Append {
             error!("Unsupported insert operation: {:?}", insert_op);
             return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
         }
-
-        // Wrap input with VariantConversionExec to convert string columns to Variant.
-        let converted_input: Arc<dyn ExecutionPlan> = Arc::new(VariantConversionExec::new(input, self.real_schema()));
-
-        // Create sink executor with the converted input
-        let sink = DataSinkExec::new(converted_input, Arc::new(self.clone()), None);
-
-        Ok(Arc::new(sink))
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(self.clone()), None)))
     }
 
     fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
@@ -2453,10 +2275,11 @@ impl TableProvider for ProjectRoutingTable {
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
         span.record("table.project_id", project_id.as_str());
 
-        let has_variant_columns = self.real_schema().fields().iter().any(|f| is_variant_type(f.data_type()));
-        let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> {
+        let has_variant_columns = self.schema.fields().iter().any(|f| crate::schema_loader::is_variant_type(f.data_type()));
+        let real_schema = self.schema.clone();
+        let wrap_result = move |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> {
             if has_variant_columns {
-                Ok(Arc::new(VariantToJsonExec::new(plan, self.real_schema())))
+                Ok(Arc::new(VariantToJsonExec::new(plan, real_schema.clone())))
             } else {
                 Ok(plan)
             }

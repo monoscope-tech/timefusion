@@ -209,7 +209,7 @@ pub struct DmlExec {
     database: Arc<Database>,
     buffered_layer: Option<Arc<BufferedWriteLayer>>,
     session: Arc<dyn Session>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl std::fmt::Debug for DmlExec {
@@ -243,12 +243,12 @@ impl DmlExec {
     fn new(
         op_type: DmlOperation, table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(input.schema()),
             datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
             input.properties().emission_type,
             input.properties().boundedness,
-        );
+        ));
         Self {
             op_type,
             table_name,
@@ -320,7 +320,7 @@ impl ExecutionPlan for DmlExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -537,7 +537,7 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
 
         builder
             .await
-            .map(|(table, metrics)| (table, metrics.num_deleted_rows as u64))
+            .map(|(table, metrics)| (table, metrics.num_deleted_rows.unwrap_or(0) as u64))
             .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta DELETE: {}", e)))
     })
     .await;

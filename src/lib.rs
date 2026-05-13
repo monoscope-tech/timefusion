@@ -6,6 +6,7 @@ pub mod config;
 pub mod database;
 pub mod dml;
 pub mod functions;
+pub mod grpc_handlers;
 pub mod mem_buffer;
 pub mod object_store_cache;
 pub mod optimizers;

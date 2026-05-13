@@ -91,6 +91,7 @@ const_default!(d_true: bool = true);
 const_default!(d_s3_endpoint: String = "https://s3.amazonaws.com");
 const_default!(d_data_dir: PathBuf = "./data");
 const_default!(d_pgwire_port: u16 = 5432);
+const_default!(d_grpc_port: u16 = 50051);
 const_default!(d_table_prefix: String = "timefusion");
 const_default!(d_batch_queue_capacity: usize = 100_000_000);
 const_default!(d_pgwire_user: String = "postgres");
@@ -239,6 +240,10 @@ pub struct CoreConfig {
     pub pgwire_user: String,
     #[serde(default)]
     pub pgwire_password: Option<String>,
+    #[serde(default = "d_grpc_port")]
+    pub grpc_port: u16,
+    #[serde(default)]
+    pub grpc_token: Option<String>,
 }
 
 impl CoreConfig {
