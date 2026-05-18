@@ -5,6 +5,7 @@ use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
 use std::sync::Arc;
 use timefusion::buffered_write_layer::BufferedWriteLayer;
+use timefusion::clock;
 use timefusion::config::{self, AppConfig};
 use timefusion::database::Database;
 use timefusion::telemetry;
@@ -29,6 +30,7 @@ fn main() -> anyhow::Result<()> {
 async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Initialize OpenTelemetry with OTLP exporter
     telemetry::init_telemetry(&cfg.telemetry)?;
+    clock::init_from_env();
 
     info!("Starting TimeFusion application");
 
@@ -53,12 +55,37 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         Arc::new(move |project_id: String, table_name: String, batches: Vec<arrow::array::RecordBatch>| {
             let db = db_for_callback.clone();
             Box::pin(async move {
+                // Capture pre-state file URIs so we can derive the post-write delta.
+                let pre = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
                 // skip_queue=true to write directly to Delta
-                db.insert_records_batch(&project_id, &table_name, batches, true).await
+                db.insert_records_batch(&project_id, &table_name, batches, true).await?;
+                let post = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
+                let pre_set: std::collections::HashSet<String> = pre.into_iter().collect();
+                let added: Vec<String> = post.into_iter().filter(|u| !pre_set.contains(u)).collect();
+                Ok(added)
             })
         });
 
-    let buffered_layer = Arc::new(BufferedWriteLayer::with_config(cfg_arc)?.with_delta_writer(delta_write_callback));
+    // Optional sidecar tantivy index callback. Off by default; enabled when
+    // TIMEFUSION_TANTIVY_ENABLED=true and the table is in the indexed list.
+    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone())?.with_delta_writer(delta_write_callback);
+    if cfg.tantivy.enabled() {
+        let bucket = cfg.aws.aws_s3_bucket.clone().unwrap_or_default();
+        if !bucket.is_empty() {
+            let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
+            let storage_opts = cfg.aws.build_storage_options(None);
+            let obj_store = db.create_object_store(&storage_uri, &storage_opts).await?;
+            let svc = Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
+            layer = layer.with_tantivy_indexer(svc.clone().callback());
+            let cache_root = cfg.core.timefusion_data_dir.clone();
+            let search = Arc::new(timefusion::tantivy_index::search::TantivySearchService::new(obj_store, cache_root));
+            db = db.with_tantivy_search(search).with_tantivy_indexer(svc);
+            info!("Tantivy sidecar indexes enabled for tables: {:?}", cfg.tantivy.indexed_tables());
+        } else {
+            info!("Tantivy enabled but no AWS_S3_BUCKET configured; skipping");
+        }
+    }
+    let buffered_layer = Arc::new(layer);
 
     // Recover from WAL on startup
     info!("Starting WAL recovery...");

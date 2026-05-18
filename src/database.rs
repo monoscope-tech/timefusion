@@ -85,6 +85,124 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 /// schema expects Variant. Called from `DataSink::write_all` so that INSERT statements (where
 /// the table provider presents Variant cols as Utf8View for the SQL planner's type check) can
 /// land their JSON-string values in the underlying Delta storage which expects Variant structs.
+/// Normalize incoming Timestamp columns whose timezone is a numeric UTC
+/// offset (`"+00:00"` — what psycopg / pgwire emit for timestamptz) to the
+/// IANA name `"UTC"`. Delta-rs's Arrow→Delta schema converter rejects
+/// `Timestamp(µs, "+00:00")` even though it's semantically identical to
+/// `"UTC"`; without normalization every flush errors out and MemBuffer
+/// fills until eviction warnings, with no data ever reaching Delta.
+///
+/// We only retag — the underlying micros-since-epoch buffer is unchanged.
+/// Build a minimal `SessionState` for delta-rs `OptimizeBuilder` to use.
+///
+/// delta-rs's default `DeltaSessionConfig` turns `schema_force_view_types`
+/// ON, which makes the optimize-internal Parquet reader cast our Variant
+/// columns' Binary buffers to BinaryView at read time. The kernel's
+/// `unshredded_variant()` schema then mismatches and the rewrite errors
+/// out ("Expected ... Binary, got ... BinaryView"). Passing this session
+/// via `.with_session_state(...)` overrides the default and keeps the
+/// read schema as declared.
+fn build_optimize_session_state() -> datafusion::execution::session_state::SessionState {
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::prelude::SessionConfig;
+    let cfg = SessionConfig::new()
+        .set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+    SessionStateBuilder::new().with_config(cfg).with_default_features().build()
+}
+
+/// Cast Variant struct columns (Struct{BinaryView,BinaryView}) to the
+/// Binary-backed form delta-kernel's `unshredded_variant()` requires on
+/// write. No-op for any column that's not a Variant struct or already in
+/// Binary form. Called from `insert_records_batch` right before the
+/// Delta write so MemBuffer can keep its natural BinaryView layout
+/// (matches what parquet reads produce → no per-row read-side cast).
+fn cast_variant_columns_to_binary(batch: RecordBatch) -> RecordBatch {
+    use arrow::array::StructArray;
+    use arrow::compute::cast;
+    use datafusion::arrow::datatypes::{DataType, Field};
+    let schema = batch.schema();
+    let mut new_cols = batch.columns().to_vec();
+    let mut new_fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    let mut changed = false;
+    for (i, field) in schema.fields().iter().enumerate() {
+        if !is_variant_type(field.data_type()) {
+            continue;
+        }
+        let DataType::Struct(struct_fields) = field.data_type() else { continue };
+        // Only act if any inner field is BinaryView.
+        let needs = struct_fields.iter().any(|f| matches!(f.data_type(), DataType::BinaryView));
+        if !needs {
+            continue;
+        }
+        let Some(struct_arr) = batch.columns()[i].as_any().downcast_ref::<StructArray>() else { continue };
+        let casted_cols: Vec<arrow::array::ArrayRef> = struct_arr
+            .columns()
+            .iter()
+            .zip(struct_fields.iter())
+            .map(|(arr, f)| {
+                if matches!(f.data_type(), DataType::BinaryView) {
+                    cast(arr, &DataType::Binary).unwrap_or_else(|_| arr.clone())
+                } else {
+                    arr.clone()
+                }
+            })
+            .collect();
+        let casted_fields: arrow::datatypes::Fields = struct_fields
+            .iter()
+            .map(|f| {
+                if matches!(f.data_type(), DataType::BinaryView) {
+                    Arc::new(Field::new(f.name(), DataType::Binary, f.is_nullable()))
+                } else {
+                    f.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .into();
+        new_cols[i] = Arc::new(StructArray::new(casted_fields.clone(), casted_cols, struct_arr.nulls().cloned()));
+        new_fields[i] = Arc::new(
+            Field::new(field.name(), DataType::Struct(casted_fields), field.is_nullable())
+                .with_metadata(field.metadata().clone()),
+        );
+        changed = true;
+    }
+    if !changed {
+        return batch;
+    }
+    let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
+    RecordBatch::try_new(new_schema, new_cols).unwrap_or(batch)
+}
+
+fn normalize_timestamp_tz(batch: RecordBatch) -> RecordBatch {
+    use arrow::array::{TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
+    use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
+    let is_utc_offset = |tz: &str| matches!(tz, "+00:00" | "-00:00" | "+0000" | "-0000" | "Z" | "utc" | "Utc");
+    let schema = batch.schema();
+    let mut new_fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
+    let mut new_cols = batch.columns().to_vec();
+    let mut changed = false;
+    for (i, field) in schema.fields().iter().enumerate() {
+        if let DataType::Timestamp(unit, Some(tz)) = field.data_type()
+            && is_utc_offset(tz.as_ref())
+        {
+            let col = &batch.columns()[i];
+            let retagged: Arc<dyn arrow::array::Array> = match unit {
+                TimeUnit::Microsecond => Arc::new(col.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().clone().with_timezone("UTC")),
+                TimeUnit::Millisecond => Arc::new(col.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap().clone().with_timezone("UTC")),
+                TimeUnit::Nanosecond => Arc::new(col.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap().clone().with_timezone("UTC")),
+                TimeUnit::Second => Arc::new(col.as_any().downcast_ref::<TimestampSecondArray>().unwrap().clone().with_timezone("UTC")),
+            };
+            new_cols[i] = retagged;
+            new_fields[i] = Arc::new(Field::new(field.name(), DataType::Timestamp(*unit, Some("UTC".into())), field.is_nullable()).with_metadata(field.metadata().clone()));
+            changed = true;
+        }
+    }
+    if !changed {
+        return batch;
+    }
+    let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
+    RecordBatch::try_new(new_schema, new_cols).unwrap_or(batch)
+}
+
 fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
     use datafusion::arrow::array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray, StructArray};
     use datafusion::arrow::compute::cast;
@@ -107,7 +225,10 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
                 None => builder.append_null(),
             }
         }
-        // VariantArrayBuilder emits BinaryView; delta_kernel's unshredded_variant() expects Binary.
+        // Cast VariantArrayBuilder's BinaryView output to Binary so the
+        // batch matches `delta_kernel::unshredded_variant()` (which is what
+        // our schema declares). Both Delta reads and MemBuffer end up as
+        // Binary → no per-row casts on the read path.
         let arr: StructArray = builder.build().into();
         let metadata = cast(arr.column(0), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         let value = cast(arr.column(1), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
@@ -278,6 +399,8 @@ pub struct Database {
     statistics_extractor: Arc<DeltaStatisticsExtractor>,
     last_written_versions: Arc<RwLock<HashMap<(String, String), u64>>>,
     buffered_layer: Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
+    tantivy_search: Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
+    tantivy_indexer: Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
 }
 
 impl Database {
@@ -547,6 +670,8 @@ impl Database {
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             buffered_layer: None,
+            tantivy_search: None,
+            tantivy_indexer: None,
         };
 
         Ok(db)
@@ -577,6 +702,28 @@ impl Database {
     /// Get the buffered write layer if configured
     pub fn buffered_layer(&self) -> Option<&Arc<crate::buffered_write_layer::BufferedWriteLayer>> {
         self.buffered_layer.as_ref()
+    }
+
+    /// Attach the tantivy search service used by the scan-side prefilter.
+    pub fn with_tantivy_search(mut self, svc: Arc<crate::tantivy_index::search::TantivySearchService>) -> Self {
+        self.tantivy_search = Some(svc);
+        self
+    }
+
+    pub fn tantivy_search(&self) -> Option<&Arc<crate::tantivy_index::search::TantivySearchService>> {
+        self.tantivy_search.as_ref()
+    }
+
+    /// Attach the write-side tantivy service. Used by the compaction-GC hook
+    /// in `optimize_table` to clean up stale sidecar indexes after files are
+    /// rewritten away.
+    pub fn with_tantivy_indexer(mut self, svc: Arc<crate::tantivy_index::service::TantivyIndexService>) -> Self {
+        self.tantivy_indexer = Some(svc);
+        self
+    }
+
+    pub fn tantivy_indexer(&self) -> Option<&Arc<crate::tantivy_index::service::TantivyIndexService>> {
+        self.tantivy_indexer.as_ref()
     }
 
     /// Query Delta tables directly, bypassing the in-memory buffer (for testing).
@@ -930,6 +1077,14 @@ impl Database {
                 info!("Registered ProjectRoutingTable for table '{}' with SessionContext", table_name);
             }
         }
+
+        // Register the introspection table. `SELECT * FROM timefusion_stats`
+        // returns a flat (component, key, value) snapshot of MemBuffer / WAL /
+        // BufferedWriteLayer counters — see src/stats_table.rs.
+        ctx.register_table(
+            "timefusion_stats",
+            Arc::new(crate::stats_table::StatsTableProvider::new(self.buffered_layer.clone())),
+        )?;
 
         self.register_pg_settings_table(ctx)?;
         self.register_set_config_udf(ctx);
@@ -1335,6 +1490,21 @@ impl Database {
         skip(self),
         fields(project_id = %project_id, table.name = %table_name)
     )]
+    /// Return the live parquet file URIs of a Delta table after refreshing
+    /// its state. Returns empty if the table doesn't exist yet (pre-create).
+    /// Used by the buffered-layer's Delta callback to surface "files added
+    /// by this commit" to the sidecar tantivy indexer.
+    pub async fn list_file_uris(&self, project_id: &str, table_name: &str) -> Result<Vec<String>> {
+        let table_ref = match self.resolve_table(project_id, table_name).await {
+            Ok(r) => r,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut table = table_ref.write().await;
+        let _ = table.update_state().await;
+        let uris: Vec<String> = table.get_file_uris()?.collect();
+        Ok(uris)
+    }
+
     pub async fn get_or_create_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
         // Route to appropriate table based on whether project has custom storage
         if self.has_custom_storage(project_id, table_name).await {
@@ -1345,7 +1515,7 @@ impl Database {
     }
 
     /// Create an object store for the given URI and storage options
-    async fn create_object_store(&self, storage_uri: &str, storage_options: &HashMap<String, String>) -> Result<Arc<dyn object_store::ObjectStore>> {
+    pub async fn create_object_store(&self, storage_uri: &str, storage_options: &HashMap<String, String>) -> Result<Arc<dyn object_store::ObjectStore>> {
         use object_store::aws::AmazonS3Builder;
         use object_store::{BackoffConfig, ClientOptions, RetryConfig};
         use std::time::Duration;
@@ -1453,6 +1623,12 @@ impl Database {
     )]
     pub async fn insert_records_batch(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
         let span = tracing::Span::current();
+        // Normalize timezone-as-offset (`+00:00`) timestamp columns to the
+        // IANA `"UTC"` form. Delta-rs Arrow→Delta schema conversion only
+        // accepts `"UTC"`; without this normalisation the flush callback
+        // path (which feeds MemBuffer batches straight into Delta) errors
+        // out and data piles up in MemBuffer.
+        let batches: Vec<RecordBatch> = batches.into_iter().map(normalize_timestamp_tz).collect();
 
         // Extract project_id from first batch if not provided
         let project_id = if project_id.is_empty() && !batches.is_empty() {
@@ -1488,6 +1664,13 @@ impl Database {
         }
 
         span.record("use_queue", false);
+
+        // Delta-kernel's `unshredded_variant()` expects Struct{Binary,Binary}
+        // on write, but our MemBuffer carries Struct{BinaryView,BinaryView}
+        // (matches what the parquet reader natively produces — no per-row
+        // casts on read). Cast just-before-write so the Delta commit
+        // accepts the schema.
+        let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect();
 
         // Get or create the table
         let table_ref = self.get_or_create_table(&project_id, &table_name).await?;
@@ -1617,6 +1800,9 @@ impl Database {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let writer_properties = self.create_writer_properties(schema.sorting_columns(), &schema.fields);
 
+        // Same trade-off as optimize_table_light: best-effort, don't pause
+        // flushes (see comment there). Z-order full optimize is daily-ish,
+        // so an occasional OCC failure is fine.
         let optimize_result = table_clone
             .optimize()
             .with_filters(&partition_filters)
@@ -1628,6 +1814,10 @@ impl Database {
             .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
+            // Avoid the BinaryView read for Variant columns (same issue as
+            // optimize_table_light); delta-rs's internal session defaults to
+            // schema_force_view_types=true.
+            .with_session_state(Arc::new(build_optimize_session_state()))
             .await;
 
         match optimize_result {
@@ -1654,8 +1844,36 @@ impl Database {
                     let compression_ratio = metrics.num_files_removed as f64 / metrics.num_files_added as f64;
                     info!("Optimization compression ratio: {:.2}x", compression_ratio);
                 }
+                // Capture live file URIs from the new table *before* taking
+                // the write lock to swap it in — used by the tantivy GC hook
+                // below to drop indexes whose covered files no longer exist.
+                let live_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
                 let mut table = table_ref.write().await;
                 *table = new_table;
+                drop(table);
+                // Tantivy compaction GC — drop sidecar indexes for files that
+                // were rewritten away. Best-effort: errors are logged.
+                if let Some(svc) = self.tantivy_indexer().cloned() {
+                    let svc_table = table_name.to_string();
+                    // Per-project: collect all (project_id, ...) values from
+                    // manifests in this table prefix. Today only the unified
+                    // "default" path is exercised in practice; iterate over
+                    // known custom projects too.
+                    let mut project_ids: Vec<String> = self.custom_project_tables.read().await.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone()).collect();
+                    project_ids.push("default".to_string());
+                    for pid in project_ids {
+                        match svc.gc_after_compaction(&svc_table, &pid, &live_uris).await {
+                            Ok(report) if report.entries_removed > 0 => {
+                                info!(
+                                    "tantivy gc: project={} table={} removed={} kept={} blobs_deleted={}",
+                                    pid, svc_table, report.entries_removed, report.kept, report.blobs_deleted
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => warn!("tantivy gc failed for project={} table={}: {}", pid, svc_table, e),
+                        }
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
@@ -1667,51 +1885,103 @@ impl Database {
 
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         let start_time = std::time::Instant::now();
-        let table_clone = {
-            let table = table_ref.read().await;
-            table.clone()
-        };
-
         let today = Utc::now().date_naive();
-        info!("Light optimizing files from date: {}", today);
-
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?];
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
-
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let optimize_result = table_clone
-            .optimize()
-            .with_filters(&partition_filters)
-            .with_type(deltalake::operations::optimize::OptimizeType::Compact)
-            .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
-            .with_writer_properties(self.create_writer_properties(schema.sorting_columns(), &schema.fields))
-            .with_min_commit_interval(tokio::time::Duration::from_secs(30))
-            .await;
+        let writer_properties = self.create_writer_properties(schema.sorting_columns(), &schema.fields);
 
-        match optimize_result {
-            Ok((new_table, metrics)) => {
-                let min_files = self.config.maintenance.timefusion_compact_min_files;
-                if metrics.total_considered_files < min_files {
-                    debug!(
-                        "Skipping light optimization commit: {} files < min threshold {}",
-                        metrics.total_considered_files, min_files
+        // Best-effort optimize: retry on OCC conflict but DO NOT hold the
+        // flush lock. Earlier we wrapped this in `with_flush_paused` to
+        // ensure optimize won the race against flush commits, but the
+        // retry+OCC time is 4–10s and flushes accumulate buckets during
+        // that window — at 25h-bench scale we saw 46+ stuck MemBuffer
+        // buckets and a 10× drop in ingest throughput. Better to let
+        // optimize fail loudly during heavy ingest; the next scheduler
+        // tick (5 min later) usually catches a quiet enough window.
+        self.optimize_table_light_inner(table_ref, today, &partition_filters, target_size, &writer_properties, start_time).await
+    }
+
+    /// Inner optimize loop. Caller is expected to hold the flush lock when
+    /// a `BufferedWriteLayer` is active; the retry loop here remains as a
+    /// safety net against bursts from `flush_all_now` or shutdown flushes.
+    async fn optimize_table_light_inner(
+        &self,
+        table_ref: &Arc<RwLock<DeltaTable>>,
+        today: chrono::NaiveDate,
+        partition_filters: &[PartitionFilter],
+        target_size: i64,
+        writer_properties: &WriterProperties,
+        start_time: std::time::Instant,
+    ) -> Result<()> {
+        const MAX_RETRIES: usize = 4;
+        let mut last_err: Option<deltalake::DeltaTableError> = None;
+        for attempt in 0..MAX_RETRIES {
+            let table_clone = {
+                let table = table_ref.read().await;
+                table.clone()
+            };
+            if attempt == 0 {
+                info!("Light optimizing files from date: {}", today);
+            } else {
+                debug!("Light optimize retry {}/{} after OCC conflict", attempt + 1, MAX_RETRIES);
+            }
+            let optimize_result = table_clone
+                .optimize()
+                .with_filters(partition_filters)
+                .with_type(deltalake::operations::optimize::OptimizeType::Compact)
+                .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+                .with_writer_properties(writer_properties.clone())
+                .with_min_commit_interval(tokio::time::Duration::from_secs(30))
+                // Variant columns are stored as Struct{Binary, Binary} on disk; if
+                // the optimize-internal Parquet read uses `schema_force_view_types=true`
+                // (delta-rs's default), it returns BinaryView and the rewrite blows up
+                // mid-scan with "Expected ... Binary, got ... BinaryView".
+                .with_session_state(Arc::new(build_optimize_session_state()))
+                .await;
+            match optimize_result {
+                Ok((new_table, metrics)) => {
+                    let min_files = self.config.maintenance.timefusion_compact_min_files;
+                    if metrics.total_considered_files < min_files {
+                        debug!(
+                            "Skipping light optimization commit: {} files < min threshold {}",
+                            metrics.total_considered_files, min_files
+                        );
+                        return Ok(());
+                    }
+                    let duration = start_time.elapsed();
+                    info!(
+                        "Light optimization completed in {:?} (attempt {}): {} files removed, {} files added",
+                        duration, attempt + 1, metrics.num_files_removed, metrics.num_files_added
                     );
+                    let mut table = table_ref.write().await;
+                    *table = new_table;
                     return Ok(());
                 }
-                let duration = start_time.elapsed();
-                info!(
-                    "Light optimization completed in {:?}: {} files removed, {} files added",
-                    duration, metrics.num_files_removed, metrics.num_files_added
-                );
-                let mut table = table_ref.write().await;
-                *table = new_table;
-                Ok(())
-            }
-            Err(e) => {
-                error!("Light optimization operation failed: {}", e);
-                Err(anyhow::anyhow!("Light table optimization failed: {}", e))
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_conflict = msg.contains("concurrent transaction") || msg.contains("Commit failed");
+                    // "Found unmasked nulls for non-nullable StructArray" surfaces
+                    // when delta-rs is mid-rewrite and the in-flight Add log lines
+                    // for partition struct values aren't fully populated yet.
+                    // It usually clears on a fresh re-scan, so treat as transient.
+                    let is_transient_schema = msg.contains("Found unmasked nulls");
+                    if (is_conflict || is_transient_schema) && attempt + 1 < MAX_RETRIES {
+                        // Quick backoff scaled so we straddle multiple flush
+                        // ticks (~2s each) — picks 150, 300, 600 ms.
+                        let backoff_ms = 150u64 << attempt;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    error!("Light optimization operation failed (attempt {}): {}", attempt + 1, e);
+                    return Err(anyhow::anyhow!("Light table optimization failed: {}", e));
+                }
             }
         }
+        let err = last_err.map(|e| e.to_string()).unwrap_or_else(|| "exhausted retries".into());
+        warn!("Light optimization gave up after {} OCC conflicts; will retry next tick: {}", MAX_RETRIES, err);
+        Ok(())
     }
 
     /// Vacuum the Delta table to clean up old files that are no longer needed
@@ -1852,7 +2122,7 @@ impl ProjectRoutingTable {
     }
 
     /// Real (Variant-typed) schema for internal use.
-    fn real_schema(&self) -> SchemaRef {
+    pub fn real_schema(&self) -> SchemaRef {
         self.schema.clone()
     }
 
@@ -1931,12 +2201,23 @@ impl ProjectRoutingTable {
         }
     }
 
-    /// Checks if a column supports exact pushdown (partitions, sorted columns, indexed columns)
+    /// Checks if a column supports *exact* pushdown — meaning the table
+    /// provider promises to fully apply the filter so DataFusion can drop
+    /// the FilterExec on top. Only true partition columns qualify:
+    /// Delta's partition pruning is genuinely exact, and partition values
+    /// are also compared exactly inside MemBuffer.
+    ///
+    /// Previously this list included `timestamp`, `id`, `level`, etc. on
+    /// the assumption that MemBuffer's row-level filter (best-effort) plus
+    /// Delta's row-group statistics would catch them. But MemBuffer's
+    /// physical-expr compilation silently falls back to "no filter" if the
+    /// expression can't be lowered for any reason (type coercion, Utf8View
+    /// vs Utf8, etc.) — and with Exact pushdown, FilterExec is gone, so
+    /// rows leak through unfiltered. Bench harness caught this as
+    /// `timestamp >= '02:55' AND timestamp < '03:00'` returning the entire
+    /// 10-minute bucket.
     fn is_pushdown_column(column_name: &str) -> bool {
-        matches!(
-            column_name,
-            "project_id" | "date" | "timestamp" | "id" | "level" | "status_code" | "resource___service___name" | "name" | "duration"
-        )
+        matches!(column_name, "project_id" | "date")
     }
 
     /// Apply time-series specific optimizations to filters
@@ -2004,7 +2285,23 @@ impl ProjectRoutingTable {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         table.update_datafusion_session(state).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let provider = table.table_provider().await.map_err(|e| DataFusionError::External(Box::new(e)))?;
+        // Build the delta-rs table provider with our session so its scan
+        // inherits `schema_force_view_types=false` (set in
+        // `create_session_context`). delta-rs's default is `true` (BinaryView),
+        // which mismatches our Binary-typed MemBuffer at the union and
+        // panics in physical planning. The session is a SessionState in
+        // practice; clone the concrete type so we can hand an
+        // `Arc<dyn Session + 'static>` to `with_session`.
+        let session_state = state
+            .as_any()
+            .downcast_ref::<datafusion::execution::context::SessionState>()
+            .cloned();
+        let provider = if let Some(ss) = session_state {
+            table.table_provider().with_session(Arc::new(ss)).await
+        } else {
+            table.table_provider().await
+        }
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Translate projection indices from our schema to delta table's schema.
         // DataFusion passes indices based on ProjectRoutingTable.schema, but the
@@ -2047,11 +2344,25 @@ impl ProjectRoutingTable {
             return Ok(plan);
         }
 
+        // Variant columns are an Arrow ExtensionType whose inner storage may
+        // be either Struct{Binary,Binary} or Struct{BinaryView,BinaryView}
+        // depending on which session built the scan plan. The
+        // parquet-variant-compute kernel and our UDFs accept both, so a
+        // per-row CAST(BinaryView→Binary) here is pure overhead — it was
+        // costing ~4× on `SELECT payload`. Skip the coercion for any field
+        // whose target type is Variant; let the kernel handle the layout.
+        let differs = |plan_field: &arrow_schema::Field, target_field: &arrow_schema::Field| -> bool {
+            if plan_field.data_type() == target_field.data_type() {
+                return false;
+            }
+            !crate::schema_loader::is_variant_type(target_field.data_type())
+        };
+
         let needs_coercion = plan_schema
             .fields()
             .iter()
             .zip(target_schema.fields())
-            .any(|(plan_field, target_field)| plan_field.data_type() != target_field.data_type());
+            .any(|(plan_field, target_field)| differs(plan_field, target_field));
 
         if !needs_coercion {
             return Ok(plan);
@@ -2064,7 +2375,7 @@ impl ProjectRoutingTable {
             .zip(target_schema.fields())
             .map(|((idx, plan_field), target_field)| {
                 let col_expr = Arc::new(PhysicalColumn::new(plan_field.name(), idx)) as Arc<dyn datafusion::physical_expr::PhysicalExpr>;
-                let expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = if plan_field.data_type() != target_field.data_type() {
+                let expr: Arc<dyn datafusion::physical_expr::PhysicalExpr> = if differs(plan_field, target_field) {
                     Arc::new(CastExpr::new(col_expr, target_field.data_type().clone(), None))
                 } else {
                     col_expr
@@ -2178,6 +2489,7 @@ impl DataSink for ProjectRoutingTable {
             debug!("write_all: received batch with {} rows", batch_rows);
             total_row_count += batch_rows;
             let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
+            let batch = normalize_timestamp_tz(batch);
             let converted = convert_variant_columns(batch, &target_schema)?;
             project_batches.entry(project_id).or_default().push(converted);
         }
@@ -2275,15 +2587,78 @@ impl TableProvider for ProjectRoutingTable {
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
         span.record("table.project_id", project_id.as_str());
 
-        let has_variant_columns = self.schema.fields().iter().any(|f| crate::schema_loader::is_variant_type(f.data_type()));
-        let real_schema = self.schema.clone();
-        let wrap_result = move |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> {
-            if has_variant_columns {
-                Ok(Arc::new(VariantToJsonExec::new(plan, real_schema.clone())))
-            } else {
-                Ok(plan)
+        // Tantivy prefilter: if the query contains text_match() and tantivy is
+        // available for this table, resolve the candidate (timestamp,id) set
+        // from the sidecar indexes. The resulting `id IN (..)` filter is added
+        // ONLY to the Delta scan — MemBuffer rows aren't in any sidecar index,
+        // so we keep their text_match() post-filter intact via the UDF's
+        // substring fallback (correctness: result = MemBuffer.text_match ∪ Delta.text_match).
+        let mut tantivy_id_filter: Option<Expr> = None;
+        if let Some(svc) = self.database.tantivy_search() {
+            let preds = crate::tantivy_index::udf::collect_text_matches(&optimized_filters);
+            if !preds.is_empty() {
+                use datafusion::logical_expr::{Expr, lit};
+                // `all_ids = None` means we have no authoritative prefilter
+                // (some index was missing or search failed). Treat as full
+                // scan; the text_match UDF post-filter preserves correctness.
+                let mut all_ids: Option<Vec<String>> = None;
+                let mut any_index = false;
+                for p in &preds {
+                    match svc.search(&self.table_name, &project_id, &p.column, &p.query).await {
+                        Ok(Some(hits)) => {
+                            any_index = true;
+                            let ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+                            all_ids = Some(match all_ids.take() {
+                                None => ids,
+                                Some(prev) => {
+                                    let prev_set: std::collections::HashSet<&str> = prev.iter().map(|s| s.as_str()).collect();
+                                    ids.into_iter().filter(|i| prev_set.contains(i.as_str())).collect()
+                                }
+                            });
+                        }
+                        Ok(None) => {
+                            // No usable index for this predicate — full scan + UDF post-filter.
+                            all_ids = None;
+                            any_index = false;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("tantivy search failed for {}/{}: {} — falling back to full scan", project_id, self.table_name, e);
+                            all_ids = None;
+                            any_index = false;
+                            break;
+                        }
+                    }
+                }
+                if any_index {
+                    if let Some(ids) = all_ids {
+                        tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
+                            expr: Box::new(datafusion::logical_expr::col("id")),
+                            list: ids.into_iter().map(lit).collect(),
+                            negated: false,
+                        }));
+                    }
+                }
             }
-        };
+        }
+
+        // Variant scan-boundary conversion REMOVED — see Variant-native plan,
+        // step 1. Previously every scan was wrapped in VariantToJsonExec which
+        // decoded Struct{Binary,Binary} → Utf8 JSON for every row read,
+        // costing 2–6× vs storing the same payload as Utf8 (per
+        // `bench/variant_bench.py`). Downstream plan nodes (variant_get,
+        // jsonb_path_exists, ->/->>) now receive Variant binary directly and
+        // call `parquet_variant_compute::variant_get` (vectorized,
+        // shredded-aware) for path extraction. JSON serialization for the
+        // wire only happens at the root projection — see
+        // VariantSelectRewriter.
+        //
+        // VariantToJsonExec is kept in this file for a possible
+        // prefix-collision fallback (`resource` next to
+        // `resource___service___name`); if the kernel-scan bug re-surfaces,
+        // wire it back via a column-rename shim, NOT a per-row JSON
+        // conversion.
+        let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> { Ok(plan) };
 
         // Check if buffered layer is configured
         let has_layer = self.database.buffered_layer().is_some();
@@ -2291,7 +2666,11 @@ impl TableProvider for ProjectRoutingTable {
         let Some(layer) = self.database.buffered_layer() else {
             // No buffered layer, query Delta directly
             debug!("No buffered layer, querying Delta only");
-            let plan = self.scan_delta_only(state, &project_id, projection, &optimized_filters, limit).await?;
+            let mut delta_only_filters = optimized_filters.clone();
+            if let Some(f) = tantivy_id_filter.clone() {
+                delta_only_filters.push(f);
+            }
+            let plan = self.scan_delta_only(state, &project_id, projection, &delta_only_filters, limit).await?;
             return wrap_result(plan);
         };
 
@@ -2303,12 +2682,13 @@ impl TableProvider for ProjectRoutingTable {
         // Extract query time range from filters
         let query_time_range = self.extract_time_range_from_filters(&optimized_filters);
 
-        // Determine if we can skip Delta (query entirely within MemBuffer range)
+        // Skip Delta when the query's lower bound is at/after MemBuffer's
+        // oldest row. Delta is excluded from MemBuffer's range by the
+        // per-bucket logic below, so no Delta row can satisfy
+        // `timestamp >= query_min` in that case — upper bound doesn't matter
+        // (covers open-ended `WHERE timestamp >= now() - 5m` dashboards).
         let skip_delta = match (mem_time_range, query_time_range) {
-            (Some((mem_oldest, mem_newest)), Some((query_min, query_max))) => {
-                // Skip Delta if query's entire time range is within MemBuffer
-                query_min >= mem_oldest && query_max <= mem_newest
-            }
+            (Some((mem_oldest, _)), Some((query_min, _))) => query_min >= mem_oldest,
             _ => false,
         };
 
@@ -2325,7 +2705,11 @@ impl TableProvider for ProjectRoutingTable {
         debug!("MemBuffer partitions count: {} for {}/{}", mem_partitions.len(), project_id, self.table_name);
         if mem_partitions.is_empty() {
             debug!("No MemBuffer data, querying Delta only for {}/{}", project_id, self.table_name);
-            let plan = self.scan_delta_only(state, &project_id, projection, &optimized_filters, limit).await?;
+            let mut delta_only_filters = optimized_filters.clone();
+            if let Some(f) = tantivy_id_filter.clone() {
+                delta_only_filters.push(f);
+            }
+            let plan = self.scan_delta_only(state, &project_id, projection, &delta_only_filters, limit).await?;
             return wrap_result(plan);
         }
 
@@ -2342,22 +2726,34 @@ impl TableProvider for ProjectRoutingTable {
             return wrap_result(mem_plan);
         }
 
-        // Get oldest timestamp from MemBuffer for time-based exclusion
-        let oldest_mem_ts = mem_time_range.map(|(oldest, _)| oldest);
-
-        // Build Delta filters with time exclusion
-        let delta_filters = if let Some(cutoff) = oldest_mem_ts {
-            let exclusion = Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(col("timestamp")),
-                op: Operator::Lt,
-                right: Box::new(lit(ScalarValue::TimestampMicrosecond(Some(cutoff), Some("UTC".into())))),
-            });
-            let mut filters = optimized_filters.clone();
-            filters.push(exclusion);
-            filters
-        } else {
-            optimized_filters.clone()
-        };
+        // Build Delta filters with per-bucket exclusion.
+        //
+        // The MemBuffer / Delta union must not double-count rows: any time
+        // range currently held by a MemBuffer bucket is served *by*
+        // MemBuffer (it's authoritative for those rows) so Delta must
+        // exclude them. The old logic used a single `timestamp < oldest_mem_ts`
+        // cutoff, which broke catastrophically when a bucket got stuck in
+        // MemBuffer (e.g. failed flush) — it dragged `oldest_mem_ts`
+        // backwards and wrongly hid all the Delta rows *above* it. Fixed
+        // by listing the actual ranges MemBuffer currently holds and
+        // excluding only those.
+        let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
+        let mut delta_filters = optimized_filters.clone();
+        let ts_col = || Box::new(col("timestamp"));
+        let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
+        for (start, end) in &mem_ranges {
+            // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
+            let below = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::Lt, right: ts_lit(*start) });
+            let at_or_above = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::GtEq, right: ts_lit(*end) });
+            delta_filters.push(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(below),
+                op: Operator::Or,
+                right: Box::new(at_or_above),
+            }));
+        }
+        if let Some(f) = tantivy_id_filter.clone() {
+            delta_filters.push(f);
+        }
 
         // Execute Delta query
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");

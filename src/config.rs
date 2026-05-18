@@ -19,6 +19,7 @@ pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
         maintenance: envy::from_env()?,
         memory: envy::from_env()?,
         telemetry: envy::from_env()?,
+        tantivy: envy::from_env()?,
     })
 }
 
@@ -51,6 +52,11 @@ macro_rules! const_default {
     };
     ($name:ident: u16 = $val:expr) => {
         fn $name() -> u16 {
+            $val
+        }
+    };
+    ($name:ident: u32 = $val:expr) => {
+        fn $name() -> u32 {
             $val
         }
     };
@@ -103,6 +109,21 @@ const_default!(d_shutdown_timeout: u64 = 5);
 const_default!(d_wal_corruption_threshold: usize = 10);
 const_default!(d_flush_parallelism: usize = 4);
 const_default!(d_wal_fsync_ms: u64 = 200);
+// MemBuffer bucket window (seconds). Smaller windows free RAM sooner because
+// the previous bucket becomes flushable sooner; larger windows amortize into
+// fewer/larger Delta commits. Default 600s (10 min) matches the historical
+// hardcoded value; high-throughput tenants benefit from 60–120s.
+const_default!(d_bucket_duration_secs: u64 = 600);
+// Memory pressure threshold (0–100) at which the flush task is woken
+// independently of the periodic flush timer. Triggers an early
+// `flush_completed_buckets` so MemBuffer drains before reservation reaches
+// the hard limit. 0 disables pressure-triggered flushes.
+const_default!(d_pressure_flush_pct: u32 = 75);
+// Durability mode for the WAL. One of:
+//   "ms"        — async fsync every `wal_fsync_ms` (default; ~200ms loss window)
+//   "sync_each" — fsync after every entry (zero data-loss window, ~1ms per write)
+//   "none"      — never fsync (test/throwaway data only)
+const_default!(d_wal_fsync_mode: String = "ms");
 const_default!(d_wal_max_files: usize = 200);
 const_default!(d_foyer_memory_mb: usize = 512);
 const_default!(d_foyer_disk_gb: usize = 100);
@@ -153,6 +174,53 @@ pub struct AppConfig {
     pub memory: MemoryConfig,
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
+    #[serde(flatten)]
+    pub tantivy: TantivyConfig,
+}
+
+const_default!(d_tantivy_max_index_mb: u64 = 64);
+const_default!(d_tantivy_cache_disk_gb: u64 = 4);
+const_default!(d_tantivy_zstd_level: i32 = 19);
+const_default!(d_tantivy_min_files: usize = 2);
+
+/// Tantivy sidecar-index configuration. Off by default; opt in per-table.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TantivyConfig {
+    #[serde(default)]
+    pub timefusion_tantivy_enabled: bool,
+    #[serde(default = "d_tantivy_max_index_mb")]
+    pub timefusion_tantivy_max_index_size_mb: u64,
+    #[serde(default = "d_tantivy_cache_disk_gb")]
+    pub timefusion_tantivy_cache_disk_gb: u64,
+    #[serde(default = "d_tantivy_zstd_level")]
+    pub timefusion_tantivy_compression_level: i32,
+    /// Comma-separated list of tables to index, e.g. "otel_logs_and_spans".
+    #[serde(default)]
+    pub timefusion_tantivy_indexed_tables: Option<String>,
+    #[serde(default = "d_tantivy_min_files")]
+    pub timefusion_tantivy_min_files_for_pushdown: usize,
+}
+
+impl TantivyConfig {
+    pub fn enabled(&self) -> bool {
+        self.timefusion_tantivy_enabled
+    }
+    pub fn indexed_tables(&self) -> Vec<String> {
+        self.timefusion_tantivy_indexed_tables
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+    pub fn is_table_indexed(&self, table: &str) -> bool {
+        self.enabled() && self.indexed_tables().iter().any(|t| t == table)
+    }
+    pub fn compression_level(&self) -> i32 {
+        self.timefusion_tantivy_compression_level
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -275,8 +343,22 @@ pub struct BufferConfig {
     pub timefusion_flush_immediately: bool,
     #[serde(default = "d_wal_fsync_ms")]
     pub timefusion_wal_fsync_ms: u64,
+    #[serde(default = "d_wal_fsync_mode")]
+    pub timefusion_wal_fsync_mode: String,
     #[serde(default = "d_wal_max_files")]
     pub timefusion_wal_max_file_count: usize,
+    #[serde(default = "d_bucket_duration_secs")]
+    pub timefusion_bucket_duration_secs: u64,
+    #[serde(default = "d_pressure_flush_pct")]
+    pub timefusion_pressure_flush_pct: u32,
+}
+
+/// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
+#[derive(Debug, Clone, Copy)]
+pub enum WalFsyncMode {
+    Milliseconds(u64),
+    SyncEach,
+    None,
 }
 
 impl BufferConfig {
@@ -304,8 +386,21 @@ impl BufferConfig {
     pub fn wal_fsync_ms(&self) -> u64 {
         self.timefusion_wal_fsync_ms.max(1)
     }
+    pub fn wal_fsync_mode(&self) -> WalFsyncMode {
+        match self.timefusion_wal_fsync_mode.to_ascii_lowercase().as_str() {
+            "sync_each" | "synceach" | "each" => WalFsyncMode::SyncEach,
+            "none" | "off" | "disabled" => WalFsyncMode::None,
+            _ => WalFsyncMode::Milliseconds(self.wal_fsync_ms()),
+        }
+    }
     pub fn wal_max_file_count(&self) -> usize {
         self.timefusion_wal_max_file_count
+    }
+    pub fn bucket_duration_secs(&self) -> u64 {
+        self.timefusion_bucket_duration_secs.max(1)
+    }
+    pub fn pressure_flush_pct(&self) -> u32 {
+        self.timefusion_pressure_flush_pct.min(100)
     }
 
     pub fn compute_shutdown_timeout(&self, current_memory_mb: usize) -> Duration {

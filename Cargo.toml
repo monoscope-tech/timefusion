@@ -21,9 +21,11 @@ log = "0.4.27"
 color-eyre = "0.6.5"
 arrow-schema = "58"
 regex = "1.11.1"
-# delta-rs PR #4325 — variant type support, with timefusion-specific fixes
-# (defaults schema_force_view_types to false so variant scans yield Binary, not BinaryView)
-deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", branch = "timefusion-fixes", features = [
+# delta-rs main + local Variant DML fix. Branch `timefusion-variant-dml` on
+# our fork carries the write_data_plan normalization for issue #40
+# ("Expected Struct(Binary), got Struct(BinaryView)" on DELETE/UPDATE).
+# Rebase the branch onto upstream main when picking up newer revs.
+deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", branch = "timefusion-variant-dml", features = [
   "datafusion",
   "s3",
 ] }
@@ -86,6 +88,10 @@ base64 = "0.22"
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
+tantivy = "0.22"
+tar = "0.4"
+zstd = "0.13"
+tempfile = "3"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
@@ -107,6 +113,27 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 name = "core_benchmarks"
 harness = false
 
+[[bench]]
+name = "tantivy_benchmarks"
+harness = false
+
+[[bench]]
+name = "sort_layout_benchmarks"
+harness = false
+
 [features]
 default = []
 test = []
+
+# Local patch: arrow-pg 0.13.0's UUID parameter decoder calls
+# `portal.parameter::<String>`, which pgwire rejects for the UUID OID and
+# breaks any client (Hasql, tokio-postgres binary) sending UUIDs. Vendored
+# copy decodes as `uuid::Uuid` then stringifies into the Utf8 column.
+[patch.crates-io]
+arrow-pg = { path = "vendor/arrow-pg" }
+# Local patch: datafusion-postgres 0.16.0's `ordered_param_types` sorts
+# placeholders lexicographically (`$10` before `$2`), so multi-row INSERTs
+# with >9 placeholders return the wrong type-by-position to the client.
+# Vendored copy sorts by numeric suffix instead.
+datafusion-postgres = { path = "vendor/datafusion-postgres" }
+

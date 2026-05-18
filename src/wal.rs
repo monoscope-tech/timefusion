@@ -1,8 +1,6 @@
-use crate::schema_loader::{get_default_schema, get_schema};
-use arrow::array::{Array, ArrayRef, RecordBatch, make_array};
-use arrow::buffer::{Buffer, NullBuffer};
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
 use bincode::{Decode, Encode};
 use dashmap::DashSet;
 use std::path::PathBuf;
@@ -32,12 +30,17 @@ pub enum WalError {
     EmptyBatch,
 }
 
-/// Magic bytes to identify new WAL format with DML support
-const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32]; // "WAL2"
-/// Version byte must be > 2 to distinguish from legacy operation bytes (0=Insert, 1=Delete, 2=Update)
-const WAL_VERSION: u8 = 128;
-/// Version 129: Arrow IPC format - embeds schema, handles all Arrow types automatically
-const WAL_VERSION_IPC: u8 = 129;
+/// Magic bytes to identify the WAL format ("WAL2").
+const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32];
+/// Insert batches are stored as Arrow IPC stream bytes. Embeds the schema so
+/// the reader doesn't need a separate registry lookup, and round-trips every
+/// Arrow type (List/Struct/Variant/…) without the per-buffer bincode shuffle
+/// the older CompactBatch format required.
+///
+/// Version byte must be > 2 to distinguish from legacy operation bytes
+/// (0=Insert, 1=Delete, 2=Update). We're at 130; older formats are intentionally
+/// unsupported — wipe the WAL directory if upgrading.
+const WAL_VERSION: u8 = 130;
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 /// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
 const MAX_BATCH_SIZE: usize = 100 * 1024 * 1024;
@@ -97,103 +100,49 @@ pub struct UpdatePayload {
     pub assignments: Vec<(String, String)>,
 }
 
-/// Compact representation of a column's raw Arrow buffers (no schema embedded)
-#[derive(Debug, Encode, Decode)]
-struct CompactColumn {
-    null_bitmap: Option<Vec<u8>>,
-    buffers: Vec<Vec<u8>>,
-    children: Vec<CompactColumn>,
-    null_count: usize,
-    /// Length of child arrays (needed for List types where child length != parent length)
-    child_lens: Vec<usize>,
-}
-
-/// Compact batch without schema - just raw column data
-#[derive(Debug, Encode, Decode)]
-struct CompactBatch {
-    num_rows: usize,
-    columns: Vec<CompactColumn>,
-}
-
-impl CompactColumn {
-    fn from_array(array: &dyn Array) -> Self {
-        let data = array.to_data();
-        Self {
-            null_bitmap: data.nulls().map(|n| n.buffer().as_slice().to_vec()),
-            buffers: data.buffers().iter().map(|b| b.as_slice().to_vec()).collect(),
-            children: data.child_data().iter().map(Self::from_array_data).collect(),
-            null_count: data.null_count(),
-            child_lens: data.child_data().iter().map(|c| c.len()).collect(),
-        }
-    }
-
-    fn from_array_data(data: &arrow::array::ArrayData) -> Self {
-        Self {
-            null_bitmap: data.nulls().map(|n| n.buffer().as_slice().to_vec()),
-            buffers: data.buffers().iter().map(|b| b.as_slice().to_vec()).collect(),
-            children: data.child_data().iter().map(Self::from_array_data).collect(),
-            null_count: data.null_count(),
-            child_lens: data.child_data().iter().map(|c| c.len()).collect(),
-        }
-    }
-
-    fn to_array_data(&self, data_type: &DataType, len: usize) -> Result<arrow::array::ArrayData, WalError> {
-        let null_buffer = self
-            .null_bitmap
-            .as_ref()
-            .map(|b| NullBuffer::new(arrow::buffer::BooleanBuffer::new(Buffer::from(b.as_slice()), 0, len)));
-        let buffers: Vec<Buffer> = self.buffers.iter().map(|b| Buffer::from(b.as_slice())).collect();
-
-        let child_data: Result<Vec<arrow::array::ArrayData>, WalError> = match data_type {
-            DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => self
-                .children
-                .iter()
-                .zip(&self.child_lens)
-                .map(|(child, &child_len)| child.to_array_data(field.data_type(), child_len))
-                .collect(),
-            DataType::Struct(fields) => self
-                .children
-                .iter()
-                .zip(fields.iter())
-                .zip(&self.child_lens)
-                .map(|((child, field), &child_len)| child.to_array_data(field.data_type(), child_len))
-                .collect(),
-            DataType::Map(field, _) => self
-                .children
-                .iter()
-                .zip(&self.child_lens)
-                .map(|(child, &child_len)| child.to_array_data(field.data_type(), child_len))
-                .collect(),
-            _ => Ok(vec![]),
-        };
-
-        arrow::array::ArrayData::try_new(
-            data_type.clone(),
-            len,
-            null_buffer.map(|n| n.into_inner().into_inner()),
-            0,
-            buffers,
-            child_data?,
-        )
-        .map_err(WalError::ArrowIpc)
-    }
-}
+/// Number of walrus shards per logical (project_id, table_name) topic.
+/// Walrus serializes appends within a single collection — the per-collection
+/// `is_batch_writing` AtomicBool returns WouldBlock on concurrent batch
+/// writes. Routing each write to one of N hash-distinguished shards lifts the
+/// single-project ceiling near-linearly (different shards never contend on
+/// the same walrus block/offset), at the cost of merging N streams in
+/// timestamp order during recovery.
+///
+/// 4 is a defensible default for a developer/single-host workload; production
+/// deployments can override via `TIMEFUSION_WAL_SHARDS_PER_TOPIC`.
+const WAL_SHARDS_PER_TOPIC_DEFAULT: usize = 4;
 
 pub struct WalManager {
     wal: Walrus,
     data_dir: PathBuf,
+    /// Logical topic strings ("{project_id}:{table_name}") — one entry per
+    /// (project, table). Each maps to `shards_per_topic` walrus collections.
     known_topics: DashSet<String>,
+    /// Per-topic round-robin counter chooses which shard the next batch is
+    /// appended to. Topic-scoped (rather than global) so we don't penalize
+    /// the cold-cache miss for an idle topic.
+    shard_counter: dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
+    shards_per_topic: usize,
 }
 
 impl WalManager {
     pub fn new(data_dir: PathBuf) -> Result<Self, WalError> {
-        Self::with_fsync_ms(data_dir, FSYNC_SCHEDULE_MS)
+        Self::with_fsync_mode(data_dir, crate::config::WalFsyncMode::Milliseconds(FSYNC_SCHEDULE_MS))
     }
 
     pub fn with_fsync_ms(data_dir: PathBuf, fsync_ms: u64) -> Result<Self, WalError> {
+        Self::with_fsync_mode(data_dir, crate::config::WalFsyncMode::Milliseconds(fsync_ms))
+    }
+
+    pub fn with_fsync_mode(data_dir: PathBuf, mode: crate::config::WalFsyncMode) -> Result<Self, WalError> {
         std::fs::create_dir_all(&data_dir)?;
 
-        let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(fsync_ms))?;
+        let schedule = match mode {
+            crate::config::WalFsyncMode::Milliseconds(ms) => FsyncSchedule::Milliseconds(ms),
+            crate::config::WalFsyncMode::SyncEach => FsyncSchedule::SyncEach,
+            crate::config::WalFsyncMode::None => FsyncSchedule::NoFsync,
+        };
+        let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, schedule)?;
 
         // Load known topics from index file
         let meta_dir = data_dir.join(".timefusion_meta");
@@ -207,13 +156,25 @@ impl WalManager {
             }
         }
 
-        info!("WAL initialized at {:?}, known topics: {}", data_dir, known_topics.len());
-        Ok(Self { wal, data_dir, known_topics })
+        let shards_per_topic = std::env::var("TIMEFUSION_WAL_SHARDS_PER_TOPIC")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(WAL_SHARDS_PER_TOPIC_DEFAULT);
+
+        info!("WAL initialized at {:?}, known topics: {}, shards/topic: {}", data_dir, known_topics.len(), shards_per_topic);
+        Ok(Self {
+            wal,
+            data_dir,
+            known_topics,
+            shard_counter: dashmap::DashMap::new(),
+            shards_per_topic,
+        })
     }
 
     // Persist topic to index file. Called after WAL append - if crash occurs between
-    // append and persist, orphan entries are still recovered via read_all_entries_raw
-    // which scans all WAL topics in the directory regardless of index.
+    // append and persist, orphan entries are still recovered via for_each_entry
+    // which scans all known WAL topics in the directory.
     fn persist_topic(&self, topic: &str) {
         if self.known_topics.insert(topic.to_string()) {
             let meta_dir = self.data_dir.join(".timefusion_meta");
@@ -238,14 +199,30 @@ impl WalManager {
         format!("{}:{}", project_id, table_name)
     }
 
-    /// Short hash for walrus topic key (walrus has 62-byte metadata limit)
-    fn walrus_topic_key(project_id: &str, table_name: &str) -> String {
+    /// Short hash for walrus topic key, scoped to a shard so we get N
+    /// independent walrus collections per logical (project, table).
+    /// Walrus's metadata budget is 62 bytes; 16 hex chars + a `-` + 2 digits
+    /// shard suffix stays well under.
+    fn walrus_topic_key(project_id: &str, table_name: &str, shard: usize) -> String {
         use ahash::AHasher;
         use std::hash::{Hash, Hasher};
         let mut hasher = AHasher::default();
         project_id.hash(&mut hasher);
         table_name.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        format!("{:016x}-{:02}", hasher.finish(), shard)
+    }
+
+    /// Round-robin shard chooser for a topic. Bumps a per-topic counter so
+    /// concurrent batches for the same topic spread across N walrus
+    /// collections rather than serializing at walrus's per-collection write
+    /// lock.
+    fn pick_shard(&self, topic: &str) -> usize {
+        use std::sync::atomic::Ordering;
+        let counter = self
+            .shard_counter
+            .entry(topic.to_string())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+        (counter.fetch_add(1, Ordering::Relaxed) as usize) % self.shards_per_topic
     }
 
     fn parse_topic(topic: &str) -> Option<(String, String)> {
@@ -255,18 +232,20 @@ impl WalManager {
     #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
     pub fn append(&self, project_id: &str, table_name: &str, batch: &RecordBatch) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
-        let walrus_key = Self::walrus_topic_key(project_id, table_name);
+        let shard = self.pick_shard(&topic);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let entry = WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?);
         self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
-        debug!("WAL append INSERT: topic={}, rows={}", topic, batch.num_rows());
+        debug!("WAL append INSERT: topic={}, shard={}, rows={}", topic, shard, batch.num_rows());
         Ok(())
     }
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub fn append_batch(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
-        let walrus_key = Self::walrus_topic_key(project_id, table_name);
+        let shard = self.pick_shard(&topic);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let payloads: Vec<Vec<u8>> = batches
             .iter()
             .map(|batch| serialize_wal_entry(&WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?)))
@@ -275,14 +254,15 @@ impl WalManager {
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         self.wal.batch_append_for_topic(&walrus_key, &payload_refs)?;
         self.persist_topic(&topic);
-        debug!("WAL batch append INSERT: topic={}, batches={}", topic, batches.len());
+        debug!("WAL batch append INSERT: topic={}, shard={}, batches={}", topic, shard, batches.len());
         Ok(())
     }
 
     #[instrument(skip(self), fields(project_id, table_name))]
     pub fn append_delete(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
-        let walrus_key = Self::walrus_topic_key(project_id, table_name);
+        let shard = self.pick_shard(&topic);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let data = bincode::encode_to_vec(
             &DeletePayload {
                 predicate_sql: predicate_sql.map(String::from),
@@ -292,14 +272,15 @@ impl WalManager {
         let entry = WalEntry::new(project_id, table_name, WalOperation::Delete, data);
         self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
-        debug!("WAL append DELETE: topic={}, predicate={:?}", topic, predicate_sql);
+        debug!("WAL append DELETE: topic={}, shard={}, predicate={:?}", topic, shard, predicate_sql);
         Ok(())
     }
 
     #[instrument(skip(self, assignments), fields(project_id, table_name))]
     pub fn append_update(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)]) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
-        let walrus_key = Self::walrus_topic_key(project_id, table_name);
+        let shard = self.pick_shard(&topic);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let payload = UpdatePayload {
             predicate_sql: predicate_sql.map(String::from),
             assignments: assignments.to_vec(),
@@ -308,8 +289,9 @@ impl WalManager {
         self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
         debug!(
-            "WAL append UPDATE: topic={}, predicate={:?}, assignments={}",
+            "WAL append UPDATE: topic={}, shard={}, predicate={:?}, assignments={}",
             topic,
+            shard,
             predicate_sql,
             assignments.len()
         );
@@ -321,29 +303,35 @@ impl WalManager {
         &self, project_id: &str, table_name: &str, since_timestamp_micros: Option<i64>, checkpoint: bool,
     ) -> Result<(Vec<WalEntry>, usize), WalError> {
         let topic = Self::make_topic(project_id, table_name);
-        let walrus_key = Self::walrus_topic_key(project_id, table_name);
         let cutoff = since_timestamp_micros.unwrap_or(0);
         let mut results = Vec::new();
         let mut error_count = 0usize;
 
-        loop {
-            match self.wal.read_next(&walrus_key, checkpoint) {
-                Ok(Some(entry_data)) => match deserialize_wal_entry(&entry_data.data) {
-                    Ok(entry) if entry.timestamp_micros >= cutoff => results.push(entry),
-                    Ok(_) => {} // Skip old entries
+        // Each topic is split across `shards_per_topic` walrus collections; we
+        // drain each in append order, then sort the merged slice by
+        // timestamp so the caller sees a topic-wide ordering.
+        for shard in 0..self.shards_per_topic {
+            let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
+            loop {
+                match self.wal.read_next(&walrus_key, checkpoint) {
+                    Ok(Some(entry_data)) => match deserialize_wal_entry(&entry_data.data) {
+                        Ok(entry) if entry.timestamp_micros >= cutoff => results.push(entry),
+                        Ok(_) => {} // Skip old entries
+                        Err(e) => {
+                            warn!("Skipping corrupted WAL entry: {}", e);
+                            error_count += 1;
+                        }
+                    },
+                    Ok(None) => break,
                     Err(e) => {
-                        warn!("Skipping corrupted WAL entry: {}", e);
+                        error!("I/O error reading WAL shard {}: {}", shard, e);
                         error_count += 1;
+                        break;
                     }
-                },
-                Ok(None) => break,
-                Err(e) => {
-                    error!("I/O error reading WAL: {}", e);
-                    error_count += 1;
-                    break;
                 }
             }
         }
+        results.sort_by_key(|e| e.timestamp_micros);
 
         if error_count > 0 {
             warn!("WAL read: topic={}, entries={}, errors={}", topic, results.len(), error_count);
@@ -353,41 +341,95 @@ impl WalManager {
         Ok((results, error_count))
     }
 
-    #[instrument(skip(self))]
-    pub fn read_all_entries_raw(&self, since_timestamp_micros: Option<i64>, checkpoint: bool) -> Result<(Vec<WalEntry>, usize), WalError> {
+    /// Stream every WAL entry past `since_timestamp_micros` through `callback`.
+    /// Bounded recovery memory: at most one entry per shard is alive at a
+    /// time, vs the old `read_all_entries_raw` which materialized the entire
+    /// post-cutoff slice (millions of entries / GiBs at long retention) into
+    /// a Vec.
+    ///
+    /// Within each topic, the N shard streams are merged by `timestamp_micros`
+    /// using a min-heap (k-way merge), so DELETE-after-INSERT ordering within
+    /// a topic is preserved even when those operations happen on different
+    /// shards. Cross-topic ordering is not preserved — that's fine because
+    /// DELETE and UPDATE only mutate their own topic's MemBuffer.
+    #[instrument(skip(self, callback))]
+    pub fn for_each_entry<F>(&self, since_timestamp_micros: Option<i64>, checkpoint: bool, mut callback: F) -> Result<(u64, usize), WalError>
+    where
+        F: FnMut(WalEntry),
+    {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+
         let cutoff = since_timestamp_micros.unwrap_or(0);
+        let mut total_entries = 0u64;
+        let mut total_errors = 0usize;
 
-        let (mut all_results, total_errors) = self.list_topics()?.into_iter().filter_map(|topic| Self::parse_topic(&topic).map(|(p, t)| (topic, p, t))).fold(
-            (Vec::new(), 0usize),
-            |(mut results, mut errors), (topic, project_id, table_name)| {
-                match self.read_entries_raw(&project_id, &table_name, Some(cutoff), checkpoint) {
-                    Ok((entries, err_count)) => {
-                        results.extend(entries);
-                        errors += err_count;
-                    }
-                    Err(e) => {
-                        warn!("Failed to read entries for topic {}: {}", topic, e);
-                        errors += 1;
-                    }
+        for topic in self.list_topics()? {
+            let Some((project_id, table_name)) = Self::parse_topic(&topic) else { continue };
+
+            // Prime the heap with each shard's first eligible entry. Heap is
+            // keyed by (timestamp, shard) so smaller timestamps come out first;
+            // shard index breaks ties deterministically. The entry payload
+            // travels alongside the key in a parallel Vec slot indexed by
+            // shard, avoiding the `Ord` bound on `WalEntry`.
+            //
+            // Invariant: at most one in-flight entry per shard is alive at a
+            // time → recovery memory is O(shards_per_topic), not O(total entries).
+            let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::with_capacity(self.shards_per_topic);
+            let shard_keys: Vec<String> = (0..self.shards_per_topic).map(|s| Self::walrus_topic_key(&project_id, &table_name, s)).collect();
+            let mut pending: Vec<Option<WalEntry>> = (0..self.shards_per_topic).map(|_| None).collect();
+            for shard in 0..self.shards_per_topic {
+                if let Some(entry) = Self::next_eligible_from_shard(&self.wal, &shard_keys[shard], cutoff, checkpoint, &mut total_errors) {
+                    heap.push(Reverse((entry.timestamp_micros, shard)));
+                    pending[shard] = Some(entry);
                 }
-                (results, errors)
-            },
-        );
+            }
 
-        all_results.sort_by_key(|e| e.timestamp_micros);
+            while let Some(Reverse((_, shard))) = heap.pop() {
+                let entry = pending[shard].take().expect("heap and pending out of sync");
+                total_entries += 1;
+                callback(entry);
+                if let Some(next) = Self::next_eligible_from_shard(&self.wal, &shard_keys[shard], cutoff, checkpoint, &mut total_errors) {
+                    heap.push(Reverse((next.timestamp_micros, shard)));
+                    pending[shard] = Some(next);
+                }
+            }
+        }
 
         if total_errors > 0 {
-            warn!("WAL read all: total_entries={}, cutoff={}, errors={}", all_results.len(), cutoff, total_errors);
+            warn!("WAL read all: total_entries={}, cutoff={}, errors={}", total_entries, cutoff, total_errors);
         } else {
-            info!("WAL read all: total_entries={}, cutoff={}", all_results.len(), cutoff);
+            info!("WAL read all: total_entries={}, cutoff={}", total_entries, cutoff);
         }
-        Ok((all_results, total_errors))
+        Ok((total_entries, total_errors))
     }
 
-    pub fn deserialize_batch(data: &[u8], table_name: &str) -> Result<RecordBatch, WalError> {
-        let schema = get_schema(table_name).map(|s| s.schema_ref()).unwrap_or_else(|| get_default_schema().schema_ref());
-        // Try CompactBatch (v128) first, fall back to IPC (v129) for backward compat
-        deserialize_record_batch(data, &schema).or_else(|_| deserialize_record_batch_ipc(data))
+    /// Read until we get an entry whose timestamp is `>= cutoff`, dropping
+    /// older entries and skipping corrupted ones. Returns `None` at end of
+    /// stream. Shared by `for_each_entry`'s k-way merge.
+    fn next_eligible_from_shard(wal: &Walrus, key: &str, cutoff: i64, checkpoint: bool, errors: &mut usize) -> Option<WalEntry> {
+        loop {
+            match wal.read_next(key, checkpoint) {
+                Ok(Some(d)) => match deserialize_wal_entry(&d.data) {
+                    Ok(entry) if entry.timestamp_micros >= cutoff => return Some(entry),
+                    Ok(_) => continue, // drop pre-cutoff
+                    Err(e) => {
+                        warn!("Skipping corrupted WAL entry on shard {}: {}", key, e);
+                        *errors += 1;
+                    }
+                },
+                Ok(None) => return None,
+                Err(e) => {
+                    error!("I/O error reading WAL shard {}: {}", key, e);
+                    *errors += 1;
+                    return None;
+                }
+            }
+        }
+    }
+
+    pub fn deserialize_batch(data: &[u8], _table_name: &str) -> Result<RecordBatch, WalError> {
+        deserialize_record_batch(data)
     }
 
     pub fn list_topics(&self) -> Result<Vec<String>, WalError> {
@@ -397,15 +439,17 @@ impl WalManager {
     #[instrument(skip(self))]
     pub fn checkpoint(&self, project_id: &str, table_name: &str) -> Result<(), WalError> {
         let topic = Self::make_topic(project_id, table_name);
-        let walrus_key = Self::walrus_topic_key(project_id, table_name);
         let mut count = 0;
-        loop {
-            match self.wal.read_next(&walrus_key, true) {
-                Ok(Some(_)) => count += 1,
-                Ok(None) => break,
-                Err(e) => {
-                    warn!("Error during checkpoint for {}: {}", topic, e);
-                    break;
+        for shard in 0..self.shards_per_topic {
+            let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
+            loop {
+                match self.wal.read_next(&walrus_key, true) {
+                    Ok(Some(_)) => count += 1,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("Error during checkpoint for {} shard {}: {}", topic, shard, e);
+                        break;
+                    }
                 }
             }
         }
@@ -417,6 +461,18 @@ impl WalManager {
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
+    }
+
+    /// Configured number of walrus collections per logical topic. Reported
+    /// out for `timefusion.stats()` so operators can see effective parallelism.
+    pub fn shards_per_topic(&self) -> usize {
+        self.shards_per_topic
+    }
+
+    /// Number of registered logical topics (one per (project, table) pair),
+    /// independent of shard count.
+    pub fn known_topic_count(&self) -> usize {
+        self.known_topics.len()
     }
 
     /// Returns WAL file count and total size in bytes by scanning the data directory.
@@ -438,14 +494,16 @@ impl WalManager {
 }
 
 fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
-    let compact = CompactBatch {
-        num_rows: batch.num_rows(),
-        columns: batch.columns().iter().map(|c| CompactColumn::from_array(c.as_ref())).collect(),
-    };
-    bincode::encode_to_vec(&compact, BINCODE_CONFIG).map_err(WalError::BincodeEncode)
+    let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 1024);
+    {
+        let mut w = StreamWriter::try_new_with_options(&mut buf, batch.schema_ref(), IpcWriteOptions::default())?;
+        w.write(batch)?;
+        w.finish()?;
+    }
+    Ok(buf)
 }
 
-fn deserialize_record_batch_ipc(data: &[u8]) -> Result<RecordBatch, WalError> {
+fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
     if data.len() > MAX_BATCH_SIZE {
         return Err(WalError::BatchTooLarge {
             size: data.len(),
@@ -457,24 +515,6 @@ fn deserialize_record_batch_ipc(data: &[u8]) -> Result<RecordBatch, WalError> {
         return Ok(batch?);
     }
     Err(WalError::EmptyBatch)
-}
-
-/// Legacy CompactBatch deserialization for WAL version 128
-fn deserialize_record_batch(data: &[u8], schema: &SchemaRef) -> Result<RecordBatch, WalError> {
-    if data.len() > MAX_BATCH_SIZE {
-        return Err(WalError::BatchTooLarge {
-            size: data.len(),
-            max: MAX_BATCH_SIZE,
-        });
-    }
-    let (compact, _): (CompactBatch, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
-    let arrays: Result<Vec<ArrayRef>, WalError> = compact
-        .columns
-        .iter()
-        .zip(schema.fields())
-        .map(|(col, field)| Ok(make_array(col.to_array_data(field.data_type(), compact.num_rows)?)))
-        .collect();
-    RecordBatch::try_new(schema.clone(), arrays?).map_err(WalError::ArrowIpc)
 }
 
 fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, WalError> {
@@ -490,37 +530,21 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
         return Err(WalError::TooShort { len: data.len() });
     }
 
-    if data[0..4] == WAL_MAGIC {
-        // WAL format detection based on byte 4:
-        // - v0 (legacy): data[4] is operation byte (0=Insert, 1=Delete, 2=Update)
-        // - v1+ (current): data[4] is version byte (>=128), data[5] is operation
-        // Since WalOperation values are 0-2 and WAL_VERSION is 128, we can safely
-        // distinguish formats: if data[4] > 2, it must be a version byte, not an operation.
-        if data[4] > 2 {
-            if data.len() < 6 {
-                return Err(WalError::TooShort { len: data.len() });
-            }
-            if data[4] != WAL_VERSION && data[4] != WAL_VERSION_IPC {
-                return Err(WalError::UnsupportedVersion {
-                    version: data[4],
-                    expected: WAL_VERSION_IPC,
-                });
-            }
-            WalOperation::try_from(data[5])?;
-            let (entry, _): (WalEntry, _) = bincode::decode_from_slice(&data[6..], BINCODE_CONFIG)?;
-            Ok(entry)
-        } else {
-            // Legacy v0: magic + operation + data
-            WalOperation::try_from(data[4])?;
-            let (entry, _): (WalEntry, _) = bincode::decode_from_slice(&data[5..], BINCODE_CONFIG)?;
-            Ok(entry)
-        }
-    } else {
-        // Ancient format - no magic header, assume INSERT
-        let (mut entry, _): (WalEntry, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
-        entry.operation = WalOperation::Insert;
-        Ok(entry)
+    if data[0..4] != WAL_MAGIC {
+        return Err(WalError::UnsupportedVersion {
+            version: data[0],
+            expected: WAL_VERSION,
+        });
     }
+    if data.len() < 6 || data[4] != WAL_VERSION {
+        return Err(WalError::UnsupportedVersion {
+            version: data[4],
+            expected: WAL_VERSION,
+        });
+    }
+    WalOperation::try_from(data[5])?;
+    let (entry, _): (WalEntry, _) = bincode::decode_from_slice(&data[6..], BINCODE_CONFIG)?;
+    Ok(entry)
 }
 
 pub fn deserialize_delete_payload(data: &[u8]) -> Result<DeletePayload, WalError> {
@@ -555,9 +579,8 @@ mod tests {
     #[test]
     fn test_record_batch_serialization() {
         let batch = create_test_batch();
-        let schema = batch.schema();
         let serialized = serialize_record_batch(&batch).unwrap();
-        let deserialized = deserialize_record_batch(&serialized, &schema).unwrap();
+        let deserialized = deserialize_record_batch(&serialized).unwrap();
         assert_eq!(batch.num_rows(), deserialized.num_rows());
         assert_eq!(batch.num_columns(), deserialized.num_columns());
     }

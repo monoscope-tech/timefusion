@@ -1,0 +1,28 @@
+syntax = "proto3";
+package timefusion.v1;
+
+// Streaming ingestion service. Clients open a single bidi stream and push
+// WriteBatch messages continuously; the server emits a WriteAck for every
+// batch, signalling backpressure via `status` and `mem_pressure_pct`.
+service Ingest {
+  rpc Write(stream WriteBatch) returns (stream WriteAck);
+}
+
+message WriteBatch {
+  uint64 seq = 1;            // client-assigned, echoed in ack
+  string project_id = 2;
+  string table_name = 3;
+  bytes  arrow_ipc = 4;      // Arrow IPC stream-format payload (1+ RecordBatches)
+}
+
+message WriteAck {
+  enum Status {
+    OK = 0;       // accepted & durable in WAL/MemBuffer
+    RETRY = 1;    // soft backpressure — client should slow down and resend
+    REJECT = 2;   // hard error — see `error`, do not retry as-is
+  }
+  uint64 seq = 1;
+  Status status = 2;
+  uint32 mem_pressure_pct = 3;  // 0..100, MemBuffer fill ratio
+  string error = 4;             // populated only when status != OK
+}
