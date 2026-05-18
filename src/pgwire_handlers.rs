@@ -1,6 +1,10 @@
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use datafusion_postgres::DfSessionService;
+use datafusion_postgres::hooks::QueryHook;
+use datafusion_postgres::hooks::set_show::SetShowHook;
+use datafusion_postgres::hooks::transactions::TransactionStatementHook;
+use crate::plan_cache::PlanCacheHook;
 use datafusion_postgres::pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
 use datafusion_postgres::pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler};
 use datafusion_postgres::pgwire::api::portal::Portal;
@@ -66,21 +70,39 @@ impl AuthSource for ConfigAuthSource {
 pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
     auth_config: AuthConfig,
+    plan_cache: Arc<PlanCacheHook>,
 }
 
 impl LoggingHandlerFactory {
     pub fn new(session_context: Arc<SessionContext>, auth_config: AuthConfig) -> Self {
-        Self { session_context, auth_config }
+        let plan_cache = Arc::new(PlanCacheHook::default());
+        crate::plan_cache::set_global(plan_cache.clone());
+        Self { session_context, auth_config, plan_cache }
+    }
+
+    /// Hook list passed to every `DfSessionService` instance the factory
+    /// produces. Sharing the single `plan_cache` Arc is what makes the LRU
+    /// global rather than per-connection.
+    fn hooks(&self) -> Vec<Arc<dyn QueryHook>> {
+        vec![
+            self.plan_cache.clone() as Arc<dyn QueryHook>,
+            Arc::new(SetShowHook),
+            Arc::new(TransactionStatementHook),
+        ]
+    }
+
+    pub fn plan_cache(&self) -> Arc<PlanCacheHook> {
+        self.plan_cache.clone()
     }
 }
 
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        Arc::new(LoggingSimpleQueryHandler::new(self.session_context.clone()))
+        Arc::new(LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()))
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        Arc::new(LoggingExtendedQueryHandler::new(self.session_context.clone()))
+        Arc::new(LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()))
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
@@ -115,6 +137,12 @@ impl LoggingSimpleQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
         Self {
             inner: DfSessionService::new(session_context),
+        }
+    }
+
+    pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
+        Self {
+            inner: DfSessionService::new_with_hooks(session_context, hooks),
         }
     }
 }
@@ -194,6 +222,12 @@ impl LoggingExtendedQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
         Self {
             inner: DfSessionService::new(session_context),
+        }
+    }
+
+    pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
+        Self {
+            inner: DfSessionService::new_with_hooks(session_context, hooks),
         }
     }
 }

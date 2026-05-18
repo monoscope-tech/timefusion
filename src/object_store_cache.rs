@@ -113,17 +113,17 @@ pub struct FoyerCacheConfig {
 impl Default for FoyerCacheConfig {
     fn default() -> Self {
         Self {
-            memory_size_bytes: 536_870_912,    // 512MB
-            disk_size_bytes: 107_374_182_400,  // 100GB
-            ttl: Duration::from_secs(604_800), // 7 days
+            memory_size_bytes: 134_217_728,   // 128MB
+            disk_size_bytes: 107_374_182_400, // 100GB
+            ttl: Duration::from_secs(86_400), // 24h
             cache_dir: PathBuf::from("/tmp/timefusion_cache"),
             shards: 8,
             file_size_bytes: 16_777_216, // 16MB - good for Parquet files
             enable_stats: true,
-            parquet_metadata_size_hint: 1_048_576,   // 1MB - typical size for parquet metadata
-            metadata_memory_size_bytes: 536_870_912, // 512MB
-            metadata_disk_size_bytes: 5_368_709_120, // 5GB
-            metadata_shards: 4,                      // Fewer shards for metadata cache
+            parquet_metadata_size_hint: 1_048_576,  // 1MB - typical size for parquet metadata
+            metadata_memory_size_bytes: 67_108_864, // 64MB
+            metadata_disk_size_bytes: 536_870_912,  // 512MB
+            metadata_shards: 4,                     // Fewer shards for metadata cache
         }
     }
 }

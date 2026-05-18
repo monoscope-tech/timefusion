@@ -80,7 +80,10 @@ async fn setup_s3_bench(name: &str) -> (SessionContext, Arc<Database>, String) {
     let db_clone = db_for_cb.clone();
     let delta_cb: timefusion::buffered_write_layer::DeltaWriteCallback = Arc::new(move |project_id, table_name, batches| {
         let db = db_clone.clone();
-        Box::pin(async move { db.insert_records_batch(&project_id, &table_name, batches, true).await })
+        Box::pin(async move {
+            db.insert_records_batch(&project_id, &table_name, batches, true).await?;
+            Ok(Vec::new())
+        })
     });
     let layer = Arc::new(BufferedWriteLayer::with_config(Arc::clone(&cfg)).unwrap().with_delta_writer(delta_cb));
     let db = db_for_cb.with_buffered_layer(Arc::clone(&layer));

@@ -19,7 +19,25 @@ use tracing::{debug, info, instrument, warn};
 // longer = larger Delta files. Matches default flush interval for aligned boundaries.
 // Note: Timestamps before 1970 (negative microseconds) produce negative bucket IDs,
 // which is supported but may result in unexpected ordering if mixed with post-1970 data.
-const BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000;
+const DEFAULT_BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000;
+#[cfg(test)]
+const BUCKET_DURATION_MICROS: i64 = DEFAULT_BUCKET_DURATION_MICROS;
+
+static BUCKET_DURATION_MICROS_CFG: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+
+/// Configured bucket window in microseconds. Set once at startup via
+/// `set_bucket_duration_micros`; defaults to 10 minutes when unset. Smaller
+/// windows free MemBuffer memory sooner (because the previous bucket becomes
+/// flushable sooner) at the cost of more, smaller Delta commits.
+pub fn bucket_duration_micros() -> i64 {
+    *BUCKET_DURATION_MICROS_CFG.get_or_init(|| DEFAULT_BUCKET_DURATION_MICROS)
+}
+
+/// Set the bucket window. No-op after the first call (OnceLock). Must be
+/// invoked before any MemBuffer activity, e.g. from `init_config`.
+pub fn set_bucket_duration_micros(micros: i64) {
+    let _ = BUCKET_DURATION_MICROS_CFG.set(micros.max(1_000_000));
+}
 
 /// Check if two schemas are compatible for merge.
 /// Compatible means: all existing fields must be present in incoming schema with same type,
@@ -149,8 +167,22 @@ pub struct MemBufferStats {
     pub estimated_memory_bytes: usize,
 }
 
+/// Per-batch fixed overhead: RecordBatch struct, schema Arc bump, ArrayData
+/// metadata for each column, and DashMap/Mutex slots when held in a TimeBucket.
+/// Empirically ~64 B for the batch + 96 B per column (ArrayData + Buffer headers).
+const BATCH_FIXED_OVERHEAD: usize = 64;
+const PER_COLUMN_OVERHEAD: usize = 96;
+
+fn apply_signed_delta(counter: &AtomicUsize, delta: i64) {
+    if delta > 0 {
+        counter.fetch_add(delta as usize, Ordering::Relaxed);
+    } else if delta < 0 {
+        counter.fetch_sub((-delta) as usize, Ordering::Relaxed);
+    }
+}
+
 pub fn estimate_batch_size(batch: &RecordBatch) -> usize {
-    batch.get_array_memory_size()
+    batch.get_array_memory_size() + BATCH_FIXED_OVERHEAD + batch.num_columns() * PER_COLUMN_OVERHEAD
 }
 
 /// Merge two arrays based on a boolean mask.
@@ -254,6 +286,27 @@ fn extract_timestamp_range(filters: &[Expr]) -> (Option<i64>, Option<i64>) {
     (min_ts, max_ts)
 }
 
+/// Compile filters into a single conjunction physical expression evaluated against `schema`.
+fn compile_filter_conjunction(filters: &[Expr], schema: &SchemaRef) -> DFResult<Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+    let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
+    let props = ExecutionProps::new();
+    let conjunction = filters.iter().cloned().reduce(datafusion::logical_expr::and).unwrap();
+    Ok(Some(create_physical_expr(&conjunction, &df_schema, &props)?))
+}
+
+/// Apply a compiled predicate, returning only matching rows. Best-effort: on
+/// any evaluation error we return the original batch so DataFusion's FilterExec
+/// can finish the job.
+fn apply_predicate(batch: &RecordBatch, pred: &Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> RecordBatch {
+    let Ok(value) = pred.evaluate(batch) else { return batch.clone() };
+    let Ok(arr) = value.into_array(batch.num_rows()) else { return batch.clone() };
+    let Some(mask) = arr.as_any().downcast_ref::<BooleanArray>() else { return batch.clone() };
+    filter_record_batch(batch, mask).unwrap_or_else(|_| batch.clone())
+}
+
 /// Check if a bucket's time range overlaps with the query range.
 fn bucket_overlaps_range(bucket: &TimeBucket, range: &(Option<i64>, Option<i64>)) -> bool {
     let (min_filter, max_filter) = range;
@@ -285,7 +338,7 @@ impl MemBuffer {
     }
 
     pub fn compute_bucket_id(timestamp_micros: i64) -> i64 {
-        timestamp_micros / BUCKET_DURATION_MICROS
+        timestamp_micros / bucket_duration_micros()
     }
 
     #[inline]
@@ -294,7 +347,7 @@ impl MemBuffer {
     }
 
     pub fn current_bucket_id() -> i64 {
-        let now_micros = chrono::Utc::now().timestamp_micros();
+        let now_micros = crate::clock::now_micros();
         Self::compute_bucket_id(now_micros)
     }
 
@@ -384,19 +437,22 @@ impl MemBuffer {
         let ts_range = extract_timestamp_range(filters);
 
         if let Some(table) = self.get_table(project_id, table_name) {
+            // Pre-compile filters into a single physical predicate so each batch is
+            // filtered to matching rows before returning. Best-effort: anything that
+            // fails to compile is left for FilterExec on top to evaluate.
+            let pred = compile_filter_conjunction(filters, &table.schema).ok().flatten();
             for bucket_entry in table.buckets.iter() {
                 let bucket = bucket_entry.value();
                 if !bucket_overlaps_range(bucket, &ts_range) {
                     continue;
                 }
-                let mut batches = bucket.batches.lock();
-                if batches.len() > 1 {
-                    if let Ok(single) = arrow::compute::concat_batches(&table.schema, &*batches) {
-                        batches.clear();
-                        batches.push(single);
-                    }
+                // Hold the lock only long enough to clone Arc'd batch refs; release
+                // before filtering so writers / concurrent readers aren't blocked.
+                let snapshot: Vec<RecordBatch> = bucket.batches.lock().iter().cloned().collect();
+                match &pred {
+                    Some(p) => results.extend(snapshot.iter().map(|b| apply_predicate(b, p)).filter(|b| b.num_rows() > 0)),
+                    None => results.extend(snapshot),
                 }
-                results.extend(batches.iter().cloned());
             }
         }
 
@@ -413,6 +469,7 @@ impl MemBuffer {
         let ts_range = extract_timestamp_range(filters);
 
         if let Some(table) = self.get_table(project_id, table_name) {
+            let pred = compile_filter_conjunction(filters, &table.schema).ok().flatten();
             let mut bucket_ids: Vec<i64> = table.buckets.iter().map(|b| *b.key()).collect();
             bucket_ids.sort();
 
@@ -420,15 +477,16 @@ impl MemBuffer {
                 if let Some(bucket) = table.buckets.get(&bucket_id)
                     && bucket_overlaps_range(&bucket, &ts_range)
                 {
-                    let mut batches = bucket.batches.lock();
-                    if !batches.is_empty() {
-                        if batches.len() > 1 {
-                            if let Ok(single) = arrow::compute::concat_batches(&table.schema, &*batches) {
-                                batches.clear();
-                                batches.push(single);
-                            }
-                        }
-                        partitions.push(batches.clone());
+                    let snapshot: Vec<RecordBatch> = bucket.batches.lock().iter().cloned().collect();
+                    if snapshot.is_empty() {
+                        continue;
+                    }
+                    let out: Vec<RecordBatch> = match &pred {
+                        Some(p) => snapshot.iter().map(|b| apply_predicate(b, p)).filter(|b| b.num_rows() > 0).collect(),
+                        None => snapshot,
+                    };
+                    if !out.is_empty() {
+                        partitions.push(out);
                     }
                 }
             }
@@ -445,6 +503,24 @@ impl MemBuffer {
 
     /// Get the time range (oldest, newest) for a project/table.
     /// Returns None if no data exists.
+    /// Time ranges (start, end_exclusive) of every bucket currently held in
+    /// MemBuffer for this project/table, sorted ascending by start. Used by
+    /// the query path to exclude exactly those ranges from the Delta scan,
+    /// so a stuck/un-flushed old bucket no longer hides Delta data above it.
+    /// Returns an empty Vec if the table is absent.
+    pub fn get_bucket_ranges(&self, project_id: &str, table_name: &str) -> Vec<(i64, i64)> {
+        let Some(table) = self.get_table(project_id, table_name) else {
+            return Vec::new();
+        };
+        let dur = bucket_duration_micros();
+        let mut ranges: Vec<(i64, i64)> = table.buckets.iter().map(|b| {
+            let id = *b.key();
+            (id * dur, (id + 1) * dur)
+        }).collect();
+        ranges.sort_by_key(|(s, _)| *s);
+        ranges
+    }
+
     pub fn get_time_range(&self, project_id: &str, table_name: &str) -> Option<(i64, i64)> {
         let oldest = self.get_oldest_timestamp(project_id, table_name)?;
         let newest = self.get_newest_timestamp(project_id, table_name)?;
@@ -477,7 +553,8 @@ impl MemBuffer {
 
     #[instrument(skip(self), fields(project_id, table_name, bucket_id))]
     pub fn drain_bucket(&self, project_id: &str, table_name: &str, bucket_id: i64) -> Option<Vec<RecordBatch>> {
-        if let Some(table) = self.get_table(project_id, table_name)
+        let key = Self::make_key(project_id, table_name);
+        if let Some(table) = self.tables.get(&key).map(|e| e.value().clone())
             && let Some((_, bucket)) = table.buckets.remove(&bucket_id)
         {
             let freed_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
@@ -491,9 +568,18 @@ impl MemBuffer {
                 batches.len(),
                 freed_bytes
             );
+            drop(table);
+            self.try_drop_empty_table(&key);
             return Some(batches);
         }
         None
+    }
+
+    /// Race-safe removal of an empty TableBuffer. `remove_if` holds the shard
+    /// write lock; the strong_count check skips eviction whenever a
+    /// writer/reader is mid-operation on this table.
+    fn try_drop_empty_table(&self, key: &TableKey) -> bool {
+        self.tables.remove_if(key, |_, v| v.buckets.is_empty() && Arc::strong_count(v) == 1).is_some()
     }
 
     pub fn get_flushable_buckets(&self, cutoff_bucket_id: i64) -> Vec<FlushableBucket> {
@@ -513,26 +599,42 @@ impl MemBuffer {
             let table = table_entry.value();
             for bucket in table.buckets.iter() {
                 let bucket_id = *bucket.key();
-                if filter(bucket_id) {
-                    let batches = bucket.batches.lock();
-                    if !batches.is_empty() {
-                        let compacted = if batches.len() > 1 {
-                            arrow::compute::concat_batches(&table.schema, &*batches).map_or_else(|_| batches.clone(), |single| vec![single])
-                        } else {
-                            batches.clone()
-                        };
-                        result.push(FlushableBucket {
-                            project_id: project_id.to_string(),
-                            table_name: table_name.to_string(),
-                            bucket_id,
-                            batches: compacted,
-                            row_count: bucket.row_count.load(Ordering::Relaxed),
-                        });
-                    }
+                if !filter(bucket_id) {
+                    continue;
                 }
+                // Snapshot under the lock with Arc-bumps only — no deep copy.
+                // Parquet writer downstream regroups rows into row groups
+                // regardless of input batch boundaries, so pre-compaction is
+                // unnecessary and would temporarily double bucket memory.
+                let batches: Vec<RecordBatch> = bucket.batches.lock().iter().cloned().collect();
+                if batches.is_empty() {
+                    continue;
+                }
+                result.push(FlushableBucket {
+                    project_id: project_id.to_string(),
+                    table_name: table_name.to_string(),
+                    bucket_id,
+                    batches,
+                    row_count: bucket.row_count.load(Ordering::Relaxed),
+                });
             }
         }
         result
+    }
+
+    /// Count buckets whose `max_timestamp` is older than `cutoff_micros`.
+    /// Used by the eviction task to surface buckets that have aged past
+    /// retention without being flushed (which means flushes are stuck).
+    pub fn count_buckets_with_max_ts_before(&self, cutoff_micros: i64) -> usize {
+        let mut n = 0usize;
+        for t in self.tables.iter() {
+            for b in t.value().buckets.iter() {
+                if b.value().max_timestamp.load(Ordering::Relaxed) < cutoff_micros {
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     #[instrument(skip(self))]
@@ -540,6 +642,7 @@ impl MemBuffer {
         let cutoff_bucket_id = Self::compute_bucket_id(cutoff_timestamp_micros);
         let mut evicted_count = 0;
         let mut freed_bytes = 0usize;
+        let mut empty_table_keys: Vec<TableKey> = Vec::new();
 
         for table_entry in self.tables.iter() {
             let table = table_entry.value();
@@ -551,16 +654,29 @@ impl MemBuffer {
                     evicted_count += 1;
                 }
             }
+            if table.buckets.is_empty() {
+                empty_table_keys.push(table_entry.key().clone());
+            }
+        }
+
+        // Drop empty TableBuffer entries so per-table metadata (schema Arc,
+        // project/table name Arcs, DashMap shards) is reclaimed at scale.
+        // `get_or_create_table` recreates a fresh entry on the next write.
+        let mut tables_dropped = 0usize;
+        for key in empty_table_keys {
+            if self.try_drop_empty_table(&key) {
+                tables_dropped += 1;
+            }
         }
 
         if freed_bytes > 0 {
             self.estimated_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
         }
 
-        if evicted_count > 0 {
+        if evicted_count > 0 || tables_dropped > 0 {
             debug!(
-                "MemBuffer evicted {} buckets older than bucket_id={}, freed {} bytes",
-                evicted_count, cutoff_bucket_id, freed_bytes
+                "MemBuffer evicted {} buckets older than bucket_id={}, dropped {} empty tables, freed {} bytes",
+                evicted_count, cutoff_bucket_id, tables_dropped, freed_bytes
             );
         }
         evicted_count
@@ -587,13 +703,15 @@ impl MemBuffer {
         let physical_predicate = predicate.map(|p| create_physical_expr(p, &df_schema, &props)).transpose()?;
 
         let mut total_deleted = 0u64;
-        let mut memory_freed = 0usize;
+        let mut total_freed = 0usize;
 
         for mut bucket_entry in table.buckets.iter_mut() {
             let bucket = bucket_entry.value_mut();
             let mut batches = bucket.batches.lock();
 
             let mut new_batches = Vec::with_capacity(batches.len());
+            let mut bucket_freed = 0usize;
+            let mut bucket_rows_removed = 0usize;
             for batch in batches.drain(..) {
                 let original_rows = batch.num_rows();
                 let original_size = estimate_batch_size(&batch);
@@ -614,26 +732,30 @@ impl MemBuffer {
                 };
 
                 let deleted = original_rows - filtered_batch.num_rows();
-                total_deleted += deleted as u64;
+                bucket_rows_removed += deleted;
 
                 if filtered_batch.num_rows() > 0 {
                     let new_size = estimate_batch_size(&filtered_batch);
-                    memory_freed += original_size.saturating_sub(new_size);
+                    bucket_freed += original_size.saturating_sub(new_size);
                     new_batches.push(filtered_batch);
                 } else {
-                    memory_freed += original_size;
+                    bucket_freed += original_size;
                 }
             }
 
             *batches = new_batches;
-            let new_row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-            bucket.row_count.store(new_row_count, Ordering::Relaxed);
-            let new_memory: usize = batches.iter().map(|b| estimate_batch_size(b)).sum();
-            bucket.memory_bytes.store(new_memory, Ordering::Relaxed);
+            if bucket_rows_removed > 0 {
+                bucket.row_count.fetch_sub(bucket_rows_removed, Ordering::Relaxed);
+            }
+            if bucket_freed > 0 {
+                bucket.memory_bytes.fetch_sub(bucket_freed, Ordering::Relaxed);
+            }
+            total_deleted += bucket_rows_removed as u64;
+            total_freed += bucket_freed;
         }
 
-        if memory_freed > 0 {
-            self.estimated_bytes.fetch_sub(memory_freed, Ordering::Relaxed);
+        if total_freed > 0 {
+            self.estimated_bytes.fetch_sub(total_freed, Ordering::Relaxed);
         }
 
         debug!("MemBuffer delete: project={}, table={}, rows_deleted={}", project_id, table_name, total_deleted);
@@ -669,13 +791,15 @@ impl MemBuffer {
             .collect::<DFResult<Vec<_>>>()?;
 
         let mut total_updated = 0u64;
-        let mut memory_delta = 0i64;
+        let mut total_delta: i64 = 0;
 
         for mut bucket_entry in table.buckets.iter_mut() {
             let bucket = bucket_entry.value_mut();
             let mut batches = bucket.batches.lock();
 
-            let old_memory: usize = batches.iter().map(|b| estimate_batch_size(b)).sum();
+            // Track delta only for batches actually rebuilt — unchanged batches
+            // contribute 0 to the delta and don't need re-estimation.
+            let mut bucket_delta: i64 = 0;
             let new_batches: Vec<RecordBatch> = batches
                 .drain(..)
                 .map(|batch| {
@@ -684,7 +808,6 @@ impl MemBuffer {
                         return Ok(batch);
                     }
 
-                    // Evaluate predicate to find matching rows
                     let mask = if let Some(ref phys_pred) = physical_predicate {
                         let result = phys_pred.evaluate(&batch)?;
                         let arr = result.into_array(num_rows)?;
@@ -693,25 +816,20 @@ impl MemBuffer {
                             .cloned()
                             .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?
                     } else {
-                        // No predicate = update all rows
                         BooleanArray::from(vec![true; num_rows])
                     };
 
                     let matching_count = mask.iter().filter(|v| v == &Some(true)).count();
-                    total_updated += matching_count as u64;
-
                     if matching_count == 0 {
                         return Ok(batch);
                     }
+                    total_updated += matching_count as u64;
 
-                    // Build new columns with updated values
+                    let old_size = estimate_batch_size(&batch);
                     let new_columns: Vec<ArrayRef> = (0..batch.num_columns())
                         .map(|col_idx| {
-                            // Check if this column has an assignment
                             if let Some((_, phys_expr)) = physical_assignments.iter().find(|(idx, _)| *idx == col_idx) {
-                                // Evaluate the new value expression
                                 let new_values = phys_expr.evaluate(&batch)?.into_array(num_rows)?;
-                                // Merge: use new value where mask is true, original otherwise
                                 merge_arrays(batch.column(col_idx), &new_values, &mask)
                             } else {
                                 Ok(batch.column(col_idx).clone())
@@ -719,23 +837,19 @@ impl MemBuffer {
                         })
                         .collect::<DFResult<Vec<_>>>()?;
 
-                    RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+                    let new_batch = RecordBatch::try_new(batch.schema(), new_columns)
+                        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                    bucket_delta += estimate_batch_size(&new_batch) as i64 - old_size as i64;
+                    Ok(new_batch)
                 })
                 .collect::<DFResult<Vec<_>>>()?;
 
             *batches = new_batches;
-            let new_memory: usize = batches.iter().map(|b| estimate_batch_size(b)).sum();
-            bucket.memory_bytes.store(new_memory, Ordering::Relaxed);
-            memory_delta += new_memory as i64 - old_memory as i64;
+            apply_signed_delta(&bucket.memory_bytes, bucket_delta);
+            total_delta += bucket_delta;
         }
 
-        if memory_delta != 0 {
-            if memory_delta > 0 {
-                self.estimated_bytes.fetch_add(memory_delta as usize, Ordering::Relaxed);
-            } else {
-                self.estimated_bytes.fetch_sub((-memory_delta) as usize, Ordering::Relaxed);
-            }
-        }
+        apply_signed_delta(&self.estimated_bytes, total_delta);
 
         debug!("MemBuffer update: project={}, table={}, rows_updated={}", project_id, table_name, total_updated);
         Ok(total_updated)
@@ -1097,27 +1211,54 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_compaction_on_flush() {
+    fn test_flushable_buckets_carry_all_batches() {
+        // We no longer pre-compact at flush time — the parquet writer downstream
+        // regroups rows into row groups itself, and pre-compacting forces an
+        // unnecessary deep copy of the entire bucket.
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
 
-        // Insert 10 small batches into the same bucket
         let total_rows = 10;
         for i in 0..total_rows {
             let batch = create_multi_row_batch(vec![i as i64], vec!["test"]);
             buffer.insert("project1", "table1", batch, ts).unwrap();
         }
 
-        let stats = buffer.get_stats();
-        assert_eq!(stats.total_batches, total_rows);
-
-        // get_flushable_buckets should compact into 1 batch
         let cutoff = MemBuffer::compute_bucket_id(ts) + 1;
         let flushable = buffer.get_flushable_buckets(cutoff);
         assert_eq!(flushable.len(), 1);
-        assert_eq!(flushable[0].batches.len(), 1);
+        assert_eq!(flushable[0].batches.len(), total_rows);
         assert_eq!(flushable[0].row_count, total_rows);
-        assert_eq!(flushable[0].batches[0].num_rows(), total_rows);
+        let summed: usize = flushable[0].batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(summed, total_rows);
+    }
+
+    #[test]
+    fn test_point_lookup_fast_path_filters_inline() {
+        use datafusion::logical_expr::{col, lit};
+
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        // 10 rows in a single bucket — point lookup should return only the matching one.
+        let batch = create_multi_row_batch(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10], vec!["a"; 10]);
+        buffer.insert("project1", "table1", batch, ts).unwrap();
+
+        // Non-point query: returns the whole bucket (downstream FilterExec narrows it).
+        let no_id_filter = buffer.query("project1", "table1", &[]).unwrap();
+        let total_rows: usize = no_id_filter.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 10);
+
+        // Point lookup by id: MemBuffer applies filter inline, returns 1 row.
+        let id_pred = col("id").eq(lit(5i64));
+        let point = buffer.query("project1", "table1", &[id_pred]).unwrap();
+        let total_rows: usize = point.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "point lookup should return exactly the matching row");
+
+        // query_partitioned must also apply the filter inline.
+        let id_pred2 = col("id").eq(lit(7i64));
+        let parts = buffer.query_partitioned("project1", "table1", &[id_pred2]).unwrap();
+        let total_rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1);
     }
 
     #[test]

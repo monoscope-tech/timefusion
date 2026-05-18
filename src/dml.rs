@@ -27,9 +27,21 @@ use crate::database::Database;
 /// Build a clean SessionState with config + runtime from the given session but with
 /// delta-rs's DeltaPlanner instead of our custom DmlQueryPlanner.
 fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
+    // delta-rs's DELETE/UPDATE re-reads existing parquet files and rewrites
+    // them. Without `schema_force_view_types=false`, the reader returns
+    // Struct{BinaryView,BinaryView} for our Variant columns while
+    // delta_kernel's `unshredded_variant()` schema declares Binary —
+    // mismatch rejects the operation with "Expected ... Binary, got ...
+    // BinaryView" even on an empty table.
+    //
+    // Start from `DeltaSessionConfig::default()` so we inherit delta-rs's
+    // other required defaults (hash_join_inlist_pushdown=0, etc.) and only
+    // override the view-types flag.
+    let cfg: datafusion::prelude::SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
+    let cfg = cfg.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
     Arc::new(
         SessionStateBuilder::new()
-            .with_config(session.config().clone())
+            .with_config(cfg)
             .with_runtime_env(session.runtime_env().clone())
             .with_default_features()
             .with_query_planner(deltalake::delta_datafusion::planner::DeltaPlanner::new())
