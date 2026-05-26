@@ -43,6 +43,12 @@ pub struct BucketTextIndex {
     /// rebuild on next query; the original SQL predicate keeps results
     /// correct in the meantime.
     pub indexed_rows: usize,
+    /// Approximate memory cost of this index in bytes. Used by the
+    /// `MemBuffer` LRU to enforce a global budget. Estimated from the
+    /// snapshot's indexed-text bytes × 2 (rough overhead for trigram
+    /// postings + skip lists); errs on the high side so the budget is
+    /// conservative rather than blown.
+    pub size_bytes: usize,
 }
 
 impl BucketTextIndex {
@@ -56,9 +62,10 @@ impl BucketTextIndex {
         if batches.is_empty() {
             return Ok(None);
         }
+        let size_bytes = estimate_index_size(table, batches);
         let (index, built_schema, _stats) = builder::build_in_memory(table, batches).with_context(|| format!("build mem-index for {}", table.table_name))?;
         register_tokenizers(&index);
-        Ok(Some(Self { index, built_schema: Arc::new(built_schema), indexed_rows: row_count }))
+        Ok(Some(Self { index, built_schema: Arc::new(built_schema), indexed_rows: row_count, size_bytes }))
     }
 
     /// Run a `text_match`-style query against this index and return hits.
@@ -72,4 +79,31 @@ impl BucketTextIndex {
         let q = qp.parse_query(&pred.query).map_err(|e| anyhow!("parse mem-index query '{}': {e}", pred.query))?;
         crate::tantivy_index::reader::query_index(&self.index, &*q, None)
     }
+}
+
+/// Approximate the memory cost of an index built from these batches:
+/// indexed-text bytes × 2 (postings + skip-list overhead, conservative for
+/// trigram tokenizers). Used by the `MemBuffer` LRU budget — accurate to
+/// within ~2× is sufficient since the budget is itself a soft cap.
+fn estimate_index_size(table: &TableSchema, batches: &[RecordBatch]) -> usize {
+    use arrow::array::{Array, AsArray};
+    let indexed_fields: Vec<&str> = table.fields.iter().filter(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)).map(|f| f.name.as_str()).collect();
+    if indexed_fields.is_empty() {
+        return 0;
+    }
+    let mut bytes: usize = 0;
+    for batch in batches {
+        for field_name in &indexed_fields {
+            let Some(arr) = batch.column_by_name(field_name) else { continue };
+            if let Some(a) = arr.as_string_opt::<i32>() {
+                bytes += a.value_data().len();
+            } else if arr.as_any().downcast_ref::<arrow::array::StringViewArray>().is_some() {
+                // Utf8View — approximate by total array byte size; over-counts
+                // by the validity/offset overhead but stays in the right
+                // order of magnitude.
+                bytes += arr.get_array_memory_size();
+            }
+        }
+    }
+    bytes.saturating_mul(2)
 }

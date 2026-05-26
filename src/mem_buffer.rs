@@ -132,7 +132,27 @@ pub struct MemBuffer {
     /// Reduces 3 hash lookups to 1 for table access.
     tables: DashMap<TableKey, Arc<TableBuffer>>,
     estimated_bytes: AtomicUsize,
+    /// LRU cache of per-bucket tantivy indexes. Lives at the MemBuffer
+    /// level (not on individual TimeBuckets) so the LRU has a global view
+    /// for byte-budget eviction. Entries are dropped:
+    /// - when `text_index_max_bytes` is exceeded (LRU-evict tail)
+    /// - when the bucket receives an insert (cache_invalidate by key)
+    /// - when the bucket drains/evicts (cache_invalidate by key)
+    text_index_cache: parking_lot::Mutex<lru::LruCache<BucketCacheKey, Arc<crate::tantivy_index::mem_index::BucketTextIndex>>>,
+    /// Sum of `size_bytes` across cached entries. Kept in an atomic so the
+    /// hot insert path can do a single load to check "over budget?" without
+    /// taking the LRU mutex.
+    text_index_bytes: AtomicUsize,
+    /// Soft budget for cached text indexes (bytes). When exceeded, LRU
+    /// evictions drop oldest cached buckets until under. Auto-tuned from
+    /// `buffer_max_memory_mb` at MemBuffer construction.
+    text_index_max_bytes: usize,
 }
+
+/// Cache key: (project_id, table_name, bucket_id). All three are cheap to
+/// clone (Arc<str> + i64) so the key lives both in the LRU and in the
+/// invalidation calls.
+pub type BucketCacheKey = (Arc<str>, Arc<str>, i64);
 
 pub struct TableBuffer {
     buckets: DashMap<i64, TimeBucket>,
@@ -147,11 +167,6 @@ pub struct TimeBucket {
     memory_bytes: AtomicUsize,
     min_timestamp: AtomicI64,
     max_timestamp: AtomicI64,
-    /// Lazily-built tantivy index over the rows currently in this bucket.
-    /// Materializes on first `text_match` query, dropped on drain/eviction
-    /// or when row_count grows past `indexed_rows`. None when the table has
-    /// no tantivy-indexed fields (no useful index to build).
-    text_index: parking_lot::RwLock<Option<crate::tantivy_index::mem_index::BucketTextIndex>>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,9 +372,71 @@ fn bucket_overlaps_range(bucket: &TimeBucket, range: &(Option<i64>, Option<i64>)
 
 impl MemBuffer {
     pub fn new() -> Self {
+        // Default text-index budget: 128MB. Production code path goes
+        // through `new_with_max_index_bytes` from BufferedWriteLayer which
+        // sizes this against the configured MemBuffer memory budget.
+        Self::new_with_max_index_bytes(128 * 1024 * 1024)
+    }
+
+    pub fn new_with_max_index_bytes(text_index_max_bytes: usize) -> Self {
         Self {
             tables: DashMap::new(),
             estimated_bytes: AtomicUsize::new(0),
+            text_index_cache: parking_lot::Mutex::new(lru::LruCache::unbounded()),
+            text_index_bytes: AtomicUsize::new(0),
+            text_index_max_bytes,
+        }
+    }
+
+    /// Approximate bytes currently held by cached per-bucket text indexes.
+    pub fn text_index_bytes(&self) -> usize {
+        self.text_index_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Configured byte budget for the text-index cache.
+    pub fn text_index_max_bytes(&self) -> usize {
+        self.text_index_max_bytes
+    }
+
+    /// Cache key for a bucket. Builds an Arc<str> per call but only on the
+    /// cache-miss path, so the hot lookup is cheap (the bucket_id alone).
+    fn cache_key(project_id: &str, table_name: &str, bucket_id: i64) -> BucketCacheKey {
+        (Arc::from(project_id), Arc::from(table_name), bucket_id)
+    }
+
+    /// Look up a cached text index. Promotes the entry to MRU on hit.
+    fn cache_get(&self, key: &BucketCacheKey) -> Option<Arc<crate::tantivy_index::mem_index::BucketTextIndex>> {
+        self.text_index_cache.lock().get(key).cloned()
+    }
+
+    /// Insert a freshly-built index into the cache, evicting LRU entries
+    /// to stay under `text_index_max_bytes`. Returns the inserted Arc.
+    fn cache_put(&self, key: BucketCacheKey, idx: Arc<crate::tantivy_index::mem_index::BucketTextIndex>) -> Arc<crate::tantivy_index::mem_index::BucketTextIndex> {
+        let size = idx.size_bytes;
+        let mut cache = self.text_index_cache.lock();
+        // Overwrite any existing entry for this key (stale index from a
+        // smaller snapshot). Adjust the byte counter accordingly.
+        if let Some(old) = cache.put(key, idx.clone()) {
+            self.text_index_bytes.fetch_sub(old.size_bytes, Ordering::Relaxed);
+        }
+        self.text_index_bytes.fetch_add(size, Ordering::Relaxed);
+        // Evict LRU until under budget.
+        while self.text_index_bytes.load(Ordering::Relaxed) > self.text_index_max_bytes {
+            match cache.pop_lru() {
+                Some((_, evicted)) => {
+                    self.text_index_bytes.fetch_sub(evicted.size_bytes, Ordering::Relaxed);
+                }
+                None => break,
+            }
+        }
+        idx
+    }
+
+    /// Drop the cached entry for a bucket. Called by `insert_batch` and
+    /// `drain_bucket` to keep the cache from going stale.
+    fn cache_invalidate(&self, key: &BucketCacheKey) {
+        if let Some(old) = self.text_index_cache.lock().pop(key) {
+            self.text_index_bytes.fetch_sub(old.size_bytes, Ordering::Relaxed);
         }
     }
 
@@ -440,8 +517,13 @@ impl MemBuffer {
     pub fn insert(&self, project_id: &str, table_name: &str, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<()> {
         let schema = batch.schema();
         let table = self.get_or_create_table(project_id, table_name, &schema)?;
-        let batch_size = table.insert_batch(batch, timestamp_micros)?;
+        let (batch_size, bucket_id) = table.insert_batch(batch, timestamp_micros)?;
         self.estimated_bytes.fetch_add(batch_size, Ordering::Relaxed);
+        // Drop any stale text-index cache entry for this bucket — the
+        // `indexed_rows == snapshot_rows` check would reject it on the
+        // next query anyway, but freeing the bytes now lets the LRU give
+        // budget to other buckets immediately.
+        self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
         Ok(())
     }
 
@@ -454,10 +536,16 @@ impl MemBuffer {
         let table = self.get_or_create_table(project_id, table_name, &schema)?;
 
         let mut total_size = 0usize;
+        let mut touched_buckets: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for batch in batches {
-            total_size += table.insert_batch(batch, timestamp_micros)?;
+            let (sz, bucket_id) = table.insert_batch(batch, timestamp_micros)?;
+            total_size += sz;
+            touched_buckets.insert(bucket_id);
         }
         self.estimated_bytes.fetch_add(total_size, Ordering::Relaxed);
+        for bucket_id in touched_buckets {
+            self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
+        }
         Ok(())
     }
 
@@ -499,8 +587,10 @@ impl MemBuffer {
         let mut acc: Option<std::collections::HashSet<String>> = None;
         let mut any_usable = false;
         for bucket_entry in table.buckets.iter() {
+            let bucket_id = *bucket_entry.key();
             let bucket = bucket_entry.value();
-            let (_snapshot, ids_opt) = bucket.search_with_snapshot(table_schema, preds)?;
+            let key = Self::cache_key(project_id, table_name, bucket_id);
+            let (_snapshot, ids_opt) = self.search_with_snapshot(bucket, &key, table_schema, preds)?;
             if let Some(ids) = ids_opt {
                 any_usable = true;
                 acc = Some(match acc.take() {
@@ -556,7 +646,8 @@ impl MemBuffer {
             if !bucket_overlaps_range(&bucket, &ts_range) {
                 continue;
             }
-            let (snapshot, ids_opt) = bucket.search_with_snapshot(table_schema, preds)?;
+            let key = Self::cache_key(project_id, table_name, bucket_id);
+            let (snapshot, ids_opt) = self.search_with_snapshot(&bucket, &key, table_schema, preds)?;
             if snapshot.is_empty() {
                 continue;
             }
@@ -719,6 +810,9 @@ impl MemBuffer {
             let freed_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
             self.estimated_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
             let batches = bucket.batches.into_inner();
+            // Bucket is gone — drop its text-index cache entry so the LRU
+            // doesn't hold ~MB of dead postings until natural eviction.
+            self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
             debug!(
                 "MemBuffer drain: project={}, table={}, bucket={}, batches={}, freed_bytes={}",
                 project_id,
@@ -811,6 +905,9 @@ impl MemBuffer {
                 if let Some((_, bucket)) = table.buckets.remove(&bucket_id) {
                     freed_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
                     evicted_count += 1;
+                    // Free the bucket's text-index cache entry alongside its
+                    // batches — same reasoning as in drain_bucket.
+                    self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, bucket_id));
                 }
             }
             if table.buckets.is_empty() {
@@ -1096,29 +1193,24 @@ impl TableBuffer {
     }
 
     /// Insert a batch into this table's appropriate time bucket.
-    /// Returns the batch size in bytes for memory tracking.
-    pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<usize> {
+    /// Returns `(batch_size_bytes, bucket_id)` so the caller (`MemBuffer`)
+    /// can invalidate the matching text-index cache entry. Cache lives at
+    /// the MemBuffer level for global byte-budget LRU; correctness is via
+    /// the `indexed_rows == snapshot_rows` version check, so this
+    /// invalidation is a cache-cleanliness optimization rather than a
+    /// correctness requirement.
+    pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<(usize, i64)> {
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
         let batch_size = estimate_batch_size(&batch);
 
         let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
-        // Hold the batches lock across the push AND the cache invalidation
-        // so a concurrent `search_with_snapshot` either sees both the new
-        // batch and a cleared cache, or neither — never the inconsistent
-        // (new batch present, stale cache present) state.
         {
             let mut g = bucket.batches.lock();
             g.push(batch);
             bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
             bucket.memory_bytes.fetch_add(batch_size, Ordering::Relaxed);
-            // text_index is on the bucket struct, not gated by `g` per se,
-            // but acquiring `text_index.write()` while holding `g` is
-            // deadlock-free: searches take `batches.lock()` first to take
-            // the snapshot, release it, then acquire `text_index.read()`.
-            // Insert's order matches: `batches.lock()` → `text_index.write()`.
-            *bucket.text_index.write() = None;
         }
         bucket.update_timestamps(timestamp_micros);
 
@@ -1126,7 +1218,7 @@ impl TableBuffer {
             "TableBuffer insert: project={}, table={}, bucket={}, rows={}, bytes={}",
             self.project_id, self.table_name, bucket_id, row_count, batch_size
         );
-        Ok(batch_size)
+        Ok((batch_size, bucket_id))
     }
 }
 
@@ -1138,7 +1230,6 @@ impl TimeBucket {
             memory_bytes: AtomicUsize::new(0),
             min_timestamp: AtomicI64::new(i64::MAX),
             max_timestamp: AtomicI64::new(i64::MIN),
-            text_index: parking_lot::RwLock::new(None),
         }
     }
 
@@ -1147,68 +1238,54 @@ impl TimeBucket {
         self.max_timestamp.fetch_max(timestamp, Ordering::Relaxed);
     }
 
-    /// Atomic snapshot + text-match search. Returns the snapshot we just
-    /// took (under `batches` lock) AND the set of IDs matching `preds`
-    /// (intersected — multi-predicate is AND). The two are guaranteed
-    /// consistent: any row in the snapshot that matches the predicates
-    /// is in the returned ID set.
+    /// Atomic snapshot of this bucket's batches + row count. Both come
+    /// from the same lock acquisition so they're guaranteed consistent.
+    fn snapshot(&self) -> (Vec<arrow::record_batch::RecordBatch>, usize) {
+        let g = self.batches.lock();
+        let snap: Vec<arrow::record_batch::RecordBatch> = g.iter().cloned().collect();
+        let n: usize = snap.iter().map(|b| b.num_rows()).sum();
+        (snap, n)
+    }
+}
+
+impl MemBuffer {
+    /// Atomic snapshot + text-match search for one bucket.
     ///
-    /// `Ok(None)` means "no usable index for this table" — caller falls
-    /// back to running the original SQL predicate on the snapshot.
+    /// The bucket's `batches.lock()` provides the snapshot; the
+    /// MemBuffer-level cache provides (or builds) the tantivy index. Cache
+    /// hit is gated on `indexed_rows == snapshot_rows` — a concurrent
+    /// insert between cache hit and use would NOT silently return stale
+    /// results because the snapshot we took precedes any later insert.
     ///
-    /// Concurrency invariant: insertion holds the batches lock while
-    /// pushing AND while invalidating `text_index`. So a reader who took
-    /// the snapshot under that lock + then reads `text_index` will see
-    /// either (cache matching this snapshot) OR (None → rebuild from this
-    /// snapshot). No torn states.
+    /// `Ok((snapshot, None))` means "no usable text index for this table"
+    /// or "no preds passed" — caller falls back to running the original
+    /// SQL predicate on the snapshot.
     fn search_with_snapshot(
         &self,
+        bucket: &TimeBucket,
+        cache_key: &BucketCacheKey,
         table_schema: &crate::schema_loader::TableSchema,
         preds: &[crate::tantivy_index::udf::TextMatchPred],
     ) -> anyhow::Result<(Vec<arrow::record_batch::RecordBatch>, Option<std::collections::HashSet<String>>)> {
-        // Snapshot batches + row count under the same lock so they're
-        // mutually consistent.
-        let (snapshot, snapshot_rows) = {
-            let g = self.batches.lock();
-            let snap: Vec<arrow::record_batch::RecordBatch> = g.iter().cloned().collect();
-            let n: usize = snap.iter().map(|b| b.num_rows()).sum();
-            (snap, n)
-        };
-
+        let (snapshot, snapshot_rows) = bucket.snapshot();
         if preds.is_empty() || snapshot.is_empty() {
             return Ok((snapshot, None));
         }
 
-        // Acquire-or-build the index, sized to match THIS snapshot. Cached
-        // index reused only if its indexed_rows matches snapshot_rows —
-        // any mismatch means concurrent insertion changed the bucket, and
-        // we rebuild from our snapshot (not from current bucket state).
-        let cached_ok = {
-            let r = self.text_index.read();
-            r.as_ref().is_some_and(|idx| idx.indexed_rows == snapshot_rows)
-        };
-
-        let ids_per_pred_result: anyhow::Result<Vec<std::collections::HashSet<String>>> = if cached_ok {
-            let r = self.text_index.read();
-            let idx = r.as_ref().expect("cached_ok implies Some");
-            preds.iter().map(|p| idx.search(p).map(|hits| hits.into_iter().map(|h| h.id).collect())).collect()
-        } else {
+        // Try the cache. Reuse only if its row count matches the snapshot.
+        let mut idx = self.cache_get(cache_key);
+        if !idx.as_ref().is_some_and(|i| i.indexed_rows == snapshot_rows) {
             let built = crate::tantivy_index::mem_index::BucketTextIndex::build(table_schema, &snapshot, snapshot_rows)?;
             let Some(built) = built else {
-                // Table has no indexed fields → caller falls back to scan.
                 return Ok((snapshot, None));
             };
-            let ids = preds.iter().map(|p| built.search(p).map(|hits| hits.into_iter().map(|h| h.id).collect())).collect::<anyhow::Result<Vec<_>>>()?;
-            *self.text_index.write() = Some(built);
-            Ok(ids)
-        };
+            idx = Some(self.cache_put(cache_key.clone(), Arc::new(built)));
+        }
+        let idx = idx.expect("idx is Some on this path");
 
-        let ids_per_pred = ids_per_pred_result?;
-        // Intersect across predicates (multi-pred queries are AND-ed).
-        let combined = ids_per_pred
-            .into_iter()
-            .reduce(|a, b| a.intersection(&b).cloned().collect())
-            .unwrap_or_default();
+        // Run each predicate and intersect (multi-pred queries are AND-ed).
+        let ids_per_pred: anyhow::Result<Vec<std::collections::HashSet<String>>> = preds.iter().map(|p| idx.search(p).map(|hits| hits.into_iter().map(|h| h.id).collect())).collect();
+        let combined = ids_per_pred?.into_iter().reduce(|a, b| a.intersection(&b).cloned().collect()).unwrap_or_default();
         Ok((snapshot, Some(combined)))
     }
 }

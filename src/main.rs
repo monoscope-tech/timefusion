@@ -10,7 +10,7 @@ use timefusion::config::{self, AppConfig};
 use timefusion::database::Database;
 use timefusion::telemetry;
 use tokio::time::{Duration, sleep};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 fn main() -> anyhow::Result<()> {
     // Initialize environment before any threads spawn
@@ -138,24 +138,42 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     // Start gRPC ingestion server alongside PGWire
     let grpc_port = cfg.core.grpc_port;
+    // GRPC_TOKEN: required shared bearer token. Clients send
+    // `Authorization: Bearer <token>` and the server (grpc_handlers.rs)
+    // compares against this env var. Same fail-secure posture as
+    // PGWIRE_PASSWORD — opt out for local dev only via
+    // TIMEFUSION_ALLOW_INSECURE_AUTH=true.
     let grpc_token = {
         let allow_insecure = std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
         match (&cfg.core.grpc_token, allow_insecure) {
             (Some(t), _) if !t.is_empty() => Some(t.clone()),
             (_, true) => {
-                tracing::warn!("GRPC_TOKEN unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — gRPC ingest accepts any client. Acceptable for local dev ONLY; never in production.");
+                warn!("GRPC_TOKEN unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — gRPC ingest accepts any client. Local dev ONLY.");
                 None
             }
             _ => return Err(anyhow::anyhow!("GRPC_TOKEN is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open ingest for local dev)")),
         }
     };
+    // gRPC shutdown signal: tonic's `serve_with_shutdown` polls this future
+    // and stops accepting new requests once it resolves. In-flight requests
+    // are then awaited up to the server's drain timeout.
+    let grpc_shutdown = tokio_util::sync::CancellationToken::new();
+    let grpc_shutdown_for_task = grpc_shutdown.clone();
     let db_for_grpc = Arc::clone(&db);
     let grpc_task = tokio::spawn(async move {
         let addr = format!("0.0.0.0:{grpc_port}").parse().expect("valid grpc addr");
         info!("Starting gRPC ingestion server on port: {}", grpc_port);
         let svc = timefusion::grpc_handlers::IngestService::new(db_for_grpc, grpc_token).into_server();
-        if let Err(e) = tonic::transport::Server::builder().add_service(svc).serve(addr).await {
+        let serve = tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_shutdown(addr, async move {
+                grpc_shutdown_for_task.cancelled().await;
+                info!("gRPC server: shutdown signal received, draining in-flight requests");
+            });
+        if let Err(e) = serve.await {
             error!("gRPC server error: {}", e);
+        } else {
+            info!("gRPC server: shutdown complete");
         }
     });
 
@@ -163,24 +181,54 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let db_for_shutdown = db.clone();
     let buffered_layer_for_shutdown = Arc::clone(&buffered_layer);
 
+    // Catch SIGTERM (k8s rolling restart) in addition to SIGINT (Ctrl-C).
+    // Without SIGTERM handling, k8s sends SIGKILL after the grace period
+    // and in-flight writes are dropped.
+    let term_signal = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            sigterm.recv().await;
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<()>().await;
+        }
+    };
+
     // Wait for shutdown signal
     tokio::select! {
         _ = pg_task => {error!("PGWire server task failed")},
-        _ = grpc_task => {error!("gRPC server task failed")},
         _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, initiating shutdown");
-
-            // Shutdown buffered layer to flush remaining data to Delta
-            if let Err(e) = buffered_layer_for_shutdown.shutdown().await {
-                error!("Error during buffered layer shutdown: {}", e);
-            }
-            sleep(Duration::from_millis(500)).await;
-
-            // Properly shutdown the database including cache
-            if let Err(e) = db_for_shutdown.shutdown().await {
-                error!("Error during database shutdown: {}", e);
-            }
+            info!("Received SIGINT, initiating graceful shutdown");
         }
+        _ = term_signal => {
+            info!("Received SIGTERM, initiating graceful shutdown");
+        }
+    }
+
+    // Drain order matters:
+    // 1. Tell gRPC to stop accepting new connections. tonic's
+    //    serve_with_shutdown then waits for existing streams to complete.
+    // 2. Once gRPC is done, the buffered layer no longer receives new
+    //    writes — safe to flush + checkpoint.
+    // 3. Shut down database (cache, foyer, log store).
+    grpc_shutdown.cancel();
+    let grpc_drain_deadline = Duration::from_secs(cfg.buffer.timefusion_shutdown_timeout_secs.max(5));
+    match tokio::time::timeout(grpc_drain_deadline, grpc_task).await {
+        Ok(Ok(())) => info!("gRPC drained cleanly"),
+        Ok(Err(e)) => error!("gRPC task panicked during drain: {}", e),
+        Err(_) => error!("gRPC drain exceeded {}s — forcing shutdown; in-flight requests may be reset", grpc_drain_deadline.as_secs()),
+    }
+
+    if let Err(e) = buffered_layer_for_shutdown.shutdown().await {
+        error!("Error during buffered layer shutdown: {}", e);
+    }
+    sleep(Duration::from_millis(500)).await;
+
+    if let Err(e) = db_for_shutdown.shutdown().await {
+        error!("Error during database shutdown: {}", e);
     }
 
     info!("Shutdown complete.");
