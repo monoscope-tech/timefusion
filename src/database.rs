@@ -285,24 +285,28 @@ struct StorageConfig {
 
 #[derive(Debug, Clone)]
 pub struct Database {
-    config:                Arc<AppConfig>,
+    config:                          Arc<AppConfig>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
-    unified_tables:        UnifiedTables,
+    unified_tables:                  UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
-    custom_project_tables: CustomProjectTables,
-    batch_queue:           Option<Arc<crate::batch_queue::BatchQueue>>,
-    maintenance_shutdown:  Arc<CancellationToken>,
-    config_pool:           Option<PgPool>,
-    storage_configs:       Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
-    default_s3_bucket:     Option<String>,
-    default_s3_prefix:     Option<String>,
-    default_s3_endpoint:   Option<String>,
-    object_store_cache:    Option<Arc<SharedFoyerCache>>,
-    statistics_extractor:  Arc<DeltaStatisticsExtractor>,
-    last_written_versions: Arc<RwLock<HashMap<(String, String), u64>>>,
-    buffered_layer:        Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
-    tantivy_search:        Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
-    tantivy_indexer:       Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
+    custom_project_tables:           CustomProjectTables,
+    batch_queue:                     Option<Arc<crate::batch_queue::BatchQueue>>,
+    maintenance_shutdown:            Arc<CancellationToken>,
+    config_pool:                     Option<PgPool>,
+    storage_configs:                 Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
+    /// Monotonic deadline (nanos since process start) for when the next
+    /// storage-configs refresh from the config DB is allowed. Capped at 30s
+    /// so a hot SQL path doesn't hit PG on every statement.
+    storage_configs_next_refresh_ns: Arc<std::sync::atomic::AtomicU64>,
+    default_s3_bucket:               Option<String>,
+    default_s3_prefix:               Option<String>,
+    default_s3_endpoint:             Option<String>,
+    object_store_cache:              Option<Arc<SharedFoyerCache>>,
+    statistics_extractor:            Arc<DeltaStatisticsExtractor>,
+    last_written_versions:           Arc<RwLock<HashMap<(String, String), u64>>>,
+    buffered_layer:                  Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
+    tantivy_search:                  Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
+    tantivy_indexer:                 Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
 }
 
 impl Database {
@@ -550,6 +554,7 @@ impl Database {
             maintenance_shutdown: Arc::new(CancellationToken::new()),
             config_pool,
             storage_configs: Arc::new(RwLock::new(storage_configs)),
+            storage_configs_next_refresh_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             default_s3_bucket: default_s3_bucket.clone(),
             default_s3_prefix: Some(default_s3_prefix.clone()),
             default_s3_endpoint,
@@ -897,8 +902,9 @@ impl Database {
         let _ = options.set("datafusion.explain.show_schema", "true");
         let _ = options.set("datafusion.runtime.metadata_cache_limit", "500M");
 
-        // Enable general statistics collection for query optimization
-        // TOOD: Delete, since its true by default
+        // Enable general statistics collection for query optimization.
+        // (DataFusion default is `true` — set explicitly so a future default flip
+        // doesn't silently regress query plans.)
         let _ = options.set("datafusion.execution.collect_statistics", "true");
 
         // Enable bloom filter pruning if available in Parquet files
@@ -1140,12 +1146,28 @@ impl Database {
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         let span = tracing::Span::current();
 
-        // Try to reload custom configs from database if we have a pool (lazy loading)
-        if let Some(ref pool) = self.config_pool
-            && let Ok(new_configs) = Self::load_storage_configs(pool).await
-        {
-            let mut configs = self.storage_configs.write().await;
-            *configs = new_configs;
+        // Lazy reload of storage configs from PG, but at most once per
+        // STORAGE_CONFIGS_TTL_NS. Without this, every SQL statement that hits
+        // resolve_table issues a fresh PG roundtrip — death by a thousand cuts
+        // under load.
+        if let Some(ref pool) = self.config_pool {
+            const STORAGE_CONFIGS_TTL_NS: u64 = 30 * 1_000_000_000; // 30s
+            use std::{sync::atomic::Ordering, time::Instant};
+            // Lazily anchor the clock so we use a monotonic delta from process start.
+            static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            let start = START.get_or_init(Instant::now);
+            let now_ns = start.elapsed().as_nanos() as u64;
+            let next = self.storage_configs_next_refresh_ns.load(Ordering::Relaxed);
+            if now_ns >= next
+                && self
+                    .storage_configs_next_refresh_ns
+                    .compare_exchange(next, now_ns + STORAGE_CONFIGS_TTL_NS, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                && let Ok(new_configs) = Self::load_storage_configs(pool).await
+            {
+                let mut configs = self.storage_configs.write().await;
+                *configs = new_configs;
+            }
         }
 
         // Check if project has custom storage config → use isolated table
@@ -1174,11 +1196,11 @@ impl Database {
                 };
 
                 let current_version = table.read().await.version();
-                let should_update = match (current_version, last_written_version) {
-                    (Some(current), Some(last)) => current < last,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
+                // Only refresh when we know we're behind. Firing on
+                // (Some(_), None) caused an S3 update_state on every read for any
+                // table this process hasn't written to (read-only replicas, post-restart) —
+                // a cold-table tax compounding with resolve_table's lookup cost.
+                let should_update = matches!((current_version, last_written_version), (Some(current), Some(last)) if current < last);
 
                 if should_update {
                     self.update_table(table, "", table_name)
@@ -1209,11 +1231,11 @@ impl Database {
                 };
 
                 let current_version = table.read().await.version();
-                let should_update = match (current_version, last_written_version) {
-                    (Some(current), Some(last)) => current < last,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
+                // Only refresh when we know we're behind. Firing on
+                // (Some(_), None) caused an S3 update_state on every read for any
+                // table this process hasn't written to (read-only replicas, post-restart) —
+                // a cold-table tax compounding with resolve_table's lookup cost.
+                let should_update = matches!((current_version, last_written_version), (Some(current), Some(last)) if current < last);
 
                 if should_update {
                     self.update_table(table, project_id, table_name)

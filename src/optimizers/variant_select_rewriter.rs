@@ -77,14 +77,17 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
     // Build a patched arrow Schema where every Utf8View column whose
     // real-schema counterpart is Variant gets the Variant data type back
-    // (and the extension-name metadata).
+    // (and the extension-name metadata). O(n) lookup via a name→field map —
+    // schemas with many columns made the original `column_with_name` loop
+    // O(n²).
     let lying_schema = scan.projected_schema.as_arrow();
+    let real_by_name: std::collections::HashMap<&str, &Arc<Field>> = real.fields().iter().map(|f| (f.name().as_str(), f)).collect();
     let mut patched_fields: Vec<Arc<Field>> = Vec::with_capacity(lying_schema.fields().len());
     let mut changed = false;
     for f in lying_schema.fields() {
-        match real.column_with_name(f.name()) {
-            Some((_, real_field)) if is_variant_type(real_field.data_type()) => {
-                patched_fields.push(Arc::new(real_field.as_ref().clone()));
+        match real_by_name.get(f.name().as_str()) {
+            Some(real_field) if is_variant_type(real_field.data_type()) => {
+                patched_fields.push(Arc::clone(real_field));
                 changed = true;
             }
             _ => patched_fields.push(f.clone()),
