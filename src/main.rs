@@ -126,10 +126,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let pg_port = cfg.core.pgwire_port;
     info!("Starting PGWire server on port: {}", pg_port);
 
-    let auth_config = timefusion::pgwire_handlers::AuthConfig {
-        username: cfg.core.pgwire_user.clone(),
-        password: cfg.core.pgwire_password.clone(),
-    };
+    let auth_config = timefusion::pgwire_handlers::AuthConfig::from_core(&cfg.core)?;
 
     let pg_task = tokio::spawn(async move {
         let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
@@ -141,7 +138,17 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     // Start gRPC ingestion server alongside PGWire
     let grpc_port = cfg.core.grpc_port;
-    let grpc_token = cfg.core.grpc_token.clone();
+    let grpc_token = {
+        let allow_insecure = std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        match (&cfg.core.grpc_token, allow_insecure) {
+            (Some(t), _) if !t.is_empty() => Some(t.clone()),
+            (_, true) => {
+                tracing::warn!("GRPC_TOKEN unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — gRPC ingest accepts any client. Acceptable for local dev ONLY; never in production.");
+                None
+            }
+            _ => return Err(anyhow::anyhow!("GRPC_TOKEN is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open ingest for local dev)")),
+        }
+    };
     let db_for_grpc = Arc::clone(&db);
     let grpc_task = tokio::spawn(async move {
         let addr = format!("0.0.0.0:{grpc_port}").parse().expect("valid grpc addr");
