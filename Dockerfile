@@ -3,7 +3,7 @@
 ##############################
 #         Builder Stage      #
 ##############################
-FROM rust:1.89-slim-bullseye AS builder
+FROM rust:1.91-slim-bookworm AS builder
 WORKDIR /app
 
 # Install build dependencies. protoc is required by tonic-prost-build (build.rs).
