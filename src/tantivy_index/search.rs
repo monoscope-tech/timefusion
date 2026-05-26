@@ -8,20 +8,25 @@
 //! On-miss: download blob → unpack to a fresh tempdir → atomically rename
 //! into the cache path. Open the index from the cache path with mmap.
 
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
 use anyhow::{Context, Result, anyhow};
 use object_store::ObjectStore;
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tantivy::query::QueryParser;
 
-use crate::tantivy_index::manifest;
-use crate::tantivy_index::reader::{Hit, query_index};
-use crate::tantivy_index::store;
+use crate::tantivy_index::{
+    manifest,
+    reader::{Hit, query_index},
+    store,
+};
 
 #[derive(Debug)]
 pub struct SearchResult {
-    pub hits: Vec<Hit>,
+    pub hits:         Vec<Hit>,
     /// Sum of `rows` across all manifest entries that contributed (whether
     /// they hit or not). Lets the caller compute hit_count / indexed_rows
     /// for the selectivity cutoff.
@@ -31,7 +36,7 @@ pub struct SearchResult {
 #[derive(Debug)]
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
-    pub cache_root: PathBuf,
+    pub cache_root:   PathBuf,
 }
 
 impl TantivySearchService {

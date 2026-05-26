@@ -18,9 +18,10 @@
 //!
 //! Logged once at startup so ops can see exactly what was chosen.
 
-use crate::config::AppConfig;
 use sysinfo::{Disks, System};
 use tracing::info;
+
+use crate::config::AppConfig;
 
 const RAM_FRACTION_QUERY_POOL: f64 = 0.30;
 const RAM_FRACTION_BUFFER: f64 = 0.25;
@@ -95,7 +96,7 @@ pub fn apply(config: &mut AppConfig) {
 
     // Foyer metadata memory cache. Default static = 512MB.
     if env_unset("TIMEFUSION_FOYER_METADATA_MEMORY_MB") {
-        let derived = ((total_ram_mb as f64 * RAM_FRACTION_FOYER_META) as usize).min(MAX_FOYER_META_MB).max(64);
+        let derived = ((total_ram_mb as f64 * RAM_FRACTION_FOYER_META) as usize).clamp(64, MAX_FOYER_META_MB);
         if derived != config.cache.timefusion_foyer_metadata_memory_mb {
             config.cache.timefusion_foyer_metadata_memory_mb = derived;
             applied.push(("TIMEFUSION_FOYER_METADATA_MEMORY_MB", format!("{}MB", derived)));
@@ -112,7 +113,7 @@ pub fn apply(config: &mut AppConfig) {
             }
         }
         if env_unset("TIMEFUSION_FOYER_METADATA_DISK_GB") {
-            let derived = ((avail_gb as f64 * DISK_FRACTION_FOYER_META) as usize).min(MAX_FOYER_META_DISK_GB).max(1);
+            let derived = ((avail_gb as f64 * DISK_FRACTION_FOYER_META) as usize).clamp(1, MAX_FOYER_META_DISK_GB);
             if derived != config.cache.timefusion_foyer_metadata_disk_gb {
                 config.cache.timefusion_foyer_metadata_disk_gb = derived;
                 applied.push(("TIMEFUSION_FOYER_METADATA_DISK_GB", format!("{}GB", derived)));

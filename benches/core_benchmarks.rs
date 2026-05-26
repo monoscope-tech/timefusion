@@ -1,12 +1,13 @@
-use criterion::{Criterion, criterion_group, criterion_main};
-use std::path::PathBuf;
-use std::sync::Arc;
-use timefusion::buffered_write_layer::BufferedWriteLayer;
-use timefusion::config::AppConfig;
-use timefusion::database::Database;
-use timefusion::test_utils::test_helpers::{json_to_batch, test_span};
+use std::{path::PathBuf, sync::Arc};
 
+use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::execution::context::SessionContext;
+use timefusion::{
+    buffered_write_layer::BufferedWriteLayer,
+    config::AppConfig,
+    database::Database,
+    test_utils::test_helpers::{json_to_batch, test_span},
+};
 
 fn bench_config(name: &str) -> Arc<AppConfig> {
     let uuid = &uuid::Uuid::new_v4().to_string()[..8].to_string();

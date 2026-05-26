@@ -1,24 +1,27 @@
-use arrow::datatypes::DataType as ArrowDataType;
-use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
-use deltalake::datafusion::parquet::file::metadata::SortingColumn;
-use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
+
+use arrow::datatypes::{DataType as ArrowDataType, Field, FieldRef, Schema, SchemaRef};
+use deltalake::{
+    datafusion::parquet::file::metadata::SortingColumn,
+    kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField},
+};
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::OnceLock;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSchema {
-    pub table_name: String,
-    pub partitions: Vec<String>,
+    pub table_name:      String,
+    pub partitions:      Vec<String>,
     pub sorting_columns: Vec<SortingColumnDef>,
     pub z_order_columns: Vec<String>,
-    pub fields: Vec<FieldDef>,
+    pub fields:          Vec<FieldDef>,
     /// Column the optimizer should rewrite into a `date` partition filter.
     /// Defaults to `"timestamp"` for back-compat with existing schemas.
     #[serde(default)]
-    pub time_column: Option<String>,
+    pub time_column:     Option<String>,
 }
 
 impl TableSchema {
@@ -29,23 +32,23 @@ impl TableSchema {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SortingColumnDef {
-    pub name: String,
-    pub descending: bool,
+    pub name:        String,
+    pub descending:  bool,
     pub nulls_first: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FieldDef {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
+    pub name:         String,
+    pub data_type:    String,
+    pub nullable:     bool,
     #[serde(default)]
-    pub tantivy: Option<TantivyFieldConfig>,
+    pub tantivy:      Option<TantivyFieldConfig>,
     /// Opt-out for dictionary encoding. Default on. Set false for high-entropy
     /// free-text columns (stacktraces, raw queries, full URLs) where dict just
     /// builds a useless 8MB before falling back to PLAIN — wasted writer pass.
     #[serde(default)]
-    pub dictionary: Option<bool>,
+    pub dictionary:   Option<bool>,
     /// Per-column bloom filter opt-in. Default off. Enable for high-cardinality
     /// equality-lookup columns (ids, trace_ids, span_ids, session_ids).
     #[serde(default)]
@@ -64,11 +67,11 @@ pub struct FieldDef {
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct TantivyFieldConfig {
     #[serde(default)]
-    pub indexed: bool,
+    pub indexed:   bool,
     #[serde(default)]
     pub tokenizer: Option<String>,
     #[serde(default)]
-    pub flatten: Option<String>,
+    pub flatten:   Option<String>,
 }
 
 impl TableSchema {
@@ -132,8 +135,8 @@ impl TableSchema {
             .iter()
             .filter_map(|col| {
                 self.fields.iter().position(|f| f.name == col.name).map(|idx| SortingColumn {
-                    column_idx: idx as i32,
-                    descending: col.descending,
+                    column_idx:  idx as i32,
+                    descending:  col.descending,
                     nulls_first: col.nulls_first,
                 })
             })
@@ -256,7 +259,9 @@ pub fn get_default_schema() -> &'static TableSchema {
 pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
     match data_type {
         ArrowDataType::Struct(fields) if fields.len() == 2 => {
-            fields.iter().any(|f| f.name() == "metadata" && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
+            fields
+                .iter()
+                .any(|f| f.name() == "metadata" && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
                 && fields.iter().any(|f| f.name() == "value" && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
         }
         _ => false,
@@ -293,4 +298,3 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
         .collect();
     Arc::new(Schema::new(new_fields))
 }
-

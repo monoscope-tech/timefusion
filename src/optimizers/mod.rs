@@ -2,14 +2,13 @@ mod tantivy_rewriter;
 mod variant_insert_rewriter;
 mod variant_select_rewriter;
 
+use datafusion::{
+    logical_expr::{BinaryExpr, Expr, Operator},
+    scalar::ScalarValue,
+};
 pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;
 pub use variant_select_rewriter::VariantSelectRewriter;
-
-// Remove unused imports warning - these are used by the submodules indirectly
-
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use datafusion::scalar::ScalarValue;
 
 /// Utilities for converting timestamp filters to date partition filters
 /// for better partition pruning in Delta Lake
@@ -24,7 +23,9 @@ pub mod time_range_partition_pruner {
     /// `"event_time"`). Non-matching columns are skipped — pruning only fires for
     /// the table's declared time column.
     pub fn timestamp_to_date_filter(expr: &Expr, time_column: &str) -> Option<Expr> {
-        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else { return None };
+        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+            return None;
+        };
         let Expr::Column(col) = left.as_ref() else { return None };
         if col.name != time_column {
             return None;

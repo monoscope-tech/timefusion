@@ -18,4 +18,4 @@ pub mod udf;
 
 pub use builder::{IndexBuildStats, build_in_memory};
 pub use reader::{Hit, query_index};
-pub use schema::{TS_FIELD, ID_FIELD, build_for_table};
+pub use schema::{ID_FIELD, TS_FIELD, build_for_table};

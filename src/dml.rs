@@ -1,5 +1,4 @@
-use std::any::Any;
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -18,11 +17,9 @@ use datafusion::{
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
-use tracing::field::Empty;
-use tracing::{Instrument, error, info, instrument};
+use tracing::{Instrument, error, field::Empty, info, instrument};
 
-use crate::buffered_write_layer::BufferedWriteLayer;
-use crate::database::Database;
+use crate::{buffered_write_layer::BufferedWriteLayer, database::Database};
 
 /// Build a clean SessionState with config + runtime from the given session but with
 /// delta-rs's DeltaPlanner instead of our custom DmlQueryPlanner.
@@ -54,8 +51,8 @@ type DmlInfo = (String, String, Option<Expr>, Option<Vec<(String, Expr)>>);
 
 /// Custom query planner that intercepts DML operations
 pub struct DmlQueryPlanner {
-    planner: DefaultPhysicalPlanner,
-    database: Arc<Database>,
+    planner:        DefaultPhysicalPlanner,
+    database:       Arc<Database>,
     buffered_layer: Option<Arc<BufferedWriteLayer>>,
 }
 
@@ -146,8 +143,8 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                         .then(|| {
                             scan.filters.iter().cloned().reduce(|acc, filter| {
                                 Expr::BinaryExpr(BinaryExpr {
-                                    left: Box::new(acc),
-                                    op: Operator::And,
+                                    left:  Box::new(acc),
+                                    op:    Operator::And,
                                     right: Box::new(filter),
                                 })
                             })
@@ -212,16 +209,16 @@ fn extract_project_id(expr: &Expr) -> Option<String> {
 /// Unified DML execution plan
 #[derive(Clone)]
 pub struct DmlExec {
-    op_type: DmlOperation,
-    table_name: String,
-    project_id: String,
-    predicate: Option<Expr>,
-    assignments: Vec<(String, Expr)>,
-    input: Arc<dyn ExecutionPlan>,
-    database: Arc<Database>,
+    op_type:        DmlOperation,
+    table_name:     String,
+    project_id:     String,
+    predicate:      Option<Expr>,
+    assignments:    Vec<(String, Expr)>,
+    input:          Arc<dyn ExecutionPlan>,
+    database:       Arc<Database>,
     buffered_layer: Option<Arc<BufferedWriteLayer>>,
-    session: Arc<dyn Session>,
-    properties: Arc<PlanProperties>,
+    session:        Arc<dyn Session>,
+    properties:     Arc<PlanProperties>,
 }
 
 impl std::fmt::Debug for DmlExec {
@@ -408,11 +405,11 @@ impl ExecutionPlan for DmlExec {
 }
 
 struct DmlContext<'a> {
-    database: &'a Database,
+    database:       &'a Database,
     buffered_layer: Option<&'a Arc<BufferedWriteLayer>>,
-    table_name: &'a str,
-    project_id: &'a str,
-    predicate: Option<Expr>,
+    table_name:     &'a str,
+    project_id:     &'a str,
+    predicate:      Option<Expr>,
 }
 
 impl<'a> DmlContext<'a> {
@@ -443,6 +440,7 @@ impl<'a> DmlContext<'a> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn perform_update_with_buffer(
     database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
     assignments: Vec<(String, Expr)>, session: Arc<dyn Session>, span: &tracing::Span,

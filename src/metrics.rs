@@ -16,67 +16,73 @@
 //! in a process-global `OnceLock`; if init isn't called (tests, embedded
 //! use), the helpers no-op.
 
-use crate::buffered_write_layer::BufferedWriteLayer;
-use crate::config::TelemetryConfig;
-use crate::tantivy_index::service::TantivyIndexService;
-use opentelemetry::KeyValue;
-use opentelemetry::metrics::{Counter, Meter};
+use std::{
+    sync::{Arc, OnceLock, Weak},
+    time::Duration,
+};
+
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Meter},
+};
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
-use std::sync::{Arc, OnceLock, Weak};
-use std::time::Duration;
+use opentelemetry_sdk::{
+    Resource,
+    metrics::{PeriodicReader, SdkMeterProvider},
+};
 use tracing::{info, warn};
+
+use crate::{buffered_write_layer::BufferedWriteLayer, config::TelemetryConfig, tantivy_index::service::TantivyIndexService};
 
 static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
 
 /// Holds counters that need to be incremented from the hot path. Gauges are
 /// observed by callback and don't need to live here.
 pub struct MetricsRegistry {
-    pub ingest_inserts: Counter<u64>,
-    pub ingest_rows: Counter<u64>,
-    pub ingest_errors: Counter<u64>,
-    pub wal_corruption: Counter<u64>,
-    pub flush_completed: Counter<u64>,
-    pub flush_failed: Counter<u64>,
-    pub query_executions: Counter<u64>,
+    pub ingest_inserts:             Counter<u64>,
+    pub ingest_rows:                Counter<u64>,
+    pub ingest_errors:              Counter<u64>,
+    pub wal_corruption:             Counter<u64>,
+    pub flush_completed:            Counter<u64>,
+    pub flush_failed:               Counter<u64>,
+    pub query_executions:           Counter<u64>,
     pub tantivy_prefilter_attempts: Counter<u64>,
-    pub tantivy_prefilter_used: Counter<u64>,
-    pub tantivy_prefilter_skipped: Counter<u64>,
-    pub tantivy_prefilter_errors: Counter<u64>,
-    pub tantivy_build_failures: Counter<u64>,
+    pub tantivy_prefilter_used:     Counter<u64>,
+    pub tantivy_prefilter_skipped:  Counter<u64>,
+    pub tantivy_prefilter_errors:   Counter<u64>,
+    pub tantivy_build_failures:     Counter<u64>,
 }
 
 impl MetricsRegistry {
     fn new(meter: &Meter) -> Self {
         Self {
-            ingest_inserts: meter.u64_counter("timefusion.ingest.inserts").with_description("Ingest insert calls accepted").build(),
-            ingest_rows: meter.u64_counter("timefusion.ingest.rows").with_description("Rows accepted into MemBuffer").build(),
-            ingest_errors: meter.u64_counter("timefusion.ingest.errors").with_description("Ingest call failures").build(),
-            wal_corruption: meter
+            ingest_inserts:             meter.u64_counter("timefusion.ingest.inserts").with_description("Ingest insert calls accepted").build(),
+            ingest_rows:                meter.u64_counter("timefusion.ingest.rows").with_description("Rows accepted into MemBuffer").build(),
+            ingest_errors:              meter.u64_counter("timefusion.ingest.errors").with_description("Ingest call failures").build(),
+            wal_corruption:             meter
                 .u64_counter("timefusion.wal.corruption_events")
                 .with_description("WAL entries that failed to deserialize or replay")
                 .build(),
-            flush_completed: meter.u64_counter("timefusion.flush.completed").with_description("Flush cycles that committed to Delta").build(),
-            flush_failed: meter.u64_counter("timefusion.flush.failed").with_description("Flush cycles that errored").build(),
-            query_executions: meter.u64_counter("timefusion.query.executions").with_description("SQL query plans executed").build(),
+            flush_completed:            meter.u64_counter("timefusion.flush.completed").with_description("Flush cycles that committed to Delta").build(),
+            flush_failed:               meter.u64_counter("timefusion.flush.failed").with_description("Flush cycles that errored").build(),
+            query_executions:           meter.u64_counter("timefusion.query.executions").with_description("SQL query plans executed").build(),
             tantivy_prefilter_attempts: meter
                 .u64_counter("timefusion.tantivy.prefilter_attempts")
                 .with_description("Queries where at least one text_match predicate triggered a tantivy lookup")
                 .build(),
-            tantivy_prefilter_used: meter
+            tantivy_prefilter_used:     meter
                 .u64_counter("timefusion.tantivy.prefilter_used")
                 .with_description("Queries where the tantivy id-set prefilter was applied to the Delta scan")
                 .build(),
-            tantivy_prefilter_skipped: meter
+            tantivy_prefilter_skipped:  meter
                 .u64_counter("timefusion.tantivy.prefilter_skipped")
                 .with_description("Queries where tantivy lookup was attempted but pushdown was skipped (no index, hit cap, or low selectivity)")
                 .build(),
-            tantivy_prefilter_errors: meter
+            tantivy_prefilter_errors:   meter
                 .u64_counter("timefusion.tantivy.prefilter_errors")
                 .with_description("Tantivy lookups that errored (S3 down, parse failure, etc.)")
                 .build(),
-            tantivy_build_failures: meter
+            tantivy_build_failures:     meter
                 .u64_counter("timefusion.tantivy.build_failures")
                 .with_description("Post-flush tantivy index builds that errored — accumulating drift means queries silently fall back to UDF scan")
                 .build(),
@@ -93,7 +99,9 @@ pub fn registry() -> Option<&'static MetricsRegistry> {
 ///
 /// `buffered_layer` is a Weak so the metrics callback doesn't extend its
 /// lifetime — the layer owns its shutdown order, not us.
-pub fn init_metrics(config: &TelemetryConfig, buffered_layer: Weak<BufferedWriteLayer>, tantivy_indexer: Option<Weak<TantivyIndexService>>) -> anyhow::Result<()> {
+pub fn init_metrics(
+    config: &TelemetryConfig, buffered_layer: Weak<BufferedWriteLayer>, tantivy_indexer: Option<Weak<TantivyIndexService>>,
+) -> anyhow::Result<()> {
     if METRICS.get().is_some() {
         return Ok(());
     }
@@ -128,10 +136,10 @@ pub fn init_metrics(config: &TelemetryConfig, buffered_layer: Weak<BufferedWrite
         .u64_observable_gauge("timefusion.mem_buffer.oldest_bucket_age_seconds")
         .with_description("Age of oldest MemBuffer bucket; alert if > 2x flush_interval_secs")
         .with_callback(move |obs| {
-            if let Some(layer) = bl_for_buckets.upgrade() {
-                if let Some(age) = layer.snapshot_stats().oldest_bucket_age_secs {
-                    obs.observe(age, &[]);
-                }
+            if let Some(layer) = bl_for_buckets.upgrade()
+                && let Some(age) = layer.snapshot_stats().oldest_bucket_age_secs
+            {
+                obs.observe(age, &[]);
             }
         })
         .build();
@@ -229,7 +237,10 @@ pub fn init_metrics(config: &TelemetryConfig, buffered_layer: Weak<BufferedWrite
     // until shutdown anyway. Avoids stashing a handle the caller must own.
     let _ = Arc::new(provider);
 
-    info!("OpenTelemetry metrics initialized (OTLP -> {}, interval=30s)", config.otel_exporter_otlp_endpoint);
+    info!(
+        "OpenTelemetry metrics initialized (OTLP -> {}, interval=30s)",
+        config.otel_exporter_otlp_endpoint
+    );
     Ok(())
 }
 

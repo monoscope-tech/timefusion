@@ -20,10 +20,12 @@ jobs:
       # group_imports, format_code_in_doc_comments, normalize_doc_attributes,
       # empty_item_single_line, struct_field_align_threshold). Stable fmt
       # silently drops them and reformats differently → CI mismatch.
+      # rust-toolchain.toml pins to stable, so install nightly *and* invoke it
+      # explicitly with `+nightly` so cargo doesn't fall back to the pinned channel.
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-      - run: cargo fmt --all --check
+      - run: cargo +nightly fmt --all --check
 
   clippy:
     name: Clippy

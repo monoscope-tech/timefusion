@@ -12,36 +12,68 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::{
+    array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray},
+    datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
+};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use tantivy::query::TermQuery;
-use tantivy::schema::IndexRecordOption;
-use tantivy::Term;
-
-use timefusion::schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig};
-use timefusion::tantivy_index::{builder::build_in_memory, reader::query_index, store};
+use tantivy::{Term, query::TermQuery, schema::IndexRecordOption};
+use timefusion::{
+    schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
+    tantivy_index::{builder::build_in_memory, reader::query_index, store},
+};
 
 fn table() -> TableSchema {
     TableSchema {
-        table_name: "bench".into(),
-        partitions: vec![],
-        sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
+        table_name:      "bench".into(),
+        partitions:      vec![],
+        sorting_columns: vec![SortingColumnDef {
+            name:        "timestamp".into(),
+            descending:  false,
+            nulls_first: false,
+        }],
         z_order_columns: vec![],
-        fields: vec![
-            FieldDef { name: "timestamp".into(), data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(), nullable: false, tantivy: None },
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None },
+        time_column:     None,
+        fields:          vec![
             FieldDef {
-                name: "level".into(),
-                data_type: "Utf8".into(),
-                nullable: true,
-                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), stored: false, flatten: None }),
+                name:         "timestamp".into(),
+                data_type:    "Timestamp(Microsecond, Some(\"UTC\"))".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
+                bloom_filter: false,
             },
             FieldDef {
-                name: "message".into(),
-                data_type: "Utf8".into(),
-                nullable: true,
-                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("default".into()), stored: false, flatten: None }),
+                name:         "id".into(),
+                data_type:    "Utf8".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
+                bloom_filter: false,
+            },
+            FieldDef {
+                name:         "level".into(),
+                data_type:    "Utf8".into(),
+                nullable:     true,
+                tantivy:      Some(TantivyFieldConfig {
+                    indexed:   true,
+                    tokenizer: Some("raw".into()),
+                    flatten:   None,
+                }),
+                dictionary:   None,
+                bloom_filter: false,
+            },
+            FieldDef {
+                name:         "message".into(),
+                data_type:    "Utf8".into(),
+                nullable:     true,
+                tantivy:      Some(TantivyFieldConfig {
+                    indexed:   true,
+                    tokenizer: Some("default".into()),
+                    flatten:   None,
+                }),
+                dictionary:   None,
+                bloom_filter: false,
             },
         ],
     }
@@ -53,7 +85,9 @@ fn synthetic_batch(n: usize) -> RecordBatch {
     let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from((0..n as i64).map(|i| 1_000_000 + i * 1000).collect::<Vec<_>>()).with_timezone("UTC"));
     let id: ArrayRef = Arc::new(StringArray::from((0..n).map(|i| format!("id-{i}")).collect::<Vec<_>>()));
     let level: ArrayRef = Arc::new(StringArray::from((0..n).map(|i| levels[i % levels.len()]).collect::<Vec<_>>()));
-    let msg: ArrayRef = Arc::new(StringArray::from((0..n).map(|i| format!("{} {}", words[i % words.len()], words[(i + 3) % words.len()])).collect::<Vec<_>>()));
+    let msg: ArrayRef = Arc::new(StringArray::from(
+        (0..n).map(|i| format!("{} {}", words[i % words.len()], words[(i + 3) % words.len()])).collect::<Vec<_>>(),
+    ));
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
         Field::new("id", DataType::Utf8, false),
@@ -97,7 +131,12 @@ fn bench_size_ratio(c: &mut Criterion) {
     let b = synthetic_batch(n);
     let (blob, stats) = store::build_and_pack(&table, std::slice::from_ref(&b), 19).unwrap();
     let bytes_per_row = blob.len() as f64 / stats.rows as f64;
-    println!("tantivy index size: {} bytes for {} rows ({:.2} bytes/row)", blob.len(), stats.rows, bytes_per_row);
+    println!(
+        "tantivy index size: {} bytes for {} rows ({:.2} bytes/row)",
+        blob.len(),
+        stats.rows,
+        bytes_per_row
+    );
     c.bench_function("tantivy_pack_100k_zstd_19", |bench| {
         bench.iter(|| {
             let _ = store::build_and_pack(&table, std::slice::from_ref(&b), 19).unwrap();
@@ -110,16 +149,18 @@ fn bench_size_ratio(c: &mut Criterion) {
 // Requires MinIO. Skipped if AWS_S3_ENDPOINT isn't reachable.
 // ────────────────────────────────────────────────────────────────────────────
 
-use serde_json::json;
-use std::path::PathBuf;
-use std::time::Duration;
-use timefusion::buffered_write_layer::{BufferedWriteLayer, DeltaWriteCallback};
-use timefusion::config::{AppConfig, TantivyConfig};
-use timefusion::database::Database;
-use timefusion::tantivy_index::{search::TantivySearchService, service::TantivyIndexService};
-use timefusion::test_utils::test_helpers::json_to_batch;
+use std::{path::PathBuf, time::Duration};
 
-fn make_app_cfg(test_id: &str, tantivy_enabled: bool) -> Arc<AppConfig> {
+use serde_json::json;
+use timefusion::{
+    buffered_write_layer::{BufferedWriteLayer, DeltaWriteCallback},
+    config::{AppConfig, TantivyConfig},
+    database::Database,
+    tantivy_index::{search::TantivySearchService, service::TantivyIndexService},
+    test_utils::test_helpers::json_to_batch,
+};
+
+fn make_app_cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
     let mut c = AppConfig::default();
     c.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
     c.aws.aws_access_key_id = Some("minioadmin".into());
@@ -131,7 +172,6 @@ fn make_app_cfg(test_id: &str, tantivy_enabled: bool) -> Arc<AppConfig> {
     c.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-tantivy-bench-{test_id}"));
     c.cache.timefusion_foyer_disabled = true;
     c.tantivy = TantivyConfig {
-        
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
     };

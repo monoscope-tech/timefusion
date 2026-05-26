@@ -5,36 +5,61 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::{
+    array::{ArrayRef, RecordBatch, StringArray, TimestampMicrosecondArray},
+    datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
+};
 use object_store::memory::InMemory;
 use tempfile::TempDir;
-
-use timefusion::config::TantivyConfig;
-use timefusion::schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig};
-use timefusion::tantivy_index::{
-    manifest::{self, ManifestEntry},
-    search::TantivySearchService,
-    service::TantivyIndexService,
+use timefusion::{
+    config::TantivyConfig,
+    schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
+    tantivy_index::{
+        manifest::{self, ManifestEntry},
+        search::TantivySearchService,
+        service::TantivyIndexService,
+    },
 };
 
 #[allow(dead_code)]
 fn schema_with(level_indexed: bool) -> TableSchema {
     TableSchema {
-        table_name: "logs".into(),
-        partitions: vec![],
-        sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
+        table_name:      "logs".into(),
+        partitions:      vec![],
+        sorting_columns: vec![SortingColumnDef {
+            name:        "timestamp".into(),
+            descending:  false,
+            nulls_first: false,
+        }],
         z_order_columns: vec![],
-        time_column: None,
-        fields: vec![
-            FieldDef { name: "timestamp".into(), data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
+        time_column:     None,
+        fields:          vec![
             FieldDef {
-                name: "level".into(),
-                data_type: "Utf8".into(),
-                nullable: true,
-                tantivy: level_indexed.then(|| TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None }),
-                dictionary: None,
+                name:         "timestamp".into(),
+                data_type:    "Timestamp(Microsecond, Some(\"UTC\"))".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
+                bloom_filter: false,
+            },
+            FieldDef {
+                name:         "id".into(),
+                data_type:    "Utf8".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
+                bloom_filter: false,
+            },
+            FieldDef {
+                name:         "level".into(),
+                data_type:    "Utf8".into(),
+                nullable:     true,
+                tantivy:      level_indexed.then(|| TantivyFieldConfig {
+                    indexed:   true,
+                    tokenizer: Some("raw".into()),
+                    flatten:   None,
+                }),
+                dictionary:   None,
                 bloom_filter: false,
             },
         ],
@@ -64,7 +89,6 @@ async fn callback_builds_index_and_search_returns_hits() {
 
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig {
-        
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
     };
@@ -125,14 +149,14 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
         "p1",
         "bucket-bad",
         ManifestEntry {
-            index: None,
-            rows: 0,
-            built_at: chrono::Utc::now(),
-            schema_version: manifest::SCHEMA_VERSION,
+            index:                None,
+            rows:                 0,
+            built_at:             chrono::Utc::now(),
+            schema_version:       manifest::SCHEMA_VERSION,
             min_timestamp_micros: None,
             max_timestamp_micros: None,
-            error: Some("simulated build failure".into()),
-            covered_files: vec![],
+            error:                Some("simulated build failure".into()),
+            covered_files:        vec![],
         },
     )
     .await
@@ -151,15 +175,28 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     let project_id = "p1";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig {
-        
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
     };
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
     let cb = svc.clone().callback();
     // First flush wrote file_a; second flush wrote file_b.
-    cb(project_id.into(), table_name.into(), vec![batch(&[(1_000_000, "a", "INFO")])], vec!["file_a".into()]).await.unwrap();
-    cb(project_id.into(), table_name.into(), vec![batch(&[(2_000_000, "b", "ERROR")])], vec!["file_b".into()]).await.unwrap();
+    cb(
+        project_id.into(),
+        table_name.into(),
+        vec![batch(&[(1_000_000, "a", "INFO")])],
+        vec!["file_a".into()],
+    )
+    .await
+    .unwrap();
+    cb(
+        project_id.into(),
+        table_name.into(),
+        vec![batch(&[(2_000_000, "b", "ERROR")])],
+        vec!["file_b".into()],
+    )
+    .await
+    .unwrap();
     let m_before = manifest::load(store.as_ref(), table_name, project_id).await.unwrap();
     assert_eq!(m_before.entries.len(), 2);
 
@@ -189,7 +226,6 @@ async fn search_skips_indexes_that_dont_have_the_field() {
     let project_id = "p1";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig {
-        
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
     };

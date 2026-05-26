@@ -15,15 +15,20 @@
 //! writes "k1:v1 k2:v2 …" tokens (key+value flattened). Nested objects are
 //! traversed recursively.
 
-use crate::schema_loader::TableSchema;
-use crate::tantivy_index::schema::{BuiltSchema, build_for_table};
 use anyhow::{Context, Result, anyhow, bail};
-use arrow::array::{Array, ArrayRef, AsArray, ListArray, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray};
-use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
+use arrow::{
+    array::{Array, ArrayRef, AsArray, ListArray, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray},
+    datatypes::DataType,
+    record_batch::RecordBatch,
+};
 use parquet_variant_compute::VariantArray;
 use parquet_variant_json::VariantToJson;
 use tantivy::{Index, IndexWriter, doc, schema::Schema as TSchema};
+
+use crate::{
+    schema_loader::TableSchema,
+    tantivy_index::schema::{BuiltSchema, build_for_table},
+};
 
 /// Heap reserved per tantivy `IndexWriter`. Surfaced so the
 /// `BufferedWriteLayer` can subtract peak in-flight tantivy memory from the
@@ -32,8 +37,8 @@ pub const WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexBuildStats {
-    pub rows: u64,
-    pub batches: u32,
+    pub rows:                 u64,
+    pub batches:              u32,
     pub min_timestamp_micros: Option<i64>,
     pub max_timestamp_micros: Option<i64>,
 }
@@ -76,15 +81,19 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
 
     // Pre-resolve user-field columns once per batch.
     struct UserCol<'a> {
-        field: tantivy::schema::Field,
+        field:  tantivy::schema::Field,
         column: &'a ArrayRef,
-        kind: ColKind,
+        kind:   ColKind,
     }
     let mut user_cols: Vec<UserCol> = Vec::new();
     for (name, uf) in &built.user_fields {
         let Ok(idx) = schema.index_of(name) else { continue };
         let kind = ColKind::detect(batch.column(idx).data_type(), uf.source.tantivy.as_ref().and_then(|t| t.flatten.as_deref()))?;
-        user_cols.push(UserCol { field: uf.field, column: batch.column(idx), kind });
+        user_cols.push(UserCol {
+            field: uf.field,
+            column: batch.column(idx),
+            kind,
+        });
     }
 
     for row in 0..batch.num_rows() {
@@ -97,10 +106,10 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
             if uc.column.is_null(row) {
                 continue;
             }
-            if let Some(text) = uc.kind.extract(uc.column, row)? {
-                if !text.is_empty() {
-                    doc.add_text(uc.field, &text);
-                }
+            if let Some(text) = uc.kind.extract(uc.column, row)?
+                && !text.is_empty()
+            {
+                doc.add_text(uc.field, &text);
             }
         }
         writer.add_document(doc).context("add_document")?;

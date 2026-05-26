@@ -1,13 +1,16 @@
 //! Buffer consistency tests - verifies query results are consistent whether data is in MemBuffer or Delta.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use datafusion::arrow::array::{Array, AsArray, StringViewArray};
 use serial_test::serial;
-use std::sync::Arc;
 use test_case::test_case;
-use timefusion::buffered_write_layer::BufferedWriteLayer;
-use timefusion::database::Database;
-use timefusion::test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span};
+use timefusion::{
+    buffered_write_layer::BufferedWriteLayer,
+    database::Database,
+    test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span},
+};
 
 fn get_str(arr: &dyn Array, idx: usize) -> String {
     arr.as_any().downcast_ref::<StringViewArray>().map(|a| a.value(idx).to_string()).unwrap_or_default()

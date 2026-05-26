@@ -27,7 +27,10 @@ use std::sync::Arc;
 use datafusion::{
     arrow::datatypes::{Field, Schema},
     catalog::default_table_source::DefaultTableSource,
-    common::{DFSchema, DFSchemaRef, Result, tree_node::{Transformed, TreeNode}},
+    common::{
+        DFSchema, DFSchemaRef, Result,
+        tree_node::{Transformed, TreeNode},
+    },
     config::ConfigOptions,
     logical_expr::{Expr, ExprSchemable, LogicalPlan, Projection, TableScan, expr::ScalarFunction},
     optimizer::AnalyzerRule,
@@ -35,14 +38,15 @@ use datafusion::{
 use datafusion_variant::VariantToJsonUdf;
 use tracing::debug;
 
-use crate::database::ProjectRoutingTable;
-use crate::schema_loader::is_variant_type;
+use crate::{database::ProjectRoutingTable, schema_loader::is_variant_type};
 
 #[derive(Debug, Default)]
 pub struct VariantSelectRewriter;
 
 impl AnalyzerRule for VariantSelectRewriter {
-    fn name(&self) -> &str { "variant_select_rewriter" }
+    fn name(&self) -> &str {
+        "variant_select_rewriter"
+    }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         if matches!(plan, LogicalPlan::Dml(_)) {
@@ -95,7 +99,10 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let mut zipped: Vec<(Option<datafusion::sql::TableReference>, Arc<Field>)> = qualifiers.into_iter().zip(patched_arrow.fields().iter().cloned()).collect();
     let new_df: DFSchemaRef = Arc::new(DFSchema::new_with_metadata(std::mem::take(&mut zipped), patched_arrow.metadata().clone())?);
     debug!(target: "variant_select_rewriter", "patched TableScan({}) schema → Variant", scan.table_name);
-    Ok(Transformed::yes(LogicalPlan::TableScan(TableScan { projected_schema: new_df, ..scan })))
+    Ok(Transformed::yes(LogicalPlan::TableScan(TableScan {
+        projected_schema: new_df,
+        ..scan
+    })))
 }
 
 /// Peel Sort / Limit / Distinct / SubqueryAlias from the root and wrap
@@ -148,31 +155,31 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 fn wrap_projection(proj: Projection) -> Result<LogicalPlan> {
     let input_schema = proj.input.schema().clone();
     let variant_to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonUdf::default()));
-    let mut modified = false;
+    let mut wrapped = 0usize;
     let new_exprs: Vec<Expr> = proj
         .expr
         .iter()
         .map(|expr| {
             if is_variant_expr(expr, &input_schema) {
-                modified = true;
+                wrapped += 1;
                 wrap_with_variant_to_json(expr, &variant_to_json)
             } else {
                 expr.clone()
             }
         })
         .collect();
-    if !modified {
+    if wrapped == 0 {
         return Ok(LogicalPlan::Projection(proj));
     }
-    debug!(target: "variant_select_rewriter", "wrapped {} Variant exprs at root projection", new_exprs.iter().filter(|e| matches!(e, Expr::ScalarFunction(_))).count());
+    debug!(target: "variant_select_rewriter", "wrapped {} Variant exprs at root projection", wrapped);
     Ok(LogicalPlan::Projection(Projection::try_new(new_exprs, proj.input.clone())?))
 }
 
 fn is_variant_expr(expr: &Expr, schema: &DFSchema) -> bool {
-    if let Expr::ScalarFunction(sf) = expr {
-        if sf.func.name() == "variant_to_json" {
-            return false;
-        }
+    if let Expr::ScalarFunction(sf) = expr
+        && sf.func.name() == "variant_to_json"
+    {
+        return false;
     }
     expr.get_type(schema).map(|dt| is_variant_type(&dt)).unwrap_or(false)
 }
@@ -182,7 +189,10 @@ fn wrap_with_variant_to_json(expr: &Expr, udf: &Arc<datafusion::logical_expr::Sc
         Expr::Alias(a) => (a.expr.as_ref().clone(), Some(a.name.clone())),
         _ => (expr.clone(), None),
     };
-    let wrapped = Expr::ScalarFunction(ScalarFunction { func: udf.clone(), args: vec![inner] });
+    let wrapped = Expr::ScalarFunction(ScalarFunction {
+        func: udf.clone(),
+        args: vec![inner],
+    });
     match alias {
         Some(name) => wrapped.alias(name),
         None => wrapped,

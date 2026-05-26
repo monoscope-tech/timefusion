@@ -1,8 +1,6 @@
+use std::{collections::HashMap, path::PathBuf, sync::OnceLock, time::Duration};
+
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::time::Duration;
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
@@ -11,15 +9,15 @@ pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
     // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
     // See: https://github.com/softprops/envy/issues/26
     Ok(AppConfig {
-        aws: envy::from_env()?,
-        core: envy::from_env()?,
-        buffer: envy::from_env()?,
-        cache: envy::from_env()?,
-        parquet: envy::from_env()?,
+        aws:         envy::from_env()?,
+        core:        envy::from_env()?,
+        buffer:      envy::from_env()?,
+        cache:       envy::from_env()?,
+        parquet:     envy::from_env()?,
         maintenance: envy::from_env()?,
-        memory: envy::from_env()?,
-        telemetry: envy::from_env()?,
-        tantivy: envy::from_env()?,
+        memory:      envy::from_env()?,
+        telemetry:   envy::from_env()?,
+        tantivy:     envy::from_env()?,
     })
 }
 
@@ -170,23 +168,23 @@ fn d_service_version() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     #[serde(flatten)]
-    pub aws: AwsConfig,
+    pub aws:         AwsConfig,
     #[serde(flatten)]
-    pub core: CoreConfig,
+    pub core:        CoreConfig,
     #[serde(flatten)]
-    pub buffer: BufferConfig,
+    pub buffer:      BufferConfig,
     #[serde(flatten)]
-    pub cache: CacheConfig,
+    pub cache:       CacheConfig,
     #[serde(flatten)]
-    pub parquet: ParquetConfig,
+    pub parquet:     ParquetConfig,
     #[serde(flatten)]
     pub maintenance: MaintenanceConfig,
     #[serde(flatten)]
-    pub memory: MemoryConfig,
+    pub memory:      MemoryConfig,
     #[serde(flatten)]
-    pub telemetry: TelemetryConfig,
+    pub telemetry:   TelemetryConfig,
     #[serde(flatten)]
-    pub tantivy: TantivyConfig,
+    pub tantivy:     TantivyConfig,
 }
 
 const_default!(d_tantivy_max_index_mb: u64 = 64);
@@ -203,18 +201,18 @@ const_default!(d_tantivy_prefilter_min_selectivity_pct: u32 = 50);
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TantivyConfig {
     #[serde(default = "d_tantivy_max_index_mb")]
-    pub timefusion_tantivy_max_index_size_mb: u64,
+    pub timefusion_tantivy_max_index_size_mb:             u64,
     #[serde(default = "d_tantivy_cache_disk_gb")]
-    pub timefusion_tantivy_cache_disk_gb: u64,
+    pub timefusion_tantivy_cache_disk_gb:                 u64,
     #[serde(default = "d_tantivy_zstd_level")]
-    pub timefusion_tantivy_compression_level: i32,
+    pub timefusion_tantivy_compression_level:             i32,
     #[serde(default = "d_tantivy_min_files")]
-    pub timefusion_tantivy_min_files_for_pushdown: usize,
+    pub timefusion_tantivy_min_files_for_pushdown:        usize,
     /// If a tantivy prefilter would produce more than this many hits, skip
     /// the `id IN (...)` pushdown entirely — the IN-list itself becomes the
     /// bottleneck above this point. Default 100k.
     #[serde(default = "d_tantivy_prefilter_max_hits")]
-    pub timefusion_tantivy_prefilter_max_hits: usize,
+    pub timefusion_tantivy_prefilter_max_hits:            usize,
     /// If a tantivy prefilter selects more than this percentage of the
     /// indexed rows, the pushdown isn't worth the round-trip; skip it and
     /// let Delta scan with the original predicate. Default 50 (%).
@@ -262,35 +260,35 @@ impl TantivyConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AwsConfig {
     #[serde(default)]
-    pub aws_access_key_id: Option<String>,
+    pub aws_access_key_id:     Option<String>,
     #[serde(default)]
     pub aws_secret_access_key: Option<String>,
     #[serde(default)]
-    pub aws_default_region: Option<String>,
+    pub aws_default_region:    Option<String>,
     #[serde(default = "d_s3_endpoint")]
-    pub aws_s3_endpoint: String,
+    pub aws_s3_endpoint:       String,
     #[serde(default)]
-    pub aws_s3_bucket: Option<String>,
+    pub aws_s3_bucket:         Option<String>,
     #[serde(default)]
-    pub aws_allow_http: Option<String>,
+    pub aws_allow_http:        Option<String>,
     #[serde(flatten)]
-    pub dynamodb: DynamoDbConfig,
+    pub dynamodb:              DynamoDbConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct DynamoDbConfig {
     #[serde(default)]
-    pub aws_s3_locking_provider: Option<String>,
+    pub aws_s3_locking_provider:        Option<String>,
     #[serde(default)]
-    pub delta_dynamo_table_name: Option<String>,
+    pub delta_dynamo_table_name:        Option<String>,
     #[serde(default)]
-    pub aws_access_key_id_dynamodb: Option<String>,
+    pub aws_access_key_id_dynamodb:     Option<String>,
     #[serde(default)]
     pub aws_secret_access_key_dynamodb: Option<String>,
     #[serde(default)]
-    pub aws_region_dynamodb: Option<String>,
+    pub aws_region_dynamodb:            Option<String>,
     #[serde(default)]
-    pub aws_endpoint_url_dynamodb: Option<String>,
+    pub aws_endpoint_url_dynamodb:      Option<String>,
 }
 
 impl AwsConfig {
@@ -329,25 +327,25 @@ impl AwsConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
     #[serde(default = "d_data_dir")]
-    pub timefusion_data_dir: PathBuf,
+    pub timefusion_data_dir:             PathBuf,
     #[serde(default = "d_pgwire_port")]
-    pub pgwire_port: u16,
+    pub pgwire_port:                     u16,
     #[serde(default = "d_table_prefix")]
-    pub timefusion_table_prefix: String,
+    pub timefusion_table_prefix:         String,
     #[serde(default)]
-    pub timefusion_config_database_url: Option<String>,
+    pub timefusion_config_database_url:  Option<String>,
     #[serde(default)]
-    pub enable_batch_queue: bool,
+    pub enable_batch_queue:              bool,
     #[serde(default = "d_batch_queue_capacity")]
     pub timefusion_batch_queue_capacity: usize,
     #[serde(default = "d_pgwire_user")]
-    pub pgwire_user: String,
+    pub pgwire_user:                     String,
     #[serde(default)]
-    pub pgwire_password: Option<String>,
+    pub pgwire_password:                 Option<String>,
     #[serde(default = "d_grpc_port")]
-    pub grpc_port: u16,
+    pub grpc_port:                       u16,
     #[serde(default)]
-    pub grpc_token: Option<String>,
+    pub grpc_token:                      Option<String>,
 }
 
 impl CoreConfig {
@@ -362,35 +360,35 @@ impl CoreConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BufferConfig {
     #[serde(default = "d_flush_interval")]
-    pub timefusion_flush_interval_secs: u64,
+    pub timefusion_flush_interval_secs:      u64,
     #[serde(default = "d_retention_mins")]
-    pub timefusion_buffer_retention_mins: u64,
+    pub timefusion_buffer_retention_mins:    u64,
     #[serde(default = "d_eviction_interval")]
-    pub timefusion_eviction_interval_secs: u64,
+    pub timefusion_eviction_interval_secs:   u64,
     #[serde(default = "d_buffer_max_memory")]
-    pub timefusion_buffer_max_memory_mb: usize,
+    pub timefusion_buffer_max_memory_mb:     usize,
     #[serde(default = "d_shutdown_timeout")]
-    pub timefusion_shutdown_timeout_secs: u64,
+    pub timefusion_shutdown_timeout_secs:    u64,
     #[serde(default = "d_wal_corruption_threshold")]
     pub timefusion_wal_corruption_threshold: usize,
     #[serde(default = "d_flush_parallelism")]
-    pub timefusion_flush_parallelism: usize,
+    pub timefusion_flush_parallelism:        usize,
     #[serde(default)]
-    pub timefusion_flush_immediately: bool,
+    pub timefusion_flush_immediately:        bool,
     #[serde(default = "d_wal_fsync_ms")]
-    pub timefusion_wal_fsync_ms: u64,
+    pub timefusion_wal_fsync_ms:             u64,
     #[serde(default = "d_wal_fsync_mode")]
-    pub timefusion_wal_fsync_mode: String,
+    pub timefusion_wal_fsync_mode:           String,
     #[serde(default = "d_wal_max_files")]
-    pub timefusion_wal_max_file_count: usize,
+    pub timefusion_wal_max_file_count:       usize,
     #[serde(default = "d_bucket_duration_secs")]
-    pub timefusion_bucket_duration_secs: u64,
+    pub timefusion_bucket_duration_secs:     u64,
     #[serde(default = "d_pressure_flush_pct")]
-    pub timefusion_pressure_flush_pct: u32,
+    pub timefusion_pressure_flush_pct:       u32,
     /// WAL shards per (project, table) topic. Higher = more append parallelism
     /// at the cost of O(shards) recovery memory and more file handles.
     #[serde(default = "d_wal_shards_per_topic")]
-    pub timefusion_wal_shards_per_topic: usize,
+    pub timefusion_wal_shards_per_topic:     usize,
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
@@ -454,31 +452,31 @@ impl BufferConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
     #[serde(default = "d_foyer_memory_mb")]
-    pub timefusion_foyer_memory_mb: usize,
+    pub timefusion_foyer_memory_mb:            usize,
     #[serde(default)]
-    pub timefusion_foyer_disk_mb: Option<usize>,
+    pub timefusion_foyer_disk_mb:              Option<usize>,
     #[serde(default = "d_foyer_disk_gb")]
-    pub timefusion_foyer_disk_gb: usize,
+    pub timefusion_foyer_disk_gb:              usize,
     #[serde(default = "d_foyer_ttl")]
-    pub timefusion_foyer_ttl_seconds: u64,
+    pub timefusion_foyer_ttl_seconds:          u64,
     #[serde(default = "d_foyer_shards")]
-    pub timefusion_foyer_shards: usize,
+    pub timefusion_foyer_shards:               usize,
     #[serde(default = "d_foyer_file_size_mb")]
-    pub timefusion_foyer_file_size_mb: usize,
+    pub timefusion_foyer_file_size_mb:         usize,
     #[serde(default = "d_foyer_stats")]
-    pub timefusion_foyer_stats: String,
+    pub timefusion_foyer_stats:                String,
     #[serde(default = "d_metadata_size_hint")]
     pub timefusion_parquet_metadata_size_hint: usize,
     #[serde(default = "d_metadata_memory_mb")]
-    pub timefusion_foyer_metadata_memory_mb: usize,
+    pub timefusion_foyer_metadata_memory_mb:   usize,
     #[serde(default)]
-    pub timefusion_foyer_metadata_disk_mb: Option<usize>,
+    pub timefusion_foyer_metadata_disk_mb:     Option<usize>,
     #[serde(default = "d_metadata_disk_gb")]
-    pub timefusion_foyer_metadata_disk_gb: usize,
+    pub timefusion_foyer_metadata_disk_gb:     usize,
     #[serde(default = "d_metadata_shards")]
-    pub timefusion_foyer_metadata_shards: usize,
+    pub timefusion_foyer_metadata_shards:      usize,
     #[serde(default)]
-    pub timefusion_foyer_disabled: bool,
+    pub timefusion_foyer_disabled:             bool,
 }
 
 impl CacheConfig {
@@ -512,65 +510,65 @@ impl CacheConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParquetConfig {
     #[serde(default = "d_page_rows")]
-    pub timefusion_page_row_count_limit: usize,
+    pub timefusion_page_row_count_limit:   usize,
     /// ZSTD level for hot writes (flush + today's light optimize). Default 3.
     /// Aliased by the legacy env name; lower = faster ingest.
     #[serde(default = "d_zstd_level", alias = "timefusion_zstd_level_hot")]
     pub timefusion_zstd_compression_level: i32,
     #[serde(default = "d_zstd_level_warm")]
-    pub timefusion_zstd_level_warm: i32,
+    pub timefusion_zstd_level_warm:        i32,
     #[serde(default = "d_zstd_level_cool")]
-    pub timefusion_zstd_level_cool: i32,
+    pub timefusion_zstd_level_cool:        i32,
     #[serde(default = "d_zstd_level_cold")]
-    pub timefusion_zstd_level_cold: i32,
+    pub timefusion_zstd_level_cold:        i32,
     #[serde(default = "d_warm_cutoff_days")]
-    pub timefusion_warm_cutoff_days: u64,
+    pub timefusion_warm_cutoff_days:       u64,
     #[serde(default = "d_cool_cutoff_days")]
-    pub timefusion_cool_cutoff_days: u64,
+    pub timefusion_cool_cutoff_days:       u64,
     #[serde(default = "d_cold_cutoff_days")]
-    pub timefusion_cold_cutoff_days: u64,
+    pub timefusion_cold_cutoff_days:       u64,
     #[serde(default = "d_row_group_size")]
-    pub timefusion_max_row_group_size: usize,
+    pub timefusion_max_row_group_size:     usize,
     #[serde(default = "d_checkpoint_interval")]
-    pub timefusion_checkpoint_interval: u64,
+    pub timefusion_checkpoint_interval:    u64,
     #[serde(default = "d_optimize_target")]
-    pub timefusion_optimize_target_size: i64,
+    pub timefusion_optimize_target_size:   i64,
     #[serde(default = "d_stats_cache_size")]
-    pub timefusion_stats_cache_size: usize,
+    pub timefusion_stats_cache_size:       usize,
     #[serde(default)]
-    pub timefusion_bloom_filter_disabled: bool,
+    pub timefusion_bloom_filter_disabled:  bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MaintenanceConfig {
     #[serde(default = "d_vacuum_retention")]
-    pub timefusion_vacuum_retention_hours: u64,
+    pub timefusion_vacuum_retention_hours:     u64,
     #[serde(default = "d_optimize_window_hours")]
-    pub timefusion_optimize_window_hours: u64,
+    pub timefusion_optimize_window_hours:      u64,
     #[serde(default = "d_compact_min_files")]
-    pub timefusion_compact_min_files: usize,
+    pub timefusion_compact_min_files:          usize,
     #[serde(default = "d_light_optimize_target")]
     pub timefusion_light_optimize_target_size: i64,
     #[serde(default = "d_light_schedule")]
-    pub timefusion_light_optimize_schedule: String,
+    pub timefusion_light_optimize_schedule:    String,
     #[serde(default = "d_optimize_schedule")]
-    pub timefusion_optimize_schedule: String,
+    pub timefusion_optimize_schedule:          String,
     #[serde(default = "d_vacuum_schedule")]
-    pub timefusion_vacuum_schedule: String,
+    pub timefusion_vacuum_schedule:            String,
     #[serde(default = "d_recompress_schedule")]
-    pub timefusion_recompress_schedule: String,
+    pub timefusion_recompress_schedule:        String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
     #[serde(default = "d_mem_gb")]
-    pub timefusion_memory_limit_gb: usize,
+    pub timefusion_memory_limit_gb:              usize,
     #[serde(default = "d_mem_fraction")]
-    pub timefusion_memory_fraction: f64,
+    pub timefusion_memory_fraction:              f64,
     #[serde(default)]
     pub timefusion_sort_spill_reservation_bytes: Option<usize>,
     #[serde(default = "d_true")]
-    pub timefusion_tracing_record_metrics: bool,
+    pub timefusion_tracing_record_metrics:       bool,
 }
 
 impl MemoryConfig {
@@ -584,11 +582,11 @@ pub struct TelemetryConfig {
     #[serde(default = "d_otlp_endpoint")]
     pub otel_exporter_otlp_endpoint: String,
     #[serde(default = "d_service_name")]
-    pub otel_service_name: String,
+    pub otel_service_name:           String,
     #[serde(default = "d_service_version")]
-    pub otel_service_version: String,
+    pub otel_service_version:        String,
     #[serde(default)]
-    pub log_format: Option<String>,
+    pub log_format:                  Option<String>,
 }
 
 impl TelemetryConfig {

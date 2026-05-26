@@ -11,9 +11,11 @@ RUN apt-get update && \
     apt-get install -y pkg-config libssl-dev protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy Cargo manifests, build.rs, and proto files (needed for build.rs to run).
+# Copy Cargo manifests, build.rs, proto files (needed by build.rs at compile
+# time), and vendored path-dep crates referenced in Cargo.toml.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto/ proto/
+COPY vendor/ vendor/
 
 # Create dummy bench files (one per [[bench]] in Cargo.toml) and a dummy main
 # to allow dependency caching without the full source tree.

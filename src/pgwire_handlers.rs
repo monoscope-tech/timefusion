@@ -1,25 +1,28 @@
+use std::{fmt::Debug, sync::Arc};
+
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
-use datafusion_postgres::DfSessionService;
-use datafusion_postgres::hooks::QueryHook;
-use datafusion_postgres::hooks::set_show::SetShowHook;
-use datafusion_postgres::hooks::transactions::TransactionStatementHook;
-use crate::plan_cache::PlanCacheHook;
-use datafusion_postgres::pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
-use datafusion_postgres::pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler};
-use datafusion_postgres::pgwire::api::portal::Portal;
-use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use datafusion_postgres::pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
-use datafusion_postgres::pgwire::api::stmt::StoredStatement;
-use datafusion_postgres::pgwire::api::store::PortalStore;
-use datafusion_postgres::pgwire::api::{ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers};
-use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
-use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
+use datafusion_postgres::{
+    DfSessionService,
+    hooks::{QueryHook, set_show::SetShowHook, transactions::TransactionStatementHook},
+    pgwire::{
+        api::{
+            ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers,
+            auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler, cleartext::CleartextPasswordAuthStartupHandler},
+            portal::Portal,
+            query::{ExtendedQueryHandler, SimpleQueryHandler},
+            results::{DescribePortalResponse, DescribeStatementResponse, Response},
+            stmt::StoredStatement,
+            store::PortalStore,
+        },
+        error::{PgWireError, PgWireResult},
+        messages::PgWireBackendMessage,
+    },
+};
 use futures::Sink;
-use std::fmt::Debug;
-use std::sync::Arc;
-use tracing::field::Empty;
-use tracing::{Instrument, info, instrument};
+use tracing::{Instrument, field::Empty, info, instrument};
+
+use crate::plan_cache::PlanCacheHook;
 
 /// Auth configuration for PgWire server
 #[derive(Debug, Clone)]
@@ -46,12 +49,18 @@ impl AuthConfig {
     pub fn from_core(core: &crate::config::CoreConfig) -> anyhow::Result<Self> {
         let allow_insecure = std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
         match (&core.pgwire_password, allow_insecure) {
-            (Some(p), _) if !p.is_empty() => Ok(Self { username: core.pgwire_user.clone(), password: Some(p.clone()) }),
+            (Some(p), _) if !p.is_empty() => Ok(Self {
+                username: core.pgwire_user.clone(),
+                password: Some(p.clone()),
+            }),
             (_, true) => {
                 tracing::warn!(
                     "PGWIRE_PASSWORD unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — pgwire endpoint accepts any password. Acceptable for local dev ONLY; never in production."
                 );
-                Ok(Self { username: core.pgwire_user.clone(), password: None })
+                Ok(Self {
+                    username: core.pgwire_user.clone(),
+                    password: None,
+                })
             }
             _ => anyhow::bail!("PGWIRE_PASSWORD is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open auth for local dev)"),
         }
@@ -90,26 +99,26 @@ impl AuthSource for ConfigAuthSource {
 /// Custom handler factory that creates handlers with logging and auth
 pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
-    auth_config: AuthConfig,
-    plan_cache: Arc<PlanCacheHook>,
+    auth_config:     AuthConfig,
+    plan_cache:      Arc<PlanCacheHook>,
 }
 
 impl LoggingHandlerFactory {
     pub fn new(session_context: Arc<SessionContext>, auth_config: AuthConfig) -> Self {
         let plan_cache = Arc::new(PlanCacheHook::default());
         crate::plan_cache::set_global(plan_cache.clone());
-        Self { session_context, auth_config, plan_cache }
+        Self {
+            session_context,
+            auth_config,
+            plan_cache,
+        }
     }
 
     /// Hook list passed to every `DfSessionService` instance the factory
     /// produces. Sharing the single `plan_cache` Arc is what makes the LRU
     /// global rather than per-connection.
     fn hooks(&self) -> Vec<Arc<dyn QueryHook>> {
-        vec![
-            self.plan_cache.clone() as Arc<dyn QueryHook>,
-            Arc::new(SetShowHook),
-            Arc::new(TransactionStatementHook),
-        ]
+        vec![self.plan_cache.clone() as Arc<dyn QueryHook>, Arc::new(SetShowHook), Arc::new(TransactionStatementHook)]
     }
 
     pub fn plan_cache(&self) -> Arc<PlanCacheHook> {

@@ -18,19 +18,27 @@
 //!
 //! Reports wall time, file size, and (row groups read / total).
 
-use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray};
-use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use datafusion::execution::context::SessionContext;
-use datafusion::prelude::ParquetReadOptions;
-use deltalake::datafusion::parquet::arrow::ArrowWriter;
-use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
-use deltalake::datafusion::parquet::file::properties::{EnabledStatistics, WriterProperties};
-use deltalake::datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
+
+use arrow::{
+    array::{ArrayRef, Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray},
+    compute::{SortColumn, SortOptions, lexsort_to_indices, take},
+    datatypes::{DataType, Field, Schema, TimeUnit},
+};
+use datafusion::{execution::context::SessionContext, prelude::ParquetReadOptions};
+use deltalake::datafusion::parquet::{
+    arrow::ArrowWriter,
+    basic::{Compression, ZstdLevel},
+    file::{
+        properties::{EnabledStatistics, WriterProperties},
+        reader::{FileReader, SerializedFileReader},
+    },
+};
 
 const N_ROWS: usize = 200_000;
 const N_SERVICES: usize = 20;
@@ -89,8 +97,11 @@ fn sort_batch(batch: &RecordBatch, by: &[&str]) -> RecordBatch {
     let cols: Vec<SortColumn> = by
         .iter()
         .map(|name| SortColumn {
-            values: batch.column(batch.schema().index_of(name).unwrap()).clone(),
-            options: Some(SortOptions { descending: false, nulls_first: false }),
+            values:  batch.column(batch.schema().index_of(name).unwrap()).clone(),
+            options: Some(SortOptions {
+                descending:  false,
+                nulls_first: false,
+            }),
         })
         .collect();
     let indices = lexsort_to_indices(&cols, None).unwrap();
@@ -101,7 +112,7 @@ fn sort_batch(batch: &RecordBatch, by: &[&str]) -> RecordBatch {
 fn writer_props() -> WriterProperties {
     WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
-        .set_max_row_group_size(ROW_GROUP_SIZE)
+        .set_max_row_group_row_count(Some(ROW_GROUP_SIZE))
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_bloom_filter_enabled(true)
         .set_bloom_filter_fpp(0.01)
@@ -175,7 +186,10 @@ async fn main() {
     let ts_lit = |t: i64| format!("TIMESTAMP '1970-01-01 00:00:00 UTC' + INTERVAL '{} microseconds'", t);
 
     let queries: Vec<(&str, String)> = vec![
-        ("Q1_point_lookup", format!("SELECT id FROM t WHERE timestamp = {} AND id = '{}'", ts_lit(target_ts), target_id)),
+        (
+            "Q1_point_lookup",
+            format!("SELECT id FROM t WHERE timestamp = {} AND id = '{}'", ts_lit(target_ts), target_id),
+        ),
         (
             "Q2_service_in_time",
             format!(
@@ -193,7 +207,10 @@ async fn main() {
                 ts_lit(win_end)
             ),
         ),
-        ("Q4_service_only", format!("SELECT count(*) FROM t WHERE resource___service___name = '{}'", target_svc)),
+        (
+            "Q4_service_only",
+            format!("SELECT count(*) FROM t WHERE resource___service___name = '{}'", target_svc),
+        ),
     ];
 
     println!("\nTimings (ms, mean over 30 iters; rows = result row count):");

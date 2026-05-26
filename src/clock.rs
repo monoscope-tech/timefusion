@@ -35,11 +35,7 @@ pub fn init_from_env() {
 #[inline]
 pub fn now_micros() -> i64 {
     let v = FROZEN_NOW.load(Ordering::Acquire);
-    if v == WALL_SENTINEL {
-        chrono::Utc::now().timestamp_micros()
-    } else {
-        v
-    }
+    if v == WALL_SENTINEL { chrono::Utc::now().timestamp_micros() } else { v }
 }
 
 /// True when the clock is currently pinned (test mode).

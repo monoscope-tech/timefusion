@@ -1,15 +1,25 @@
-use crate::config::{self, AppConfig};
-use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp};
-use crate::wal::{WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_update_payload};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
 use arrow::array::RecordBatch;
 use futures::stream::{self, StreamExt};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-use tokio::sync::{Mutex, Notify};
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{Mutex, Notify},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
+
+use crate::{
+    config::{self, AppConfig},
+    mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp},
+    wal::{WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_update_payload},
+};
 
 // Reservation-side scale factor applied to `estimate_batch_size()` to
 // account for what that estimator doesn't already cover: per-batch Vec
@@ -45,8 +55,7 @@ const CAS_BACKOFF_MAX_EXPONENT: u32 = 10;
 fn write_owner_only(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
         let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
         f.write_all(contents)?;
         f.sync_all()
@@ -95,18 +104,18 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
 /// `snapshot_stats()` and rendered as rows by `timefusion.stats()`.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
-    pub mem_project_count: usize,
-    pub mem_total_buckets: usize,
-    pub mem_total_rows: usize,
-    pub mem_total_batches: usize,
-    pub mem_estimated_bytes: usize,
-    pub reserved_bytes: usize,
-    pub max_memory_bytes: usize,
-    pub pressure_pct: u32,
-    pub wal_files: usize,
-    pub wal_disk_bytes: u64,
-    pub wal_shards_per_topic: usize,
-    pub wal_known_topics: usize,
+    pub mem_project_count:      usize,
+    pub mem_total_buckets:      usize,
+    pub mem_total_rows:         usize,
+    pub mem_total_batches:      usize,
+    pub mem_estimated_bytes:    usize,
+    pub reserved_bytes:         usize,
+    pub max_memory_bytes:       usize,
+    pub pressure_pct:           u32,
+    pub wal_files:              usize,
+    pub wal_disk_bytes:         u64,
+    pub wal_shards_per_topic:   usize,
+    pub wal_known_topics:       usize,
     pub bucket_duration_micros: i64,
     /// Age of the oldest bucket in MemBuffer (seconds, computed from
     /// `now - min(bucket.min_timestamp)`). None when MemBuffer is empty.
@@ -116,19 +125,19 @@ pub struct StatsSnapshot {
 
 #[derive(Debug, Default)]
 pub struct RecoveryStats {
-    pub entries_replayed: u64,
-    pub batches_recovered: u64,
-    pub oldest_entry_timestamp: Option<i64>,
-    pub newest_entry_timestamp: Option<i64>,
-    pub recovery_duration_ms: u64,
+    pub entries_replayed:          u64,
+    pub batches_recovered:         u64,
+    pub oldest_entry_timestamp:    Option<i64>,
+    pub newest_entry_timestamp:    Option<i64>,
+    pub recovery_duration_ms:      u64,
     pub corrupted_entries_skipped: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct FlushStats {
     pub buckets_flushed: u64,
-    pub buckets_failed: u64,
-    pub total_rows: u64,
+    pub buckets_failed:  u64,
+    pub total_rows:      u64,
 }
 
 /// Callback for writing batches to Delta Lake. The callback MUST:
@@ -139,8 +148,7 @@ pub struct FlushStats {
 ///   are compacted away)
 ///
 /// This is critical for WAL checkpoint safety - we only mark entries as consumed after successful commit.
-pub type DeltaWriteCallback =
-    Arc<dyn Fn(String, String, Vec<RecordBatch>) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> + Send + Sync>;
+pub type DeltaWriteCallback = Arc<dyn Fn(String, String, Vec<RecordBatch>) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> + Send + Sync>;
 
 /// Optional callback invoked AFTER a successful Delta commit. Receives the
 /// `(project_id, table_name, batches, added_file_uris)` and is responsible
@@ -153,16 +161,16 @@ pub type TantivyIndexCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, Vec<String>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 pub struct BufferedWriteLayer {
-    config: Arc<AppConfig>,
-    wal: Arc<WalManager>,
-    mem_buffer: Arc<MemBuffer>,
-    shutdown: CancellationToken,
-    delta_write_callback: Option<DeltaWriteCallback>,
+    config:                 Arc<AppConfig>,
+    wal:                    Arc<WalManager>,
+    mem_buffer:             Arc<MemBuffer>,
+    shutdown:               CancellationToken,
+    delta_write_callback:   Option<DeltaWriteCallback>,
     tantivy_index_callback: Option<TantivyIndexCallback>,
-    background_tasks: Mutex<Vec<JoinHandle<()>>>,
-    flush_lock: Mutex<()>,
-    reserved_bytes: AtomicUsize, // Memory reserved for in-flight writes
-    pressure_notify: Arc<Notify>, // Wakes flush task when pressure threshold crossed
+    background_tasks:       Mutex<Vec<JoinHandle<()>>>,
+    flush_lock:             Mutex<()>,
+    reserved_bytes:         AtomicUsize, // Memory reserved for in-flight writes
+    pressure_notify:        Arc<Notify>, // Wakes flush task when pressure threshold crossed
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -408,7 +416,10 @@ impl BufferedWriteLayer {
                         }
                     }
                     Err(e) => {
-                        error!("WAL CORRUPTION: undeserializable INSERT batch for {}.{}: {}", entry.project_id, entry.table_name, e);
+                        error!(
+                            "WAL CORRUPTION: undeserializable INSERT batch for {}.{}: {}",
+                            entry.project_id, entry.table_name, e
+                        );
                         quarantine_entry(&quarantine_dir, &entry, "insert_corrupt", &e.to_string());
                     }
                 },
@@ -422,7 +433,10 @@ impl BufferedWriteLayer {
                         }
                     }
                     Err(e) => {
-                        error!("WAL CORRUPTION: undeserializable DELETE payload for {}.{}: {}", entry.project_id, entry.table_name, e);
+                        error!(
+                            "WAL CORRUPTION: undeserializable DELETE payload for {}.{}: {}",
+                            entry.project_id, entry.table_name, e
+                        );
                         quarantine_entry(&quarantine_dir, &entry, "delete_corrupt", &e.to_string());
                     }
                 },
@@ -436,7 +450,10 @@ impl BufferedWriteLayer {
                         }
                     }
                     Err(e) => {
-                        error!("WAL CORRUPTION: undeserializable UPDATE payload for {}.{}: {}", entry.project_id, entry.table_name, e);
+                        error!(
+                            "WAL CORRUPTION: undeserializable UPDATE payload for {}.{}: {}",
+                            entry.project_id, entry.table_name, e
+                        );
                         quarantine_entry(&quarantine_dir, &entry, "update_corrupt", &e.to_string());
                     }
                 },
@@ -629,11 +646,14 @@ impl BufferedWriteLayer {
         // Sidecar tantivy index — best-effort, never fails the flush.
         // We still count the failure so ops can alert on accumulating index
         // drift (silent UDF-fallback degradation is otherwise invisible).
-        if let Some(ref idx_cb) = self.tantivy_index_callback {
-            if let Err(e) = idx_cb(bucket.project_id.clone(), bucket.table_name.clone(), bucket.batches.clone(), added_files).await {
-                crate::metrics::record_tantivy_build_failure();
-                warn!("Tantivy index build failed (non-fatal): project={}, table={}, bucket_id={}: {}", bucket.project_id, bucket.table_name, bucket.bucket_id, e);
-            }
+        if let Some(ref idx_cb) = self.tantivy_index_callback
+            && let Err(e) = idx_cb(bucket.project_id.clone(), bucket.table_name.clone(), bucket.batches.clone(), added_files).await
+        {
+            crate::metrics::record_tantivy_build_failure();
+            warn!(
+                "Tantivy index build failed (non-fatal): project={}, table={}, bucket_id={}: {}",
+                bucket.project_id, bucket.table_name, bucket.bucket_id, e
+            );
         }
         Ok(())
     }
@@ -819,11 +839,7 @@ impl BufferedWriteLayer {
     /// point-in-time bucket state. Falls through to `query_partitioned`
     /// behavior when `preds` is empty or the table has no indexed fields.
     pub fn query_partitioned_with_text_match(
-        &self,
-        project_id: &str,
-        table_name: &str,
-        filters: &[datafusion::logical_expr::Expr],
-        preds: &[crate::tantivy_index::udf::TextMatchPred],
+        &self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr], preds: &[crate::tantivy_index::udf::TextMatchPred],
     ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
         self.mem_buffer.query_partitioned_with_text_match(project_id, table_name, filters, preds)
     }
@@ -869,11 +885,13 @@ impl BufferedWriteLayer {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use serial_test::serial;
+    use tempfile::tempdir;
+
     use super::*;
     use crate::test_utils::test_helpers::{json_to_batch, test_span};
-    use serial_test::serial;
-    use std::path::PathBuf;
-    use tempfile::tempdir;
 
     fn create_test_config(data_dir: PathBuf) -> Arc<AppConfig> {
         let mut cfg = AppConfig::default();

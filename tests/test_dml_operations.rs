@@ -1,13 +1,14 @@
 #[cfg(test)]
 mod test_dml_operations {
+    use std::{path::PathBuf, sync::Arc};
+
     use anyhow::Result;
-    use datafusion::arrow;
-    use datafusion::arrow::array::{Array, AsArray, StringArray, StringViewArray};
+    use datafusion::{
+        arrow,
+        arrow::array::{Array, AsArray, StringArray, StringViewArray},
+    };
     use serial_test::serial;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use timefusion::config::AppConfig;
-    use timefusion::database::Database;
+    use timefusion::{config::AppConfig, database::Database};
     use tracing::info;
 
     /// Helper function to get string value from either Utf8View or Utf8 array

@@ -9,13 +9,16 @@
 //! must remain a *superset* of what tantivy returns so post-filtering with
 //! this UDF preserves correctness.
 
-use std::any::Any;
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
-use arrow::array::{Array, ArrayRef, BooleanBuilder, StringArray, StringViewArray};
-use arrow::datatypes::DataType;
-use datafusion::common::Result as DFResult;
-use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility};
+use arrow::{
+    array::{Array, ArrayRef, BooleanBuilder, StringArray, StringViewArray},
+    datatypes::DataType,
+};
+use datafusion::{
+    common::Result as DFResult,
+    logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
+};
 
 pub const TEXT_MATCH_NAME: &str = "text_match";
 
@@ -26,7 +29,9 @@ pub struct TextMatchUdf {
 
 impl Default for TextMatchUdf {
     fn default() -> Self {
-        Self { sig: Signature::any(2, Volatility::Immutable) }
+        Self {
+            sig: Signature::any(2, Volatility::Immutable),
+        }
     }
 }
 
@@ -95,8 +100,7 @@ pub fn text_match_udf() -> ScalarUDF {
 /// Detect a `text_match(col, 'q')` predicate and extract its column name and
 /// query string. Returns `Some` only if the call shape is exactly that.
 pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextMatchPred> {
-    use datafusion::logical_expr::Expr;
-    use datafusion::scalar::ScalarValue;
+    use datafusion::{logical_expr::Expr, scalar::ScalarValue};
     let Expr::ScalarFunction(sf) = expr else { return None };
     if sf.func.name() != TEXT_MATCH_NAME {
         return None;
@@ -118,7 +122,7 @@ pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextM
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextMatchPred {
     pub column: String,
-    pub query: String,
+    pub query:  String,
 }
 
 /// Walk filter expressions, pulling out all `text_match` calls.

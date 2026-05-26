@@ -18,18 +18,22 @@
 //! by sqlparser AFTER its own normalization, so `INSERT INTO t VALUES ($1)`
 //! and `insert into t values ($1)` collapse to one entry.
 
+use std::{num::NonZeroUsize, sync::Mutex};
+
 use async_trait::async_trait;
-use datafusion::logical_expr::LogicalPlan;
-use datafusion::prelude::SessionContext;
-use datafusion::sql::parser::Statement as DfStatement;
-use datafusion::sql::sqlparser::ast::Statement;
-use datafusion_postgres::hooks::{HookClient, QueryHook};
-use datafusion_postgres::pgwire::api::ClientInfo;
-use datafusion_postgres::pgwire::api::results::Response;
-use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
+use datafusion::{
+    logical_expr::LogicalPlan,
+    prelude::SessionContext,
+    sql::{parser::Statement as DfStatement, sqlparser::ast::Statement},
+};
+use datafusion_postgres::{
+    hooks::{HookClient, QueryHook},
+    pgwire::{
+        api::{ClientInfo, results::Response},
+        error::{PgWireError, PgWireResult},
+    },
+};
 use lru::LruCache;
-use std::num::NonZeroUsize;
-use std::sync::Mutex;
 use tracing::debug;
 
 const DEFAULT_PLAN_CACHE_CAPACITY: usize = 256;
@@ -48,8 +52,8 @@ pub fn global() -> Option<std::sync::Arc<PlanCacheHook>> {
 }
 
 pub struct PlanCacheHook {
-    cache: Mutex<LruCache<String, LogicalPlan>>,
-    hits: std::sync::atomic::AtomicU64,
+    cache:  Mutex<LruCache<String, LogicalPlan>>,
+    hits:   std::sync::atomic::AtomicU64,
     misses: std::sync::atomic::AtomicU64,
 }
 
@@ -63,8 +67,8 @@ impl PlanCacheHook {
     pub fn new(capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
-            cache: Mutex::new(LruCache::new(cap)),
-            hits: std::sync::atomic::AtomicU64::new(0),
+            cache:  Mutex::new(LruCache::new(cap)),
+            hits:   std::sync::atomic::AtomicU64::new(0),
             misses: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -83,7 +87,10 @@ impl PlanCacheHook {
         // Cheap heuristic: only consider DML statement kinds and require a
         // placeholder marker in the source text. Avoids walking the AST.
         let has_placeholder = sql.contains('$');
-        matches!(stmt, Statement::Insert(_) | Statement::Query(_) | Statement::Update { .. } | Statement::Delete(_)) && has_placeholder
+        matches!(
+            stmt,
+            Statement::Insert(_) | Statement::Query(_) | Statement::Update { .. } | Statement::Delete(_)
+        ) && has_placeholder
     }
 }
 
@@ -103,12 +110,12 @@ impl QueryHook for PlanCacheHook {
             return None;
         }
 
-        if let Ok(mut guard) = self.cache.lock() {
-            if let Some(plan) = guard.get(&canonical) {
-                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                debug!(target: "plan_cache", "hit: {}", canonical);
-                return Some(Ok(plan.clone()));
-            }
+        if let Ok(mut guard) = self.cache.lock()
+            && let Some(plan) = guard.get(&canonical)
+        {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            debug!(target: "plan_cache", "hit: {}", canonical);
+            return Some(Ok(plan.clone()));
         }
 
         // Miss: build the plan, install it, hand a clone back to caller.
@@ -130,8 +137,8 @@ impl QueryHook for PlanCacheHook {
     }
 
     async fn handle_extended_query(
-        &self, _statement: &Statement, _logical_plan: &LogicalPlan, _params: &datafusion::common::ParamValues,
-        _session_context: &SessionContext, _client: &mut dyn HookClient,
+        &self, _statement: &Statement, _logical_plan: &LogicalPlan, _params: &datafusion::common::ParamValues, _session_context: &SessionContext,
+        _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         None
     }

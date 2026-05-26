@@ -22,21 +22,25 @@
 //! buckets active at once; outside that window the post-flush callback
 //! takes over and these in-memory copies are released.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, anyhow};
 use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
-use tantivy::Index;
-use tantivy::query::QueryParser;
+use tantivy::{Index, query::QueryParser};
 
-use crate::schema_loader::TableSchema;
-use crate::tantivy_index::builder;
-use crate::tantivy_index::reader::Hit;
-use crate::tantivy_index::schema::{BuiltSchema, register_tokenizers};
-use crate::tantivy_index::udf::TextMatchPred;
+use crate::{
+    schema_loader::TableSchema,
+    tantivy_index::{
+        builder,
+        reader::Hit,
+        schema::{BuiltSchema, register_tokenizers},
+        udf::TextMatchPred,
+    },
+};
 
 /// A built tantivy index covering all rows currently in a bucket.
 pub struct BucketTextIndex {
-    pub index: Index,
+    pub index:        Index,
     pub built_schema: Arc<BuiltSchema>,
     /// Row count at build time. The cache is valid while
     /// `bucket.row_count == indexed_rows`. When more rows arrive we
@@ -48,7 +52,7 @@ pub struct BucketTextIndex {
     /// snapshot's indexed-text bytes × 2 (rough overhead for trigram
     /// postings + skip lists); errs on the high side so the budget is
     /// conservative rather than blown.
-    pub size_bytes: usize,
+    pub size_bytes:   usize,
 }
 
 impl BucketTextIndex {
@@ -65,7 +69,12 @@ impl BucketTextIndex {
         let size_bytes = estimate_index_size(table, batches);
         let (index, built_schema, _stats) = builder::build_in_memory(table, batches).with_context(|| format!("build mem-index for {}", table.table_name))?;
         register_tokenizers(&index);
-        Ok(Some(Self { index, built_schema: Arc::new(built_schema), indexed_rows: row_count, size_bytes }))
+        Ok(Some(Self {
+            index,
+            built_schema: Arc::new(built_schema),
+            indexed_rows: row_count,
+            size_bytes,
+        }))
     }
 
     /// Run a `text_match`-style query against this index and return hits.

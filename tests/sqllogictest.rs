@@ -1,17 +1,18 @@
 #[cfg(test)]
 mod sqllogictest_tests {
-    use anyhow::Result;
-    use async_trait::async_trait;
-    use datafusion_postgres::ServerOptions;
-    use dotenv::dotenv;
-    use serial_test::serial;
-    use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
     use std::{
         fmt,
         path::Path,
         sync::Arc,
         time::{Duration, Instant},
     };
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use datafusion_postgres::ServerOptions;
+    use dotenv::dotenv;
+    use serial_test::serial;
+    use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{NoTls, Row};
@@ -111,16 +112,20 @@ mod sqllogictest_tests {
 
     impl<'a> tokio_postgres::types::FromSql<'a> for PgNumeric {
         fn from_sql(_ty: &tokio_postgres::types::Type, buf: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
-            if buf.len() < 8 { return Err("NUMERIC buffer too short".into()); }
+            if buf.len() < 8 {
+                return Err("NUMERIC buffer too short".into());
+            }
             let ndigits = u16::from_be_bytes([buf[0], buf[1]]) as usize;
             let weight = i16::from_be_bytes([buf[2], buf[3]]);
             let sign = u16::from_be_bytes([buf[4], buf[5]]);
             let dscale = u16::from_be_bytes([buf[6], buf[7]]) as usize;
-            if buf.len() < 8 + ndigits * 2 { return Err("NUMERIC digits truncated".into()); }
-            let digits: Vec<u16> = (0..ndigits)
-                .map(|i| u16::from_be_bytes([buf[8 + i * 2], buf[9 + i * 2]]))
-                .collect();
-            if sign == 0xC000 { return Ok(PgNumeric("NaN".into())); }
+            if buf.len() < 8 + ndigits * 2 {
+                return Err("NUMERIC digits truncated".into());
+            }
+            let digits: Vec<u16> = (0..ndigits).map(|i| u16::from_be_bytes([buf[8 + i * 2], buf[9 + i * 2]])).collect();
+            if sign == 0xC000 {
+                return Ok(PgNumeric("NaN".into()));
+            }
             if ndigits == 0 {
                 return Ok(PgNumeric(if dscale == 0 { "0".into() } else { format!("0.{}", "0".repeat(dscale)) }));
             }
@@ -129,10 +134,15 @@ mod sqllogictest_tests {
             for w in 0..=weight.max(0) as i32 {
                 let idx = w as usize;
                 let d = if idx < ndigits { digits[idx] } else { 0 };
-                if w == 0 { int_part.push_str(&d.to_string()); }
-                else { int_part.push_str(&format!("{:04}", d)); }
+                if w == 0 {
+                    int_part.push_str(&d.to_string());
+                } else {
+                    int_part.push_str(&format!("{:04}", d));
+                }
             }
-            if int_part.is_empty() { int_part.push('0'); }
+            if int_part.is_empty() {
+                int_part.push('0');
+            }
             // Fractional part
             let mut frac_part = String::new();
             let frac_groups = (dscale as i32 + 3) / 4;
