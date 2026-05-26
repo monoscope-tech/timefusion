@@ -306,6 +306,27 @@ fn compile_filter_conjunction(filters: &[Expr], schema: &SchemaRef) -> DFResult<
     Ok(Some(create_physical_expr(&conjunction, &df_schema, &props)?))
 }
 
+/// Filter a batch to rows whose `id` is in `ids`. Returns a fresh batch.
+/// On any error (missing `id` column, unexpected type) the batch is
+/// returned unfiltered — the caller's predicate-based filter will catch
+/// any over-inclusion. Supports Utf8View, Utf8, and LargeUtf8 ID types.
+fn filter_batch_by_id_set(batch: &RecordBatch, ids: &std::collections::HashSet<String>) -> RecordBatch {
+    use arrow::array::{AsArray, BooleanArray, LargeStringArray, StringArray, StringViewArray};
+    let Some(arr) = batch.column_by_name("id") else { return batch.clone() };
+    let mask: BooleanArray = if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
+        (0..a.len()).map(|i| !a.is_null(i) && ids.contains(a.value(i))).collect()
+    } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        (0..a.len()).map(|i| !a.is_null(i) && ids.contains(a.value(i))).collect()
+    } else if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
+        (0..a.len()).map(|i| !a.is_null(i) && ids.contains(a.value(i))).collect()
+    } else {
+        // Unknown id type — let the original predicate handle the filtering.
+        let _ = arr.as_string_opt::<i32>(); // keep AsArray import live
+        return batch.clone();
+    };
+    filter_record_batch(batch, &mask).unwrap_or_else(|_| batch.clone())
+}
+
 /// Apply a compiled predicate, returning only matching rows. Best-effort: on
 /// any evaluation error we return the original batch so DataFusion's FilterExec
 /// can finish the job.
@@ -467,33 +488,106 @@ impl MemBuffer {
             return Ok(None);
         };
 
-        // Per-predicate ID sets, then intersect across predicates (multi-
-        // predicate queries are AND-ed).
+        // Walk buckets, taking each bucket's atomic snapshot+ids.
+        // NOTE: this returns IDs without the matching snapshot, so the
+        // caller MUST NOT use it to filter a separately-fetched snapshot —
+        // a concurrent insert could add a row to the bucket between this
+        // call and the snapshot, and the new row would be incorrectly
+        // dropped. For SQL routing use `query_partitioned_with_text_match`
+        // which keeps snapshot+ids atomic per bucket. This method is kept
+        // for tests + future read-only consumers (e.g. EXPLAIN).
         let mut acc: Option<std::collections::HashSet<String>> = None;
         let mut any_usable = false;
-        for pred in preds {
-            let mut ids_for_pred: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for bucket_entry in table.buckets.iter() {
-                let bucket = bucket_entry.value();
-                match bucket.search_text_match(table_schema, pred)? {
-                    Some(hits) => {
-                        any_usable = true;
-                        for h in hits {
-                            ids_for_pred.insert(h.id);
-                        }
+        for bucket_entry in table.buckets.iter() {
+            let bucket = bucket_entry.value();
+            let (_snapshot, ids_opt) = bucket.search_with_snapshot(table_schema, preds)?;
+            if let Some(ids) = ids_opt {
+                any_usable = true;
+                acc = Some(match acc.take() {
+                    None => ids,
+                    Some(mut prev) => {
+                        prev.extend(ids);
+                        prev
                     }
-                    None => {
-                        // Bucket couldn't index — bail to scan for safety.
-                        return Ok(None);
-                    }
-                }
+                });
             }
-            acc = Some(match acc.take() {
-                None => ids_for_pred,
-                Some(prev) => prev.intersection(&ids_for_pred).cloned().collect(),
-            });
         }
         if any_usable { Ok(acc) } else { Ok(None) }
+    }
+
+    /// Atomic MemBuffer query with text-match prefilter. For each bucket:
+    ///   - Snapshot batches + run text_match search → ID set (under the
+    ///     same `batches` lock).
+    ///   - Apply `id IN (ids)` and the rest of `filters` to the snapshot.
+    /// This guarantees the prefilter and the data come from the same point
+    /// in time — closing the race where a concurrent insert would otherwise
+    /// be visible in the data but absent from the prefilter ID set.
+    ///
+    /// When `preds` is empty or the table has no indexed fields, behaves
+    /// exactly like `query_partitioned`.
+    #[instrument(skip(self, filters, preds), fields(project_id, table_name))]
+    pub fn query_partitioned_with_text_match(
+        &self,
+        project_id: &str,
+        table_name: &str,
+        filters: &[Expr],
+        preds: &[crate::tantivy_index::udf::TextMatchPred],
+    ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+        if preds.is_empty() {
+            return self.query_partitioned(project_id, table_name, filters);
+        }
+        let table_schema = crate::schema_loader::get_schema(table_name);
+        let has_indexed = table_schema.as_ref().is_some_and(|s| s.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)));
+        if !has_indexed {
+            return self.query_partitioned(project_id, table_name, filters);
+        }
+        let table_schema = table_schema.expect("has_indexed implies Some");
+
+        let mut partitions = Vec::new();
+        let ts_range = extract_timestamp_range(filters);
+
+        let Some(table) = self.get_table(project_id, table_name) else { return Ok(partitions) };
+        let pred = compile_filter_conjunction(filters, &table.schema).ok().flatten();
+        let mut bucket_ids: Vec<i64> = table.buckets.iter().map(|b| *b.key()).collect();
+        bucket_ids.sort();
+
+        for bucket_id in bucket_ids {
+            let Some(bucket) = table.buckets.get(&bucket_id) else { continue };
+            if !bucket_overlaps_range(&bucket, &ts_range) {
+                continue;
+            }
+            let (snapshot, ids_opt) = bucket.search_with_snapshot(table_schema, preds)?;
+            if snapshot.is_empty() {
+                continue;
+            }
+
+            // Apply id IN ids (atomic with snapshot) when available; the
+            // rest of `filters` (including the original `=` / `LIKE` /
+            // `text_match` UDF call) runs afterwards via the compiled
+            // predicate. Without an id set, fall through to predicate-only.
+            let filtered: Vec<RecordBatch> = snapshot
+                .into_iter()
+                .filter_map(|b| {
+                    let b = if let Some(ids) = ids_opt.as_ref() { filter_batch_by_id_set(&b, ids) } else { b };
+                    if b.num_rows() == 0 {
+                        return None;
+                    }
+                    match &pred {
+                        Some(p) => {
+                            let out = apply_predicate(&b, p);
+                            (out.num_rows() > 0).then_some(out)
+                        }
+                        None => Some(b),
+                    }
+                })
+                .collect();
+
+            if !filtered.is_empty() {
+                partitions.push(filtered);
+            }
+        }
+        debug!("MemBuffer query_partitioned_with_text_match: project={}, table={}, partitions={}", project_id, table_name, partitions.len());
+        Ok(partitions)
     }
 
     #[instrument(skip(self, filters), fields(project_id, table_name))]
@@ -1010,14 +1104,23 @@ impl TableBuffer {
 
         let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
-        bucket.batches.lock().push(batch);
-
-        bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
-        bucket.memory_bytes.fetch_add(batch_size, Ordering::Relaxed);
+        // Hold the batches lock across the push AND the cache invalidation
+        // so a concurrent `search_with_snapshot` either sees both the new
+        // batch and a cleared cache, or neither — never the inconsistent
+        // (new batch present, stale cache present) state.
+        {
+            let mut g = bucket.batches.lock();
+            g.push(batch);
+            bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
+            bucket.memory_bytes.fetch_add(batch_size, Ordering::Relaxed);
+            // text_index is on the bucket struct, not gated by `g` per se,
+            // but acquiring `text_index.write()` while holding `g` is
+            // deadlock-free: searches take `batches.lock()` first to take
+            // the snapshot, release it, then acquire `text_index.read()`.
+            // Insert's order matches: `batches.lock()` → `text_index.write()`.
+            *bucket.text_index.write() = None;
+        }
         bucket.update_timestamps(timestamp_micros);
-        // Cached text index (if any) covers the pre-insert row set; drop it
-        // so the next text_match query rebuilds with the new data.
-        bucket.invalidate_text_index();
 
         debug!(
             "TableBuffer insert: project={}, table={}, bucket={}, rows={}, bytes={}",
@@ -1044,41 +1147,69 @@ impl TimeBucket {
         self.max_timestamp.fetch_max(timestamp, Ordering::Relaxed);
     }
 
-    /// Drop the cached text index. Called from `drain_bucket` and on any
-    /// insert that grew the bucket — next text-match query rebuilds.
-    fn invalidate_text_index(&self) {
-        *self.text_index.write() = None;
-    }
-
-    /// Search the bucket's text index for one predicate, building it on
-    /// demand. Returns hit IDs from rows currently in the bucket.
+    /// Atomic snapshot + text-match search. Returns the snapshot we just
+    /// took (under `batches` lock) AND the set of IDs matching `preds`
+    /// (intersected — multi-predicate is AND). The two are guaranteed
+    /// consistent: any row in the snapshot that matches the predicates
+    /// is in the returned ID set.
     ///
-    /// Concurrency: the read lock is released before searching so multiple
-    /// concurrent queries can share the cached index. If the cache is stale
-    /// (row_count > indexed_rows) we drop and rebuild — at-most one writer
-    /// gets the rebuild via the upgrade attempt.
-    fn search_text_match(&self, table_schema: &crate::schema_loader::TableSchema, pred: &crate::tantivy_index::udf::TextMatchPred) -> anyhow::Result<Option<Vec<crate::tantivy_index::reader::Hit>>> {
-        let current_rows = self.row_count.load(Ordering::Relaxed);
-        if current_rows == 0 {
-            return Ok(Some(Vec::new()));
+    /// `Ok(None)` means "no usable index for this table" — caller falls
+    /// back to running the original SQL predicate on the snapshot.
+    ///
+    /// Concurrency invariant: insertion holds the batches lock while
+    /// pushing AND while invalidating `text_index`. So a reader who took
+    /// the snapshot under that lock + then reads `text_index` will see
+    /// either (cache matching this snapshot) OR (None → rebuild from this
+    /// snapshot). No torn states.
+    fn search_with_snapshot(
+        &self,
+        table_schema: &crate::schema_loader::TableSchema,
+        preds: &[crate::tantivy_index::udf::TextMatchPred],
+    ) -> anyhow::Result<(Vec<arrow::record_batch::RecordBatch>, Option<std::collections::HashSet<String>>)> {
+        // Snapshot batches + row count under the same lock so they're
+        // mutually consistent.
+        let (snapshot, snapshot_rows) = {
+            let g = self.batches.lock();
+            let snap: Vec<arrow::record_batch::RecordBatch> = g.iter().cloned().collect();
+            let n: usize = snap.iter().map(|b| b.num_rows()).sum();
+            (snap, n)
+        };
+
+        if preds.is_empty() || snapshot.is_empty() {
+            return Ok((snapshot, None));
         }
-        // Cached & up-to-date path
-        {
+
+        // Acquire-or-build the index, sized to match THIS snapshot. Cached
+        // index reused only if its indexed_rows matches snapshot_rows —
+        // any mismatch means concurrent insertion changed the bucket, and
+        // we rebuild from our snapshot (not from current bucket state).
+        let cached_ok = {
             let r = self.text_index.read();
-            if let Some(idx) = r.as_ref() {
-                if idx.indexed_rows == current_rows {
-                    return idx.search(pred).map(Some);
-                }
-            }
-        }
-        // Build (or rebuild) — snapshot the batches under the bucket lock
-        // so we get a consistent view.
-        let snapshot: Vec<arrow::record_batch::RecordBatch> = self.batches.lock().iter().cloned().collect();
-        let built = crate::tantivy_index::mem_index::BucketTextIndex::build(table_schema, &snapshot, current_rows)?;
-        let Some(built) = built else { return Ok(None) };
-        let hits = built.search(pred)?;
-        *self.text_index.write() = Some(built);
-        Ok(Some(hits))
+            r.as_ref().is_some_and(|idx| idx.indexed_rows == snapshot_rows)
+        };
+
+        let ids_per_pred_result: anyhow::Result<Vec<std::collections::HashSet<String>>> = if cached_ok {
+            let r = self.text_index.read();
+            let idx = r.as_ref().expect("cached_ok implies Some");
+            preds.iter().map(|p| idx.search(p).map(|hits| hits.into_iter().map(|h| h.id).collect())).collect()
+        } else {
+            let built = crate::tantivy_index::mem_index::BucketTextIndex::build(table_schema, &snapshot, snapshot_rows)?;
+            let Some(built) = built else {
+                // Table has no indexed fields → caller falls back to scan.
+                return Ok((snapshot, None));
+            };
+            let ids = preds.iter().map(|p| built.search(p).map(|hits| hits.into_iter().map(|h| h.id).collect())).collect::<anyhow::Result<Vec<_>>>()?;
+            *self.text_index.write() = Some(built);
+            Ok(ids)
+        };
+
+        let ids_per_pred = ids_per_pred_result?;
+        // Intersect across predicates (multi-pred queries are AND-ed).
+        let combined = ids_per_pred
+            .into_iter()
+            .reduce(|a, b| a.intersection(&b).cloned().collect())
+            .unwrap_or_default();
+        Ok((snapshot, Some(combined)))
     }
 }
 
@@ -1165,6 +1296,46 @@ mod tests {
         buffer.insert("p1", "otel_logs_and_spans", batch2, ts + 1).unwrap();
         let post = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).unwrap().unwrap();
         assert!(post.contains("b"), "expected 'b' after insert+rebuild, got {:?}", post);
+    }
+
+    #[test]
+    fn query_partitioned_with_text_match_returns_atomic_snapshot() {
+        // Atomicity invariant: query_partitioned_with_text_match returns
+        // batches filtered against an id set taken from the SAME snapshot.
+        // A row that exists in the bucket at query time MUST be either in
+        // both (returned) or in neither (filtered) — never in the snapshot
+        // but missing from the id set.
+        use crate::test_utils::test_helpers::{json_to_batch, test_span};
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        // Build a batch with two rows, one matching the search and one not.
+        let batch = json_to_batch(vec![test_span("hit-1", "alpha-search-svc", "p1"), test_span("miss-1", "completely-unrelated-svc", "p1")]).unwrap();
+        buffer.insert("p1", "otel_logs_and_spans", batch, ts).unwrap();
+
+        let preds = vec![crate::tantivy_index::udf::TextMatchPred { column: "name".into(), query: "alpha".into() }];
+        let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], &preds).unwrap();
+        let total_rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "expected only the matching row, got {} rows in {:?}", total_rows, parts);
+
+        // Verify the returned row is the matching one by checking the id col.
+        use arrow::array::AsArray;
+        let returned = &parts[0][0];
+        let id_arr = returned.column_by_name("id").unwrap().as_string_view();
+        assert_eq!(id_arr.value(0), "hit-1");
+    }
+
+    #[test]
+    fn query_partitioned_with_text_match_empty_preds_falls_through() {
+        // No text_match preds → behave identically to query_partitioned.
+        use crate::test_utils::test_helpers::{json_to_batch, test_span};
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let batch = json_to_batch(vec![test_span("a", "svc", "p1"), test_span("b", "svc", "p1")]).unwrap();
+        buffer.insert("p1", "otel_logs_and_spans", batch, ts).unwrap();
+
+        let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], &[]).unwrap();
+        let total: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "no text_match preds → all rows returned");
     }
 
     #[test]
