@@ -48,6 +48,7 @@ tokio-rustls = "0.26.1"
 datafusion-postgres = "0.16"
 datafusion-functions-json = "0.53"
 anyhow = "1.0.100"
+subtle = "2"
 tokio-util = "0.7.17"
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }

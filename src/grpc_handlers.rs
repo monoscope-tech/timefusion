@@ -12,6 +12,7 @@ use arrow_ipc::reader::StreamReader;
 use futures::StreamExt;
 use std::io::Cursor;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -47,18 +48,12 @@ impl IngestService {
     }
 
     fn check_auth<T>(&self, req: &Request<T>) -> Result<(), Status> {
-        let Some(expected) = self.token.as_deref() else {
-            return Ok(());
-        };
         let got = req
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "));
-        match got {
-            Some(t) if t == expected => Ok(()),
-            _ => Err(Status::unauthenticated("invalid or missing bearer token")),
-        }
+        verify_bearer(self.token.as_deref(), got)
     }
 }
 
@@ -165,4 +160,39 @@ async fn process_one(db: &Database, msg: WriteBatch) -> WriteAck {
 
 fn ack_err(seq: u64, pressure: u32, err: &str) -> WriteAck {
     WriteAck { seq, status: AckStatus::Reject as i32, mem_pressure_pct: pressure, error: err.into() }
+}
+
+/// Constant-time bearer-token check. When `expected` is `None`, auth is open.
+/// Equal-length plaintexts compare in time independent of contents; length
+/// mismatch short-circuits (and would be observable from the wire anyway).
+fn verify_bearer(expected: Option<&str>, got: Option<&str>) -> Result<(), Status> {
+    let Some(expected) = expected else { return Ok(()) };
+    match got {
+        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => Ok(()),
+        _ => Err(Status::unauthenticated("invalid or missing bearer token")),
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::verify_bearer;
+
+    #[test]
+    fn rejects_wrong_same_length_token() {
+        let err = verify_bearer(Some("abcdef"), Some("zzzzzz")).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+    #[test]
+    fn rejects_missing_token() {
+        assert!(verify_bearer(Some("abcdef"), None).is_err());
+    }
+    #[test]
+    fn accepts_correct_token() {
+        assert!(verify_bearer(Some("abcdef"), Some("abcdef")).is_ok());
+    }
+    #[test]
+    fn open_when_unconfigured() {
+        assert!(verify_bearer(None, None).is_ok());
+        assert!(verify_bearer(None, Some("anything")).is_ok());
+    }
 }
