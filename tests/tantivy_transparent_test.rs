@@ -99,15 +99,18 @@ async fn rewriter_handles_trailing_wildcard_like() -> Result<()> {
 #[tokio::test]
 async fn rewriter_leaves_unsupported_like_patterns_alone() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
+    // `level` uses the `raw` tokenizer (single token, case-sensitive),
+    // so `LIKE '%RR%'` cannot be expressed as a tantivy primitive. The
+    // rewriter must NOT inject text_match — original LIKE still applies.
+    // (`name` is now ngram3 so `%substring%` IS accelerable — see the
+    // rewriter_handles_infix_like_on_ngram3_column test.)
     let plan = analyze(
         &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND name LIKE '%substring%'",
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level LIKE '%RR%'",
     )
     .await?;
     let s = plan_str(&plan);
-    // `%substring%` cannot be expressed as a tantivy prefix or term query —
-    // rewriter must NOT inject text_match (original LIKE still correct).
-    assert!(!s.contains("text_match"), "expected NO text_match for embedded wildcards, got:\n{}", s);
+    assert!(!s.contains("text_match"), "expected NO text_match for %infix% on raw column, got:\n{}", s);
     Ok(())
 }
 
@@ -157,6 +160,90 @@ async fn rewriter_is_idempotent_under_replanning() -> Result<()> {
 }
 
 #[tokio::test]
+async fn rewriter_handles_infix_like_on_ngram3_column() -> Result<()> {
+    let ctx = analyzer_only_ctx().await?;
+    // `status_message` uses ngram3 → `LIKE '%failed%'` is accelerable.
+    let plan = analyze(
+        &ctx,
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%failed%'",
+    )
+    .await?;
+    let s = plan_str(&plan);
+    assert!(s.contains("text_match"), "expected text_match for %infix% on ngram3, got:\n{}", s);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rewriter_handles_suffix_like_on_ngram3_column() -> Result<()> {
+    let ctx = analyzer_only_ctx().await?;
+    let plan = analyze(
+        &ctx,
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%failed'",
+    )
+    .await?;
+    let s = plan_str(&plan);
+    assert!(s.contains("text_match"), "expected text_match for %suffix on ngram3, got:\n{}", s);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rewriter_handles_ilike_on_ngram3_column() -> Result<()> {
+    let ctx = analyzer_only_ctx().await?;
+    let plan = analyze(
+        &ctx,
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message ILIKE '%FAILED%'",
+    )
+    .await?;
+    let s = plan_str(&plan);
+    assert!(s.contains("text_match"), "expected text_match for ILIKE on ngram3, got:\n{}", s);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rewriter_skips_ilike_on_raw_tokenized_column() -> Result<()> {
+    let ctx = analyzer_only_ctx().await?;
+    // `level` uses raw (case-sensitive). ILIKE must NOT push down or we'd
+    // miss case variants in the prefilter set.
+    let plan = analyze(
+        &ctx,
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level ILIKE 'error'",
+    )
+    .await?;
+    let s = plan_str(&plan);
+    assert!(!s.contains("text_match"), "expected NO text_match for ILIKE on raw, got:\n{}", s);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rewriter_skips_infix_like_on_raw_tokenized_column() -> Result<()> {
+    let ctx = analyzer_only_ctx().await?;
+    // `level` uses raw; `LIKE '%RR%'` has no tantivy primitive that matches.
+    let plan = analyze(
+        &ctx,
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level LIKE '%RR%'",
+    )
+    .await?;
+    let s = plan_str(&plan);
+    assert!(!s.contains("text_match"), "expected NO text_match for %infix% on raw, got:\n{}", s);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rewriter_skips_sub_3_char_eq_on_ngram3() -> Result<()> {
+    let ctx = analyzer_only_ctx().await?;
+    // Sub-3-char literal on ngram3: no full trigram → tantivy term query
+    // would degenerate. Bail to scan.
+    let plan = analyze(
+        &ctx,
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND name = 'ok'",
+    )
+    .await?;
+    let s = plan_str(&plan);
+    assert!(!s.contains("text_match"), "expected NO text_match on <3 char literal, got:\n{}", s);
+    Ok(())
+}
+
+#[tokio::test]
 async fn rewriter_handles_multiple_indexed_predicates() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // Two indexed columns (level + name) — both should get text_match
@@ -189,16 +276,16 @@ fn indexed_tables_auto_discovers_prod_schema() {
 }
 
 #[test]
-fn indexed_tables_merges_csv_override() {
-    let cfg = TantivyConfig {
-        timefusion_tantivy_indexed_tables: Some("custom_table,other".to_string()),
-        ..Default::default()
-    };
+fn indexed_tables_is_schema_only() {
+    // Schema is the single source of truth. No CSV override knob — adding
+    // a knob nobody asks for is exactly what the project's CLAUDE.md
+    // forbids ("compactness and succinctness is a priority").
+    let cfg = TantivyConfig::default();
     let tables = cfg.indexed_tables();
-    // Both auto-discovered + CSV-overridden tables present, union.
-    assert!(tables.iter().any(|t| t == "otel_logs_and_spans"), "auto-discovery still in effect");
-    assert!(tables.iter().any(|t| t == "custom_table"), "CSV override merged");
-    assert!(tables.iter().any(|t| t == "other"), "CSV override merged (2)");
+    assert!(tables.iter().any(|t| t == "otel_logs_and_spans"));
+    // No way to inject a non-schema name now — confirm a synthetic name
+    // is absent.
+    assert!(!tables.iter().any(|t| t == "custom_table"));
 }
 
 #[test]

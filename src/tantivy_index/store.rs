@@ -48,6 +48,7 @@ pub fn build_to_dir(
     let built = crate::tantivy_index::schema::build_for_table(table);
     let mmap_dir = MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
     let index = Index::create(mmap_dir, built.schema.clone(), Default::default()).map_err(|e| anyhow!("create disk index: {e}"))?;
+    crate::tantivy_index::schema::register_tokenizers(&index);
     let stats = crate::tantivy_index::builder::index_to_writer(&built, &index, batches)?;
     Ok((built, stats))
 }
@@ -83,7 +84,12 @@ pub fn unpack_to_dir(blob: &[u8], dest: &Path) -> Result<()> {
 pub fn open_index(dir: &Path) -> Result<Index> {
     use tantivy::directory::MmapDirectory;
     let mm = MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
-    Index::open(mm).map_err(|e| anyhow!("open index: {e}"))
+    let index = Index::open(mm).map_err(|e| anyhow!("open index: {e}"))?;
+    // Tokenizer registry is per-Index, not persisted, so the reader must
+    // re-register exactly the same chains the writer used. Mismatch ⇒ silent
+    // miss (tantivy looks up by name and falls back to default).
+    crate::tantivy_index::schema::register_tokenizers(&index);
+    Ok(index)
 }
 
 pub async fn upload(store: &dyn ObjectStore, path: &ObjPath, blob: Bytes) -> Result<()> {

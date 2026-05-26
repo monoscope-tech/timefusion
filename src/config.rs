@@ -195,10 +195,10 @@ const_default!(d_tantivy_min_files: usize = 2);
 const_default!(d_tantivy_prefilter_max_hits: usize = 100_000);
 const_default!(d_tantivy_prefilter_min_selectivity_pct: u32 = 50);
 
-/// Tantivy sidecar-index configuration. Indexing is always-on whenever a
-/// schema declares `tantivy.indexed: true` on at least one field. The
-/// optional `timefusion_tantivy_indexed_tables` override is additive (for
-/// dynamic tables not in the static schema registry).
+/// Tantivy sidecar-index configuration. Indexing is always-on for any
+/// table whose YAML schema declares `tantivy.indexed: true` on at least
+/// one field. There is no override knob — schema is the single source of
+/// truth.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TantivyConfig {
     #[serde(default = "d_tantivy_max_index_mb")]
@@ -207,11 +207,6 @@ pub struct TantivyConfig {
     pub timefusion_tantivy_cache_disk_gb: u64,
     #[serde(default = "d_tantivy_zstd_level")]
     pub timefusion_tantivy_compression_level: i32,
-    /// Optional comma-separated override list, e.g. "otel_logs_and_spans".
-    /// Additive to the schema-registry auto-discovery — useful for
-    /// dynamically-created tables that don't have a YAML schema.
-    #[serde(default)]
-    pub timefusion_tantivy_indexed_tables: Option<String>,
     #[serde(default = "d_tantivy_min_files")]
     pub timefusion_tantivy_min_files_for_pushdown: usize,
     /// If a tantivy prefilter would produce more than this many hits, skip
@@ -227,9 +222,8 @@ pub struct TantivyConfig {
 }
 
 impl TantivyConfig {
-    /// Tables to index: union of (a) schemas with `tantivy.indexed: true`
-    /// on any field, and (b) the override env list. Walked once per call;
-    /// callers should cache if hot.
+    /// Tables to index: schemas with `tantivy.indexed: true` on any field.
+    /// Walked from the static registry on each call; cheap (compiled-in YAML).
     pub fn indexed_tables(&self) -> Vec<String> {
         use std::collections::BTreeSet;
         let mut set: BTreeSet<String> = BTreeSet::new();
@@ -238,11 +232,6 @@ impl TantivyConfig {
                 if schema.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)) {
                     set.insert(name);
                 }
-            }
-        }
-        if let Some(csv) = self.timefusion_tantivy_indexed_tables.as_deref() {
-            for t in csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                set.insert(t.to_string());
             }
         }
         set.into_iter().collect()

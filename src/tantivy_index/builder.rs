@@ -44,6 +44,7 @@ pub struct IndexBuildStats {
 pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(Index, BuiltSchema, IndexBuildStats)> {
     let built = build_for_table(table);
     let index = Index::create_in_ram(built.schema.clone());
+    crate::tantivy_index::schema::register_tokenizers(&index);
     let stats = index_to_writer(&built, &index, batches)?;
     Ok((index, built, stats))
 }

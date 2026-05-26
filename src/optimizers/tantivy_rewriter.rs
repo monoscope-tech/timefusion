@@ -1,7 +1,7 @@
 //! Transparent Tantivy acceleration for standard SQL predicates.
 //!
-//! Rewrites `col = 'literal'` and `col LIKE 'pattern'` on
-//! tantivy-indexed columns by **additively** AND-ing a `text_match(col, q)`
+//! Rewrites `col = 'literal'`, `col LIKE 'pattern'`, and `col ILIKE 'pattern'`
+//! on tantivy-indexed columns by **additively** AND-ing a `text_match(col, q)`
 //! call to the predicate. The original comparison is never removed — it
 //! still applies as a post-filter on MemBuffer rows and Delta files whose
 //! tantivy index hasn't built yet (post-flush lag). The `text_match` call,
@@ -9,32 +9,27 @@
 //! produces an `id IN (...)` prefilter that narrows the Delta scan.
 //!
 //! Correctness invariants:
-//! 1. The original predicate is preserved verbatim in the plan, so any row
-//!    that satisfies it (regardless of whether tantivy returned it) is
-//!    correctly emitted.
-//! 2. We only rewrite predicates on columns that are confirmed
-//!    `tantivy.indexed: true` in the table's YAML schema. Non-indexed
-//!    columns are left alone — adding `text_match` on them would be a
-//!    correctness bug (the UDF's substring fallback works, but the prefilter
-//!    would return `None` and we'd waste a round trip).
-//! 3. Already-wrapped predicates aren't rewrapped — the analyzer is
-//!    idempotent under repeated passes.
-//! 4. LIKE patterns with non-trailing wildcards (e.g. `'%substr%'`) are left
-//!    alone; tantivy term/prefix queries can't express them without an
-//!    n-gram tokenizer, which v1 doesn't ship.
+//! 1. The original predicate is preserved verbatim in the plan.
+//! 2. Only rewrite predicates on columns confirmed `tantivy.indexed: true`.
+//! 3. Idempotent under repeated passes.
+//! 4. Patterns the *target column's tokenizer* can't accelerate are left
+//!    alone (correctness preserved via the original predicate).
 //!
-//! Patterns currently rewritten:
+//! Patterns by tokenizer:
 //!
-//! | SQL form                | tantivy query passed to text_match     |
-//! |-------------------------|----------------------------------------|
-//! | `col = 'literal'`       | `'literal'`                            |
-//! | `col LIKE 'literal'`    | `'literal'`  (no wildcards)            |
-//! | `col LIKE 'prefix%'`    | `'prefix*'` (trailing-wildcard prefix) |
+//! | SQL form              | raw   | default | ngram3 |
+//! |-----------------------|-------|---------|--------|
+//! | `col = 'lit'`         | ✅ exact | ✅ exact | ✅ exact (case-insens via ngram lowercaser; Delta `=` re-filters case) |
+//! | `col LIKE 'lit'`      | ✅    | ✅      | ✅      |
+//! | `col LIKE 'pre%'`     | ✅ prefix | ✅ prefix | ✅ prefix |
+//! | `col LIKE '%suf'`     | ❌    | ❌      | ✅ via ngram |
+//! | `col LIKE '%mid%'`    | ❌    | ❌      | ✅ via ngram |
+//! | `col ILIKE 'lit'`     | ❌    | ✅ (lowercased literal) | ✅ |
+//! | `col ILIKE '%mid%'`   | ❌    | ❌      | ✅ |
 //!
-//! Patterns explicitly NOT rewritten in v1: `'%suffix'`, `'%substr%'`,
-//! `ILIKE` (case-insensitive coupling depends on tokenizer choice — left
-//! to the existing `text_match` UDF substring fallback for now), and any
-//! pattern containing `_` (single-char wildcard).
+//! `_` (single-char wildcard) is never accelerated — semantics don't map
+//! cleanly to any tantivy primitive. Strings shorter than 3 chars on
+//! ngram3 columns fall through (no full trigram available).
 
 use datafusion::common::{
     Result,
@@ -44,10 +39,16 @@ use datafusion::config::ConfigOptions;
 use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, ScalarUDF, expr::Like, expr::ScalarFunction, lit};
 use datafusion::optimizer::AnalyzerRule;
 use datafusion::scalar::ScalarValue;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
+use crate::tantivy_index::schema::{DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER};
 use crate::tantivy_index::udf::{TEXT_MATCH_NAME, TextMatchUdf};
+
+/// Minimum literal length we'll accelerate on ngram3. Tantivy's 3-gram
+/// tokenizer produces no tokens for inputs shorter than `n` characters, so
+/// a 2-char query would match every doc (degenerate) — bail to scan.
+const NGRAM_MIN_QUERY_LEN: usize = 3;
 
 #[derive(Debug, Default)]
 pub struct TantivyPredicateRewriter;
@@ -83,7 +84,7 @@ fn rewrite_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     }
 }
 
-fn rewrite_expr(expr: Expr, indexed_columns: &HashSet<String>) -> Result<Transformed<Expr>> {
+fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>) -> Result<Transformed<Expr>> {
     // Skip the children of a text_match call (already a tantivy predicate).
     if let Expr::ScalarFunction(sf) = &expr {
         if sf.func.name() == TEXT_MATCH_NAME {
@@ -93,8 +94,6 @@ fn rewrite_expr(expr: Expr, indexed_columns: &HashSet<String>) -> Result<Transfo
     if let Some((column, query)) = match_indexed_predicate(&expr, indexed_columns) {
         let tm = text_match_call(column, query);
         let wrapped = Expr::BinaryExpr(BinaryExpr::new(Box::new(expr), Operator::And, Box::new(tm)));
-        // Jump: do not recurse into the wrapped tree — we'd re-match the
-        // inner Eq/Like and produce `(x AND tm) AND tm` infinitely.
         Ok(Transformed::new(wrapped, true, TreeNodeRecursion::Jump))
     } else {
         Ok(Transformed::no(expr))
@@ -102,9 +101,10 @@ fn rewrite_expr(expr: Expr, indexed_columns: &HashSet<String>) -> Result<Transfo
 }
 
 /// If `expr` is a rewritable predicate on an indexed column, return
-/// `(column_name, tantivy_query)`. Tantivy query syntax: `term` for exact,
-/// `term*` for prefix.
-fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashSet<String>) -> Option<(String, String)> {
+/// `(column_name, tantivy_query)`. Decision depends on the column's
+/// tokenizer — raw can't do substring; ngram3 can do everything; default
+/// is in between.
+fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'static str>) -> Option<(String, String)> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => {
             let (col, lit) = match (left.as_ref(), right.as_ref()) {
@@ -112,14 +112,19 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashSet<String>) -> Op
                 (Expr::Literal(s, _), Expr::Column(c)) => (c, s),
                 _ => return None,
             };
-            if !indexed_columns.contains(&c_name(col)) {
+            let tok = *indexed_columns.get(&c_name(col))?;
+            let s = extract_utf8_literal(lit)?;
+            // Raw and default tokenizers want safe-char terms (raw is
+            // single-token, default does word split — both struggle with
+            // QueryParser metachars). ngram3 sees the literal char-by-char
+            // and lowercases, so we still gate on safe chars to keep the
+            // injected `text_match` UDF call simple.
+            if !s.chars().all(is_tantivy_safe_term_char) || s.is_empty() {
                 return None;
             }
-            let s = extract_utf8_literal(lit)?;
-            // Conservative: bail on any literal containing tantivy QueryParser
-            // metachars. Correctness preserved because the original `=`
-            // predicate stays in the plan.
-            if !s.chars().all(is_tantivy_safe_term_char) || s.is_empty() {
+            // Skip ngram3 acceleration for sub-3-char literals (no
+            // valid trigram → tantivy returns everything).
+            if tok == NGRAM3_TOKENIZER && s.chars().count() < NGRAM_MIN_QUERY_LEN {
                 return None;
             }
             Some((c_name(col), tantivy_escape_term(&s)))
@@ -129,15 +134,29 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashSet<String>) -> Op
             expr: l,
             pattern: r,
             escape_char,
-            case_insensitive: false,
+            case_insensitive,
         }) => {
             let Expr::Column(c) = l.as_ref() else { return None };
-            if !indexed_columns.contains(&c_name(c)) {
+            let tok = *indexed_columns.get(&c_name(c))?;
+            // ILIKE on raw (case-sensitive single token) is not accelerable
+            // without a parallel case-insensitive index — skip.
+            if *case_insensitive && tok == RAW_TOKENIZER {
                 return None;
             }
             let Expr::Literal(s, _) = r.as_ref() else { return None };
             let pat = extract_utf8_literal(s)?;
-            classify_like_pattern(&pat, *escape_char).map(|q| (c_name(c), q))
+            let allow_substring = tok == NGRAM3_TOKENIZER;
+            let q = classify_like_pattern(&pat, *escape_char, allow_substring)?;
+            // ngram3 tokenizer lowercases on both index and query side, so
+            // ILIKE comes for free. For "default" tokenizer (also lowercased)
+            // the query parser also lowercases. So no extra work needed —
+            // case sensitivity is already lost in the prefilter, and the
+            // original LIKE/ILIKE predicate re-runs on the Delta side with
+            // correct semantics.
+            if tok == NGRAM3_TOKENIZER && q.chars().filter(|c| *c != '*').count() < NGRAM_MIN_QUERY_LEN {
+                return None;
+            }
+            Some((c_name(c), q))
         }
         _ => None,
     }
@@ -154,57 +173,85 @@ fn extract_utf8_literal(s: &ScalarValue) -> Option<String> {
     }
 }
 
-/// Decide which Tantivy query form a SQL LIKE pattern maps to. Only handles:
-/// - no wildcard:   `'foo'`          -> term `foo`
-/// - trailing `%`:  `'foo%'`         -> prefix `foo*`
+/// Decide which Tantivy query form a SQL LIKE pattern maps to.
 ///
-/// `_` (single-char wildcard) is treated as a non-supported pattern.
-/// Embedded `%` (`'fo%o'`, `'%foo%'`) is non-supported.
-fn classify_like_pattern(pat: &str, escape: Option<char>) -> Option<String> {
+/// `allow_substring=false` (raw/default tokenizer):
+///   - `'foo'`     → term `foo`
+///   - `'foo%'`    → prefix `foo*`
+///   - `'%foo'`, `'%foo%'`, embedded `%` → unsupported (None)
+///
+/// `allow_substring=true` (ngram3 tokenizer):
+///   - `'foo'`     → term `foo`
+///   - `'foo%'`    → prefix `foo*`
+///   - `'%foo'`    → term `foo`  (n-gram match by tantivy)
+///   - `'%foo%'`   → term `foo`
+///   - Embedded `%` between literal chars (e.g. `'a%b'`) → unsupported
+///
+/// `_` (single-char wildcard) is never accelerable. Returns None.
+fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: bool) -> Option<String> {
     let esc = escape.unwrap_or('\\');
+    let chars: Vec<char> = pat.chars().collect();
+    let total = chars.len();
+    if total == 0 {
+        return None;
+    }
     let mut out = String::new();
-    let mut chars = pat.chars().peekable();
+    let mut i = 0;
+    let mut leading_wildcard = false;
     let mut trailing_wildcard = false;
-    let total_chars = pat.chars().count();
-    let mut idx = 0;
-    while let Some(c) = chars.next() {
-        idx += 1;
+    // Detect leading %
+    if chars[0] == '%' {
+        leading_wildcard = true;
+        i = 1;
+    }
+    while i < total {
+        let c = chars[i];
         if c == esc {
             // Next char is literal.
-            if let Some(&n) = chars.peek() {
-                chars.next();
-                idx += 1;
-                if !is_tantivy_safe_term_char(n) {
-                    return None;
-                }
-                out.push(n);
-                continue;
-            } else {
+            i += 1;
+            if i >= total {
                 return None; // trailing escape
             }
+            let n = chars[i];
+            if !is_tantivy_safe_term_char(n) {
+                return None;
+            }
+            out.push(n);
+            i += 1;
+            continue;
         }
         if c == '_' {
             return None;
         }
         if c == '%' {
-            if idx == total_chars {
+            if i + 1 == total {
                 trailing_wildcard = true;
-            } else {
-                return None; // leading or embedded %
+                break;
             }
-            continue;
+            // Embedded %: only the leading-or-trailing-only forms are
+            // handled here. `'a%b'` would need positional ranking that
+            // tantivy can't trivially give us. Bail.
+            return None;
         }
         if !is_tantivy_safe_term_char(c) {
-            // Special chars that would confuse QueryParser; bail rather than
-            // mis-escape.
             return None;
         }
         out.push(c);
+        i += 1;
     }
     if out.is_empty() {
         return None;
     }
-    Some(if trailing_wildcard { format!("{}*", out) } else { out })
+    Some(match (leading_wildcard, trailing_wildcard) {
+        // Plain exact / prefix / suffix / infix matches.
+        (false, false) => out,                  // 'foo'
+        (false, true) => format!("{}*", out),   // 'foo%' (prefix)
+        // Suffix-only and infix forms only meaningful on ngram3; for raw/
+        // default tokenizers we'd be sending tantivy a query that matches
+        // the substring as a whole token (it won't). Bail.
+        (true, false) | (true, true) if !allow_substring => return None,
+        (true, _) => out, // ngram3 will trigram-match the substring
+    })
 }
 
 /// Conservative: only allow alnum, dot, dash, underscore, slash, colon,
@@ -255,21 +302,30 @@ fn find_indexed_table(plan: &LogicalPlan) -> Option<String> {
     found
 }
 
-/// Indexed columns for a table from the static schema registry. Returns
-/// `None` when the table isn't in the registry (custom/dynamic tables);
-/// callers treat that as "skip rewrite" — correct behavior because we have
-/// no schema to consult.
-fn indexed_columns_for(table: &str) -> Option<HashSet<String>> {
-    static CACHE: OnceLock<HashMap<String, HashSet<String>>> = OnceLock::new();
+/// Indexed columns for a table from the static schema registry — keyed by
+/// column name, value is the resolved tokenizer (raw/default/ngram3).
+/// Returns `None` when the table isn't in the registry.
+fn indexed_columns_for(table: &str) -> Option<HashMap<String, &'static str>> {
+    static CACHE: OnceLock<HashMap<String, HashMap<String, &'static str>>> = OnceLock::new();
     let map = CACHE.get_or_init(|| {
-        let mut m: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut m: HashMap<String, HashMap<String, &'static str>> = HashMap::new();
         for name in crate::schema_loader::registry().list_tables() {
             if let Some(schema) = crate::schema_loader::registry().get(&name) {
-                let cols: HashSet<String> = schema
+                let cols: HashMap<String, &'static str> = schema
                     .fields
                     .iter()
-                    .filter(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed))
-                    .map(|f| f.name.clone())
+                    .filter_map(|f| {
+                        let cfg = f.tantivy.as_ref()?;
+                        if !cfg.indexed {
+                            return None;
+                        }
+                        let tok = match cfg.tokenizer.as_deref().unwrap_or(NGRAM3_TOKENIZER) {
+                            RAW_TOKENIZER => RAW_TOKENIZER,
+                            DEFAULT_TOKENIZER => DEFAULT_TOKENIZER,
+                            _ => NGRAM3_TOKENIZER,
+                        };
+                        Some((f.name.clone(), tok))
+                    })
                     .collect();
                 if !cols.is_empty() {
                     m.insert(name, cols);
@@ -287,52 +343,63 @@ mod tests {
 
     #[test]
     fn like_classifier_exact_no_wildcards() {
-        assert_eq!(classify_like_pattern("foo", None), Some("foo".to_string()));
+        assert_eq!(classify_like_pattern("foo", None, false), Some("foo".to_string()));
     }
 
     #[test]
     fn like_classifier_trailing_wildcard() {
-        assert_eq!(classify_like_pattern("foo%", None), Some("foo*".to_string()));
+        assert_eq!(classify_like_pattern("foo%", None, false), Some("foo*".to_string()));
     }
 
     #[test]
-    fn like_classifier_leading_wildcard_unsupported() {
-        assert_eq!(classify_like_pattern("%foo", None), None);
+    fn like_classifier_leading_wildcard_unsupported_on_raw() {
+        assert_eq!(classify_like_pattern("%foo", None, false), None);
     }
 
     #[test]
-    fn like_classifier_embedded_wildcard_unsupported() {
-        assert_eq!(classify_like_pattern("fo%o", None), None);
+    fn like_classifier_leading_wildcard_supported_on_ngram3() {
+        assert_eq!(classify_like_pattern("%foo", None, true), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn like_classifier_infix_supported_on_ngram3() {
+        assert_eq!(classify_like_pattern("%foo%", None, true), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn like_classifier_infix_unsupported_on_raw() {
+        assert_eq!(classify_like_pattern("%foo%", None, false), None);
+    }
+
+    #[test]
+    fn like_classifier_embedded_percent_unsupported() {
+        assert_eq!(classify_like_pattern("fo%o", None, true), None);
+        assert_eq!(classify_like_pattern("fo%o", None, false), None);
     }
 
     #[test]
     fn like_classifier_underscore_unsupported() {
-        assert_eq!(classify_like_pattern("fo_", None), None);
+        assert_eq!(classify_like_pattern("fo_", None, true), None);
     }
 
     #[test]
     fn like_classifier_special_char_bails() {
-        assert_eq!(classify_like_pattern("foo+bar", None), None);
+        assert_eq!(classify_like_pattern("foo+bar", None, true), None);
     }
 
     #[test]
     fn like_classifier_safe_dots_dashes_allowed() {
-        assert_eq!(classify_like_pattern("svc.user-api", None), Some("svc.user-api".to_string()));
+        assert_eq!(classify_like_pattern("svc.user-api", None, false), Some("svc.user-api".to_string()));
     }
 
     #[test]
     fn like_classifier_escape_metachar_bails_conservatively() {
-        // Escape produces a literal `%` in the SQL semantics — but `%` is
-        // not in our safe-term char set, so we bail and the original LIKE
-        // predicate still applies (correctness retained, perf opportunity
-        // lost — acceptable for v1).
-        assert_eq!(classify_like_pattern("foo\\%", Some('\\')), None);
+        assert_eq!(classify_like_pattern("foo\\%", Some('\\'), false), None);
     }
 
     #[test]
     fn match_indexed_eq_picks_up_known_column() {
-        // Column name not in the registry → no rewrite.
-        let cols = HashSet::from(["service_name".to_string()]);
+        let cols: HashMap<String, &'static str> = HashMap::from([("service_name".to_string(), RAW_TOKENIZER)]);
         let e = Expr::BinaryExpr(BinaryExpr::new(
             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("service_name"))),
             Operator::Eq,
@@ -347,5 +414,46 @@ mod tests {
             Box::new(lit("x")),
         ));
         assert_eq!(match_indexed_predicate(&other, &cols), None);
+    }
+
+    #[test]
+    fn match_eq_skips_short_literals_on_ngram3() {
+        // Sub-3-char literal on an ngram3 column has no full trigram; bail
+        // to avoid a tantivy match-everything degenerate query.
+        let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
+        let e = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            Operator::Eq,
+            Box::new(lit("ab")),
+        ));
+        assert_eq!(match_indexed_predicate(&e, &cols), None);
+    }
+
+    #[test]
+    fn match_ilike_skipped_on_raw_columns() {
+        // ILIKE on a raw-tokenized (case-sensitive) column would silently
+        // miss case variants; skip the rewrite.
+        let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), RAW_TOKENIZER)]);
+        let e = Expr::Like(Like {
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("foo")),
+            escape_char: None,
+            case_insensitive: true,
+        });
+        assert_eq!(match_indexed_predicate(&e, &cols), None);
+    }
+
+    #[test]
+    fn match_ilike_substring_works_on_ngram3() {
+        let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
+        let e = Expr::Like(Like {
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("%foo%")),
+            escape_char: None,
+            case_insensitive: true,
+        });
+        assert_eq!(match_indexed_predicate(&e, &cols), Some(("c".into(), "foo".into())));
     }
 }
