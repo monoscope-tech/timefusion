@@ -718,6 +718,13 @@ impl BufferedWriteLayer {
         self.mem_buffer.get_stats().total_rows == 0
     }
 
+    /// Direct accessor for the underlying `MemBuffer`. Used by the SQL
+    /// routing layer to call `search_text_match` (the in-memory tantivy
+    /// prefilter for buckets that haven't flushed yet).
+    pub fn mem_buffer(&self) -> &MemBuffer {
+        &self.mem_buffer
+    }
+
     pub fn get_stats(&self) -> MemBufferStats {
         self.mem_buffer.get_stats()
     }

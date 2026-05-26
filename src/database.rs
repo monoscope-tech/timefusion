@@ -2764,81 +2764,130 @@ impl TableProvider for ProjectRoutingTable {
         let project_id = self.extract_project_id_from_filters(&optimized_filters).unwrap_or_else(|| self.default_project.clone());
         span.record("table.project_id", project_id.as_str());
 
-        // Tantivy prefilter: if the query contains text_match() and tantivy is
-        // available for this table, resolve the candidate (timestamp,id) set
-        // from the sidecar indexes. The resulting `id IN (..)` filter is added
-        // ONLY to the Delta scan — MemBuffer rows aren't in any sidecar index,
-        // so we keep their text_match() post-filter intact via the UDF's
-        // substring fallback (correctness: result = MemBuffer.text_match ∪ Delta.text_match).
-        let mut tantivy_id_filter: Option<Expr> = None;
-        if let Some(svc) = self.database.tantivy_search() {
+        // Tantivy prefilter: combine candidate IDs from both the sidecar S3
+        // indexes (cover flushed Delta files) AND the per-bucket in-memory
+        // indexes (cover MemBuffer rows that haven't flushed yet). The
+        // resulting `id IN (..)` filter is applied to BOTH Delta and
+        // MemBuffer scans — IDs are globally unique, so the union covers
+        // every store without double-counting. The original SQL predicate
+        // stays in the plan as the correctness backstop.
+        let tantivy_id_filter: Option<Expr> = {
             let preds = crate::tantivy_index::udf::collect_text_matches(&optimized_filters);
-            if !preds.is_empty() {
+            if preds.is_empty() {
+                None
+            } else {
                 use datafusion::logical_expr::{Expr, lit};
                 let tcfg = &self.database.config().tantivy;
                 let max_hits = tcfg.prefilter_max_hits();
                 let min_sel_pct = tcfg.prefilter_min_selectivity_pct() as u64;
                 crate::metrics::record_tantivy_prefilter_attempt();
 
-                let mut all_ids: Option<Vec<String>> = None;
-                let mut any_index = false;
+                let mut delta_ids: Option<std::collections::HashSet<String>> = None;
+                let mut delta_indexed_rows: u64 = 0;
+                let mut delta_any_usable = false;
                 let mut abort_reason: Option<&'static str> = None;
-                for p in &preds {
-                    match svc.search_with_stats(&self.table_name, &project_id, &p.column, &p.query, max_hits).await {
-                        Ok(Some(result)) => {
-                            // Selectivity cutoff: if matches >= min_sel_pct of indexed
-                            // rows, the IN-list won't prune enough to be worth the
-                            // round-trip. Bail; original predicate still applies.
-                            let hit_count = result.hits.len() as u64;
-                            if result.indexed_rows > 0 && hit_count * 100 >= result.indexed_rows * min_sel_pct {
-                                abort_reason = Some("low_selectivity");
-                                any_index = false;
+
+                // Sidecar (Delta) tantivy. Per-predicate intersect (AND).
+                if let Some(svc) = self.database.tantivy_search() {
+                    for p in &preds {
+                        match svc.search_with_stats(&self.table_name, &project_id, &p.column, &p.query, max_hits).await {
+                            Ok(Some(result)) => {
+                                delta_any_usable = true;
+                                delta_indexed_rows = delta_indexed_rows.saturating_add(result.indexed_rows);
+                                let ids: std::collections::HashSet<String> = result.hits.into_iter().map(|h| h.id).collect();
+                                delta_ids = Some(match delta_ids.take() {
+                                    None => ids,
+                                    Some(prev) => prev.intersection(&ids).cloned().collect(),
+                                });
+                            }
+                            Ok(None) => {
+                                abort_reason = Some("delta_no_index_or_cap_exceeded");
+                                delta_ids = None;
+                                delta_any_usable = false;
                                 break;
                             }
-                            any_index = true;
-                            let ids: Vec<String> = result.hits.into_iter().map(|h| h.id).collect();
-                            all_ids = Some(match all_ids.take() {
-                                None => ids,
-                                Some(prev) => {
-                                    let prev_set: std::collections::HashSet<&str> = prev.iter().map(|s| s.as_str()).collect();
-                                    ids.into_iter().filter(|i| prev_set.contains(i.as_str())).collect()
-                                }
-                            });
-                        }
-                        Ok(None) => {
-                            // Either no usable index, or the hit cap was exceeded.
-                            // Either way fall back; the UDF / original predicate
-                            // post-filter preserves correctness.
-                            abort_reason = Some("no_index_or_cap_exceeded");
-                            any_index = false;
-                            break;
-                        }
-                        Err(e) => {
-                            warn!("tantivy search failed for {}/{}: {} — falling back to full scan", project_id, self.table_name, e);
-                            crate::metrics::record_tantivy_prefilter_error();
-                            abort_reason = Some("error");
-                            any_index = false;
-                            break;
+                            Err(e) => {
+                                warn!("tantivy search failed for {}/{}: {} — falling back to full scan", project_id, self.table_name, e);
+                                crate::metrics::record_tantivy_prefilter_error();
+                                abort_reason = Some("delta_error");
+                                delta_ids = None;
+                                delta_any_usable = false;
+                                break;
+                            }
                         }
                     }
                 }
-                if any_index {
-                    if let Some(ids) = all_ids {
+
+                // In-memory (MemBuffer) tantivy. Covers the 0..flush_interval
+                // window of recent data the Delta sidecar can't see yet.
+                let mem_ids = if let Some(layer) = self.database.buffered_layer() {
+                    match layer.mem_buffer().search_text_match(&project_id, &self.table_name, &preds) {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            warn!("mem-buffer text_match search failed for {}/{}: {} — falling back to full scan", project_id, self.table_name, e);
+                            crate::metrics::record_tantivy_prefilter_error();
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Combine. None means "no authoritative coverage on this side";
+                // bail if BOTH sides bailed (rewriter's original predicate is
+                // the correctness fallback). If exactly one side covered, we
+                // can't safely narrow — the other side might have matches we'd
+                // exclude. Bail conservatively.
+                let combined: Option<std::collections::HashSet<String>> = match (delta_any_usable, mem_ids) {
+                    (true, Some(mem)) => {
+                        // Union: each id lives in exactly one store, so this is
+                        // the complete candidate set across both.
+                        let mut all = delta_ids.unwrap_or_default();
+                        all.extend(mem);
+                        Some(all)
+                    }
+                    // Delta only: the in-memory side either had no indexed
+                    // fields or no buffered layer. Use the delta hits as-is —
+                    // MemBuffer query path still runs the original predicate
+                    // unfiltered (correctness preserved).
+                    (true, None) => delta_ids,
+                    // MemBuffer only: no Delta sidecar (single-node test, or
+                    // cold table). Delta scan still runs the original predicate.
+                    (false, Some(mem)) => Some(mem),
+                    (false, None) => {
+                        if abort_reason.is_none() {
+                            abort_reason = Some("no_usable_index");
+                        }
+                        None
+                    }
+                };
+
+                if let Some(ids) = combined {
+                    // Selectivity cutoff: only apply when Delta sidecar was
+                    // usable (we have indexed_rows from it). Pure in-memory
+                    // matches always go in — MemBuffer is small enough that
+                    // narrowing is always a win.
+                    if delta_indexed_rows > 0 && (ids.len() as u64) * 100 >= delta_indexed_rows * min_sel_pct {
+                        crate::metrics::record_tantivy_prefilter_skipped();
+                        debug!("Tantivy prefilter skipped for {}/{}: low_selectivity", project_id, self.table_name);
+                        None
+                    } else {
                         crate::metrics::record_tantivy_prefilter_used();
-                        tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
+                        Some(Expr::InList(datafusion::logical_expr::expr::InList {
                             expr: Box::new(datafusion::logical_expr::col("id")),
                             list: ids.into_iter().map(lit).collect(),
                             negated: false,
-                        }));
+                        }))
                     }
                 } else {
                     crate::metrics::record_tantivy_prefilter_skipped();
                     if let Some(reason) = abort_reason {
                         debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
                     }
+                    None
                 }
             }
-        }
+        };
 
         // Variant binary flows through scans untouched; downstream nodes
         // (variant_get, ->, ->>) consume it directly. JSON serialization
@@ -2877,8 +2926,19 @@ impl TableProvider for ProjectRoutingTable {
             _ => false,
         };
 
-        // Query MemBuffer with partitioned data for parallel execution
-        let mem_partitions = match layer.query_partitioned(&project_id, &self.table_name, &optimized_filters) {
+        // Query MemBuffer with partitioned data for parallel execution.
+        // The tantivy `id IN (..)` filter is appended so MemBuffer prunes
+        // batches by ID just like the Delta scan does — IDs are globally
+        // unique, so a row's presence is bounded to one set.
+        let mem_filters: Vec<Expr> = match tantivy_id_filter.clone() {
+            Some(f) => {
+                let mut v = optimized_filters.clone();
+                v.push(f);
+                v
+            }
+            None => optimized_filters.clone(),
+        };
+        let mem_partitions = match layer.query_partitioned(&project_id, &self.table_name, &mem_filters) {
             Ok(partitions) => partitions,
             Err(e) => {
                 warn!("Failed to query mem buffer: {}", e);

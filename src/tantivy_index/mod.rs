@@ -8,6 +8,7 @@
 
 pub mod builder;
 pub mod manifest;
+pub mod mem_index;
 pub mod reader;
 pub mod schema;
 pub mod search;
