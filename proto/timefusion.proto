@@ -4,6 +4,11 @@ package timefusion.v1;
 // Streaming ingestion service. Clients open a single bidi stream and push
 // WriteBatch messages continuously; the server emits a WriteAck for every
 // batch, signalling backpressure via `status` and `mem_pressure_pct`.
+//
+// Ack ordering: NOT preserved. The server decodes/inserts up to N batches
+// concurrently per stream, so acks may arrive in any order relative to
+// sends. Clients MUST correlate acks to sends by `WriteBatch.seq` and
+// track outstanding seqs themselves.
 service Ingest {
   rpc Write(stream WriteBatch) returns (stream WriteAck);
 }
