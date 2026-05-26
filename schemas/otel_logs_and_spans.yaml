@@ -56,7 +56,7 @@ fields:
     data_type: Utf8
     nullable: true
     bloom_filter: true
-    tantivy: { indexed: true, tokenizer: default }
+    tantivy: { indexed: true, tokenizer: ngram3 }
   - name: kind
     data_type: Utf8
     nullable: true
@@ -68,7 +68,7 @@ fields:
   - name: status_message
     data_type: Utf8
     nullable: true
-    tantivy: { indexed: true, tokenizer: default }
+    tantivy: { indexed: true, tokenizer: ngram3 }
   - name: level
     data_type: Utf8
     nullable: true
@@ -85,7 +85,7 @@ fields:
   - name: body
     data_type: Variant
     nullable: true
-    tantivy: { indexed: true, tokenizer: default, flatten: json }
+    tantivy: { indexed: true, tokenizer: ngram3, flatten: json }
   - name: duration
     data_type: Int64
     nullable: true
@@ -125,7 +125,7 @@ fields:
   - name: attributes
     data_type: Variant
     nullable: true
-    tantivy: { indexed: true, tokenizer: default, flatten: kv }
+    tantivy: { indexed: true, tokenizer: ngram3, flatten: kv }
   - name: attributes___client___address
     data_type: Utf8
     nullable: true
@@ -321,7 +321,7 @@ fields:
   - name: summary
     data_type: "List(Utf8)"
     nullable: false
-    tantivy: { indexed: true, tokenizer: default }
+    tantivy: { indexed: true, tokenizer: ngram3 }
   - name: errors
     data_type: Variant
     nullable: true

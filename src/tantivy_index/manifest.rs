@@ -15,7 +15,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MANIFEST_PREFIX: &str = "index_manifests";
-pub const SCHEMA_VERSION: u32 = 1;
+// Bumped from 1 → 2 when we introduced the `ngram3` tokenizer (different
+// term dictionary; old indexes can't be queried with the new analyzer
+// chain). Indexes with `schema_version < 2` are skipped by search.rs and
+// will be replaced on the next flush.
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {

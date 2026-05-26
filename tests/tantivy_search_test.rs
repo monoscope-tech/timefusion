@@ -65,7 +65,6 @@ async fn callback_builds_index_and_search_returns_hits() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig {
         
-        timefusion_tantivy_indexed_tables: Some(table_name.to_string()),
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
     };
@@ -153,7 +152,6 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig {
         
-        timefusion_tantivy_indexed_tables: Some(table_name.into()),
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
     };
@@ -192,7 +190,6 @@ async fn search_skips_indexes_that_dont_have_the_field() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig {
         
-        timefusion_tantivy_indexed_tables: Some(table_name.into()),
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
     };

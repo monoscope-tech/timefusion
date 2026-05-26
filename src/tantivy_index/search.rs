@@ -76,7 +76,12 @@ impl TantivySearchService {
             let Ok(field_obj) = schema.get_field(field) else {
                 continue;
             };
-            let qp = QueryParser::for_index(&idx, vec![field_obj]);
+            let mut qp = QueryParser::for_index(&idx, vec![field_obj]);
+            // AND multiple tokens together. Critical for n-gram: "hello"
+            // tokenizes into trigrams `hel`,`ell`,`llo` and we want ALL to
+            // match (a single matching trigram doesn't imply substring
+            // presence — only the full sequence does).
+            qp.set_conjunction_by_default();
             let q = qp.parse_query(query_str).map_err(|e| anyhow!("parse query: {e}"))?;
             let hits = query_index(&idx, &*q, None)?;
             indexed_rows = indexed_rows.saturating_add(entry.rows);

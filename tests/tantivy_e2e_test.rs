@@ -43,7 +43,6 @@ fn cfg(test_id: &str, tantivy_enabled: bool) -> Arc<AppConfig> {
     c.cache.timefusion_foyer_disabled = true;
     c.tantivy = TantivyConfig {
         
-        timefusion_tantivy_indexed_tables: Some("otel_logs_and_spans".into()),
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
     };
@@ -93,8 +92,10 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
 }
 
 /// Build a RecordBatch matching the otel_logs_and_spans schema using the
-/// existing test helper. `rows` is (id, name, status_message); timestamp uses
-/// `now()` so we land on today's date partition (Delta validation requires it).
+/// existing test helper. `rows` is `(id, name, status_message)`. The `level`
+/// is derived from the message ("failed" → ERROR, "timeout" → WARN, else
+/// INFO) so tests can query `WHERE level = 'ERROR'` to exercise the
+/// rewriter's `=` path against the raw-tokenized indexed column.
 fn make_batch(project: &str, rows: Vec<(&str, &str, &str)>) -> RecordBatch {
     let now = chrono::Utc::now();
     let records: Vec<_> = rows
@@ -102,10 +103,18 @@ fn make_batch(project: &str, rows: Vec<(&str, &str, &str)>) -> RecordBatch {
         .enumerate()
         .map(|(i, (id, name, msg))| {
             let ts = now.timestamp_micros() + i as i64;
+            let lvl = if msg.contains("failed") || msg.contains("declined") {
+                "ERROR"
+            } else if msg.contains("timeout") {
+                "WARN"
+            } else {
+                "INFO"
+            };
             json!({
                 "timestamp": ts,
                 "id": id,
                 "name": name,
+                "level": lvl,
                 "status_message": msg,
                 "project_id": project,
                 "date": now.date_naive().to_string(),
@@ -178,7 +187,13 @@ async fn delta_flushed_text_match_matches_baseline() -> Result<()> {
 
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
-async fn membuffer_only_text_match_uses_udf_fallback() -> Result<()> {
+async fn membuffer_only_level_eq_falls_back_correctly() -> Result<()> {
+    // Rows stay in MemBuffer (no flush). The rewriter still injects
+    // `text_match(level, 'ERROR')` next to the `=` predicate, but the
+    // tantivy search returns `None` (no manifest yet) → no prefilter
+    // applied → original `level = 'ERROR'` filter runs against the
+    // in-memory batches. Correctness invariant: result identical to the
+    // tantivy-off baseline.
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (db, ctx, _svc) = build_db(&format!("{id}-mem-on"), true).await?;
     let (db2, ctx2, _) = build_db(&format!("{id}-mem-off"), false).await?;
@@ -193,10 +208,10 @@ async fn membuffer_only_text_match_uses_udf_fallback() -> Result<()> {
     db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false).await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND text_match(status_message, 'failed')");
+    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
     let r_on = collect_ids(&ctx, &q).await?;
     let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "MemBuffer text_match must be identical with and without tantivy");
+    assert_eq!(r_on, r_off, "MemBuffer-only result must equal baseline with rewriter on");
     assert_eq!(r_on, vec!["x2".to_string()]);
     Ok(())
 }
@@ -228,7 +243,13 @@ async fn tantivy_indexer_actually_writes_manifest_when_flush_routes_through_buff
 
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
-async fn mixed_membuffer_and_delta_text_match_returns_union() -> Result<()> {
+async fn mixed_membuffer_and_delta_level_eq_returns_union() -> Result<()> {
+    // The hard case: some rows are in Delta (and possibly indexed by
+    // tantivy), some are still in MemBuffer (definitely not indexed).
+    // The rewriter wraps `level = 'ERROR'` with text_match. Behavior:
+    //   - Delta side may get prefiltered by id IN(...) from tantivy
+    //   - MemBuffer side is queried directly with the original predicate
+    //   - Result is the union with no duplicates and no missed rows
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (db, ctx, _svc) = build_db(&format!("{id}-mix-on"), true).await?;
     let (db2, ctx2, _) = build_db(&format!("{id}-mix-off"), false).await?;
@@ -249,10 +270,10 @@ async fn mixed_membuffer_and_delta_text_match_returns_union() -> Result<()> {
     db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, mem_rows)], false).await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND text_match(status_message, 'failed')");
+    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
     let r_on = collect_ids(&ctx, &q).await?;
     let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "mixed mode results must be identical between on/off");
+    assert_eq!(r_on, r_off, "mixed-mode results must be identical between on/off");
     assert_eq!(r_on, vec!["d-old1".to_string(), "m-new1".to_string()]);
     Ok(())
 }
@@ -321,17 +342,27 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     let m = timefusion::tantivy_index::manifest::load(svc.object_store.as_ref(), TABLE, &p).await?;
     assert!(!m.entries.is_empty(), "manifest should have entries after flush");
 
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND text_match(status_message, 'failed')");
+    // Real-world SQL: `WHERE level = 'ERROR'`. The TantivyPredicateRewriter
+    // additively wraps this with `text_match(level, 'ERROR')` so the
+    // ProjectRoutingTable invokes the tantivy prefilter. The original `=`
+    // predicate stays in the plan and re-runs on the Delta scan output —
+    // which is what makes this correct on MemBuffer rows + freshly-flushed
+    // not-yet-indexed files. Test data uses derived levels:
+    //   "login failed: bad password" → ERROR
+    //   "charge declined"             → ERROR
+    //   "login successful"            → INFO
+    //   "charge succeeded"            → INFO
+    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
     let r_on = collect_ids(&ctx, &q).await?;
     let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "post-flush prefilter must match baseline");
-    assert_eq!(r_on, vec!["k1".to_string()]);
+    assert_eq!(r_on, r_off, "post-flush prefilter must match baseline for `level = 'ERROR'`");
+    assert_eq!(r_on, vec!["k1".to_string(), "k3".to_string()]);
 
-    // And a second predicate using a different word.
-    let q2 = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND text_match(status_message, 'charge')");
+    // Second natural-SQL predicate. INFO is also indexed via the rewriter.
+    let q2 = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'INFO'");
     let r2_on = collect_ids(&ctx, &q2).await?;
     let r2_off = collect_ids(&ctx2, &q2).await?;
     assert_eq!(r2_on, r2_off);
-    assert_eq!(r2_on, vec!["k3".to_string(), "k4".to_string()]);
+    assert_eq!(r2_on, vec!["k2".to_string(), "k4".to_string()]);
     Ok(())
 }
