@@ -781,6 +781,21 @@ impl BufferedWriteLayer {
         self.mem_buffer.query_partitioned(project_id, table_name, filters)
     }
 
+    /// MemBuffer query with atomic text-match prefilter. Used by the SQL
+    /// routing layer when text_match predicates are present — guarantees
+    /// the per-bucket prefilter and the returned snapshot reflect the same
+    /// point-in-time bucket state. Falls through to `query_partitioned`
+    /// behavior when `preds` is empty or the table has no indexed fields.
+    pub fn query_partitioned_with_text_match(
+        &self,
+        project_id: &str,
+        table_name: &str,
+        filters: &[datafusion::logical_expr::Expr],
+        preds: &[crate::tantivy_index::udf::TextMatchPred],
+    ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
+        self.mem_buffer.query_partitioned_with_text_match(project_id, table_name, filters, preds)
+    }
+
     /// Check if a table exists in the memory buffer.
     pub fn has_table(&self, project_id: &str, table_name: &str) -> bool {
         self.mem_buffer.has_table(project_id, table_name)
