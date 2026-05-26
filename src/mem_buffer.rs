@@ -147,6 +147,11 @@ pub struct TimeBucket {
     memory_bytes: AtomicUsize,
     min_timestamp: AtomicI64,
     max_timestamp: AtomicI64,
+    /// Lazily-built tantivy index over the rows currently in this bucket.
+    /// Materializes on first `text_match` query, dropped on drain/eviction
+    /// or when row_count grows past `indexed_rows`. None when the table has
+    /// no tantivy-indexed fields (no useful index to build).
+    text_index: parking_lot::RwLock<Option<crate::tantivy_index::mem_index::BucketTextIndex>>,
 }
 
 #[derive(Debug, Clone)]
@@ -433,6 +438,62 @@ impl MemBuffer {
         }
         self.estimated_bytes.fetch_add(total_size, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Search every bucket of `(project_id, table_name)` for rows matching
+    /// the given `text_match` predicates. Builds per-bucket tantivy indexes
+    /// JIT (cached until row_count changes; dropped on drain/evict).
+    ///
+    /// Semantics mirror `TantivySearchService::search`:
+    /// - `Ok(None)`: table has no indexed fields → caller falls back to
+    ///   running the original predicate (which is always present in the
+    ///   plan thanks to the rewriter being additive).
+    /// - `Ok(Some(ids))`: union of matching IDs across all buckets,
+    ///   intersected across multiple predicates (AND semantics).
+    pub fn search_text_match(&self, project_id: &str, table_name: &str, preds: &[crate::tantivy_index::udf::TextMatchPred]) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+        if preds.is_empty() {
+            return Ok(None);
+        }
+        let Some(table_schema) = crate::schema_loader::get_schema(table_name) else {
+            return Ok(None);
+        };
+        // Skip if the schema has no tantivy-indexed fields — the per-bucket
+        // build would just return None per-bucket anyway, but checking once
+        // here avoids the per-bucket overhead.
+        if !table_schema.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)) {
+            return Ok(None);
+        }
+        let Some(table) = self.get_table(project_id, table_name) else {
+            return Ok(None);
+        };
+
+        // Per-predicate ID sets, then intersect across predicates (multi-
+        // predicate queries are AND-ed).
+        let mut acc: Option<std::collections::HashSet<String>> = None;
+        let mut any_usable = false;
+        for pred in preds {
+            let mut ids_for_pred: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for bucket_entry in table.buckets.iter() {
+                let bucket = bucket_entry.value();
+                match bucket.search_text_match(table_schema, pred)? {
+                    Some(hits) => {
+                        any_usable = true;
+                        for h in hits {
+                            ids_for_pred.insert(h.id);
+                        }
+                    }
+                    None => {
+                        // Bucket couldn't index — bail to scan for safety.
+                        return Ok(None);
+                    }
+                }
+            }
+            acc = Some(match acc.take() {
+                None => ids_for_pred,
+                Some(prev) => prev.intersection(&ids_for_pred).cloned().collect(),
+            });
+        }
+        if any_usable { Ok(acc) } else { Ok(None) }
     }
 
     #[instrument(skip(self, filters), fields(project_id, table_name))]
@@ -954,6 +1015,9 @@ impl TableBuffer {
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
         bucket.memory_bytes.fetch_add(batch_size, Ordering::Relaxed);
         bucket.update_timestamps(timestamp_micros);
+        // Cached text index (if any) covers the pre-insert row set; drop it
+        // so the next text_match query rebuilds with the new data.
+        bucket.invalidate_text_index();
 
         debug!(
             "TableBuffer insert: project={}, table={}, bucket={}, rows={}, bytes={}",
@@ -971,12 +1035,50 @@ impl TimeBucket {
             memory_bytes: AtomicUsize::new(0),
             min_timestamp: AtomicI64::new(i64::MAX),
             max_timestamp: AtomicI64::new(i64::MIN),
+            text_index: parking_lot::RwLock::new(None),
         }
     }
 
     fn update_timestamps(&self, timestamp: i64) {
         self.min_timestamp.fetch_min(timestamp, Ordering::Relaxed);
         self.max_timestamp.fetch_max(timestamp, Ordering::Relaxed);
+    }
+
+    /// Drop the cached text index. Called from `drain_bucket` and on any
+    /// insert that grew the bucket — next text-match query rebuilds.
+    fn invalidate_text_index(&self) {
+        *self.text_index.write() = None;
+    }
+
+    /// Search the bucket's text index for one predicate, building it on
+    /// demand. Returns hit IDs from rows currently in the bucket.
+    ///
+    /// Concurrency: the read lock is released before searching so multiple
+    /// concurrent queries can share the cached index. If the cache is stale
+    /// (row_count > indexed_rows) we drop and rebuild — at-most one writer
+    /// gets the rebuild via the upgrade attempt.
+    fn search_text_match(&self, table_schema: &crate::schema_loader::TableSchema, pred: &crate::tantivy_index::udf::TextMatchPred) -> anyhow::Result<Option<Vec<crate::tantivy_index::reader::Hit>>> {
+        let current_rows = self.row_count.load(Ordering::Relaxed);
+        if current_rows == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        // Cached & up-to-date path
+        {
+            let r = self.text_index.read();
+            if let Some(idx) = r.as_ref() {
+                if idx.indexed_rows == current_rows {
+                    return idx.search(pred).map(Some);
+                }
+            }
+        }
+        // Build (or rebuild) — snapshot the batches under the bucket lock
+        // so we get a consistent view.
+        let snapshot: Vec<arrow::record_batch::RecordBatch> = self.batches.lock().iter().cloned().collect();
+        let built = crate::tantivy_index::mem_index::BucketTextIndex::build(table_schema, &snapshot, current_rows)?;
+        let Some(built) = built else { return Ok(None) };
+        let hits = built.search(pred)?;
+        *self.text_index.write() = Some(built);
+        Ok(Some(hits))
     }
 }
 
@@ -1010,6 +1112,59 @@ mod tests {
         let results = buffer.query("project1", "table1", &[]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].num_rows(), 1);
+    }
+
+    #[test]
+    fn search_text_match_returns_matching_ids_from_membuffer() {
+        // Build a real otel_logs_and_spans batch and verify the per-bucket
+        // tantivy index returns matching IDs before flush. This exercises:
+        // (1) lazy build on first query, (2) ngram3 tokenizer integration,
+        // (3) the bucket-search → MemBuffer.search_text_match plumbing.
+        use crate::test_utils::test_helpers::{json_to_batch, test_span};
+        let buffer = MemBuffer::new();
+        let r1 = test_span("row-1", "auth-svc", "p1");
+        let r2 = test_span("row-2", "billing-svc", "p1");
+        let batch = json_to_batch(vec![r1, r2]).expect("json_to_batch");
+        let ts = chrono::Utc::now().timestamp_micros();
+        buffer.insert("p1", "otel_logs_and_spans", batch, ts).unwrap();
+
+        let preds = vec![crate::tantivy_index::udf::TextMatchPred { column: "name".into(), query: "auth".into() }];
+        let got = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).expect("search");
+        let ids = got.expect("indexed table produces Some");
+        assert!(ids.contains("row-1"), "expected row-1 (auth-svc) in hit set: {:?}", ids);
+        assert!(!ids.contains("row-2"), "expected row-2 (billing-svc) NOT in hit set: {:?}", ids);
+    }
+
+    #[test]
+    fn search_text_match_returns_none_for_unindexed_table() {
+        // table1 isn't in the YAML schema registry → no indexed fields →
+        // search_text_match returns None so the caller falls back.
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        buffer.insert("p1", "table1", create_test_batch(ts), ts).unwrap();
+
+        let preds = vec![crate::tantivy_index::udf::TextMatchPred { column: "name".into(), query: "test".into() }];
+        let got = buffer.search_text_match("p1", "table1", &preds).expect("search");
+        assert!(got.is_none(), "unindexed table should return None, got {:?}", got);
+    }
+
+    #[test]
+    fn search_text_match_cache_invalidates_on_insert() {
+        // Build cache via first query, insert new rows, second query must
+        // see them (i.e. cache was invalidated and rebuilt).
+        use crate::test_utils::test_helpers::{json_to_batch, test_span};
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let batch1 = json_to_batch(vec![test_span("a", "alpha-svc", "p1")]).unwrap();
+        buffer.insert("p1", "otel_logs_and_spans", batch1, ts).unwrap();
+        let preds = vec![crate::tantivy_index::udf::TextMatchPred { column: "name".into(), query: "beta".into() }];
+        let initial = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).unwrap().unwrap();
+        assert!(initial.is_empty(), "no 'beta' row inserted yet");
+
+        let batch2 = json_to_batch(vec![test_span("b", "beta-svc", "p1")]).unwrap();
+        buffer.insert("p1", "otel_logs_and_spans", batch2, ts + 1).unwrap();
+        let post = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).unwrap().unwrap();
+        assert!(post.contains("b"), "expected 'b' after insert+rebuild, got {:?}", post);
     }
 
     #[test]
