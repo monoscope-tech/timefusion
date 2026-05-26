@@ -37,6 +37,27 @@ impl Default for AuthConfig {
     }
 }
 
+impl AuthConfig {
+    /// Construct from `CoreConfig`, requiring an explicit password unless
+    /// `TIMEFUSION_ALLOW_INSECURE_AUTH=true` is set. We hard-fail the
+    /// startup path rather than silently accept an empty password — the
+    /// PG wire protocol's cleartext handler treats `None` as "accept any",
+    /// which is an open ingest endpoint when bound to 0.0.0.0.
+    pub fn from_core(core: &crate::config::CoreConfig) -> anyhow::Result<Self> {
+        let allow_insecure = std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        match (&core.pgwire_password, allow_insecure) {
+            (Some(p), _) if !p.is_empty() => Ok(Self { username: core.pgwire_user.clone(), password: Some(p.clone()) }),
+            (_, true) => {
+                tracing::warn!(
+                    "PGWIRE_PASSWORD unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — pgwire endpoint accepts any password. Acceptable for local dev ONLY; never in production."
+                );
+                Ok(Self { username: core.pgwire_user.clone(), password: None })
+            }
+            _ => anyhow::bail!("PGWIRE_PASSWORD is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open auth for local dev)"),
+        }
+    }
+}
+
 /// AuthSource that validates against configured credentials
 #[derive(Debug, Clone)]
 pub struct ConfigAuthSource {

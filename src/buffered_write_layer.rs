@@ -39,6 +39,24 @@ const CAS_BACKOFF_MAX_EXPONENT: u32 = 10;
 /// so ops can post-mortem without blocking recovery. Best-effort: write
 /// failures are logged but never propagated — quarantine is observability,
 /// not durability.
+/// Write raw bytes to a path with owner-only (0600) permissions on Unix.
+/// On Windows we fall back to plain write — ACL hardening there is out of
+/// scope for this helper.
+fn write_owner_only(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        f.write_all(contents)?;
+        f.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, contents)
+    }
+}
+
 fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &str, reason: &str) {
     if let Err(e) = std::fs::create_dir_all(quarantine_dir) {
         error!("Failed to create WAL quarantine dir {:?}: {}", quarantine_dir, e);
@@ -48,7 +66,9 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
     let topic = format!("{}__{}", entry.project_id, entry.table_name).replace(['/', '\\', ':', '\0'], "_");
     let filename = format!("{}_{}_{}.bin", entry.timestamp_micros, kind, topic);
     let path = quarantine_dir.join(&filename);
-    if let Err(e) = std::fs::write(&path, &entry.data) {
+    // Quarantine files contain raw user data that failed to deserialize —
+    // write with mode 0600 so they're not world-readable on shared hosts.
+    if let Err(e) = write_owner_only(&path, &entry.data) {
         error!("Failed to write quarantine file {:?}: {}", path, e);
         return;
     }
@@ -64,7 +84,7 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
         reason,
         entry.data.len()
     );
-    if let Err(e) = std::fs::write(&meta_path, meta) {
+    if let Err(e) = write_owner_only(&meta_path, meta.as_bytes()) {
         error!("Failed to write quarantine meta {:?}: {}", meta_path, e);
     }
     error!("Quarantined WAL entry to {:?} (kind={}, bytes={})", path, kind, entry.data.len());
@@ -598,8 +618,11 @@ impl BufferedWriteLayer {
             Vec::new()
         };
         // Sidecar tantivy index — best-effort, never fails the flush.
+        // We still count the failure so ops can alert on accumulating index
+        // drift (silent UDF-fallback degradation is otherwise invisible).
         if let Some(ref idx_cb) = self.tantivy_index_callback {
             if let Err(e) = idx_cb(bucket.project_id.clone(), bucket.table_name.clone(), bucket.batches.clone(), added_files).await {
+                crate::metrics::record_tantivy_build_failure();
                 warn!("Tantivy index build failed (non-fatal): project={}, table={}, bucket_id={}: {}", bucket.project_id, bucket.table_name, bucket.bucket_id, e);
             }
         }
@@ -807,10 +830,13 @@ impl BufferedWriteLayer {
     #[instrument(skip(self, predicate), fields(project_id, table_name))]
     pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>) -> datafusion::error::Result<u64> {
         let predicate_sql = predicate.map(|p| format!("{}", p));
-        // Log to WAL first for durability
-        if let Err(e) = self.wal.append_delete(project_id, table_name, predicate_sql.as_deref()) {
-            warn!("Failed to log DELETE to WAL: {}", e);
-        }
+        // Log to WAL first for durability. Failure here means the delete is
+        // not recoverable after a crash — propagate so the client knows the
+        // operation didn't commit, rather than apply in-memory and lose it
+        // on the next restart's WAL replay.
+        self.wal
+            .append_delete(project_id, table_name, predicate_sql.as_deref())
+            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_delete failed: {e}").into()))?;
         self.mem_buffer.delete(project_id, table_name, predicate)
     }
 
@@ -823,10 +849,11 @@ impl BufferedWriteLayer {
     ) -> datafusion::error::Result<u64> {
         let predicate_sql = predicate.map(|p| format!("{}", p));
         let assignments_sql: Vec<(String, String)> = assignments.iter().map(|(col, expr)| (col.clone(), format!("{}", expr))).collect();
-        // Log to WAL first for durability
-        if let Err(e) = self.wal.append_update(project_id, table_name, predicate_sql.as_deref(), &assignments_sql) {
-            warn!("Failed to log UPDATE to WAL: {}", e);
-        }
+        // See `delete()` — WAL failure must propagate so the client doesn't
+        // see a "successful" update that disappears on the next restart.
+        self.wal
+            .append_update(project_id, table_name, predicate_sql.as_deref(), &assignments_sql)
+            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_update failed: {e}").into()))?;
         self.mem_buffer.update(project_id, table_name, predicate, assignments)
     }
 }

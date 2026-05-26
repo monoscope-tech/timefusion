@@ -44,6 +44,7 @@ pub struct MetricsRegistry {
     pub tantivy_prefilter_used: Counter<u64>,
     pub tantivy_prefilter_skipped: Counter<u64>,
     pub tantivy_prefilter_errors: Counter<u64>,
+    pub tantivy_build_failures: Counter<u64>,
 }
 
 impl MetricsRegistry {
@@ -74,6 +75,10 @@ impl MetricsRegistry {
             tantivy_prefilter_errors: meter
                 .u64_counter("timefusion.tantivy.prefilter_errors")
                 .with_description("Tantivy lookups that errored (S3 down, parse failure, etc.)")
+                .build(),
+            tantivy_build_failures: meter
+                .u64_counter("timefusion.tantivy.build_failures")
+                .with_description("Post-flush tantivy index builds that errored — accumulating drift means queries silently fall back to UDF scan")
                 .build(),
         }
     }
@@ -286,5 +291,11 @@ pub fn record_tantivy_prefilter_skipped() {
 pub fn record_tantivy_prefilter_error() {
     if let Some(m) = METRICS.get() {
         m.tantivy_prefilter_errors.add(1, &[]);
+    }
+}
+
+pub fn record_tantivy_build_failure() {
+    if let Some(m) = METRICS.get() {
+        m.tantivy_build_failures.add(1, &[]);
     }
 }
