@@ -233,18 +233,29 @@ pub fn init_metrics(config: &TelemetryConfig, buffered_layer: Weak<BufferedWrite
     Ok(())
 }
 
+/// Build the standard (project_id, table_name) attribute pair.
+/// Cardinality math at typical multi-tenant scale: ~100 projects × ~20
+/// tables = 2k series per counter, which OTel handles cleanly. If a
+/// deployment has thousands of projects, switch to label-only on
+/// table_name (or drop project_id) — but that's an upstream knob, not
+/// something to gate at this layer.
+fn ingest_attrs(project_id: &str, table_name: &str) -> [KeyValue; 2] {
+    [KeyValue::new("project_id", project_id.to_string()), KeyValue::new("table_name", table_name.to_string())]
+}
+
 /// Convenience helpers for hot-path counter increments. No-op if metrics
 /// weren't initialized (tests, embedded use).
-pub fn record_insert(rows: u64) {
+pub fn record_insert(project_id: &str, table_name: &str, rows: u64) {
     if let Some(m) = METRICS.get() {
-        m.ingest_inserts.add(1, &[]);
-        m.ingest_rows.add(rows, &[]);
+        let attrs = ingest_attrs(project_id, table_name);
+        m.ingest_inserts.add(1, &attrs);
+        m.ingest_rows.add(rows, &attrs);
     }
 }
 
-pub fn record_ingest_error() {
+pub fn record_ingest_error(project_id: &str, table_name: &str) {
     if let Some(m) = METRICS.get() {
-        m.ingest_errors.add(1, &[]);
+        m.ingest_errors.add(1, &ingest_attrs(project_id, table_name));
     }
 }
 

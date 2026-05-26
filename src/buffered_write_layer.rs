@@ -177,7 +177,12 @@ impl BufferedWriteLayer {
         let wal = Arc::new(WalManager::with_fsync_mode(cfg.core.wal_dir(), cfg.buffer.wal_fsync_mode())?);
         // Apply configurable bucket duration before MemBuffer reads it.
         crate::mem_buffer::set_bucket_duration_micros((cfg.buffer.bucket_duration_secs() as i64) * 1_000_000);
-        let mem_buffer = Arc::new(MemBuffer::new());
+        // Text-index cache budget: 25% of the MemBuffer memory budget.
+        // Rationale: indexed text is roughly 1.5–2x raw text in postings,
+        // and indexed columns are a fraction of total row bytes. 25% is a
+        // soft ceiling — LRU drops oldest entries before this is exceeded.
+        let text_index_max_bytes = (cfg.buffer.max_memory_mb() / 4).max(16) * 1024 * 1024;
+        let mem_buffer = Arc::new(MemBuffer::new_with_max_index_bytes(text_index_max_bytes));
 
         Ok(Self {
             config: cfg,
@@ -348,8 +353,8 @@ impl BufferedWriteLayer {
         self.release_reservation(reserved_size);
 
         match &result {
-            Ok(()) => crate::metrics::record_insert(row_count as u64),
-            Err(_) => crate::metrics::record_ingest_error(),
+            Ok(()) => crate::metrics::record_insert(project_id, table_name, row_count as u64),
+            Err(_) => crate::metrics::record_ingest_error(project_id, table_name),
         }
         result?;
 
