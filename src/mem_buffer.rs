@@ -165,6 +165,10 @@ pub struct MemBufferStats {
     pub total_rows: usize,
     pub total_batches: usize,
     pub estimated_memory_bytes: usize,
+    /// Min `min_timestamp` across all buckets in microseconds, or None if empty.
+    /// Used to derive `mem_buffer_oldest_bucket_age_seconds` for the metrics
+    /// exporter — a key staleness signal (alert if > 2× flush interval).
+    pub oldest_bucket_micros: Option<i64>,
 }
 
 /// Per-batch fixed overhead: RecordBatch struct, schema Arc bump, ArrayData
@@ -878,6 +882,7 @@ impl MemBuffer {
     pub fn get_stats(&self) -> MemBufferStats {
         let (mut total_buckets, mut total_rows, mut total_batches) = (0, 0, 0);
         let mut project_ids = std::collections::HashSet::new();
+        let mut oldest: Option<i64> = None;
 
         for table_entry in self.tables.iter() {
             let (project_id, _) = table_entry.key();
@@ -888,6 +893,10 @@ impl MemBuffer {
             for bucket in table.buckets.iter() {
                 total_rows += bucket.row_count.load(Ordering::Relaxed);
                 total_batches += bucket.batches.lock().len();
+                let ts = bucket.min_timestamp.load(Ordering::Relaxed);
+                if ts != i64::MAX {
+                    oldest = Some(oldest.map_or(ts, |o| o.min(ts)));
+                }
             }
         }
         MemBufferStats {
@@ -896,6 +905,7 @@ impl MemBuffer {
             total_rows,
             total_batches,
             estimated_memory_bytes: self.estimated_bytes.load(Ordering::Relaxed),
+            oldest_bucket_micros: oldest,
         }
     }
 

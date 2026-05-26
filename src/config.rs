@@ -28,7 +28,8 @@ pub fn init_config() -> Result<&'static AppConfig, envy::Error> {
     if let Some(cfg) = CONFIG.get() {
         return Ok(cfg);
     }
-    let config = load_config_from_env()?;
+    let mut config = load_config_from_env()?;
+    crate::autotune::apply(&mut config);
     let _ = CONFIG.set(config);
     Ok(CONFIG.get().unwrap())
 }

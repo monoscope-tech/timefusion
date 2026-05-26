@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+pub mod autotune;
 pub mod batch_queue;
 pub mod buffered_write_layer;
 pub mod clock;
@@ -9,6 +10,7 @@ pub mod dml;
 pub mod functions;
 pub mod grpc_handlers;
 pub mod mem_buffer;
+pub mod metrics;
 pub mod object_store_cache;
 pub mod optimizers;
 pub mod pgwire_handlers;

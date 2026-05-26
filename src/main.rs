@@ -87,6 +87,13 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
     let buffered_layer = Arc::new(layer);
 
+    // Initialize OpenTelemetry metrics — observable gauges read snapshot_stats()
+    // each export cycle (30s), keeping the hot path untouched. Weak ref so
+    // metrics don't extend the layer's lifetime.
+    if let Err(e) = timefusion::metrics::init_metrics(&cfg.telemetry, Arc::downgrade(&buffered_layer)) {
+        error!("Failed to initialize OTel metrics: {} — continuing without metrics export", e);
+    }
+
     // Recover from WAL on startup
     info!("Starting WAL recovery...");
     let recovery_stats = buffered_layer.recover_from_wal().await?;

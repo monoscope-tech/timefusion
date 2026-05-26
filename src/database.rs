@@ -2391,6 +2391,12 @@ impl ProjectRoutingTable {
     fn apply_time_series_optimizations(&self, filters: &[Expr]) -> DFResult<Vec<Expr>> {
         use crate::optimizers::time_range_partition_pruner;
 
+        // Resolve the schema-declared time column for this table; falls back to
+        // "timestamp" when the schema isn't registered (custom/dynamic tables).
+        let time_column = crate::schema_loader::get_schema(&self.table_name)
+            .map(|s| s.time_column_name().to_string())
+            .unwrap_or_else(|| "timestamp".to_string());
+
         let mut optimized_filters = Vec::new();
         let mut has_date_filter = false;
 
@@ -2406,9 +2412,9 @@ impl ProjectRoutingTable {
         if !has_date_filter {
             for filter in filters {
                 // Check if this is a timestamp filter that needs a date filter added
-                if let Some(date_filter) = time_range_partition_pruner::timestamp_to_date_filter(filter) {
+                if let Some(date_filter) = time_range_partition_pruner::timestamp_to_date_filter(filter, &time_column) {
                     optimized_filters.push(date_filter);
-                    debug!("Added date partition filter for timestamp query optimization");
+                    debug!("Added date partition filter for {} on column {}", self.table_name, time_column);
                 }
             }
         }
@@ -2959,6 +2965,7 @@ mod writer_properties_tests {
                 .collect(),
             z_order_columns: vec![],
             fields,
+            time_column: None,
         }
     }
 

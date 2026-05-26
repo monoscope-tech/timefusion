@@ -15,6 +15,16 @@ pub struct TableSchema {
     pub sorting_columns: Vec<SortingColumnDef>,
     pub z_order_columns: Vec<String>,
     pub fields: Vec<FieldDef>,
+    /// Column the optimizer should rewrite into a `date` partition filter.
+    /// Defaults to `"timestamp"` for back-compat with existing schemas.
+    #[serde(default)]
+    pub time_column: Option<String>,
+}
+
+impl TableSchema {
+    pub fn time_column_name(&self) -> &str {
+        self.time_column.as_deref().unwrap_or("timestamp")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
