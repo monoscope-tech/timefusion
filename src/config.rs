@@ -224,21 +224,29 @@ pub struct TantivyConfig {
 
 impl TantivyConfig {
     /// Tables to index: schemas with `tantivy.indexed: true` on any field.
-    /// Walked from the static registry on each call; cheap (compiled-in YAML).
+    /// Computed once from the static registry on first access (the registry
+    /// is compiled-in YAML, so there's nothing to invalidate).
+    fn indexed_set() -> &'static std::collections::HashSet<String> {
+        static SET: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+        SET.get_or_init(|| {
+            crate::schema_loader::registry()
+                .list_tables()
+                .into_iter()
+                .filter(|name| {
+                    crate::schema_loader::registry()
+                        .get(name)
+                        .is_some_and(|s| s.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)))
+                })
+                .collect()
+        })
+    }
     pub fn indexed_tables(&self) -> Vec<String> {
-        use std::collections::BTreeSet;
-        let mut set: BTreeSet<String> = BTreeSet::new();
-        for name in crate::schema_loader::registry().list_tables() {
-            if let Some(schema) = crate::schema_loader::registry().get(&name) {
-                if schema.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)) {
-                    set.insert(name);
-                }
-            }
-        }
-        set.into_iter().collect()
+        let mut v: Vec<String> = Self::indexed_set().iter().cloned().collect();
+        v.sort();
+        v
     }
     pub fn is_table_indexed(&self, table: &str) -> bool {
-        self.indexed_tables().iter().any(|t| t == table)
+        Self::indexed_set().contains(table)
     }
     pub fn compression_level(&self) -> i32 {
         self.timefusion_tantivy_compression_level

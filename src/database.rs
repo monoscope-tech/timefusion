@@ -184,11 +184,13 @@ fn normalize_timestamp_tz(batch: RecordBatch) -> RecordBatch {
             && is_utc_offset(tz.as_ref())
         {
             let col = &batch.columns()[i];
+            // Downcasts are guarded by the `DataType::Timestamp(unit, ..)` match above.
+            let expect_msg = "timestamp downcast guarded by DataType match";
             let retagged: Arc<dyn arrow::array::Array> = match unit {
-                TimeUnit::Microsecond => Arc::new(col.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().clone().with_timezone("UTC")),
-                TimeUnit::Millisecond => Arc::new(col.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap().clone().with_timezone("UTC")),
-                TimeUnit::Nanosecond => Arc::new(col.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap().clone().with_timezone("UTC")),
-                TimeUnit::Second => Arc::new(col.as_any().downcast_ref::<TimestampSecondArray>().unwrap().clone().with_timezone("UTC")),
+                TimeUnit::Microsecond => Arc::new(col.as_any().downcast_ref::<TimestampMicrosecondArray>().expect(expect_msg).clone().with_timezone("UTC")),
+                TimeUnit::Millisecond => Arc::new(col.as_any().downcast_ref::<TimestampMillisecondArray>().expect(expect_msg).clone().with_timezone("UTC")),
+                TimeUnit::Nanosecond => Arc::new(col.as_any().downcast_ref::<TimestampNanosecondArray>().expect(expect_msg).clone().with_timezone("UTC")),
+                TimeUnit::Second => Arc::new(col.as_any().downcast_ref::<TimestampSecondArray>().expect(expect_msg).clone().with_timezone("UTC")),
             };
             new_cols[i] = retagged;
             new_fields[i] = Arc::new(Field::new(field.name(), DataType::Timestamp(*unit, Some("UTC".into())), field.is_nullable()).with_metadata(field.metadata().clone()));
@@ -243,15 +245,17 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
             continue;
         }
         let col = &columns[idx];
+        // Downcasts are guarded by the `DataType::*` match arm above.
+        let name = target_field.name();
         let converted: Option<ArrayRef> = match col.data_type() {
             DataType::Utf8View => Some(Arc::new(utf8_to_variant(Box::new(
-                col.as_any().downcast_ref::<StringViewArray>().unwrap().iter(),
+                col.as_any().downcast_ref::<StringViewArray>().unwrap_or_else(|| panic!("Utf8View downcast failed for column {name}")).iter(),
             ))?) as ArrayRef),
             DataType::Utf8 => Some(Arc::new(utf8_to_variant(Box::new(
-                col.as_any().downcast_ref::<StringArray>().unwrap().iter(),
+                col.as_any().downcast_ref::<StringArray>().unwrap_or_else(|| panic!("Utf8 downcast failed for column {name}")).iter(),
             ))?) as ArrayRef),
             DataType::LargeUtf8 => Some(Arc::new(utf8_to_variant(Box::new(
-                col.as_any().downcast_ref::<LargeStringArray>().unwrap().iter(),
+                col.as_any().downcast_ref::<LargeStringArray>().unwrap_or_else(|| panic!("LargeUtf8 downcast failed for column {name}")).iter(),
             ))?) as ArrayRef),
             _ => None, // already Variant struct
         };
