@@ -174,7 +174,11 @@ impl std::fmt::Debug for BufferedWriteLayer {
 impl BufferedWriteLayer {
     /// Create a new BufferedWriteLayer with explicit config.
     pub fn with_config(cfg: Arc<AppConfig>) -> anyhow::Result<Self> {
-        let wal = Arc::new(WalManager::with_fsync_mode(cfg.core.wal_dir(), cfg.buffer.wal_fsync_mode())?);
+        let wal = Arc::new(WalManager::with_fsync_mode_and_shards(
+            cfg.core.wal_dir(),
+            cfg.buffer.wal_fsync_mode(),
+            cfg.buffer.wal_shards_per_topic(),
+        )?);
         // Apply configurable bucket duration before MemBuffer reads it.
         crate::mem_buffer::set_bucket_duration_micros((cfg.buffer.bucket_duration_secs() as i64) * 1_000_000);
         // Text-index cache budget: 25% of the MemBuffer memory budget.
