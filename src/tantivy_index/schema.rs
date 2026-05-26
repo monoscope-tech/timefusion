@@ -14,6 +14,11 @@ use crate::schema_loader::{FieldDef, TableSchema, TantivyFieldConfig};
 use std::collections::HashMap;
 use tantivy::schema::{Field, FieldType, IndexRecordOption, NumericOptions, Schema, SchemaBuilder, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED, TEXT};
 
+// User fields are indexed-only by design: tantivy is a search index, not a
+// document store — the authoritative row payload lives in Delta/parquet.
+// Only `_timestamp` and `_id` are stored, because the reader needs them to
+// emit `(timestamp, id)` hits that the SQL layer joins back against Delta.
+
 pub const TS_FIELD: &str = "_timestamp";
 pub const ID_FIELD: &str = "_id";
 
@@ -36,7 +41,7 @@ pub struct UserField {
 pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
     let mut b = SchemaBuilder::new();
     let timestamp = b.add_i64_field(TS_FIELD, NumericOptions::default() | STORED | FAST | INDEXED);
-    let id = b.add_text_field(ID_FIELD, raw_text_options(true));
+    let id = b.add_text_field(ID_FIELD, raw_id_options());
 
     let mut user_fields = HashMap::new();
     for fd in &table.fields {
@@ -54,31 +59,23 @@ pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
     BuiltSchema { schema: b.build(), timestamp, id, user_fields }
 }
 
-fn raw_text_options(stored: bool) -> TextOptions {
-    let indexing = TextFieldIndexing::default()
-        .set_tokenizer("raw")
-        .set_index_option(IndexRecordOption::Basic);
-    let mut opts = TextOptions::default().set_indexing_options(indexing);
-    if stored {
-        opts = opts | STORED;
-    }
-    opts
+fn raw_id_options() -> TextOptions {
+    TextOptions::default().set_indexing_options(
+        TextFieldIndexing::default()
+            .set_tokenizer("raw")
+            .set_index_option(IndexRecordOption::Basic),
+    ) | STORED
 }
 
 fn text_options_for(cfg: &TantivyFieldConfig) -> TextOptions {
-    let tok = cfg.tokenizer.as_deref().unwrap_or("default");
-    let mut opts = match tok {
+    match cfg.tokenizer.as_deref().unwrap_or("default") {
         "raw" => TextOptions::default().set_indexing_options(
             TextFieldIndexing::default()
                 .set_tokenizer("raw")
                 .set_index_option(IndexRecordOption::Basic),
         ),
         _ => TEXT.into(),
-    };
-    if cfg.stored {
-        opts = opts | STORED;
     }
-    opts
 }
 
 /// Helper for tests and pushdown rule: which user fields are configured?

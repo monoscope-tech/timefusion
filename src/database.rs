@@ -29,7 +29,6 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_functions_json;
 use datafusion::arrow::record_batch::RecordBatch;
 use deltalake::PartitionFilter;
-use deltalake::datafusion::parquet::file::metadata::SortingColumn;
 use deltalake::datafusion::parquet::file::properties::WriterProperties;
 use deltalake::kernel::transaction::CommitProperties;
 use deltalake::operations::create::CreateBuilder;
@@ -266,108 +265,12 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
     RecordBatch::try_new(new_schema, columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-/// Stream-level wrap that converts Variant columns to JSON strings for SELECT output.
-/// Used at the scan() boundary so downstream operators (Aggregate, Filter, etc.) see
-/// Utf8 instead of Struct{Binary,Binary} for Variant cols — needed for GROUP BY/HAVING
-/// over non-variant cols in tables that contain variant cols, since DataFusion's
-/// physical planning and delta-rs's kernel scan path otherwise mis-resolve adjacent
-/// columns whose names share the variant column's prefix (e.g. `resource___service___name`
-/// next to a `resource` variant column).
-#[derive(Debug)]
-struct VariantToJsonExec {
-    input: Arc<dyn ExecutionPlan>,
-    real_schema: SchemaRef,
-    output_schema: SchemaRef,
-    properties: Arc<datafusion::physical_plan::PlanProperties>,
-}
-
-impl VariantToJsonExec {
-    fn new(input: Arc<dyn ExecutionPlan>, real_schema: SchemaRef) -> Self {
-        use datafusion::arrow::datatypes::{DataType, Field};
-        use datafusion::physical_plan::{ExecutionPlanProperties, PlanProperties, execution_plan::Boundedness};
-        let input_schema = input.schema();
-        let output_fields: Vec<Arc<Field>> = input_schema
-            .fields()
-            .iter()
-            .map(|f| {
-                let is_variant = real_schema.column_with_name(f.name()).is_some_and(|(_, rf)| crate::schema_loader::is_variant_type(rf.data_type()));
-                if is_variant {
-                    Arc::new(Field::new(f.name(), DataType::Utf8, f.is_nullable()))
-                } else {
-                    f.clone()
-                }
-            })
-            .collect();
-        let output_schema = Arc::new(arrow_schema::Schema::new(output_fields));
-        let properties = Arc::new(PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(output_schema.clone()),
-            input.output_partitioning().clone(),
-            input.pipeline_behavior(),
-            Boundedness::Bounded,
-        ));
-        Self { input, real_schema, output_schema, properties }
-    }
-
-    fn convert_batch(batch: RecordBatch, real_schema: &SchemaRef) -> DFResult<RecordBatch> {
-        use datafusion::arrow::array::{ArrayRef, StringBuilder, StructArray};
-        use datafusion::arrow::datatypes::{DataType, Field};
-        use datafusion::arrow::record_batch::RecordBatchOptions;
-        use parquet_variant_compute::VariantArray;
-        use parquet_variant_json::VariantToJson;
-        let batch_schema = batch.schema();
-        let row_count = batch.num_rows();
-        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
-        let mut new_fields: Vec<Arc<Field>> = batch_schema.fields().iter().cloned().collect();
-        for (idx, batch_field) in batch_schema.fields().iter().enumerate() {
-            let is_variant = real_schema.column_with_name(batch_field.name()).is_some_and(|(_, f)| crate::schema_loader::is_variant_type(f.data_type()));
-            if !is_variant {
-                continue;
-            }
-            if let Some(struct_arr) = columns[idx].as_any().downcast_ref::<StructArray>() {
-                let variant_arr = VariantArray::try_new(struct_arr).map_err(|e| DataFusionError::Execution(format!("VariantArray::try_new failed: {e}")))?;
-                let mut b = StringBuilder::new();
-                for i in 0..variant_arr.len() {
-                    if variant_arr.is_null(i) {
-                        b.append_null();
-                    } else {
-                        b.append_value(&variant_arr.value(i).to_json_string().map_err(|e| DataFusionError::Execution(format!("variant→json: {e}")))?);
-                    }
-                }
-                columns[idx] = Arc::new(b.finish());
-                new_fields[idx] = Arc::new(Field::new(batch_field.name(), DataType::Utf8, batch_field.is_nullable()));
-            }
-        }
-        let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
-        RecordBatch::try_new_with_options(new_schema, columns, &RecordBatchOptions::new().with_row_count(Some(row_count)))
-            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
-    }
-}
-
-impl datafusion::physical_plan::DisplayAs for VariantToJsonExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "VariantToJsonExec")
-    }
-}
-
-impl ExecutionPlan for VariantToJsonExec {
-    fn name(&self) -> &str { "VariantToJsonExec" }
-    fn as_any(&self) -> &dyn Any { self }
-    fn properties(&self) -> &Arc<datafusion::physical_plan::PlanProperties> { &self.properties }
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> { vec![&self.input] }
-    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(VariantToJsonExec::new(children[0].clone(), self.real_schema.clone())))
-    }
-    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
-        let input_stream = self.input.execute(partition, context)?;
-        let real_schema = self.real_schema.clone();
-        let output_schema = self.output_schema.clone();
-        let s = input_stream.map(move |b| b.and_then(|batch| Self::convert_batch(batch, &real_schema)));
-        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(output_schema, s)))
-    }
-}
-
-// Compression level for parquet files - kept for WriterProperties fallback
+// Fallback ZSTD level when a configured/tier level is rejected as out-of-range.
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+// Parquet footer key-value metadata key recording the ZSTD level used to
+// write the file. Read by `recompress_partition` to skip files already
+// at-or-above the target tier without rewriting.
+const COMPRESSION_TIER_KEY: &str = "timefusion.compression_tier";
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct StorageConfig {
@@ -443,41 +346,26 @@ impl Database {
         storage_options
     }
 
-    /// Creates standard writer properties used across different operations
-    fn create_writer_properties(&self, sorting_columns: Vec<SortingColumn>, fields: &[crate::schema_loader::FieldDef]) -> WriterProperties {
-        use deltalake::datafusion::parquet::basic::{Compression, Encoding, ZstdLevel};
-        use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
-        use deltalake::datafusion::parquet::schema::types::ColumnPath;
-
-        let page_row_count_limit = self.config.parquet.timefusion_page_row_count_limit;
-        let compression_level = self.config.parquet.timefusion_zstd_compression_level;
-        let max_row_group_size = self.config.parquet.timefusion_max_row_group_size;
-
-        let mut builder = WriterProperties::builder()
-            .set_compression(Compression::ZSTD(
-                ZstdLevel::try_new(compression_level).unwrap_or_else(|_| ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()),
-            ))
-            .set_max_row_group_row_count(Some(max_row_group_size))
-            .set_dictionary_enabled(true)
-            .set_dictionary_page_size_limit(8388608)
-            .set_statistics_enabled(EnabledStatistics::Page)
-            .set_bloom_filter_enabled(!self.config.parquet.timefusion_bloom_filter_disabled)
-            .set_bloom_filter_fpp(0.01)
-            .set_bloom_filter_ndv(100_000)
-            .set_data_page_row_count_limit(page_row_count_limit)
-            .set_sorting_columns(if sorting_columns.is_empty() { None } else { Some(sorting_columns) });
-
-        for field in fields {
-            let dt = field.data_type.as_str();
-            let col = ColumnPath::from(field.name.as_str());
-            if dt.starts_with("Timestamp") || dt == "Date32" {
-                builder = builder.set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED).set_column_dictionary_enabled(col, false);
-            } else if matches!(dt, "Int32" | "Int64" | "UInt32" | "UInt64") {
-                builder = builder.set_column_encoding(col, Encoding::DELTA_BINARY_PACKED);
-            }
-        }
-
-        builder.build()
+    /// Creates writer properties for a Delta write at a given compression tier.
+    ///
+    /// Tiered strategy: hot writes use level 3 (fast ingest);
+    /// `recompress_partition` rewrites older partitions at 9/15/19 to
+    /// maximize storage savings on
+    /// cold data. The chosen level is embedded in Parquet footer key-value
+    /// metadata (`timefusion.compression_tier`) so re-sweeps can skip files
+    /// already at the target tier.
+    ///
+    /// Encoding strategy per column:
+    /// - Timestamps/Date32, ints: `DELTA_BINARY_PACKED` (dict off for timestamps).
+    /// - Sorted-key Utf8 columns: `DELTA_BYTE_ARRAY` (delta-encoded, dict off) —
+    ///   excellent ratios on sorted ids/service names; harmless when only mostly
+    ///   sorted (still better than raw PLAIN).
+    /// - Other Utf8: default (dict on, auto-falls back to PLAIN at 8MB).
+    /// - Per-field `dictionary: false` opt-out for high-entropy free-text.
+    /// - Per-field `bloom_filter: true` opt-in for point-lookup columns
+    ///   (ids/trace_ids/span_ids); NDV scaled to row-group size.
+    fn create_writer_properties(&self, schema: &crate::schema_loader::TableSchema, zstd_level: i32) -> WriterProperties {
+        build_writer_properties(&self.config.parquet, schema, zstd_level)
     }
 
     /// Updates a DeltaTable and handles errors consistently
@@ -820,6 +708,54 @@ impl Database {
             scheduler.add(optimize_job).await?;
         } else {
             info!("Optimize job scheduling skipped - empty schedule");
+        }
+
+        // Recompress job - daily tier upgrade for cool (7-30d) and cold (30d+).
+        // Skips partitions whose probe file already advertises the target tier
+        // via Parquet footer metadata, so re-runs are cheap on stable data.
+        let recompress_schedule = self.config.maintenance.timefusion_recompress_schedule.clone();
+        let cool_cutoff = self.config.parquet.timefusion_cool_cutoff_days;
+        let cold_cutoff = self.config.parquet.timefusion_cold_cutoff_days;
+        let zstd_cool = self.config.parquet.timefusion_zstd_level_cool;
+        let zstd_cold = self.config.parquet.timefusion_zstd_level_cold;
+
+        if !recompress_schedule.is_empty() {
+            info!(
+                "Recompress job scheduled: {} (warm→cool@{}d zstd={}, cool→cold@{}d zstd={})",
+                recompress_schedule, cool_cutoff, zstd_cool, cold_cutoff, zstd_cold
+            );
+            // Cold sweep upper bound — partitions older than this fall under
+            // vacuum; we don't need to keep extending the window indefinitely.
+            let cold_upper = (self.config.maintenance.timefusion_vacuum_retention_hours / 24).max(cold_cutoff + 60);
+
+            let recompress_job = Job::new_async(recompress_schedule.as_str(), {
+                let db = db.clone();
+                move |_, _| {
+                    let db = db.clone();
+                    Box::pin(async move {
+                        info!("Running scheduled tier recompression");
+                        // Flatten unified + custom tables into one (name, table) list.
+                        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
+                            db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+                        targets.extend(
+                            db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())),
+                        );
+                        // Cool tier first, then cold — order matters only at
+                        // the cutoff boundary where files may need two hops.
+                        for (name, table) in &targets {
+                            if let Err(e) = db.recompress_tier_window(table, name, cool_cutoff, cold_cutoff, zstd_cool).await {
+                                error!("Recompress (cool tier) failed for '{}': {}", name, e);
+                            }
+                            if let Err(e) = db.recompress_tier_window(table, name, cold_cutoff, cold_upper, zstd_cold).await {
+                                error!("Recompress (cold tier) failed for '{}': {}", name, e);
+                            }
+                        }
+                    })
+                }
+            })?;
+            scheduler.add(recompress_job).await?;
+        } else {
+            info!("Recompress job scheduling skipped - empty schedule");
         }
 
         // Vacuum job - configurable schedule (default: daily at 2AM)
@@ -1678,7 +1614,7 @@ impl Database {
         // Get the appropriate schema for this table
         let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
 
-        let writer_properties = self.create_writer_properties(schema.sorting_columns(), &schema.fields);
+        let writer_properties = self.create_writer_properties(&schema, self.config.parquet.timefusion_zstd_compression_level);
 
         // Retry logic for concurrent writes
         let max_retries = 5;
@@ -1798,7 +1734,10 @@ impl Database {
         info!("Optimizing files from {} date partitions", partition_filters.len());
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let writer_properties = self.create_writer_properties(schema.sorting_columns(), &schema.fields);
+        // Full Z-order optimize runs every 30 min over a 48h window — promote
+        // these rewrites to the "warm" tier so day-old data lands smaller on
+        // disk without slowing the hot flush path.
+        let writer_properties = self.create_writer_properties(&schema, self.config.parquet.timefusion_zstd_level_warm);
 
         // Same trade-off as optimize_table_light: best-effort, don't pause
         // flushes (see comment there). Z-order full optimize is daily-ish,
@@ -1883,13 +1822,158 @@ impl Database {
         }
     }
 
+    /// Rewrites a date partition at a higher ZSTD level using Z-order (or
+    /// Compact if no z_order_columns). Skips partitions whose probe file
+    /// already advertises a tier `>= target_level` via Parquet footer KV
+    /// metadata (`timefusion.compression_tier`).
+    ///
+    /// Probes only one file per partition. Safe in steady state: each
+    /// successful recompress rewrites every file in the partition at the
+    /// same level, so all files share a tier. A partial-rewrite failure
+    /// would leave mixed tiers — the next sweep then sees the probe's tier
+    /// and may skip, but the partition will be re-evaluated the day after.
+    /// Acceptable for an idempotent daily job.
+    pub async fn recompress_partition(
+        &self,
+        table_ref: &Arc<RwLock<DeltaTable>>,
+        table_name: &str,
+        date: chrono::NaiveDate,
+        target_level: i32,
+    ) -> Result<()> {
+        use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+        use object_store::{ObjectStoreExt, path::Path as OsPath};
+
+        let date_str = date.to_string();
+        let date_marker = format!("date={}", date_str);
+
+        let (uris, log_store, table_uri) = {
+            let table = table_ref.read().await;
+            let uris: Vec<String> = table.get_file_uris()?.filter(|u| u.contains(&date_marker)).collect();
+            (uris, table.log_store(), table.table_url().to_string())
+        };
+        if uris.is_empty() {
+            debug!("recompress: no files in partition date={} for table={}", date_str, table_name);
+            return Ok(());
+        }
+
+        // Probe one file's footer KV metadata. URIs returned by delta-rs are
+        // absolute (s3://bucket/...); the table's object_store is rooted at
+        // table_uri, so the relative key is the URI with that prefix stripped.
+        // `table_url()` may include a `?endpoint=...` query string (non-AWS
+        // backends like MinIO) which `get_file_uris()` does not — strip it
+        // before matching.
+        let probe_uri = &uris[0];
+        let table_prefix = table_uri.split('?').next().unwrap_or(&table_uri).trim_end_matches('/');
+        let probe_tier = match probe_uri.strip_prefix(table_prefix).and_then(|s| s.strip_prefix('/').or(Some(s))) {
+            Some(rel) => {
+                let object_store = log_store.object_store(None);
+                let path = OsPath::from(rel);
+                // `head()` returns `meta.location` relative to the bucket,
+                // but `ParquetObjectReader` consumes object-store-relative
+                // paths and would double-prefix. Pass our original `path`.
+                match object_store.head(&path).await {
+                    Ok(meta) => {
+                        let mut reader = ParquetObjectReader::new(object_store.clone(), path.clone()).with_file_size(meta.size);
+                        reader.get_metadata(None).await.ok().and_then(|pq| {
+                            pq.file_metadata().key_value_metadata().and_then(|kvs| {
+                                kvs.iter()
+                                    .find(|kv| kv.key == COMPRESSION_TIER_KEY)
+                                    .and_then(|kv| kv.value.as_ref())
+                                    .and_then(|v| v.parse::<i32>().ok())
+                            })
+                        })
+                    }
+                    Err(e) => {
+                        warn!("recompress probe: head failed for {}: {}; rewriting anyway", probe_uri, e);
+                        None
+                    }
+                }
+            }
+            None => {
+                warn!("recompress probe: could not relativize {} against {}; rewriting anyway", probe_uri, table_prefix);
+                None
+            }
+        };
+
+        // If probe failed or tier is unknown, fall through to rewrite — safer
+        // than skipping a partition that may still be at hot tier.
+        if let Some(t) = probe_tier
+            && t >= target_level
+        {
+            debug!("recompress: skip date={} table={} (already at tier {})", date_str, table_name, t);
+            return Ok(());
+        }
+
+        info!("recompress: rewriting date={} table={} at zstd={} ({} files)", date_str, table_name, target_level, uris.len());
+
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let writer_properties = self.create_writer_properties(&schema, target_level);
+        let partition_filters = vec![PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
+        let target_size = self.config.parquet.timefusion_optimize_target_size;
+
+        let table_clone = table_ref.read().await.clone();
+        let optimize_result = table_clone
+            .optimize()
+            .with_filters(&partition_filters)
+            // Z-order rewrites every file in the partition (Compact only
+            // touches small files), which is exactly what we need to lift
+            // the partition's tier.
+            .with_type(if schema.z_order_columns.is_empty() {
+                deltalake::operations::optimize::OptimizeType::Compact
+            } else {
+                deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone())
+            })
+            .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+            .with_writer_properties(writer_properties)
+            .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
+            .with_session_state(Arc::new(build_optimize_session_state()))
+            .await;
+
+        match optimize_result {
+            Ok((new_table, metrics)) => {
+                info!(
+                    "recompress: date={} table={} removed={} added={} considered={}",
+                    date_str, table_name, metrics.num_files_removed, metrics.num_files_added, metrics.total_considered_files
+                );
+                *table_ref.write().await = new_table;
+                Ok(())
+            }
+            Err(e) => {
+                error!("recompress failed for date={} table={}: {}", date_str, table_name, e);
+                Err(anyhow::anyhow!("recompress failed: {}", e))
+            }
+        }
+    }
+
+    /// Sweep partitions in [age_min_days, age_max_days) and recompress any
+    /// whose probe tier is below `target_level`. Iterates day-by-day; each
+    /// day's optimize is its own Delta commit so a mid-sweep failure leaves
+    /// completed days at the new tier.
+    pub async fn recompress_tier_window(
+        &self,
+        table_ref: &Arc<RwLock<DeltaTable>>,
+        table_name: &str,
+        age_min_days: u64,
+        age_max_days: u64,
+        target_level: i32,
+    ) -> Result<()> {
+        let today = Utc::now().date_naive();
+        for days_ago in age_min_days..age_max_days {
+            let date = today - chrono::Duration::days(days_ago as i64);
+            if let Err(e) = self.recompress_partition(table_ref, table_name, date, target_level).await {
+                warn!("recompress_tier_window: skipping date={} after error: {}", date, e);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         let start_time = std::time::Instant::now();
         let today = Utc::now().date_naive();
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?];
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let writer_properties = self.create_writer_properties(schema.sorting_columns(), &schema.fields);
+        let writer_properties = self.create_writer_properties(&schema, self.config.parquet.timefusion_zstd_compression_level);
 
         // Best-effort optimize: retry on OCC conflict but DO NOT hold the
         // flush lock. Earlier we wrapped this in `with_flush_paused` to
@@ -2081,6 +2165,89 @@ impl Database {
         info!("Database shutdown complete");
         Ok(())
     }
+}
+
+/// Pure builder for parquet `WriterProperties` at a given compression tier.
+/// Lives outside `impl Database` so unit tests can exercise tier/encoding/bloom
+/// decisions without instantiating a Database (which needs S3/MinIO).
+fn build_writer_properties(
+    parquet_cfg: &crate::config::ParquetConfig,
+    schema: &crate::schema_loader::TableSchema,
+    zstd_level: i32,
+) -> WriterProperties {
+    use deltalake::datafusion::parquet::basic::{Compression, Encoding, ZstdLevel};
+    use deltalake::datafusion::parquet::file::metadata::KeyValue;
+    use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
+    use deltalake::datafusion::parquet::schema::types::ColumnPath;
+
+    let page_row_count_limit = parquet_cfg.timefusion_page_row_count_limit;
+    let max_row_group_size = parquet_cfg.timefusion_max_row_group_size;
+    let bloom_globally_disabled = parquet_cfg.timefusion_bloom_filter_disabled;
+
+    // Per-column bloom NDV sized to a typical row-group row count.
+    // 1M rows ≈ parquet-rs's default `set_max_row_group_size`; gives an
+    // ~1.7MB bloom per column at fpp=0.01, vs ~150MB if we naively scaled
+    // by the byte-sized `max_row_group_size`. The legacy global 100k
+    // produced near-1.0 false-positive rates at scale.
+    const BLOOM_NDV: u64 = 1_000_000;
+
+    let sorting_columns_pq = schema.sorting_columns();
+    let sort_key_names: std::collections::HashSet<&str> =
+        schema.sorting_columns.iter().map(|c| c.name.as_str()).collect();
+
+    // Note: do NOT call `set_bloom_filter_fpp` at the global level — parquet-rs
+    // treats any global bloom setter (other than `set_bloom_filter_enabled`)
+    // as implicit enable, which then uses the default NDV (~1M) and triggers
+    // massive bloom buffer allocations on every column. We set fpp per-column
+    // only, for the columns we actually want blooms on.
+    let mut builder = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(
+            ZstdLevel::try_new(zstd_level).unwrap_or_else(|_| ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()),
+        ))
+        .set_max_row_group_row_count(Some(max_row_group_size))
+        .set_dictionary_enabled(true)
+        .set_dictionary_page_size_limit(8388608)
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_bloom_filter_enabled(false)
+        .set_data_page_row_count_limit(page_row_count_limit)
+        .set_sorting_columns(if sorting_columns_pq.is_empty() { None } else { Some(sorting_columns_pq) })
+        .set_key_value_metadata(Some(vec![KeyValue::new(
+            COMPRESSION_TIER_KEY.to_string(),
+            zstd_level.to_string(),
+        )]));
+
+    for field in &schema.fields {
+        let dt = field.data_type.as_str();
+        let col = ColumnPath::from(field.name.as_str());
+        let is_sort_key = sort_key_names.contains(field.name.as_str());
+
+        if dt.starts_with("Timestamp") || dt == "Date32" {
+            builder = builder
+                .set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED)
+                .set_column_dictionary_enabled(col.clone(), false);
+        } else if matches!(dt, "Int32" | "Int64" | "UInt32" | "UInt64") {
+            builder = builder.set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED);
+        } else if dt == "Utf8" && is_sort_key {
+            builder = builder
+                .set_column_encoding(col.clone(), Encoding::DELTA_BYTE_ARRAY)
+                .set_column_dictionary_enabled(col.clone(), false);
+        }
+
+        // Explicit per-column dict opt-out (overrides defaults above only
+        // when set to Some(false); Some(true)/None leaves defaults intact).
+        if field.dictionary == Some(false) {
+            builder = builder.set_column_dictionary_enabled(col.clone(), false);
+        }
+
+        if field.bloom_filter && !bloom_globally_disabled {
+            builder = builder
+                .set_column_bloom_filter_enabled(col.clone(), true)
+                .set_column_bloom_filter_ndv(col.clone(), BLOOM_NDV)
+                .set_column_bloom_filter_fpp(col, 0.01);
+        }
+    }
+
+    builder.build()
 }
 
 #[derive(Debug, Clone)]
@@ -2642,22 +2809,9 @@ impl TableProvider for ProjectRoutingTable {
             }
         }
 
-        // Variant scan-boundary conversion REMOVED — see Variant-native plan,
-        // step 1. Previously every scan was wrapped in VariantToJsonExec which
-        // decoded Struct{Binary,Binary} → Utf8 JSON for every row read,
-        // costing 2–6× vs storing the same payload as Utf8 (per
-        // `bench/variant_bench.py`). Downstream plan nodes (variant_get,
-        // jsonb_path_exists, ->/->>) now receive Variant binary directly and
-        // call `parquet_variant_compute::variant_get` (vectorized,
-        // shredded-aware) for path extraction. JSON serialization for the
-        // wire only happens at the root projection — see
-        // VariantSelectRewriter.
-        //
-        // VariantToJsonExec is kept in this file for a possible
-        // prefix-collision fallback (`resource` next to
-        // `resource___service___name`); if the kernel-scan bug re-surfaces,
-        // wire it back via a column-rename shim, NOT a per-row JSON
-        // conversion.
+        // Variant binary flows through scans untouched; downstream nodes
+        // (variant_get, ->, ->>) consume it directly. JSON serialization
+        // happens only at the root projection via VariantSelectRewriter.
         let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> { Ok(plan) };
 
         // Check if buffered layer is configured
@@ -2781,6 +2935,105 @@ impl Drop for Database {
 }
 
 #[cfg(test)]
+mod writer_properties_tests {
+    use super::*;
+    use crate::schema_loader::{FieldDef, SortingColumnDef, TableSchema};
+    use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
+    use deltalake::datafusion::parquet::schema::types::ColumnPath;
+
+    fn cfg() -> crate::config::ParquetConfig {
+        serde_json::from_str("{}").unwrap()
+    }
+
+    fn field(name: &str, dt: &str) -> FieldDef {
+        FieldDef { name: name.into(), data_type: dt.into(), nullable: true, tantivy: None, dictionary: None, bloom_filter: false }
+    }
+
+    fn schema_with(fields: Vec<FieldDef>, sort: Vec<&str>) -> TableSchema {
+        TableSchema {
+            table_name: "t".into(),
+            partitions: vec![],
+            sorting_columns: sort
+                .into_iter()
+                .map(|n| SortingColumnDef { name: n.into(), descending: false, nulls_first: false })
+                .collect(),
+            z_order_columns: vec![],
+            fields,
+        }
+    }
+
+    #[test]
+    fn compression_level_drives_zstd() {
+        for level in [3, 9, 15, 19] {
+            let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), level);
+            assert_eq!(p.compression(&ColumnPath::from("anything")), Compression::ZSTD(ZstdLevel::try_new(level).unwrap()));
+        }
+    }
+
+    #[test]
+    fn invalid_zstd_level_falls_back() {
+        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 999);
+        assert_eq!(p.compression(&ColumnPath::from("x")), Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()));
+    }
+
+    #[test]
+    fn footer_kv_metadata_carries_tier() {
+        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 15);
+        let kv = p.key_value_metadata().expect("KV metadata present");
+        let tier = kv.iter().find(|k| k.key == COMPRESSION_TIER_KEY).expect("tier key present");
+        assert_eq!(tier.value.as_deref(), Some("15"));
+    }
+
+    #[test]
+    fn bloom_opt_in_only_for_flagged_columns() {
+        let mut f1 = field("id", "Utf8");
+        f1.bloom_filter = true;
+        let p = build_writer_properties(&cfg(), &schema_with(vec![f1, field("body", "Utf8")], vec![]), 3);
+        assert!(p.bloom_filter_properties(&ColumnPath::from("id")).is_some(), "flagged column has bloom");
+        assert!(p.bloom_filter_properties(&ColumnPath::from("body")).is_none(), "unflagged column has no bloom");
+    }
+
+    #[test]
+    fn global_bloom_kill_switch_overrides_opt_in() {
+        let mut f = field("id", "Utf8");
+        f.bloom_filter = true;
+        let mut c = cfg();
+        c.timefusion_bloom_filter_disabled = true;
+        let p = build_writer_properties(&c, &schema_with(vec![f], vec![]), 3);
+        assert!(p.bloom_filter_properties(&ColumnPath::from("id")).is_none());
+    }
+
+    #[test]
+    fn dictionary_opt_out_disables_dict() {
+        let mut f = field("stacktrace", "Utf8");
+        f.dictionary = Some(false);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![f], vec![]), 3);
+        assert!(!p.dictionary_enabled(&ColumnPath::from("stacktrace")));
+    }
+
+    #[test]
+    fn sort_key_utf8_uses_delta_byte_array_and_no_dict() {
+        use deltalake::datafusion::parquet::basic::Encoding;
+        let p = build_writer_properties(&cfg(), &schema_with(vec![field("id", "Utf8")], vec!["id"]), 3);
+        assert_eq!(p.encoding(&ColumnPath::from("id")), Some(Encoding::DELTA_BYTE_ARRAY));
+        assert!(!p.dictionary_enabled(&ColumnPath::from("id")));
+    }
+
+    #[test]
+    fn timestamp_and_int_use_delta_binary_packed() {
+        use deltalake::datafusion::parquet::basic::Encoding;
+        let p = build_writer_properties(
+            &cfg(),
+            &schema_with(vec![field("ts", "Timestamp(Nanosecond, None)"), field("n", "Int64")], vec![]),
+            3,
+        );
+        assert_eq!(p.encoding(&ColumnPath::from("ts")), Some(Encoding::DELTA_BINARY_PACKED));
+        assert!(!p.dictionary_enabled(&ColumnPath::from("ts")));
+        assert_eq!(p.encoding(&ColumnPath::from("n")), Some(Encoding::DELTA_BINARY_PACKED));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::AppConfig;
@@ -2828,6 +3081,49 @@ mod tests {
         datafusion_functions_json::register_all(&mut ctx)?;
         db.setup_session_context(&mut ctx)?;
         Ok((db, ctx, test_prefix))
+    }
+
+    /// End-to-end test of `recompress_partition`. Skip behavior is the
+    /// load-bearing property: if the footer-tier probe breaks, the daily
+    /// cron rewrites every partition every night. We assert via file-set
+    /// comparison since the production code path itself reads the footer.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_recompress_partition_skip_idempotency() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let (db, _ctx, prefix) = setup_test_database().await?;
+            let project_id = format!("project_{}", prefix);
+            let today = chrono::Utc::now().date_naive();
+
+            let batch = json_to_batch(vec![test_span("rc1", "span1", &project_id)])?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+
+            let table_ref = get_unified_delta_table(db.unified_tables(), "otel_logs_and_spans").await.expect("table created");
+
+            // First recompress at tier 9 — must rewrite files.
+            let files_before: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
+            assert!(!files_before.is_empty(), "expected files in today's partition");
+            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9).await?;
+            let files_after: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
+            assert_ne!(files_before, files_after, "first recompress must rewrite files");
+
+            // Re-run at the same tier — footer probe must detect tier=9 and skip,
+            // so the file set is unchanged. If skip is broken, this assertion
+            // fails because Optimize emits a fresh part file.
+            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9).await?;
+            let files_after_rerun: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
+            assert_eq!(files_after, files_after_rerun, "rerun at same tier must skip");
+
+            // Downgrade target — also skip.
+            db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 3).await?;
+            let files_after_downgrade: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
+            assert_eq!(files_after, files_after_downgrade, "downgrade target must skip");
+
+            db.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
     }
 
     #[serial]

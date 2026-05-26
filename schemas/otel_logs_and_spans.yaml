@@ -44,15 +44,18 @@ fields:
   - name: id
     data_type: Utf8
     nullable: false
+    bloom_filter: true
   - name: parent_id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: hashes
     data_type: "List(Utf8)"
     nullable: true
   - name: name
     data_type: Utf8
     nullable: true
+    bloom_filter: true
     tantivy: { indexed: true, tokenizer: default }
   - name: kind
     data_type: Utf8
@@ -98,9 +101,11 @@ fields:
   - name: context___trace_id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: context___span_id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: context___trace_state
     data_type: Utf8
     nullable: true
@@ -116,6 +121,7 @@ fields:
   - name: links
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes
     data_type: Variant
     nullable: true
@@ -171,9 +177,11 @@ fields:
   - name: attributes___code___stacktrace
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___log__record___original
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___log__record___uid
     data_type: Utf8
     nullable: true
@@ -189,12 +197,14 @@ fields:
   - name: attributes___exception___stacktrace
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___url___fragment
     data_type: Utf8
     nullable: true
   - name: attributes___url___full
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___url___path
     data_type: Utf8
     nullable: true
@@ -225,6 +235,7 @@ fields:
   - name: attributes___session___id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: attributes___session___previous___id
     data_type: Utf8
     nullable: true
@@ -252,9 +263,11 @@ fields:
   - name: attributes___db___query___text
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___user___id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: attributes___user___email
     data_type: Utf8
     nullable: true
