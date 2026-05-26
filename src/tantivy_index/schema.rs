@@ -17,11 +17,15 @@
 //! dominant pattern for logs/traces. Opt-down to `raw`/`default` for
 //! point-lookup-only columns (IDs, enums).
 
-use crate::schema_loader::{FieldDef, TableSchema, TantivyFieldConfig};
 use std::collections::HashMap;
-use tantivy::Index;
-use tantivy::schema::{Field, FieldType, IndexRecordOption, NumericOptions, Schema, SchemaBuilder, TextFieldIndexing, TextOptions, FAST, INDEXED, STORED};
-use tantivy::tokenizer::{AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter, SimpleTokenizer, TextAnalyzer};
+
+use tantivy::{
+    Index,
+    schema::{FAST, Field, FieldType, INDEXED, IndexRecordOption, NumericOptions, STORED, Schema, SchemaBuilder, TextFieldIndexing, TextOptions},
+    tokenizer::{AsciiFoldingFilter, LowerCaser, NgramTokenizer, RawTokenizer, RemoveLongFilter, SimpleTokenizer, TextAnalyzer},
+};
+
+use crate::schema_loader::{FieldDef, TableSchema, TantivyFieldConfig};
 
 /// Tokenizer name we use for n-gram indexing. Combined with `LowerCaser` so
 /// `ILIKE` semantics fall out automatically.
@@ -43,9 +47,9 @@ pub const ID_FIELD: &str = "_id";
 
 /// Result of building a tantivy schema for a table.
 pub struct BuiltSchema {
-    pub schema: Schema,
-    pub timestamp: Field,
-    pub id: Field,
+    pub schema:      Schema,
+    pub timestamp:   Field,
+    pub id:          Field,
     /// Map of source-column-name → tantivy field. Only contains user columns
     /// that were `indexed: true` in YAML. Variants/lists are included here.
     pub user_fields: HashMap<String, UserField>,
@@ -53,7 +57,7 @@ pub struct BuiltSchema {
 
 #[derive(Debug, Clone)]
 pub struct UserField {
-    pub field: Field,
+    pub field:  Field,
     pub source: FieldDef,
 }
 
@@ -75,15 +79,16 @@ pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
         let f = b.add_text_field(&fd.name, opts);
         user_fields.insert(fd.name.clone(), UserField { field: f, source: fd.clone() });
     }
-    BuiltSchema { schema: b.build(), timestamp, id, user_fields }
+    BuiltSchema {
+        schema: b.build(),
+        timestamp,
+        id,
+        user_fields,
+    }
 }
 
 fn raw_id_options() -> TextOptions {
-    TextOptions::default().set_indexing_options(
-        TextFieldIndexing::default()
-            .set_tokenizer("raw")
-            .set_index_option(IndexRecordOption::Basic),
-    ) | STORED
+    TextOptions::default().set_indexing_options(TextFieldIndexing::default().set_tokenizer("raw").set_index_option(IndexRecordOption::Basic)) | STORED
 }
 
 /// Map a YAML tokenizer name to tantivy `TextOptions`. Unknown names fall
@@ -108,16 +113,12 @@ fn text_options_for(cfg: &TantivyFieldConfig) -> TextOptions {
         // matching reduces to: consecutive trigrams of the query string).
         IndexRecordOption::WithFreqsAndPositions
     };
-    TextOptions::default().set_indexing_options(
-        TextFieldIndexing::default()
-            .set_tokenizer(name)
-            .set_index_option(index_option),
-    )
+    TextOptions::default().set_indexing_options(TextFieldIndexing::default().set_tokenizer(name).set_index_option(index_option))
 }
 
 /// Resolve the tokenizer for a field (defaulting to ngram3). Used by the
 /// rewriter to decide which LIKE/ILIKE patterns it can accelerate.
-pub fn resolved_tokenizer<'a>(table: &'a TableSchema, name: &str) -> Option<&'static str> {
+pub fn resolved_tokenizer(table: &TableSchema, name: &str) -> Option<&'static str> {
     let cfg = table.fields.iter().find(|f| f.name == name)?.tantivy.as_ref()?;
     if !cfg.indexed {
         return None;
@@ -162,11 +163,7 @@ pub fn register_tokenizers(index: &Index) {
 
 /// Helper for tests and pushdown rule: which user fields are configured?
 pub fn indexed_field_names(table: &TableSchema) -> Vec<String> {
-    table
-        .fields
-        .iter()
-        .filter_map(|f| f.tantivy.as_ref().filter(|t| t.indexed).map(|_| f.name.clone()))
-        .collect()
+    table.fields.iter().filter_map(|f| f.tantivy.as_ref().filter(|t| t.indexed).map(|_| f.name.clone())).collect()
 }
 
 /// Returns the tokenizer name for a field, if it's indexed.

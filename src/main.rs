@@ -1,14 +1,17 @@
 // main.rs
 #![recursion_limit = "512"]
 
+use std::sync::Arc;
+
 use datafusion_postgres::ServerOptions;
 use dotenv::dotenv;
-use std::sync::Arc;
-use timefusion::buffered_write_layer::BufferedWriteLayer;
-use timefusion::clock;
-use timefusion::config::{self, AppConfig};
-use timefusion::database::Database;
-use timefusion::telemetry;
+use timefusion::{
+    buffered_write_layer::BufferedWriteLayer,
+    clock,
+    config::{self, AppConfig},
+    database::Database,
+    telemetry,
+};
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
@@ -80,7 +83,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
             let storage_opts = cfg.aws.build_storage_options(None);
             let obj_store = db.create_object_store(&storage_uri, &storage_opts).await?;
-            let svc = Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
+            let svc = Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(
+                obj_store.clone(),
+                Arc::new(cfg.tantivy.clone()),
+            ));
             layer = layer.with_tantivy_indexer(svc.clone().callback());
             let cache_root = cfg.core.timefusion_data_dir.clone();
             let search = Arc::new(timefusion::tantivy_index::search::TantivySearchService::new(obj_store, cache_root));
@@ -151,7 +157,11 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 warn!("GRPC_TOKEN unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — gRPC ingest accepts any client. Local dev ONLY.");
                 None
             }
-            _ => return Err(anyhow::anyhow!("GRPC_TOKEN is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open ingest for local dev)")),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "GRPC_TOKEN is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open ingest for local dev)"
+                ));
+            }
         }
     };
     // gRPC shutdown signal: tonic's `serve_with_shutdown` polls this future
@@ -164,12 +174,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         let addr = format!("0.0.0.0:{grpc_port}").parse().expect("valid grpc addr");
         info!("Starting gRPC ingestion server on port: {}", grpc_port);
         let svc = timefusion::grpc_handlers::IngestService::new(db_for_grpc, grpc_token).into_server();
-        let serve = tonic::transport::Server::builder()
-            .add_service(svc)
-            .serve_with_shutdown(addr, async move {
-                grpc_shutdown_for_task.cancelled().await;
-                info!("gRPC server: shutdown signal received, draining in-flight requests");
-            });
+        let serve = tonic::transport::Server::builder().add_service(svc).serve_with_shutdown(addr, async move {
+            grpc_shutdown_for_task.cancelled().await;
+            info!("gRPC server: shutdown signal received, draining in-flight requests");
+        });
         if let Err(e) = serve.await {
             error!("gRPC server error: {}", e);
         } else {
@@ -219,7 +227,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     match tokio::time::timeout(grpc_drain_deadline, grpc_task).await {
         Ok(Ok(())) => info!("gRPC drained cleanly"),
         Ok(Err(e)) => error!("gRPC task panicked during drain: {}", e),
-        Err(_) => error!("gRPC drain exceeded {}s — forcing shutdown; in-flight requests may be reset", grpc_drain_deadline.as_secs()),
+        Err(_) => error!(
+            "gRPC drain exceeded {}s — forcing shutdown; in-flight requests may be reset",
+            grpc_drain_deadline.as_secs()
+        ),
     }
 
     if let Err(e) = buffered_layer_for_shutdown.shutdown().await {

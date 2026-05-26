@@ -1,14 +1,12 @@
 #[cfg(test)]
 mod integration {
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+
     use anyhow::Result;
     use datafusion_postgres::ServerOptions;
-    use rand::{Rng, RngExt};
+    use rand::RngExt;
     use serial_test::serial;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use timefusion::config::AppConfig;
-    use timefusion::database::Database;
+    use timefusion::{config::AppConfig, database::Database};
     use tokio::sync::Notify;
     use tokio_postgres::{Client, NoTls};
     use uuid::Uuid;
@@ -35,8 +33,8 @@ mod integration {
     }
 
     struct TestServer {
-        port: u16,
-        test_id: String,
+        port:     u16,
+        test_id:  String,
         shutdown: Arc<Notify>,
     }
 

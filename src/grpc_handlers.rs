@@ -5,18 +5,19 @@
 //! validated against `CoreConfig::grpc_token`. When unset, the endpoint is open
 //! (intended for trusted-network deployments / development).
 
-use crate::database::Database;
+use std::{io::Cursor, sync::Arc};
+
 use anyhow::Context;
 use arrow::array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use futures::StreamExt;
-use std::io::Cursor;
-use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
+
+use crate::database::Database;
 
 /// Pressure threshold above which we soft-reject with RETRY instead of
 /// admitting the write. Keeps a margin below the hard reservation limit so
@@ -30,11 +31,14 @@ pub mod pb {
     tonic::include_proto!("timefusion.v1");
 }
 
-use pb::ingest_server::{Ingest, IngestServer};
-use pb::{WriteAck, WriteBatch, write_ack::Status as AckStatus};
+use pb::{
+    WriteAck, WriteBatch,
+    ingest_server::{Ingest, IngestServer},
+    write_ack::Status as AckStatus,
+};
 
 pub struct IngestService {
-    db: Arc<Database>,
+    db:    Arc<Database>,
     token: Option<String>,
 }
 
@@ -48,11 +52,7 @@ impl IngestService {
     }
 
     fn check_auth<T>(&self, req: &Request<T>) -> Result<(), Status> {
-        let got = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.strip_prefix("Bearer "));
+        let got = req.metadata().get("authorization").and_then(|v| v.to_str().ok()).and_then(|s| s.strip_prefix("Bearer "));
         verify_bearer(self.token.as_deref(), got)
     }
 }
@@ -61,7 +61,7 @@ impl IngestService {
 /// is materialized. Bounded peak memory: only one decoded batch is alive at a
 /// time on top of the encoded bytes. Empty / row-less batches are skipped.
 /// Returns the number of non-empty batches inserted.
-async fn decode_and_insert<'a, F, Fut>(bytes: &'a [u8], mut sink: F) -> anyhow::Result<usize>
+async fn decode_and_insert<F, Fut>(bytes: &[u8], mut sink: F) -> anyhow::Result<usize>
 where
     F: FnMut(RecordBatch) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
@@ -153,13 +153,23 @@ async fn process_one(db: &Database, msg: WriteBatch) -> WriteAck {
 
     match result {
         Ok(0) => ack_err(seq, pressure, "empty arrow ipc payload"),
-        Ok(_) => WriteAck { seq, status: AckStatus::Ok as i32, mem_pressure_pct: pressure, error: String::new() },
+        Ok(_) => WriteAck {
+            seq,
+            status: AckStatus::Ok as i32,
+            mem_pressure_pct: pressure,
+            error: String::new(),
+        },
         Err(e) => ack_err(seq, pressure, &format!("decode/insert: {e:#}")),
     }
 }
 
 fn ack_err(seq: u64, pressure: u32, err: &str) -> WriteAck {
-    WriteAck { seq, status: AckStatus::Reject as i32, mem_pressure_pct: pressure, error: err.into() }
+    WriteAck {
+        seq,
+        status: AckStatus::Reject as i32,
+        mem_pressure_pct: pressure,
+        error: err.into(),
+    }
 }
 
 /// Constant-time bearer-token check. When `expected` is `None`, auth is open.

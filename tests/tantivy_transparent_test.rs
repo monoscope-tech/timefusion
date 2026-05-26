@@ -20,12 +20,14 @@
 
 #![cfg(test)]
 
-use anyhow::Result;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::LogicalPlan;
 use std::sync::Arc;
-use timefusion::config::{AppConfig, TantivyConfig};
-use timefusion::database::Database;
+
+use anyhow::Result;
+use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
+use timefusion::{
+    config::{AppConfig, TantivyConfig},
+    database::Database,
+};
 
 /// Build a minimal in-memory session context with the prod schemas
 /// registered. No Delta, no MemBuffer — just the analyzer chain.
@@ -69,11 +71,7 @@ async fn rewriter_injects_text_match_for_eq_on_indexed_column() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // `level` is indexed (tantivy.indexed: true, tokenizer: raw) in the prod
     // YAML. The rewriter should produce `level = 'ERROR' AND text_match(level, 'ERROR')`.
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level = 'ERROR'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level = 'ERROR'").await?;
     let s = plan_str(&plan);
     assert!(s.contains("text_match"), "expected text_match in plan, got:\n{}", s);
     // The original `=` must still appear (additive — correctness invariant).
@@ -84,11 +82,7 @@ async fn rewriter_injects_text_match_for_eq_on_indexed_column() -> Result<()> {
 #[tokio::test]
 async fn rewriter_handles_trailing_wildcard_like() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND name LIKE 'api%'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND name LIKE 'api%'").await?;
     let s = plan_str(&plan);
     // Prefix LIKE rewritten to text_match(col, 'api*').
     assert!(s.contains("text_match"), "expected text_match for prefix LIKE, got:\n{}", s);
@@ -104,11 +98,7 @@ async fn rewriter_leaves_unsupported_like_patterns_alone() -> Result<()> {
     // rewriter must NOT inject text_match — original LIKE still applies.
     // (`name` is now ngram3 so `%substring%` IS accelerable — see the
     // rewriter_handles_infix_like_on_ngram3_column test.)
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level LIKE '%RR%'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level LIKE '%RR%'").await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match for %infix% on raw column, got:\n{}", s);
     Ok(())
@@ -118,11 +108,7 @@ async fn rewriter_leaves_unsupported_like_patterns_alone() -> Result<()> {
 async fn rewriter_skips_non_indexed_columns() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // `id` is NOT indexed in the prod schema (tantivy: null).
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND id = 'abc'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND id = 'abc'").await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match on non-indexed col, got:\n{}", s);
     Ok(())
@@ -133,11 +119,7 @@ async fn rewriter_skips_special_chars_in_literal() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // `+` is a tantivy QueryParser metachar. Conservative path: skip the
     // rewrite rather than misparse. Correctness preserved by retained `=`.
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level = 'foo+bar'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level = 'foo+bar'").await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match on metachar literal, got:\n{}", s);
     Ok(())
@@ -204,11 +186,7 @@ async fn rewriter_skips_ilike_on_raw_tokenized_column() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // `level` uses raw (case-sensitive). ILIKE must NOT push down or we'd
     // miss case variants in the prefilter set.
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level ILIKE 'error'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level ILIKE 'error'").await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match for ILIKE on raw, got:\n{}", s);
     Ok(())
@@ -218,11 +196,7 @@ async fn rewriter_skips_ilike_on_raw_tokenized_column() -> Result<()> {
 async fn rewriter_skips_infix_like_on_raw_tokenized_column() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // `level` uses raw; `LIKE '%RR%'` has no tantivy primitive that matches.
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level LIKE '%RR%'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level LIKE '%RR%'").await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match for %infix% on raw, got:\n{}", s);
     Ok(())
@@ -233,11 +207,7 @@ async fn rewriter_skips_sub_3_char_eq_on_ngram3() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // Sub-3-char literal on ngram3: no full trigram → tantivy term query
     // would degenerate. Bail to scan.
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND name = 'ok'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND name = 'ok'").await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match on <3 char literal, got:\n{}", s);
     Ok(())

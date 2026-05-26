@@ -14,7 +14,7 @@ use crate::tantivy_index::schema::{ID_FIELD, TS_FIELD};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hit {
     pub timestamp_micros: i64,
-    pub id: String,
+    pub id:               String,
 }
 
 /// Run a tantivy `Query` against the index and return hits up to `limit`.
@@ -31,15 +31,8 @@ pub fn query_index(index: &Index, query: &dyn Query, limit: Option<usize>) -> Re
     let mut hits = Vec::with_capacity(top.len());
     for (_score, addr) in top {
         let doc: TantivyDocument = searcher.doc(addr).map_err(|e| anyhow!("doc fetch: {e}"))?;
-        let ts = doc
-            .get_first(ts_field)
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow!("hit missing _timestamp"))?;
-        let id = doc
-            .get_first(id_field)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("hit missing _id"))?;
+        let ts = doc.get_first(ts_field).and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("hit missing _timestamp"))?;
+        let id = doc.get_first(id_field).and_then(|v| v.as_str()).map(|s| s.to_string()).ok_or_else(|| anyhow!("hit missing _id"))?;
         hits.push(Hit { timestamp_micros: ts, id });
     }
     Ok(hits)

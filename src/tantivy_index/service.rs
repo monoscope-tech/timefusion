@@ -7,25 +7,32 @@
 //! manifest entries by intersecting their `[min_ts, max_ts]` with the query's
 //! time predicates (or scans the full manifest for full-text predicates).
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
+
 use anyhow::{Context, Result};
 use chrono::Utc;
 use object_store::ObjectStore;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::buffered_write_layer::TantivyIndexCallback;
-use crate::config::TantivyConfig;
-use crate::schema_loader;
-use crate::tantivy_index::manifest::{self, ManifestEntry};
-use crate::tantivy_index::store;
+use crate::{
+    buffered_write_layer::TantivyIndexCallback,
+    config::TantivyConfig,
+    schema_loader,
+    tantivy_index::{
+        manifest::{self, ManifestEntry},
+        store,
+    },
+};
 
 /// Owns the object store + tantivy config and produces a callback.
 #[derive(Debug)]
 pub struct TantivyIndexService {
-    pub object_store: Arc<dyn ObjectStore>,
-    pub config: Arc<TantivyConfig>,
+    pub object_store:      Arc<dyn ObjectStore>,
+    pub config:            Arc<TantivyConfig>,
     /// Max `max_timestamp_micros` across every index this process has
     /// successfully published. Feeds the `index_lag_seconds` gauge. Loaded
     /// from manifests on first observation (lazy) and updated after each
@@ -35,7 +42,11 @@ pub struct TantivyIndexService {
 
 impl TantivyIndexService {
     pub fn new(object_store: Arc<dyn ObjectStore>, config: Arc<TantivyConfig>) -> Self {
-        Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN) }
+        Self {
+            object_store,
+            config,
+            newest_indexed_micros: AtomicI64::new(i64::MIN),
+        }
     }
 
     /// Newest indexed timestamp seen so far (microseconds). `None` if the
@@ -73,27 +84,31 @@ impl TantivyIndexService {
         })
     }
 
-    async fn build_and_publish(&self, project_id: &str, table_name: &str, batches: Vec<arrow::record_batch::RecordBatch>, added_files: Vec<String>) -> Result<()> {
+    async fn build_and_publish(
+        &self, project_id: &str, table_name: &str, batches: Vec<arrow::record_batch::RecordBatch>, added_files: Vec<String>,
+    ) -> Result<()> {
         let table = schema_loader::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
         let bucket_uuid = Uuid::new_v4().to_string();
         // Build & pack
         let level = self.config.compression_level();
         let svc_table = table.clone();
         let svc_batches = batches.clone();
-        let pack_result = tokio::task::spawn_blocking(move || store::build_and_pack(&svc_table, &svc_batches, level)).await.context("join build")?;
+        let pack_result = tokio::task::spawn_blocking(move || store::build_and_pack(&svc_table, &svc_batches, level))
+            .await
+            .context("join build")?;
         let (blob, stats) = match pack_result {
             Ok(v) => v,
             Err(e) => {
                 let key = bucket_key(&bucket_uuid);
                 let entry = ManifestEntry {
-                    index: None,
-                    rows: 0,
-                    built_at: Utc::now(),
-                    schema_version: manifest::SCHEMA_VERSION,
+                    index:                None,
+                    rows:                 0,
+                    built_at:             Utc::now(),
+                    schema_version:       manifest::SCHEMA_VERSION,
                     min_timestamp_micros: None,
                     max_timestamp_micros: None,
-                    error: Some(format!("build failed: {e}")),
-                    covered_files: added_files.clone(),
+                    error:                Some(format!("build failed: {e}")),
+                    covered_files:        added_files.clone(),
                 };
                 let _ = manifest::upsert(self.object_store.as_ref(), table_name, project_id, &key, entry).await;
                 warn!("tantivy build failed for {project_id}/{table_name}: {e}");
@@ -107,14 +122,14 @@ impl TantivyIndexService {
 
         let key = bucket_key(&bucket_uuid);
         let entry = ManifestEntry {
-            index: Some(path.to_string()),
-            rows: stats.rows,
-            built_at: Utc::now(),
-            schema_version: manifest::SCHEMA_VERSION,
+            index:                Some(path.to_string()),
+            rows:                 stats.rows,
+            built_at:             Utc::now(),
+            schema_version:       manifest::SCHEMA_VERSION,
             min_timestamp_micros: stats.min_timestamp_micros,
             max_timestamp_micros: stats.max_timestamp_micros,
-            error: None,
-            covered_files: added_files,
+            error:                None,
+            covered_files:        added_files,
         };
         manifest::upsert(self.object_store.as_ref(), table_name, project_id, &key, entry).await?;
         self.observe_newest(stats.max_timestamp_micros);
@@ -173,8 +188,8 @@ impl TantivyIndexService {
 
 #[derive(Debug, Default, Clone)]
 pub struct GcReport {
-    pub kept: usize,
-    pub entries_removed: usize,
-    pub blobs_deleted: usize,
+    pub kept:               usize,
+    pub entries_removed:    usize,
+    pub blobs_deleted:      usize,
     pub blob_delete_errors: usize,
 }

@@ -16,21 +16,22 @@
 
 #![cfg(test)]
 
+use std::{path::PathBuf, sync::Arc};
+
 use anyhow::Result;
 use arrow::array::{Array, RecordBatch};
-use datafusion::arrow::array::AsArray;
-use datafusion::execution::context::SessionContext;
+use datafusion::{arrow::array::AsArray, execution::context::SessionContext};
 use serde_json::json;
 use serial_test::serial;
-use std::path::PathBuf;
-use std::sync::Arc;
-use timefusion::buffered_write_layer::{BufferedWriteLayer, DeltaWriteCallback};
-use timefusion::config::{AppConfig, TantivyConfig};
-use timefusion::database::Database;
-use timefusion::tantivy_index::{search::TantivySearchService, service::TantivyIndexService};
-use timefusion::test_utils::test_helpers::json_to_batch;
+use timefusion::{
+    buffered_write_layer::{BufferedWriteLayer, DeltaWriteCallback},
+    config::{AppConfig, TantivyConfig},
+    database::Database,
+    tantivy_index::{search::TantivySearchService, service::TantivyIndexService},
+    test_utils::test_helpers::json_to_batch,
+};
 
-fn cfg(test_id: &str, tantivy_enabled: bool) -> Arc<AppConfig> {
+fn cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
     let mut c = AppConfig::default();
     c.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
     c.aws.aws_access_key_id = Some("minioadmin".into());
@@ -42,7 +43,6 @@ fn cfg(test_id: &str, tantivy_enabled: bool) -> Arc<AppConfig> {
     c.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-tantivy-e2e-{test_id}"));
     c.cache.timefusion_foyer_disabled = true;
     c.tantivy = TantivyConfig {
-        
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
     };
@@ -255,17 +255,11 @@ async fn mixed_membuffer_and_delta_level_eq_returns_union() -> Result<()> {
     let (db2, ctx2, _) = build_db(&format!("{id}-mix-off"), false).await?;
     let p = unique_project();
 
-    let delta_rows = vec![
-        ("d-old1", "n", "old failed operation"),
-        ("d-old2", "n", "old successful operation"),
-    ];
+    let delta_rows = vec![("d-old1", "n", "old failed operation"), ("d-old2", "n", "old successful operation")];
     db.insert_records_batch(&p, TABLE, vec![make_batch(&p, delta_rows.clone())], true).await?;
     db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, delta_rows)], true).await?;
 
-    let mem_rows = vec![
-        ("m-new1", "n", "new failed operation"),
-        ("m-new2", "n", "new clean operation"),
-    ];
+    let mem_rows = vec![("m-new1", "n", "new failed operation"), ("m-new2", "n", "new clean operation")];
     db.insert_records_batch(&p, TABLE, vec![make_batch(&p, mem_rows.clone())], false).await?;
     db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, mem_rows)], false).await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

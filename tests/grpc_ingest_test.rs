@@ -2,17 +2,21 @@
 //! real Database+BufferedWriteLayer, drives it via an in-memory duplex transport,
 //! and verifies Arrow IPC payloads land in the buffer.
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use arrow::array::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
 use serial_test::serial;
-use std::sync::Arc;
-use timefusion::buffered_write_layer::BufferedWriteLayer;
-use timefusion::database::Database;
-use timefusion::grpc_handlers::IngestService;
-use timefusion::grpc_handlers::pb::ingest_client::IngestClient;
-use timefusion::grpc_handlers::pb::{WriteBatch, write_ack::Status as AckStatus};
-use timefusion::test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span};
+use timefusion::{
+    buffered_write_layer::BufferedWriteLayer,
+    database::Database,
+    grpc_handlers::{
+        IngestService,
+        pb::{WriteBatch, ingest_client::IngestClient, write_ack::Status as AckStatus},
+    },
+    test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span},
+};
 use tokio::io::DuplexStream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Endpoint, Server, Uri};
@@ -67,9 +71,20 @@ async fn grpc_write_round_trip() -> Result<()> {
     let mut client = make_client(IngestService::new(Arc::clone(&db), None)).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(4);
-    tx.send(WriteBatch { seq: 1, project_id: project_id.clone(), table_name: table_name.clone(), arrow_ipc: payload.clone() })
-        .await?;
-    tx.send(WriteBatch { seq: 2, project_id: project_id.clone(), table_name, arrow_ipc: payload }).await?;
+    tx.send(WriteBatch {
+        seq:        1,
+        project_id: project_id.clone(),
+        table_name: table_name.clone(),
+        arrow_ipc:  payload.clone(),
+    })
+    .await?;
+    tx.send(WriteBatch {
+        seq: 2,
+        project_id: project_id.clone(),
+        table_name,
+        arrow_ipc: payload,
+    })
+    .await?;
     drop(tx);
 
     let mut acks = client.write(ReceiverStream::new(rx)).await?.into_inner();
@@ -98,8 +113,13 @@ async fn grpc_rejects_bad_payload() -> Result<()> {
 
     let mut client = make_client(IngestService::new(db, None)).await;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tx.send(WriteBatch { seq: 7, project_id: "p".into(), table_name: "otel_traces_and_logs".into(), arrow_ipc: vec![0xde, 0xad] })
-        .await?;
+    tx.send(WriteBatch {
+        seq:        7,
+        project_id: "p".into(),
+        table_name: "otel_traces_and_logs".into(),
+        arrow_ipc:  vec![0xde, 0xad],
+    })
+    .await?;
     drop(tx);
 
     let mut acks = client.write(ReceiverStream::new(rx)).await?.into_inner();
@@ -120,7 +140,13 @@ async fn grpc_auth_rejects_missing_token() -> Result<()> {
 
     let mut client = make_client(IngestService::new(db, Some("s3cret".into()))).await;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tx.send(WriteBatch { seq: 1, project_id: "p".into(), table_name: "otel_traces_and_logs".into(), arrow_ipc: vec![] }).await?;
+    tx.send(WriteBatch {
+        seq:        1,
+        project_id: "p".into(),
+        table_name: "otel_traces_and_logs".into(),
+        arrow_ipc:  vec![],
+    })
+    .await?;
     drop(tx);
 
     let err = client.write(ReceiverStream::new(rx)).await.unwrap_err();

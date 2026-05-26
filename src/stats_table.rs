@@ -8,23 +8,28 @@
 //!     SELECT * FROM timefusion_stats;
 //!     SELECT key, value FROM timefusion_stats WHERE component='mem_buffer';
 
-use crate::buffered_write_layer::BufferedWriteLayer;
-use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use std::{any::Any, sync::Arc};
+
+use arrow::{
+    array::{ArrayRef, StringArray},
+    datatypes::{DataType, Field, Schema, SchemaRef},
+    record_batch::RecordBatch,
+};
 use async_trait::async_trait;
-use datafusion::catalog::Session;
-use datafusion::common::Result as DFResult;
-use datafusion::datasource::{MemTable, TableProvider, TableType};
-use datafusion::error::DataFusionError;
-use datafusion::logical_expr::Expr;
-use datafusion::physical_plan::ExecutionPlan;
-use std::any::Any;
-use std::sync::Arc;
+use datafusion::{
+    catalog::Session,
+    common::Result as DFResult,
+    datasource::{MemTable, TableProvider, TableType},
+    error::DataFusionError,
+    logical_expr::Expr,
+    physical_plan::ExecutionPlan,
+};
+
+use crate::buffered_write_layer::BufferedWriteLayer;
 
 #[derive(Debug)]
 pub struct StatsTableProvider {
-    layer: Option<Arc<BufferedWriteLayer>>,
+    layer:  Option<Arc<BufferedWriteLayer>>,
     schema: SchemaRef,
 }
 
@@ -48,7 +53,11 @@ impl StatsTableProvider {
             rows.push(("mem_buffer", "total_rows".into(), s.mem_total_rows.to_string()));
             rows.push(("mem_buffer", "total_batches".into(), s.mem_total_batches.to_string()));
             rows.push(("mem_buffer", "estimated_bytes".into(), s.mem_estimated_bytes.to_string()));
-            rows.push(("mem_buffer", "estimated_mb".into(), format!("{:.1}", s.mem_estimated_bytes as f64 / (1024.0 * 1024.0))));
+            rows.push((
+                "mem_buffer",
+                "estimated_mb".into(),
+                format!("{:.1}", s.mem_estimated_bytes as f64 / (1024.0 * 1024.0)),
+            ));
             rows.push(("mem_buffer", "bucket_duration_micros".into(), s.bucket_duration_micros.to_string()));
             rows.push((
                 "mem_buffer",
@@ -57,7 +66,11 @@ impl StatsTableProvider {
             ));
             rows.push(("buffered_layer", "reserved_bytes".into(), s.reserved_bytes.to_string()));
             rows.push(("buffered_layer", "max_memory_bytes".into(), s.max_memory_bytes.to_string()));
-            rows.push(("buffered_layer", "max_memory_mb".into(), format!("{:.1}", s.max_memory_bytes as f64 / (1024.0 * 1024.0))));
+            rows.push((
+                "buffered_layer",
+                "max_memory_mb".into(),
+                format!("{:.1}", s.max_memory_bytes as f64 / (1024.0 * 1024.0)),
+            ));
             rows.push(("buffered_layer", "pressure_pct".into(), s.pressure_pct.to_string()));
             rows.push(("wal", "files".into(), s.wal_files.to_string()));
             rows.push(("wal", "disk_bytes".into(), s.wal_disk_bytes.to_string()));
@@ -81,11 +94,7 @@ impl StatsTableProvider {
         let keys: Vec<&str> = rows.iter().map(|r| r.1.as_str()).collect();
         let values: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
 
-        let cols: Vec<ArrayRef> = vec![
-            Arc::new(StringArray::from(components)),
-            Arc::new(StringArray::from(keys)),
-            Arc::new(StringArray::from(values)),
-        ];
+        let cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(components)), Arc::new(StringArray::from(keys)), Arc::new(StringArray::from(values))];
         RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 }
@@ -102,9 +111,7 @@ impl TableProvider for StatsTableProvider {
         TableType::View
     }
 
-    async fn scan(
-        &self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Build a fresh batch on every scan — counters move, we want point-in-time.
         let batch = self.snapshot_batch()?;
         let mem = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;

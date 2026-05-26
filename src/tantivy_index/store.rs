@@ -9,11 +9,14 @@
 //! `pack_index` serializes the in-memory `Index` to bytes; `unpack_to_dir`
 //! is the inverse. Upload/download are thin wrappers around `ObjectStore`.
 
+use std::{
+    io::{Cursor, Read, Write},
+    path::{Path, PathBuf},
+};
+
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjPath};
-use std::io::{Cursor, Read, Write};
-use std::path::{Path, PathBuf};
 use tantivy::Index;
 
 pub const INDEX_PREFIX: &str = "indexes";
@@ -28,9 +31,7 @@ pub fn blob_path(table: &str, project_id: &str, file_uuid: &str) -> ObjPath {
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot, then
 /// pack it into a `tar.zst` blob. Avoids any RAM→disk copy.
 pub fn build_and_pack(
-    table: &crate::schema_loader::TableSchema,
-    batches: &[arrow::record_batch::RecordBatch],
-    level: i32,
+    table: &crate::schema_loader::TableSchema, batches: &[arrow::record_batch::RecordBatch], level: i32,
 ) -> Result<(Bytes, crate::tantivy_index::builder::IndexBuildStats)> {
     let tmp = tempfile::tempdir().context("build_and_pack: tempdir")?;
     let (_built, stats) = build_to_dir(table, batches, tmp.path())?;
@@ -40,9 +41,7 @@ pub fn build_and_pack(
 
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot.
 pub fn build_to_dir(
-    table: &crate::schema_loader::TableSchema,
-    batches: &[arrow::record_batch::RecordBatch],
-    dir: &Path,
+    table: &crate::schema_loader::TableSchema, batches: &[arrow::record_batch::RecordBatch], dir: &Path,
 ) -> Result<(crate::tantivy_index::schema::BuiltSchema, crate::tantivy_index::builder::IndexBuildStats)> {
     use tantivy::directory::MmapDirectory;
     let built = crate::tantivy_index::schema::build_for_table(table);
@@ -99,7 +98,7 @@ pub async fn upload(store: &dyn ObjectStore, path: &ObjPath, blob: Bytes) -> Res
 
 pub async fn download(store: &dyn ObjectStore, path: &ObjPath) -> Result<Bytes> {
     let result = store.get(path).await.with_context(|| format!("get {path}"))?;
-    Ok(result.bytes().await.with_context(|| format!("read {path}"))?)
+    result.bytes().await.with_context(|| format!("read {path}"))
 }
 
 pub async fn delete(store: &dyn ObjectStore, path: &ObjPath) -> Result<()> {

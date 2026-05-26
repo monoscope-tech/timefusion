@@ -1,23 +1,26 @@
+use std::{any::Any, sync::Arc};
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringViewArray, StringViewBuilder,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
+use datafusion::{
+    arrow::{
+        array::{
+            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringViewArray, StringViewBuilder,
+            TimestampMicrosecondArray, TimestampNanosecondArray,
+        },
+        datatypes::{DataType, TimeUnit},
+    },
+    common::{DFSchema, DataFusionError, ExprSchema, ScalarValue, not_impl_err},
+    logical_expr::{
+        Accumulator, AggregateUDF, ColumnarValue, Expr, ExprSchemable, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature,
+        TypeSignature, Volatility, create_udaf, create_udf,
+        expr::{Alias, ScalarFunction},
+        planner::{ExprPlanner, PlannerResult, RawBinaryExpr},
+    },
+    sql::sqlparser::ast::BinaryOperator,
 };
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::{DFSchema, DataFusionError, ExprSchema, ScalarValue, not_impl_err};
-use datafusion::logical_expr::ExprSchemable;
-use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, ColumnarValue, Expr, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility, create_udaf, create_udf,
-    expr::{Alias, ScalarFunction},
-    planner::{ExprPlanner, PlannerResult, RawBinaryExpr},
-};
-use datafusion::sql::sqlparser::ast::BinaryOperator;
 use serde_json::{Value as JsonValue, json};
-use std::any::Any;
-use std::sync::Arc;
 use tdigests::TDigest;
 
 use crate::schema_loader::is_variant_type;
@@ -84,7 +87,10 @@ impl ExprPlanner for VariantAwareExprPlanner {
         if is_long_arrow {
             args.push(Expr::Literal(ScalarValue::Utf8(Some("Utf8".into())), None));
         }
-        let result = Expr::ScalarFunction(ScalarFunction { func: Arc::new(variant_get_udf), args });
+        let result = Expr::ScalarFunction(ScalarFunction {
+            func: Arc::new(variant_get_udf),
+            args,
+        });
 
         // Create alias to preserve original SQL representation
         let op_str = if is_long_arrow { "->>" } else { "->" };
@@ -258,14 +264,19 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
 
 /// `timefusion_set_clock(rfc3339_text)` → bigint micros-since-epoch.
 fn create_set_clock_udf() -> ScalarUDF {
-    use datafusion::arrow::array::{Int64Array, StringArray};
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::DataType,
+    };
     let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
         let arr = match &args[0] {
             ColumnarValue::Array(a) => a.clone(),
             ColumnarValue::Scalar(s) => s.to_array()?,
         };
-        let s = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| DataFusionError::Execution("timefusion_set_clock expects Utf8".into()))?;
+        let s = arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("timefusion_set_clock expects Utf8".into()))?;
         let mut b = Int64Array::builder(s.len());
         for i in 0..s.len() {
             if s.is_null(i) {
@@ -284,14 +295,16 @@ fn create_set_clock_udf() -> ScalarUDF {
 
 /// `timefusion_advance_clock(delta_micros)` → new bigint micros.
 fn create_advance_clock_udf() -> ScalarUDF {
-    use datafusion::arrow::array::Int64Array;
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::{array::Int64Array, datatypes::DataType};
     let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
         let arr = match &args[0] {
             ColumnarValue::Array(a) => a.clone(),
             ColumnarValue::Scalar(s) => s.to_array()?,
         };
-        let d = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| DataFusionError::Execution("timefusion_advance_clock expects Int64".into()))?;
+        let d = arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| DataFusionError::Execution("timefusion_advance_clock expects Int64".into()))?;
         let mut b = Int64Array::builder(d.len());
         for i in 0..d.len() {
             if d.is_null(i) {
@@ -307,8 +320,7 @@ fn create_advance_clock_udf() -> ScalarUDF {
 
 /// `timefusion_now_micros()` → current clock value (frozen or wall).
 fn create_now_micros_udf() -> ScalarUDF {
-    use datafusion::arrow::array::Int64Array;
-    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::{array::Int64Array, datatypes::DataType};
     let fun: ScalarFunctionImplementation = Arc::new(move |_args: &[ColumnarValue]| {
         let v = crate::clock::now_micros();
         Ok(ColumnarValue::Array(Arc::new(Int64Array::from(vec![v]))))
@@ -1424,7 +1436,10 @@ impl<'a> BinaryAccessor<'a> {
         } else if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::BinaryViewArray>() {
             Ok(Self::View(a))
         } else {
-            Err(DataFusionError::Execution(format!("Variant {field} column is not Binary or BinaryView (got {:?})", col.data_type())))
+            Err(DataFusionError::Execution(format!(
+                "Variant {field} column is not Binary or BinaryView (got {:?})",
+                col.data_type()
+            )))
         }
     }
 
@@ -1465,8 +1480,12 @@ fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &serde_json_path::J
         .as_any()
         .downcast_ref::<StructArray>()
         .ok_or_else(|| DataFusionError::Execution("Expected Variant struct array".to_string()))?;
-    let metadata_col = struct_array.column_by_name("metadata").ok_or_else(|| DataFusionError::Execution("Variant missing metadata column".to_string()))?;
-    let value_col = struct_array.column_by_name("value").ok_or_else(|| DataFusionError::Execution("Variant missing value column".to_string()))?;
+    let metadata_col = struct_array
+        .column_by_name("metadata")
+        .ok_or_else(|| DataFusionError::Execution("Variant missing metadata column".to_string()))?;
+    let value_col = struct_array
+        .column_by_name("value")
+        .ok_or_else(|| DataFusionError::Execution("Variant missing value column".to_string()))?;
     let metadata_binary = BinaryAccessor::try_new(metadata_col, "metadata")?;
     let value_binary = BinaryAccessor::try_new(value_col, "value")?;
     let mut builder = BooleanArray::builder(struct_array.len());
@@ -1503,7 +1522,9 @@ fn simple_path_to_variant_path(raw: &str) -> Option<parquet_variant::VariantPath
                     }
                     i += 1;
                 }
-                if i == start { return None; }
+                if i == start {
+                    return None;
+                }
                 elements.push(VariantPathElement::field(std::borrow::Cow::Borrowed(&s[start..i])));
             }
             b'[' => {
@@ -1515,7 +1536,9 @@ fn simple_path_to_variant_path(raw: &str) -> Option<parquet_variant::VariantPath
                     }
                     i += 1;
                 }
-                if i >= bytes.len() || i == start { return None; }
+                if i >= bytes.len() || i == start {
+                    return None;
+                }
                 let idx: usize = s[start..i].parse().ok()?;
                 elements.push(VariantPathElement::index(idx));
                 i += 1; // skip ']'

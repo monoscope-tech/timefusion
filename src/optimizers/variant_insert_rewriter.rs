@@ -29,7 +29,7 @@ impl AnalyzerRule for VariantInsertRewriter {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        plan.transform_up(|node| rewrite_insert_node(node)).map(|t| t.data)
+        plan.transform_up(rewrite_insert_node).map(|t| t.data)
     }
 }
 
@@ -71,10 +71,10 @@ fn rewrite_insert_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
         if let Some(new_input) = new_input {
             let new_dml = LogicalPlan::Dml(DmlStatement {
-                op: dml.op.clone(),
-                table_name: dml.table_name.clone(),
-                target: dml.target.clone(),
-                input: Arc::new(new_input),
+                op:            dml.op.clone(),
+                table_name:    dml.table_name.clone(),
+                target:        dml.target.clone(),
+                input:         Arc::new(new_input),
                 output_schema: dml.output_schema.clone(),
             });
             return Ok(Transformed::yes(new_dml));
@@ -156,9 +156,9 @@ fn is_utf8_expr(expr: &Expr) -> bool {
     match expr {
         // Only non-null Utf8 literals should be wrapped with json_to_variant.
         // NULL literals must pass through (otherwise json_to_variant tries to parse "" and fails).
-        Expr::Literal(ScalarValue::Utf8(Some(_)), _)
-        | Expr::Literal(ScalarValue::Utf8View(Some(_)), _)
-        | Expr::Literal(ScalarValue::LargeUtf8(Some(_)), _) => true,
+        Expr::Literal(ScalarValue::Utf8(Some(_)), _) | Expr::Literal(ScalarValue::Utf8View(Some(_)), _) | Expr::Literal(ScalarValue::LargeUtf8(Some(_)), _) => {
+            true
+        }
         Expr::Cast(cast) => is_utf8_expr(&cast.expr),
         _ => false,
     }

@@ -8,11 +8,12 @@
 //! check on read. Good enough for low-frequency manifest writes; if multiple
 //! writers race, last-writer-wins (entries are idempotent upserts).
 
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjPath};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 pub const MANIFEST_PREFIX: &str = "index_manifests";
 pub const SCHEMA_VERSION: u32 = 1;
@@ -26,14 +27,14 @@ pub struct Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     /// Object-store path to the index tar.zst, or `None` if build failed.
-    pub index: Option<String>,
-    pub rows: u64,
-    pub built_at: DateTime<Utc>,
-    pub schema_version: u32,
+    pub index:                Option<String>,
+    pub rows:                 u64,
+    pub built_at:             DateTime<Utc>,
+    pub schema_version:       u32,
     pub min_timestamp_micros: Option<i64>,
     pub max_timestamp_micros: Option<i64>,
     /// Set when build failed; `index` will be None.
-    pub error: Option<String>,
+    pub error:                Option<String>,
     /// Parquet file URIs that this index covers. Populated from the Delta
     /// write commit's add-actions. Used by `gc_after_compaction` to detect
     /// stale entries: when any of these URIs is no longer live (i.e. it was
@@ -41,12 +42,15 @@ pub struct ManifestEntry {
     /// and can be dropped. Older entries built before this field existed
     /// will deserialize to an empty Vec.
     #[serde(default)]
-    pub covered_files: Vec<String>,
+    pub covered_files:        Vec<String>,
 }
 
 impl Default for Manifest {
     fn default() -> Self {
-        Self { version: SCHEMA_VERSION, entries: BTreeMap::new() }
+        Self {
+            version: SCHEMA_VERSION,
+            entries: BTreeMap::new(),
+        }
     }
 }
 
@@ -76,13 +80,7 @@ pub async fn save(store: &dyn ObjectStore, table: &str, project_id: &str, manife
 }
 
 /// Idempotent upsert: load, mutate, save.
-pub async fn upsert(
-    store: &dyn ObjectStore,
-    table: &str,
-    project_id: &str,
-    parquet_key: &str,
-    entry: ManifestEntry,
-) -> Result<()> {
+pub async fn upsert(store: &dyn ObjectStore, table: &str, project_id: &str, parquet_key: &str, entry: ManifestEntry) -> Result<()> {
     let mut m = load(store, table, project_id).await?;
     m.entries.insert(parquet_key.to_string(), entry);
     save(store, table, project_id, &m).await

@@ -3,62 +3,97 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayBuilder, ArrayRef, ListArray, RecordBatch, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray};
-use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::{
+    array::{Array, ArrayBuilder, ArrayRef, ListArray, RecordBatch, StringArray, StringBuilder, StructArray, TimestampMicrosecondArray},
+    buffer::OffsetBuffer,
+    datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit},
+};
 use parquet_variant_compute::VariantArrayBuilder;
 use parquet_variant_json::JsonToVariant;
-use tantivy::query::{BooleanQuery, Occur, QueryParser, RangeQuery, TermQuery};
-use tantivy::schema::IndexRecordOption;
-use tantivy::Term;
-
-use timefusion::schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig};
-use timefusion::tantivy_index::{build_for_table, build_in_memory, query_index, Hit};
+use tantivy::{
+    Term,
+    query::{BooleanQuery, Occur, QueryParser, RangeQuery, TermQuery},
+    schema::IndexRecordOption,
+};
+use timefusion::{
+    schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
+    tantivy_index::{Hit, build_for_table, build_in_memory, query_index},
+};
 
 fn ts_field(name: &str, nullable: bool) -> FieldDef {
-    FieldDef { name: name.into(), data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(), nullable, tantivy: None, dictionary: None, bloom_filter: false }
+    FieldDef {
+        name: name.into(),
+        data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(),
+        nullable,
+        tantivy: None,
+        dictionary: None,
+        bloom_filter: false,
+    }
 }
 fn utf8(name: &str, indexed: bool, tokenizer: &str) -> FieldDef {
     FieldDef {
-        name: name.into(),
-        data_type: "Utf8".into(),
-        nullable: true,
-        tantivy: indexed.then(|| TantivyFieldConfig { indexed: true, tokenizer: Some(tokenizer.into()), flatten: None }),
-        dictionary: None,
+        name:         name.into(),
+        data_type:    "Utf8".into(),
+        nullable:     true,
+        tantivy:      indexed.then(|| TantivyFieldConfig {
+            indexed:   true,
+            tokenizer: Some(tokenizer.into()),
+            flatten:   None,
+        }),
+        dictionary:   None,
         bloom_filter: false,
     }
 }
 fn list_utf8(name: &str, tokenizer: &str) -> FieldDef {
     FieldDef {
-        name: name.into(),
-        data_type: "List(Utf8)".into(),
-        nullable: false,
-        tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some(tokenizer.into()), flatten: None }),
-        dictionary: None,
+        name:         name.into(),
+        data_type:    "List(Utf8)".into(),
+        nullable:     false,
+        tantivy:      Some(TantivyFieldConfig {
+            indexed:   true,
+            tokenizer: Some(tokenizer.into()),
+            flatten:   None,
+        }),
+        dictionary:   None,
         bloom_filter: false,
     }
 }
 fn variant(name: &str, flatten: &str) -> FieldDef {
     FieldDef {
-        name: name.into(),
-        data_type: "Variant".into(),
-        nullable: true,
-        tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("default".into()), flatten: Some(flatten.into()) }),
-        dictionary: None,
+        name:         name.into(),
+        data_type:    "Variant".into(),
+        nullable:     true,
+        tantivy:      Some(TantivyFieldConfig {
+            indexed:   true,
+            tokenizer: Some("default".into()),
+            flatten:   Some(flatten.into()),
+        }),
+        dictionary:   None,
         bloom_filter: false,
     }
 }
 
 fn small_table() -> TableSchema {
     TableSchema {
-        table_name: "t".into(),
-        partitions: vec![],
-        sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
+        table_name:      "t".into(),
+        partitions:      vec![],
+        sorting_columns: vec![SortingColumnDef {
+            name:        "timestamp".into(),
+            descending:  false,
+            nulls_first: false,
+        }],
         z_order_columns: vec![],
-        time_column: None,
-        fields: vec![
+        time_column:     None,
+        fields:          vec![
             ts_field("timestamp", false),
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
+            FieldDef {
+                name:         "id".into(),
+                data_type:    "Utf8".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
+                bloom_filter: false,
+            },
             utf8("level", true, "raw"),
             utf8("message", true, "default"),
             list_utf8("summary", "default"),
@@ -68,6 +103,7 @@ fn small_table() -> TableSchema {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn batch(rows: &[(i64, &str, &str, &str, Vec<&str>, &str, &str)]) -> RecordBatch {
     // (timestamp, id, level, message, summary, body_json, attrs_json)
     let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from(rows.iter().map(|r| r.0).collect::<Vec<_>>()).with_timezone("UTC"));
@@ -175,9 +211,33 @@ fn schema_build_emits_reserved_and_user_fields() {
 fn build_and_query_term_and_phrase() {
     let table = small_table();
     let b = batch(&[
-        (1_000_000, "a", "INFO", "hello world", vec!["greeting"], r#"{"msg":"timeout occurred"}"#, r#"{"http":{"status":"200"}}"#),
-        (2_000_000, "b", "ERROR", "panic on shutdown", vec!["fatal", "shutdown"], r#"{"msg":"db connection lost"}"#, r#"{"http":{"status":"500"}}"#),
-        (3_000_000, "c", "INFO", "goodbye world", vec!["greeting"], r#"{"msg":"clean exit"}"#, r#"{"http":{"status":"200"}}"#),
+        (
+            1_000_000,
+            "a",
+            "INFO",
+            "hello world",
+            vec!["greeting"],
+            r#"{"msg":"timeout occurred"}"#,
+            r#"{"http":{"status":"200"}}"#,
+        ),
+        (
+            2_000_000,
+            "b",
+            "ERROR",
+            "panic on shutdown",
+            vec!["fatal", "shutdown"],
+            r#"{"msg":"db connection lost"}"#,
+            r#"{"http":{"status":"500"}}"#,
+        ),
+        (
+            3_000_000,
+            "c",
+            "INFO",
+            "goodbye world",
+            vec!["greeting"],
+            r#"{"msg":"clean exit"}"#,
+            r#"{"http":{"status":"200"}}"#,
+        ),
     ]);
     let (idx, built, stats) = build_in_memory(&table, std::slice::from_ref(&b)).unwrap();
     assert_eq!(stats.rows, 3);
@@ -188,7 +248,13 @@ fn build_and_query_term_and_phrase() {
     let level_field = built.user_fields.get("level").unwrap().field;
     let q = TermQuery::new(Term::from_field_text(level_field, "ERROR"), IndexRecordOption::Basic);
     let hits = query_index(&idx, &q, None).unwrap();
-    assert_eq!(hits, vec![Hit { timestamp_micros: 2_000_000, id: "b".into() }]);
+    assert_eq!(
+        hits,
+        vec![Hit {
+            timestamp_micros: 2_000_000,
+            id:               "b".into(),
+        }]
+    );
 
     // Phrase via QueryParser on default-tokenizer field (message)
     let msg_field = built.user_fields.get("message").unwrap().field;
@@ -256,10 +322,7 @@ fn variant_json_flatten_full_text() {
 #[test]
 fn list_utf8_is_joined_and_searchable() {
     let table = small_table();
-    let b = batch(&[
-        (1_000_000, "a", "INFO", "x", vec!["alpha", "beta"], "", ""),
-        (2_000_000, "b", "INFO", "y", vec!["gamma"], "", ""),
-    ]);
+    let b = batch(&[(1_000_000, "a", "INFO", "x", vec!["alpha", "beta"], "", ""), (2_000_000, "b", "INFO", "y", vec!["gamma"], "", "")]);
     let (idx, built, _) = build_in_memory(&table, std::slice::from_ref(&b)).unwrap();
     let summary = built.user_fields.get("summary").unwrap().field;
     let qp = QueryParser::for_index(&idx, vec![summary]);

@@ -1,49 +1,45 @@
-use crate::config::{self, AppConfig};
-use crate::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
-use crate::schema_loader::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type};
-use crate::statistics::DeltaStatisticsExtractor;
+use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use chrono::Utc;
-use datafusion::arrow::array::Array;
-use datafusion::common::Statistics;
-use datafusion::common::not_impl_err;
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
-use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
-use datafusion::physical_expr::expressions::{CastExpr, Column as PhysicalColumn};
-use datafusion::physical_plan::DisplayAs;
-use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::scalar::ScalarValue;
 use datafusion::{
+    arrow::{array::Array, record_batch::RecordBatch},
     catalog::Session,
-    datasource::{TableProvider, TableType},
+    common::{Statistics, not_impl_err},
+    datasource::{
+        TableProvider, TableType,
+        sink::{DataSink, DataSinkExec},
+    },
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{BinaryExpr, col, dml::InsertOp, lit},
-    physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream, union::UnionExec},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, col, dml::InsertOp, lit},
+    physical_expr::expressions::{CastExpr, Column as PhysicalColumn},
+    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream, projection::ProjectionExec, union::UnionExec},
+    scalar::ScalarValue,
 };
-use datafusion_datasource::memory::MemorySourceConfig;
-use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
 use datafusion_functions_json;
-use datafusion::arrow::record_batch::RecordBatch;
-use deltalake::PartitionFilter;
-use deltalake::datafusion::parquet::file::properties::WriterProperties;
-use deltalake::kernel::transaction::CommitProperties;
-use deltalake::operations::create::CreateBuilder;
-use deltalake::{DeltaTable, DeltaTableBuilder};
+use deltalake::{
+    DeltaTable, DeltaTableBuilder, PartitionFilter, datafusion::parquet::file::properties::WriterProperties, kernel::transaction::CommitProperties,
+    operations::create::CreateBuilder,
+};
 use futures::StreamExt;
 use instrumented_object_store::instrument_object_store;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use std::fmt;
-use std::{any::Any, collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::field::Empty;
-use tracing::{Instrument, debug, error, info, instrument, warn};
+use tracing::{Instrument, debug, error, field::Empty, info, instrument, warn};
 use url::Url;
+
+use crate::{
+    config::{self, AppConfig},
+    object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
+    schema_loader::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type},
+    statistics::DeltaStatisticsExtractor,
+};
 
 // Unified tables: one Delta table per schema (table_name -> DeltaTable)
 // All default projects share the same table, with project_id as a partition column
@@ -102,10 +98,8 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 /// via `.with_session_state(...)` overrides the default and keeps the
 /// read schema as declared.
 fn build_optimize_session_state() -> datafusion::execution::session_state::SessionState {
-    use datafusion::execution::SessionStateBuilder;
-    use datafusion::prelude::SessionConfig;
-    let cfg = SessionConfig::new()
-        .set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+    use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
+    let cfg = SessionConfig::new().set_bool("datafusion.execution.parquet.schema_force_view_types", false);
     SessionStateBuilder::new().with_config(cfg).with_default_features().build()
 }
 
@@ -115,9 +109,8 @@ fn build_optimize_session_state() -> datafusion::execution::session_state::Sessi
 /// Binary form. Called from `insert_records_batch` right before the
 /// Delta write so MemBuffer can keep its natural BinaryView layout
 /// (matches what parquet reads produce → no per-row read-side cast).
-fn cast_variant_columns_to_binary(batch: RecordBatch) -> RecordBatch {
-    use arrow::array::StructArray;
-    use arrow::compute::cast;
+fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
+    use arrow::{array::StructArray, compute::cast};
     use datafusion::arrow::datatypes::{DataType, Field};
     let schema = batch.schema();
     let mut new_cols = batch.columns().to_vec();
@@ -133,19 +126,21 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> RecordBatch {
         if !needs {
             continue;
         }
-        let Some(struct_arr) = batch.columns()[i].as_any().downcast_ref::<StructArray>() else { continue };
+        let Some(struct_arr) = batch.columns()[i].as_any().downcast_ref::<StructArray>() else {
+            continue;
+        };
         let casted_cols: Vec<arrow::array::ArrayRef> = struct_arr
             .columns()
             .iter()
             .zip(struct_fields.iter())
-            .map(|(arr, f)| {
+            .map(|(arr, f)| -> DFResult<arrow::array::ArrayRef> {
                 if matches!(f.data_type(), DataType::BinaryView) {
-                    cast(arr, &DataType::Binary).unwrap_or_else(|_| arr.clone())
+                    cast(arr, &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
                 } else {
-                    arr.clone()
+                    Ok(arr.clone())
                 }
             })
-            .collect();
+            .collect::<DFResult<_>>()?;
         let casted_fields: arrow::datatypes::Fields = struct_fields
             .iter()
             .map(|f| {
@@ -158,20 +153,17 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> RecordBatch {
             .collect::<Vec<_>>()
             .into();
         new_cols[i] = Arc::new(StructArray::new(casted_fields.clone(), casted_cols, struct_arr.nulls().cloned()));
-        new_fields[i] = Arc::new(
-            Field::new(field.name(), DataType::Struct(casted_fields), field.is_nullable())
-                .with_metadata(field.metadata().clone()),
-        );
+        new_fields[i] = Arc::new(Field::new(field.name(), DataType::Struct(casted_fields), field.is_nullable()).with_metadata(field.metadata().clone()));
         changed = true;
     }
     if !changed {
-        return batch;
+        return Ok(batch);
     }
     let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).unwrap_or(batch)
+    RecordBatch::try_new(new_schema, new_cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
-fn normalize_timestamp_tz(batch: RecordBatch) -> RecordBatch {
+fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
     use arrow::array::{TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
     use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
     let is_utc_offset = |tz: &str| matches!(tz, "+00:00" | "-00:00" | "+0000" | "-0000" | "Z" | "utc" | "Utc");
@@ -193,21 +185,24 @@ fn normalize_timestamp_tz(batch: RecordBatch) -> RecordBatch {
                 TimeUnit::Second => Arc::new(col.as_any().downcast_ref::<TimestampSecondArray>().expect(expect_msg).clone().with_timezone("UTC")),
             };
             new_cols[i] = retagged;
-            new_fields[i] = Arc::new(Field::new(field.name(), DataType::Timestamp(*unit, Some("UTC".into())), field.is_nullable()).with_metadata(field.metadata().clone()));
+            new_fields[i] =
+                Arc::new(Field::new(field.name(), DataType::Timestamp(*unit, Some("UTC".into())), field.is_nullable()).with_metadata(field.metadata().clone()));
             changed = true;
         }
     }
     if !changed {
-        return batch;
+        return Ok(batch);
     }
     let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).unwrap_or(batch)
+    RecordBatch::try_new(new_schema, new_cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
 }
 
 fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
-    use datafusion::arrow::array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray, StructArray};
-    use datafusion::arrow::compute::cast;
-    use datafusion::arrow::datatypes::{DataType, Field};
+    use datafusion::arrow::{
+        array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray, StructArray},
+        compute::cast,
+        datatypes::{DataType, Field},
+    };
     use parquet_variant_compute::VariantArrayBuilder;
     use parquet_variant_json::JsonToVariant;
 
@@ -233,10 +228,7 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
         let arr: StructArray = builder.build().into();
         let metadata = cast(arr.column(0), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         let value = cast(arr.column(1), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        let fields = vec![
-            Arc::new(Field::new("metadata", DataType::Binary, false)),
-            Arc::new(Field::new("value", DataType::Binary, false)),
-        ];
+        let fields = vec![Arc::new(Field::new("metadata", DataType::Binary, false)), Arc::new(Field::new("value", DataType::Binary, false))];
         Ok(StructArray::new(fields.into(), vec![metadata, value], arr.nulls().cloned()))
     };
 
@@ -245,17 +237,20 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
             continue;
         }
         let col = &columns[idx];
-        // Downcasts are guarded by the `DataType::*` match arm above.
+        // Downcasts are guarded by the `DataType::*` match arm above. If Arrow ever
+        // returns a different concrete array for the same logical type, surface as
+        // a DataFusionError instead of panicking on the INSERT path.
         let name = target_field.name();
+        let bad_downcast = |ty: &str| DataFusionError::Execution(format!("{ty} downcast failed for column {name}"));
         let converted: Option<ArrayRef> = match col.data_type() {
             DataType::Utf8View => Some(Arc::new(utf8_to_variant(Box::new(
-                col.as_any().downcast_ref::<StringViewArray>().unwrap_or_else(|| panic!("Utf8View downcast failed for column {name}")).iter(),
+                col.as_any().downcast_ref::<StringViewArray>().ok_or_else(|| bad_downcast("Utf8View"))?.iter(),
             ))?) as ArrayRef),
             DataType::Utf8 => Some(Arc::new(utf8_to_variant(Box::new(
-                col.as_any().downcast_ref::<StringArray>().unwrap_or_else(|| panic!("Utf8 downcast failed for column {name}")).iter(),
+                col.as_any().downcast_ref::<StringArray>().ok_or_else(|| bad_downcast("Utf8"))?.iter(),
             ))?) as ArrayRef),
             DataType::LargeUtf8 => Some(Arc::new(utf8_to_variant(Box::new(
-                col.as_any().downcast_ref::<LargeStringArray>().unwrap_or_else(|| panic!("LargeUtf8 downcast failed for column {name}")).iter(),
+                col.as_any().downcast_ref::<LargeStringArray>().ok_or_else(|| bad_downcast("LargeUtf8"))?.iter(),
             ))?) as ArrayRef),
             _ => None, // already Variant struct
         };
@@ -278,36 +273,36 @@ const COMPRESSION_TIER_KEY: &str = "timefusion.compression_tier";
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct StorageConfig {
-    project_id: String,
-    table_name: String,
-    s3_bucket: String,
-    s3_prefix: String,
-    s3_region: String,
-    s3_access_key_id: String,
+    project_id:           String,
+    table_name:           String,
+    s3_bucket:            String,
+    s3_prefix:            String,
+    s3_region:            String,
+    s3_access_key_id:     String,
     s3_secret_access_key: String,
-    s3_endpoint: Option<String>,
+    s3_endpoint:          Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Database {
-    config: Arc<AppConfig>,
+    config:                Arc<AppConfig>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
-    unified_tables: UnifiedTables,
+    unified_tables:        UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
     custom_project_tables: CustomProjectTables,
-    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
-    maintenance_shutdown: Arc<CancellationToken>,
-    config_pool: Option<PgPool>,
-    storage_configs: Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
-    default_s3_bucket: Option<String>,
-    default_s3_prefix: Option<String>,
-    default_s3_endpoint: Option<String>,
-    object_store_cache: Option<Arc<SharedFoyerCache>>,
-    statistics_extractor: Arc<DeltaStatisticsExtractor>,
+    batch_queue:           Option<Arc<crate::batch_queue::BatchQueue>>,
+    maintenance_shutdown:  Arc<CancellationToken>,
+    config_pool:           Option<PgPool>,
+    storage_configs:       Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
+    default_s3_bucket:     Option<String>,
+    default_s3_prefix:     Option<String>,
+    default_s3_endpoint:   Option<String>,
+    object_store_cache:    Option<Arc<SharedFoyerCache>>,
+    statistics_extractor:  Arc<DeltaStatisticsExtractor>,
     last_written_versions: Arc<RwLock<HashMap<(String, String), u64>>>,
-    buffered_layer: Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
-    tantivy_search: Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
-    tantivy_indexer: Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
+    buffered_layer:        Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
+    tantivy_search:        Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
+    tantivy_indexer:       Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
 }
 
 impl Database {
@@ -459,7 +454,7 @@ impl Database {
             return None;
         }
 
-        let foyer_config = FoyerCacheConfig::from_app_config(&cfg);
+        let foyer_config = FoyerCacheConfig::from_app_config(cfg);
         info!(
             "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, TTL: {}s)",
             foyer_config.memory_size_bytes / 1024 / 1024,
@@ -741,9 +736,7 @@ impl Database {
                         // Flatten unified + custom tables into one (name, table) list.
                         let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
                             db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
-                        targets.extend(
-                            db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())),
-                        );
+                        targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
                         // Cool tier first, then cold — order matters only at
                         // the cutoff boundary where files may need two hops.
                         for (name, table) in &targets {
@@ -875,13 +868,15 @@ impl Database {
 
     /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(self: Arc<Self>) -> SessionContext {
-        use crate::dml::DmlQueryPlanner;
-        use datafusion::config::ConfigOptions;
-        use datafusion::execution::SessionStateBuilder;
-        use datafusion::execution::context::SessionContext;
-        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-        use datafusion_tracing::{InstrumentationOptions, instrument_with_info_spans};
         use std::sync::Arc;
+
+        use datafusion::{
+            config::ConfigOptions,
+            execution::{SessionStateBuilder, context::SessionContext, runtime_env::RuntimeEnvBuilder},
+        };
+        use datafusion_tracing::{InstrumentationOptions, instrument_with_info_spans};
+
+        use crate::dml::DmlQueryPlanner;
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.catalog.information_schema", "true");
@@ -1045,9 +1040,11 @@ impl Database {
 
     /// Register PostgreSQL settings table for compatibility
     pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
-        use datafusion::arrow::array::StringViewArray;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::arrow::{
+            array::StringViewArray,
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8View, false),
@@ -1080,15 +1077,22 @@ impl Database {
 
     /// Register set_config UDF for PostgreSQL compatibility
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
-        use datafusion::arrow::array::{StringViewArray, StringViewBuilder};
-        use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
+        use datafusion::{
+            arrow::{
+                array::{StringViewArray, StringViewBuilder},
+                datatypes::DataType,
+            },
+            logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
+        };
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
-            let param_value_array = match &args[1] {
-                ColumnarValue::Array(array) => array.as_any().downcast_ref::<StringViewArray>().expect("set_config second arg must be a StringViewArray"),
-                _ => panic!("set_config second arg must be an array"),
+            let ColumnarValue::Array(array) = &args[1] else {
+                return Err(DataFusionError::Execution("set_config: second argument must be an array".into()));
             };
+            let param_value_array = array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .ok_or_else(|| DataFusionError::Execution(format!("set_config: second argument must be StringViewArray, got {:?}", array.data_type())))?;
 
             let mut builder = StringViewBuilder::new();
             for i in 0..param_value_array.len() {
@@ -1245,8 +1249,14 @@ impl Database {
             return Err(anyhow::anyhow!("No default S3 bucket configured for unified table '{}'", table_name));
         };
 
-        let prefix = self.default_s3_prefix.as_ref().unwrap();
-        let endpoint = self.default_s3_endpoint.as_ref().unwrap();
+        let prefix = self
+            .default_s3_prefix
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No default S3 prefix configured for unified table '{}'", table_name))?;
+        let endpoint = self
+            .default_s3_endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No default S3 endpoint configured for unified table '{}'", table_name))?;
         // Unified table path: s3://{bucket}/{prefix}/{table_name}/ (NO project_id subdirectory)
         let storage_uri = format!("s3://{}/{}/{}/?endpoint={}", bucket, prefix, table_name, endpoint);
         let storage_options = self.build_storage_options();
@@ -1460,9 +1470,9 @@ impl Database {
 
     /// Create an object store for the given URI and storage options
     pub async fn create_object_store(&self, storage_uri: &str, storage_options: &HashMap<String, String>) -> Result<Arc<dyn object_store::ObjectStore>> {
-        use object_store::aws::AmazonS3Builder;
-        use object_store::{BackoffConfig, ClientOptions, RetryConfig};
         use std::time::Duration;
+
+        use object_store::{BackoffConfig, ClientOptions, RetryConfig, aws::AmazonS3Builder};
 
         // Parse the S3 URI to extract bucket and prefix
         let url = Url::parse(storage_uri)?;
@@ -1470,12 +1480,12 @@ impl Database {
 
         // Configure retry with exponential backoff for transient network errors
         let retry_config = RetryConfig {
-            max_retries: 5,
+            max_retries:   5,
             retry_timeout: Duration::from_secs(180),
-            backoff: BackoffConfig {
+            backoff:       BackoffConfig {
                 init_backoff: Duration::from_millis(100),
-                max_backoff: Duration::from_secs(15),
-                base: 2.0,
+                max_backoff:  Duration::from_secs(15),
+                base:         2.0,
             },
         };
 
@@ -1572,7 +1582,7 @@ impl Database {
         // accepts `"UTC"`; without this normalisation the flush callback
         // path (which feeds MemBuffer batches straight into Delta) errors
         // out and data piles up in MemBuffer.
-        let batches: Vec<RecordBatch> = batches.into_iter().map(normalize_timestamp_tz).collect();
+        let batches: Vec<RecordBatch> = batches.into_iter().map(normalize_timestamp_tz).collect::<DFResult<Vec<_>>>()?;
 
         // Extract project_id from first batch if not provided
         let project_id = if project_id.is_empty() && !batches.is_empty() {
@@ -1614,7 +1624,7 @@ impl Database {
         // (matches what the parquet reader natively produces — no per-row
         // casts on read). Cast just-before-write so the Delta commit
         // accepts the schema.
-        let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect();
+        let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
 
         // Get or create the table
         let table_ref = self.get_or_create_table(&project_id, &table_name).await?;
@@ -1622,7 +1632,7 @@ impl Database {
         // Get the appropriate schema for this table
         let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
 
-        let writer_properties = self.create_writer_properties(&schema, self.config.parquet.timefusion_zstd_compression_level);
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
 
         // Retry logic for concurrent writes
         let max_retries = 5;
@@ -1745,7 +1755,7 @@ impl Database {
         // Full Z-order optimize runs every 30 min over a 48h window — promote
         // these rewrites to the "warm" tier so day-old data lands smaller on
         // disk without slowing the hot flush path.
-        let writer_properties = self.create_writer_properties(&schema, self.config.parquet.timefusion_zstd_level_warm);
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm);
 
         // Same trade-off as optimize_table_light: best-effort, don't pause
         // flushes (see comment there). Z-order full optimize is daily-ish,
@@ -1806,7 +1816,8 @@ impl Database {
                     // manifests in this table prefix. Today only the unified
                     // "default" path is exercised in practice; iterate over
                     // known custom projects too.
-                    let mut project_ids: Vec<String> = self.custom_project_tables.read().await.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone()).collect();
+                    let mut project_ids: Vec<String> =
+                        self.custom_project_tables.read().await.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone()).collect();
                     project_ids.push("default".to_string());
                     for pid in project_ids {
                         match svc.gc_after_compaction(&svc_table, &pid, &live_uris).await {
@@ -1841,13 +1852,7 @@ impl Database {
     /// would leave mixed tiers — the next sweep then sees the probe's tier
     /// and may skip, but the partition will be re-evaluated the day after.
     /// Acceptable for an idempotent daily job.
-    pub async fn recompress_partition(
-        &self,
-        table_ref: &Arc<RwLock<DeltaTable>>,
-        table_name: &str,
-        date: chrono::NaiveDate,
-        target_level: i32,
-    ) -> Result<()> {
+    pub async fn recompress_partition(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_level: i32) -> Result<()> {
         use deltalake::datafusion::parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
         use object_store::{ObjectStoreExt, path::Path as OsPath};
 
@@ -1898,7 +1903,10 @@ impl Database {
                 }
             }
             None => {
-                warn!("recompress probe: could not relativize {} against {}; rewriting anyway", probe_uri, table_prefix);
+                warn!(
+                    "recompress probe: could not relativize {} against {}; rewriting anyway",
+                    probe_uri, table_prefix
+                );
                 None
             }
         };
@@ -1912,10 +1920,16 @@ impl Database {
             return Ok(());
         }
 
-        info!("recompress: rewriting date={} table={} at zstd={} ({} files)", date_str, table_name, target_level, uris.len());
+        info!(
+            "recompress: rewriting date={} table={} at zstd={} ({} files)",
+            date_str,
+            table_name,
+            target_level,
+            uris.len()
+        );
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let writer_properties = self.create_writer_properties(&schema, target_level);
+        let writer_properties = self.create_writer_properties(schema, target_level);
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
@@ -1958,12 +1972,7 @@ impl Database {
     /// day's optimize is its own Delta commit so a mid-sweep failure leaves
     /// completed days at the new tier.
     pub async fn recompress_tier_window(
-        &self,
-        table_ref: &Arc<RwLock<DeltaTable>>,
-        table_name: &str,
-        age_min_days: u64,
-        age_max_days: u64,
-        target_level: i32,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, age_min_days: u64, age_max_days: u64, target_level: i32,
     ) -> Result<()> {
         let today = Utc::now().date_naive();
         for days_ago in age_min_days..age_max_days {
@@ -1981,7 +1990,7 @@ impl Database {
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?];
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let writer_properties = self.create_writer_properties(&schema, self.config.parquet.timefusion_zstd_compression_level);
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
 
         // Best-effort optimize: retry on OCC conflict but DO NOT hold the
         // flush lock. Earlier we wrapped this in `with_flush_paused` to
@@ -1998,13 +2007,8 @@ impl Database {
     /// a `BufferedWriteLayer` is active; the retry loop here remains as a
     /// safety net against bursts from `flush_all_now` or shutdown flushes.
     async fn optimize_table_light_inner(
-        &self,
-        table_ref: &Arc<RwLock<DeltaTable>>,
-        today: chrono::NaiveDate,
-        partition_filters: &[PartitionFilter],
-        target_size: i64,
-        writer_properties: &WriterProperties,
-        start_time: std::time::Instant,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, today: chrono::NaiveDate, partition_filters: &[PartitionFilter], target_size: i64,
+        writer_properties: &WriterProperties, start_time: std::time::Instant,
     ) -> Result<()> {
         const MAX_RETRIES: usize = 4;
         let mut last_err: Option<deltalake::DeltaTableError> = None;
@@ -2044,7 +2048,10 @@ impl Database {
                     let duration = start_time.elapsed();
                     info!(
                         "Light optimization completed in {:?} (attempt {}): {} files removed, {} files added",
-                        duration, attempt + 1, metrics.num_files_removed, metrics.num_files_added
+                        duration,
+                        attempt + 1,
+                        metrics.num_files_removed,
+                        metrics.num_files_added
                     );
                     let mut table = table_ref.write().await;
                     *table = new_table;
@@ -2178,15 +2185,12 @@ impl Database {
 /// Pure builder for parquet `WriterProperties` at a given compression tier.
 /// Lives outside `impl Database` so unit tests can exercise tier/encoding/bloom
 /// decisions without instantiating a Database (which needs S3/MinIO).
-fn build_writer_properties(
-    parquet_cfg: &crate::config::ParquetConfig,
-    schema: &crate::schema_loader::TableSchema,
-    zstd_level: i32,
-) -> WriterProperties {
-    use deltalake::datafusion::parquet::basic::{Compression, Encoding, ZstdLevel};
-    use deltalake::datafusion::parquet::file::metadata::KeyValue;
-    use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
-    use deltalake::datafusion::parquet::schema::types::ColumnPath;
+fn build_writer_properties(parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema_loader::TableSchema, zstd_level: i32) -> WriterProperties {
+    use deltalake::datafusion::parquet::{
+        basic::{Compression, Encoding, ZstdLevel},
+        file::{metadata::KeyValue, properties::EnabledStatistics},
+        schema::types::ColumnPath,
+    };
 
     let page_row_count_limit = parquet_cfg.timefusion_page_row_count_limit;
     let max_row_group_size = parquet_cfg.timefusion_max_row_group_size;
@@ -2200,8 +2204,7 @@ fn build_writer_properties(
     const BLOOM_NDV: u64 = 1_000_000;
 
     let sorting_columns_pq = schema.sorting_columns();
-    let sort_key_names: std::collections::HashSet<&str> =
-        schema.sorting_columns.iter().map(|c| c.name.as_str()).collect();
+    let sort_key_names: std::collections::HashSet<&str> = schema.sorting_columns.iter().map(|c| c.name.as_str()).collect();
 
     // Note: do NOT call `set_bloom_filter_fpp` at the global level — parquet-rs
     // treats any global bloom setter (other than `set_bloom_filter_enabled`)
@@ -2219,10 +2222,7 @@ fn build_writer_properties(
         .set_bloom_filter_enabled(false)
         .set_data_page_row_count_limit(page_row_count_limit)
         .set_sorting_columns(if sorting_columns_pq.is_empty() { None } else { Some(sorting_columns_pq) })
-        .set_key_value_metadata(Some(vec![KeyValue::new(
-            COMPRESSION_TIER_KEY.to_string(),
-            zstd_level.to_string(),
-        )]));
+        .set_key_value_metadata(Some(vec![KeyValue::new(COMPRESSION_TIER_KEY.to_string(), zstd_level.to_string())]));
 
     for field in &schema.fields {
         let dt = field.data_type.as_str();
@@ -2236,9 +2236,7 @@ fn build_writer_properties(
         } else if matches!(dt, "Int32" | "Int64" | "UInt32" | "UInt64") {
             builder = builder.set_column_encoding(col.clone(), Encoding::DELTA_BINARY_PACKED);
         } else if dt == "Utf8" && is_sort_key {
-            builder = builder
-                .set_column_encoding(col.clone(), Encoding::DELTA_BYTE_ARRAY)
-                .set_column_dictionary_enabled(col.clone(), false);
+            builder = builder.set_column_encoding(col.clone(), Encoding::DELTA_BYTE_ARRAY).set_column_dictionary_enabled(col.clone(), false);
         }
 
         // Explicit per-column dict opt-out (overrides defaults above only
@@ -2261,10 +2259,10 @@ fn build_writer_properties(
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
-    database: Arc<Database>,
-    schema: SchemaRef,
-    _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
-    table_name: String,
+    database:        Arc<Database>,
+    schema:          SchemaRef,
+    _batch_queue:    Option<Arc<crate::batch_queue::BatchQueue>>,
+    table_name:      String,
 }
 
 impl ProjectRoutingTable {
@@ -2473,10 +2471,7 @@ impl ProjectRoutingTable {
         // panics in physical planning. The session is a SessionState in
         // practice; clone the concrete type so we can hand an
         // `Arc<dyn Session + 'static>` to `with_session`.
-        let session_state = state
-            .as_any()
-            .downcast_ref::<datafusion::execution::context::SessionState>()
-            .cloned();
+        let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
         let provider = if let Some(ss) = session_state {
             table.table_provider().with_session(Arc::new(ss)).await
         } else {
@@ -2670,7 +2665,7 @@ impl DataSink for ProjectRoutingTable {
             debug!("write_all: received batch with {} rows", batch_rows);
             total_row_count += batch_rows;
             let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
-            let batch = normalize_timestamp_tz(batch);
+            let batch = normalize_timestamp_tz(batch)?;
             let converted = convert_variant_columns(batch, &target_schema)?;
             project_batches.entry(project_id).or_default().push(converted);
         }
@@ -2782,7 +2777,9 @@ impl TableProvider for ProjectRoutingTable {
         //    row in the snapshot that isn't in the pre-computed id set.
         let text_match_preds = crate::tantivy_index::udf::collect_text_matches(&optimized_filters);
         let mut tantivy_id_filter: Option<Expr> = None;
-        if !text_match_preds.is_empty() && let Some(svc) = self.database.tantivy_search() {
+        if !text_match_preds.is_empty()
+            && let Some(svc) = self.database.tantivy_search()
+        {
             use datafusion::logical_expr::{Expr, lit};
             let tcfg = &self.database.config().tantivy;
             let max_hits = tcfg.prefilter_max_hits();
@@ -2810,7 +2807,10 @@ impl TableProvider for ProjectRoutingTable {
                         break;
                     }
                     Err(e) => {
-                        warn!("tantivy search failed for {}/{}: {} — falling back to full scan", project_id, self.table_name, e);
+                        warn!(
+                            "tantivy search failed for {}/{}: {} — falling back to full scan",
+                            project_id, self.table_name, e
+                        );
                         crate::metrics::record_tantivy_prefilter_error();
                         abort_reason = Some("delta_error");
                         delta_any_usable = false;
@@ -2831,8 +2831,8 @@ impl TableProvider for ProjectRoutingTable {
                     } else {
                         crate::metrics::record_tantivy_prefilter_used();
                         tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
-                            expr: Box::new(datafusion::logical_expr::col("id")),
-                            list: ids.into_iter().map(lit).collect(),
+                            expr:    Box::new(datafusion::logical_expr::col("id")),
+                            list:    ids.into_iter().map(lit).collect(),
                             negated: false,
                         }));
                     }
@@ -2936,11 +2936,19 @@ impl TableProvider for ProjectRoutingTable {
         let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
         for (start, end) in &mem_ranges {
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
-            let below = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::Lt, right: ts_lit(*start) });
-            let at_or_above = Expr::BinaryExpr(BinaryExpr { left: ts_col(), op: Operator::GtEq, right: ts_lit(*end) });
+            let below = Expr::BinaryExpr(BinaryExpr {
+                left:  ts_col(),
+                op:    Operator::Lt,
+                right: ts_lit(*start),
+            });
+            let at_or_above = Expr::BinaryExpr(BinaryExpr {
+                left:  ts_col(),
+                op:    Operator::GtEq,
+                right: ts_lit(*end),
+            });
             delta_filters.push(Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(below),
-                op: Operator::Or,
+                left:  Box::new(below),
+                op:    Operator::Or,
                 right: Box::new(at_or_above),
             }));
         }
@@ -2975,17 +2983,27 @@ impl Drop for Database {
 
 #[cfg(test)]
 mod writer_properties_tests {
+    use deltalake::datafusion::parquet::{
+        basic::{Compression, ZstdLevel},
+        schema::types::ColumnPath,
+    };
+
     use super::*;
     use crate::schema_loader::{FieldDef, SortingColumnDef, TableSchema};
-    use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
-    use deltalake::datafusion::parquet::schema::types::ColumnPath;
 
     fn cfg() -> crate::config::ParquetConfig {
         serde_json::from_str("{}").unwrap()
     }
 
     fn field(name: &str, dt: &str) -> FieldDef {
-        FieldDef { name: name.into(), data_type: dt.into(), nullable: true, tantivy: None, dictionary: None, bloom_filter: false }
+        FieldDef {
+            name:         name.into(),
+            data_type:    dt.into(),
+            nullable:     true,
+            tantivy:      None,
+            dictionary:   None,
+            bloom_filter: false,
+        }
     }
 
     fn schema_with(fields: Vec<FieldDef>, sort: Vec<&str>) -> TableSchema {
@@ -2994,7 +3012,11 @@ mod writer_properties_tests {
             partitions: vec![],
             sorting_columns: sort
                 .into_iter()
-                .map(|n| SortingColumnDef { name: n.into(), descending: false, nulls_first: false })
+                .map(|n| SortingColumnDef {
+                    name:        n.into(),
+                    descending:  false,
+                    nulls_first: false,
+                })
                 .collect(),
             z_order_columns: vec![],
             fields,
@@ -3006,14 +3028,20 @@ mod writer_properties_tests {
     fn compression_level_drives_zstd() {
         for level in [3, 9, 15, 19] {
             let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), level);
-            assert_eq!(p.compression(&ColumnPath::from("anything")), Compression::ZSTD(ZstdLevel::try_new(level).unwrap()));
+            assert_eq!(
+                p.compression(&ColumnPath::from("anything")),
+                Compression::ZSTD(ZstdLevel::try_new(level).unwrap())
+            );
         }
     }
 
     #[test]
     fn invalid_zstd_level_falls_back() {
         let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 999);
-        assert_eq!(p.compression(&ColumnPath::from("x")), Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap()));
+        assert_eq!(
+            p.compression(&ColumnPath::from("x")),
+            Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap())
+        );
     }
 
     #[test]
@@ -3075,11 +3103,12 @@ mod writer_properties_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::AppConfig;
-    use crate::test_utils::test_helpers::*;
-    use serial_test::serial;
     use std::path::PathBuf;
+
+    use serial_test::serial;
+
+    use super::*;
+    use crate::{config::AppConfig, test_utils::test_helpers::*};
 
     /// Helper function to extract string value from array column, handling different string array types
     fn get_str(array: &dyn Array, idx: usize) -> String {

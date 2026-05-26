@@ -1,9 +1,12 @@
+use std::path::PathBuf;
+
 use arrow::array::RecordBatch;
-use arrow_ipc::reader::StreamReader;
-use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
+use arrow_ipc::{
+    reader::StreamReader,
+    writer::{IpcWriteOptions, StreamWriter},
+};
 use bincode::{Decode, Encode};
 use dashmap::DashSet;
-use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
 use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
@@ -70,11 +73,11 @@ impl TryFrom<u8> for WalOperation {
 #[derive(Debug, Encode, Decode)]
 pub struct WalEntry {
     pub timestamp_micros: i64,
-    pub project_id: String,
-    pub table_name: String,
-    pub operation: WalOperation,
+    pub project_id:       String,
+    pub table_name:       String,
+    pub operation:        WalOperation,
     #[bincode(with_serde)]
-    pub data: Vec<u8>,
+    pub data:             Vec<u8>,
 }
 
 impl WalEntry {
@@ -97,7 +100,7 @@ pub struct DeletePayload {
 #[derive(Debug, Encode, Decode)]
 pub struct UpdatePayload {
     pub predicate_sql: Option<String>,
-    pub assignments: Vec<(String, String)>,
+    pub assignments:   Vec<(String, String)>,
 }
 
 /// Number of walrus shards per logical (project_id, table_name) topic.
@@ -113,15 +116,15 @@ pub struct UpdatePayload {
 const WAL_SHARDS_PER_TOPIC_DEFAULT: usize = 4;
 
 pub struct WalManager {
-    wal: Walrus,
-    data_dir: PathBuf,
+    wal:              Walrus,
+    data_dir:         PathBuf,
     /// Logical topic strings ("{project_id}:{table_name}") — one entry per
     /// (project, table). Each maps to `shards_per_topic` walrus collections.
-    known_topics: DashSet<String>,
+    known_topics:     DashSet<String>,
     /// Per-topic round-robin counter chooses which shard the next batch is
     /// appended to. Topic-scoped (rather than global) so we don't penalize
     /// the cold-cache miss for an idle topic.
-    shard_counter: dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
+    shard_counter:    dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
     shards_per_topic: usize,
 }
 
@@ -161,7 +164,12 @@ impl WalManager {
         }
 
         let shards_per_topic = shards_per_topic.max(1);
-        info!("WAL initialized at {:?}, known topics: {}, shards/topic: {}", data_dir, known_topics.len(), shards_per_topic);
+        info!(
+            "WAL initialized at {:?}, known topics: {}, shards/topic: {}",
+            data_dir,
+            known_topics.len(),
+            shards_per_topic
+        );
         Ok(Self {
             wal,
             data_dir,
@@ -203,8 +211,9 @@ impl WalManager {
     /// Walrus's metadata budget is 62 bytes; 16 hex chars + a `-` + 2 digits
     /// shard suffix stays well under.
     fn walrus_topic_key(project_id: &str, table_name: &str, shard: usize) -> String {
-        use ahash::AHasher;
         use std::hash::{Hash, Hasher};
+
+        use ahash::AHasher;
         let mut hasher = AHasher::default();
         project_id.hash(&mut hasher);
         table_name.hash(&mut hasher);
@@ -217,10 +226,7 @@ impl WalManager {
     /// lock.
     fn pick_shard(&self, topic: &str) -> usize {
         use std::sync::atomic::Ordering;
-        let counter = self
-            .shard_counter
-            .entry(topic.to_string())
-            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+        let counter = self.shard_counter.entry(topic.to_string()).or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
         (counter.fetch_add(1, Ordering::Relaxed) as usize) % self.shards_per_topic
     }
 
@@ -282,7 +288,7 @@ impl WalManager {
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let payload = UpdatePayload {
             predicate_sql: predicate_sql.map(String::from),
-            assignments: assignments.to_vec(),
+            assignments:   assignments.to_vec(),
         };
         let entry = WalEntry::new(project_id, table_name, WalOperation::Update, bincode::encode_to_vec(&payload, BINCODE_CONFIG)?);
         self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
@@ -364,15 +370,16 @@ impl WalManager {
     where
         F: FnMut(WalEntry),
     {
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
+        use std::{cmp::Reverse, collections::BinaryHeap};
 
         let cutoff = since_timestamp_micros.unwrap_or(0);
         let mut total_entries = 0u64;
         let mut total_errors = 0usize;
 
         for topic in self.list_topics()? {
-            let Some((project_id, table_name)) = Self::parse_topic(&topic) else { continue };
+            let Some((project_id, table_name)) = Self::parse_topic(&topic) else {
+                continue;
+            };
 
             // Prime the heap with each shard's first eligible entry. Heap is
             // keyed by (timestamp, shard) so smaller timestamps come out first;
@@ -496,11 +503,11 @@ impl WalManager {
         let mut total_bytes = 0u64;
         if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
             for entry in entries.flatten() {
-                if let Ok(meta) = entry.metadata() {
-                    if meta.is_file() {
-                        file_count += 1;
-                        total_bytes += meta.len();
-                    }
+                if let Ok(meta) = entry.metadata()
+                    && meta.is_file()
+                {
+                    file_count += 1;
+                    total_bytes += meta.len();
                 }
             }
         }
@@ -522,14 +529,14 @@ fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
     if data.len() > MAX_BATCH_SIZE {
         return Err(WalError::BatchTooLarge {
             size: data.len(),
-            max: MAX_BATCH_SIZE,
+            max:  MAX_BATCH_SIZE,
         });
     }
-    let reader = StreamReader::try_new(std::io::Cursor::new(data), None)?;
-    for batch in reader {
-        return Ok(batch?);
+    let mut reader = StreamReader::try_new(std::io::Cursor::new(data), None)?;
+    match reader.next() {
+        Some(batch) => Ok(batch?),
+        None => Err(WalError::EmptyBatch),
     }
-    Err(WalError::EmptyBatch)
 }
 
 fn serialize_wal_entry(entry: &WalEntry) -> Result<Vec<u8>, WalError> {
@@ -547,13 +554,13 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
 
     if data[0..4] != WAL_MAGIC {
         return Err(WalError::UnsupportedVersion {
-            version: data[0],
+            version:  data[0],
             expected: WAL_VERSION,
         });
     }
     if data.len() < 6 || data[4] != WAL_VERSION {
         return Err(WalError::UnsupportedVersion {
-            version: data[4],
+            version:  data[4],
             expected: WAL_VERSION,
         });
     }
@@ -574,10 +581,14 @@ pub fn deserialize_update_payload(data: &[u8]) -> Result<UpdatePayload, WalError
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use arrow::array::{Int64Array, StringViewArray};
-    use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    use arrow::{
+        array::{Int64Array, StringViewArray},
+        datatypes::{DataType, Field, Schema},
+    };
+
+    use super::*;
 
     fn create_test_batch() -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
@@ -604,10 +615,10 @@ mod tests {
     fn test_wal_entry_serialization() {
         let entry = WalEntry {
             timestamp_micros: 1234567890,
-            project_id: "project-123".to_string(),
-            table_name: "test_table".to_string(),
-            operation: WalOperation::Insert,
-            data: vec![1, 2, 3, 4, 5],
+            project_id:       "project-123".to_string(),
+            table_name:       "test_table".to_string(),
+            operation:        WalOperation::Insert,
+            data:             vec![1, 2, 3, 4, 5],
         };
         let serialized = serialize_wal_entry(&entry).unwrap();
         let deserialized = deserialize_wal_entry(&serialized).unwrap();
@@ -637,7 +648,7 @@ mod tests {
     fn test_update_payload_serialization() {
         let payload = UpdatePayload {
             predicate_sql: Some("id = 1".to_string()),
-            assignments: vec![("name".to_string(), "'updated'".to_string())],
+            assignments:   vec![("name".to_string(), "'updated'".to_string())],
         };
         let serialized = bincode::encode_to_vec(&payload, BINCODE_CONFIG).unwrap();
         let deserialized = deserialize_update_payload(&serialized).unwrap();

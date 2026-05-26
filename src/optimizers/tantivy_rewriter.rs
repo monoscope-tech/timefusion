@@ -31,19 +31,30 @@
 //! cleanly to any tantivy primitive. Strings shorter than 3 chars on
 //! ngram3 columns fall through (no full trigram available).
 
-use datafusion::common::{
-    Result,
-    tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
 };
-use datafusion::config::ConfigOptions;
-use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, ScalarUDF, expr::Like, expr::ScalarFunction, lit};
-use datafusion::optimizer::AnalyzerRule;
-use datafusion::scalar::ScalarValue;
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
 
-use crate::tantivy_index::schema::{DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER};
-use crate::tantivy_index::udf::{TEXT_MATCH_NAME, TextMatchUdf};
+use datafusion::{
+    common::{
+        Result,
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
+    },
+    config::ConfigOptions,
+    logical_expr::{
+        BinaryExpr, Expr, LogicalPlan, Operator, ScalarUDF,
+        expr::{Like, ScalarFunction},
+        lit,
+    },
+    optimizer::AnalyzerRule,
+    scalar::ScalarValue,
+};
+
+use crate::tantivy_index::{
+    schema::{DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER},
+    udf::{TEXT_MATCH_NAME, TextMatchUdf},
+};
 
 /// Minimum literal length we'll accelerate on ngram3. Tantivy's 3-gram
 /// tokenizer produces no tokens for inputs shorter than `n` characters, so
@@ -62,7 +73,7 @@ impl AnalyzerRule for TantivyPredicateRewriter {
         if matches!(plan, LogicalPlan::Dml(_)) {
             return Ok(plan);
         }
-        Ok(plan.transform_down(|p| rewrite_node(p))?.data)
+        Ok(plan.transform_down(rewrite_node)?.data)
     }
 }
 
@@ -86,10 +97,10 @@ fn rewrite_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
 fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>) -> Result<Transformed<Expr>> {
     // Skip the children of a text_match call (already a tantivy predicate).
-    if let Expr::ScalarFunction(sf) = &expr {
-        if sf.func.name() == TEXT_MATCH_NAME {
-            return Ok(Transformed::new(expr, false, TreeNodeRecursion::Jump));
-        }
+    if let Expr::ScalarFunction(sf) = &expr
+        && sf.func.name() == TEXT_MATCH_NAME
+    {
+        return Ok(Transformed::new(expr, false, TreeNodeRecursion::Jump));
     }
     if let Some((column, query)) = match_indexed_predicate(&expr, indexed_columns) {
         let tm = text_match_call(column, query);
@@ -244,8 +255,8 @@ fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: bool)
     }
     Some(match (leading_wildcard, trailing_wildcard) {
         // Plain exact / prefix / suffix / infix matches.
-        (false, false) => out,                  // 'foo'
-        (false, true) => format!("{}*", out),   // 'foo%' (prefix)
+        (false, false) => out,                // 'foo'
+        (false, true) => format!("{}*", out), // 'foo%' (prefix)
         // Suffix-only and infix forms only meaningful on ngram3; for raw/
         // default tokenizers we'd be sending tantivy a query that matches
         // the substring as a whole token (it won't). Bail.
@@ -435,10 +446,10 @@ mod tests {
         // miss case variants; skip the rewrite.
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), RAW_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated: false,
-            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern: Box::new(lit("foo")),
-            escape_char: None,
+            negated:          false,
+            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern:          Box::new(lit("foo")),
+            escape_char:      None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols), None);
@@ -448,10 +459,10 @@ mod tests {
     fn match_ilike_substring_works_on_ngram3() {
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated: false,
-            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern: Box::new(lit("%foo%")),
-            escape_char: None,
+            negated:          false,
+            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern:          Box::new(lit("%foo%")),
+            escape_char:      None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols), Some(("c".into(), "foo".into())));

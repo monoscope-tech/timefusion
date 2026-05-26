@@ -27,41 +27,49 @@
 //! Invoked from the `plan_cache` miss path so every parsed plan goes
 //! through it once before being cached.
 
-use datafusion::common::tree_node::{Transformed, TreeNode};
-use datafusion::logical_expr::{Cast, Expr, LogicalPlan, Values};
+use datafusion::{
+    common::tree_node::{Transformed, TreeNode},
+    logical_expr::{Cast, Expr, LogicalPlan, Values},
+};
 use tracing::debug;
 
 pub fn rewrite_plan(plan: LogicalPlan) -> LogicalPlan {
-    let result = plan.clone().transform_up(|node| {
-        let LogicalPlan::Values(values) = node else {
-            return Ok(Transformed::no(node));
-        };
-        let schema = values.schema.clone();
-        let column_types: Vec<_> = schema.fields().iter().map(|f| f.data_type().clone()).collect();
-        let new_rows: Vec<Vec<Expr>> = values
-            .values
-            .iter()
-            .map(|row| {
-                row.iter().enumerate().map(|(col_idx, expr)| {
-                    let Some(target_ty) = column_types.get(col_idx).cloned() else {
-                        return expr.clone();
-                    };
-                    let Expr::Placeholder(_) = expr else {
-                        return expr.clone();
-                    };
-                    // Always wrap in Cast. Even if the Placeholder's inferred
-                    // `field` already has a matching type, that information
-                    // is only set reliably for row-1 placeholders in a
-                    // multi-row VALUES; row-2+ get `field: None` and so
-                    // `get_parameter_types()` reports them as unknown. Adding
-                    // the explicit Cast forces extract_placeholder_cast_types
-                    // to pick up every placeholder.
-                    Expr::Cast(Cast::new(Box::new(expr.clone()), target_ty))
-                }).collect()
-            })
-            .collect();
-        Ok(Transformed::yes(LogicalPlan::Values(Values { schema, values: new_rows })))
-    }).map(|t| t.data);
+    let result = plan
+        .clone()
+        .transform_up(|node| {
+            let LogicalPlan::Values(values) = node else {
+                return Ok(Transformed::no(node));
+            };
+            let schema = values.schema.clone();
+            let column_types: Vec<_> = schema.fields().iter().map(|f| f.data_type().clone()).collect();
+            let new_rows: Vec<Vec<Expr>> = values
+                .values
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .enumerate()
+                        .map(|(col_idx, expr)| {
+                            let Some(target_ty) = column_types.get(col_idx).cloned() else {
+                                return expr.clone();
+                            };
+                            let Expr::Placeholder(_) = expr else {
+                                return expr.clone();
+                            };
+                            // Always wrap in Cast. Even if the Placeholder's inferred
+                            // `field` already has a matching type, that information
+                            // is only set reliably for row-1 placeholders in a
+                            // multi-row VALUES; row-2+ get `field: None` and so
+                            // `get_parameter_types()` reports them as unknown. Adding
+                            // the explicit Cast forces extract_placeholder_cast_types
+                            // to pick up every placeholder.
+                            Expr::Cast(Cast::new(Box::new(expr.clone()), target_ty))
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(Transformed::yes(LogicalPlan::Values(Values { schema, values: new_rows })))
+        })
+        .map(|t| t.data);
     match result {
         Ok(p) => p,
         Err(e) => {

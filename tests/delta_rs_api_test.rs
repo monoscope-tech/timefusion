@@ -1,9 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use datafusion::arrow::array::{Array, AsArray, LargeStringArray, StringArray, StringViewArray};
 use serial_test::serial;
-use std::sync::Arc;
-use timefusion::database::Database;
-use timefusion::test_utils::test_helpers::*;
+use timefusion::{database::Database, test_utils::test_helpers::*};
 
 fn get_str(array: &dyn Array, idx: usize) -> String {
     if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {

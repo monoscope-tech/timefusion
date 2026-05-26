@@ -9,16 +9,17 @@ pub fn init_test_logging() {
 }
 
 pub mod test_helpers {
-    use crate::config::AppConfig;
-    use crate::schema_loader::get_default_schema;
+    use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
     use arrow_json::ReaderBuilder;
-    use datafusion::arrow::compute::cast;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::{
+        compute::cast,
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
     use serde_json::{Value, json};
-    use std::collections::HashMap;
-    use std::path::PathBuf;
-    use std::sync::Arc;
+
+    use crate::{config::AppConfig, schema_loader::get_default_schema};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum BufferMode {
@@ -27,14 +28,14 @@ pub mod test_helpers {
     }
 
     pub struct TestConfigBuilder {
-        test_name: String,
+        test_name:   String,
         buffer_mode: BufferMode,
     }
 
     impl TestConfigBuilder {
         pub fn new(test_name: &str) -> Self {
             Self {
-                test_name: test_name.to_string(),
+                test_name:   test_name.to_string(),
                 buffer_mode: BufferMode::Enabled,
             }
         }
