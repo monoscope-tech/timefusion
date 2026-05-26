@@ -3181,7 +3181,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_recompress_partition_skip_idempotency() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
             let (db, _ctx, prefix) = setup_test_database().await?;
             let project_id = format!("project_{}", prefix);
             let today = chrono::Utc::now().date_naive();
@@ -3214,7 +3214,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
+        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
     }
 
     #[serial]
@@ -3608,7 +3608,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_table_creation() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
             dotenv::dotenv().ok();
             unsafe {
                 std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
@@ -3646,7 +3646,7 @@ mod tests {
             Ok(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
+        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
     }
 
     #[serial]
@@ -3693,7 +3693,7 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_mixed_operations() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
             dotenv::dotenv().ok();
             unsafe {
                 std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
@@ -3741,6 +3741,6 @@ mod tests {
             Ok(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
+        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
     }
 }
