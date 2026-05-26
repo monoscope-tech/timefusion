@@ -6,22 +6,27 @@
 FROM rust:1.89-slim-bullseye AS builder
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies. protoc is required by tonic-prost-build (build.rs).
 RUN apt-get update && \
-    apt-get install -y pkg-config libssl-dev && \
+    apt-get install -y pkg-config libssl-dev protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy Cargo manifests and cache dependencies
-COPY Cargo.toml Cargo.lock ./
+# Copy Cargo manifests, build.rs, and proto files (needed for build.rs to run).
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto/ proto/
 
-# Create dummy files to allow dependency caching
+# Create dummy bench files (one per [[bench]] in Cargo.toml) and a dummy main
+# to allow dependency caching without the full source tree.
 RUN mkdir src && echo "fn main() {}" > src/main.rs && \
-    mkdir benches && echo "fn main() {}" > benches/core_benchmarks.rs
+    mkdir benches && \
+    echo "fn main() {}" > benches/core_benchmarks.rs && \
+    echo "fn main() {}" > benches/tantivy_benchmarks.rs && \
+    echo "fn main() {}" > benches/sort_layout_benchmarks.rs
 
 # Build a dummy release binary (to cache dependencies)
 RUN cargo build --release
 
-# Copy the full source code, including dashboard.html
+# Copy the full source code
 COPY src/ src/
 COPY schemas/ schemas/
 
