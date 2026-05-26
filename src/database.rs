@@ -3541,7 +3541,9 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn test_concurrent_writes_same_project() -> Result<()> {
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        // Locally <3s; CI's MinIO + fresh Delta-table create-on-write under 3-way
+        // concurrent contention regularly exceeds 60s on the GHA runner. Headroom.
+        tokio::time::timeout(std::time::Duration::from_secs(180), async {
             dotenv::dotenv().ok();
             unsafe {
                 std::env::set_var("AWS_S3_BUCKET", "timefusion-tests");
@@ -3578,7 +3580,7 @@ mod tests {
             Ok(())
         })
         .await
-        .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
+        .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
     }
 
     #[serial]
