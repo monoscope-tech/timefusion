@@ -967,6 +967,10 @@ impl Database {
         let analyzer_rules: Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> = vec![
             Arc::new(datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction::new()),
             Arc::new(crate::optimizers::VariantInsertRewriter),
+            // Tantivy predicate rewriter runs BEFORE TypeCoercion so the
+            // injected `text_match(col, lit)` calls get coerced like any
+            // other UDF args (Utf8 vs Utf8View etc).
+            Arc::new(crate::optimizers::TantivyPredicateRewriter),
             Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
             Arc::new(crate::optimizers::VariantSelectRewriter),
         ];
@@ -2771,16 +2775,28 @@ impl TableProvider for ProjectRoutingTable {
             let preds = crate::tantivy_index::udf::collect_text_matches(&optimized_filters);
             if !preds.is_empty() {
                 use datafusion::logical_expr::{Expr, lit};
-                // `all_ids = None` means we have no authoritative prefilter
-                // (some index was missing or search failed). Treat as full
-                // scan; the text_match UDF post-filter preserves correctness.
+                let tcfg = &self.database.config().tantivy;
+                let max_hits = tcfg.prefilter_max_hits();
+                let min_sel_pct = tcfg.prefilter_min_selectivity_pct() as u64;
+                crate::metrics::record_tantivy_prefilter_attempt();
+
                 let mut all_ids: Option<Vec<String>> = None;
                 let mut any_index = false;
+                let mut abort_reason: Option<&'static str> = None;
                 for p in &preds {
-                    match svc.search(&self.table_name, &project_id, &p.column, &p.query).await {
-                        Ok(Some(hits)) => {
+                    match svc.search_with_stats(&self.table_name, &project_id, &p.column, &p.query, max_hits).await {
+                        Ok(Some(result)) => {
+                            // Selectivity cutoff: if matches >= min_sel_pct of indexed
+                            // rows, the IN-list won't prune enough to be worth the
+                            // round-trip. Bail; original predicate still applies.
+                            let hit_count = result.hits.len() as u64;
+                            if result.indexed_rows > 0 && hit_count * 100 >= result.indexed_rows * min_sel_pct {
+                                abort_reason = Some("low_selectivity");
+                                any_index = false;
+                                break;
+                            }
                             any_index = true;
-                            let ids: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+                            let ids: Vec<String> = result.hits.into_iter().map(|h| h.id).collect();
                             all_ids = Some(match all_ids.take() {
                                 None => ids,
                                 Some(prev) => {
@@ -2790,14 +2806,17 @@ impl TableProvider for ProjectRoutingTable {
                             });
                         }
                         Ok(None) => {
-                            // No usable index for this predicate — full scan + UDF post-filter.
-                            all_ids = None;
+                            // Either no usable index, or the hit cap was exceeded.
+                            // Either way fall back; the UDF / original predicate
+                            // post-filter preserves correctness.
+                            abort_reason = Some("no_index_or_cap_exceeded");
                             any_index = false;
                             break;
                         }
                         Err(e) => {
                             warn!("tantivy search failed for {}/{}: {} — falling back to full scan", project_id, self.table_name, e);
-                            all_ids = None;
+                            crate::metrics::record_tantivy_prefilter_error();
+                            abort_reason = Some("error");
                             any_index = false;
                             break;
                         }
@@ -2805,11 +2824,17 @@ impl TableProvider for ProjectRoutingTable {
                 }
                 if any_index {
                     if let Some(ids) = all_ids {
+                        crate::metrics::record_tantivy_prefilter_used();
                         tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
                             expr: Box::new(datafusion::logical_expr::col("id")),
                             list: ids.into_iter().map(lit).collect(),
                             negated: false,
                         }));
+                    }
+                } else {
+                    crate::metrics::record_tantivy_prefilter_skipped();
+                    if let Some(reason) = abort_reason {
+                        debug!("Tantivy prefilter skipped for {}/{}: {}", project_id, self.table_name, reason);
                     }
                 }
             }

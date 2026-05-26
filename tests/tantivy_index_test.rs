@@ -55,6 +55,7 @@ fn small_table() -> TableSchema {
         partitions: vec![],
         sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
         z_order_columns: vec![],
+        time_column: None,
         fields: vec![
             ts_field("timestamp", false),
             FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },

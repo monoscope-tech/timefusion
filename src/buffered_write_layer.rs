@@ -200,11 +200,13 @@ impl BufferedWriteLayer {
         } else {
             self.config.cache.memory_size_bytes() + self.config.cache.metadata_memory_size_bytes()
         };
-        let tantivy_peak = if self.config.tantivy.enabled() {
-            // Each in-flight flush spawns one tantivy writer with WRITER_HEAP_BYTES.
-            crate::tantivy_index::builder::WRITER_HEAP_BYTES * self.config.buffer.flush_parallelism()
-        } else {
+        // Each in-flight flush may spawn one tantivy writer with WRITER_HEAP_BYTES.
+        // Always reserve the peak when there's at least one indexed table — cheaper
+        // to slightly over-reserve than to OOM on a flush burst.
+        let tantivy_peak = if self.config.tantivy.indexed_tables().is_empty() {
             0
+        } else {
+            crate::tantivy_index::builder::WRITER_HEAP_BYTES * self.config.buffer.flush_parallelism()
         };
         let reserved = foyer.saturating_add(tantivy_peak);
         // Always leave at least a 64MB working budget for MemBuffer so a

@@ -1,6 +1,8 @@
+mod tantivy_rewriter;
 mod variant_insert_rewriter;
 mod variant_select_rewriter;
 
+pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;
 pub use variant_select_rewriter::VariantSelectRewriter;
 

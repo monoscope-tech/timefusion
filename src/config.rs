@@ -192,44 +192,72 @@ const_default!(d_tantivy_max_index_mb: u64 = 64);
 const_default!(d_tantivy_cache_disk_gb: u64 = 4);
 const_default!(d_tantivy_zstd_level: i32 = 19);
 const_default!(d_tantivy_min_files: usize = 2);
+const_default!(d_tantivy_prefilter_max_hits: usize = 100_000);
+const_default!(d_tantivy_prefilter_min_selectivity_pct: u32 = 50);
 
-/// Tantivy sidecar-index configuration. Off by default; opt in per-table.
+/// Tantivy sidecar-index configuration. Indexing is always-on whenever a
+/// schema declares `tantivy.indexed: true` on at least one field. The
+/// optional `timefusion_tantivy_indexed_tables` override is additive (for
+/// dynamic tables not in the static schema registry).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TantivyConfig {
-    #[serde(default)]
-    pub timefusion_tantivy_enabled: bool,
     #[serde(default = "d_tantivy_max_index_mb")]
     pub timefusion_tantivy_max_index_size_mb: u64,
     #[serde(default = "d_tantivy_cache_disk_gb")]
     pub timefusion_tantivy_cache_disk_gb: u64,
     #[serde(default = "d_tantivy_zstd_level")]
     pub timefusion_tantivy_compression_level: i32,
-    /// Comma-separated list of tables to index, e.g. "otel_logs_and_spans".
+    /// Optional comma-separated override list, e.g. "otel_logs_and_spans".
+    /// Additive to the schema-registry auto-discovery — useful for
+    /// dynamically-created tables that don't have a YAML schema.
     #[serde(default)]
     pub timefusion_tantivy_indexed_tables: Option<String>,
     #[serde(default = "d_tantivy_min_files")]
     pub timefusion_tantivy_min_files_for_pushdown: usize,
+    /// If a tantivy prefilter would produce more than this many hits, skip
+    /// the `id IN (...)` pushdown entirely — the IN-list itself becomes the
+    /// bottleneck above this point. Default 100k.
+    #[serde(default = "d_tantivy_prefilter_max_hits")]
+    pub timefusion_tantivy_prefilter_max_hits: usize,
+    /// If a tantivy prefilter selects more than this percentage of the
+    /// indexed rows, the pushdown isn't worth the round-trip; skip it and
+    /// let Delta scan with the original predicate. Default 50 (%).
+    #[serde(default = "d_tantivy_prefilter_min_selectivity_pct")]
+    pub timefusion_tantivy_prefilter_min_selectivity_pct: u32,
 }
 
 impl TantivyConfig {
-    pub fn enabled(&self) -> bool {
-        self.timefusion_tantivy_enabled
-    }
+    /// Tables to index: union of (a) schemas with `tantivy.indexed: true`
+    /// on any field, and (b) the override env list. Walked once per call;
+    /// callers should cache if hot.
     pub fn indexed_tables(&self) -> Vec<String> {
-        self.timefusion_tantivy_indexed_tables
-            .as_deref()
-            .unwrap_or("")
-            .split(',')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect()
+        use std::collections::BTreeSet;
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        for name in crate::schema_loader::registry().list_tables() {
+            if let Some(schema) = crate::schema_loader::registry().get(&name) {
+                if schema.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)) {
+                    set.insert(name);
+                }
+            }
+        }
+        if let Some(csv) = self.timefusion_tantivy_indexed_tables.as_deref() {
+            for t in csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                set.insert(t.to_string());
+            }
+        }
+        set.into_iter().collect()
     }
     pub fn is_table_indexed(&self, table: &str) -> bool {
-        self.enabled() && self.indexed_tables().iter().any(|t| t == table)
+        self.indexed_tables().iter().any(|t| t == table)
     }
     pub fn compression_level(&self) -> i32 {
         self.timefusion_tantivy_compression_level
+    }
+    pub fn prefilter_max_hits(&self) -> usize {
+        self.timefusion_tantivy_prefilter_max_hits.max(1)
+    }
+    pub fn prefilter_min_selectivity_pct(&self) -> u32 {
+        self.timefusion_tantivy_prefilter_min_selectivity_pct.min(100)
     }
 }
 

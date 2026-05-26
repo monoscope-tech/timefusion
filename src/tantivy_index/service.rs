@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use object_store::ObjectStore;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -25,11 +26,35 @@ use crate::tantivy_index::store;
 pub struct TantivyIndexService {
     pub object_store: Arc<dyn ObjectStore>,
     pub config: Arc<TantivyConfig>,
+    /// Max `max_timestamp_micros` across every index this process has
+    /// successfully published. Feeds the `index_lag_seconds` gauge. Loaded
+    /// from manifests on first observation (lazy) and updated after each
+    /// successful build_and_publish.
+    newest_indexed_micros: AtomicI64,
 }
 
 impl TantivyIndexService {
     pub fn new(object_store: Arc<dyn ObjectStore>, config: Arc<TantivyConfig>) -> Self {
-        Self { object_store, config }
+        Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN) }
+    }
+
+    /// Newest indexed timestamp seen so far (microseconds). `None` if the
+    /// service has never published or warm-loaded any index.
+    pub fn newest_indexed_micros(&self) -> Option<i64> {
+        let v = self.newest_indexed_micros.load(Ordering::Relaxed);
+        if v == i64::MIN { None } else { Some(v) }
+    }
+
+    fn observe_newest(&self, ts_micros: Option<i64>) {
+        if let Some(ts) = ts_micros {
+            let mut cur = self.newest_indexed_micros.load(Ordering::Relaxed);
+            while ts > cur {
+                match self.newest_indexed_micros.compare_exchange_weak(cur, ts, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(v) => cur = v,
+                }
+            }
+        }
     }
 
     /// Build the callback to attach via `BufferedWriteLayer::with_tantivy_indexer`.
@@ -92,6 +117,7 @@ impl TantivyIndexService {
             covered_files: added_files,
         };
         manifest::upsert(self.object_store.as_ref(), table_name, project_id, &key, entry).await?;
+        self.observe_newest(stats.max_timestamp_micros);
         Ok(())
     }
 }
