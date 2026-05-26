@@ -106,6 +106,7 @@ const_default!(d_flush_interval: u64 = 600);
 const_default!(d_retention_mins: u64 = 70);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
+const_default!(d_wal_shards_per_topic: usize = 4);
 const_default!(d_shutdown_timeout: u64 = 5);
 const_default!(d_wal_corruption_threshold: usize = 10);
 const_default!(d_flush_parallelism: usize = 4);
@@ -378,6 +379,10 @@ pub struct BufferConfig {
     pub timefusion_bucket_duration_secs: u64,
     #[serde(default = "d_pressure_flush_pct")]
     pub timefusion_pressure_flush_pct: u32,
+    /// WAL shards per (project, table) topic. Higher = more append parallelism
+    /// at the cost of O(shards) recovery memory and more file handles.
+    #[serde(default = "d_wal_shards_per_topic")]
+    pub timefusion_wal_shards_per_topic: usize,
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
@@ -400,6 +405,9 @@ impl BufferConfig {
     }
     pub fn max_memory_mb(&self) -> usize {
         self.timefusion_buffer_max_memory_mb.max(64)
+    }
+    pub fn wal_shards_per_topic(&self) -> usize {
+        self.timefusion_wal_shards_per_topic.max(1)
     }
     pub fn wal_corruption_threshold(&self) -> usize {
         self.timefusion_wal_corruption_threshold

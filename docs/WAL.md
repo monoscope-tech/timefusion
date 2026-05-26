@@ -30,7 +30,7 @@ Client INSERT
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ Byte 0-3:  WAL_MAGIC [0x57, 0x41, 0x4C, 0x32] ("WAL2")       │
-│ Byte 4:    VERSION (128)                                     │
+│ Byte 4:    VERSION (130)                                     │
 │ Byte 5:    OPERATION (0=Insert, 1=Delete, 2=Update)          │
 │ Byte 6+:   BINCODE_PAYLOAD (WalEntry)                        │
 └──────────────────────────────────────────────────────────────┘
@@ -200,7 +200,7 @@ Prevents unbounded memory allocation from corrupted or malicious WAL data.
 
 ### Version Detection
 
-The version byte (128) is greater than any valid operation byte (0-2), allowing safe format detection:
+The version byte (currently 130, ≥ 128) is greater than any valid operation byte (0-2), allowing safe format detection. When the on-disk version is older than the build, recovery emits a `warn!` and rejects the entry as `UnsupportedVersion`; operators should wipe `${TIMEFUSION_DATA_DIR}/wal` or roll back the binary.
 
 ```rust
 fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {

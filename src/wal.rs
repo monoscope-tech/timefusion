@@ -109,7 +109,7 @@ pub struct UpdatePayload {
 /// timestamp order during recovery.
 ///
 /// 4 is a defensible default for a developer/single-host workload; production
-/// deployments can override via `TIMEFUSION_WAL_SHARDS_PER_TOPIC`.
+/// deployments override via `BufferConfig::timefusion_wal_shards_per_topic`.
 const WAL_SHARDS_PER_TOPIC_DEFAULT: usize = 4;
 
 pub struct WalManager {
@@ -135,6 +135,10 @@ impl WalManager {
     }
 
     pub fn with_fsync_mode(data_dir: PathBuf, mode: crate::config::WalFsyncMode) -> Result<Self, WalError> {
+        Self::with_fsync_mode_and_shards(data_dir, mode, WAL_SHARDS_PER_TOPIC_DEFAULT)
+    }
+
+    pub fn with_fsync_mode_and_shards(data_dir: PathBuf, mode: crate::config::WalFsyncMode, shards_per_topic: usize) -> Result<Self, WalError> {
         std::fs::create_dir_all(&data_dir)?;
 
         let schedule = match mode {
@@ -156,12 +160,7 @@ impl WalManager {
             }
         }
 
-        let shards_per_topic = std::env::var("TIMEFUSION_WAL_SHARDS_PER_TOPIC")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 1)
-            .unwrap_or(WAL_SHARDS_PER_TOPIC_DEFAULT);
-
+        let shards_per_topic = shards_per_topic.max(1);
         info!("WAL initialized at {:?}, known topics: {}, shards/topic: {}", data_dir, known_topics.len(), shards_per_topic);
         Ok(Self {
             wal,
@@ -317,6 +316,14 @@ impl WalManager {
                     Ok(Some(entry_data)) => match deserialize_wal_entry(&entry_data.data) {
                         Ok(entry) if entry.timestamp_micros >= cutoff => results.push(entry),
                         Ok(_) => {} // Skip old entries
+                        Err(e @ WalError::UnsupportedVersion { .. }) => {
+                            warn!(
+                                "WAL on-disk version mismatch on shard {} ({e}); wipe \
+                                 ${{TIMEFUSION_DATA_DIR}}/wal or run the matching binary version",
+                                shard
+                            );
+                            error_count += 1;
+                        }
                         Err(e) => {
                             error!("WAL CORRUPTION on shard {}: undeserializable entry: {}", shard, e);
                             error_count += 1;
@@ -413,6 +420,14 @@ impl WalManager {
                 Ok(Some(d)) => match deserialize_wal_entry(&d.data) {
                     Ok(entry) if entry.timestamp_micros >= cutoff => return Some(entry),
                     Ok(_) => continue, // drop pre-cutoff
+                    Err(e @ WalError::UnsupportedVersion { .. }) => {
+                        warn!(
+                            "WAL on-disk version mismatch on shard {} ({e}); wipe \
+                             ${{TIMEFUSION_DATA_DIR}}/wal or run the matching binary version",
+                            key
+                        );
+                        *errors += 1;
+                    }
                     Err(e) => {
                         error!("WAL CORRUPTION on shard {}: undeserializable entry: {}", key, e);
                         *errors += 1;
