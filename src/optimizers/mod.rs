@@ -17,10 +17,14 @@ pub mod time_range_partition_pruner {
     /// Extract date from timestamp filter for partition pruning.
     /// Accepts any timestamp unit — pgwire literals arrive as Microsecond, not Nanosecond,
     /// so missing units silently disabled date pruning for point lookups.
-    pub fn timestamp_to_date_filter(expr: &Expr) -> Option<Expr> {
+    ///
+    /// `time_column` is the schema-declared time column name (e.g. `"timestamp"`,
+    /// `"event_time"`). Non-matching columns are skipped — pruning only fires for
+    /// the table's declared time column.
+    pub fn timestamp_to_date_filter(expr: &Expr, time_column: &str) -> Option<Expr> {
         let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else { return None };
         let Expr::Column(col) = left.as_ref() else { return None };
-        if col.name != "timestamp" {
+        if col.name != time_column {
             return None;
         }
         let Expr::Literal(scalar, _) = right.as_ref() else { return None };

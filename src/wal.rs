@@ -318,7 +318,7 @@ impl WalManager {
                         Ok(entry) if entry.timestamp_micros >= cutoff => results.push(entry),
                         Ok(_) => {} // Skip old entries
                         Err(e) => {
-                            warn!("Skipping corrupted WAL entry: {}", e);
+                            error!("WAL CORRUPTION on shard {}: undeserializable entry: {}", shard, e);
                             error_count += 1;
                         }
                     },
@@ -414,7 +414,7 @@ impl WalManager {
                     Ok(entry) if entry.timestamp_micros >= cutoff => return Some(entry),
                     Ok(_) => continue, // drop pre-cutoff
                     Err(e) => {
-                        warn!("Skipping corrupted WAL entry on shard {}: {}", key, e);
+                        error!("WAL CORRUPTION on shard {}: undeserializable entry: {}", key, e);
                         *errors += 1;
                     }
                 },

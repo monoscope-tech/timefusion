@@ -50,6 +50,11 @@ impl StatsTableProvider {
             rows.push(("mem_buffer", "estimated_bytes".into(), s.mem_estimated_bytes.to_string()));
             rows.push(("mem_buffer", "estimated_mb".into(), format!("{:.1}", s.mem_estimated_bytes as f64 / (1024.0 * 1024.0))));
             rows.push(("mem_buffer", "bucket_duration_micros".into(), s.bucket_duration_micros.to_string()));
+            rows.push((
+                "mem_buffer",
+                "oldest_bucket_age_secs".into(),
+                s.oldest_bucket_age_secs.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+            ));
             rows.push(("buffered_layer", "reserved_bytes".into(), s.reserved_bytes.to_string()));
             rows.push(("buffered_layer", "max_memory_bytes".into(), s.max_memory_bytes.to_string()));
             rows.push(("buffered_layer", "max_memory_mb".into(), format!("{:.1}", s.max_memory_bytes as f64 / (1024.0 * 1024.0))));

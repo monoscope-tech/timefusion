@@ -1,6 +1,6 @@
 use crate::config::{self, AppConfig};
 use crate::mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp};
-use crate::wal::{WalManager, WalOperation, deserialize_delete_payload, deserialize_update_payload};
+use crate::wal::{WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_update_payload};
 use arrow::array::RecordBatch;
 use futures::stream::{self, StreamExt};
 use std::sync::Arc;
@@ -35,6 +35,42 @@ const CAS_BACKOFF_BASE_MICROS: u64 = 1;
 /// Maximum backoff exponent (caps delay at ~1ms)
 const CAS_BACKOFF_MAX_EXPONENT: u32 = 10;
 
+/// Persist a corrupted/unreplayable WAL entry to `{wal_dir}/quarantine/`
+/// so ops can post-mortem without blocking recovery. Best-effort: write
+/// failures are logged but never propagated — quarantine is observability,
+/// not durability.
+fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &str, reason: &str) {
+    if let Err(e) = std::fs::create_dir_all(quarantine_dir) {
+        error!("Failed to create WAL quarantine dir {:?}: {}", quarantine_dir, e);
+        return;
+    }
+    // Sanitize topic for filename: project:table can contain '/' or other chars
+    let topic = format!("{}__{}", entry.project_id, entry.table_name).replace(['/', '\\', ':', '\0'], "_");
+    let filename = format!("{}_{}_{}.bin", entry.timestamp_micros, kind, topic);
+    let path = quarantine_dir.join(&filename);
+    if let Err(e) = std::fs::write(&path, &entry.data) {
+        error!("Failed to write quarantine file {:?}: {}", path, e);
+        return;
+    }
+    // Sidecar metadata file for human inspection
+    let meta_path = path.with_extension("meta");
+    let meta = format!(
+        "ts_micros={}\nproject_id={}\ntable_name={}\noperation={:?}\nkind={}\nreason={}\nbytes={}\n",
+        entry.timestamp_micros,
+        entry.project_id,
+        entry.table_name,
+        entry.operation,
+        kind,
+        reason,
+        entry.data.len()
+    );
+    if let Err(e) = std::fs::write(&meta_path, meta) {
+        error!("Failed to write quarantine meta {:?}: {}", meta_path, e);
+    }
+    error!("Quarantined WAL entry to {:?} (kind={}, bytes={})", path, kind, entry.data.len());
+    crate::metrics::record_wal_corruption();
+}
+
 /// Operator-visible snapshot of the BufferedWriteLayer state. Returned by
 /// `snapshot_stats()` and rendered as rows by `timefusion.stats()`.
 #[derive(Debug, Clone)]
@@ -52,6 +88,10 @@ pub struct StatsSnapshot {
     pub wal_shards_per_topic: usize,
     pub wal_known_topics: usize,
     pub bucket_duration_micros: i64,
+    /// Age of the oldest bucket in MemBuffer (seconds, computed from
+    /// `now - min(bucket.min_timestamp)`). None when MemBuffer is empty.
+    /// Alerting target: alert at > 2× `flush_interval_secs`.
+    pub oldest_bucket_age_secs: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -258,6 +298,8 @@ impl BufferedWriteLayer {
             }
         }
 
+        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+
         // Reserve memory atomically before writing - prevents race condition
         let reserved_size = self.try_reserve_memory(&batches).await?;
 
@@ -283,6 +325,10 @@ impl BufferedWriteLayer {
         // Release reservation (memory is now tracked by MemBuffer)
         self.release_reservation(reserved_size);
 
+        match &result {
+            Ok(()) => crate::metrics::record_insert(row_count as u64),
+            Err(_) => crate::metrics::record_ingest_error(),
+        }
         result?;
 
         // Immediate flush mode: flush after every insert
@@ -313,6 +359,7 @@ impl BufferedWriteLayer {
         let mut newest_ts: Option<i64> = None;
         let mem_buffer = &self.mem_buffer;
 
+        let quarantine_dir = self.wal.data_dir().join("quarantine");
         let (_total, error_count) = self.wal.for_each_entry(Some(cutoff), true, |entry| {
             match entry.operation {
                 WalOperation::Insert => match WalManager::deserialize_batch(&entry.data, &entry.table_name) {
@@ -323,30 +370,44 @@ impl BufferedWriteLayer {
                         }
                         match mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros) {
                             Ok(()) => entries_replayed += 1,
-                            Err(e) => warn!("Skipping incompatible WAL entry for {}.{}: {}", entry.project_id, entry.table_name, e),
+                            Err(e) => {
+                                error!("WAL CORRUPTION: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
+                                quarantine_entry(&quarantine_dir, &entry, "insert_incompatible", &e.to_string());
+                            }
                         }
                     }
-                    Err(e) => warn!("Skipping corrupted INSERT batch for {}.{}: {}", entry.project_id, entry.table_name, e),
+                    Err(e) => {
+                        error!("WAL CORRUPTION: undeserializable INSERT batch for {}.{}: {}", entry.project_id, entry.table_name, e);
+                        quarantine_entry(&quarantine_dir, &entry, "insert_corrupt", &e.to_string());
+                    }
                 },
                 WalOperation::Delete => match deserialize_delete_payload(&entry.data) {
                     Ok(payload) => {
                         if let Err(e) = mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref()) {
-                            warn!("Failed to replay DELETE: {}", e);
+                            error!("WAL CORRUPTION: failed to replay DELETE for {}.{}: {}", entry.project_id, entry.table_name, e);
+                            quarantine_entry(&quarantine_dir, &entry, "delete_replay_failed", &e.to_string());
                         } else {
                             deletes_replayed += 1;
                         }
                     }
-                    Err(e) => warn!("Skipping corrupted DELETE payload: {}", e),
+                    Err(e) => {
+                        error!("WAL CORRUPTION: undeserializable DELETE payload for {}.{}: {}", entry.project_id, entry.table_name, e);
+                        quarantine_entry(&quarantine_dir, &entry, "delete_corrupt", &e.to_string());
+                    }
                 },
                 WalOperation::Update => match deserialize_update_payload(&entry.data) {
                     Ok(payload) => {
                         if let Err(e) = mem_buffer.update_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), &payload.assignments) {
-                            warn!("Failed to replay UPDATE: {}", e);
+                            error!("WAL CORRUPTION: failed to replay UPDATE for {}.{}: {}", entry.project_id, entry.table_name, e);
+                            quarantine_entry(&quarantine_dir, &entry, "update_replay_failed", &e.to_string());
                         } else {
                             updates_replayed += 1;
                         }
                     }
-                    Err(e) => warn!("Skipping corrupted UPDATE payload: {}", e),
+                    Err(e) => {
+                        error!("WAL CORRUPTION: undeserializable UPDATE payload for {}.{}: {}", entry.project_id, entry.table_name, e);
+                        quarantine_entry(&quarantine_dir, &entry, "update_corrupt", &e.to_string());
+                    }
                 },
             }
             let ts = entry.timestamp_micros;
@@ -426,6 +487,7 @@ impl BufferedWriteLayer {
             }
 
             if let Err(e) = self.flush_completed_buckets().await {
+                crate::metrics::record_flush(false);
                 error!("Flush task error: {}", e);
             }
             // WAL monitoring: check file accumulation
@@ -503,12 +565,14 @@ impl BufferedWriteLayer {
             match result {
                 Ok(()) => {
                     self.checkpoint_and_drain(&bucket);
+                    crate::metrics::record_flush(true);
                     debug!(
                         "Flushed bucket: project={}, table={}, bucket_id={}, rows={}",
                         bucket.project_id, bucket.table_name, bucket.bucket_id, bucket.row_count
                     );
                 }
                 Err(e) => {
+                    crate::metrics::record_flush(false);
                     error!(
                         "Failed to flush bucket: project={}, table={}, bucket_id={}: {}",
                         bucket.project_id, bucket.table_name, bucket.bucket_id, e
@@ -663,6 +727,10 @@ impl BufferedWriteLayer {
     pub fn snapshot_stats(&self) -> StatsSnapshot {
         let mem = self.mem_buffer.get_stats();
         let (wal_files, wal_bytes) = self.wal.wal_stats();
+        let oldest_bucket_age_secs = mem.oldest_bucket_micros.map(|ts| {
+            let now = crate::clock::now_micros();
+            ((now - ts).max(0) / 1_000_000) as u64
+        });
         StatsSnapshot {
             mem_project_count: mem.project_count,
             mem_total_buckets: mem.total_buckets,
@@ -677,6 +745,7 @@ impl BufferedWriteLayer {
             wal_shards_per_topic: self.wal.shards_per_topic(),
             wal_known_topics: self.wal.known_topic_count(),
             bucket_duration_micros: crate::mem_buffer::bucket_duration_micros(),
+            oldest_bucket_age_secs,
         }
     }
 
