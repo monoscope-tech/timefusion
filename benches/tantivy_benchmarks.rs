@@ -131,7 +131,7 @@ fn make_app_cfg(test_id: &str, tantivy_enabled: bool) -> Arc<AppConfig> {
     c.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-tantivy-bench-{test_id}"));
     c.cache.timefusion_foyer_disabled = true;
     c.tantivy = TantivyConfig {
-        timefusion_tantivy_enabled: tantivy_enabled,
+        
         timefusion_tantivy_indexed_tables: Some("otel_logs_and_spans".into()),
         timefusion_tantivy_compression_level: 3,
         ..Default::default()

@@ -20,6 +20,15 @@ use crate::tantivy_index::reader::{Hit, query_index};
 use crate::tantivy_index::store;
 
 #[derive(Debug)]
+pub struct SearchResult {
+    pub hits: Vec<Hit>,
+    /// Sum of `rows` across all manifest entries that contributed (whether
+    /// they hit or not). Lets the caller compute hit_count / indexed_rows
+    /// for the selectivity cutoff.
+    pub indexed_rows: u64,
+}
+
+#[derive(Debug)]
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
     pub cache_root: PathBuf,
@@ -30,20 +39,21 @@ impl TantivySearchService {
         Self { object_store, cache_root }
     }
 
-    /// Run `text:<query>` across all usable index entries for a project/table.
+    /// Outcome of a search: hits + cost information for the caller's
+    /// selectivity decision. `indexed_rows` is the total row count covered
+    /// by the queried indexes, used to compute hit-set selectivity.
+    pub async fn search(&self, table: &str, project_id: &str, field: &str, query_str: &str) -> Result<Option<Vec<Hit>>> {
+        Ok(self.search_with_stats(table, project_id, field, query_str, usize::MAX).await?.map(|r| r.hits))
+    }
+
+    /// Bounded variant. Aborts (returns `Ok(None)`) once cumulative hits
+    /// across indexes exceed `max_hits` — the caller treats the result as
+    /// "too noisy to push down" and falls back to full scan.
     ///
     /// Returns:
-    /// - `Ok(None)` — no usable index exists (manifest empty, all entries
-    ///   marked failed, or none indexes the requested field). The caller
-    ///   must fall back to a full scan + UDF post-filter; the tantivy result
-    ///   doesn't authoritatively cover the data.
-    /// - `Ok(Some(hits))` — at least one usable index was queried; `hits`
-    ///   is the union of `(timestamp, id)` matches across all of them.
-    ///   `Some(vec![])` means "indexes ran and matched zero rows" — the
-    ///   caller may use that as an authoritative prefilter for the files
-    ///   those indexes cover, *but* it does not cover any rows still in
-    ///   MemBuffer or in newly-written Delta files that haven't flushed.
-    pub async fn search(&self, table: &str, project_id: &str, field: &str, query_str: &str) -> Result<Option<Vec<Hit>>> {
+    /// - `Ok(None)` — no usable index, or hit cap exceeded.
+    /// - `Ok(Some(SearchResult))` — search ran to completion within bounds.
+    pub async fn search_with_stats(&self, table: &str, project_id: &str, field: &str, query_str: &str, max_hits: usize) -> Result<Option<SearchResult>> {
         let m = manifest::load(self.object_store.as_ref(), table, project_id).await?;
         if m.entries.is_empty() {
             return Ok(None);
@@ -51,9 +61,9 @@ impl TantivySearchService {
         let mut all_hits: Vec<Hit> = Vec::new();
         let mut seen: HashSet<(i64, String)> = HashSet::new();
         let mut usable_entries = 0usize;
+        let mut indexed_rows: u64 = 0;
         for (key, entry) in &m.entries {
             if entry.schema_version != manifest::SCHEMA_VERSION {
-                // Skip entries built with an incompatible tantivy schema version.
                 continue;
             }
             let Some(blob_path) = entry.index.as_ref() else {
@@ -64,26 +74,27 @@ impl TantivySearchService {
             let idx = store::open_index(&dir).with_context(|| format!("open index {file_uuid}"))?;
             let schema = idx.schema();
             let Ok(field_obj) = schema.get_field(field) else {
-                // Field not in this index — skip it.
                 continue;
             };
             let qp = QueryParser::for_index(&idx, vec![field_obj]);
             let q = qp.parse_query(query_str).map_err(|e| anyhow!("parse query: {e}"))?;
             let hits = query_index(&idx, &*q, None)?;
+            indexed_rows = indexed_rows.saturating_add(entry.rows);
             for h in hits {
-                let key = (h.timestamp_micros, h.id.clone());
-                if seen.insert(key) {
+                let dedup_key = (h.timestamp_micros, h.id.clone());
+                if seen.insert(dedup_key) {
                     all_hits.push(h);
+                    if all_hits.len() > max_hits {
+                        return Ok(None);
+                    }
                 }
             }
             usable_entries += 1;
         }
         if usable_entries == 0 {
-            // Manifest had entries but none indexed the requested field or
-            // matched our schema version — can't authoritatively prefilter.
             return Ok(None);
         }
-        Ok(Some(all_hits))
+        Ok(Some(SearchResult { hits: all_hits, indexed_rows }))
     }
 
     async fn ensure_cached(&self, table: &str, project_id: &str, file_uuid: &str, blob_path: &str) -> Result<PathBuf> {

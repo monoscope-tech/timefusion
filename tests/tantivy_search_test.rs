@@ -25,6 +25,7 @@ fn schema_with(level_indexed: bool) -> TableSchema {
         partitions: vec![],
         sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
         z_order_columns: vec![],
+        time_column: None,
         fields: vec![
             FieldDef { name: "timestamp".into(), data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
             FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
@@ -63,7 +64,7 @@ async fn callback_builds_index_and_search_returns_hits() {
 
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig {
-        timefusion_tantivy_enabled: true,
+        
         timefusion_tantivy_indexed_tables: Some(table_name.to_string()),
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
@@ -100,19 +101,18 @@ async fn callback_builds_index_and_search_returns_hits() {
 }
 
 #[tokio::test]
-async fn callback_skips_when_table_not_in_indexed_list() {
+async fn callback_skips_when_table_not_indexed() {
+    // Tantivy is now auto-on for any table whose schema declares
+    // `tantivy.indexed: true` fields. Pass a synthetic table name with
+    // no schema and no override-list match — callback must be a no-op.
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
-    let cfg = TantivyConfig {
-        timefusion_tantivy_enabled: true,
-        timefusion_tantivy_indexed_tables: Some("some_other_table".into()),
-        ..Default::default()
-    };
+    let cfg = TantivyConfig::default();
     let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
     let cb = svc.callback();
     let b = batch(&[(1_000_000, "a", "INFO")]);
-    cb("p1".into(), "otel_logs_and_spans".into(), vec![b], vec![]).await.expect("noop callback");
-    let m = manifest::load(store.as_ref(), "otel_logs_and_spans", "p1").await.unwrap();
-    assert!(m.entries.is_empty(), "no manifest entry should be written when table is not indexed");
+    cb("p1".into(), "no_such_table".into(), vec![b], vec![]).await.expect("noop callback");
+    let m = manifest::load(store.as_ref(), "no_such_table", "p1").await.unwrap();
+    assert!(m.entries.is_empty(), "no manifest entry should be written for an unknown table");
 }
 
 #[tokio::test]
@@ -152,7 +152,7 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
     let project_id = "p1";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig {
-        timefusion_tantivy_enabled: true,
+        
         timefusion_tantivy_indexed_tables: Some(table_name.into()),
         timefusion_tantivy_compression_level: 3,
         ..Default::default()
@@ -191,7 +191,7 @@ async fn search_skips_indexes_that_dont_have_the_field() {
     let project_id = "p1";
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let cfg = TantivyConfig {
-        timefusion_tantivy_enabled: true,
+        
         timefusion_tantivy_indexed_tables: Some(table_name.into()),
         timefusion_tantivy_compression_level: 3,
         ..Default::default()

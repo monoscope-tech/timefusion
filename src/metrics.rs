@@ -18,6 +18,7 @@
 
 use crate::buffered_write_layer::BufferedWriteLayer;
 use crate::config::TelemetryConfig;
+use crate::tantivy_index::service::TantivyIndexService;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Meter};
 use opentelemetry_otlp::WithExportConfig;
@@ -39,6 +40,10 @@ pub struct MetricsRegistry {
     pub flush_completed: Counter<u64>,
     pub flush_failed: Counter<u64>,
     pub query_executions: Counter<u64>,
+    pub tantivy_prefilter_attempts: Counter<u64>,
+    pub tantivy_prefilter_used: Counter<u64>,
+    pub tantivy_prefilter_skipped: Counter<u64>,
+    pub tantivy_prefilter_errors: Counter<u64>,
 }
 
 impl MetricsRegistry {
@@ -54,6 +59,22 @@ impl MetricsRegistry {
             flush_completed: meter.u64_counter("timefusion.flush.completed").with_description("Flush cycles that committed to Delta").build(),
             flush_failed: meter.u64_counter("timefusion.flush.failed").with_description("Flush cycles that errored").build(),
             query_executions: meter.u64_counter("timefusion.query.executions").with_description("SQL query plans executed").build(),
+            tantivy_prefilter_attempts: meter
+                .u64_counter("timefusion.tantivy.prefilter_attempts")
+                .with_description("Queries where at least one text_match predicate triggered a tantivy lookup")
+                .build(),
+            tantivy_prefilter_used: meter
+                .u64_counter("timefusion.tantivy.prefilter_used")
+                .with_description("Queries where the tantivy id-set prefilter was applied to the Delta scan")
+                .build(),
+            tantivy_prefilter_skipped: meter
+                .u64_counter("timefusion.tantivy.prefilter_skipped")
+                .with_description("Queries where tantivy lookup was attempted but pushdown was skipped (no index, hit cap, or low selectivity)")
+                .build(),
+            tantivy_prefilter_errors: meter
+                .u64_counter("timefusion.tantivy.prefilter_errors")
+                .with_description("Tantivy lookups that errored (S3 down, parse failure, etc.)")
+                .build(),
         }
     }
 }
@@ -67,7 +88,7 @@ pub fn registry() -> Option<&'static MetricsRegistry> {
 ///
 /// `buffered_layer` is a Weak so the metrics callback doesn't extend its
 /// lifetime — the layer owns its shutdown order, not us.
-pub fn init_metrics(config: &TelemetryConfig, buffered_layer: Weak<BufferedWriteLayer>) -> anyhow::Result<()> {
+pub fn init_metrics(config: &TelemetryConfig, buffered_layer: Weak<BufferedWriteLayer>, tantivy_indexer: Option<Weak<TantivyIndexService>>) -> anyhow::Result<()> {
     if METRICS.get().is_some() {
         return Ok(());
     }
@@ -154,7 +175,7 @@ pub fn init_metrics(config: &TelemetryConfig, buffered_layer: Weak<BufferedWrite
         })
         .build();
 
-    let bl_for_wal_files = buffered_layer;
+    let bl_for_wal_files = buffered_layer.clone();
     meter
         .u64_observable_gauge("timefusion.wal.files")
         .with_description("Number of WAL segment files on disk")
@@ -164,6 +185,35 @@ pub fn init_metrics(config: &TelemetryConfig, buffered_layer: Weak<BufferedWrite
             }
         })
         .build();
+
+    // Index lag: how far behind ingest the newest published tantivy index is.
+    // Computed as max(0, now - newest_max_timestamp). Surfaces the post-flush
+    // indexing lag that the rewriter / search service can't shortcut around.
+    if let Some(indexer_weak) = tantivy_indexer {
+        let bl_for_lag = buffered_layer;
+        meter
+            .u64_observable_gauge("timefusion.tantivy.index_lag_seconds")
+            .with_description("now() minus newest indexed timestamp; quantifies post-flush index lag")
+            .with_callback(move |obs| {
+                let Some(svc) = indexer_weak.upgrade() else { return };
+                let Some(newest_idx) = svc.newest_indexed_micros() else { return };
+                // Compare against newest MemBuffer timestamp if available
+                // (more meaningful than wall clock — ingest may have stopped).
+                // Fall back to wall clock if no MemBuffer reference exists.
+                let now_micros = if let Some(layer) = bl_for_lag.upgrade() {
+                    layer
+                        .snapshot_stats()
+                        .oldest_bucket_age_secs
+                        .map(|_| crate::clock::now_micros())
+                        .unwrap_or_else(crate::clock::now_micros)
+                } else {
+                    crate::clock::now_micros()
+                };
+                let lag_secs = ((now_micros - newest_idx).max(0) / 1_000_000) as u64;
+                obs.observe(lag_secs, &[]);
+            })
+            .build();
+    }
 
     let registry = MetricsRegistry::new(&meter);
     if METRICS.set(registry).is_err() {
@@ -212,5 +262,29 @@ pub fn record_flush(success: bool) {
 pub fn record_query() {
     if let Some(m) = METRICS.get() {
         m.query_executions.add(1, &[]);
+    }
+}
+
+pub fn record_tantivy_prefilter_attempt() {
+    if let Some(m) = METRICS.get() {
+        m.tantivy_prefilter_attempts.add(1, &[]);
+    }
+}
+
+pub fn record_tantivy_prefilter_used() {
+    if let Some(m) = METRICS.get() {
+        m.tantivy_prefilter_used.add(1, &[]);
+    }
+}
+
+pub fn record_tantivy_prefilter_skipped() {
+    if let Some(m) = METRICS.get() {
+        m.tantivy_prefilter_skipped.add(1, &[]);
+    }
+}
+
+pub fn record_tantivy_prefilter_error() {
+    if let Some(m) = METRICS.get() {
+        m.tantivy_prefilter_errors.add(1, &[]);
     }
 }

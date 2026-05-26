@@ -66,10 +66,15 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             })
         });
 
-    // Optional sidecar tantivy index callback. Off by default; enabled when
-    // TIMEFUSION_TANTIVY_ENABLED=true and the table is in the indexed list.
+    // Tantivy sidecar indexes are always-on whenever at least one table has
+    // `tantivy.indexed: true` fields in its YAML schema (or appears in the
+    // optional `TIMEFUSION_TANTIVY_INDEXED_TABLES` override). The query layer
+    // accelerates standard SQL predicates (`=`, `LIKE 'prefix%'`) via the
+    // TantivyPredicateRewriter — callers don't need to know tantivy exists.
     let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone())?.with_delta_writer(delta_write_callback);
-    if cfg.tantivy.enabled() {
+    let mut tantivy_svc_for_metrics: Option<Arc<timefusion::tantivy_index::service::TantivyIndexService>> = None;
+    let indexed_tables = cfg.tantivy.indexed_tables();
+    if !indexed_tables.is_empty() {
         let bucket = cfg.aws.aws_s3_bucket.clone().unwrap_or_default();
         if !bucket.is_empty() {
             let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
@@ -79,10 +84,11 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             layer = layer.with_tantivy_indexer(svc.clone().callback());
             let cache_root = cfg.core.timefusion_data_dir.clone();
             let search = Arc::new(timefusion::tantivy_index::search::TantivySearchService::new(obj_store, cache_root));
-            db = db.with_tantivy_search(search).with_tantivy_indexer(svc);
-            info!("Tantivy sidecar indexes enabled for tables: {:?}", cfg.tantivy.indexed_tables());
+            db = db.with_tantivy_search(search).with_tantivy_indexer(svc.clone());
+            tantivy_svc_for_metrics = Some(svc);
+            info!("Tantivy sidecar indexes active for tables: {:?}", indexed_tables);
         } else {
-            info!("Tantivy enabled but no AWS_S3_BUCKET configured; skipping");
+            error!("Schema declares indexed columns but AWS_S3_BUCKET is unset — Tantivy disabled, queries will scan");
         }
     }
     let buffered_layer = Arc::new(layer);
@@ -90,7 +96,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Initialize OpenTelemetry metrics — observable gauges read snapshot_stats()
     // each export cycle (30s), keeping the hot path untouched. Weak ref so
     // metrics don't extend the layer's lifetime.
-    if let Err(e) = timefusion::metrics::init_metrics(&cfg.telemetry, Arc::downgrade(&buffered_layer)) {
+    let tantivy_weak = tantivy_svc_for_metrics.as_ref().map(Arc::downgrade);
+    if let Err(e) = timefusion::metrics::init_metrics(&cfg.telemetry, Arc::downgrade(&buffered_layer), tantivy_weak) {
         error!("Failed to initialize OTel metrics: {} — continuing without metrics export", e);
     }
 
