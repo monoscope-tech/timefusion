@@ -31,22 +31,32 @@ pub struct FieldDef {
     pub nullable: bool,
     #[serde(default)]
     pub tantivy: Option<TantivyFieldConfig>,
+    /// Opt-out for dictionary encoding. Default on. Set false for high-entropy
+    /// free-text columns (stacktraces, raw queries, full URLs) where dict just
+    /// builds a useless 8MB before falling back to PLAIN — wasted writer pass.
+    #[serde(default)]
+    pub dictionary: Option<bool>,
+    /// Per-column bloom filter opt-in. Default off. Enable for high-cardinality
+    /// equality-lookup columns (ids, trace_ids, span_ids, session_ids).
+    #[serde(default)]
+    pub bloom_filter: bool,
 }
 
 /// Per-column tantivy index configuration. Drives `tantivy_index::schema`.
 ///
 /// `tokenizer`: "raw" (exact match keyword) or "default" (tokenized text).
-/// `stored`: include in fast-field/stored payload (only `_timestamp` and `_id` are
-/// stored implicitly; user fields default to indexed-only to keep indexes small).
 /// `flatten`: for Variant columns — "json" (value-only text) or "kv" (key:value tokens).
+///
+/// User fields are always indexed-only — the real data lives in Delta/parquet.
+/// Only the reserved `_timestamp` and `_id` reserved fields are stored, and only
+/// because the reader needs them to produce `(timestamp, id)` prefilter hits for
+/// the Delta-side join.
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct TantivyFieldConfig {
     #[serde(default)]
     pub indexed: bool,
     #[serde(default)]
     pub tokenizer: Option<String>,
-    #[serde(default)]
-    pub stored: bool,
     #[serde(default)]
     pub flatten: Option<String>,
 }

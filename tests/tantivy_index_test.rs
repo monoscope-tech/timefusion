@@ -16,14 +16,16 @@ use timefusion::schema_loader::{FieldDef, SortingColumnDef, TableSchema, Tantivy
 use timefusion::tantivy_index::{build_for_table, build_in_memory, query_index, Hit};
 
 fn ts_field(name: &str, nullable: bool) -> FieldDef {
-    FieldDef { name: name.into(), data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(), nullable, tantivy: None }
+    FieldDef { name: name.into(), data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(), nullable, tantivy: None, dictionary: None, bloom_filter: false }
 }
 fn utf8(name: &str, indexed: bool, tokenizer: &str) -> FieldDef {
     FieldDef {
         name: name.into(),
         data_type: "Utf8".into(),
         nullable: true,
-        tantivy: indexed.then(|| TantivyFieldConfig { indexed: true, tokenizer: Some(tokenizer.into()), stored: false, flatten: None }),
+        tantivy: indexed.then(|| TantivyFieldConfig { indexed: true, tokenizer: Some(tokenizer.into()), flatten: None }),
+        dictionary: None,
+        bloom_filter: false,
     }
 }
 fn list_utf8(name: &str, tokenizer: &str) -> FieldDef {
@@ -31,7 +33,9 @@ fn list_utf8(name: &str, tokenizer: &str) -> FieldDef {
         name: name.into(),
         data_type: "List(Utf8)".into(),
         nullable: false,
-        tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some(tokenizer.into()), stored: false, flatten: None }),
+        tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some(tokenizer.into()), flatten: None }),
+        dictionary: None,
+        bloom_filter: false,
     }
 }
 fn variant(name: &str, flatten: &str) -> FieldDef {
@@ -39,7 +43,9 @@ fn variant(name: &str, flatten: &str) -> FieldDef {
         name: name.into(),
         data_type: "Variant".into(),
         nullable: true,
-        tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("default".into()), stored: false, flatten: Some(flatten.into()) }),
+        tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("default".into()), flatten: Some(flatten.into()) }),
+        dictionary: None,
+        bloom_filter: false,
     }
 }
 
@@ -51,7 +57,7 @@ fn small_table() -> TableSchema {
         z_order_columns: vec![],
         fields: vec![
             ts_field("timestamp", false),
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None },
+            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
             utf8("level", true, "raw"),
             utf8("message", true, "default"),
             list_utf8("summary", "default"),

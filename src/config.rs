@@ -137,6 +137,15 @@ const_default!(d_metadata_disk_gb: usize = 5);
 const_default!(d_metadata_shards: usize = 4);
 const_default!(d_page_rows: usize = 20_000);
 const_default!(d_zstd_level: i32 = 3);
+// Tiered compression by partition age. Hot writes prioritize ingest latency;
+// older data is rewritten at progressively higher levels by `recompress_tier`.
+const_default!(d_zstd_level_warm: i32 = 9);
+const_default!(d_zstd_level_cool: i32 = 15);
+const_default!(d_zstd_level_cold: i32 = 19);
+const_default!(d_warm_cutoff_days: u64 = 1);
+const_default!(d_cool_cutoff_days: u64 = 7);
+const_default!(d_cold_cutoff_days: u64 = 30);
+const_default!(d_recompress_schedule: String = "0 0 3 * * *");
 const_default!(d_row_group_size: usize = 134_217_728); // 128MB
 const_default!(d_checkpoint_interval: u64 = 10);
 const_default!(d_optimize_target: i64 = 128 * 1024 * 1024);
@@ -470,8 +479,22 @@ impl CacheConfig {
 pub struct ParquetConfig {
     #[serde(default = "d_page_rows")]
     pub timefusion_page_row_count_limit: usize,
-    #[serde(default = "d_zstd_level")]
+    /// ZSTD level for hot writes (flush + today's light optimize). Default 3.
+    /// Aliased by the legacy env name; lower = faster ingest.
+    #[serde(default = "d_zstd_level", alias = "timefusion_zstd_level_hot")]
     pub timefusion_zstd_compression_level: i32,
+    #[serde(default = "d_zstd_level_warm")]
+    pub timefusion_zstd_level_warm: i32,
+    #[serde(default = "d_zstd_level_cool")]
+    pub timefusion_zstd_level_cool: i32,
+    #[serde(default = "d_zstd_level_cold")]
+    pub timefusion_zstd_level_cold: i32,
+    #[serde(default = "d_warm_cutoff_days")]
+    pub timefusion_warm_cutoff_days: u64,
+    #[serde(default = "d_cool_cutoff_days")]
+    pub timefusion_cool_cutoff_days: u64,
+    #[serde(default = "d_cold_cutoff_days")]
+    pub timefusion_cold_cutoff_days: u64,
     #[serde(default = "d_row_group_size")]
     pub timefusion_max_row_group_size: usize,
     #[serde(default = "d_checkpoint_interval")]
@@ -500,6 +523,8 @@ pub struct MaintenanceConfig {
     pub timefusion_optimize_schedule: String,
     #[serde(default = "d_vacuum_schedule")]
     pub timefusion_vacuum_schedule: String,
+    #[serde(default = "d_recompress_schedule")]
+    pub timefusion_recompress_schedule: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

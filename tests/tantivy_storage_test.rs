@@ -30,13 +30,15 @@ fn table() -> TableSchema {
         sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
         z_order_columns: vec![],
         fields: vec![
-            FieldDef { name: "timestamp".into(), data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(), nullable: false, tantivy: None },
-            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None },
+            FieldDef { name: "timestamp".into(), data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
+            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
             FieldDef {
                 name: "level".into(),
                 data_type: "Utf8".into(),
                 nullable: true,
-                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), stored: false, flatten: None }),
+                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None }),
+                dictionary: None,
+                bloom_filter: false,
             },
         ],
     }
