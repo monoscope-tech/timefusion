@@ -306,7 +306,7 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 // at-or-above the target tier without rewriting.
 const COMPRESSION_TIER_KEY: &str = "timefusion.compression_tier";
 
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+#[derive(Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct StorageConfig {
     project_id:           String,
     table_name:           String,
@@ -316,6 +316,24 @@ struct StorageConfig {
     s3_access_key_id:     String,
     s3_secret_access_key: String,
     s3_endpoint:          Option<String>,
+}
+
+// Manual Debug — never let the AWS credentials land in a {:?} log line.
+// Derived Debug would, derived Serialize already does (only used for the
+// PG-backed config table, but worth noting as a future audit point).
+impl std::fmt::Debug for StorageConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageConfig")
+            .field("project_id", &self.project_id)
+            .field("table_name", &self.table_name)
+            .field("s3_bucket", &self.s3_bucket)
+            .field("s3_prefix", &self.s3_prefix)
+            .field("s3_region", &self.s3_region)
+            .field("s3_access_key_id", &"[redacted]")
+            .field("s3_secret_access_key", &"[redacted]")
+            .field("s3_endpoint", &self.s3_endpoint)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
