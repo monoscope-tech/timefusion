@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use datafusion::{
     common::{
-        Result,
+        DataFusionError, Result,
         tree_node::{Transformed, TreeNode},
     },
     config::ConfigOptions,
@@ -11,7 +11,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_variant::JsonToVariantUdf;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::schema_loader::is_variant_type;
 
@@ -95,17 +95,14 @@ fn rewrite_input_for_variant(input: &LogicalPlan, variant_indices: &[usize]) -> 
         LogicalPlan::Values(values) => rewrite_values_for_variant(values, &variant_set),
         LogicalPlan::Projection(proj) => rewrite_projection_for_variant(proj, &variant_set),
         // Shapes like `INSERT … SELECT col FROM staging` (TableScan, Filter, etc.)
-        // don't currently get json_to_variant wrapping — the writer will hit a
-        // type-mismatch when staging.col is Utf8. warn! so the limitation is
-        // visible rather than silent.
-        other => {
-            warn!(
-                target: "variant_insert_rewriter",
-                input = %other.display(),
-                "INSERT input is not Values/Projection; json_to_variant wrapping is skipped — Variant column writes from this source may fail at write time"
-            );
-            Ok(None)
-        }
+        // don't currently get json_to_variant wrapping. Fail at plan time with
+        // an actionable message rather than letting the write hit an opaque
+        // type-mismatch error after travelling through the executor.
+        other => Err(DataFusionError::Plan(format!(
+            "INSERT into Variant column from input shape `{}` is not supported. \
+             Use INSERT … VALUES, or add an explicit `json_to_variant(col)` in the SELECT projection.",
+            other.display()
+        ))),
     }
 }
 
