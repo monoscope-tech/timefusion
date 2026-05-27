@@ -17,6 +17,16 @@
 //! value would explode the cache. The `to_string()` we key on is produced
 //! by sqlparser AFTER its own normalization, so `INSERT INTO t VALUES ($1)`
 //! and `insert into t values ($1)` collapse to one entry.
+//!
+//! Schema-staleness invariant. `LogicalPlan` embeds the table's `SchemaRef`
+//! at parse time. Caching across schema changes would silently serve plans
+//! built against the old shape. We rely on the fact that timefusion's
+//! `schema_loader::registry()` is loaded via `include_dir!` at compile time
+//! and is therefore immutable for the lifetime of the process — see
+//! `optimizers/tantivy_rewriter::indexed_columns_for` which makes the same
+//! assumption. If we ever add hot-reload of YAML schemas, this cache must
+//! also gain a schema-version token in the key (e.g. an `Arc<AtomicU64>`
+//! bumped on each reload) or a full flush on reload.
 
 use std::num::NonZeroUsize;
 
