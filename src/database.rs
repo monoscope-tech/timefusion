@@ -510,22 +510,56 @@ impl Database {
         Ok(())
     }
 
-    /// Load storage configurations from PostgreSQL.
+    /// Load storage configurations from PostgreSQL. AWS credential columns
+    /// are decrypted in-place when prefixed with `enc:v1:` (see
+    /// `secret_crypto`); legacy plaintext rows pass through with a warning
+    /// so the encryption rollout can be gradual.
     async fn load_storage_configs(pool: &PgPool) -> Result<HashMap<(String, String), StorageConfig>> {
         let configs: Vec<StorageConfig> = sqlx::query_as(
-            "SELECT project_id, table_name, s3_bucket, s3_prefix, s3_region, 
-             s3_access_key_id, s3_secret_access_key, s3_endpoint 
+            "SELECT project_id, table_name, s3_bucket, s3_prefix, s3_region,
+             s3_access_key_id, s3_secret_access_key, s3_endpoint
              FROM timefusion_projects WHERE is_active = true",
         )
         .fetch_all(pool)
         .await?;
 
+        let key_set = crate::secret_crypto::key_configured();
         let mut map = HashMap::new();
-        for config in configs {
+        let mut plaintext_rows = 0usize;
+        for mut config in configs {
+            let enc_access = config.s3_access_key_id.starts_with(crate::secret_crypto::ENC_PREFIX);
+            let enc_secret = config.s3_secret_access_key.starts_with(crate::secret_crypto::ENC_PREFIX);
+            match crate::secret_crypto::decrypt_or_passthrough(&config.s3_access_key_id) {
+                Ok(v) => config.s3_access_key_id = v,
+                Err(e) => {
+                    error!("Skipping {}/{}: cannot decrypt s3_access_key_id: {}", config.project_id, config.table_name, e);
+                    continue;
+                }
+            }
+            match crate::secret_crypto::decrypt_or_passthrough(&config.s3_secret_access_key) {
+                Ok(v) => config.s3_secret_access_key = v,
+                Err(e) => {
+                    error!("Skipping {}/{}: cannot decrypt s3_secret_access_key: {}", config.project_id, config.table_name, e);
+                    continue;
+                }
+            }
+            if !(enc_access && enc_secret) {
+                plaintext_rows += 1;
+            }
             debug!("Loaded config: {}/{}", config.project_id, config.table_name);
             map.insert((config.project_id.clone(), config.table_name.clone()), config);
         }
-        info!("Loaded {} storage configs from timefusion_projects", map.len());
+        if plaintext_rows > 0 {
+            warn!(
+                "{} timefusion_projects row(s) hold AWS credentials in plaintext. Re-encrypt with `timefusion encrypt-secret <value>` and UPDATE the row.",
+                plaintext_rows
+            );
+        }
+        info!(
+            "Loaded {} storage configs from timefusion_projects (encryption key: {})",
+            map.len(),
+            if key_set { "configured" } else { "NOT configured" }
+        );
         Ok(map)
     }
 

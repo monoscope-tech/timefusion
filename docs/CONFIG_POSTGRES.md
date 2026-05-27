@@ -174,9 +174,10 @@ Multiple TimeFusion instances can share the same configuration database. This en
 ## Security Considerations
 
 1. **Database Credentials**: Store the `TIMEFUSION_CONFIG_DATABASE_URL` securely (e.g., using environment variables or secrets management)
-2. **S3 Credentials**: Consider using IAM roles or temporary credentials instead of long-lived access keys
-3. **Network Security**: Ensure PostgreSQL connections are encrypted (use SSL/TLS)
-4. **Access Control**: Limit PostgreSQL user permissions to only what's needed:
+2. **S3 Credentials at Rest**: AWS credentials in `s3_access_key_id` / `s3_secret_access_key` should be encrypted (see below). Plaintext rows continue to load but are flagged with a startup warning.
+3. **S3 Credentials**: Consider using IAM roles or temporary credentials instead of long-lived access keys
+4. **Network Security**: Ensure PostgreSQL connections are encrypted (use SSL/TLS)
+5. **Access Control**: Limit PostgreSQL user permissions to only what's needed:
 
 ```sql
 -- Create a dedicated user for TimeFusion
@@ -187,6 +188,47 @@ GRANT CONNECT ON DATABASE your_database TO timefusion_config;
 GRANT USAGE ON SCHEMA public TO timefusion_config;
 GRANT SELECT, INSERT, UPDATE ON timefusion_projects TO timefusion_config;
 ```
+
+### Encrypting AWS Credentials at Rest
+
+TimeFusion supports AES-256-GCM application-level encryption for the
+`s3_access_key_id` and `s3_secret_access_key` columns. Encrypted values are
+stored as `enc:v1:<base64(nonce||ciphertext+tag)>`; rows without the prefix
+are still accepted on load (legacy plaintext) and produce a startup warning.
+
+**Generate a key** (32 random bytes, base64-encoded) once per environment and
+store it in your secrets manager:
+
+```bash
+openssl rand -base64 32
+```
+
+Set it on every TimeFusion instance:
+
+```bash
+export TIMEFUSION_CONFIG_ENCRYPTION_KEY="<base64-32-bytes>"
+```
+
+**Encrypt a secret** for use in SQL — uses the same key from the env:
+
+```bash
+timefusion encrypt-secret 'YOUR_AWS_SECRET_KEY'
+# prints: enc:v1:AAAA...
+```
+
+Use the output as the column value:
+
+```sql
+INSERT INTO timefusion_projects (project_id, table_name, s3_bucket, s3_prefix,
+    s3_region, s3_access_key_id, s3_secret_access_key)
+VALUES ('p1', 'otel_logs_and_spans', 'b', 'p', 'us-east-1',
+    'enc:v1:...', 'enc:v1:...');
+```
+
+**Key rotation**: decrypt with the old key, re-encrypt with the new one,
+then deploy the new key. There is no built-in dual-key reader, so do the
+re-encrypt + cutover in a maintenance window. Losing the key makes
+encrypted rows unrecoverable — treat it like the database password.
 
 ## Migration from Environment Variables
 
