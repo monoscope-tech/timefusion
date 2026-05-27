@@ -539,7 +539,10 @@ impl Database {
             match crate::secret_crypto::decrypt_or_passthrough(&config.s3_secret_access_key) {
                 Ok(v) => config.s3_secret_access_key = v,
                 Err(e) => {
-                    error!("Skipping {}/{}: cannot decrypt s3_secret_access_key: {}", config.project_id, config.table_name, e);
+                    error!(
+                        "Skipping {}/{}: cannot decrypt s3_secret_access_key: {}",
+                        config.project_id, config.table_name, e
+                    );
                     continue;
                 }
             }
