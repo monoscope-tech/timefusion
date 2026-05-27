@@ -73,24 +73,34 @@ impl ExprPlanner for VariantAwareExprPlanner {
         // Build dot-path: ["user", "name"] → "user.name", ["items", Index(0)] → "items[0]"
         let full_path = build_variant_path(&path_parts);
 
-        // Build the variant_get(base, '<path>'[, '<as_type>']) call.
-        //
-        // `->>` (LongArrow) returns text, so we use variant_get's optional
-        // third "type hint" argument with literal 'Utf8'. The
-        // `parquet_variant_compute::variant_get` kernel (called by the UDF)
-        // then projects the leaf directly to a Utf8 column in one
-        // vectorized pass — no per-row variant_to_json detour. For `->`
-        // (Arrow) we return Variant so chained `->` keeps working.
+        // Build the variant_get(base, '<path>') call. For `->` we return the
+        // Variant leaf so chained `->` keeps working. For `->>` we'd previously
+        // ask variant_get to project as Utf8, but that returns NULL for
+        // numeric/boolean leaves (parquet_variant_compute doesn't stringify).
+        // Postgres `->>` text semantics need numeric/bool → text, JSON null →
+        // SQL NULL, and string → unquoted. Compose:
+        //   variant_get(col, path) → Variant
+        //   variant_to_json(...)   → JSON-encoded text (Utf8)
+        //   json_to_pg_text(...)   → Postgres ->> text
         let variant_get_udf = ScalarUDF::from(datafusion_variant::VariantGetUdf::default());
         let path_literal = Expr::Literal(ScalarValue::Utf8(Some(full_path.clone())), None);
-        let mut args = vec![base_expr.clone(), path_literal];
-        if is_long_arrow {
-            args.push(Expr::Literal(ScalarValue::Utf8(Some("Utf8".into())), None));
-        }
-        let result = Expr::ScalarFunction(ScalarFunction {
+        let get_args = vec![base_expr.clone(), path_literal];
+        let variant_leaf = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(variant_get_udf),
-            args,
+            args: get_args,
         });
+        let result = if is_long_arrow {
+            let to_json = Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(ScalarUDF::from(datafusion_variant::VariantToJsonUdf::default())),
+                args: vec![variant_leaf],
+            });
+            Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(ScalarUDF::from(JsonToPgTextUdf::default())),
+                args: vec![to_json],
+            })
+        } else {
+            variant_leaf
+        };
 
         // Create alias to preserve original SQL representation
         let op_str = if is_long_arrow { "->>" } else { "->" };
@@ -196,6 +206,80 @@ fn path_repr(parts: &[PathComponent]) -> String {
         .join("->")
 }
 
+/// `json_to_pg_text(utf8) → utf8`: convert JSON-encoded text to Postgres `->>` text.
+///
+/// - JSON string `"Alice"` → `Alice` (parsed, so escape sequences resolve correctly)
+/// - JSON null → SQL NULL
+/// - JSON number / boolean → its literal text (`42`, `true`)
+/// - JSON object / array → returned as-is (Postgres `->>` does the same)
+///
+/// Bridges `parquet_variant_compute::variant_get`'s NULL-on-non-string-cast
+/// behavior to the Postgres `->>` contract.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonToPgTextUdf {
+    signature: Signature,
+}
+
+impl Default for JsonToPgTextUdf {
+    fn default() -> Self {
+        Self {
+            signature: Signature::uniform(1, vec![DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for JsonToPgTextUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_to_pg_text"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        let arr = match args.args.into_iter().next().unwrap() {
+            ColumnarValue::Array(a) => a,
+            ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
+        };
+        let n = arr.len();
+        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
+        // String extractor handles Utf8/Utf8View/LargeUtf8 by collecting all
+        // owned strings up front; sidesteps the borrow-from-Arc lifetime issue.
+        let owned: Vec<Option<String>> = match arr.data_type() {
+            DataType::Utf8 => {
+                let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
+                (0..n).map(|i| (!a.is_null(i)).then(|| a.value(i).to_string())).collect()
+            }
+            DataType::Utf8View => {
+                let a = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
+                (0..n).map(|i| (!a.is_null(i)).then(|| a.value(i).to_string())).collect()
+            }
+            DataType::LargeUtf8 => {
+                let a = arr.as_any().downcast_ref::<datafusion::arrow::array::LargeStringArray>().unwrap();
+                (0..n).map(|i| (!a.is_null(i)).then(|| a.value(i).to_string())).collect()
+            }
+            other => return Err(DataFusionError::Execution(format!("json_to_pg_text: unsupported input type {other:?}"))),
+        };
+        for entry in owned {
+            out.push(match entry.as_deref() {
+                None => None,
+                Some("null") => None,
+                Some(s) if s.starts_with('"') && s.ends_with('"') => match serde_json::from_str::<String>(s) {
+                    Ok(unquoted) => Some(unquoted),
+                    Err(_) => Some(s.to_string()),
+                },
+                Some(s) => Some(s.to_string()),
+            });
+        }
+        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+    }
+}
+
 /// Register all custom PostgreSQL-compatible functions
 pub fn register_custom_functions(ctx: &mut datafusion::execution::context::SessionContext) -> Result<()> {
     // Register Variant-aware expr planner (must be before JSON planner for priority)
@@ -227,6 +311,9 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
 
     // Register approx_percentile scalar function
     ctx.register_udf(create_approx_percentile_udf());
+
+    // Bridges variant -> Postgres ->> text semantics (numeric/bool/null → text/NULL).
+    ctx.register_udf(ScalarUDF::from(JsonToPgTextUdf::default()));
 
     // Register variant functions from datafusion-variant
     ctx.register_udf(ScalarUDF::from(datafusion_variant::JsonToVariantUdf::default()));
