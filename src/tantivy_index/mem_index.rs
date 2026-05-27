@@ -7,7 +7,7 @@
 //! pure query cache, never the authoritative source.
 //!
 //! Lifecycle:
-//! ```
+//! ```text
 //!   first text_match query           bucket drains
 //!         │                                │
 //!         ▼                                ▼
