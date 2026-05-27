@@ -36,7 +36,7 @@ use datafusion::{
     optimizer::AnalyzerRule,
 };
 use datafusion_variant::VariantToJsonUdf;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{database::ProjectRoutingTable, schema_loader::is_variant_type};
 
@@ -176,11 +176,11 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
                     .map(|f| f.name().as_str())
                     .collect();
                 if !variant_cols.is_empty() {
-                    log::warn!(
+                    warn!(
                         target: "variant_select_rewriter",
-                        "Variant columns exit the wire unwrapped (raw binary): root_node={}, columns={:?} — peel() can't reach a Projection through this node (Union/Aggregate/Join etc.). Wrap inputs explicitly with variant_to_json() or open a follow-up.",
-                        other.display(),
-                        variant_cols,
+                        root_node = %other.display(),
+                        columns = ?variant_cols,
+                        "Variant columns exit the wire unwrapped (raw binary) — peel() can't reach a Projection through this node (Union/Aggregate/Join etc.). Wrap inputs explicitly with variant_to_json() or open a follow-up.",
                     );
                 }
                 Ok(other)

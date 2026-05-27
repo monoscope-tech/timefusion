@@ -186,7 +186,10 @@ mod integration {
         let total: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
         assert_eq!(total, 6);
 
-        // Verify we can query specific columns (SELECT * fails due to Variant column encoding)
+        // Targeted column selection — keeps the test focused on a specific row's
+        // typed columns. VariantSelectRewriter already serializes Variant columns
+        // to JSON at the root projection, so `SELECT *` would also work end-to-end;
+        // this assertion just doesn't need every field.
         let row = client
             .query_one(
                 "SELECT id, name, status_code, level FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1",
