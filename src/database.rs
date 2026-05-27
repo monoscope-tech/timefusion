@@ -68,8 +68,11 @@ pub async fn get_unified_delta_table(unified_tables: &UnifiedTables, table_name:
 fn should_refresh_table(current_version: Option<u64>, last_written_version: Option<u64>) -> bool {
     match (current_version, last_written_version) {
         (Some(current), Some(last)) => current < last,
-        (Some(_), None) => true,
-        _ => false,
+        // Either: process hasn't directly written but a background flusher may have.
+        // Or: snapshot has no version yet but we know someone wrote one.
+        // Both warrant a refresh.
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
     }
 }
 

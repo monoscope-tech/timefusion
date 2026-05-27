@@ -31,7 +31,7 @@ use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     logical_expr::{Cast, Expr, LogicalPlan, Values},
 };
-use tracing::debug;
+use tracing::warn;
 
 pub fn rewrite_plan(plan: LogicalPlan) -> LogicalPlan {
     let result = plan
@@ -73,7 +73,10 @@ pub fn rewrite_plan(plan: LogicalPlan) -> LogicalPlan {
     match result {
         Ok(p) => p,
         Err(e) => {
-            debug!(target: "insert_coerce", "plan rewrite skipped: {e}");
+            // Falling back to the un-coerced plan can leave pgwire serving the wrong
+            // placeholder types for multi-row INSERTs — surface at warn! so it's
+            // visible in ops dashboards.
+            warn!(target: "insert_coerce", "plan rewrite skipped (multi-row INSERT type inference may suffer): {e}");
             plan
         }
     }

@@ -84,9 +84,11 @@ impl PlanCacheHook {
     /// (timestamps, UUIDs, etc.) which would never recur — caching that
     /// just pollutes the LRU and increases lock contention.
     fn cacheable(stmt: &Statement, sql: &str) -> bool {
-        // Cheap heuristic: only consider DML statement kinds and require a
-        // placeholder marker in the source text. Avoids walking the AST.
-        let has_placeholder = sql.contains('$');
+        // Cheap heuristic: only consider DML statement kinds and require an
+        // actual placeholder ($N) in the source text. Naive `contains('$')`
+        // would false-positive on dollar-quoted literals like '$100' and cache
+        // statements with embedded literal values, polluting the LRU.
+        let has_placeholder = sql.as_bytes().windows(2).any(|w| w[0] == b'$' && w[1].is_ascii_digit());
         matches!(
             stmt,
             Statement::Insert(_) | Statement::Query(_) | Statement::Update { .. } | Statement::Delete(_)
