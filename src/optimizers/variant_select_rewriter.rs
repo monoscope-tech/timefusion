@@ -197,12 +197,14 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
                     .map(|f| f.name().as_str())
                     .collect();
                 if !variant_cols.is_empty() {
-                    warn!(
-                        target: "variant_select_rewriter",
-                        root_node = %other.display(),
-                        columns = ?variant_cols,
-                        "RAW BINARY VARIANT ON THE WIRE: peel() couldn't reach a Projection through this root node (Union/Intersect/Except/Aggregate/Join/etc.). The pgwire client will receive undecodable bytes. Wrap inputs explicitly with variant_to_json() or restructure the query.",
-                    );
+                    // Hard error rather than a warn: shipping raw Variant bytes over
+                    // pgwire is silent data corruption. The user must wrap each
+                    // branch's leaf projection with variant_to_json() explicitly.
+                    return Err(datafusion::error::DataFusionError::NotImplemented(format!(
+                        "Variant columns {:?} would exit the wire unwrapped at a {} root. Wrap each branch's projection with variant_to_json(<col>) explicitly, or restructure the query so the outermost node is a Projection / Sort / Limit / Distinct / SubqueryAlias / Filter.",
+                        variant_cols,
+                        other.display()
+                    )));
                 }
                 Ok(other)
             }
@@ -259,5 +261,125 @@ fn wrap_with_variant_to_json(expr: &Expr, udf: &Arc<datafusion::logical_expr::Sc
     match alias {
         Some(name) => wrapped.alias(name),
         None => wrapped,
+    }
+}
+
+#[cfg(test)]
+mod peel_tests {
+    //! Unit tests for `wrap_root_projection` peel logic. These exercise the
+    //! Sort / Limit / Distinct / SubqueryAlias / Filter branches and the
+    //! MAX_PEEL guard without standing up a server.
+    use std::collections::HashMap;
+
+    use datafusion::{
+        arrow::datatypes::{DataType, Field, Schema},
+        common::DFSchema,
+        logical_expr::{EmptyRelation, builder::LogicalPlanBuilder, col, lit},
+    };
+
+    use super::*;
+
+    fn variant_field(name: &str) -> Field {
+        let mut md = HashMap::new();
+        md.insert("ARROW:extension:name".to_string(), "arrow.parquet.variant".to_string());
+        Field::new(
+            name,
+            DataType::Struct(
+                vec![
+                    Arc::new(Field::new("metadata", DataType::Binary, false)),
+                    Arc::new(Field::new("value", DataType::Binary, false)),
+                ]
+                .into(),
+            ),
+            true,
+        )
+        .with_metadata(md)
+    }
+
+    fn variant_projection() -> LogicalPlan {
+        let schema = Schema::new(vec![variant_field("v")]);
+        let df = Arc::new(DFSchema::try_from(schema).unwrap());
+        let empty = LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: df,
+        });
+        LogicalPlanBuilder::from(empty).project(vec![col("v")]).unwrap().build().unwrap()
+    }
+
+    fn analyze(plan: LogicalPlan) -> LogicalPlan {
+        let cfg = ConfigOptions::default();
+        VariantSelectRewriter.analyze(plan, &cfg).unwrap()
+    }
+
+    fn is_variant_to_json_call(expr: &Expr) -> bool {
+        let inner = match expr {
+            Expr::Alias(a) => a.expr.as_ref(),
+            other => other,
+        };
+        matches!(inner, Expr::ScalarFunction(sf) if sf.func.inner().as_any().is::<VariantToJsonUdf>())
+    }
+
+    fn first_projection_expr(plan: &LogicalPlan) -> &Expr {
+        fn find(p: &LogicalPlan) -> Option<&Expr> {
+            if let LogicalPlan::Projection(proj) = p {
+                return proj.expr.first();
+            }
+            p.inputs().into_iter().find_map(|i| find(i))
+        }
+        find(plan).expect("expected a Projection in the plan")
+    }
+
+    #[test]
+    fn wraps_bare_projection() {
+        let out = analyze(variant_projection());
+        assert!(is_variant_to_json_call(first_projection_expr(&out)));
+    }
+
+    #[test]
+    fn peels_sort_limit_distinct_alias_filter() {
+        let plan = LogicalPlanBuilder::from(variant_projection())
+            .filter(lit(true))
+            .unwrap()
+            .distinct()
+            .unwrap()
+            .limit(0, Some(10))
+            .unwrap()
+            .sort(vec![col("v").sort(true, false)])
+            .unwrap()
+            .alias("a")
+            .unwrap()
+            .build()
+            .unwrap();
+        let out = analyze(plan);
+        assert!(is_variant_to_json_call(first_projection_expr(&out)));
+    }
+
+    #[test]
+    fn idempotent_on_double_analyze() {
+        // Running the analyzer twice must not double-wrap; the inner-UDF guard
+        // in `is_variant_expr` (matched by TypeId, not name) ensures the second
+        // pass leaves the already-wrapped projection alone.
+        let once = analyze(variant_projection());
+        let twice = analyze(once.clone());
+        let expr_twice = first_projection_expr(&twice);
+        assert!(is_variant_to_json_call(expr_twice));
+        let Expr::ScalarFunction(sf) = expr_twice else {
+            panic!("not a scalar function");
+        };
+        // Args length stays at 1 (the bare column) — no nested variant_to_json call.
+        assert_eq!(sf.args.len(), 1);
+        assert!(matches!(sf.args[0], Expr::Column(_)), "second pass nested the call: {:?}", sf.args[0]);
+    }
+
+    #[test]
+    fn max_peel_short_circuits_on_pathological_depth() {
+        // > MAX_PEEL nested SubqueryAlias should skip wrapping rather than recurse
+        // and stack-overflow. The inner Projection remains unwrapped.
+        let mut plan = variant_projection();
+        for i in 0..300 {
+            plan = LogicalPlanBuilder::from(plan).alias(format!("a{i}")).unwrap().build().unwrap();
+        }
+        let out = analyze(plan);
+        assert!(!is_variant_to_json_call(first_projection_expr(&out)));
     }
 }
