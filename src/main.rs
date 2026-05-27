@@ -10,7 +10,7 @@ use timefusion::{
     clock,
     config::{self, AppConfig},
     database::Database,
-    telemetry,
+    secret_crypto, telemetry,
 };
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
@@ -18,6 +18,12 @@ use tracing::{error, info, warn};
 fn main() -> anyhow::Result<()> {
     // Initialize environment before any threads spawn
     dotenv().ok();
+
+    // CLI helper: `timefusion encrypt-secret <plaintext>` — prints ciphertext
+    // for use in `timefusion_projects` rows, then exits.
+    if std::env::args().nth(1).as_deref() == Some("encrypt-secret") {
+        return secret_crypto::run_cli();
+    }
 
     // Initialize global config from environment - validates all settings upfront
     let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
