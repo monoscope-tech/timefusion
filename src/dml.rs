@@ -1,5 +1,4 @@
-use std::any::Any;
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -17,8 +16,7 @@ use datafusion::{
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
-use tracing::field::Empty;
-use tracing::{Instrument, error, info, instrument};
+use tracing::{Instrument, error, field::Empty, info, instrument};
 
 use crate::database::Database;
 
@@ -27,7 +25,7 @@ type DmlInfo = (String, String, Option<Expr>, Option<Vec<(String, Expr)>>);
 
 /// Custom query planner that intercepts DML operations
 pub struct DmlQueryPlanner {
-    planner: DefaultPhysicalPlanner,
+    planner:  DefaultPhysicalPlanner,
     database: Arc<Database>,
 }
 
@@ -116,8 +114,8 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                         .then(|| {
                             scan.filters.iter().cloned().reduce(|acc, filter| {
                                 Expr::BinaryExpr(BinaryExpr {
-                                    left: Box::new(acc),
-                                    op: Operator::And,
+                                    left:  Box::new(acc),
+                                    op:    Operator::And,
                                     right: Box::new(filter),
                                 })
                             })
@@ -182,13 +180,13 @@ fn extract_project_id(expr: &Expr) -> Option<String> {
 /// Unified DML execution plan
 #[derive(Debug, Clone)]
 pub struct DmlExec {
-    op_type: DmlOperation,
-    table_name: String,
-    project_id: String,
-    predicate: Option<Expr>,
+    op_type:     DmlOperation,
+    table_name:  String,
+    project_id:  String,
+    predicate:   Option<Expr>,
     assignments: Vec<(String, Expr)>,
-    input: Arc<dyn ExecutionPlan>,
-    database: Arc<Database>,
+    input:       Arc<dyn ExecutionPlan>,
+    database:    Arc<Database>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -471,8 +469,8 @@ fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
     match expr {
         Expr::Column(col) => Ok(Expr::Column(Column::from_name(&col.name))),
         Expr::BinaryExpr(binary) => Ok(Expr::BinaryExpr(BinaryExpr {
-            left: Box::new(convert_expr_to_delta(&binary.left)?),
-            op: binary.op,
+            left:  Box::new(convert_expr_to_delta(&binary.left)?),
+            op:    binary.op,
             right: Box::new(convert_expr_to_delta(&binary.right)?),
         })),
         _ => Ok(expr.clone()),

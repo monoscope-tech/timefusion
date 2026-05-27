@@ -1,31 +1,37 @@
+use std::{
+    ops::Range,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashSet;
+use foyer::{
+    BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder,
+    RuntimeOptions, TokioRuntimeOptions,
+};
 use futures::stream::BoxStream;
 use object_store::{
     Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
     PutResult, Result as ObjectStoreResult, path::Path,
 };
-use std::ops::Range;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::field::Empty;
-use tracing::{Instrument, debug, info, instrument};
-
-use foyer::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder, RuntimeOptions, TokioRuntimeOptions};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinSet;
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinSet,
+};
+use tracing::{Instrument, debug, field::Empty, info, instrument};
 
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheValue {
     #[serde(with = "serde_bytes")]
-    data: Vec<u8>,
+    data:             Vec<u8>,
     #[serde(with = "object_meta_serde")]
-    meta: ObjectMeta,
+    meta:             ObjectMeta,
     timestamp_millis: u64,
 }
 
@@ -49,16 +55,17 @@ fn current_millis() -> u64 {
 }
 
 mod object_meta_serde {
-    use super::*;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::*;
 
     #[derive(Serialize, Deserialize)]
     struct SerializedMeta {
-        location: String,
+        location:      String,
         last_modified: i64,
-        size: u64,
-        e_tag: Option<String>,
-        version: Option<String>,
+        size:          u64,
+        e_tag:         Option<String>,
+        version:       Option<String>,
     }
 
     pub fn serialize<S>(meta: &ObjectMeta, serializer: S) -> Result<S::Ok, S::Error>
@@ -66,11 +73,11 @@ mod object_meta_serde {
         S: Serializer,
     {
         SerializedMeta {
-            location: meta.location.to_string(),
+            location:      meta.location.to_string(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta.size,
-            e_tag: meta.e_tag.clone(),
-            version: meta.version.clone(),
+            size:          meta.size,
+            e_tag:         meta.e_tag.clone(),
+            version:       meta.version.clone(),
         }
         .serialize(serializer)
     }
@@ -81,11 +88,11 @@ mod object_meta_serde {
     {
         let s = SerializedMeta::deserialize(deserializer)?;
         Ok(ObjectMeta {
-            location: Path::from(s.location),
+            location:      Path::from(s.location),
             last_modified: DateTime::<Utc>::from_timestamp_millis(s.last_modified).unwrap_or(Utc::now()),
-            size: s.size,
-            e_tag: s.e_tag,
-            version: s.version,
+            size:          s.size,
+            e_tag:         s.e_tag,
+            version:       s.version,
         })
     }
 }
@@ -93,37 +100,37 @@ mod object_meta_serde {
 /// Configuration for the foyer-based object store cache
 #[derive(Debug, Clone)]
 pub struct FoyerCacheConfig {
-    pub memory_size_bytes: usize,
-    pub disk_size_bytes: usize,
-    pub ttl: Duration,
-    pub cache_dir: PathBuf,
-    pub shards: usize,
-    pub file_size_bytes: usize,
-    pub enable_stats: bool,
+    pub memory_size_bytes:          usize,
+    pub disk_size_bytes:            usize,
+    pub ttl:                        Duration,
+    pub cache_dir:                  PathBuf,
+    pub shards:                     usize,
+    pub file_size_bytes:            usize,
+    pub enable_stats:               bool,
     /// Size hint for reading parquet metadata from the end of files
     pub parquet_metadata_size_hint: usize,
     /// Memory size for metadata cache in bytes
     pub metadata_memory_size_bytes: usize,
     /// Disk size for metadata cache in bytes
-    pub metadata_disk_size_bytes: usize,
+    pub metadata_disk_size_bytes:   usize,
     /// Number of shards for metadata cache
-    pub metadata_shards: usize,
+    pub metadata_shards:            usize,
 }
 
 impl Default for FoyerCacheConfig {
     fn default() -> Self {
         Self {
-            memory_size_bytes: 536_870_912,    // 512MB
-            disk_size_bytes: 107_374_182_400,  // 100GB
-            ttl: Duration::from_secs(604_800), // 7 days
-            cache_dir: PathBuf::from("/tmp/timefusion_cache"),
-            shards: 8,
-            file_size_bytes: 16_777_216, // 16MB - good for Parquet files
-            enable_stats: true,
-            parquet_metadata_size_hint: 1_048_576,   // 1MB - typical size for parquet metadata
-            metadata_memory_size_bytes: 536_870_912, // 512MB
-            metadata_disk_size_bytes: 5_368_709_120, // 5GB
-            metadata_shards: 4,                      // Fewer shards for metadata cache
+            memory_size_bytes:          536_870_912,                  // 512MB
+            disk_size_bytes:            107_374_182_400,              // 100GB
+            ttl:                        Duration::from_secs(604_800), // 7 days
+            cache_dir:                  PathBuf::from("/tmp/timefusion_cache"),
+            shards:                     8,
+            file_size_bytes:            16_777_216, // 16MB - good for Parquet files
+            enable_stats:               true,
+            parquet_metadata_size_hint: 1_048_576,     // 1MB - typical size for parquet metadata
+            metadata_memory_size_bytes: 536_870_912,   // 512MB
+            metadata_disk_size_bytes:   5_368_709_120, // 5GB
+            metadata_shards:            4,             // Fewer shards for metadata cache
         }
     }
 }
@@ -136,17 +143,17 @@ impl FoyerCacheConfig {
         }
 
         Self {
-            memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_MEMORY_MB", 512) * 1024 * 1024,
-            disk_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_DISK_GB", 100) * 1024 * 1024 * 1024,
-            ttl: Duration::from_secs(parse_env("TIMEFUSION_FOYER_TTL_SECONDS", 604800)),
-            cache_dir: PathBuf::from(parse_env("TIMEFUSION_FOYER_CACHE_DIR", "/tmp/timefusion_cache".to_string())),
-            shards: parse_env("TIMEFUSION_FOYER_SHARDS", 8),
-            file_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_FILE_SIZE_MB", 32) * 1024 * 1024,
-            enable_stats: parse_env("TIMEFUSION_FOYER_STATS", "true".to_string()).to_lowercase() == "true",
+            memory_size_bytes:          parse_env::<usize>("TIMEFUSION_FOYER_MEMORY_MB", 512) * 1024 * 1024,
+            disk_size_bytes:            parse_env::<usize>("TIMEFUSION_FOYER_DISK_GB", 100) * 1024 * 1024 * 1024,
+            ttl:                        Duration::from_secs(parse_env("TIMEFUSION_FOYER_TTL_SECONDS", 604800)),
+            cache_dir:                  PathBuf::from(parse_env("TIMEFUSION_FOYER_CACHE_DIR", "/tmp/timefusion_cache".to_string())),
+            shards:                     parse_env("TIMEFUSION_FOYER_SHARDS", 8),
+            file_size_bytes:            parse_env::<usize>("TIMEFUSION_FOYER_FILE_SIZE_MB", 32) * 1024 * 1024,
+            enable_stats:               parse_env("TIMEFUSION_FOYER_STATS", "true".to_string()).to_lowercase() == "true",
             parquet_metadata_size_hint: parse_env("TIMEFUSION_PARQUET_METADATA_SIZE_HINT", 1_048_576),
             metadata_memory_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_METADATA_MEMORY_MB", 512) * 1024 * 1024,
-            metadata_disk_size_bytes: parse_env::<usize>("TIMEFUSION_FOYER_METADATA_DISK_GB", 5) * 1024 * 1024 * 1024,
-            metadata_shards: parse_env("TIMEFUSION_FOYER_METADATA_SHARDS", 4),
+            metadata_disk_size_bytes:   parse_env::<usize>("TIMEFUSION_FOYER_METADATA_DISK_GB", 5) * 1024 * 1024 * 1024,
+            metadata_shards:            parse_env("TIMEFUSION_FOYER_METADATA_SHARDS", 4),
         }
     }
 
@@ -154,17 +161,17 @@ impl FoyerCacheConfig {
     /// The name parameter is used to create unique cache directories
     pub fn test_config(name: &str) -> Self {
         Self {
-            memory_size_bytes: 10 * 1024 * 1024, // 10MB
-            disk_size_bytes: 50 * 1024 * 1024,   // 50MB
-            ttl: Duration::from_secs(300),
-            cache_dir: PathBuf::from(format!("/tmp/test_foyer_{}", name)),
-            shards: 2,
-            file_size_bytes: 1024 * 1024, // 1MB
-            enable_stats: true,
+            memory_size_bytes:          10 * 1024 * 1024, // 10MB
+            disk_size_bytes:            50 * 1024 * 1024, // 50MB
+            ttl:                        Duration::from_secs(300),
+            cache_dir:                  PathBuf::from(format!("/tmp/test_foyer_{}", name)),
+            shards:                     2,
+            file_size_bytes:            1024 * 1024, // 1MB
+            enable_stats:               true,
             parquet_metadata_size_hint: 1_048_576,        // 1MB
             metadata_memory_size_bytes: 10 * 1024 * 1024, // 10MB for tests
-            metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB for tests
-            metadata_shards: 2,
+            metadata_disk_size_bytes:   50 * 1024 * 1024, // 50MB for tests
+            metadata_shards:            2,
         }
     }
 
@@ -179,17 +186,17 @@ impl FoyerCacheConfig {
 /// Statistics for cache operations
 #[derive(Debug, Default, Clone)]
 pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
+    pub hits:            u64,
+    pub misses:          u64,
     pub ttl_expirations: u64,
-    pub inner_gets: u64,
-    pub inner_puts: u64,
+    pub inner_gets:      u64,
+    pub inner_puts:      u64,
 }
 
 /// Combined statistics for both caches
 #[derive(Debug, Default, Clone)]
 pub struct CombinedCacheStats {
-    pub main: CacheStats,
+    pub main:     CacheStats,
     pub metadata: CacheStats,
 }
 
@@ -213,11 +220,11 @@ type StatsRef = Arc<RwLock<CacheStats>>;
 /// Shared Foyer cache that can be used across multiple object stores
 #[derive(Debug)]
 pub struct SharedFoyerCache {
-    cache: FoyerCache,
+    cache:          FoyerCache,
     metadata_cache: FoyerCache,
-    stats: StatsRef,
+    stats:          StatsRef,
     metadata_stats: StatsRef,
-    config: FoyerCacheConfig,
+    config:         FoyerCacheConfig,
 }
 
 impl SharedFoyerCache {
@@ -245,7 +252,7 @@ impl SharedFoyerCache {
         // Configure a dedicated runtime for Foyer disk IO to avoid blocking the main tokio runtime
         // This prevents blocking sync disk IO from starving the tokio runtime's network polling
         let runtime_opts = RuntimeOptions::Separated {
-            read_runtime_options: TokioRuntimeOptions {
+            read_runtime_options:  TokioRuntimeOptions {
                 worker_threads: 2,
                 ..Default::default()
             },
@@ -271,7 +278,7 @@ impl SharedFoyerCache {
             .await?;
 
         let metadata_runtime_opts = RuntimeOptions::Separated {
-            read_runtime_options: TokioRuntimeOptions {
+            read_runtime_options:  TokioRuntimeOptions {
                 worker_threads: 2,
                 ..Default::default()
             },
@@ -307,7 +314,7 @@ impl SharedFoyerCache {
 
     pub async fn get_stats(&self) -> CombinedCacheStats {
         CombinedCacheStats {
-            main: self.stats.read().await.clone(),
+            main:     self.stats.read().await.clone(),
             metadata: self.metadata_stats.read().await.clone(),
         }
     }
@@ -347,13 +354,13 @@ impl SharedFoyerCache {
 
 /// Foyer-based hybrid cache implementation for object store
 pub struct FoyerObjectStoreCache {
-    inner: Arc<dyn ObjectStore>,
-    cache: FoyerCache,
-    metadata_cache: FoyerCache,
-    stats: StatsRef,
-    metadata_stats: StatsRef,
-    config: FoyerCacheConfig,
-    refreshing: Arc<DashSet<String>>,
+    inner:            Arc<dyn ObjectStore>,
+    cache:            FoyerCache,
+    metadata_cache:   FoyerCache,
+    stats:            StatsRef,
+    metadata_stats:   StatsRef,
+    config:           FoyerCacheConfig,
+    refreshing:       Arc<DashSet<String>>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
@@ -503,7 +510,7 @@ impl FoyerObjectStoreCache {
 
     pub async fn get_stats(&self) -> CombinedCacheStats {
         CombinedCacheStats {
-            main: self.stats.read().await.clone(),
+            main:     self.stats.read().await.clone(),
             metadata: self.metadata_stats.read().await.clone(),
         }
     }
@@ -758,7 +765,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 use std::io::Read;
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf).map_err(|e| object_store::Error::Generic {
-                    store: "cache",
+                    store:  "cache",
                     source: Box::new(e),
                 })?;
                 buf
@@ -894,11 +901,11 @@ impl ObjectStore for FoyerObjectStoreCache {
 
                 // Cache the metadata range in the metadata cache
                 let range_meta = ObjectMeta {
-                    location: location.clone(),
+                    location:      location.clone(),
                     last_modified: file_meta.last_modified,
-                    size: data.len() as u64,
-                    e_tag: file_meta.e_tag.clone(),
-                    version: file_meta.version.clone(),
+                    size:          data.len() as u64,
+                    e_tag:         file_meta.e_tag.clone(),
+                    version:       file_meta.version.clone(),
                 };
                 self.metadata_cache.insert(range_cache_key, CacheValue::new(data.to_vec(), range_meta));
 
@@ -924,12 +931,12 @@ impl ObjectStore for FoyerObjectStoreCache {
                             GetResultPayload::File(mut file, _) => {
                                 use std::io::{Read, Seek, SeekFrom};
                                 file.seek(SeekFrom::Start(range.start)).map_err(|e| object_store::Error::Generic {
-                                    store: "cache",
+                                    store:  "cache",
                                     source: Box::new(e),
                                 })?;
                                 let mut buf = vec![0; (range.end - range.start) as usize];
                                 file.read_exact(&mut buf).map_err(|e| object_store::Error::Generic {
-                                    store: "cache",
+                                    store:  "cache",
                                     source: Box::new(e),
                                 })?;
                                 Bytes::from(buf)
@@ -1076,8 +1083,9 @@ impl std::fmt::Debug for FoyerObjectStoreCache {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use object_store::memory::InMemory;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_basic_operations() -> anyhow::Result<()> {

@@ -1,46 +1,47 @@
-use crate::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
-use crate::schema_loader::{get_default_schema, get_schema};
-use crate::statistics::DeltaStatisticsExtractor;
+use std::{any::Any, collections::HashMap, env, fmt, sync::Arc};
+
 use anyhow::Result;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use chrono::Utc;
-use datafusion::arrow::array::{Array, AsArray};
-use datafusion::common::not_impl_err;
-use datafusion::common::{SchemaExt, Statistics};
-use datafusion::datasource::sink::{DataSink, DataSinkExec};
-use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 // Removed unused imports
 use datafusion::physical_plan::DisplayAs;
-use datafusion::scalar::ScalarValue;
 use datafusion::{
+    arrow::array::{Array, AsArray},
     catalog::Session,
-    datasource::{TableProvider, TableType},
+    common::{SchemaExt, Statistics, not_impl_err},
+    datasource::{
+        TableProvider, TableType,
+        sink::{DataSink, DataSinkExec},
+    },
     error::{DataFusionError, Result as DFResult},
-    logical_expr::{BinaryExpr, dml::InsertOp},
+    execution::{TaskContext, context::SessionContext},
+    logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, dml::InsertOp},
     physical_plan::{DisplayFormatType, ExecutionPlan, SendableRecordBatchStream},
+    scalar::ScalarValue,
 };
 use datafusion_functions_json;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use deltalake::PartitionFilter;
-use deltalake::datafusion::parquet::file::metadata::SortingColumn;
-use deltalake::datafusion::parquet::file::properties::WriterProperties;
-use deltalake::kernel::transaction::CommitProperties;
-use deltalake::operations::create::CreateBuilder;
-use deltalake::{DeltaTable, DeltaTableBuilder};
+use deltalake::{
+    DeltaTable, DeltaTableBuilder, PartitionFilter,
+    datafusion::parquet::file::{metadata::SortingColumn, properties::WriterProperties},
+    kernel::transaction::CommitProperties,
+    operations::create::CreateBuilder,
+};
 use futures::StreamExt;
 use instrumented_object_store::instrument_object_store;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use std::fmt;
-use std::{any::Any, collections::HashMap, env, sync::Arc};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::field::Empty;
-use tracing::{Instrument, debug, error, info, instrument, warn};
+use tracing::{Instrument, debug, error, field::Empty, info, instrument, warn};
 use url::Url;
+
+use crate::{
+    object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
+    schema_loader::{get_default_schema, get_schema},
+    statistics::DeltaStatisticsExtractor,
+};
 
 // Changed to support multiple tables per project: (project_id, table_name) -> DeltaTable
 pub type ProjectConfigs = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
@@ -68,33 +69,33 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3; // Balance between compression ratio and 
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 struct StorageConfig {
-    project_id: String,
-    table_name: String,
-    s3_bucket: String,
-    s3_prefix: String,
-    s3_region: String,
-    s3_access_key_id: String,
+    project_id:           String,
+    table_name:           String,
+    s3_bucket:            String,
+    s3_prefix:            String,
+    s3_region:            String,
+    s3_access_key_id:     String,
     s3_secret_access_key: String,
-    s3_endpoint: Option<String>,
+    s3_endpoint:          Option<String>,
 }
 
 #[derive(Debug)]
 pub struct Database {
-    project_configs: ProjectConfigs,
-    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
-    maintenance_shutdown: Arc<CancellationToken>,
+    project_configs:       ProjectConfigs,
+    batch_queue:           Option<Arc<crate::batch_queue::BatchQueue>>,
+    maintenance_shutdown:  Arc<CancellationToken>,
     // PostgreSQL pool for configuration (optional)
-    config_pool: Option<PgPool>,
+    config_pool:           Option<PgPool>,
     // Cached storage configurations
-    storage_configs: Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
+    storage_configs:       Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
     // Default S3 settings for unconfigured mode
-    default_s3_bucket: Option<String>,
-    default_s3_prefix: Option<String>,
-    default_s3_endpoint: Option<String>,
+    default_s3_bucket:     Option<String>,
+    default_s3_prefix:     Option<String>,
+    default_s3_endpoint:   Option<String>,
     // Object store cache (optional)
-    object_store_cache: Option<Arc<SharedFoyerCache>>,
+    object_store_cache:    Option<Arc<SharedFoyerCache>>,
     // Statistics extractor for Delta Lake tables
-    statistics_extractor: Arc<DeltaStatisticsExtractor>,
+    statistics_extractor:  Arc<DeltaStatisticsExtractor>,
     // Track last written versions for read-after-write consistency
     // Map of (project_id, table_name) -> last_written_version
     last_written_versions: Arc<RwLock<HashMap<(String, String), i64>>>,
@@ -103,16 +104,16 @@ pub struct Database {
 impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
-            project_configs: Arc::clone(&self.project_configs),
-            batch_queue: self.batch_queue.clone(),
-            maintenance_shutdown: Arc::clone(&self.maintenance_shutdown),
-            config_pool: self.config_pool.clone(),
-            storage_configs: Arc::clone(&self.storage_configs),
-            default_s3_bucket: self.default_s3_bucket.clone(),
-            default_s3_prefix: self.default_s3_prefix.clone(),
-            default_s3_endpoint: self.default_s3_endpoint.clone(),
-            object_store_cache: self.object_store_cache.clone(),
-            statistics_extractor: Arc::clone(&self.statistics_extractor),
+            project_configs:       Arc::clone(&self.project_configs),
+            batch_queue:           self.batch_queue.clone(),
+            maintenance_shutdown:  Arc::clone(&self.maintenance_shutdown),
+            config_pool:           self.config_pool.clone(),
+            storage_configs:       Arc::clone(&self.storage_configs),
+            default_s3_bucket:     self.default_s3_bucket.clone(),
+            default_s3_prefix:     self.default_s3_prefix.clone(),
+            default_s3_endpoint:   self.default_s3_endpoint.clone(),
+            object_store_cache:    self.object_store_cache.clone(),
+            statistics_extractor:  Arc::clone(&self.statistics_extractor),
             last_written_versions: Arc::clone(&self.last_written_versions),
         }
     }
@@ -178,8 +179,10 @@ impl Database {
     }
     /// Creates standard writer properties used across different operations
     fn create_writer_properties(sorting_columns: Vec<SortingColumn>) -> WriterProperties {
-        use deltalake::datafusion::parquet::basic::{Compression, ZstdLevel};
-        use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
+        use deltalake::datafusion::parquet::{
+            basic::{Compression, ZstdLevel},
+            file::properties::EnabledStatistics,
+        };
 
         // Get configurable values from environment
         let page_row_count_limit = env::var("TIMEFUSION_PAGE_ROW_COUNT_LIMIT")
@@ -576,13 +579,15 @@ impl Database {
 
     /// Create and configure a SessionContext with DataFusion settings
     pub fn create_session_context(self: Arc<Self>) -> SessionContext {
-        use crate::dml::DmlQueryPlanner;
-        use datafusion::config::ConfigOptions;
-        use datafusion::execution::SessionStateBuilder;
-        use datafusion::execution::context::SessionContext;
-        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-        use datafusion_tracing::{InstrumentationOptions, instrument_with_info_spans};
         use std::sync::Arc;
+
+        use datafusion::{
+            config::ConfigOptions,
+            execution::{SessionStateBuilder, context::SessionContext, runtime_env::RuntimeEnvBuilder},
+        };
+        use datafusion_tracing::{InstrumentationOptions, instrument_with_info_spans};
+
+        use crate::dml::DmlQueryPlanner;
 
         let mut options = ConfigOptions::new();
         let _ = options.set("datafusion.catalog.information_schema", "true");
@@ -715,9 +720,11 @@ impl Database {
 
     /// Register PostgreSQL settings table for compatibility
     pub fn register_pg_settings_table(&self, ctx: &SessionContext) -> datafusion::error::Result<()> {
-        use datafusion::arrow::array::StringArray;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::arrow::{
+            array::StringArray,
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
@@ -760,9 +767,13 @@ impl Database {
 
     /// Register set_config UDF for PostgreSQL compatibility
     pub fn register_set_config_udf(&self, ctx: &SessionContext) {
-        use datafusion::arrow::array::{StringArray, StringBuilder};
-        use datafusion::arrow::datatypes::DataType;
-        use datafusion::logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf};
+        use datafusion::{
+            arrow::{
+                array::{StringArray, StringBuilder},
+                datatypes::DataType,
+            },
+            logical_expr::{ColumnarValue, ScalarFunctionImplementation, Volatility, create_udf},
+        };
 
         let set_config_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
             let param_value_array = match &args[1] {
@@ -1535,10 +1546,10 @@ impl Database {
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
-    database: Arc<Database>,
-    schema: SchemaRef,
-    _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
-    table_name: String,
+    database:        Arc<Database>,
+    schema:          SchemaRef,
+    _batch_queue:    Option<Arc<crate::batch_queue::BatchQueue>>,
+    table_name:      String,
 }
 
 impl ProjectRoutingTable {
@@ -1900,9 +1911,10 @@ impl Drop for Database {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
     use crate::test_utils::test_helpers::*;
-    use serial_test::serial;
 
     async fn setup_test_database() -> Result<(Database, SessionContext)> {
         dotenv::dotenv().ok();
@@ -2482,7 +2494,8 @@ mod tests {
 
                     db.shutdown().await?;
                     Ok::<(), anyhow::Error>(())
-                }.await;
+                }
+                .await;
 
                 let _ = tx.send(result);
             });
@@ -2564,7 +2577,12 @@ mod tests {
 
             // Now act as a "client" sending queries
             let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-            query_tx.send(("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'cross_spawn_project'".to_string(), result_tx)).await?;
+            query_tx
+                .send((
+                    "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'cross_spawn_project'".to_string(),
+                    result_tx,
+                ))
+                .await?;
 
             let result = result_rx.await.map_err(|_| anyhow::anyhow!("Query response channel closed"))??;
             use datafusion::arrow::array::AsArray;

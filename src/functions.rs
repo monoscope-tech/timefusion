@@ -1,19 +1,23 @@
+use std::{any::Any, sync::Arc};
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringBuilder, TimestampMicrosecondArray,
-    TimestampNanosecondArray,
-};
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::{DataFusionError, ScalarValue, not_impl_err};
-use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, ColumnarValue, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature, Volatility,
-    create_udaf, create_udf,
+use datafusion::{
+    arrow::{
+        array::{
+            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringBuilder, TimestampMicrosecondArray,
+            TimestampNanosecondArray,
+        },
+        datatypes::{DataType, TimeUnit},
+    },
+    common::{DataFusionError, ScalarValue, not_impl_err},
+    logical_expr::{
+        Accumulator, AggregateUDF, ColumnarValue, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
+        Volatility, create_udaf, create_udf,
+    },
 };
 use serde_json::{Value as JsonValue, json};
-use std::any::Any;
-use std::sync::Arc;
 use tdigests::TDigest;
 
 /// Register all custom PostgreSQL-compatible functions
@@ -1071,5 +1075,4 @@ mod tests {
         assert!(parse_interval_to_micros("abc minutes").is_err());
         assert!(parse_interval_to_micros("m5").is_err()); // unit before number
     }
-
 }

@@ -1,15 +1,14 @@
+use std::{sync::Arc, time::Duration};
+
 use anyhow::Result;
 use delta_kernel::arrow::record_batch::RecordBatch;
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tracing::{error, info};
 
 #[derive(Debug)]
 pub struct BatchQueue {
-    tx: mpsc::Sender<RecordBatch>,
+    tx:       mpsc::Sender<RecordBatch>,
     shutdown: tokio_util::sync::CancellationToken,
 }
 
@@ -72,13 +71,13 @@ impl BatchQueue {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::database::Database;
-    use crate::test_utils::test_helpers::*;
     use chrono::Utc;
     use serde_json::json;
     use serial_test::serial;
     use tokio::time::sleep;
+
+    use super::*;
+    use crate::{database::Database, test_utils::test_helpers::*};
 
     #[serial]
     #[tokio::test(flavor = "multi_thread")]

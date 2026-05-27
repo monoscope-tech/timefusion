@@ -1,8 +1,7 @@
 #[cfg(test)]
 mod test_custom_functions {
     use anyhow::Result;
-    use datafusion::arrow::array::AsArray;
-    use datafusion::prelude::*;
+    use datafusion::{arrow::array::AsArray, prelude::*};
     use timefusion::functions::register_custom_functions;
 
     #[tokio::test]

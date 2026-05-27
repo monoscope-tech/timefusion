@@ -1,5 +1,7 @@
-use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
-use datafusion::scalar::ScalarValue;
+use datafusion::{
+    logical_expr::{BinaryExpr, Expr, Operator},
+    scalar::ScalarValue,
+};
 
 /// Utilities for converting timestamp filters to date partition filters
 /// for better partition pruning in Delta Lake

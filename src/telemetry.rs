@@ -1,3 +1,5 @@
+use std::{env, time::Duration};
+
 use opentelemetry::{KeyValue, trace::TracerProvider};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
@@ -5,8 +7,6 @@ use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
     trace::{RandomIdGenerator, Sampler},
 };
-use std::env;
-use std::time::Duration;
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};

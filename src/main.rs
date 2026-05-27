@@ -1,12 +1,11 @@
 // main.rs
 #![recursion_limit = "512"]
 
+use std::{env, sync::Arc};
+
 use datafusion_postgres::{ServerOptions, auth::AuthManager};
 use dotenv::dotenv;
-use std::{env, sync::Arc};
-use timefusion::batch_queue::BatchQueue;
-use timefusion::database::Database;
-use timefusion::telemetry;
+use timefusion::{batch_queue::BatchQueue, database::Database, telemetry};
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 

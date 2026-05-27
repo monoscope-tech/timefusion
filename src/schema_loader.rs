@@ -1,34 +1,37 @@
-use arrow::datatypes::DataType as ArrowDataType;
-use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
-use deltalake::datafusion::parquet::file::metadata::SortingColumn;
-use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
+
+use arrow::datatypes::{DataType as ArrowDataType, Field, FieldRef, Schema, SchemaRef};
+use deltalake::{
+    datafusion::parquet::file::metadata::SortingColumn,
+    kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField},
+};
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::OnceLock;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSchema {
-    pub table_name: String,
-    pub partitions: Vec<String>,
+    pub table_name:      String,
+    pub partitions:      Vec<String>,
     pub sorting_columns: Vec<SortingColumnDef>,
     pub z_order_columns: Vec<String>,
-    pub fields: Vec<FieldDef>,
+    pub fields:          Vec<FieldDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SortingColumnDef {
-    pub name: String,
-    pub descending: bool,
+    pub name:        String,
+    pub descending:  bool,
     pub nulls_first: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FieldDef {
-    pub name: String,
+    pub name:      String,
     pub data_type: String,
-    pub nullable: bool,
+    pub nullable:  bool,
 }
 
 impl TableSchema {
@@ -83,8 +86,8 @@ impl TableSchema {
             .iter()
             .filter_map(|col| {
                 self.fields.iter().position(|f| f.name == col.name).map(|idx| SortingColumn {
-                    column_idx: idx as i32,
-                    descending: col.descending,
+                    column_idx:  idx as i32,
+                    descending:  col.descending,
                     nulls_first: col.nulls_first,
                 })
             })

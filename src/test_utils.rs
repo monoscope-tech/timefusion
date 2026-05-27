@@ -1,9 +1,11 @@
 pub mod test_helpers {
-    use crate::schema_loader::get_default_schema;
+    use std::collections::HashMap;
+
     use arrow_json::ReaderBuilder;
     use datafusion::arrow::record_batch::RecordBatch;
     use serde_json::{Value, json};
-    use std::collections::HashMap;
+
+    use crate::schema_loader::get_default_schema;
 
     pub fn json_to_batch(records: Vec<Value>) -> anyhow::Result<RecordBatch> {
         let schema = get_default_schema().schema_ref();

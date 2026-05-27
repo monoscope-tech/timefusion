@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod test_dml_operations {
-    use anyhow::Result;
-    use datafusion::arrow;
-    use datafusion::arrow::array::AsArray;
-    use serial_test::serial;
     use std::sync::Arc;
+
+    use anyhow::Result;
+    use datafusion::{arrow, arrow::array::AsArray};
+    use serial_test::serial;
     use timefusion::database::Database;
     use tracing::{Level, info};
 

@@ -1,20 +1,20 @@
 #[cfg(test)]
 mod integration {
+    use std::{sync::Arc, time::Duration};
+
     use anyhow::Result;
     use datafusion_postgres::{ServerOptions, auth::AuthManager};
     use dotenv::dotenv;
     use rand::Rng;
     use serial_test::serial;
-    use std::sync::Arc;
-    use std::time::Duration;
     use timefusion::database::Database;
     use tokio::sync::Notify;
     use tokio_postgres::{Client, NoTls};
     use uuid::Uuid;
 
     struct TestServer {
-        port: u16,
-        test_id: String,
+        port:     u16,
+        test_id:  String,
         shutdown: Arc<Notify>,
     }
 
@@ -47,21 +47,23 @@ mod integration {
                 let arrow_schema = schema.schema_ref();
 
                 // Create a minimal batch with required fields
-                use datafusion::arrow::array::*;
-                use datafusion::arrow::buffer::OffsetBuffer;
-                use datafusion::arrow::datatypes::*;
-                use datafusion::arrow::record_batch::RecordBatch;
+                use datafusion::arrow::{array::*, buffer::OffsetBuffer, datatypes::*, record_batch::RecordBatch};
 
                 let mut columns: Vec<std::sync::Arc<dyn Array>> = Vec::new();
                 for field in arrow_schema.fields() {
                     let array: std::sync::Arc<dyn Array> = match field.data_type() {
                         DataType::Utf8 => {
-                            let val = if field.name() == "project_id" { "_warmup_" }
-                            else if field.name() == "id" { "_warmup_id_" }
-                            else if field.name() == "name" { "_warmup_" }
-                            else { "" };
+                            let val = if field.name() == "project_id" {
+                                "_warmup_"
+                            } else if field.name() == "id" {
+                                "_warmup_id_"
+                            } else if field.name() == "name" {
+                                "_warmup_"
+                            } else {
+                                ""
+                            };
                             std::sync::Arc::new(StringArray::from(vec![val]))
-                        },
+                        }
                         DataType::Date32 => std::sync::Arc::new(Date32Array::from(vec![19000])),
                         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
                             let arr = TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros()]);
@@ -69,7 +71,7 @@ mod integration {
                                 Some(tz) => std::sync::Arc::new(arr.with_timezone(tz.to_string())),
                                 None => std::sync::Arc::new(arr),
                             }
-                        },
+                        }
                         DataType::Int8 => std::sync::Arc::new(Int8Array::from(vec![0i8])),
                         DataType::Int16 => std::sync::Arc::new(Int16Array::from(vec![0i16])),
                         DataType::Int32 => std::sync::Arc::new(Int32Array::from(vec![0i32])),
@@ -84,13 +86,16 @@ mod integration {
                         DataType::List(_) => {
                             let values = StringArray::from(vec![] as Vec<&str>);
                             let offsets = OffsetBuffer::from_lengths([0]);
-                            std::sync::Arc::new(ListArray::try_new(
-                                std::sync::Arc::new(Field::new("item", DataType::Utf8, true)),
-                                offsets,
-                                std::sync::Arc::new(values),
-                                None
-                            ).unwrap())
-                        },
+                            std::sync::Arc::new(
+                                ListArray::try_new(
+                                    std::sync::Arc::new(Field::new("item", DataType::Utf8, true)),
+                                    offsets,
+                                    std::sync::Arc::new(values),
+                                    None,
+                                )
+                                .unwrap(),
+                            )
+                        }
                         _ => std::sync::Arc::new(NullArray::new(1)),
                     };
                     columns.push(array);

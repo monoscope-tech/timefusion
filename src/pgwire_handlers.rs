@@ -1,26 +1,31 @@
+use std::{fmt::Debug, sync::Arc};
+
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
-use datafusion_postgres::pgwire::api::ClientPortalStore;
-use datafusion_postgres::pgwire::api::auth::{StartupHandler, noop::NoopStartupHandler};
-use datafusion_postgres::pgwire::api::portal::Portal;
-use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use datafusion_postgres::pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
-use datafusion_postgres::pgwire::api::stmt::StoredStatement;
-use datafusion_postgres::pgwire::api::store::PortalStore;
-use datafusion_postgres::pgwire::api::{ClientInfo, ErrorHandler, PgWireServerHandlers};
-use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
-use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
-use datafusion_postgres::{DfSessionService, auth::AuthManager};
+use datafusion_postgres::{
+    DfSessionService,
+    auth::AuthManager,
+    pgwire::{
+        api::{
+            ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers,
+            auth::{StartupHandler, noop::NoopStartupHandler},
+            portal::Portal,
+            query::{ExtendedQueryHandler, SimpleQueryHandler},
+            results::{DescribePortalResponse, DescribeStatementResponse, Response},
+            stmt::StoredStatement,
+            store::PortalStore,
+        },
+        error::{PgWireError, PgWireResult},
+        messages::PgWireBackendMessage,
+    },
+};
 use futures::Sink;
-use std::fmt::Debug;
-use std::sync::Arc;
-use tracing::field::Empty;
-use tracing::{Instrument, info, instrument};
+use tracing::{Instrument, field::Empty, info, instrument};
 
 /// Custom handler factory that creates handlers which log UPDATE queries
 pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
-    auth_manager: Arc<AuthManager>,
+    auth_manager:    Arc<AuthManager>,
 }
 
 impl LoggingHandlerFactory {

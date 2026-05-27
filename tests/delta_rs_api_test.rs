@@ -1,9 +1,9 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use datafusion::arrow::array::AsArray;
 use serial_test::serial;
-use std::sync::Arc;
-use timefusion::database::Database;
-use timefusion::test_utils::test_helpers::*;
+use timefusion::{database::Database, test_utils::test_helpers::*};
 
 async fn setup_test_database() -> Result<(Database, datafusion::prelude::SessionContext)> {
     dotenv::dotenv().ok();

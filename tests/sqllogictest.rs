@@ -1,17 +1,18 @@
 #[cfg(test)]
 mod sqllogictest_tests {
-    use anyhow::Result;
-    use async_trait::async_trait;
-    use datafusion_postgres::{ServerOptions, auth::AuthManager};
-    use dotenv::dotenv;
-    use serial_test::serial;
-    use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
     use std::{
         fmt,
         path::Path,
         sync::Arc,
         time::{Duration, Instant},
     };
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use datafusion_postgres::{ServerOptions, auth::AuthManager};
+    use dotenv::dotenv;
+    use serial_test::serial;
+    use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{NoTls, Row};
