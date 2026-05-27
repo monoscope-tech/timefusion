@@ -1,10 +1,8 @@
+use std::{sync::Arc, time::Duration};
+
 use futures::TryStreamExt;
-use object_store::memory::InMemory;
-use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 use serial_test::serial;
-use std::sync::Arc;
-use std::time::Duration;
 use timefusion::object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache};
 
 #[tokio::test]

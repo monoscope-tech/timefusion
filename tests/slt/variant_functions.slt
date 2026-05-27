@@ -160,11 +160,11 @@ SELECT variant_to_json(json_to_variant('{"user": {"name": "Alice", "id": 123}}')
 ----
 "Alice"
 
-# Test ->> operator (returns text via variant_to_json)
+# Test ->> operator (returns unquoted text — Postgres semantics; unlike -> which returns the JSON value)
 query T
 SELECT json_to_variant('{"user": {"name": "Alice", "id": 123}}')->'user'->>'name';
 ----
-"Alice"
+Alice
 
 # Test array index access with -> operator
 query T
@@ -176,7 +176,7 @@ SELECT variant_to_json(json_to_variant('{"items": [{"name": "item1", "qty": 5}, 
 query T
 SELECT json_to_variant('{"items": [{"name": "item1"}, {"name": "item2"}]}')->'items'->0->>'name';
 ----
-"item1"
+item1
 
 # Test accessing second array element
 query T
@@ -188,7 +188,7 @@ SELECT json_to_variant('{"items": [{"qty": 5}, {"qty": 10}]}')->'items'->1->>'qt
 query T
 SELECT json_to_variant('{"a": {"b": {"c": {"d": "deep"}}}}')->'a'->'b'->'c'->>'d';
 ----
-"deep"
+deep
 
 # Test numeric extraction via ->>
 query T
@@ -217,13 +217,13 @@ SELECT variant_to_json(json_to_variant('[1, "two", true, null]')->0);
 query T
 SELECT json_to_variant('[1, "two", true, null]')->1->>'';
 ----
-"two"
+two
 
 # Test complex nested structure
 query T
 SELECT json_to_variant('{"users": [{"profile": {"email": "alice@example.com"}}]}')->'users'->0->'profile'->>'email';
 ----
-"alice@example.com"
+alice@example.com
 
 # Test -> followed by variant_get (mixed usage)
 query T

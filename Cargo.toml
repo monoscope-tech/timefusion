@@ -5,30 +5,36 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
-datafusion = "52.1.0"
-datafusion-datasource = "52.1.0"
-arrow = "57.1.0"
-arrow-json = "57.1.0"
+datafusion = "53.1.0"
+datafusion-datasource = "53.1.0"
+arrow = "58"
+arrow-ipc = "58"
+arrow-json = "58"
 uuid = { version = "1.17", features = ["v4", "serde"] }
 serde = { version = "1", features = ["derive"] }
-serde_arrow = { version = "0.13.7", features = ["arrow-57"] }
+serde_arrow = { version = "0.14", features = ["arrow-58"] }
 serde_json = "1.0.141"
 serde_with = "3.14"
 serde_yaml = "0.9"
 async-trait = "0.1.86"
 log = "0.4.27"
 color-eyre = "0.6.5"
-arrow-schema = "57.1.0"
+arrow-schema = "58"
 regex = "1.11.1"
-# Using fork with VariantType support until upstream merges the feature
-deltalake = { git = "https://github.com/tonyalaribe/delta-rs.git", rev = "ba769136c5dd9b84a7335ea67e42b67884bfcce3", features = [
+# delta-rs main + local Variant DML fix. Branch `timefusion-variant-dml` on
+# our fork carries the write_data_plan normalization for issue #40
+# ("Expected Struct(Binary), got Struct(BinaryView)" on DELETE/UPDATE).
+# Rebase the branch onto upstream main when picking up newer revs.
+# Pinned to a SHA, not the branch tip, so `cargo update` can't silently pull
+# breaking changes from the fork. Bump explicitly when rebasing on upstream.
+deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "005b9ebf6262cd192501c29be3bb9df62acfa2f7", features = [
   "datafusion",
   "s3",
 ] }
-delta_kernel = { version = "0.19.1", features = [
+buoyant_kernel = { version = "0.22", features = [
   "arrow-conversion",
   "default-engine-rustls",
-  "arrow-57",
+  "arrow-58",
 ] }
 chrono = { version = "0.4.39", features = ["serde"] }
 chrono-tz = "0.10"
@@ -41,19 +47,23 @@ sqlx = { version = "0.8", features = [
 futures = { version = "0.3.31", features = ["alloc"] }
 bytes = "1.4"
 tokio-rustls = "0.26.1"
-datafusion-postgres = "0.14.0"
-datafusion-functions-json = "0.52.0"
+datafusion-postgres = "0.16"
+datafusion-functions-json = "0.53"
 anyhow = "1.0.100"
+subtle = "2"
+sha2 = "0.10"
+fastrand = "2"
+fnv = "1"
 tokio-util = "0.7.17"
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing = "0.1.44"
 tracing-opentelemetry = "0.32"
 opentelemetry = "0.31"
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-datafusion-tracing = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git", rev = "43734ac7a87eacb599d1d855a21c8c157d71acbb" }
-instrumented-object-store = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git", rev = "43734ac7a87eacb599d1d855a21c8c157d71acbb" }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
+datafusion-tracing = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git", rev = "8c28322f" }
+instrumented-object-store = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git", rev = "8c28322f" }
 dotenv = "0.15.0"
 include_dir = "0.7"
 aws-config = { version = "1.6.0", features = ["behavior-version-latest"] }
@@ -62,8 +72,8 @@ aws-sdk-s3 = "1.3.0"
 aws-sdk-dynamodb = "1.3.0"
 url = "2.5.4"
 tokio-cron-scheduler = "0.15"
-object_store = "0.12.4"
-foyer = { version = "0.21.1", features = ["serde"] }
+object_store = "0.13.2"
+foyer = { version = "0.22.3", features = ["serde"] }
 ahash = "0.8"
 lru = "0.16.1"
 serde_bytes = "0.11.19"
@@ -75,23 +85,63 @@ bincode = { version = "2.0", features = ["serde"] }
 walrus-rust = "0.2.0"
 thiserror = "2.0"
 strum = { version = "0.27", features = ["derive"] }
-datafusion-variant = { git = "https://github.com/tonyalaribe/datafusion-variant.git", rev = "8b6b270" }
-parquet-variant-compute = "57.2.0"
-parquet-variant-json = "57.2.0"
-parquet-variant = "57.2.0"
+datafusion-variant = { git = "https://github.com/datafusion-contrib/datafusion-variant.git", branch = "main" }
+parquet-variant-compute = "58.3"
+parquet-variant-json = "58.3"
+parquet-variant = "58.3"
 serde_json_path = "0.7"
 base64 = "0.22"
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+tantivy = "0.22"
+tar = "0.4"
+zstd = "0.13"
+tempfile = "3"
+sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
+num_cpus = "1.16"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
 serial_test = "3.2.0"
-datafusion-common = "52.1.0"
+datafusion-common = "53.1.0"
 tokio-postgres = { version = "0.7.10", features = ["with-chrono-0_4"] }
 scopeguard = "1.2.0"
-rand = "0.9.2"
+rand = "0.10.0"
 tempfile = "3"
 test-case = "3.3"
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[[bench]]
+name = "core_benchmarks"
+harness = false
+
+[[bench]]
+name = "tantivy_benchmarks"
+harness = false
+
+[[bench]]
+name = "sort_layout_benchmarks"
+harness = false
 
 [features]
 default = []
 test = []
+
+# Local patch: arrow-pg 0.13.0's UUID parameter decoder calls
+# `portal.parameter::<String>`, which pgwire rejects for the UUID OID and
+# breaks any client (Hasql, tokio-postgres binary) sending UUIDs. Vendored
+# copy decodes as `uuid::Uuid` then stringifies into the Utf8 column.
+[patch.crates-io]
+arrow-pg = { path = "vendor/arrow-pg" }
+# Local patch: datafusion-postgres 0.16.0's `ordered_param_types` sorts
+# placeholders lexicographically (`$10` before `$2`), so multi-row INSERTs
+# with >9 placeholders return the wrong type-by-position to the client.
+# Vendored copy sorts by numeric suffix instead.
+datafusion-postgres = { path = "vendor/datafusion-postgres" }
+

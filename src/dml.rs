@@ -1,5 +1,4 @@
-use std::any::Any;
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -7,29 +6,53 @@ use datafusion::{
         array::RecordBatch,
         datatypes::{DataType, Field, Schema},
     },
+    catalog::Session,
     common::{Column, Result},
     error::DataFusionError,
     execution::{
-        SendableRecordBatchStream, TaskContext,
+        SendableRecordBatchStream, SessionStateBuilder, TaskContext,
         context::{QueryPlanner, SessionState},
     },
     logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, WriteOp},
     physical_plan::{DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties, stream::RecordBatchStreamAdapter},
     physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner},
 };
-use tracing::field::Empty;
-use tracing::{Instrument, error, info, instrument};
+use tracing::{Instrument, error, field::Empty, info, instrument};
 
-use crate::buffered_write_layer::BufferedWriteLayer;
-use crate::database::Database;
+use crate::{buffered_write_layer::BufferedWriteLayer, database::Database};
+
+/// Build a clean SessionState with config + runtime from the given session but with
+/// delta-rs's DeltaPlanner instead of our custom DmlQueryPlanner.
+fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
+    // delta-rs's DELETE/UPDATE re-reads existing parquet files and rewrites
+    // them. Without `schema_force_view_types=false`, the reader returns
+    // Struct{BinaryView,BinaryView} for our Variant columns while
+    // delta_kernel's `unshredded_variant()` schema declares Binary —
+    // mismatch rejects the operation with "Expected ... Binary, got ...
+    // BinaryView" even on an empty table.
+    //
+    // Start from `DeltaSessionConfig::default()` so we inherit delta-rs's
+    // other required defaults (hash_join_inlist_pushdown=0, etc.) and only
+    // override the view-types flag.
+    let cfg: datafusion::prelude::SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
+    let cfg = cfg.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+    Arc::new(
+        SessionStateBuilder::new()
+            .with_config(cfg)
+            .with_runtime_env(session.runtime_env().clone())
+            .with_default_features()
+            .with_query_planner(deltalake::delta_datafusion::planner::DeltaPlanner::new())
+            .build(),
+    )
+}
 
 /// Type alias for DML information extracted from logical plan
 type DmlInfo = (String, String, Option<Expr>, Option<Vec<(String, Expr)>>);
 
 /// Custom query planner that intercepts DML operations
 pub struct DmlQueryPlanner {
-    planner: DefaultPhysicalPlanner,
-    database: Arc<Database>,
+    planner:        DefaultPhysicalPlanner,
+    database:       Arc<Database>,
     buffered_layer: Option<Arc<BufferedWriteLayer>>,
 }
 
@@ -79,12 +102,13 @@ impl QueryPlanner for DmlQueryPlanner {
                 span.record("table.name", table_name.as_str());
                 span.record("project_id", project_id.as_str());
 
+                let session = delta_session_from(session_state);
                 let exec = if is_update {
-                    DmlExec::update(table_name, project_id, input_exec, self.database.clone())
+                    DmlExec::update(table_name, project_id, input_exec, self.database.clone(), session)
                         .predicate(predicate)
                         .assignments(assignments.unwrap_or_default())
                 } else {
-                    DmlExec::delete(table_name, project_id, input_exec, self.database.clone()).predicate(predicate)
+                    DmlExec::delete(table_name, project_id, input_exec, self.database.clone(), session).predicate(predicate)
                 };
                 Ok(Arc::new(exec.buffered_layer(self.buffered_layer.clone())))
             }
@@ -119,8 +143,8 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                         .then(|| {
                             scan.filters.iter().cloned().reduce(|acc, filter| {
                                 Expr::BinaryExpr(BinaryExpr {
-                                    left: Box::new(acc),
-                                    op: Operator::And,
+                                    left:  Box::new(acc),
+                                    op:    Operator::And,
                                     right: Box::new(filter),
                                 })
                             })
@@ -129,10 +153,16 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 });
                 break;
             }
-            _ => match current_plan.inputs().first() {
-                Some(input) => current_plan = input,
-                None => break,
-            },
+            other => {
+                // Unknown node — Window/Subquery/Union/etc. Fall through the first
+                // input; warn so a missing predicate/project_id below is traceable
+                // to a plan shape this extractor doesn't understand.
+                tracing::warn!(target: "dml", node = ?std::mem::discriminant(other), "extract_dml_info: unhandled LogicalPlan node, descending first child — predicate/project_id extraction may be incomplete");
+                match other.inputs().first() {
+                    Some(input) => current_plan = input,
+                    None => break,
+                }
+            }
         }
     }
 
@@ -166,33 +196,21 @@ fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projecti
         .collect())
 }
 
-/// Extract project_id from filter expression
-fn extract_project_id(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(col), Expr::Literal(val, _)) | (Expr::Literal(val, _), Expr::Column(col)) if col.name == "project_id" => Some(val.to_string()),
-            _ => None,
-        },
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op: Operator::And,
-            right,
-        }) => extract_project_id(left).or_else(|| extract_project_id(right)),
-        _ => None,
-    }
-}
+use crate::optimizers::extract_project_id_from_expr as extract_project_id;
 
 /// Unified DML execution plan
 #[derive(Clone)]
 pub struct DmlExec {
-    op_type: DmlOperation,
-    table_name: String,
-    project_id: String,
-    predicate: Option<Expr>,
-    assignments: Vec<(String, Expr)>,
-    input: Arc<dyn ExecutionPlan>,
-    database: Arc<Database>,
+    op_type:        DmlOperation,
+    table_name:     String,
+    project_id:     String,
+    predicate:      Option<Expr>,
+    assignments:    Vec<(String, Expr)>,
+    input:          Arc<dyn ExecutionPlan>,
+    database:       Arc<Database>,
     buffered_layer: Option<Arc<BufferedWriteLayer>>,
+    session:        Arc<dyn Session>,
+    properties:     Arc<PlanProperties>,
 }
 
 impl std::fmt::Debug for DmlExec {
@@ -209,21 +227,22 @@ impl std::fmt::Debug for DmlExec {
 
 #[derive(Debug, Clone, PartialEq, strum::Display, strum::AsRefStr)]
 enum DmlOperation {
+    #[strum(to_string = "UPDATE")]
     Update,
+    #[strum(to_string = "DELETE")]
     Delete,
 }
 
-impl DmlOperation {
-    fn as_uppercase(&self) -> &'static str {
-        match self {
-            Self::Update => "UPDATE",
-            Self::Delete => "DELETE",
-        }
-    }
-}
-
 impl DmlExec {
-    fn new(op_type: DmlOperation, table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> Self {
+    fn new(
+        op_type: DmlOperation, table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(input.schema()),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            input.properties().emission_type,
+            input.properties().boundedness,
+        ));
         Self {
             op_type,
             table_name,
@@ -233,15 +252,17 @@ impl DmlExec {
             input,
             database,
             buffered_layer: None,
+            session,
+            properties,
         }
     }
 
-    pub fn update(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> Self {
-        Self::new(DmlOperation::Update, table_name, project_id, input, database)
+    pub fn update(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>) -> Self {
+        Self::new(DmlOperation::Update, table_name, project_id, input, database, session)
     }
 
-    pub fn delete(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>) -> Self {
-        Self::new(DmlOperation::Delete, table_name, project_id, input, database)
+    pub fn delete(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>) -> Self {
+        Self::new(DmlOperation::Delete, table_name, project_id, input, database, session)
     }
 
     pub fn predicate(mut self, predicate: Option<Expr>) -> Self {
@@ -262,7 +283,7 @@ impl DisplayAs for DmlExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "Delta{}Exec: table={}, project_id={}", self.op_type, self.table_name, self.project_id)?;
+                write!(f, "{}: table={}, project_id={}", self.name(), self.table_name, self.project_id)?;
                 if self.op_type == DmlOperation::Update && !self.assignments.is_empty() {
                     write!(
                         f,
@@ -275,7 +296,7 @@ impl DisplayAs for DmlExec {
                 }
                 Ok(())
             }
-            _ => write!(f, "Delta{}Exec", self.op_type),
+            _ => write!(f, "{}", self.name()),
         }
     }
 }
@@ -293,8 +314,8 @@ impl ExecutionPlan for DmlExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
-        self.input.properties()
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
@@ -312,7 +333,7 @@ impl ExecutionPlan for DmlExec {
         }))
     }
 
-    #[instrument(name = "dml.execute", skip_all, fields(operation = self.op_type.as_uppercase(), table.name = %self.table_name, project_id = %self.project_id, has_predicate = self.predicate.is_some(), rows.affected = Empty))]
+    #[instrument(name = "dml.execute", skip_all, fields(operation = self.op_type.as_ref(), table.name = %self.table_name, project_id = %self.project_id, has_predicate = self.predicate.is_some(), rows.affected = Empty))]
     fn execute(&self, _partition: usize, _context: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
         let span = tracing::Span::current();
         let field_name = if self.op_type == DmlOperation::Update { "rows_updated" } else { "rows_deleted" };
@@ -327,13 +348,26 @@ impl ExecutionPlan for DmlExec {
         let predicate = self.predicate.clone();
         let database = self.database.clone();
         let buffered_layer = self.buffered_layer.clone();
+        let session = self.session.clone();
 
         let future = async move {
             let result = match op_type {
                 DmlOperation::Update => {
-                    perform_update_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, assignments, &span).await
+                    perform_update_with_buffer(
+                        &database,
+                        buffered_layer.as_ref(),
+                        &table_name,
+                        &project_id,
+                        predicate,
+                        assignments,
+                        session,
+                        &span,
+                    )
+                    .await
                 }
-                DmlOperation::Delete => perform_delete_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, &span).await,
+                DmlOperation::Delete => {
+                    perform_delete_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, session, &span).await
+                }
             };
 
             if let Ok(rows) = &result {
@@ -346,7 +380,7 @@ impl ExecutionPlan for DmlExec {
                         .map_err(|e| DataFusionError::External(Box::new(e)))
                 })
                 .map_err(|e| {
-                    error!("{} failed: {}", op_type.as_uppercase(), e);
+                    error!("{} failed: {}", op_type.as_ref(), e);
                     e
                 })
         };
@@ -356,17 +390,21 @@ impl ExecutionPlan for DmlExec {
 }
 
 struct DmlContext<'a> {
-    database: &'a Database,
+    database:       &'a Database,
     buffered_layer: Option<&'a Arc<BufferedWriteLayer>>,
-    table_name: &'a str,
-    project_id: &'a str,
-    predicate: Option<Expr>,
+    table_name:     &'a str,
+    project_id:     &'a str,
+    predicate:      Option<Expr>,
 }
 
 impl<'a> DmlContext<'a> {
-    async fn execute<F, Fut>(self, mem_op: F, delta_op: Fut) -> Result<u64>
+    /// `delta_op` is a closure (not a bare Future) so its body — which may
+    /// acquire a write lock and call `update_state` — is only constructed
+    /// when there is committed data to operate on.
+    async fn execute<F, G, Fut>(self, mem_op: F, delta_op: G) -> Result<u64>
     where
         F: FnOnce(&BufferedWriteLayer, Option<&Expr>) -> Result<u64>,
+        G: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<u64>>,
     {
         let mut total_rows = 0u64;
@@ -376,22 +414,34 @@ impl<'a> DmlContext<'a> {
             total_rows += mem_op(layer, self.predicate.as_ref())?;
         }
 
-        let has_committed = self.database.project_configs().read().await.contains_key(&(self.project_id.to_string(), self.table_name.to_string()));
+        // Check if there's committed data: either in custom project tables or unified tables.
+        // The unified-tables lookup intentionally uses table_name only (no project_id):
+        // unified tables are shared across all default projects, so a hit here means "some
+        // project has committed data in this table", not "this project has". The delta_op's
+        // predicate already includes `project_id = $self.project_id`, so we never delete or
+        // update another project's rows — at worst we issue a Delta scan that matches nothing.
+        let has_committed = {
+            let custom_tables = self.database.custom_project_tables().read().await;
+            let unified_tables = self.database.unified_tables().read().await;
+            custom_tables.contains_key(&(self.project_id.to_string(), self.table_name.to_string())) || unified_tables.contains_key(self.table_name)
+        };
 
         if has_committed {
-            total_rows += delta_op.await?;
+            total_rows += delta_op().await?;
         }
 
         Ok(total_rows)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn perform_update_with_buffer(
     database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
-    assignments: Vec<(String, Expr)>, span: &tracing::Span,
+    assignments: Vec<(String, Expr)>, session: Arc<dyn Session>, span: &tracing::Span,
 ) -> Result<u64> {
-    let assignments_clone = assignments.clone();
     let update_span = tracing::trace_span!(parent: span, "delta.update");
+    // The delta closure body is only constructed (and assignments only
+    // cloned) when there is committed data. Mem path borrows `assignments`.
     DmlContext {
         database,
         buffered_layer,
@@ -400,14 +450,15 @@ async fn perform_update_with_buffer(
         predicate: predicate.clone(),
     }
     .execute(
-        |layer, pred| layer.update(project_id, table_name, pred, &assignments_clone),
-        perform_delta_update(database, table_name, project_id, predicate, assignments).instrument(update_span),
+        |layer, pred| layer.update(project_id, table_name, pred, &assignments),
+        || perform_delta_update(database, table_name, project_id, predicate, assignments.clone(), session).instrument(update_span),
     )
     .await
 }
 
 async fn perform_delete_with_buffer(
-    database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>, span: &tracing::Span,
+    database: &Database, buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<Expr>,
+    session: Arc<dyn Session>, span: &tracing::Span,
 ) -> Result<u64> {
     let delete_span = tracing::trace_span!(parent: span, "delta.delete");
     DmlContext {
@@ -419,7 +470,7 @@ async fn perform_delete_with_buffer(
     }
     .execute(
         |layer, pred| layer.delete(project_id, table_name, pred),
-        perform_delta_delete(database, table_name, project_id, predicate).instrument(delete_span),
+        || perform_delta_delete(database, table_name, project_id, predicate, session).instrument(delete_span),
     )
     .await
 }
@@ -437,14 +488,13 @@ async fn perform_delete_with_buffer(
     )
 )]
 pub async fn perform_delta_update(
-    database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>,
+    database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>, session: Arc<dyn Session>,
 ) -> Result<u64> {
     info!("Performing Delta UPDATE on table {} for project {}", table_name, project_id);
 
     let span = tracing::Span::current();
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| async move {
-        // delta-rs handles Utf8View automatically with schema_force_view_types=true (default in DF52+)
-        let mut builder = delta_table.update();
+        let mut builder = delta_table.update().with_session_state(session);
 
         if let Some(pred) = predicate {
             builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
@@ -479,13 +529,12 @@ pub async fn perform_delta_update(
         rows.deleted = Empty,
     )
 )]
-pub async fn perform_delta_delete(database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>) -> Result<u64> {
+pub async fn perform_delta_delete(database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, session: Arc<dyn Session>) -> Result<u64> {
     info!("Performing Delta DELETE on table {} for project {}", table_name, project_id);
 
     let span = tracing::Span::current();
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| async move {
-        // delta-rs handles Utf8View automatically with schema_force_view_types=true (default in DF52+)
-        let mut builder = delta_table.delete();
+        let mut builder = delta_table.delete().with_session_state(session);
 
         if let Some(pred) = predicate {
             builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
@@ -493,7 +542,7 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
 
         builder
             .await
-            .map(|(table, metrics)| (table, metrics.num_deleted_rows as u64))
+            .map(|(table, metrics)| (table, metrics.num_deleted_rows.unwrap_or(0) as u64))
             .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta DELETE: {}", e)))
     })
     .await;
@@ -511,21 +560,20 @@ where
     F: FnOnce(deltalake::DeltaTable) -> Fut,
     Fut: std::future::Future<Output = Result<(deltalake::DeltaTable, u64)>>,
 {
-    let table_key = (project_id.to_string(), table_name.to_string());
+    // Use resolve_table which routes to unified or custom table based on storage config
     let table_lock = database
-        .project_configs()
-        .read()
+        .resolve_table(project_id, table_name)
         .await
-        .get(&table_key)
-        .ok_or_else(|| DataFusionError::Execution(format!("Table not found: {} for project {}", table_name, project_id)))?
-        .clone();
+        .map_err(|e| DataFusionError::Execution(format!("Table not found: {} for project {}: {}", table_name, project_id, e)))?;
 
-    let delta_table = table_lock.write().await;
-    let (new_table, rows_affected) = operation(delta_table.clone()).await?;
-
-    drop(delta_table);
-    *table_lock.write().await = new_table;
-
+    // Hold the write lock continuously across update_state → operation → snapshot
+    // swap. Releasing between operation and the second write opened a TOCTOU window
+    // where a concurrent DELETE/UPDATE could commit a new version that we'd then
+    // overwrite with the stale snapshot from the closure's clone.
+    let mut guard = table_lock.write().await;
+    guard.update_state().await.map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
+    let (new_table, rows_affected) = operation(guard.clone()).await?;
+    *guard = new_table;
     Ok(rows_affected)
 }
 

@@ -1,17 +1,18 @@
 #[cfg(test)]
 mod sqllogictest_tests {
-    use anyhow::Result;
-    use async_trait::async_trait;
-    use datafusion_postgres::ServerOptions;
-    use dotenv::dotenv;
-    use serial_test::serial;
-    use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
     use std::{
         fmt,
         path::Path,
         sync::Arc,
         time::{Duration, Instant},
     };
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use datafusion_postgres::ServerOptions;
+    use dotenv::dotenv;
+    use serial_test::serial;
+    use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{NoTls, Row};
@@ -84,7 +85,10 @@ mod sqllogictest_tests {
                 .columns()
                 .iter()
                 .map(|col| match col.type_().name() {
-                    "int2" | "int4" | "int8" => DefaultColumnType::Integer,
+                    // UInt64 (from datafusion's array_length, json_length, etc.) is mapped to
+                    // NUMERIC by datafusion-postgres (Postgres has no unsigned types). The
+                    // values are always integral, so report Integer for sqllogictest's `I` checks.
+                    "int2" | "int4" | "int8" | "numeric" => DefaultColumnType::Integer,
                     _ => DefaultColumnType::Text,
                 })
                 .collect();
@@ -99,6 +103,65 @@ mod sqllogictest_tests {
         }
 
         async fn shutdown(&mut self) {}
+    }
+
+    /// Wrapper that decodes Postgres binary NUMERIC into a plain decimal string.
+    /// Format: ndigits(u16) weight(i16) sign(u16) dscale(u16) digits(u16 base-10000)...
+    /// See postgres backend/utils/adt/numeric.c.
+    struct PgNumeric(String);
+
+    impl<'a> tokio_postgres::types::FromSql<'a> for PgNumeric {
+        fn from_sql(_ty: &tokio_postgres::types::Type, buf: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+            if buf.len() < 8 {
+                return Err("NUMERIC buffer too short".into());
+            }
+            let ndigits = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+            let weight = i16::from_be_bytes([buf[2], buf[3]]);
+            let sign = u16::from_be_bytes([buf[4], buf[5]]);
+            let dscale = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+            if buf.len() < 8 + ndigits * 2 {
+                return Err("NUMERIC digits truncated".into());
+            }
+            let digits: Vec<u16> = (0..ndigits).map(|i| u16::from_be_bytes([buf[8 + i * 2], buf[9 + i * 2]])).collect();
+            if sign == 0xC000 {
+                return Ok(PgNumeric("NaN".into()));
+            }
+            if ndigits == 0 {
+                return Ok(PgNumeric(if dscale == 0 { "0".into() } else { format!("0.{}", "0".repeat(dscale)) }));
+            }
+            // Integer part: digit group 0 is the most-significant; each subsequent group is 4 decimal digits.
+            let mut int_part = String::new();
+            for w in 0..=weight.max(0) as i32 {
+                let idx = w as usize;
+                let d = if idx < ndigits { digits[idx] } else { 0 };
+                if w == 0 {
+                    int_part.push_str(&d.to_string());
+                } else {
+                    int_part.push_str(&format!("{:04}", d));
+                }
+            }
+            if int_part.is_empty() {
+                int_part.push('0');
+            }
+            // Fractional part
+            let mut frac_part = String::new();
+            let frac_groups = (dscale as i32 + 3) / 4;
+            for w in (weight as i32 + 1).max(0)..(weight as i32 + 1 + frac_groups) {
+                let idx = w as usize;
+                let d = if idx < ndigits { digits[idx] } else { 0 };
+                frac_part.push_str(&format!("{:04}", d));
+            }
+            frac_part.truncate(dscale);
+            let sign_prefix = if sign == 0x4000 { "-" } else { "" };
+            Ok(PgNumeric(if dscale == 0 {
+                format!("{sign_prefix}{int_part}")
+            } else {
+                format!("{sign_prefix}{int_part}.{frac_part}")
+            }))
+        }
+        fn accepts(ty: &tokio_postgres::types::Type) -> bool {
+            ty.name() == "numeric"
+        }
     }
 
     fn format_row(row: &Row) -> Vec<String> {
@@ -121,10 +184,16 @@ mod sqllogictest_tests {
                         .try_get::<_, Option<i64>>(i)
                         .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
                         .unwrap_or_else(|_| "error:int8".to_string()),
-                    "float4" | "float8" | "numeric" => row
+                    "float4" | "float8" => row
                         .try_get::<_, Option<f64>>(i)
                         .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
                         .unwrap_or_else(|_| "error:float".to_string()),
+                    // tokio-postgres has no built-in NUMERIC decoder (would require
+                    // `with-rust_decimal-1`). Parse via a custom FromSql wrapper.
+                    "numeric" => row
+                        .try_get::<_, Option<PgNumeric>>(i)
+                        .map(|v| v.map(|n| n.0).unwrap_or_else(|| "NULL".to_string()))
+                        .unwrap_or_else(|_| "error:numeric".to_string()),
                     "bool" => row
                         .try_get::<_, Option<bool>>(i)
                         .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))

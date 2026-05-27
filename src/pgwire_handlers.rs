@@ -1,21 +1,28 @@
+use std::{fmt::Debug, sync::Arc};
+
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
-use datafusion_postgres::DfSessionService;
-use datafusion_postgres::pgwire::api::auth::cleartext::CleartextPasswordAuthStartupHandler;
-use datafusion_postgres::pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler};
-use datafusion_postgres::pgwire::api::portal::Portal;
-use datafusion_postgres::pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
-use datafusion_postgres::pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
-use datafusion_postgres::pgwire::api::stmt::StoredStatement;
-use datafusion_postgres::pgwire::api::store::PortalStore;
-use datafusion_postgres::pgwire::api::{ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers};
-use datafusion_postgres::pgwire::error::{PgWireError, PgWireResult};
-use datafusion_postgres::pgwire::messages::PgWireBackendMessage;
+use datafusion_postgres::{
+    DfSessionService,
+    hooks::{QueryHook, set_show::SetShowHook, transactions::TransactionStatementHook},
+    pgwire::{
+        api::{
+            ClientInfo, ClientPortalStore, ErrorHandler, PgWireServerHandlers,
+            auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler, cleartext::CleartextPasswordAuthStartupHandler},
+            portal::Portal,
+            query::{ExtendedQueryHandler, SimpleQueryHandler},
+            results::{DescribePortalResponse, DescribeStatementResponse, Response},
+            stmt::StoredStatement,
+            store::PortalStore,
+        },
+        error::{PgWireError, PgWireResult},
+        messages::PgWireBackendMessage,
+    },
+};
 use futures::Sink;
-use std::fmt::Debug;
-use std::sync::Arc;
-use tracing::field::Empty;
-use tracing::{Instrument, info, instrument};
+use tracing::{Instrument, field::Empty, info, instrument};
+
+use crate::plan_cache::PlanCacheHook;
 
 /// Auth configuration for PgWire server
 #[derive(Debug, Clone)]
@@ -29,6 +36,33 @@ impl Default for AuthConfig {
         Self {
             username: "postgres".into(),
             password: None,
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Construct from `CoreConfig`, requiring an explicit password unless
+    /// `TIMEFUSION_ALLOW_INSECURE_AUTH=true` is set. We hard-fail the
+    /// startup path rather than silently accept an empty password — the
+    /// PG wire protocol's cleartext handler treats `None` as "accept any",
+    /// which is an open ingest endpoint when bound to 0.0.0.0.
+    pub fn from_core(core: &crate::config::CoreConfig) -> anyhow::Result<Self> {
+        let allow_insecure = std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        match (&core.pgwire_password, allow_insecure) {
+            (Some(p), _) if !p.is_empty() => Ok(Self {
+                username: core.pgwire_user.clone(),
+                password: Some(p.clone()),
+            }),
+            (_, true) => {
+                tracing::warn!(
+                    "PGWIRE_PASSWORD unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — pgwire endpoint accepts any password. Acceptable for local dev ONLY; never in production."
+                );
+                Ok(Self {
+                    username: core.pgwire_user.clone(),
+                    password: None,
+                })
+            }
+            _ => anyhow::bail!("PGWIRE_PASSWORD is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open auth for local dev)"),
         }
     }
 }
@@ -65,22 +99,40 @@ impl AuthSource for ConfigAuthSource {
 /// Custom handler factory that creates handlers with logging and auth
 pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
-    auth_config: AuthConfig,
+    auth_config:     AuthConfig,
+    plan_cache:      Arc<PlanCacheHook>,
 }
 
 impl LoggingHandlerFactory {
     pub fn new(session_context: Arc<SessionContext>, auth_config: AuthConfig) -> Self {
-        Self { session_context, auth_config }
+        let plan_cache = Arc::new(PlanCacheHook::default());
+        crate::plan_cache::set_global(plan_cache.clone());
+        Self {
+            session_context,
+            auth_config,
+            plan_cache,
+        }
+    }
+
+    /// Hook list passed to every `DfSessionService` instance the factory
+    /// produces. Sharing the single `plan_cache` Arc is what makes the LRU
+    /// global rather than per-connection.
+    fn hooks(&self) -> Vec<Arc<dyn QueryHook>> {
+        vec![self.plan_cache.clone() as Arc<dyn QueryHook>, Arc::new(SetShowHook), Arc::new(TransactionStatementHook)]
+    }
+
+    pub fn plan_cache(&self) -> Arc<PlanCacheHook> {
+        self.plan_cache.clone()
     }
 }
 
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        Arc::new(LoggingSimpleQueryHandler::new(self.session_context.clone()))
+        Arc::new(LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()))
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        Arc::new(LoggingExtendedQueryHandler::new(self.session_context.clone()))
+        Arc::new(LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()))
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
@@ -117,6 +169,12 @@ impl LoggingSimpleQueryHandler {
             inner: DfSessionService::new(session_context),
         }
     }
+
+    pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
+        Self {
+            inner: DfSessionService::new_with_hooks(session_context, hooks),
+        }
+    }
 }
 
 fn classify_query(query: &str) -> (&'static str, &'static str) {
@@ -141,11 +199,22 @@ fn classify_query(query: &str) -> (&'static str, &'static str) {
 }
 
 fn sanitize_query(query: &str, operation: &str) -> String {
+    const MAX_LEN: usize = 120;
     let lower = query.to_lowercase();
     match operation {
-        "INSERT" => lower.find(" values").map(|i| format!("{} VALUES ...", &query[..i])).unwrap_or_else(|| query.into()),
-        "UPDATE" => lower.find(" set").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.into()),
-        _ => query.into(),
+        "INSERT" => {
+            let table_end = lower.find('(').or_else(|| lower.find("values")).unwrap_or(lower.len());
+            let table_part = query[..table_end].trim_end();
+            format!("{} (...) VALUES ...", table_part)
+        }
+        "UPDATE" => lower.find(" set ").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.into()),
+        _ => {
+            if query.len() > MAX_LEN {
+                format!("{}...", &query[..MAX_LEN])
+            } else {
+                query.into()
+            }
+        }
     }
 }
 
@@ -183,6 +252,12 @@ impl LoggingExtendedQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
         Self {
             inner: DfSessionService::new(session_context),
+        }
+    }
+
+    pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
+        Self {
+            inner: DfSessionService::new_with_hooks(session_context, hooks),
         }
     }
 }

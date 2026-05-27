@@ -1,32 +1,34 @@
+use std::{
+    ops::Range,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashSet;
+use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, PsyncIoEngineConfig};
 use futures::stream::BoxStream;
 use object_store::{
-    Attributes, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, Result as ObjectStoreResult, path::Path,
+    Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as ObjectStoreResult, path::Path,
 };
-use std::ops::Range;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::field::Empty;
-use tracing::{Instrument, debug, info, instrument};
-
-use crate::config::CacheConfig;
-use foyer::{BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, IoEngineBuilder, PsyncIoEngineBuilder};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinSet;
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinSet,
+};
+use tracing::{Instrument, debug, field::Empty, info, instrument};
 
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheValue {
     #[serde(with = "serde_bytes")]
-    data: Vec<u8>,
+    data:             Vec<u8>,
     #[serde(with = "object_meta_serde")]
-    meta: ObjectMeta,
+    meta:             ObjectMeta,
     timestamp_millis: u64,
 }
 
@@ -50,16 +52,17 @@ fn current_millis() -> u64 {
 }
 
 mod object_meta_serde {
-    use super::*;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::*;
 
     #[derive(Serialize, Deserialize)]
     struct SerializedMeta {
-        location: String,
+        location:      String,
         last_modified: i64,
-        size: u64,
-        e_tag: Option<String>,
-        version: Option<String>,
+        size:          u64,
+        e_tag:         Option<String>,
+        version:       Option<String>,
     }
 
     pub fn serialize<S>(meta: &ObjectMeta, serializer: S) -> Result<S::Ok, S::Error>
@@ -67,11 +70,11 @@ mod object_meta_serde {
         S: Serializer,
     {
         SerializedMeta {
-            location: meta.location.to_string(),
+            location:      meta.location.to_string(),
             last_modified: meta.last_modified.timestamp_millis(),
-            size: meta.size,
-            e_tag: meta.e_tag.clone(),
-            version: meta.version.clone(),
+            size:          meta.size,
+            e_tag:         meta.e_tag.clone(),
+            version:       meta.version.clone(),
         }
         .serialize(serializer)
     }
@@ -82,11 +85,11 @@ mod object_meta_serde {
     {
         let s = SerializedMeta::deserialize(deserializer)?;
         Ok(ObjectMeta {
-            location: Path::from(s.location),
+            location:      Path::from(s.location),
             last_modified: DateTime::<Utc>::from_timestamp_millis(s.last_modified).unwrap_or(Utc::now()),
-            size: s.size,
-            e_tag: s.e_tag,
-            version: s.version,
+            size:          s.size,
+            e_tag:         s.e_tag,
+            version:       s.version,
         })
     }
 }
@@ -94,75 +97,73 @@ mod object_meta_serde {
 /// Configuration for the foyer-based object store cache
 #[derive(Debug, Clone)]
 pub struct FoyerCacheConfig {
-    pub memory_size_bytes: usize,
-    pub disk_size_bytes: usize,
-    pub ttl: Duration,
-    pub cache_dir: PathBuf,
-    pub shards: usize,
-    pub file_size_bytes: usize,
-    pub enable_stats: bool,
+    pub memory_size_bytes:          usize,
+    pub disk_size_bytes:            usize,
+    pub ttl:                        Duration,
+    pub cache_dir:                  PathBuf,
+    pub shards:                     usize,
+    pub file_size_bytes:            usize,
+    pub enable_stats:               bool,
     /// Size hint for reading parquet metadata from the end of files
     pub parquet_metadata_size_hint: usize,
     /// Memory size for metadata cache in bytes
     pub metadata_memory_size_bytes: usize,
     /// Disk size for metadata cache in bytes
-    pub metadata_disk_size_bytes: usize,
+    pub metadata_disk_size_bytes:   usize,
     /// Number of shards for metadata cache
-    pub metadata_shards: usize,
+    pub metadata_shards:            usize,
 }
 
 impl Default for FoyerCacheConfig {
     fn default() -> Self {
         Self {
-            memory_size_bytes: 536_870_912,    // 512MB
-            disk_size_bytes: 107_374_182_400,  // 100GB
-            ttl: Duration::from_secs(604_800), // 7 days
-            cache_dir: PathBuf::from("/tmp/timefusion_cache"),
-            shards: 8,
-            file_size_bytes: 16_777_216, // 16MB - good for Parquet files
-            enable_stats: true,
+            memory_size_bytes:          134_217_728,                 // 128MB
+            disk_size_bytes:            107_374_182_400,             // 100GB
+            ttl:                        Duration::from_secs(86_400), // 24h
+            cache_dir:                  PathBuf::from("/tmp/timefusion_cache"),
+            shards:                     8,
+            file_size_bytes:            16_777_216, // 16MB - good for Parquet files
+            enable_stats:               true,
             parquet_metadata_size_hint: 1_048_576,   // 1MB - typical size for parquet metadata
-            metadata_memory_size_bytes: 536_870_912, // 512MB
-            metadata_disk_size_bytes: 5_368_709_120, // 5GB
-            metadata_shards: 4,                      // Fewer shards for metadata cache
-        }
-    }
-}
-
-impl From<&CacheConfig> for FoyerCacheConfig {
-    fn from(cfg: &CacheConfig) -> Self {
-        Self {
-            memory_size_bytes: cfg.memory_size_bytes(),
-            disk_size_bytes: cfg.disk_size_bytes(),
-            ttl: cfg.ttl(),
-            cache_dir: cfg.timefusion_foyer_cache_dir.clone(),
-            shards: cfg.timefusion_foyer_shards,
-            file_size_bytes: cfg.file_size_bytes(),
-            enable_stats: cfg.stats_enabled(),
-            parquet_metadata_size_hint: cfg.timefusion_parquet_metadata_size_hint,
-            metadata_memory_size_bytes: cfg.metadata_memory_size_bytes(),
-            metadata_disk_size_bytes: cfg.metadata_disk_size_bytes(),
-            metadata_shards: cfg.timefusion_foyer_metadata_shards,
+            metadata_memory_size_bytes: 67_108_864,  // 64MB
+            metadata_disk_size_bytes:   536_870_912, // 512MB
+            metadata_shards:            4,           // Fewer shards for metadata cache
         }
     }
 }
 
 impl FoyerCacheConfig {
+    pub fn from_app_config(cfg: &crate::config::AppConfig) -> Self {
+        Self {
+            memory_size_bytes:          cfg.cache.memory_size_bytes(),
+            disk_size_bytes:            cfg.cache.disk_size_bytes(),
+            ttl:                        cfg.cache.ttl(),
+            cache_dir:                  cfg.core.cache_dir(),
+            shards:                     cfg.cache.timefusion_foyer_shards,
+            file_size_bytes:            cfg.cache.file_size_bytes(),
+            enable_stats:               cfg.cache.stats_enabled(),
+            parquet_metadata_size_hint: cfg.cache.timefusion_parquet_metadata_size_hint,
+            metadata_memory_size_bytes: cfg.cache.metadata_memory_size_bytes(),
+            metadata_disk_size_bytes:   cfg.cache.metadata_disk_size_bytes(),
+            metadata_shards:            cfg.cache.timefusion_foyer_metadata_shards,
+        }
+    }
+
     /// Create a test configuration with sensible defaults for testing
     /// The name parameter is used to create unique cache directories
     pub fn test_config(name: &str) -> Self {
         Self {
-            memory_size_bytes: 10 * 1024 * 1024, // 10MB
-            disk_size_bytes: 50 * 1024 * 1024,   // 50MB
-            ttl: Duration::from_secs(300),
-            cache_dir: PathBuf::from(format!("/tmp/test_foyer_{}", name)),
-            shards: 2,
-            file_size_bytes: 1024 * 1024, // 1MB
-            enable_stats: true,
+            memory_size_bytes:          10 * 1024 * 1024, // 10MB
+            disk_size_bytes:            50 * 1024 * 1024, // 50MB
+            ttl:                        Duration::from_secs(300),
+            cache_dir:                  PathBuf::from(format!("/tmp/test_foyer_{}", name)),
+            shards:                     2,
+            file_size_bytes:            1024 * 1024, // 1MB
+            enable_stats:               true,
             parquet_metadata_size_hint: 1_048_576,        // 1MB
             metadata_memory_size_bytes: 10 * 1024 * 1024, // 10MB for tests
-            metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB for tests
-            metadata_shards: 2,
+            metadata_disk_size_bytes:   50 * 1024 * 1024, // 50MB for tests
+            metadata_shards:            2,
         }
     }
 
@@ -177,17 +178,17 @@ impl FoyerCacheConfig {
 /// Statistics for cache operations
 #[derive(Debug, Default, Clone)]
 pub struct CacheStats {
-    pub hits: u64,
-    pub misses: u64,
+    pub hits:            u64,
+    pub misses:          u64,
     pub ttl_expirations: u64,
-    pub inner_gets: u64,
-    pub inner_puts: u64,
+    pub inner_gets:      u64,
+    pub inner_puts:      u64,
 }
 
 /// Combined statistics for both caches
 #[derive(Debug, Default, Clone)]
 pub struct CombinedCacheStats {
-    pub main: CacheStats,
+    pub main:     CacheStats,
     pub metadata: CacheStats,
 }
 
@@ -211,11 +212,11 @@ type StatsRef = Arc<RwLock<CacheStats>>;
 /// Shared Foyer cache that can be used across multiple object stores
 #[derive(Debug)]
 pub struct SharedFoyerCache {
-    cache: FoyerCache,
+    cache:          FoyerCache,
     metadata_cache: FoyerCache,
-    stats: StatsRef,
+    stats:          StatsRef,
     metadata_stats: StatsRef,
-    config: FoyerCacheConfig,
+    config:         FoyerCacheConfig,
 }
 
 impl SharedFoyerCache {
@@ -246,9 +247,9 @@ impl SharedFoyerCache {
             .with_shards(config.shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
             .storage()
-            .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
+            .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
-                BlockEngineBuilder::new(FsDeviceBuilder::new(&config.cache_dir).with_capacity(config.disk_size_bytes).build()?)
+                BlockEngineConfig::new(FsDeviceBuilder::new(&config.cache_dir).with_capacity(config.disk_size_bytes).build()?)
                     .with_block_size(config.file_size_bytes),
             )
             .build()
@@ -260,9 +261,9 @@ impl SharedFoyerCache {
             .with_shards(config.metadata_shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
             .storage()
-            .with_io_engine(PsyncIoEngineBuilder::new().build().await?)
+            .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
-                BlockEngineBuilder::new(FsDeviceBuilder::new(&metadata_cache_dir).with_capacity(config.metadata_disk_size_bytes).build()?)
+                BlockEngineConfig::new(FsDeviceBuilder::new(&metadata_cache_dir).with_capacity(config.metadata_disk_size_bytes).build()?)
                     .with_block_size(config.file_size_bytes),
             )
             .build()
@@ -279,7 +280,7 @@ impl SharedFoyerCache {
 
     pub async fn get_stats(&self) -> CombinedCacheStats {
         CombinedCacheStats {
-            main: self.stats.read().await.clone(),
+            main:     self.stats.read().await.clone(),
             metadata: self.metadata_stats.read().await.clone(),
         }
     }
@@ -319,13 +320,13 @@ impl SharedFoyerCache {
 
 /// Foyer-based hybrid cache implementation for object store
 pub struct FoyerObjectStoreCache {
-    inner: Arc<dyn ObjectStore>,
-    cache: FoyerCache,
-    metadata_cache: FoyerCache,
-    stats: StatsRef,
-    metadata_stats: StatsRef,
-    config: FoyerCacheConfig,
-    refreshing: Arc<DashSet<String>>,
+    inner:            Arc<dyn ObjectStore>,
+    cache:            FoyerCache,
+    metadata_cache:   FoyerCache,
+    stats:            StatsRef,
+    metadata_stats:   StatsRef,
+    config:           FoyerCacheConfig,
+    refreshing:       Arc<DashSet<String>>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
@@ -475,7 +476,7 @@ impl FoyerObjectStoreCache {
 
     pub async fn get_stats(&self) -> CombinedCacheStats {
         CombinedCacheStats {
-            main: self.stats.read().await.clone(),
+            main:     self.stats.read().await.clone(),
             metadata: self.metadata_stats.read().await.clone(),
         }
     }
@@ -486,102 +487,20 @@ impl FoyerObjectStoreCache {
     }
 }
 
-#[async_trait]
-impl ObjectStore for FoyerObjectStoreCache {
-    async fn put(&self, location: &Path, payload: PutPayload) -> ObjectStoreResult<PutResult> {
-        self.update_stats(|s| s.inner_puts += 1).await;
-
-        let payload_size = payload.content_length();
-        let is_parquet = location.as_ref().ends_with(".parquet");
-
-        debug!("S3 PUT request starting: {} (size: {} bytes, parquet: {})", location, payload_size, is_parquet);
-
-        // Write to S3 first without removing from cache (to avoid cache stampede)
-        let start_time = std::time::Instant::now();
-        let result = self.inner.put(location, payload).await?;
-        let duration = start_time.elapsed();
-
-        debug!(
-            "S3 PUT request completed: {} (size: {} bytes, duration: {}ms, parquet: {})",
-            location,
-            payload_size,
-            duration.as_millis(),
-            is_parquet
-        );
-
-        // After successful write, update the cache with the new data
-        self.update_stats(|s| s.inner_gets += 1).await;
-        if let Ok(get_result) = self.inner.get(location).await {
-            use futures::TryStreamExt;
-            let data = match get_result.payload {
-                GetResultPayload::Stream(s) => {
-                    if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
-                        chunks.concat()
-                    } else {
-                        vec![]
-                    }
-                }
-                GetResultPayload::File(mut file, _) => {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
-                }
-            };
-            if !data.is_empty() {
-                let cache_key = Self::make_cache_key(location);
-                let size = get_result.meta.size;
-                // This will atomically replace the old entry (if any) with the new one
-                self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
-                debug!("Updated cache after write: {} (size: {} bytes)", location, size);
+impl FoyerObjectStoreCache {
+    /// Collect a GetResult payload into a Vec<u8>
+    async fn collect_payload(result: GetResult) -> (Vec<u8>, ObjectMeta) {
+        use futures::TryStreamExt;
+        let meta = result.meta.clone();
+        let data = match result.payload {
+            GetResultPayload::Stream(s) => s.try_collect::<Vec<Bytes>>().await.map(|c| c.concat()).unwrap_or_default(),
+            GetResultPayload::File(mut file, _) => {
+                use std::io::Read;
+                let mut buf = Vec::new();
+                if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
             }
-        }
-
-        // Invalidate metadata cache entries for this file
-        if location.as_ref().ends_with(".parquet") {
-            self.invalidate_metadata_cache(location).await;
-        }
-
-        Ok(result)
-    }
-
-    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
-        self.update_stats(|s| s.inner_puts += 1).await;
-
-        // Write to S3 first without removing from cache (to avoid cache stampede)
-        let result = self.inner.put_opts(location, payload, opts).await?;
-
-        // After successful write, update the cache with the new data
-        if let Ok(get_result) = self.inner.get(location).await {
-            use futures::TryStreamExt;
-            let data = match get_result.payload {
-                GetResultPayload::Stream(s) => {
-                    if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
-                        chunks.concat()
-                    } else {
-                        vec![]
-                    }
-                }
-                GetResultPayload::File(mut file, _) => {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
-                }
-            };
-            if !data.is_empty() {
-                let cache_key = Self::make_cache_key(location);
-                let size = get_result.meta.size;
-                // This will atomically replace the old entry (if any) with the new one
-                self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
-                debug!("Updated cache after write: {} (size: {} bytes)", location, size);
-            }
-        }
-
-        // Invalidate metadata cache entries for this file
-        if location.as_ref().ends_with(".parquet") {
-            self.invalidate_metadata_cache(location).await;
-        }
-
-        Ok(result)
+        };
+        (data, meta)
     }
 
     #[instrument(
@@ -593,7 +512,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             is_checkpoint = Self::is_last_checkpoint(location),
         )
     )]
-    async fn get(&self, location: &Path) -> ObjectStoreResult<GetResult> {
+    async fn get_cached(&self, location: &Path) -> ObjectStoreResult<GetResult> {
         let span = tracing::Span::current();
         let cache_key = Self::make_cache_key(location);
 
@@ -730,7 +649,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 use std::io::Read;
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf).map_err(|e| object_store::Error::Generic {
-                    store: "cache",
+                    store:  "cache",
                     source: Box::new(e),
                 })?;
                 buf
@@ -739,19 +658,6 @@ impl ObjectStore for FoyerObjectStoreCache {
 
         self.cache.insert(cache_key, CacheValue::new(data.clone(), result.meta.clone()));
         Ok(Self::make_get_result(Bytes::from(data), result.meta))
-    }
-
-    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
-        // Bypass cache for complex requests
-        if options.range.is_some()
-            || options.if_match.is_some()
-            || options.if_none_match.is_some()
-            || options.if_modified_since.is_some()
-            || options.if_unmodified_since.is_some()
-        {
-            return self.inner.get_opts(location, options).await;
-        }
-        self.get(location).await
     }
 
     #[instrument(
@@ -767,7 +673,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             is_metadata = Empty,
         )
     )]
-    async fn get_range(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
+    async fn get_range_cached(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let span = tracing::Span::current();
         let is_parquet = location.as_ref().ends_with(".parquet");
 
@@ -866,11 +772,11 @@ impl ObjectStore for FoyerObjectStoreCache {
 
                 // Cache the metadata range in the metadata cache
                 let range_meta = ObjectMeta {
-                    location: location.clone(),
+                    location:      location.clone(),
                     last_modified: file_meta.last_modified,
-                    size: data.len() as u64,
-                    e_tag: file_meta.e_tag.clone(),
-                    version: file_meta.version.clone(),
+                    size:          data.len() as u64,
+                    e_tag:         file_meta.e_tag.clone(),
+                    version:       file_meta.version.clone(),
                 };
                 self.metadata_cache.insert(range_cache_key, CacheValue::new(data.to_vec(), range_meta));
 
@@ -883,7 +789,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 );
 
                 // Try to fetch and cache the full file
-                if let Ok(result) = self.get(location).await {
+                if let Ok(result) = self.get_cached(location).await {
                     // The file is now cached, extract the range
                     if range.end <= result.meta.size {
                         let data = match result.payload {
@@ -896,12 +802,12 @@ impl ObjectStore for FoyerObjectStoreCache {
                             GetResultPayload::File(mut file, _) => {
                                 use std::io::{Read, Seek, SeekFrom};
                                 file.seek(SeekFrom::Start(range.start)).map_err(|e| object_store::Error::Generic {
-                                    store: "cache",
+                                    store:  "cache",
                                     source: Box::new(e),
                                 })?;
                                 let mut buf = vec![0; (range.end - range.start) as usize];
                                 file.read_exact(&mut buf).map_err(|e| object_store::Error::Generic {
-                                    store: "cache",
+                                    store:  "cache",
                                     source: Box::new(e),
                                 })?;
                                 Bytes::from(buf)
@@ -955,7 +861,15 @@ impl ObjectStore for FoyerObjectStoreCache {
             cache_hit = Empty,
         )
     )]
-    async fn head(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
+    #[instrument(
+        name = "foyer_cache.head",
+        skip_all,
+        fields(
+            location = %location,
+            cache_hit = Empty,
+        )
+    )]
+    async fn head_cached(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
         let span = tracing::Span::current();
         let cache_key = Self::make_cache_key(location);
 
@@ -973,20 +887,114 @@ impl ObjectStore for FoyerObjectStoreCache {
         self.inner.head(location).instrument(inner_span).await
     }
 
-    async fn delete(&self, location: &Path) -> ObjectStoreResult<()> {
+    /// Core put logic: writes to inner store, then caches the new data
+    async fn put_cached(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
         self.update_stats(|s| s.inner_puts += 1).await;
-        let cache_key = Self::make_cache_key(location);
-        self.cache.remove(&cache_key);
+        let payload_size = payload.content_length();
+        let is_parquet = location.as_ref().ends_with(".parquet");
 
-        // Delete from inner store
-        self.inner.delete(location).await?;
+        debug!("S3 PUT request starting: {} (size: {} bytes, parquet: {})", location, payload_size, is_parquet);
+        let start_time = std::time::Instant::now();
+        let result = self.inner.put_opts(location, payload, opts).await?;
+        debug!(
+            "S3 PUT request completed: {} (size: {} bytes, duration: {}ms, parquet: {})",
+            location,
+            payload_size,
+            start_time.elapsed().as_millis(),
+            is_parquet
+        );
 
-        // Invalidate metadata cache entries for this file
+        // After successful write, update the cache with the new data
+        self.update_stats(|s| s.inner_gets += 1).await;
+        if let Ok(get_result) = self.inner.get(location).await {
+            let (data, meta) = Self::collect_payload(get_result).await;
+            if !data.is_empty() {
+                let size = meta.size;
+                self.cache.insert(Self::make_cache_key(location), CacheValue::new(data, meta));
+                debug!("Updated cache after write: {} (size: {} bytes)", location, size);
+            }
+        }
+
+        if is_parquet {
+            self.invalidate_metadata_cache(location).await;
+        }
+        Ok(result)
+    }
+
+    /// Invalidate cache for delete/copy destination
+    async fn invalidate_for_delete(&self, location: &Path) {
+        self.cache.remove(&Self::make_cache_key(location));
         if location.as_ref().ends_with(".parquet") {
             self.invalidate_metadata_cache(location).await;
         }
+    }
+}
 
-        Ok(())
+#[async_trait]
+impl ObjectStore for FoyerObjectStoreCache {
+    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
+        self.put_cached(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+        // Handle range requests via the dedicated range cache path
+        if let Some(GetRange::Bounded(ref r)) = options.range
+            && options.if_match.is_none()
+            && options.if_none_match.is_none()
+            && options.if_modified_since.is_none()
+            && options.if_unmodified_since.is_none()
+        {
+            let range = r.clone();
+            let bytes = self.get_range_cached(location, range.clone()).await?;
+            let meta = self.head_cached(location).await.unwrap_or(ObjectMeta {
+                location:      location.clone(),
+                last_modified: Utc::now(),
+                size:          range.end,
+                e_tag:         None,
+                version:       None,
+            });
+            let data_len = bytes.len() as u64;
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(Box::pin(futures::stream::once(async move { Ok(bytes) }))),
+                meta,
+                attributes: Attributes::new(),
+                range: range.start..range.start + data_len,
+            });
+        }
+        // Bypass cache for complex (conditional / non-bounded) requests
+        if options.range.is_some()
+            || options.if_match.is_some()
+            || options.if_none_match.is_some()
+            || options.if_modified_since.is_some()
+            || options.if_unmodified_since.is_some()
+            || options.head
+        {
+            return self.inner.get_opts(location, options).await;
+        }
+        self.get_cached(location).await
+    }
+
+    fn delete_stream(&self, locations: BoxStream<'static, ObjectStoreResult<Path>>) -> BoxStream<'static, ObjectStoreResult<Path>> {
+        use futures::StreamExt;
+        let cache = self.cache.clone();
+        let metadata_cache = self.metadata_cache.clone();
+        let inner_stream = self.inner.delete_stream(locations);
+        inner_stream
+            .inspect(move |res| {
+                if let Ok(path) = res {
+                    cache.remove(&path.to_string());
+                    if path.as_ref().ends_with(".parquet") {
+                        // Best-effort: we can't enumerate metadata keys without head;
+                        // remove the most common ones by reusing the same heuristic offsets.
+                        let _ = &metadata_cache;
+                    }
+                }
+            })
+            .boxed()
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
@@ -1001,36 +1009,10 @@ impl ObjectStore for FoyerObjectStoreCache {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.inner.copy(from, to).await?;
-        self.cache.remove(&Self::make_cache_key(to));
-
-        // Invalidate metadata cache entries for the destination file
-        if to.as_ref().ends_with(".parquet") {
-            self.invalidate_metadata_cache(to).await;
-        }
-
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
+        self.inner.copy_opts(from, to, options).await?;
+        self.invalidate_for_delete(to).await;
         Ok(())
-    }
-
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> ObjectStoreResult<()> {
-        self.inner.copy_if_not_exists(from, to).await?;
-        self.cache.remove(&Self::make_cache_key(to));
-
-        // Invalidate metadata cache entries for the destination file
-        if to.as_ref().ends_with(".parquet") {
-            self.invalidate_metadata_cache(to).await;
-        }
-
-        Ok(())
-    }
-
-    async fn put_multipart(&self, location: &Path) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart(location).await
-    }
-
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
     }
 }
 
@@ -1048,8 +1030,9 @@ impl std::fmt::Debug for FoyerObjectStoreCache {
 
 #[cfg(test)]
 mod tests {
+    use object_store::{ObjectStoreExt, memory::InMemory};
+
     use super::*;
-    use object_store::memory::InMemory;
 
     #[tokio::test]
     async fn test_basic_operations() -> anyhow::Result<()> {

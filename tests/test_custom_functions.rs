@@ -1,8 +1,10 @@
 #[cfg(test)]
 mod test_custom_functions {
     use anyhow::Result;
-    use datafusion::arrow::array::{Array, StringArray, StringViewArray};
-    use datafusion::prelude::*;
+    use datafusion::{
+        arrow::array::{Array, StringArray, StringViewArray},
+        prelude::*,
+    };
     use timefusion::functions::register_custom_functions;
 
     /// Helper to get string value from either Utf8View or Utf8 array
