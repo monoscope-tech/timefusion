@@ -121,43 +121,50 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     // Walk down via a single linear path of "peelable" parents, transforming
     // the first Projection we find. Anything outside this peel (Joins,
     // CTEs, Window, etc.) blocks wrapping — those nodes' inputs aren't the
-    // wire output.
-    fn peel(plan: LogicalPlan) -> Result<LogicalPlan> {
+    // wire output. Recursion is depth-bounded by the parser's plan-depth
+    // limit; the explicit MAX_PEEL guard below is belt-and-suspenders against
+    // an adversarial / nested-CTE plan stack-overflowing us.
+    const MAX_PEEL: u16 = 256;
+    fn peel(plan: LogicalPlan, depth: u16) -> Result<LogicalPlan> {
+        if depth >= MAX_PEEL {
+            return Ok(plan);
+        }
+        let d = depth + 1;
         match plan {
             LogicalPlan::Sort(mut s) => {
                 let inner = Arc::unwrap_or_clone(s.input);
-                s.input = Arc::new(peel(inner)?);
+                s.input = Arc::new(peel(inner, d)?);
                 Ok(LogicalPlan::Sort(s))
             }
             LogicalPlan::Limit(mut l) => {
                 let inner = Arc::unwrap_or_clone(l.input);
-                l.input = Arc::new(peel(inner)?);
+                l.input = Arc::new(peel(inner, d)?);
                 Ok(LogicalPlan::Limit(l))
             }
-            LogicalPlan::Distinct(d) => {
+            LogicalPlan::Distinct(dist) => {
                 use datafusion::logical_expr::Distinct;
-                match d {
+                match dist {
                     Distinct::All(input) => {
                         let inner = Arc::unwrap_or_clone(input);
-                        Ok(LogicalPlan::Distinct(Distinct::All(Arc::new(peel(inner)?))))
+                        Ok(LogicalPlan::Distinct(Distinct::All(Arc::new(peel(inner, d)?))))
                     }
                     Distinct::On(mut on) => {
                         let inner = Arc::unwrap_or_clone(on.input);
-                        on.input = Arc::new(peel(inner)?);
+                        on.input = Arc::new(peel(inner, d)?);
                         Ok(LogicalPlan::Distinct(Distinct::On(on)))
                     }
                 }
             }
             LogicalPlan::SubqueryAlias(mut s) => {
                 let inner = Arc::unwrap_or_clone(s.input);
-                s.input = Arc::new(peel(inner)?);
+                s.input = Arc::new(peel(inner, d)?);
                 Ok(LogicalPlan::SubqueryAlias(s))
             }
             LogicalPlan::Projection(proj) => Ok(wrap_projection(proj)?),
             other => Ok(other),
         }
     }
-    peel(plan)
+    peel(plan, 0)
 }
 
 fn wrap_projection(proj: Projection) -> Result<LogicalPlan> {
