@@ -242,41 +242,36 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
         Ok(DataType::Utf8)
     }
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        use datafusion::arrow::compute::cast;
         let arr = match args.args.into_iter().next().unwrap() {
             ColumnarValue::Array(a) => a,
             ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
         };
-        let n = arr.len();
-        let mut out: Vec<Option<String>> = Vec::with_capacity(n);
-        // String extractor handles Utf8/Utf8View/LargeUtf8 by collecting all
-        // owned strings up front; sidesteps the borrow-from-Arc lifetime issue.
-        let owned: Vec<Option<String>> = match arr.data_type() {
-            DataType::Utf8 => {
-                let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
-                (0..n).map(|i| (!a.is_null(i)).then(|| a.value(i).to_string())).collect()
+        // Cast once to Utf8 — collapses Utf8/Utf8View/LargeUtf8 to a single
+        // concrete shape, single pass over rows.
+        let utf8 = cast(&arr, &DataType::Utf8).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let strs = utf8
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("json_to_pg_text: cast to Utf8 failed".into()))?;
+        let mut b = datafusion::arrow::array::StringBuilder::with_capacity(strs.len(), strs.value_data().len());
+        for i in 0..strs.len() {
+            if strs.is_null(i) {
+                b.append_null();
+                continue;
             }
-            DataType::Utf8View => {
-                let a = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
-                (0..n).map(|i| (!a.is_null(i)).then(|| a.value(i).to_string())).collect()
+            // Parse via serde_json so escape sequences resolve correctly and
+            // false-positive shapes like '"a"+"b"' don't trigger naive unquoting.
+            // JSON null → SQL NULL; JSON string → its raw text; anything else
+            // (number, bool, object, array) → its JSON literal text (per Postgres ->>).
+            let s = strs.value(i);
+            match serde_json::from_str::<JsonValue>(s) {
+                Ok(JsonValue::Null) => b.append_null(),
+                Ok(JsonValue::String(inner)) => b.append_value(&inner),
+                Ok(_) | Err(_) => b.append_value(s),
             }
-            DataType::LargeUtf8 => {
-                let a = arr.as_any().downcast_ref::<datafusion::arrow::array::LargeStringArray>().unwrap();
-                (0..n).map(|i| (!a.is_null(i)).then(|| a.value(i).to_string())).collect()
-            }
-            other => return Err(DataFusionError::Execution(format!("json_to_pg_text: unsupported input type {other:?}"))),
-        };
-        for entry in owned {
-            out.push(match entry.as_deref() {
-                None => None,
-                Some("null") => None,
-                Some(s) if s.starts_with('"') && s.ends_with('"') => match serde_json::from_str::<String>(s) {
-                    Ok(unquoted) => Some(unquoted),
-                    Err(_) => Some(s.to_string()),
-                },
-                Some(s) => Some(s.to_string()),
-            });
         }
-        Ok(ColumnarValue::Array(Arc::new(StringArray::from(out))))
+        Ok(ColumnarValue::Array(Arc::new(b.finish())))
     }
 }
 

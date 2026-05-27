@@ -11,6 +11,7 @@ use anyhow::Context;
 use arrow::array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -173,13 +174,20 @@ fn ack_err(seq: u64, pressure: u32, err: &str) -> WriteAck {
 }
 
 /// Constant-time bearer-token check. When `expected` is `None`, auth is open.
-/// Equal-length plaintexts compare in time independent of contents; length
-/// mismatch short-circuits (and would be observable from the wire anyway).
+/// Both sides are SHA-256-hashed first so the constant-time compare runs over
+/// fixed-length 32-byte digests — this removes the token-length side channel
+/// that `ct_eq` on raw bytes would leak via the early length-mismatch exit.
 fn verify_bearer(expected: Option<&str>, got: Option<&str>) -> Result<(), Status> {
     let Some(expected) = expected else { return Ok(()) };
-    match got {
-        Some(t) if bool::from(t.as_bytes().ct_eq(expected.as_bytes())) => Ok(()),
-        _ => Err(Status::unauthenticated("invalid or missing bearer token")),
+    let Some(got) = got else {
+        return Err(Status::unauthenticated("invalid or missing bearer token"));
+    };
+    let e = Sha256::digest(expected.as_bytes());
+    let g = Sha256::digest(got.as_bytes());
+    if bool::from(e.ct_eq(&g)) {
+        Ok(())
+    } else {
+        Err(Status::unauthenticated("invalid or missing bearer token"))
     }
 }
 
@@ -190,6 +198,15 @@ mod auth_tests {
     #[test]
     fn rejects_wrong_same_length_token() {
         let err = verify_bearer(Some("abcdef"), Some("zzzzzz")).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+    #[test]
+    fn rejects_different_length_token() {
+        // Hashing both sides means length differences don't short-circuit:
+        // the ct_eq still runs over 32-byte digests.
+        let err = verify_bearer(Some("abcdef"), Some("zzz")).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        let err = verify_bearer(Some("abc"), Some("abcdefghij")).unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
     #[test]

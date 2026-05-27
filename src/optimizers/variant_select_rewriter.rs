@@ -78,14 +78,19 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(routing) = default_src.table_provider.as_any().downcast_ref::<ProjectRoutingTable>() else {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
     };
-    let real = routing.real_schema();
+    // Fast path: the lying schema only differs from the real one for
+    // Variant columns (which appear as Utf8View). If no Utf8View columns
+    // are projected, there's nothing to patch — avoid the HashMap+clones.
+    let lying_schema = scan.projected_schema.as_arrow();
+    use datafusion::arrow::datatypes::DataType;
+    if !lying_schema.fields().iter().any(|f| matches!(f.data_type(), DataType::Utf8View)) {
+        return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
+    }
 
+    let real = routing.real_schema();
     // Build a patched arrow Schema where every Utf8View column whose
     // real-schema counterpart is Variant gets the Variant data type back
-    // (and the extension-name metadata). O(n) lookup via a name→field map —
-    // schemas with many columns made the original `column_with_name` loop
-    // O(n²).
-    let lying_schema = scan.projected_schema.as_arrow();
+    // (and the extension-name metadata). O(n) lookup via a name→field map.
     let real_by_name: std::collections::HashMap<&str, &Arc<Field>> = real.fields().iter().map(|f| (f.name().as_str(), f)).collect();
     let mut patched_fields: Vec<Arc<Field>> = Vec::with_capacity(lying_schema.fields().len());
     let mut changed = false;
@@ -230,8 +235,12 @@ fn wrap_projection(proj: Projection) -> Result<LogicalPlan> {
 }
 
 fn is_variant_expr(expr: &Expr, schema: &DFSchema) -> bool {
+    // Idempotency guard: if the analyzer runs us twice, don't re-wrap an
+    // already-wrapped call. Match by concrete UDF type (TypeId) rather than
+    // by string name — renaming the UDF or registering another UDF with the
+    // same name would otherwise silently break this check.
     if let Expr::ScalarFunction(sf) = expr
-        && sf.func.name() == "variant_to_json"
+        && sf.func.inner().as_any().is::<VariantToJsonUdf>()
     {
         return false;
     }
