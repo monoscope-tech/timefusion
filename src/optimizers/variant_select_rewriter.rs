@@ -49,15 +49,20 @@ impl AnalyzerRule for VariantSelectRewriter {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        // Pass 1 (patch_table_scan) runs even for DML — VariantInsertRewriter
-        // and downstream UDFs need to see the real Variant type at scans.
-        // Pass 2 (wrap_root_projection) only wraps SELECT-style root projections
-        // with variant_to_json for the wire — DML doesn't produce a wire
-        // projection, so we skip it here to avoid mutating the writeback path.
+        // Skip DML entirely. DML targets aren't a wire projection (no
+        // variant_to_json wrap needed), and DML's input scans are already
+        // handled by VariantInsertRewriter wrapping literals with
+        // json_to_variant; injecting a Variant-typed schema there would
+        // mismatch the writer's expected Utf8 input.
         if matches!(plan, LogicalPlan::Dml(_)) {
             return Ok(plan);
         }
+        // Pass 1: patch each TableScan's projected_schema so Variant columns
+        // carry the real Variant type, not Utf8View. Downstream operators
+        // (variant_get, jsonb_path_exists, ->, ->>) need the real type.
         let patched = plan.transform_up(patch_table_scan).map(|t| t.data)?;
+        // Pass 2: wrap Variant-typed projections at the topmost SELECT
+        // projection with variant_to_json for the wire.
         wrap_root_projection(patched)
     }
 }
