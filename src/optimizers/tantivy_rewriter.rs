@@ -265,11 +265,13 @@ fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: bool)
     })
 }
 
-/// Conservative: only allow alnum, dot, dash, underscore, slash, colon,
-/// `@`, and space. Tantivy QueryParser interprets many ASCII punctuation
-/// chars (`+ - && || ! ( ) { } [ ] ^ " ~ * ? : \ /`) as syntax. If the
-/// literal contains anything else, we leave the predicate alone (the
-/// original `=` / `LIKE` still applies — correctness preserved).
+/// Conservative: only allow alnum, dot, dash, underscore, slash, `@`, and
+/// space. Colon is deliberately *excluded* — Tantivy QueryParser treats it as
+/// field-delimiter syntax. The QueryParser also interprets many other ASCII
+/// punctuation chars (`+ - && || ! ( ) { } [ ] ^ " ~ * ? : \\ /`) as syntax;
+/// if the literal contains anything outside our allowlist we leave the
+/// predicate alone (the original `=` / `LIKE` still applies — correctness
+/// preserved).
 fn is_tantivy_safe_term_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '/' | '@')
 }

@@ -41,9 +41,14 @@ const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32];
 /// the older CompactBatch format required.
 ///
 /// Version byte must be > 2 to distinguish from legacy operation bytes
-/// (0=Insert, 1=Delete, 2=Update). We're at 130; older formats are intentionally
+/// (0=Insert, 1=Delete, 2=Update). We're at 131; older formats are intentionally
 /// unsupported — wipe the WAL directory if upgrading.
-const WAL_VERSION: u8 = 130;
+///
+/// Bumps:
+///   130: Arrow IPC payload format.
+///   131: Walrus collection key uses deterministic FNV-1a instead of AHasher
+///        (AHasher's per-build seed silently stranded entries on upgrade).
+const WAL_VERSION: u8 = 131;
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 /// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
 const MAX_BATCH_SIZE: usize = 100 * 1024 * 1024;
@@ -211,11 +216,16 @@ impl WalManager {
     /// Walrus's metadata budget is 62 bytes; 16 hex chars + a `-` + 2 digits
     /// shard suffix stays well under.
     fn walrus_topic_key(project_id: &str, table_name: &str, shard: usize) -> String {
+        // Must be stable across compilations — the key indexes durable WAL
+        // data. AHasher::default() seeds itself per build, which would silently
+        // strand entries after an upgrade. FNV-1a is deterministic, fast, and
+        // 64-bit-wide (the only width walrus's 62-byte key budget needs).
         use std::hash::{Hash, Hasher};
 
-        use ahash::AHasher;
-        let mut hasher = AHasher::default();
+        use fnv::FnvHasher;
+        let mut hasher = FnvHasher::default();
         project_id.hash(&mut hasher);
+        ":".hash(&mut hasher); // separator so ("ab","c") and ("a","bc") don't collide
         table_name.hash(&mut hasher);
         format!("{:016x}-{:02}", hasher.finish(), shard)
     }
