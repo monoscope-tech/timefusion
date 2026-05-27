@@ -574,6 +574,7 @@ where
     guard.update_state().await.map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
     // block_in_place: same rationale as insert_records_batch in database.rs —
     // delta-rs's internal executor conflicts with the outer PGWire runtime.
+    // REQUIRES a multi-thread tokio runtime — panics on current_thread.
     let table_clone = guard.clone();
     let (new_table, rows_affected) = tokio::task::block_in_place(|| {
         let handle = tokio::runtime::Handle::current();

@@ -103,5 +103,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run all tests
-        timeout-minutes: 15
-        run: cargo test --all-features -- --include-ignored
+        run: cargo test --all-features

@@ -1786,11 +1786,16 @@ impl Database {
             // Hold the write lock for the entire operation to prevent concurrent conflicts
             let mut table = table_ref.write().await;
 
-            let _ = table.update_state().await;
+            if let Err(e) = table.update_state().await {
+                debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
+            }
 
             // block_in_place lets delta-rs's internal executor run without
             // colliding with the outer PGWire tokio runtime. Without this the
             // write hangs when triggered from a PGWire INSERT (issue #11).
+            // REQUIRES a multi-thread tokio runtime — panics on current_thread.
+            // All production paths (warp server, PGWire server) use multi-thread;
+            // tests calling this must use #[tokio::test(flavor = "multi_thread")].
             let table_clone = table.clone();
             let batches_clone = batches.clone();
             let partitions_clone = schema.partitions.clone();
