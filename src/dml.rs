@@ -557,8 +557,8 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
 /// Common Delta operation logic
 async fn perform_delta_operation<F, Fut>(database: &Database, table_name: &str, project_id: &str, operation: F) -> Result<u64>
 where
-    F: FnOnce(deltalake::DeltaTable) -> Fut,
-    Fut: std::future::Future<Output = Result<(deltalake::DeltaTable, u64)>>,
+    F: FnOnce(deltalake::DeltaTable) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(deltalake::DeltaTable, u64)>> + Send,
 {
     // Use resolve_table which routes to unified or custom table based on storage config
     let table_lock = database
@@ -572,7 +572,13 @@ where
     // overwrite with the stale snapshot from the closure's clone.
     let mut guard = table_lock.write().await;
     guard.update_state().await.map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
-    let (new_table, rows_affected) = operation(guard.clone()).await?;
+    // block_in_place: same rationale as insert_records_batch in database.rs —
+    // delta-rs's internal executor conflicts with the outer PGWire runtime.
+    let table_clone = guard.clone();
+    let (new_table, rows_affected) = tokio::task::block_in_place(|| {
+        let handle = tokio::runtime::Handle::current();
+        handle.block_on(async move { operation(table_clone).await })
+    })?;
     *guard = new_table;
     Ok(rows_affected)
 }

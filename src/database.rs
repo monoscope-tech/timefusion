@@ -1786,25 +1786,30 @@ impl Database {
             // Hold the write lock for the entire operation to prevent concurrent conflicts
             let mut table = table_ref.write().await;
 
-            // Update the table state to get the latest version before writing
-            if let Err(e) = table.update_state().await {
-                debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
-            }
+            let _ = table.update_state().await;
 
+            // block_in_place lets delta-rs's internal executor run without
+            // colliding with the outer PGWire tokio runtime. Without this the
+            // write hangs when triggered from a PGWire INSERT (issue #11).
+            let table_clone = table.clone();
+            let batches_clone = batches.clone();
+            let partitions_clone = schema.partitions.clone();
+            let writer_props_clone = writer_properties.clone();
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
-            let write_result = async {
-                // Schema evolution enabled: new columns will be automatically added to the table
-                table
-                    .clone()
-                    .write(batches.clone())
-                    .with_partition_columns(schema.partitions.clone())
-                    .with_writer_properties(writer_properties.clone())
-                    .with_save_mode(deltalake::protocol::SaveMode::Append)
-                    .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
-                    .await
-            }
-            .instrument(write_span)
-            .await;
+            let write_result = write_span.in_scope(|| {
+                tokio::task::block_in_place(|| {
+                    let handle = tokio::runtime::Handle::current();
+                    handle.block_on(async move {
+                        table_clone
+                            .write(batches_clone)
+                            .with_partition_columns(partitions_clone)
+                            .with_writer_properties(writer_props_clone)
+                            .with_save_mode(deltalake::protocol::SaveMode::Append)
+                            .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
+                            .await
+                    })
+                })
+            });
 
             match write_result {
                 Ok(new_table) => {
