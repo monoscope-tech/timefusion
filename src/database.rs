@@ -166,7 +166,16 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
 fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
     use arrow::array::{TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
     use datafusion::arrow::datatypes::{DataType, Field, TimeUnit};
-    let is_utc_offset = |tz: &str| matches!(tz, "+00:00" | "-00:00" | "+0000" | "-0000" | "Z" | "utc" | "Utc");
+    // Accept anything that semantically means UTC. Case-insensitive on alphabetic
+    // forms ("UTC"/"Utc"/"utc"/"Z"/"GMT") and tolerant of the common offset
+    // representations clients emit (+/- 00:00, 0000, 00). Delta-rs only
+    // accepts the IANA "UTC" string, so we rewrite any of these to it.
+    let is_utc_offset = |tz: &str| {
+        matches!(tz, "+00:00" | "-00:00" | "+0000" | "-0000" | "+00" | "-00" | "00:00" | "0000")
+            || tz.eq_ignore_ascii_case("UTC")
+            || tz.eq_ignore_ascii_case("GMT")
+            || tz.eq_ignore_ascii_case("Z")
+    };
     let schema = batch.schema();
     let mut new_fields: Vec<Arc<Field>> = schema.fields().iter().cloned().collect();
     let mut new_cols = batch.columns().to_vec();
@@ -403,8 +412,13 @@ impl Database {
                         "Failed to update table for {}/{} (attempt {}/{}): {}, retrying...",
                         project_id, table_name, retries, MAX_RETRIES, e
                     );
-                    // Exponential backoff with jitter
-                    let delay = 100 * retries as u64 + (retries as u64 * 50);
+                    // Exponential backoff with jitter, capped at ~6.4s.
+                    // `100 << retries` doubles each attempt; clamp to 6 shifts
+                    // so a long retry chain doesn't sleep for minutes. Jitter
+                    // is `± delay/4` so concurrent retriers don't thunder.
+                    let base = 100u64 << retries.min(6);
+                    let jitter = fastrand::u64(0..=base / 2);
+                    let delay = base / 2 * 3 + jitter; // base*0.75 .. base*1.25
                     tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
                 }
             }
@@ -2864,11 +2878,18 @@ impl TableProvider for ProjectRoutingTable {
 
             if delta_any_usable {
                 if let Some(ids) = delta_ids {
-                    // Selectivity cutoff: if the hit set covers most of the
-                    // indexed rows, the IN-list won't prune enough to be
-                    // worth its planning cost. Bail; original predicate
-                    // re-runs as the correctness backstop.
-                    if delta_indexed_rows > 0 && (ids.len() as u64) * 100 >= delta_indexed_rows * min_sel_pct {
+                    // No indexed rows = no useful prefilter. Without this guard
+                    // we'd emit an empty IN(...) list that zeros the Delta
+                    // scan even when matching rows exist there (e.g. data
+                    // written directly without triggering an index build).
+                    if delta_indexed_rows == 0 {
+                        crate::metrics::record_tantivy_prefilter_skipped();
+                        debug!("Tantivy prefilter skipped for {}/{}: empty_index", project_id, self.table_name);
+                    } else if (ids.len() as u64) * 100 >= delta_indexed_rows * min_sel_pct {
+                        // Selectivity cutoff: if the hit set covers most of the
+                        // indexed rows, the IN-list won't prune enough to be
+                        // worth its planning cost. Bail; original predicate
+                        // re-runs as the correctness backstop.
                         crate::metrics::record_tantivy_prefilter_skipped();
                         debug!("Tantivy prefilter skipped for {}/{}: low_selectivity", project_id, self.table_name);
                     } else {

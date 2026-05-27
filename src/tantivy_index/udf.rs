@@ -66,8 +66,16 @@ impl ScalarUDFImpl for TextMatchUdf {
         for i in 0..n {
             match (col_str(i), pat_str(i)) {
                 (Some(haystack), Some(needle)) => {
+                    // Needles arriving from the LIKE rewriter carry tantivy
+                    // syntax (`'foo*'` for prefix, `'foo'` for substring on
+                    // ngram3). For row-level substring matching we strip the
+                    // wildcards so 'batch*' substring-matches 'batch_test'.
                     let h_low = haystack.to_lowercase();
-                    let ok = needle.to_lowercase().split_whitespace().all(|tok| !tok.is_empty() && h_low.contains(tok));
+                    let ok = needle
+                        .to_lowercase()
+                        .split_whitespace()
+                        .map(|tok| tok.trim_matches(|c: char| c == '*' || c == '?'))
+                        .all(|tok| !tok.is_empty() && h_low.contains(tok));
                     b.append_value(ok);
                 }
                 _ => b.append_value(false),

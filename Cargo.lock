@@ -7784,6 +7784,7 @@ dependencies = [
  "deltalake",
  "dotenv",
  "envy",
+ "fastrand",
  "foyer",
  "futures",
  "hyper-util",
