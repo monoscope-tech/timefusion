@@ -170,8 +170,8 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         // is added to the Field's metadata in `fields()` below.
         "Variant" => ArrowDataType::Struct(
             vec![
-                Arc::new(Field::new("metadata", ArrowDataType::Binary, false)),
-                Arc::new(Field::new("value", ArrowDataType::Binary, false)),
+                Arc::new(Field::new(VARIANT_METADATA_FIELD, ArrowDataType::Binary, false)),
+                Arc::new(Field::new(VARIANT_VALUE_FIELD, ArrowDataType::Binary, false)),
             ]
             .into(),
         ),
@@ -262,6 +262,13 @@ pub fn get_default_schema() -> &'static TableSchema {
     registry().get_default().expect("No schemas available in registry")
 }
 
+/// Inner field names of the unshredded Variant struct
+/// (`delta_kernel::unshredded_variant()`). Centralized here so any writer or
+/// validator that constructs a Variant struct uses the same names; if
+/// delta-kernel ever renames these, only this file changes.
+pub const VARIANT_METADATA_FIELD: &str = "metadata";
+pub const VARIANT_VALUE_FIELD: &str = "value";
+
 /// Returns true if the given Arrow DataType structurally matches a Variant
 /// (Struct with `metadata` + `value` binary/binaryview fields).
 pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
@@ -269,8 +276,10 @@ pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
         ArrowDataType::Struct(fields) if fields.len() == 2 => {
             fields
                 .iter()
-                .any(|f| f.name() == "metadata" && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
-                && fields.iter().any(|f| f.name() == "value" && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
+                .any(|f| f.name() == VARIANT_METADATA_FIELD && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
+                && fields
+                    .iter()
+                    .any(|f| f.name() == VARIANT_VALUE_FIELD && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
         }
         _ => false,
     }
