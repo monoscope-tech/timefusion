@@ -127,6 +127,14 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     const MAX_PEEL: u16 = 256;
     fn peel(plan: LogicalPlan, depth: u16) -> Result<LogicalPlan> {
         if depth >= MAX_PEEL {
+            // Pathological plan depth — bail to avoid stack overflow. Variant
+            // columns inside the un-peeled subtree exit unwrapped; warn so this
+            // is traceable instead of silent.
+            warn!(
+                target: "variant_select_rewriter",
+                max_peel = MAX_PEEL,
+                "wrap_root_projection hit MAX_PEEL — deeply nested Sort/Limit/Distinct/SubqueryAlias chain; Variant root wrapping skipped"
+            );
             return Ok(plan);
         }
         let d = depth + 1;

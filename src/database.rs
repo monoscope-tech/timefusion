@@ -379,8 +379,10 @@ impl Database {
     fn build_storage_options(&self) -> HashMap<String, String> {
         let storage_options = self.config.aws.build_storage_options(self.default_s3_endpoint.as_deref());
 
+        // debug! (not info!) because this is called on every insert path —
+        // info-level logging here would flood production logs.
         let safe_options: HashMap<_, _> = storage_options.iter().filter(|(k, _)| !k.contains("secret") && !k.contains("password")).collect();
-        info!("Storage options configured: {:?}", safe_options);
+        debug!("Storage options configured: {:?}", safe_options);
         storage_options
     }
 
