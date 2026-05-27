@@ -87,7 +87,7 @@ fn rewrite_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                 Some(c) if !c.is_empty() => c,
                 _ => return Ok(Transformed::no(LogicalPlan::Filter(filter))),
             };
-            let new_pred = filter.predicate.clone().transform_down(|e| rewrite_expr(e, &columns))?.data;
+            let new_pred = filter.predicate.clone().transform_down(|e| rewrite_expr(e, columns))?.data;
             filter.predicate = new_pred;
             Ok(Transformed::yes(LogicalPlan::Filter(filter)))
         }
