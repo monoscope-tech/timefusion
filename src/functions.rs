@@ -82,7 +82,7 @@ impl ExprPlanner for VariantAwareExprPlanner {
         //   variant_get(col, path) → Variant
         //   variant_to_json(...)   → JSON-encoded text (Utf8)
         //   json_to_pg_text(...)   → Postgres ->> text
-        let variant_get_udf = ScalarUDF::from(datafusion_variant::VariantGetUdf::default());
+        let variant_get_udf = ScalarUDF::from(VariantGetExtUdf::default());
         let path_literal = Expr::Literal(ScalarValue::Utf8(Some(full_path.clone())), None);
         let get_args = vec![base_expr.clone(), path_literal];
         let variant_leaf = Expr::ScalarFunction(ScalarFunction {
@@ -91,7 +91,7 @@ impl ExprPlanner for VariantAwareExprPlanner {
         });
         let result = if is_long_arrow {
             let to_json = Expr::ScalarFunction(ScalarFunction {
-                func: Arc::new(ScalarUDF::from(datafusion_variant::VariantToJsonUdf::default())),
+                func: Arc::new(ScalarUDF::from(VariantToJsonExtUdf::default())),
                 args: vec![variant_leaf],
             });
             Expr::ScalarFunction(ScalarFunction {
@@ -275,6 +275,75 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
     }
 }
 
+/// `datafusion-variant`'s UDFs call `try_field_as_variant_array(field)` on
+/// their first arg and bail with "Extension type name missing" when the
+/// field lacks the `ARROW:extension:name = arrow.parquet.variant` marker.
+/// That marker survives in the LogicalPlan's `projected_schema` (set by
+/// `VariantSelectRewriter::patch_table_scan` and by `SchemaRegistry`'s
+/// `fields()`), but is stripped on the way to the physical executor's
+/// per-row Field — so any SELECT touching a Variant column would panic at
+/// execution time. We re-stamp the marker here right before delegating.
+fn stamp_variant_field(f: &Arc<datafusion::arrow::datatypes::Field>) -> Arc<datafusion::arrow::datatypes::Field> {
+    const EXT_KEY: &str = "ARROW:extension:name";
+    const EXT_VAL: &str = "arrow.parquet.variant";
+    if !is_variant_type(f.data_type()) || f.metadata().get(EXT_KEY).map(String::as_str) == Some(EXT_VAL) {
+        return f.clone();
+    }
+    let mut md = f.metadata().clone();
+    md.insert(EXT_KEY.into(), EXT_VAL.into());
+    Arc::new(f.as_ref().clone().with_metadata(md))
+}
+
+/// Wrap a `datafusion-variant` UDF so its arg fields get the Variant
+/// extension marker re-stamped before delegation. Generic over the inner
+/// UDF type so `VariantToJsonUdf` and `VariantGetUdf` share one impl.
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct VariantExtWrapper<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> {
+    inner: U,
+}
+
+impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> Default for VariantExtWrapper<U> {
+    fn default() -> Self {
+        Self { inner: U::default() }
+    }
+}
+
+impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> ScalarUDFImpl for VariantExtWrapper<U> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn signature(&self) -> &Signature {
+        self.inner.signature()
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        self.inner.return_type(arg_types)
+    }
+    // VariantGetUdf in particular panics in `return_type` and instead
+    // computes the output Field shape from arg types via this method, so
+    // we must forward it rather than rely on the default that calls
+    // return_type.
+    fn return_field_from_args(
+        &self,
+        args: datafusion::logical_expr::ReturnFieldArgs,
+    ) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
+        self.inner.return_field_from_args(args)
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> datafusion::error::Result<Vec<DataType>> {
+        self.inner.coerce_types(arg_types)
+    }
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        args.arg_fields = args.arg_fields.iter().map(stamp_variant_field).collect();
+        self.inner.invoke_with_args(args)
+    }
+}
+
+use std::hash::Hash;
+pub type VariantToJsonExtUdf = VariantExtWrapper<datafusion_variant::VariantToJsonUdf>;
+pub type VariantGetExtUdf = VariantExtWrapper<datafusion_variant::VariantGetUdf>;
+
 /// Register all custom PostgreSQL-compatible functions
 pub fn register_custom_functions(ctx: &mut datafusion::execution::context::SessionContext) -> Result<()> {
     // Register Variant-aware expr planner (must be before JSON planner for priority)
@@ -312,8 +381,8 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
 
     // Register variant functions from datafusion-variant
     ctx.register_udf(ScalarUDF::from(datafusion_variant::JsonToVariantUdf::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantToJsonUdf::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantGetUdf::default()));
+    ctx.register_udf(ScalarUDF::from(VariantToJsonExtUdf::default()));
+    ctx.register_udf(ScalarUDF::from(VariantGetExtUdf::default()));
     ctx.register_udf(ScalarUDF::from(datafusion_variant::CastToVariantUdf::default()));
     ctx.register_udf(ScalarUDF::from(datafusion_variant::IsVariantNullUdf::default()));
     ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantPretty::default()));
