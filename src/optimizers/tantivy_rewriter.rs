@@ -329,7 +329,7 @@ fn find_indexed_table(plan: &LogicalPlan) -> Option<String> {
 /// add runtime/hot-reload of schemas, this OnceLock must be replaced with an
 /// invalidatable structure — newly-added Tantivy-indexed tables would
 /// otherwise silently never accelerate.
-fn indexed_columns_for(table: &str) -> Option<HashMap<String, &'static str>> {
+fn indexed_columns_for(table: &str) -> Option<&'static HashMap<String, &'static str>> {
     static CACHE: OnceLock<HashMap<String, HashMap<String, &'static str>>> = OnceLock::new();
     let map = CACHE.get_or_init(|| {
         let mut m: HashMap<String, HashMap<String, &'static str>> = HashMap::new();
@@ -358,7 +358,7 @@ fn indexed_columns_for(table: &str) -> Option<HashMap<String, &'static str>> {
         }
         m
     });
-    map.get(table).cloned()
+    map.get(table)
 }
 
 #[cfg(test)]

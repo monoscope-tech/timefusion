@@ -148,6 +148,7 @@ impl WalManager {
 
     pub fn with_fsync_mode_and_shards(data_dir: PathBuf, mode: crate::config::WalFsyncMode, shards_per_topic: usize) -> Result<Self, WalError> {
         std::fs::create_dir_all(&data_dir)?;
+        Self::check_wal_version_stamp(&data_dir)?;
 
         let schedule = match mode {
             crate::config::WalFsyncMode::Milliseconds(ms) => FsyncSchedule::Milliseconds(ms),
@@ -182,6 +183,63 @@ impl WalManager {
             shard_counter: dashmap::DashMap::new(),
             shards_per_topic,
         })
+    }
+
+    /// Verify the on-disk WAL was written by a compatible binary before we
+    /// open it. Each `WAL_VERSION` bump is a breaking change to the entry
+    /// encoding (or, for 131, to the walrus collection key); silently mixing
+    /// versions strands data and produces noisy per-entry errors during
+    /// recovery. We write a `wal_version` stamp in `.timefusion_meta/` on
+    /// first init and refuse to start if it doesn't match.
+    ///
+    /// Fresh directories (no stamp, no walrus state) auto-stamp the current
+    /// version. A pre-existing walrus dir without a stamp is treated as
+    /// pre-stamp legacy and refused.
+    fn check_wal_version_stamp(data_dir: &std::path::Path) -> Result<(), WalError> {
+        let meta_dir = data_dir.join(".timefusion_meta");
+        let _ = std::fs::create_dir_all(&meta_dir);
+        let stamp_path = meta_dir.join("wal_version");
+
+        let has_walrus_state = std::fs::read_dir(data_dir)
+            .map(|rd| rd.flatten().any(|e| e.file_name() != ".timefusion_meta" && e.file_name() != "wal_version"))
+            .unwrap_or(false);
+
+        match std::fs::read_to_string(&stamp_path) {
+            Ok(s) => {
+                let on_disk: u8 = s.trim().parse().map_err(|_| WalError::UnsupportedVersion {
+                    version:  0,
+                    expected: WAL_VERSION,
+                })?;
+                if on_disk != WAL_VERSION {
+                    error!(
+                        "WAL on-disk version {} != binary version {}. IN-FLIGHT DATA WILL BE LOST \
+                         IF YOU PROCEED. Wipe {:?} to start fresh, or run a matching binary.",
+                        on_disk, WAL_VERSION, data_dir
+                    );
+                    return Err(WalError::UnsupportedVersion {
+                        version:  on_disk,
+                        expected: WAL_VERSION,
+                    });
+                }
+                Ok(())
+            }
+            Err(_) if has_walrus_state => {
+                error!(
+                    "WAL directory {:?} has data but no version stamp (pre-stamp legacy). \
+                     Wipe the directory to start fresh on WAL v{}.",
+                    data_dir, WAL_VERSION
+                );
+                Err(WalError::UnsupportedVersion {
+                    version:  0,
+                    expected: WAL_VERSION,
+                })
+            }
+            Err(_) => {
+                std::fs::write(&stamp_path, WAL_VERSION.to_string())?;
+                info!("WAL initialized fresh at v{}", WAL_VERSION);
+                Ok(())
+            }
+        }
     }
 
     // Persist topic to index file. Called after WAL append - if crash occurs between

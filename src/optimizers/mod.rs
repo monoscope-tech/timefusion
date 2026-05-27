@@ -57,6 +57,33 @@ pub mod time_range_partition_pruner {
 }
 
 /// Utilities for checking project_id filters
+/// Extract the literal `project_id` value from an expression tree.
+///
+/// Walks the same shapes `ProjectIdPushdown::contains_project_id` recognises:
+/// `project_id = 'x'` (either arg order, Utf8 / Utf8View) and through `AND`
+/// / `NOT` parents. Returns the first match. Used by both the SELECT-side
+/// router (`ProjectRoutingTable`) and DML extractor (`extract_dml_info` in
+/// `dml.rs`); keep them in sync by always going through this function.
+pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
+    use datafusion::common::ScalarValue;
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(col), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(col)) if col.name == "project_id" => match v {
+                ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
+                _ => None,
+            },
+            _ => None,
+        },
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And,
+            right,
+        }) => extract_project_id_from_expr(left).or_else(|| extract_project_id_from_expr(right)),
+        Expr::Not(inner) => extract_project_id_from_expr(inner),
+        _ => None,
+    }
+}
+
 pub struct ProjectIdPushdown;
 
 impl ProjectIdPushdown {

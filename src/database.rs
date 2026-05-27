@@ -2382,12 +2382,7 @@ impl ProjectRoutingTable {
     }
 
     fn extract_project_id_from_filters(&self, filters: &[Expr]) -> Option<String> {
-        for filter in filters {
-            if let Some(project_id) = self.extract_project_id(filter) {
-                return Some(project_id);
-            }
-        }
-        None
+        filters.iter().find_map(crate::optimizers::extract_project_id_from_expr)
     }
 
     fn schema(&self) -> SchemaRef {
@@ -2400,37 +2395,6 @@ impl ProjectRoutingTable {
     /// Real (Variant-typed) schema for internal use.
     pub fn real_schema(&self) -> SchemaRef {
         self.schema.clone()
-    }
-
-    #[allow(clippy::only_used_in_recursion)]
-    fn extract_project_id(&self, expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op, right }) if *op == Operator::Eq => {
-                // Check column = value (both Utf8 and Utf8View)
-                if let Expr::Column(col) = left.as_ref()
-                    && col.name == "project_id"
-                {
-                    match right.as_ref() {
-                        Expr::Literal(ScalarValue::Utf8(Some(v)), _) => return Some(v.clone()),
-                        Expr::Literal(ScalarValue::Utf8View(Some(v)), _) => return Some(v.clone()),
-                        _ => {}
-                    }
-                }
-                // Check value = column (both Utf8 and Utf8View)
-                if let Expr::Column(col) = right.as_ref()
-                    && col.name == "project_id"
-                {
-                    match left.as_ref() {
-                        Expr::Literal(ScalarValue::Utf8(Some(v)), _) => return Some(v.clone()),
-                        Expr::Literal(ScalarValue::Utf8View(Some(v)), _) => return Some(v.clone()),
-                        _ => {}
-                    }
-                }
-                None
-            }
-            Expr::Not(inner) => self.extract_project_id(inner),
-            _ => None,
-        }
     }
 
     /// Determines if a filter can be pushed down exactly to Delta Lake

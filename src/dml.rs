@@ -196,21 +196,7 @@ fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projecti
         .collect())
 }
 
-/// Extract project_id from filter expression
-fn extract_project_id(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(col), Expr::Literal(val, _)) | (Expr::Literal(val, _), Expr::Column(col)) if col.name == "project_id" => Some(val.to_string()),
-            _ => None,
-        },
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op: Operator::And,
-            right,
-        }) => extract_project_id(left).or_else(|| extract_project_id(right)),
-        _ => None,
-    }
-}
+use crate::optimizers::extract_project_id_from_expr as extract_project_id;
 
 /// Unified DML execution plan
 #[derive(Clone)]
