@@ -1207,11 +1207,16 @@ impl Database {
                 };
 
                 let current_version = table.read().await.version();
-                // Only refresh when we know we're behind. Firing on
-                // (Some(_), None) caused an S3 update_state on every read for any
-                // table this process hasn't written to (read-only replicas, post-restart) —
-                // a cold-table tax compounding with resolve_table's lookup cost.
-                let should_update = matches!((current_version, last_written_version), (Some(current), Some(last)) if current < last);
+                // Refresh when we know we're behind, or when this process
+                // hasn't directly written but a background flusher (buffered
+                // layer) might have committed new versions. Setting the
+                // `(Some(_), None) => false` shortcut here silently broke
+                // buffer→Delta visibility for the next read.
+                let should_update = match (current_version, last_written_version) {
+                    (Some(current), Some(last)) => current < last,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
 
                 if should_update {
                     self.update_table(table, "", table_name)
@@ -1242,11 +1247,16 @@ impl Database {
                 };
 
                 let current_version = table.read().await.version();
-                // Only refresh when we know we're behind. Firing on
-                // (Some(_), None) caused an S3 update_state on every read for any
-                // table this process hasn't written to (read-only replicas, post-restart) —
-                // a cold-table tax compounding with resolve_table's lookup cost.
-                let should_update = matches!((current_version, last_written_version), (Some(current), Some(last)) if current < last);
+                // Refresh when we know we're behind, or when this process
+                // hasn't directly written but a background flusher (buffered
+                // layer) might have committed new versions. Setting the
+                // `(Some(_), None) => false` shortcut here silently broke
+                // buffer→Delta visibility for the next read.
+                let should_update = match (current_version, last_written_version) {
+                    (Some(current), Some(last)) => current < last,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
 
                 if should_update {
                     self.update_table(table, project_id, table_name)
