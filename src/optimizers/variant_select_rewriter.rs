@@ -37,11 +37,7 @@ use datafusion::{
 };
 use tracing::{debug, warn};
 
-use crate::{
-    database::ProjectRoutingTable,
-    functions::VariantToJsonExtUdf,
-    schema_loader::is_variant_type,
-};
+use crate::{database::ProjectRoutingTable, functions::VariantToJsonExtUdf, schema_loader::is_variant_type};
 
 #[derive(Debug, Default)]
 pub struct VariantSelectRewriter;

@@ -325,10 +325,7 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> ScalarUDFImpl
     // computes the output Field shape from arg types via this method, so
     // we must forward it rather than rely on the default that calls
     // return_type.
-    fn return_field_from_args(
-        &self,
-        args: datafusion::logical_expr::ReturnFieldArgs,
-    ) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
+    fn return_field_from_args(&self, args: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
         self.inner.return_field_from_args(args)
     }
     fn coerce_types(&self, arg_types: &[DataType]) -> datafusion::error::Result<Vec<DataType>> {
