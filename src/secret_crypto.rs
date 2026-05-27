@@ -7,11 +7,14 @@
 //! can be rolled out without a forced backfill — re-encrypt with
 //! `timefusion encrypt-secret <value>` and UPDATE the row.
 
-use aes_gcm::aead::{Aead, KeyInit, OsRng, rand_core::RngCore};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use std::sync::OnceLock;
+
+use aes_gcm::{
+    Aes256Gcm, Key, Nonce,
+    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use std::sync::OnceLock;
 
 pub const ENC_PREFIX: &str = "enc:v1:";
 const KEY_ENV: &str = "TIMEFUSION_CONFIG_ENCRYPTION_KEY";
@@ -64,7 +67,9 @@ pub fn decrypt_or_passthrough(value: &str) -> Result<String> {
         bail!("encrypted secret payload too short");
     }
     let (nonce, ct) = bytes.split_at(NONCE_LEN);
-    let pt = c.decrypt(Nonce::from_slice(nonce), ct).map_err(|e| anyhow!("AES-GCM decrypt failed (key mismatch or tampered ciphertext): {e}"))?;
+    let pt = c
+        .decrypt(Nonce::from_slice(nonce), ct)
+        .map_err(|e| anyhow!("AES-GCM decrypt failed (key mismatch or tampered ciphertext): {e}"))?;
     String::from_utf8(pt).context("decrypted secret is not valid UTF-8")
 }
 
