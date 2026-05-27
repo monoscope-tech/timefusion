@@ -11,7 +11,7 @@ use datafusion::{
     scalar::ScalarValue,
 };
 use datafusion_variant::JsonToVariantUdf;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::schema_loader::is_variant_type;
 
@@ -99,10 +99,10 @@ fn rewrite_input_for_variant(input: &LogicalPlan, variant_indices: &[usize]) -> 
         // type-mismatch when staging.col is Utf8. warn! so the limitation is
         // visible rather than silent.
         other => {
-            log::warn!(
+            warn!(
                 target: "variant_insert_rewriter",
-                "INSERT input is {} (not Values/Projection); json_to_variant wrapping is skipped — Variant column writes from this source may fail at write time",
-                other.display()
+                input = %other.display(),
+                "INSERT input is not Values/Projection; json_to_variant wrapping is skipped — Variant column writes from this source may fail at write time"
             );
             Ok(None)
         }

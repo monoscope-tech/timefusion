@@ -153,10 +153,16 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 });
                 break;
             }
-            _ => match current_plan.inputs().first() {
-                Some(input) => current_plan = input,
-                None => break,
-            },
+            other => {
+                // Unknown node — Window/Subquery/Union/etc. Fall through the first
+                // input; warn so a missing predicate/project_id below is traceable
+                // to a plan shape this extractor doesn't understand.
+                tracing::warn!(target: "dml", node = ?std::mem::discriminant(other), "extract_dml_info: unhandled LogicalPlan node, descending first child — predicate/project_id extraction may be incomplete");
+                match other.inputs().first() {
+                    Some(input) => current_plan = input,
+                    None => break,
+                }
+            }
         }
     }
 
@@ -425,7 +431,12 @@ impl<'a> DmlContext<'a> {
             total_rows += mem_op(layer, self.predicate.as_ref())?;
         }
 
-        // Check if there's committed data: either in custom project tables or unified tables
+        // Check if there's committed data: either in custom project tables or unified tables.
+        // The unified-tables lookup intentionally uses table_name only (no project_id):
+        // unified tables are shared across all default projects, so a hit here means "some
+        // project has committed data in this table", not "this project has". The delta_op's
+        // predicate already includes `project_id = $self.project_id`, so we never delete or
+        // update another project's rows — at worst we issue a Delta scan that matches nothing.
         let has_committed = {
             let custom_tables = self.database.custom_project_tables().read().await;
             let unified_tables = self.database.unified_tables().read().await;
