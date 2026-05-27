@@ -168,8 +168,20 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
             // root; revisit if that changes. warn! when the output schema has
             // any Variant column so this gap is visible in production traces.
             other => {
-                if other.schema().fields().iter().any(|f| crate::schema_loader::is_variant_type(f.data_type())) {
-                    log::warn!(target: "variant_select_rewriter", "Variant column exits the wire unwrapped: root is {} — see comment in variant_select_rewriter::peel", other.display());
+                let variant_cols: Vec<&str> = other
+                    .schema()
+                    .fields()
+                    .iter()
+                    .filter(|f| crate::schema_loader::is_variant_type(f.data_type()))
+                    .map(|f| f.name().as_str())
+                    .collect();
+                if !variant_cols.is_empty() {
+                    log::warn!(
+                        target: "variant_select_rewriter",
+                        "Variant columns exit the wire unwrapped (raw binary): root_node={}, columns={:?} — peel() can't reach a Projection through this node (Union/Aggregate/Join etc.). Wrap inputs explicitly with variant_to_json() or open a follow-up.",
+                        other.display(),
+                        variant_cols,
+                    );
                 }
                 Ok(other)
             }

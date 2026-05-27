@@ -64,6 +64,12 @@ impl ProjectIdPushdown {
         filters.iter().any(Self::contains_project_id)
     }
 
+    /// Conservative: recognises `project_id = 'x'` (either argument order) and
+    /// AND-conjuncts that include one. **OR** is intentionally NOT handled —
+    /// `WHERE project_id = 'a' OR project_id = 'b'` is rare in practice and
+    /// reporting "no project_id filter" for it keeps the multi-tenant guard
+    /// strict (the query then errors out instead of silently scanning all
+    /// projects). Extend here if cross-project OR becomes a real workload.
     pub fn contains_project_id(expr: &Expr) -> bool {
         match expr {
             Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => matches!(
