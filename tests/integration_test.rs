@@ -361,4 +361,58 @@ mod integration {
 
         Ok(())
     }
+
+    /// End-to-end coverage of the Variant pipeline:
+    ///   INSERT (Utf8 literal → VariantInsertRewriter wraps with json_to_variant)
+    ///   → Delta/MemBuffer (binary Variant storage)
+    ///   → SELECT (VariantSelectRewriter wraps root projection with variant_to_json)
+    ///   → pgwire (wire bytes are JSON text, not raw binary)
+    /// Regression guard for PR's core contract.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_variant_column_round_trips_as_json() -> Result<()> {
+        let server = TestServer::start().await?;
+        let client = server.client().await?;
+        let span_id = Uuid::new_v4().to_string();
+        let attrs_json = r#"{"http":{"method":"GET","status":200},"user":"alice"}"#;
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO otel_logs_and_spans \
+                     (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary, attributes) \
+                     VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[]::text[], $7, '{}')",
+                    chrono::Utc::now().date_naive(),
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                    attrs_json
+                ),
+                &[&"test_project", &span_id, &"variant_round_trip", &"OK", &"with attrs", &"INFO", &vec!["summary"]],
+            )
+            .await?;
+
+        // Bare projection: hits wrap_root_projection's Projection arm directly.
+        let row = client
+            .query_one(
+                "SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &span_id],
+            )
+            .await?;
+        let got: String = row.get(0);
+        let parsed: serde_json::Value = serde_json::from_str(&got).unwrap_or_else(|e| panic!("attributes was not valid JSON: {e}; raw={got:?}"));
+        assert_eq!(parsed["http"]["method"], "GET");
+        assert_eq!(parsed["user"], "alice");
+
+        // Sort/Limit peel path: VariantSelectRewriter must wrap through Sort+Limit.
+        let row = client
+            .query_one(
+                "SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2 \
+                 ORDER BY timestamp DESC LIMIT 1",
+                &[&"test_project", &span_id],
+            )
+            .await?;
+        let got: String = row.get(0);
+        serde_json::from_str::<serde_json::Value>(&got).unwrap_or_else(|e| panic!("Sort+Limit path: attributes was not valid JSON: {e}; raw={got:?}"));
+
+        Ok(())
+    }
 }
