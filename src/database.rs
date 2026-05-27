@@ -2795,6 +2795,13 @@ impl TableProvider for ProjectRoutingTable {
             error!("Unsupported insert operation: {:?}", insert_op);
             return not_impl_err!("{insert_op} not implemented for MemoryTable yet");
         }
+        // No `logically_equivalent_names_and_types(&input.schema())` check here:
+        // `self.schema()` returns the "insert-compatible" (lying) schema where
+        // Variant columns appear as Utf8View so VALUES literals type-check.
+        // Validating against that shape would reject the real downstream batches
+        // (which carry Variant). `write_all` coerces back to Variant before
+        // the Delta commit, so the type contract is enforced at the boundary
+        // that matters.
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(self.clone()), None)))
     }
 
