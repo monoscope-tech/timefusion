@@ -1,4 +1,4 @@
-.PHONY: test test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio run-prod build-prod minio-start minio-stop minio-clean
+.PHONY: test test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
 # Default test (fast, excludes slow integration tests)
 test:
@@ -40,6 +40,11 @@ build-prod:
 	@echo "Building release with PRODUCTION configuration..."
 	@export $$(cat .env.prod | grep -v '^#' | xargs) && cargo build --release
 
+# Run with MinIO configuration (local development with prod-like settings)
+run-minio:
+	@echo "Running with MinIO configuration..."
+	@export $$(cat .env.minio.prod | grep -v '^#' | xargs) && cargo run
+
 # Start MinIO server
 minio-start:
 	@mkdir -p /tmp/minio-data
@@ -71,3 +76,26 @@ test-integration:
 test-integration-minio:
 	@echo "Running integration tests with MinIO..."
 	@export $$(cat .env.minio | grep -v '^#' | xargs) && cargo test --test integration_test --test sqllogictest -- --ignored $${ARGS}
+
+# Background-run TimeFusion against local MinIO. PID + log under /tmp.
+# Intended for use by downstream test suites (e.g. monoscope integration tests).
+tf-start: minio-start
+	@if [ -f /tmp/timefusion.pid ] && kill -0 $$(cat /tmp/timefusion.pid) 2>/dev/null; then \
+		echo "timefusion already running (pid $$(cat /tmp/timefusion.pid))"; exit 0; \
+	fi
+	@rm -f /tmp/timefusion.pid /tmp/timefusion.log
+	@export $$(cat .env.minio | grep -v '^#' | xargs) && \
+		port="$${PGWIRE_PORT:-12345}" && \
+		nohup cargo run --release > /tmp/timefusion.log 2>&1 & \
+		echo $$! > /tmp/timefusion.pid && \
+		echo "timefusion starting (PGWire: $$port, gRPC: $${GRPC_PORT:-50051}). Logs: /tmp/timefusion.log" && \
+		for i in $$(seq 1 900); do \
+			nc -z 127.0.0.1 $$port 2>/dev/null && { echo "ready"; exit 0; }; \
+			kill -0 $$(cat /tmp/timefusion.pid) 2>/dev/null || { echo "timefusion died; see /tmp/timefusion.log"; tail -50 /tmp/timefusion.log; exit 1; }; \
+			sleep 1; \
+		done; echo "timeout waiting for PGWire on $$port"; tail -50 /tmp/timefusion.log; exit 1
+
+tf-stop:
+	@[ -f /tmp/timefusion.pid ] && kill $$(cat /tmp/timefusion.pid) 2>/dev/null || true
+	@rm -f /tmp/timefusion.pid
+	@echo "timefusion stopped"

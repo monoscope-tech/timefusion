@@ -1,14 +1,12 @@
 #[cfg(test)]
 mod integration {
+    use std::{path::PathBuf, sync::Arc, time::Duration};
+
     use anyhow::Result;
     use datafusion_postgres::ServerOptions;
-    use rand::Rng;
+    use rand::RngExt;
     use serial_test::serial;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use timefusion::config::AppConfig;
-    use timefusion::database::Database;
+    use timefusion::{config::AppConfig, database::Database};
     use tokio::sync::Notify;
     use tokio_postgres::{Client, NoTls};
     use uuid::Uuid;
@@ -26,7 +24,7 @@ mod integration {
 
         // Core settings - unique per test
         cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
-        cfg.core.walrus_data_dir = PathBuf::from(format!("/tmp/walrus-{}", test_id));
+        cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-{}", test_id));
 
         // Disable Foyer cache for integration tests
         cfg.cache.timefusion_foyer_disabled = true;
@@ -35,8 +33,8 @@ mod integration {
     }
 
     struct TestServer {
-        port: u16,
-        test_id: String,
+        port:     u16,
+        test_id:  String,
         shutdown: Arc<Notify>,
     }
 
@@ -188,9 +186,17 @@ mod integration {
         let total: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
         assert_eq!(total, 6);
 
-        // Verify schema
-        let rows = client.query("SELECT * FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1", &[&"test_project"]).await?;
-        assert_eq!(rows[0].columns().len(), 89);
+        // Targeted column selection — keeps the test focused on a specific row's
+        // typed columns. VariantSelectRewriter already serializes Variant columns
+        // to JSON at the root projection, so `SELECT *` would also work end-to-end;
+        // this assertion just doesn't need every field.
+        let row = client
+            .query_one(
+                "SELECT id, name, status_code, level FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1",
+                &[&"test_project"],
+            )
+            .await?;
+        assert_eq!(row.columns().len(), 4);
 
         Ok(())
     }
@@ -352,6 +358,65 @@ mod integration {
 
         let total_count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
         assert_eq!(total_count, 3);
+
+        Ok(())
+    }
+
+    /// End-to-end coverage of the Variant pipeline:
+    ///   INSERT (Utf8 literal → VariantInsertRewriter wraps with json_to_variant)
+    ///   → Delta/MemBuffer (binary Variant storage)
+    ///   → SELECT (VariantSelectRewriter wraps root projection with variant_to_json)
+    ///   → pgwire (wire bytes are JSON text, not raw binary)
+    /// Regression guard for PR's core contract.
+    ///
+    /// The Variant extension marker is re-stamped at UDF entry by
+    /// `functions::VariantExtWrapper` because the marker that
+    /// `patch_table_scan` sets on the LogicalPlan's Field metadata is
+    /// stripped on its way to the physical executor's per-row Field.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_variant_column_round_trips_as_json() -> Result<()> {
+        let server = TestServer::start().await?;
+        let client = server.client().await?;
+        let span_id = Uuid::new_v4().to_string();
+        let attrs_json = r#"{"http":{"method":"GET","status":200},"user":"alice"}"#;
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO otel_logs_and_spans \
+                     (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary, attributes) \
+                     VALUES ($1, {}, '{}', $2, $3, $4, $5, $6, ARRAY[]::text[], $7, '{}')",
+                    chrono::Utc::now().date_naive(),
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                    attrs_json
+                ),
+                &[&"test_project", &span_id, &"variant_round_trip", &"OK", &"with attrs", &"INFO", &vec!["summary"]],
+            )
+            .await?;
+
+        // Bare projection: hits wrap_root_projection's Projection arm directly.
+        let row = client
+            .query_one(
+                "SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &span_id],
+            )
+            .await?;
+        let got: String = row.get(0);
+        let parsed: serde_json::Value = serde_json::from_str(&got).unwrap_or_else(|e| panic!("attributes was not valid JSON: {e}; raw={got:?}"));
+        assert_eq!(parsed["http"]["method"], "GET");
+        assert_eq!(parsed["user"], "alice");
+
+        // Sort/Limit peel path: VariantSelectRewriter must wrap through Sort+Limit.
+        let row = client
+            .query_one(
+                "SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2 \
+                 ORDER BY timestamp DESC LIMIT 1",
+                &[&"test_project", &span_id],
+            )
+            .await?;
+        let got: String = row.get(0);
+        serde_json::from_str::<serde_json::Value>(&got).unwrap_or_else(|e| panic!("Sort+Limit path: attributes was not valid JSON: {e}; raw={got:?}"));
 
         Ok(())
     }

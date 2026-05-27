@@ -1,23 +1,26 @@
+use std::{any::Any, sync::Arc};
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
-use datafusion::arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringViewArray, StringViewBuilder,
-    TimestampMicrosecondArray, TimestampNanosecondArray,
+use datafusion::{
+    arrow::{
+        array::{
+            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringViewArray, StringViewBuilder,
+            TimestampMicrosecondArray, TimestampNanosecondArray,
+        },
+        datatypes::{DataType, TimeUnit},
+    },
+    common::{DFSchema, DataFusionError, ExprSchema, ScalarValue, not_impl_err},
+    logical_expr::{
+        Accumulator, AggregateUDF, ColumnarValue, Expr, ExprSchemable, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature,
+        TypeSignature, Volatility, create_udaf, create_udf,
+        expr::{Alias, ScalarFunction},
+        planner::{ExprPlanner, PlannerResult, RawBinaryExpr},
+    },
+    sql::sqlparser::ast::BinaryOperator,
 };
-use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use datafusion::common::{DFSchema, DataFusionError, ExprSchema, ScalarValue, not_impl_err};
-use datafusion::logical_expr::ExprSchemable;
-use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, ColumnarValue, Expr, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature, TypeSignature,
-    Volatility, create_udaf, create_udf,
-    expr::{Alias, ScalarFunction},
-    planner::{ExprPlanner, PlannerResult, RawBinaryExpr},
-};
-use datafusion::sql::sqlparser::ast::BinaryOperator;
 use serde_json::{Value as JsonValue, json};
-use std::any::Any;
-use std::sync::Arc;
 use tdigests::TDigest;
 
 use crate::schema_loader::is_variant_type;
@@ -70,23 +73,33 @@ impl ExprPlanner for VariantAwareExprPlanner {
         // Build dot-path: ["user", "name"] → "user.name", ["items", Index(0)] → "items[0]"
         let full_path = build_variant_path(&path_parts);
 
-        // Create variant_get function call
-        let variant_get_udf = ScalarUDF::from(datafusion_variant::VariantGetUdf::default());
+        // Build the variant_get(base, '<path>') call. For `->` we return the
+        // Variant leaf so chained `->` keeps working. For `->>` we'd previously
+        // ask variant_get to project as Utf8, but that returns NULL for
+        // numeric/boolean leaves (parquet_variant_compute doesn't stringify).
+        // Postgres `->>` text semantics need numeric/bool → text, JSON null →
+        // SQL NULL, and string → unquoted. Compose:
+        //   variant_get(col, path) → Variant
+        //   variant_to_json(...)   → JSON-encoded text (Utf8)
+        //   json_to_pg_text(...)   → Postgres ->> text
+        let variant_get_udf = ScalarUDF::from(VariantGetExtUdf::default());
         let path_literal = Expr::Literal(ScalarValue::Utf8(Some(full_path.clone())), None);
-        let variant_get_call = Expr::ScalarFunction(ScalarFunction {
+        let get_args = vec![base_expr.clone(), path_literal];
+        let variant_leaf = Expr::ScalarFunction(ScalarFunction {
             func: Arc::new(variant_get_udf),
-            args: vec![base_expr.clone(), path_literal],
+            args: get_args,
         });
-
-        // For ->> wrap with variant_to_json for text output
         let result = if is_long_arrow {
-            let variant_to_json_udf = ScalarUDF::from(datafusion_variant::VariantToJsonUdf::default());
+            let to_json = Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(ScalarUDF::from(VariantToJsonExtUdf::default())),
+                args: vec![variant_leaf],
+            });
             Expr::ScalarFunction(ScalarFunction {
-                func: Arc::new(variant_to_json_udf),
-                args: vec![variant_get_call],
+                func: Arc::new(ScalarUDF::from(JsonToPgTextUdf::default())),
+                args: vec![to_json],
             })
         } else {
-            variant_get_call
+            variant_leaf
         };
 
         // Create alias to preserve original SQL representation
@@ -193,6 +206,141 @@ fn path_repr(parts: &[PathComponent]) -> String {
         .join("->")
 }
 
+/// `json_to_pg_text(utf8) → utf8`: convert JSON-encoded text to Postgres `->>` text.
+///
+/// - JSON string `"Alice"` → `Alice` (parsed, so escape sequences resolve correctly)
+/// - JSON null → SQL NULL
+/// - JSON number / boolean → its literal text (`42`, `true`)
+/// - JSON object / array → returned as-is (Postgres `->>` does the same)
+///
+/// Bridges `parquet_variant_compute::variant_get`'s NULL-on-non-string-cast
+/// behavior to the Postgres `->>` contract.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct JsonToPgTextUdf {
+    signature: Signature,
+}
+
+impl Default for JsonToPgTextUdf {
+    fn default() -> Self {
+        Self {
+            signature: Signature::uniform(1, vec![DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8], Volatility::Immutable),
+        }
+    }
+}
+
+impl ScalarUDFImpl for JsonToPgTextUdf {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        "json_to_pg_text"
+    }
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+    fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        use datafusion::arrow::compute::cast;
+        let arr = match args.args.into_iter().next().unwrap() {
+            ColumnarValue::Array(a) => a,
+            ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
+        };
+        // Cast once to Utf8 — collapses Utf8/Utf8View/LargeUtf8 to a single
+        // concrete shape, single pass over rows.
+        let utf8 = cast(&arr, &DataType::Utf8).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let strs = utf8
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("json_to_pg_text: cast to Utf8 failed".into()))?;
+        let mut b = datafusion::arrow::array::StringBuilder::with_capacity(strs.len(), strs.value_data().len());
+        for i in 0..strs.len() {
+            if strs.is_null(i) {
+                b.append_null();
+                continue;
+            }
+            // Parse via serde_json so escape sequences resolve correctly and
+            // false-positive shapes like '"a"+"b"' don't trigger naive unquoting.
+            // JSON null → SQL NULL; JSON string → its raw text; anything else
+            // (number, bool, object, array) → its JSON literal text (per Postgres ->>).
+            let s = strs.value(i);
+            match serde_json::from_str::<JsonValue>(s) {
+                Ok(JsonValue::Null) => b.append_null(),
+                Ok(JsonValue::String(inner)) => b.append_value(&inner),
+                Ok(_) | Err(_) => b.append_value(s),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(b.finish())))
+    }
+}
+
+/// `datafusion-variant`'s UDFs call `try_field_as_variant_array(field)` on
+/// their first arg and bail with "Extension type name missing" when the
+/// field lacks the `ARROW:extension:name = arrow.parquet.variant` marker.
+/// That marker survives in the LogicalPlan's `projected_schema` (set by
+/// `VariantSelectRewriter::patch_table_scan` and by `SchemaRegistry`'s
+/// `fields()`), but is stripped on the way to the physical executor's
+/// per-row Field — so any SELECT touching a Variant column would panic at
+/// execution time. We re-stamp the marker here right before delegating.
+fn stamp_variant_field(f: &Arc<datafusion::arrow::datatypes::Field>) -> Arc<datafusion::arrow::datatypes::Field> {
+    const EXT_KEY: &str = "ARROW:extension:name";
+    const EXT_VAL: &str = "arrow.parquet.variant";
+    if !is_variant_type(f.data_type()) || f.metadata().get(EXT_KEY).map(String::as_str) == Some(EXT_VAL) {
+        return f.clone();
+    }
+    let mut md = f.metadata().clone();
+    md.insert(EXT_KEY.into(), EXT_VAL.into());
+    Arc::new(f.as_ref().clone().with_metadata(md))
+}
+
+/// Wrap a `datafusion-variant` UDF so its arg fields get the Variant
+/// extension marker re-stamped before delegation. Generic over the inner
+/// UDF type so `VariantToJsonUdf` and `VariantGetUdf` share one impl.
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct VariantExtWrapper<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> {
+    inner: U,
+}
+
+impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> Default for VariantExtWrapper<U> {
+    fn default() -> Self {
+        Self { inner: U::default() }
+    }
+}
+
+impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> ScalarUDFImpl for VariantExtWrapper<U> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn signature(&self) -> &Signature {
+        self.inner.signature()
+    }
+    fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
+        self.inner.return_type(arg_types)
+    }
+    // VariantGetUdf in particular panics in `return_type` and instead
+    // computes the output Field shape from arg types via this method, so
+    // we must forward it rather than rely on the default that calls
+    // return_type.
+    fn return_field_from_args(&self, args: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
+        self.inner.return_field_from_args(args)
+    }
+    fn coerce_types(&self, arg_types: &[DataType]) -> datafusion::error::Result<Vec<DataType>> {
+        self.inner.coerce_types(arg_types)
+    }
+    fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        args.arg_fields = args.arg_fields.iter().map(stamp_variant_field).collect();
+        self.inner.invoke_with_args(args)
+    }
+}
+
+use std::hash::Hash;
+pub type VariantToJsonExtUdf = VariantExtWrapper<datafusion_variant::VariantToJsonUdf>;
+pub type VariantGetExtUdf = VariantExtWrapper<datafusion_variant::VariantGetUdf>;
+
 /// Register all custom PostgreSQL-compatible functions
 pub fn register_custom_functions(ctx: &mut datafusion::execution::context::SessionContext) -> Result<()> {
     // Register Variant-aware expr planner (must be before JSON planner for priority)
@@ -225,10 +373,13 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     // Register approx_percentile scalar function
     ctx.register_udf(create_approx_percentile_udf());
 
+    // Bridges variant -> Postgres ->> text semantics (numeric/bool/null → text/NULL).
+    ctx.register_udf(ScalarUDF::from(JsonToPgTextUdf::default()));
+
     // Register variant functions from datafusion-variant
     ctx.register_udf(ScalarUDF::from(datafusion_variant::JsonToVariantUdf::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantToJsonUdf::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantGetUdf::default()));
+    ctx.register_udf(ScalarUDF::from(VariantToJsonExtUdf::default()));
+    ctx.register_udf(ScalarUDF::from(VariantGetExtUdf::default()));
     ctx.register_udf(ScalarUDF::from(datafusion_variant::CastToVariantUdf::default()));
     ctx.register_udf(ScalarUDF::from(datafusion_variant::IsVariantNullUdf::default()));
     ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantPretty::default()));
@@ -240,7 +391,89 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     // Register jsonb_path_exists for JSONPath queries on Variant columns
     ctx.register_udf(create_jsonb_path_exists_udf());
 
+    // Register text_match(col, 'query') for tantivy-accelerated full-text search.
+    // Naive substring fallback ensures correctness when tantivy is disabled or
+    // when post-filtering MemBuffer rows; see [[tantivy_index/udf]].
+    ctx.register_udf(crate::tantivy_index::udf::text_match_udf());
+
+    // Test-only clock UDFs. Gated behind TIMEFUSION_ENABLE_TEST_UDFS so a
+    // production deployment can't have its eviction/flush clock yanked by
+    // a stray SQL session. Required by the long-duration bench harness in
+    // `bench/timeseries_lifecycle.py` to simulate hours in seconds.
+    if std::env::var("TIMEFUSION_ENABLE_TEST_UDFS").map(|v| v == "true" || v == "1").unwrap_or(false) {
+        ctx.register_udf(create_set_clock_udf());
+        ctx.register_udf(create_advance_clock_udf());
+        ctx.register_udf(create_now_micros_udf());
+        tracing::warn!("TIMEFUSION_ENABLE_TEST_UDFS=true; clock UDFs registered. Do NOT enable in production.");
+    }
+
     Ok(())
+}
+
+/// `timefusion_set_clock(rfc3339_text)` → bigint micros-since-epoch.
+fn create_set_clock_udf() -> ScalarUDF {
+    use datafusion::arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::DataType,
+    };
+    let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
+        let arr = match &args[0] {
+            ColumnarValue::Array(a) => a.clone(),
+            ColumnarValue::Scalar(s) => s.to_array()?,
+        };
+        let s = arr
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| DataFusionError::Execution("timefusion_set_clock expects Utf8".into()))?;
+        let mut b = Int64Array::builder(s.len());
+        for i in 0..s.len() {
+            if s.is_null(i) {
+                b.append_null();
+                continue;
+            }
+            let t = chrono::DateTime::parse_from_rfc3339(s.value(i))
+                .map_err(|e| DataFusionError::Execution(format!("invalid rfc3339: {e}")))?
+                .timestamp_micros();
+            b.append_value(crate::clock::set_micros(t));
+        }
+        Ok(ColumnarValue::Array(Arc::new(b.finish())))
+    });
+    create_udf("timefusion_set_clock", vec![DataType::Utf8], DataType::Int64, Volatility::Volatile, fun)
+}
+
+/// `timefusion_advance_clock(delta_micros)` → new bigint micros.
+fn create_advance_clock_udf() -> ScalarUDF {
+    use datafusion::arrow::{array::Int64Array, datatypes::DataType};
+    let fun: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| {
+        let arr = match &args[0] {
+            ColumnarValue::Array(a) => a.clone(),
+            ColumnarValue::Scalar(s) => s.to_array()?,
+        };
+        let d = arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| DataFusionError::Execution("timefusion_advance_clock expects Int64".into()))?;
+        let mut b = Int64Array::builder(d.len());
+        for i in 0..d.len() {
+            if d.is_null(i) {
+                b.append_null();
+            } else {
+                b.append_value(crate::clock::advance_micros(d.value(i)));
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(b.finish())))
+    });
+    create_udf("timefusion_advance_clock", vec![DataType::Int64], DataType::Int64, Volatility::Volatile, fun)
+}
+
+/// `timefusion_now_micros()` → current clock value (frozen or wall).
+fn create_now_micros_udf() -> ScalarUDF {
+    use datafusion::arrow::{array::Int64Array, datatypes::DataType};
+    let fun: ScalarFunctionImplementation = Arc::new(move |_args: &[ColumnarValue]| {
+        let v = crate::clock::now_micros();
+        Ok(ColumnarValue::Array(Arc::new(Int64Array::from(vec![v]))))
+    });
+    create_udf("timefusion_now_micros", vec![], DataType::Int64, Volatility::Volatile, fun)
 }
 
 /// Create the to_char UDF for PostgreSQL-compatible timestamp formatting
@@ -1275,7 +1508,7 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
         // Process based on input type
         let result = if is_variant_type(json_array.data_type()) {
             // Handle Variant struct type
-            evaluate_jsonpath_on_variant(&json_array, &json_path)?
+            evaluate_jsonpath_on_variant(&json_array, &json_path, &path_str)?
         } else {
             // Handle JSON string type
             evaluate_jsonpath_on_json_string(&json_array, &json_path)?
@@ -1336,52 +1569,132 @@ fn variant_to_serde_json(variant: &parquet_variant::Variant, depth: usize) -> Re
     })
 }
 
+/// Accessor that uniformly reads bytes from either `BinaryArray` or `BinaryViewArray`.
+/// Delta-rs/Parquet may yield either representation depending on
+/// `schema_force_view_types`, so variant decoding handles both transparently.
+enum BinaryAccessor<'a> {
+    Binary(&'a datafusion::arrow::array::BinaryArray),
+    View(&'a datafusion::arrow::array::BinaryViewArray),
+}
+
+impl<'a> BinaryAccessor<'a> {
+    fn try_new(col: &'a ArrayRef, field: &str) -> datafusion::error::Result<Self> {
+        if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::BinaryArray>() {
+            Ok(Self::Binary(a))
+        } else if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::BinaryViewArray>() {
+            Ok(Self::View(a))
+        } else {
+            Err(DataFusionError::Execution(format!(
+                "Variant {field} column is not Binary or BinaryView (got {:?})",
+                col.data_type()
+            )))
+        }
+    }
+
+    fn value(&self, i: usize) -> &[u8] {
+        match self {
+            Self::Binary(a) => a.value(i),
+            Self::View(a) => a.value(i),
+        }
+    }
+}
+
 /// Evaluate JSONPath on a Variant (Struct) array
-fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &serde_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
+fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &serde_json_path::JsonPath, raw_path: &str) -> datafusion::error::Result<ArrayRef> {
+    // Fast path: simple `$.a.b.c[N].d` style paths translate cleanly to a
+    // parquet_variant_compute::VariantPath and we can use the vectorized
+    // `variant_get` kernel, which walks the Variant binary directly without
+    // ever materializing the full JsonValue. Path existence = result is
+    // non-null per row.
+    if let Some(variant_path) = simple_path_to_variant_path(raw_path) {
+        use parquet_variant_compute::{GetOptions, variant_get};
+        let opts = GetOptions::new_with_path(variant_path);
+        let extracted = variant_get(array, opts).map_err(|e| DataFusionError::Execution(format!("variant_get failed: {e}")))?;
+        // Path exists ↔ extracted row is non-null. is_null/is_not_null arrays
+        // honor underlying null buffer cheaply (no per-row decode).
+        let mut builder = BooleanArray::builder(extracted.len());
+        for i in 0..extracted.len() {
+            builder.append_value(!extracted.is_null(i));
+        }
+        return Ok(Arc::new(builder.finish()));
+    }
+
+    // Fallback: complex JSONPath (filters, recursive descent, etc.) — fall
+    // back to the slow path that walks the Variant binary into a JsonValue
+    // and runs serde_json_path. Avoided when the path is simple.
     use datafusion::arrow::array::StructArray;
     use parquet_variant::Variant;
-
     let struct_array = array
         .as_any()
         .downcast_ref::<StructArray>()
         .ok_or_else(|| DataFusionError::Execution("Expected Variant struct array".to_string()))?;
-
     let metadata_col = struct_array
         .column_by_name("metadata")
         .ok_or_else(|| DataFusionError::Execution("Variant missing metadata column".to_string()))?;
     let value_col = struct_array
         .column_by_name("value")
         .ok_or_else(|| DataFusionError::Execution("Variant missing value column".to_string()))?;
-
-    let metadata_binary = metadata_col
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::BinaryViewArray>()
-        .ok_or_else(|| DataFusionError::Execution("Variant metadata not BinaryView".to_string()))?;
-    let value_binary = value_col
-        .as_any()
-        .downcast_ref::<datafusion::arrow::array::BinaryViewArray>()
-        .ok_or_else(|| DataFusionError::Execution("Variant value not BinaryView".to_string()))?;
-
+    let metadata_binary = BinaryAccessor::try_new(metadata_col, "metadata")?;
+    let value_binary = BinaryAccessor::try_new(value_col, "value")?;
     let mut builder = BooleanArray::builder(struct_array.len());
-
     for i in 0..struct_array.len() {
         if struct_array.is_null(i) {
             builder.append_null();
             continue;
         }
-
-        let metadata = metadata_binary.value(i);
-        let value = value_binary.value(i);
-
-        // Decode Variant to JSON
-        let variant = Variant::new(metadata, value);
+        let variant = Variant::new(metadata_binary.value(i), value_binary.value(i));
         let json_value = variant_to_serde_json(&variant, 0)?;
-
-        // Apply JSONPath and check if any matches exist
         builder.append_value(!json_path.query(&json_value).is_empty());
     }
-
     Ok(Arc::new(builder.finish()))
+}
+
+/// Convert a simple JSONPath (`$.a.b[0].c`) to a `parquet_variant::VariantPath`.
+/// Returns `None` for any path that uses filters, recursive descent, slices,
+/// wildcards, or other features that don't map to direct field/index access —
+/// those fall back to the slow JsonValue path.
+fn simple_path_to_variant_path(raw: &str) -> Option<parquet_variant::VariantPath<'_>> {
+    use parquet_variant::{VariantPath, VariantPathElement};
+    let s = raw.strip_prefix('$').unwrap_or(raw);
+    let mut elements: Vec<VariantPathElement> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'.' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'.' && bytes[i] != b'[' {
+                    if !(bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                        return None;
+                    }
+                    i += 1;
+                }
+                if i == start {
+                    return None;
+                }
+                elements.push(VariantPathElement::field(std::borrow::Cow::Borrowed(&s[start..i])));
+            }
+            b'[' => {
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != b']' {
+                    if !bytes[i].is_ascii_digit() {
+                        return None;
+                    }
+                    i += 1;
+                }
+                if i >= bytes.len() || i == start {
+                    return None;
+                }
+                let idx: usize = s[start..i].parse().ok()?;
+                elements.push(VariantPathElement::index(idx));
+                i += 1; // skip ']'
+            }
+            _ => return None,
+        }
+    }
+    Some(VariantPath::new(elements))
 }
 
 /// Evaluate JSONPath on a JSON string array

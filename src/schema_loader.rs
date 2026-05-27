@@ -1,34 +1,77 @@
-use arrow::datatypes::DataType as ArrowDataType;
-use arrow::datatypes::{Field, FieldRef, Schema, SchemaRef};
-use deltalake::datafusion::parquet::file::metadata::SortingColumn;
-use deltalake::kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
+
+use arrow::datatypes::{DataType as ArrowDataType, Field, FieldRef, Schema, SchemaRef};
+use deltalake::{
+    datafusion::parquet::file::metadata::SortingColumn,
+    kernel::{ArrayType, DataType as DeltaDataType, PrimitiveType, StructField},
+};
 use include_dir::{Dir, include_dir};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::OnceLock;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSchema {
-    pub table_name: String,
-    pub partitions: Vec<String>,
+    pub table_name:      String,
+    pub partitions:      Vec<String>,
     pub sorting_columns: Vec<SortingColumnDef>,
     pub z_order_columns: Vec<String>,
-    pub fields: Vec<FieldDef>,
+    pub fields:          Vec<FieldDef>,
+    /// Column the optimizer should rewrite into a `date` partition filter.
+    /// Defaults to `"timestamp"` for back-compat with existing schemas.
+    #[serde(default)]
+    pub time_column:     Option<String>,
+}
+
+impl TableSchema {
+    pub fn time_column_name(&self) -> &str {
+        self.time_column.as_deref().unwrap_or("timestamp")
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SortingColumnDef {
-    pub name: String,
-    pub descending: bool,
+    pub name:        String,
+    pub descending:  bool,
     pub nulls_first: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FieldDef {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
+    pub name:         String,
+    pub data_type:    String,
+    pub nullable:     bool,
+    #[serde(default)]
+    pub tantivy:      Option<TantivyFieldConfig>,
+    /// Opt-out for dictionary encoding. Default on. Set false for high-entropy
+    /// free-text columns (stacktraces, raw queries, full URLs) where dict just
+    /// builds a useless 8MB before falling back to PLAIN — wasted writer pass.
+    #[serde(default)]
+    pub dictionary:   Option<bool>,
+    /// Per-column bloom filter opt-in. Default off. Enable for high-cardinality
+    /// equality-lookup columns (ids, trace_ids, span_ids, session_ids).
+    #[serde(default)]
+    pub bloom_filter: bool,
+}
+
+/// Per-column tantivy index configuration. Drives `tantivy_index::schema`.
+///
+/// `tokenizer`: "raw" (exact match keyword) or "default" (tokenized text).
+/// `flatten`: for Variant columns — "json" (value-only text) or "kv" (key:value tokens).
+///
+/// User fields are always indexed-only — the real data lives in Delta/parquet.
+/// Only the reserved `_timestamp` and `_id` reserved fields are stored, and only
+/// because the reader needs them to produce `(timestamp, id)` prefilter hits for
+/// the Delta-side join.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct TantivyFieldConfig {
+    #[serde(default)]
+    pub indexed:   bool,
+    #[serde(default)]
+    pub tokenizer: Option<String>,
+    #[serde(default)]
+    pub flatten:   Option<String>,
 }
 
 impl TableSchema {
@@ -37,7 +80,19 @@ impl TableSchema {
             .iter()
             .map(|f| {
                 let data_type = parse_arrow_data_type(&f.data_type)?;
-                Ok(Arc::new(Field::new(&f.name, data_type, f.nullable)) as FieldRef)
+                let mut field = Field::new(&f.name, data_type, f.nullable);
+                // Mark Variant fields with the Arrow ExtensionType key so
+                // downstream code that does `Field::try_extension_type::<VariantType>()`
+                // (delta-rs main, parquet-variant-compute) doesn't panic
+                // with "Extension type name missing". Without this, fresh
+                // tables (variant_bench) crash on the first INSERT.
+                if f.data_type == "Variant" {
+                    use std::collections::HashMap;
+                    let mut md: HashMap<String, String> = field.metadata().clone();
+                    md.insert("ARROW:extension:name".into(), "arrow.parquet.variant".into());
+                    field = field.with_metadata(md);
+                }
+                Ok(Arc::new(field) as FieldRef)
             })
             .collect()
     }
@@ -54,10 +109,7 @@ impl TableSchema {
 
     pub fn schema_ref(&self) -> SchemaRef {
         // Return schema with partition columns moved to the end to match Delta Lake's output order
-        let all_fields = self.fields().unwrap_or_else(|e| {
-            log::error!("Failed to get fields: {:?}", e);
-            Vec::new()
-        });
+        let all_fields = self.fields().unwrap_or_else(|e| panic!("Failed to build schema for table {}: {e:?}", self.table_name));
 
         let partition_set: std::collections::HashSet<&str> = self.partitions.iter().map(|s| s.as_str()).collect();
 
@@ -83,8 +135,8 @@ impl TableSchema {
             .iter()
             .filter_map(|col| {
                 self.fields.iter().position(|f| f.name == col.name).map(|idx| SortingColumn {
-                    column_idx: idx as i32,
-                    descending: col.descending,
+                    column_idx:  idx as i32,
+                    descending:  col.descending,
                     nulls_first: col.nulls_first,
                 })
             })
@@ -97,6 +149,7 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         // Use Utf8View for better performance with zero-copy string operations
         "Utf8" => ArrowDataType::Utf8View,
         "Date32" => ArrowDataType::Date32,
+        "Boolean" => ArrowDataType::Boolean,
         "Int32" => ArrowDataType::Int32,
         "Int64" => ArrowDataType::Int64,
         "UInt32" => ArrowDataType::UInt32,
@@ -104,12 +157,21 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8View, true))),
         "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
-        // Variant Binary Encoding: Struct with metadata and value binary fields
-        // Using BinaryView for compatibility with datafusion-variant/parquet-variant-compute
+        // Variant: declare the inner buffers as Binary to match
+        // `delta_kernel::unshredded_variant()`. delta-rs's kernel rejects
+        // schema mismatches at scan validation time even when no data
+        // files exist (e.g. fresh DELETE on an empty table). Both
+        // MemBuffer and Delta reads end up as Binary because:
+        //   - the parquet reader honors `schema_force_view_types=false`
+        //     (set in our session and in `delta_session_from` for DML);
+        //   - `convert_variant_columns` casts VariantArrayBuilder's
+        //     BinaryView output to Binary before MemBuffer ever sees it.
+        // The ExtensionType marker (`ARROW:extension:name = arrow.parquet.variant`)
+        // is added to the Field's metadata in `fields()` below.
         "Variant" => ArrowDataType::Struct(
             vec![
-                Arc::new(Field::new("metadata", ArrowDataType::BinaryView, false)),
-                Arc::new(Field::new("value", ArrowDataType::BinaryView, false)),
+                Arc::new(Field::new(VARIANT_METADATA_FIELD, ArrowDataType::Binary, false)),
+                Arc::new(Field::new(VARIANT_VALUE_FIELD, ArrowDataType::Binary, false)),
             ]
             .into(),
         ),
@@ -122,6 +184,7 @@ fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
     Ok(match s {
         "Utf8" => DeltaDataType::Primitive(String),
         "Date32" => DeltaDataType::Primitive(Date),
+        "Boolean" => DeltaDataType::Primitive(Boolean),
         "Int32" | "UInt32" => DeltaDataType::Primitive(Integer),
         "Int64" | "UInt64" => DeltaDataType::Primitive(Long),
         "List(Utf8)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(String), true))),
@@ -174,7 +237,15 @@ impl SchemaRegistry {
     }
 }
 
-// Global registry instance
+// Global registry instance.
+//
+// IMPORTANT: The registry is loaded once via `include_dir!` and `OnceLock`,
+// so schemas are immutable for the lifetime of the process. Several
+// downstream caches rely on this invariant for correctness (not just perf):
+//   - `optimizers::tantivy_rewriter::indexed_columns_for` (per-table tokenizer map)
+//   - `plan_cache::PlanCacheHook` (LogicalPlan embeds SchemaRef at parse time)
+// If hot-reload of YAML schemas is ever added, those caches must gain a
+// schema-version token in their key (or be flushed on reload).
 static SCHEMA_REGISTRY: OnceLock<SchemaRegistry> = OnceLock::new();
 
 pub fn registry() -> &'static SchemaRegistry {
@@ -191,18 +262,56 @@ pub fn get_default_schema() -> &'static TableSchema {
     registry().get_default().expect("No schemas available in registry")
 }
 
-/// Returns true if the given Arrow DataType represents a Variant type (Struct with metadata + value BinaryView fields)
+/// Inner field names of the unshredded Variant struct
+/// (`delta_kernel::unshredded_variant()`). Centralized here so any writer or
+/// validator that constructs a Variant struct uses the same names; if
+/// delta-kernel ever renames these, only this file changes.
+pub const VARIANT_METADATA_FIELD: &str = "metadata";
+pub const VARIANT_VALUE_FIELD: &str = "value";
+
+/// Returns true if the given Arrow DataType structurally matches a Variant
+/// (Struct with `metadata` + `value` binary/binaryview fields).
 pub fn is_variant_type(data_type: &ArrowDataType) -> bool {
     match data_type {
         ArrowDataType::Struct(fields) if fields.len() == 2 => {
-            fields.iter().any(|f| f.name() == "metadata" && matches!(f.data_type(), ArrowDataType::BinaryView))
-                && fields.iter().any(|f| f.name() == "value" && matches!(f.data_type(), ArrowDataType::BinaryView))
+            fields
+                .iter()
+                .any(|f| f.name() == VARIANT_METADATA_FIELD && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
+                && fields
+                    .iter()
+                    .any(|f| f.name() == VARIANT_VALUE_FIELD && matches!(f.data_type(), ArrowDataType::Binary | ArrowDataType::BinaryView))
         }
         _ => false,
     }
 }
 
-/// Get indices of Variant columns in a schema
-pub fn get_variant_column_indices(schema: &SchemaRef) -> Vec<usize> {
-    schema.fields().iter().enumerate().filter(|(_, f)| is_variant_type(f.data_type())).map(|(i, _)| i).collect()
+/// Replaces Variant fields with Utf8View on a schema. This is the schema we hand to the
+/// SQL planner via `TableProvider::schema()` whenever the table contains Variant columns.
+///
+/// Background: `INSERT INTO t (v) VALUES ('{"a":1}')` fails inside
+/// `LogicalPlanBuilder::values` because `arrow_cast::can_cast_types(Utf8, Struct{Binary,Binary})`
+/// is false. The check is hardcoded in datafusion-expr; there is no extension hook to
+/// register a Utf8→Variant coercion (datafusion exposes `ExprPlanner` for binary ops,
+/// field access, etc., but not for the values-type check). Patching arrow-cast or
+/// datafusion-expr is the only "fundamental" fix and is out of scope.
+///
+/// So we keep two views of the schema:
+/// - SQL-facing view (this function): Utf8View for variant cols → planner accepts JSON literals.
+/// - Storage view (`real_schema()`): the actual Struct{Binary, Binary} variant type.
+///
+/// `DataSink::write_all` converts inbound Utf8/Utf8View → Variant struct (via
+/// `parquet_variant_compute::VariantArrayBuilder`) before the Delta write.
+pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
+    let new_fields: Vec<FieldRef> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if is_variant_type(f.data_type()) {
+                Arc::new(Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable()))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    Arc::new(Schema::new(new_fields))
 }

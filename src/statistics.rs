@@ -1,30 +1,30 @@
+use std::{num::NonZeroUsize, sync::Arc};
+
 use anyhow::{Context, Result};
-use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::Statistics;
-use datafusion::common::stats::Precision;
+use datafusion::{
+    arrow::{array::Array, datatypes::SchemaRef},
+    common::{Statistics, stats::Precision},
+};
 use deltalake::DeltaTable;
 use lru::LruCache;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 /// Cache entry for basic table statistics
 #[derive(Clone, Debug)]
 pub struct CachedStatistics {
-    pub stats: Statistics,
+    pub stats:     Statistics,
     pub timestamp: std::time::Instant,
-    pub version: i64,
+    pub version:   u64,
 }
 
 /// Simplified statistics extractor for Delta Lake tables
 /// Only extracts basic row count and byte size statistics
 #[derive(Debug)]
 pub struct DeltaStatisticsExtractor {
-    cache: Arc<RwLock<LruCache<String, CachedStatistics>>>,
+    cache:             Arc<RwLock<LruCache<String, CachedStatistics>>>,
     cache_ttl_seconds: u64,
-    page_row_limit: usize,
+    page_row_limit:    usize,
 }
 
 impl DeltaStatisticsExtractor {
@@ -46,7 +46,7 @@ impl DeltaStatisticsExtractor {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.peek(&cache_key) {
                 let elapsed = cached.timestamp.elapsed().as_secs();
-                let current_version = table.version().unwrap_or(-1);
+                let current_version = table.version().unwrap_or(0);
 
                 if elapsed < self.cache_ttl_seconds && cached.version == current_version {
                     debug!("Statistics cache hit for {} (version {})", cache_key, current_version);
@@ -66,8 +66,8 @@ impl DeltaStatisticsExtractor {
 
         // Create basic statistics without column-level details
         let stats = Statistics {
-            num_rows: Precision::Inexact(num_rows as usize),
-            total_byte_size: Precision::Exact(total_byte_size as usize),
+            num_rows:          Precision::Inexact(num_rows as usize),
+            total_byte_size:   Precision::Exact(total_byte_size as usize),
             column_statistics: vec![], // No column statistics needed
         };
 
@@ -77,9 +77,9 @@ impl DeltaStatisticsExtractor {
             cache.put(
                 cache_key.clone(),
                 CachedStatistics {
-                    stats: stats.clone(),
+                    stats:     stats.clone(),
                     timestamp: std::time::Instant::now(),
-                    version: version.unwrap_or(0),
+                    version:   version.unwrap_or(0),
                 },
             );
         }

@@ -4,23 +4,27 @@
 
 #[cfg(test)]
 mod connection_pressure {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
     use anyhow::Result;
     use datafusion_postgres::ServerOptions;
     use dotenv::dotenv;
-    use rand::Rng;
+    use rand::RngExt;
     use serial_test::serial;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
     use timefusion::database::Database;
-    use tokio::sync::Notify;
-    use tokio::time::timeout;
+    use tokio::{sync::Notify, time::timeout};
     use tokio_postgres::NoTls;
     use uuid::Uuid;
 
     struct PressureTestServer {
-        port: u16,
-        test_id: String,
+        port:     u16,
+        test_id:  String,
         shutdown: Arc<Notify>,
     }
 

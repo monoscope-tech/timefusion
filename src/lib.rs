@@ -1,17 +1,25 @@
 #![recursion_limit = "512"]
 
+pub mod autotune;
 pub mod batch_queue;
 pub mod buffered_write_layer;
+pub mod clock;
 pub mod config;
 pub mod database;
 pub mod dml;
 pub mod functions;
+pub mod grpc_handlers;
+pub mod insert_coerce;
 pub mod mem_buffer;
+pub mod metrics;
 pub mod object_store_cache;
 pub mod optimizers;
 pub mod pgwire_handlers;
+pub mod plan_cache;
 pub mod schema_loader;
 pub mod statistics;
+pub mod stats_table;
+pub mod tantivy_index;
 pub mod telemetry;
 pub mod test_utils;
 pub mod wal;

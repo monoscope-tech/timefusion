@@ -1,9 +1,35 @@
 table_name: otel_logs_and_spans
 partitions:
+  - project_id
   - date
-sorting_columns: []
+# Hot paths: point lookup by (timestamp, id), and service_name queries within
+# a time range. Leading with `timestamp` keeps row-group min/max stats tight
+# for any timestamp-bound query; sorting by service_name next clusters rows
+# of the same service together within each row group, so service_name filters
+# inside a time range prune at the page level.
+sorting_columns:
+  - name: timestamp
+    descending: false
+    nulls_first: false
+  - name: resource___service___name
+    descending: false
+    nulls_first: false
+  - name: id
+    descending: false
+    nulls_first: false
+  - name: level
+    descending: false
+    nulls_first: false
+  - name: status_code
+    descending: false
+    nulls_first: false
+# Z-ORDER interleaves bits across all listed columns, so file-level min/max
+# stats become useful for each. Three dimensions trade a small amount of
+# per-dimension tightness for cross-dimensional file pruning — worth it when
+# service_name is also a frequent predicate.
 z_order_columns:
   - timestamp
+  - id
   - resource___service___name
 fields:
   - name: date
@@ -18,27 +44,35 @@ fields:
   - name: id
     data_type: Utf8
     nullable: false
+    bloom_filter: true
   - name: parent_id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: hashes
     data_type: "List(Utf8)"
-    nullable: false
+    nullable: true
   - name: name
     data_type: Utf8
     nullable: true
+    bloom_filter: true
+    tantivy: { indexed: true, tokenizer: ngram3 }
   - name: kind
     data_type: Utf8
     nullable: true
+    tantivy: { indexed: true, tokenizer: raw }
   - name: status_code
     data_type: Utf8
     nullable: true
+    tantivy: { indexed: true, tokenizer: raw }
   - name: status_message
     data_type: Utf8
     nullable: true
+    tantivy: { indexed: true, tokenizer: ngram3 }
   - name: level
     data_type: Utf8
     nullable: true
+    tantivy: { indexed: true, tokenizer: raw }
   - name: severity
     data_type: Variant
     nullable: true
@@ -51,6 +85,7 @@ fields:
   - name: body
     data_type: Variant
     nullable: true
+    tantivy: { indexed: true, tokenizer: ngram3, flatten: json }
   - name: duration
     data_type: Int64
     nullable: true
@@ -66,9 +101,11 @@ fields:
   - name: context___trace_id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: context___span_id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: context___trace_state
     data_type: Utf8
     nullable: true
@@ -76,7 +113,7 @@ fields:
     data_type: Utf8
     nullable: true
   - name: context___is_remote
-    data_type: Utf8
+    data_type: Boolean
     nullable: true
   - name: events
     data_type: Variant
@@ -84,9 +121,11 @@ fields:
   - name: links
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes
     data_type: Variant
     nullable: true
+    tantivy: { indexed: true, tokenizer: ngram3, flatten: kv }
   - name: attributes___client___address
     data_type: Utf8
     nullable: true
@@ -138,9 +177,11 @@ fields:
   - name: attributes___code___stacktrace
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___log__record___original
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___log__record___uid
     data_type: Utf8
     nullable: true
@@ -156,12 +197,14 @@ fields:
   - name: attributes___exception___stacktrace
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___url___fragment
     data_type: Utf8
     nullable: true
   - name: attributes___url___full
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___url___path
     data_type: Utf8
     nullable: true
@@ -192,6 +235,7 @@ fields:
   - name: attributes___session___id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: attributes___session___previous___id
     data_type: Utf8
     nullable: true
@@ -219,9 +263,11 @@ fields:
   - name: attributes___db___query___text
     data_type: Utf8
     nullable: true
+    dictionary: false
   - name: attributes___user___id
     data_type: Utf8
     nullable: true
+    bloom_filter: true
   - name: attributes___user___email
     data_type: Utf8
     nullable: true
@@ -263,16 +309,22 @@ fields:
     nullable: true
   - name: project_id
     data_type: Utf8
-    nullable: false
+    # Partition column. Declared nullable because delta-rs's per-file
+    # stats builder constructs a StructArray that nulls out partition
+    # columns (the value lives in the partition path, not the column),
+    # and a non-nullable declaration here makes every write fail with
+    # "Found unmasked nulls for non-nullable StructArray field project_id"
+    # before any data lands in Delta. The application contract (every row
+    # MUST have a project_id) is enforced at the routing layer, not in
+    # the schema.
+    nullable: true
   - name: summary
     data_type: "List(Utf8)"
     nullable: false
+    tantivy: { indexed: true, tokenizer: ngram3 }
   - name: errors
     data_type: Variant
     nullable: true
-  - name: log_pattern
-    data_type: Utf8
-    nullable: true
-  - name: summary_pattern
-    data_type: Utf8
+  - name: message_size_bytes
+    data_type: Int64
     nullable: true
