@@ -40,15 +40,10 @@ const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32];
 /// Arrow type (List/Struct/Variant/…) without the per-buffer bincode shuffle
 /// the older CompactBatch format required.
 ///
-/// Version byte must be > 2 to distinguish from legacy operation bytes
-/// (0=Insert, 1=Delete, 2=Update). We're at 131; older formats are intentionally
-/// unsupported — wipe the WAL directory if upgrading.
-///
-/// Bumps:
-///   130: Arrow IPC payload format.
-///   131: Walrus collection key uses deterministic FNV-1a instead of AHasher
-///        (AHasher's per-build seed silently stranded entries on upgrade).
-const WAL_VERSION: u8 = 131;
+/// Bump on any breaking change to the on-disk WAL format or the walrus key
+/// derivation. The startup version-stamp check refuses to open a directory
+/// written by a different version, so existing data must be wiped on bump.
+const WAL_VERSION: u8 = 1;
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 /// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
 const MAX_BATCH_SIZE: usize = 100 * 1024 * 1024;
@@ -278,13 +273,19 @@ impl WalManager {
         // data. AHasher::default() seeds itself per build, which would silently
         // strand entries after an upgrade. FNV-1a is deterministic, fast, and
         // 64-bit-wide (the only width walrus's 62-byte key budget needs).
-        use std::hash::{Hash, Hasher};
+        //
+        // Length-prefix each field so ("a:b","c") and ("a","b:c") (or any
+        // pair that would concatenate to the same bytes) hash distinctly.
+        // Don't rely on `str::hash`'s 0xff terminator for separation — that's
+        // a stdlib implementation detail, not a contract.
+        use std::hash::Hasher;
 
         use fnv::FnvHasher;
         let mut hasher = FnvHasher::default();
-        project_id.hash(&mut hasher);
-        ":".hash(&mut hasher); // separator so ("ab","c") and ("a","bc") don't collide
-        table_name.hash(&mut hasher);
+        hasher.write_u64(project_id.len() as u64);
+        hasher.write(project_id.as_bytes());
+        hasher.write_u64(table_name.len() as u64);
+        hasher.write(table_name.as_bytes());
         format!("{:016x}-{:02}", hasher.finish(), shard)
     }
 
@@ -716,13 +717,38 @@ mod tests {
 
     /// Stability anchor: `walrus_topic_key` must produce the same bytes across
     /// builds and library versions. A regression here silently strands WAL
-    /// entries on upgrade — see WAL_VERSION 131 bump rationale.
+    /// entries on upgrade — see WAL_VERSION 131/132 bump rationale.
     #[test]
     fn walrus_topic_key_is_stable() {
-        assert_eq!(WalManager::walrus_topic_key("project", "table", 0), "40df847bedad365d-00");
-        assert_eq!(WalManager::walrus_topic_key("p1", "otel_logs_and_spans", 3), "39ffdd9cbe44176d-03");
-        // Separator guard: ("ab","c") and ("a","bc") must produce different keys.
-        assert_ne!(WalManager::walrus_topic_key("ab", "c", 0), WalManager::walrus_topic_key("a", "bc", 0));
+        let k = WalManager::walrus_topic_key("project", "table", 0);
+        // 16-hex-char FNV-1a + "-00" suffix. Concrete value is pinned below;
+        // shape check first so a regression reports a useful diff.
+        assert_eq!(k.len(), 19, "key shape changed: {k}");
+        assert!(k.ends_with("-00"));
+        // Pinned values — update both lines together if the encoding changes,
+        // and bump WAL_VERSION + document in the const's Bumps section.
+        assert_eq!(WalManager::walrus_topic_key("project", "table", 0), "d8751a406eed3d9a-00");
+        assert_eq!(WalManager::walrus_topic_key("p1", "otel_logs_and_spans", 3), "ae0768bab343abd1-03");
+    }
+
+    /// Collision guards: distinct (project_id, table_name) tuples must map
+    /// to distinct walrus keys regardless of contents. Length-prefix
+    /// encoding makes this hold even when one input embeds the separator.
+    #[test]
+    fn walrus_topic_key_no_collisions() {
+        let pairs = [
+            (("ab", "c"), ("a", "bc")),   // boundary slide
+            (("a:b", "c"), ("a", "b:c")), // ':' inside an input — previously the failure mode
+            (("a", ""), ("", "a")),       // empty / non-empty swap
+            (("aa", ""), ("a", "a")),     // boundary slide with empty
+        ];
+        for ((p1, t1), (p2, t2)) in pairs {
+            assert_ne!(
+                WalManager::walrus_topic_key(p1, t1, 0),
+                WalManager::walrus_topic_key(p2, t2, 0),
+                "({p1:?},{t1:?}) and ({p2:?},{t2:?}) collide"
+            );
+        }
     }
 
     #[test]

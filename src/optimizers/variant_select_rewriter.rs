@@ -182,35 +182,49 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
                 Ok(LogicalPlan::Filter(f))
             }
             LogicalPlan::Projection(proj) => Ok(wrap_projection(proj)?),
-            // Union/Intersect/Except/Aggregate/Join at the root: Variant columns
-            // exit unwrapped to the wire. A correct fix needs branch-aware
-            // wrapping (e.g. wrap each Union arm's leaf projection). Today no
-            // built-in schema's wire-facing query shape produces these at the
-            // root; revisit if that changes. warn! when the output schema has
-            // any Variant column so this gap is visible in production traces.
-            other => {
-                let variant_cols: Vec<&str> = other
-                    .schema()
-                    .fields()
-                    .iter()
-                    .filter(|f| crate::schema_loader::is_variant_type(f.data_type()))
-                    .map(|f| f.name().as_str())
-                    .collect();
-                if !variant_cols.is_empty() {
-                    // Hard error rather than a warn: shipping raw Variant bytes over
-                    // pgwire is silent data corruption. The user must wrap each
-                    // branch's leaf projection with variant_to_json() explicitly.
-                    return Err(datafusion::error::DataFusionError::NotImplemented(format!(
-                        "Variant columns {:?} would exit the wire unwrapped at a {} root. Wrap each branch's projection with variant_to_json(<col>) explicitly, or restructure the query so the outermost node is a Projection / Sort / Limit / Distinct / SubqueryAlias / Filter.",
-                        variant_cols,
-                        other.display()
-                    )));
-                }
-                Ok(other)
-            }
+            // Union/Intersect/Except/Aggregate/Join/Window/etc. — anything we
+            // can't peel through. We don't descend (would need branch-aware
+            // rewriting that handles set ops, joins, aggregates differently),
+            // but we *can* wrap above: emit a top-level Projection that calls
+            // variant_to_json on each Variant-typed output column. Intermediate
+            // ops still see binary Variant; only the wire boundary converts.
+            other => add_root_variant_projection(other),
         }
     }
     peel(plan, 0)
+}
+
+/// Add a top-level Projection above `plan` that wraps every Variant-typed
+/// output column with `variant_to_json`. Used for plan shapes that can't be
+/// peeled into (Union/Aggregate/Join/Window/etc.) — the wrap is at the wire
+/// only, so intermediate ops still operate on binary Variant.
+///
+/// Non-Variant columns pass through as bare `Expr::Column` so DataFusion's
+/// schema accounting stays identical (same names, same qualifiers).
+fn add_root_variant_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let schema = plan.schema().clone();
+    let variant_cols: Vec<usize> = schema.fields().iter().enumerate().filter(|(_, f)| is_variant_type(f.data_type())).map(|(i, _)| i).collect();
+    if variant_cols.is_empty() {
+        return Ok(plan);
+    }
+    let variant_to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonUdf::default()));
+    let exprs: Vec<Expr> = schema
+        .iter()
+        .map(|(qualifier, field)| {
+            let col = Expr::Column(datafusion::common::Column::new(qualifier.cloned(), field.name().clone()));
+            if is_variant_type(field.data_type()) {
+                wrap_with_variant_to_json(&col, &variant_to_json).alias(field.name())
+            } else {
+                col
+            }
+        })
+        .collect();
+    debug!(
+        target: "variant_select_rewriter",
+        "added root Projection over un-peelable plan: wrapped {} Variant column(s)",
+        variant_cols.len()
+    );
+    Ok(LogicalPlan::Projection(Projection::try_new(exprs, Arc::new(plan))?))
 }
 
 fn wrap_projection(proj: Projection) -> Result<LogicalPlan> {
