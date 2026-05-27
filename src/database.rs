@@ -313,9 +313,18 @@ struct StorageConfig {
     s3_bucket:            String,
     s3_prefix:            String,
     s3_region:            String,
+    /// Skipped on serialize so credentials never leak through serde-based dumps
+    /// (debug endpoints, metrics serialization, etc.). sqlx::FromRow bypasses
+    /// serde so DB-row loading is unaffected.
+    #[serde(serialize_with = "redact_str")]
     s3_access_key_id:     String,
+    #[serde(serialize_with = "redact_str")]
     s3_secret_access_key: String,
     s3_endpoint:          Option<String>,
+}
+
+fn redact_str<S: serde::Serializer>(_: &str, ser: S) -> std::result::Result<S::Ok, S::Error> {
+    ser.serialize_str("[redacted]")
 }
 
 // Manual Debug — never let the AWS credentials land in a {:?} log line.
@@ -510,9 +519,10 @@ impl Database {
 
         let mut map = HashMap::new();
         for config in configs {
-            info!("Loaded config: {}/{}", config.project_id, config.table_name);
+            debug!("Loaded config: {}/{}", config.project_id, config.table_name);
             map.insert((config.project_id.clone(), config.table_name.clone()), config);
         }
+        info!("Loaded {} storage configs from timefusion_projects", map.len());
         Ok(map)
     }
 
