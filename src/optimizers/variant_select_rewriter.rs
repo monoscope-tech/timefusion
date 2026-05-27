@@ -35,10 +35,13 @@ use datafusion::{
     logical_expr::{Expr, ExprSchemable, LogicalPlan, Projection, TableScan, expr::ScalarFunction},
     optimizer::AnalyzerRule,
 };
-use datafusion_variant::VariantToJsonUdf;
 use tracing::{debug, warn};
 
-use crate::{database::ProjectRoutingTable, schema_loader::is_variant_type};
+use crate::{
+    database::ProjectRoutingTable,
+    functions::VariantToJsonExtUdf,
+    schema_loader::is_variant_type,
+};
 
 #[derive(Debug, Default)]
 pub struct VariantSelectRewriter;
@@ -57,10 +60,20 @@ impl AnalyzerRule for VariantSelectRewriter {
         if matches!(plan, LogicalPlan::Dml(_)) {
             return Ok(plan);
         }
-        // Pass 1: patch each TableScan's projected_schema so Variant columns
-        // carry the real Variant type, not Utf8View. Downstream operators
-        // (variant_get, jsonb_path_exists, ->, ->>) need the real type.
-        let patched = plan.transform_up(patch_table_scan).map(|t| t.data)?;
+        // Pass 1: bottom-up: patch each TableScan's projected_schema so
+        // Variant columns carry the real Variant type, then recompute every
+        // parent's cached DFSchema so the new type propagates up through
+        // intermediate Projections / Sorts / Filters. Without the per-node
+        // recompute, `wrap_projection`'s `is_variant_expr` check sees a
+        // stale Utf8View type from a parent's cached schema and skips
+        // wrapping (e.g. `ORDER BY x LIMIT n` introduces an outer
+        // Projection over a Sort whose schema must be re-derived).
+        let patched = plan
+            .transform_up(|node| {
+                let patched = patch_table_scan(node)?.data;
+                Ok(Transformed::yes(patched.recompute_schema()?))
+            })?
+            .data;
         // Pass 2: wrap Variant-typed projections at the topmost SELECT
         // projection with variant_to_json for the wire.
         wrap_root_projection(patched)
@@ -214,7 +227,7 @@ fn add_root_variant_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
     if variant_cols.is_empty() {
         return Ok(plan);
     }
-    let variant_to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonUdf::default()));
+    let variant_to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonExtUdf::default()));
     let exprs: Vec<Expr> = schema
         .iter()
         .map(|(qualifier, field)| {
@@ -236,7 +249,7 @@ fn add_root_variant_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
 
 fn wrap_projection(proj: Projection) -> Result<LogicalPlan> {
     let input_schema = proj.input.schema().clone();
-    let variant_to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonUdf::default()));
+    let variant_to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonExtUdf::default()));
     let mut wrapped = 0usize;
     let new_exprs: Vec<Expr> = proj
         .expr
@@ -263,7 +276,7 @@ fn is_variant_expr(expr: &Expr, schema: &DFSchema) -> bool {
     // by string name — renaming the UDF or registering another UDF with the
     // same name would otherwise silently break this check.
     if let Expr::ScalarFunction(sf) = expr
-        && sf.func.inner().as_any().is::<VariantToJsonUdf>()
+        && sf.func.inner().as_any().is::<VariantToJsonExtUdf>()
     {
         return false;
     }
@@ -331,7 +344,7 @@ mod peel_tests {
             Expr::Alias(a) => a.expr.as_ref(),
             other => other,
         };
-        matches!(inner, Expr::ScalarFunction(sf) if sf.func.inner().as_any().is::<VariantToJsonUdf>())
+        matches!(inner, Expr::ScalarFunction(sf) if sf.func.inner().as_any().is::<VariantToJsonExtUdf>())
     }
 
     fn first_projection_expr(plan: &LogicalPlan) -> &Expr {

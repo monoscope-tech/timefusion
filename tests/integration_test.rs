@@ -369,18 +369,12 @@ mod integration {
     ///   → pgwire (wire bytes are JSON text, not raw binary)
     /// Regression guard for PR's core contract.
     ///
-    /// TODO: currently panics in `variant_to_json` (UDF) with
-    /// "Extension type name missing" — the `ARROW:extension:name = arrow.parquet.variant`
-    /// marker that `patch_table_scan` sets on the LogicalPlan's Field metadata
-    /// isn't surviving the trip into the physical executor's per-row Field
-    /// passed to `try_field_as_variant_array`. Either upstream
-    /// `datafusion-variant` should use `try_extension_type` (not the
-    /// panicking variant) and accept Struct{Binary,Binary} by shape, or we
-    /// need a wrapper that re-injects the marker on the read side. Re-enable
-    /// after one of those lands.
+    /// The Variant extension marker is re-stamped at UDF entry by
+    /// `functions::VariantExtWrapper` because the marker that
+    /// `patch_table_scan` sets on the LogicalPlan's Field metadata is
+    /// stripped on its way to the physical executor's per-row Field.
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    #[ignore = "see TODO above — datafusion-variant requires extension marker on runtime Field"]
     async fn test_variant_column_round_trips_as_json() -> Result<()> {
         let server = TestServer::start().await?;
         let client = server.client().await?;
