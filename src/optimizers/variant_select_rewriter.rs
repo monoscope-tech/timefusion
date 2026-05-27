@@ -284,13 +284,7 @@ mod peel_tests {
         md.insert("ARROW:extension:name".to_string(), "arrow.parquet.variant".to_string());
         Field::new(
             name,
-            DataType::Struct(
-                vec![
-                    Arc::new(Field::new("metadata", DataType::Binary, false)),
-                    Arc::new(Field::new("value", DataType::Binary, false)),
-                ]
-                .into(),
-            ),
+            DataType::Struct(vec![Arc::new(Field::new("metadata", DataType::Binary, false)), Arc::new(Field::new("value", DataType::Binary, false))].into()),
             true,
         )
         .with_metadata(md)
@@ -301,7 +295,7 @@ mod peel_tests {
         let df = Arc::new(DFSchema::try_from(schema).unwrap());
         let empty = LogicalPlan::EmptyRelation(EmptyRelation {
             produce_one_row: false,
-            schema: df,
+            schema:          df,
         });
         LogicalPlanBuilder::from(empty).project(vec![col("v")]).unwrap().build().unwrap()
     }
@@ -373,13 +367,23 @@ mod peel_tests {
 
     #[test]
     fn max_peel_short_circuits_on_pathological_depth() {
-        // > MAX_PEEL nested SubqueryAlias should skip wrapping rather than recurse
-        // and stack-overflow. The inner Projection remains unwrapped.
-        let mut plan = variant_projection();
-        for i in 0..300 {
-            plan = LogicalPlanBuilder::from(plan).alias(format!("a{i}")).unwrap().build().unwrap();
-        }
-        let out = analyze(plan);
-        assert!(!is_variant_to_json_call(first_projection_expr(&out)));
+        // > MAX_PEEL nested SubqueryAlias should make peel() bail rather than
+        // recurse forever. DataFusion's own transform_up walk over a 300-deep
+        // plan blows the default 2 MiB test stack, so we run the whole thing
+        // on a larger thread — that itself is the assertion that peel()'s
+        // depth guard is doing useful work alongside transform_up's recursion.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let mut plan = variant_projection();
+                for i in 0..300 {
+                    plan = LogicalPlanBuilder::from(plan).alias(format!("a{i}")).unwrap().build().unwrap();
+                }
+                let out = analyze(plan);
+                assert!(!is_variant_to_json_call(first_projection_expr(&out)));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
