@@ -25,7 +25,9 @@ regex = "1.11.1"
 # our fork carries the write_data_plan normalization for issue #40
 # ("Expected Struct(Binary), got Struct(BinaryView)" on DELETE/UPDATE).
 # Rebase the branch onto upstream main when picking up newer revs.
-deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", branch = "timefusion-variant-dml", features = [
+# Pinned to a SHA, not the branch tip, so `cargo update` can't silently pull
+# breaking changes from the fork. Bump explicitly when rebasing on upstream.
+deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "005b9ebf6262cd192501c29be3bb9df62acfa2f7", features = [
   "datafusion",
   "s3",
 ] }
@@ -50,6 +52,7 @@ datafusion-functions-json = "0.53"
 anyhow = "1.0.100"
 subtle = "2"
 fastrand = "2"
+fnv = "1"
 tokio-util = "0.7.17"
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
