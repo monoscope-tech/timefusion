@@ -273,30 +273,22 @@ fn convert_timezone(timestamp_array: &ArrayRef, tz_str: &str) -> datafusion::err
 
     // Handle microsecond timestamps (which is what we're using)
     if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
-        let mut values = Vec::with_capacity(timestamps.len());
-        let mut nulls = Vec::with_capacity(timestamps.len());
+        // Builder preserves null bitmap; return type is Timestamp(µs, None) so don't attach a tz.
+        let mut builder = TimestampMicrosecondArray::builder(timestamps.len());
 
         for i in 0..timestamps.len() {
             if timestamps.is_null(i) {
-                values.push(0);
-                nulls.push(false);
+                builder.append_null();
             } else {
                 let timestamp_us = timestamps.value(i);
                 let datetime =
                     DateTime::<Utc>::from_timestamp_micros(timestamp_us).ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))?;
-
-                // Convert to target timezone (keeping the same instant in time)
                 let converted = datetime.with_timezone(&tz);
-
-                // Convert back to UTC timestamp for storage
-                values.push(converted.timestamp_micros());
-                nulls.push(true);
+                builder.append_value(converted.timestamp_micros());
             }
         }
 
-        // Create array without timezone annotation (matches return_type which returns None)
-        let array = TimestampMicrosecondArray::from(values);
-        Ok(Arc::new(array))
+        Ok(Arc::new(builder.finish()))
     } else if let Some(timestamps) = timestamp_array.as_any().downcast_ref::<TimestampNanosecondArray>() {
         let mut builder = TimestampNanosecondArray::builder(timestamps.len());
 
