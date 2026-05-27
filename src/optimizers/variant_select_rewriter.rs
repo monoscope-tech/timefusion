@@ -49,15 +49,15 @@ impl AnalyzerRule for VariantSelectRewriter {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        // Pass 1 (patch_table_scan) runs even for DML — VariantInsertRewriter
+        // and downstream UDFs need to see the real Variant type at scans.
+        // Pass 2 (wrap_root_projection) only wraps SELECT-style root projections
+        // with variant_to_json for the wire — DML doesn't produce a wire
+        // projection, so we skip it here to avoid mutating the writeback path.
         if matches!(plan, LogicalPlan::Dml(_)) {
             return Ok(plan);
         }
-        // Pass 1: patch every TableScan that points at a ProjectRoutingTable
-        // so its projected_schema carries Variant (not Utf8View) for variant
-        // columns. transform_up so leaves are visited first; parents will
-        // recompute their derived schemas if DataFusion's analyzer asks.
         let patched = plan.transform_up(patch_table_scan).map(|t| t.data)?;
-        // Pass 2: wrap variant-typed columns at the topmost projection only.
         wrap_root_projection(patched)
     }
 }

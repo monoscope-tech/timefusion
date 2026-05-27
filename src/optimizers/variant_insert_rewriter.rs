@@ -88,14 +88,17 @@ fn rewrite_insert_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 /// valid for that single plan. Recursing into nested projections with the same
 /// indices would mis-wrap unrelated columns whose positions happen to align.
 fn rewrite_input_for_variant(input: &LogicalPlan, variant_indices: &[usize]) -> Result<Option<LogicalPlan>> {
+    // Membership tests in the row/expr loops below were Vec::contains (O(n)) —
+    // O(rows × cols × variant_cols) overall. Hoist into a HashSet once.
+    let variant_set: std::collections::HashSet<usize> = variant_indices.iter().copied().collect();
     match input {
-        LogicalPlan::Values(values) => rewrite_values_for_variant(values, variant_indices),
-        LogicalPlan::Projection(proj) => rewrite_projection_for_variant(proj, variant_indices),
+        LogicalPlan::Values(values) => rewrite_values_for_variant(values, &variant_set),
+        LogicalPlan::Projection(proj) => rewrite_projection_for_variant(proj, &variant_set),
         _ => Ok(None),
     }
 }
 
-fn rewrite_values_for_variant(values: &Values, variant_indices: &[usize]) -> Result<Option<LogicalPlan>> {
+fn rewrite_values_for_variant(values: &Values, variant_indices: &std::collections::HashSet<usize>) -> Result<Option<LogicalPlan>> {
     let json_to_variant_udf = Arc::new(datafusion::logical_expr::ScalarUDF::from(JsonToVariantUdf::default()));
     let mut modified = false;
 
@@ -107,6 +110,7 @@ fn rewrite_values_for_variant(values: &Values, variant_indices: &[usize]) -> Res
                 .enumerate()
                 .map(|(idx, expr)| {
                     if variant_indices.contains(&idx) && is_utf8_expr(expr) {
+                        // (HashSet::contains: O(1))
                         modified = true;
                         wrap_with_json_to_variant(expr, &json_to_variant_udf)
                     } else {
@@ -127,7 +131,7 @@ fn rewrite_values_for_variant(values: &Values, variant_indices: &[usize]) -> Res
     }
 }
 
-fn rewrite_projection_for_variant(proj: &Projection, variant_indices: &[usize]) -> Result<Option<LogicalPlan>> {
+fn rewrite_projection_for_variant(proj: &Projection, variant_indices: &std::collections::HashSet<usize>) -> Result<Option<LogicalPlan>> {
     let json_to_variant_udf = Arc::new(datafusion::logical_expr::ScalarUDF::from(JsonToVariantUdf::default()));
     let mut modified = false;
 
