@@ -571,17 +571,14 @@ where
         .await
         .map_err(|e| DataFusionError::Execution(format!("Table not found: {} for project {}: {}", table_name, project_id, e)))?;
 
-    let mut delta_table = table_lock.write().await;
-    // Refresh snapshot so DML sees the latest committed version
-    delta_table
-        .update_state()
-        .await
-        .map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
-    let (new_table, rows_affected) = operation(delta_table.clone()).await?;
-
-    drop(delta_table);
-    *table_lock.write().await = new_table;
-
+    // Hold the write lock continuously across update_state → operation → snapshot
+    // swap. Releasing between operation and the second write opened a TOCTOU window
+    // where a concurrent DELETE/UPDATE could commit a new version that we'd then
+    // overwrite with the stale snapshot from the closure's clone.
+    let mut guard = table_lock.write().await;
+    guard.update_state().await.map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
+    let (new_table, rows_affected) = operation(guard.clone()).await?;
+    *guard = new_table;
     Ok(rows_affected)
 }
 
