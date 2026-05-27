@@ -36,8 +36,11 @@ use crate::{
 // 1.5x value was an unmeasured guess that wasted ~23% of the configured
 // `max_memory_mb` budget.
 const MEMORY_OVERHEAD_MULTIPLIER: f64 = 1.15;
-/// Hard limit multiplier (120%) provides headroom for in-flight writes while preventing OOM
-const HARD_LIMIT_MULTIPLIER: usize = 5; // max_bytes + max_bytes/5 = 120%
+/// Hard limit = `max_bytes + max_bytes / HARD_LIMIT_HEADROOM_DIVISOR` →
+/// 120% of the configured budget, leaving headroom for in-flight writes
+/// while preventing unbounded growth. Named "divisor" (not "multiplier")
+/// because the math is `/ N`; `5` → +20%.
+const HARD_LIMIT_HEADROOM_DIVISOR: usize = 5;
 /// Maximum CAS retry attempts before failing
 const MAX_CAS_RETRIES: u32 = 100;
 /// Base backoff delay in microseconds for CAS retries
@@ -276,7 +279,7 @@ impl BufferedWriteLayer {
         let estimated_size = (batch_size as f64 * MEMORY_OVERHEAD_MULTIPLIER) as usize;
 
         let max_bytes = self.max_memory_bytes();
-        let hard_limit = max_bytes.saturating_add(max_bytes / HARD_LIMIT_MULTIPLIER);
+        let hard_limit = max_bytes.saturating_add(max_bytes / HARD_LIMIT_HEADROOM_DIVISOR);
 
         for attempt in 0..MAX_CAS_RETRIES {
             let current_reserved = self.reserved_bytes.load(Ordering::Acquire);
