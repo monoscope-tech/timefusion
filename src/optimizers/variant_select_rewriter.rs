@@ -78,9 +78,16 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let Some(routing) = default_src.table_provider.as_any().downcast_ref::<ProjectRoutingTable>() else {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
     };
-    // Fast path: the lying schema only differs from the real one for
-    // Variant columns (which appear as Utf8View). If no Utf8View columns
-    // are projected, there's nothing to patch — avoid the HashMap+clones.
+    // Fast path: if no Utf8View columns are projected, there can be no
+    // Variant columns to un-lie about — bail before the HashMap+clones.
+    //
+    // Note: this is an over-approximation. A scan that projects a genuine
+    // (non-Variant) Utf8View column alongside zero Variant columns will
+    // still fall through to the full pass below; the `changed` flag at
+    // line ~106 then returns `Transformed::no` and the only cost is the
+    // wasted HashMap build. Tightening this to "any Utf8View column has a
+    // Variant counterpart in real_schema" would require a second pass over
+    // `real`, which isn't worth it for the common case (Variant scans).
     let lying_schema = scan.projected_schema.as_arrow();
     use datafusion::arrow::datatypes::DataType;
     if !lying_schema.fields().iter().any(|f| matches!(f.data_type(), DataType::Utf8View)) {
