@@ -18,7 +18,7 @@
 //! by sqlparser AFTER its own normalization, so `INSERT INTO t VALUES ($1)`
 //! and `insert into t values ($1)` collapse to one entry.
 
-use std::{num::NonZeroUsize, sync::Mutex};
+use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
 use datafusion::{
@@ -34,6 +34,7 @@ use datafusion_postgres::{
     },
 };
 use lru::LruCache;
+use parking_lot::Mutex;
 use tracing::debug;
 
 const DEFAULT_PLAN_CACHE_CAPACITY: usize = 256;
@@ -112,9 +113,8 @@ impl QueryHook for PlanCacheHook {
             return None;
         }
 
-        if let Ok(mut guard) = self.cache.lock()
-            && let Some(plan) = guard.get(&canonical)
-        {
+        // parking_lot::Mutex never poisons → no Result wrapper.
+        if let Some(plan) = self.cache.lock().get(&canonical) {
             self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             debug!(target: "plan_cache", "hit: {}", canonical);
             return Some(Ok(plan.clone()));
@@ -132,9 +132,7 @@ impl QueryHook for PlanCacheHook {
         // inference returns the right type per placeholder (otherwise row-1
         // types leak across to row-2+ placeholders by position).
         let plan = crate::insert_coerce::rewrite_plan(plan);
-        if let Ok(mut guard) = self.cache.lock() {
-            guard.put(canonical, plan.clone());
-        }
+        self.cache.lock().put(canonical, plan.clone());
         Some(Ok(plan))
     }
 
