@@ -61,9 +61,14 @@ pub mod time_range_partition_pruner {
 ///
 /// Walks the same shapes `ProjectIdPushdown::contains_project_id` recognises:
 /// `project_id = 'x'` (either arg order, Utf8 / Utf8View) and through `AND`
-/// / `NOT` parents. Returns the first match. Used by both the SELECT-side
-/// router (`ProjectRoutingTable`) and DML extractor (`extract_dml_info` in
+/// parents. Returns the first match. Used by both the SELECT-side router
+/// (`ProjectRoutingTable`) and DML extractor (`extract_dml_info` in
 /// `dml.rs`); keep them in sync by always going through this function.
+///
+/// `NOT` is intentionally not walked into: `NOT project_id = 'x'` excludes
+/// that project rather than selecting it, so returning it as the routing
+/// target would route to the wrong tenant. Matching the conservative
+/// `contains_project_id` shape ensures both helpers agree.
 pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
     use datafusion::common::ScalarValue;
     match expr {
@@ -79,7 +84,6 @@ pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
             op: Operator::And,
             right,
         }) => extract_project_id_from_expr(left).or_else(|| extract_project_id_from_expr(right)),
-        Expr::Not(inner) => extract_project_id_from_expr(inner),
         _ => None,
     }
 }
