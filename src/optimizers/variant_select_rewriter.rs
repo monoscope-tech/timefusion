@@ -161,6 +161,11 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
                 Ok(LogicalPlan::SubqueryAlias(s))
             }
             LogicalPlan::Projection(proj) => Ok(wrap_projection(proj)?),
+            // Union/Intersect/Except/Aggregate/Join at the root: Variant columns
+            // exit unwrapped to the wire. A correct fix needs branch-aware
+            // wrapping (e.g. wrap each Union arm's leaf projection). Today no
+            // built-in schema's wire-facing query shape produces these at the
+            // root; revisit if that changes.
             other => Ok(other),
         }
     }

@@ -272,6 +272,11 @@ fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: bool)
 /// if the literal contains anything outside our allowlist we leave the
 /// predicate alone (the original `=` / `LIKE` still applies — correctness
 /// preserved).
+///
+/// Note: space is treated by the QueryParser as an implicit `AND` between
+/// terms, so `'foo bar'` matches docs containing both `foo` and `bar`, not
+/// the phrase. Acceptable here because `text_match` is additive — the
+/// original `=` / `LIKE` re-filters as the correctness backstop.
 fn is_tantivy_safe_term_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '/' | '@')
 }
@@ -318,6 +323,12 @@ fn find_indexed_table(plan: &LogicalPlan) -> Option<String> {
 /// Indexed columns for a table from the static schema registry — keyed by
 /// column name, value is the resolved tokenizer (raw/default/ngram3).
 /// Returns `None` when the table isn't in the registry.
+///
+/// The cache is populated *once* on first call. This is safe because
+/// `schema_loader::registry()` is compiled-in YAML and immutable. If we ever
+/// add runtime/hot-reload of schemas, this OnceLock must be replaced with an
+/// invalidatable structure — newly-added Tantivy-indexed tables would
+/// otherwise silently never accelerate.
 fn indexed_columns_for(table: &str) -> Option<HashMap<String, &'static str>> {
     static CACHE: OnceLock<HashMap<String, HashMap<String, &'static str>>> = OnceLock::new();
     let map = CACHE.get_or_init(|| {

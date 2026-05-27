@@ -59,6 +59,20 @@ pub async fn get_unified_delta_table(unified_tables: &UnifiedTables, table_name:
     unified_tables.read().await.get(table_name).cloned()
 }
 
+/// Should `resolve_*_table` call `update_state()` on the cached snapshot?
+/// Refresh when this process knows the snapshot is behind (last_written ahead
+/// of current) *or* when this process hasn't written but something else (e.g.
+/// the buffered_write_layer's background flusher) may have committed. The
+/// `(Some(_), None) => false` shortcut once tempted us — it broke buffer→Delta
+/// visibility — so the bias is toward refreshing more often, not less.
+fn should_refresh_table(current_version: Option<u64>, last_written_version: Option<u64>) -> bool {
+    match (current_version, last_written_version) {
+        (Some(current), Some(last)) => current < last,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     use datafusion::arrow::array::{StringArray, StringViewArray};
@@ -185,13 +199,22 @@ fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
             && is_utc_offset(tz.as_ref())
         {
             let col = &batch.columns()[i];
-            // Downcasts are guarded by the `DataType::Timestamp(unit, ..)` match above.
-            let expect_msg = "timestamp downcast guarded by DataType match";
+            // Downcasts are guarded by the outer `DataType::Timestamp(unit, ..)` match,
+            // but Arrow's trait-object dispatch isn't an unsafe-level guarantee — return
+            // an error rather than panic on the INSERT path if a future Arrow version
+            // diverges.
+            let bad = |w| DataFusionError::Execution(format!("timestamp downcast failed for field '{}' with width {w}", field.name()));
             let retagged: Arc<dyn arrow::array::Array> = match unit {
-                TimeUnit::Microsecond => Arc::new(col.as_any().downcast_ref::<TimestampMicrosecondArray>().expect(expect_msg).clone().with_timezone("UTC")),
-                TimeUnit::Millisecond => Arc::new(col.as_any().downcast_ref::<TimestampMillisecondArray>().expect(expect_msg).clone().with_timezone("UTC")),
-                TimeUnit::Nanosecond => Arc::new(col.as_any().downcast_ref::<TimestampNanosecondArray>().expect(expect_msg).clone().with_timezone("UTC")),
-                TimeUnit::Second => Arc::new(col.as_any().downcast_ref::<TimestampSecondArray>().expect(expect_msg).clone().with_timezone("UTC")),
+                TimeUnit::Microsecond => {
+                    Arc::new(col.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| bad("Microsecond"))?.clone().with_timezone("UTC"))
+                }
+                TimeUnit::Millisecond => {
+                    Arc::new(col.as_any().downcast_ref::<TimestampMillisecondArray>().ok_or_else(|| bad("Millisecond"))?.clone().with_timezone("UTC"))
+                }
+                TimeUnit::Nanosecond => {
+                    Arc::new(col.as_any().downcast_ref::<TimestampNanosecondArray>().ok_or_else(|| bad("Nanosecond"))?.clone().with_timezone("UTC"))
+                }
+                TimeUnit::Second => Arc::new(col.as_any().downcast_ref::<TimestampSecondArray>().ok_or_else(|| bad("Second"))?.clone().with_timezone("UTC")),
             };
             new_cols[i] = retagged;
             new_fields[i] =
@@ -1221,16 +1244,7 @@ impl Database {
                 };
 
                 let current_version = table.read().await.version();
-                // Refresh when we know we're behind, or when this process
-                // hasn't directly written but a background flusher (buffered
-                // layer) might have committed new versions. Setting the
-                // `(Some(_), None) => false` shortcut here silently broke
-                // buffer→Delta visibility for the next read.
-                let should_update = match (current_version, last_written_version) {
-                    (Some(current), Some(last)) => current < last,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
+                let should_update = should_refresh_table(current_version, last_written_version);
 
                 if should_update {
                     self.update_table(table, "", table_name)
@@ -1261,16 +1275,7 @@ impl Database {
                 };
 
                 let current_version = table.read().await.version();
-                // Refresh when we know we're behind, or when this process
-                // hasn't directly written but a background flusher (buffered
-                // layer) might have committed new versions. Setting the
-                // `(Some(_), None) => false` shortcut here silently broke
-                // buffer→Delta visibility for the next read.
-                let should_update = match (current_version, last_written_version) {
-                    (Some(current), Some(last)) => current < last,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
+                let should_update = should_refresh_table(current_version, last_written_version);
 
                 if should_update {
                     self.update_table(table, project_id, table_name)
@@ -1641,10 +1646,18 @@ impl Database {
         // out and data piles up in MemBuffer.
         let batches: Vec<RecordBatch> = batches.into_iter().map(normalize_timestamp_tz).collect::<DFResult<Vec<_>>>()?;
 
-        // Extract project_id from first batch if not provided
+        // Extract project_id from first batch if not provided. If neither the
+        // caller nor the data carries one, log loudly and bucket under
+        // "default" — silently misrouting writes is the worst outcome, but
+        // returning an error would break callers that already rely on the
+        // legacy fallback.
         let project_id = if project_id.is_empty() && !batches.is_empty() {
-            extract_project_id(&batches[0]).unwrap_or_else(|| "default".to_string())
+            extract_project_id(&batches[0]).unwrap_or_else(|| {
+                warn!("insert_records_batch: empty project_id and batch has no project_id column → bucketing under 'default'");
+                "default".to_string()
+            })
         } else if project_id.is_empty() {
+            warn!("insert_records_batch: empty project_id and no batches → bucketing under 'default'");
             "default".to_string()
         } else {
             project_id.to_string()
