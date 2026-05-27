@@ -168,6 +168,14 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
                 s.input = Arc::new(peel(inner, d)?);
                 Ok(LogicalPlan::SubqueryAlias(s))
             }
+            LogicalPlan::Filter(mut f) => {
+                // Some DataFusion rewrite passes promote a Filter above the
+                // outermost Projection. Peel through it so Variant columns
+                // still reach the wire wrapped, not as raw binary.
+                let inner = Arc::unwrap_or_clone(f.input);
+                f.input = Arc::new(peel(inner, d)?);
+                Ok(LogicalPlan::Filter(f))
+            }
             LogicalPlan::Projection(proj) => Ok(wrap_projection(proj)?),
             // Union/Intersect/Except/Aggregate/Join at the root: Variant columns
             // exit unwrapped to the wire. A correct fix needs branch-aware
@@ -188,7 +196,7 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
                         target: "variant_select_rewriter",
                         root_node = %other.display(),
                         columns = ?variant_cols,
-                        "Variant columns exit the wire unwrapped (raw binary) — peel() can't reach a Projection through this node (Union/Aggregate/Join etc.). Wrap inputs explicitly with variant_to_json() or open a follow-up.",
+                        "RAW BINARY VARIANT ON THE WIRE: peel() couldn't reach a Projection through this root node (Union/Intersect/Except/Aggregate/Join/etc.). The pgwire client will receive undecodable bytes. Wrap inputs explicitly with variant_to_json() or restructure the query.",
                     );
                 }
                 Ok(other)
