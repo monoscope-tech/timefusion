@@ -165,8 +165,14 @@ fn wrap_root_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
             // exit unwrapped to the wire. A correct fix needs branch-aware
             // wrapping (e.g. wrap each Union arm's leaf projection). Today no
             // built-in schema's wire-facing query shape produces these at the
-            // root; revisit if that changes.
-            other => Ok(other),
+            // root; revisit if that changes. warn! when the output schema has
+            // any Variant column so this gap is visible in production traces.
+            other => {
+                if other.schema().fields().iter().any(|f| crate::schema_loader::is_variant_type(f.data_type())) {
+                    log::warn!(target: "variant_select_rewriter", "Variant column exits the wire unwrapped: root is {} — see comment in variant_select_rewriter::peel", other.display());
+                }
+                Ok(other)
+            }
         }
     }
     peel(plan, 0)

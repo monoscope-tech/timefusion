@@ -333,9 +333,10 @@ impl WalManager {
                         Ok(entry) if entry.timestamp_micros >= cutoff => results.push(entry),
                         Ok(_) => {} // Skip old entries
                         Err(e @ WalError::UnsupportedVersion { .. }) => {
-                            warn!(
-                                "WAL on-disk version mismatch on shard {} ({e}); wipe \
-                                 ${{TIMEFUSION_DATA_DIR}}/wal or run the matching binary version",
+                            error!(
+                                "WAL on-disk version mismatch on shard {} ({e}); IN-FLIGHT DATA WILL BE LOST. \
+                                 Wipe ${{TIMEFUSION_DATA_DIR}}/wal to start fresh, or roll back to a binary \
+                                 that wrote the existing entries.",
                                 shard
                             );
                             error_count += 1;
@@ -438,9 +439,10 @@ impl WalManager {
                     Ok(entry) if entry.timestamp_micros >= cutoff => return Some(entry),
                     Ok(_) => continue, // drop pre-cutoff
                     Err(e @ WalError::UnsupportedVersion { .. }) => {
-                        warn!(
-                            "WAL on-disk version mismatch on shard {} ({e}); wipe \
-                             ${{TIMEFUSION_DATA_DIR}}/wal or run the matching binary version",
+                        error!(
+                            "WAL on-disk version mismatch on shard {} ({e}); IN-FLIGHT DATA WILL BE LOST. \
+                             Wipe ${{TIMEFUSION_DATA_DIR}}/wal to start fresh, or roll back to a binary \
+                             that wrote the existing entries.",
                             key
                         );
                         *errors += 1;
@@ -652,6 +654,17 @@ mod tests {
         let serialized_none = bincode::encode_to_vec(&payload_none, BINCODE_CONFIG).unwrap();
         let deserialized_none = deserialize_delete_payload(&serialized_none).unwrap();
         assert_eq!(payload_none.predicate_sql, deserialized_none.predicate_sql);
+    }
+
+    /// Stability anchor: `walrus_topic_key` must produce the same bytes across
+    /// builds and library versions. A regression here silently strands WAL
+    /// entries on upgrade — see WAL_VERSION 131 bump rationale.
+    #[test]
+    fn walrus_topic_key_is_stable() {
+        assert_eq!(WalManager::walrus_topic_key("project", "table", 0), "40df847bedad365d-00");
+        assert_eq!(WalManager::walrus_topic_key("p1", "otel_logs_and_spans", 3), "39ffdd9cbe44176d-03");
+        // Separator guard: ("ab","c") and ("a","bc") must produce different keys.
+        assert_ne!(WalManager::walrus_topic_key("ab", "c", 0), WalManager::walrus_topic_key("a", "bc", 0));
     }
 
     #[test]

@@ -94,7 +94,18 @@ fn rewrite_input_for_variant(input: &LogicalPlan, variant_indices: &[usize]) -> 
     match input {
         LogicalPlan::Values(values) => rewrite_values_for_variant(values, &variant_set),
         LogicalPlan::Projection(proj) => rewrite_projection_for_variant(proj, &variant_set),
-        _ => Ok(None),
+        // Shapes like `INSERT … SELECT col FROM staging` (TableScan, Filter, etc.)
+        // don't currently get json_to_variant wrapping — the writer will hit a
+        // type-mismatch when staging.col is Utf8. warn! so the limitation is
+        // visible rather than silent.
+        other => {
+            log::warn!(
+                target: "variant_insert_rewriter",
+                "INSERT input is {} (not Values/Projection); json_to_variant wrapping is skipped — Variant column writes from this source may fail at write time",
+                other.display()
+            );
+            Ok(None)
+        }
     }
 }
 
