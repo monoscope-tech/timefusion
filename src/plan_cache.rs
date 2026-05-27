@@ -90,20 +90,24 @@ impl PlanCacheHook {
         (self.hits.load(Relaxed), self.misses.load(Relaxed))
     }
 
-    /// Only cache INSERTs and SELECTs that have at least one placeholder.
-    /// Without a placeholder, the canonical text contains literal values
-    /// (timestamps, UUIDs, etc.) which would never recur — caching that
-    /// just pollutes the LRU and increases lock contention.
-    fn cacheable(stmt: &Statement, sql: &str) -> bool {
-        // Cheap heuristic: only consider DML statement kinds and require an
-        // actual placeholder ($N) in the source text. Naive `contains('$')`
-        // would false-positive on dollar-quoted literals like '$100' and cache
-        // statements with embedded literal values, polluting the LRU.
-        let has_placeholder = sql.as_bytes().windows(2).any(|w| w[0] == b'$' && w[1].is_ascii_digit());
+    /// Cheap pre-check on the AST kind. Skipping non-DML before paying for
+    /// `Statement::to_string()` avoids serializing the AST on every Parse
+    /// message regardless of cacheability.
+    fn kind_is_cacheable(stmt: &Statement) -> bool {
         matches!(
             stmt,
             Statement::Insert(_) | Statement::Query(_) | Statement::Update { .. } | Statement::Delete(_)
-        ) && has_placeholder
+        )
+    }
+
+    /// Only cache statements with at least one placeholder. Without a
+    /// placeholder, the canonical text contains literal values (timestamps,
+    /// UUIDs, etc.) which would never recur — caching that just pollutes the
+    /// LRU and increases lock contention.
+    fn has_placeholder(sql: &str) -> bool {
+        // Naive `contains('$')` would false-positive on dollar-quoted literals
+        // like '$100' and cache statements with embedded literal values.
+        sql.as_bytes().windows(2).any(|w| w[0] == b'$' && w[1].is_ascii_digit())
     }
 }
 
@@ -118,8 +122,13 @@ impl QueryHook for PlanCacheHook {
     async fn handle_extended_parse_query(
         &self, statement: &Statement, session_context: &SessionContext, _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
+        // Cheap AST-variant check first; only then pay for to_string() and
+        // the placeholder scan.
+        if !Self::kind_is_cacheable(statement) {
+            return None;
+        }
         let canonical = statement.to_string();
-        if !Self::cacheable(statement, &canonical) {
+        if !Self::has_placeholder(&canonical) {
             return None;
         }
 

@@ -119,6 +119,34 @@ and the tantivy GC drops the dead entries.
 
 ---
 
+## WAL format upgrades
+
+The WAL header carries a version byte. When the binary's `WAL_VERSION`
+changes (currently `131`), entries written by an older build are
+unreadable by the new build — recovery emits an `error!` log
+("WAL on-disk version mismatch on shard … IN-FLIGHT DATA WILL BE LOST"),
+the entries are skipped, and any rows that hadn't yet flushed to Delta
+are dropped on the floor.
+
+Procedure for a WAL-incompatible upgrade:
+
+1. **Drain.** Stop ingest at the load balancer / client side.
+2. **Wait for flush.** Watch `oldest_bucket_age_seconds` and the WAL
+   directory size. Once buckets stop turning over and pending entries
+   reach 0, all in-flight writes are durable in Delta.
+3. **Stop the service** (graceful shutdown — `SIGTERM`).
+4. **Back up the WAL directory** (`${TIMEFUSION_DATA_DIR}/wal`) — small,
+   cheap insurance against a botched migration.
+5. **Wipe the WAL directory.** `rm -rf ${TIMEFUSION_DATA_DIR}/wal/*`.
+6. **Deploy the new binary and restart.** Recovery scans an empty
+   directory cleanly; first writes start a fresh WAL at the new version.
+
+Rolling back from a newer version to an older one needs the inverse:
+the old binary can't read the new format either. Always back up before
+upgrading.
+
+---
+
 ## Monitoring
 
 All metrics export via OTel to `OTEL_EXPORTER_OTLP_ENDPOINT`. Page-level

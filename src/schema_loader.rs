@@ -237,7 +237,15 @@ impl SchemaRegistry {
     }
 }
 
-// Global registry instance
+// Global registry instance.
+//
+// IMPORTANT: The registry is loaded once via `include_dir!` and `OnceLock`,
+// so schemas are immutable for the lifetime of the process. Several
+// downstream caches rely on this invariant for correctness (not just perf):
+//   - `optimizers::tantivy_rewriter::indexed_columns_for` (per-table tokenizer map)
+//   - `plan_cache::PlanCacheHook` (LogicalPlan embeds SchemaRef at parse time)
+// If hot-reload of YAML schemas is ever added, those caches must gain a
+// schema-version token in their key (or be flushed on reload).
 static SCHEMA_REGISTRY: OnceLock<SchemaRegistry> = OnceLock::new();
 
 pub fn registry() -> &'static SchemaRegistry {
