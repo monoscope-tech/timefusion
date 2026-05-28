@@ -1073,15 +1073,10 @@ impl Database {
         // query workloads via TIMEFUSION_MEMORY_POOL=fair_spill.
         let pool_size = (memory_limit_bytes as f64 * memory_fraction) as usize;
         let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
-            crate::config::MemoryPoolKind::Greedy =>
-                Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
-            crate::config::MemoryPoolKind::FairSpill =>
-                Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
+            crate::config::MemoryPoolKind::Greedy => Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
+            crate::config::MemoryPoolKind::FairSpill => Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
         };
-        let runtime_env = RuntimeEnvBuilder::new()
-            .with_memory_pool(pool)
-            .build()
-            .expect("Failed to create runtime environment");
+        let runtime_env = RuntimeEnvBuilder::new().with_memory_pool(pool).build().expect("Failed to create runtime environment");
 
         let runtime_env = Arc::new(runtime_env);
 
