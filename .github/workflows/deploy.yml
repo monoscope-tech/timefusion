@@ -40,6 +40,40 @@ jobs:
           cache-to: type=gha,mode=max
           debug: true
 
+      # Pull the published image and verify the binary actually starts.
+      # We previously shipped images that exited at the dynamic linker
+      # (GLIBC mismatch from a builder/runtime base skew) because nothing
+      # between "image pushed" and "CapRover deploys it" had ever executed
+      # the binary. With TIMEFUSION_ALLOW_INSECURE_AUTH the process can
+      # boot without secrets, reach the PGWire listen call, then we kill
+      # it. SIGTERM via `timeout` exits 124; anything else means the
+      # binary crashed and we must NOT deploy it.
+      - name: Smoke test pushed image
+        run: |
+          docker pull "$IMAGE_URL"
+          set +e
+          docker run --rm \
+            -e TIMEFUSION_ALLOW_INSECURE_AUTH=true \
+            -e AWS_S3_BUCKET=smoke -e AWS_REGION=us-east-1 \
+            -e AWS_ACCESS_KEY_ID=smoke -e AWS_SECRET_ACCESS_KEY=smoke \
+            -e RUST_LOG=info \
+            --name tf-smoke "$IMAGE_URL" &
+          PID=$!
+          # Give it 12s to reach the PGWire listen log; then kill.
+          for i in $(seq 1 12); do
+            if docker logs tf-smoke 2>&1 | grep -q "Listening on 0.0.0.0:5432"; then
+              echo "smoke: PGWire listening, image OK"
+              docker kill tf-smoke >/dev/null 2>&1 || true
+              wait $PID 2>/dev/null || true
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "smoke: binary never reached PGWire listen — last logs:"
+          docker logs tf-smoke 2>&1 | tail -40
+          docker kill tf-smoke >/dev/null 2>&1 || true
+          exit 1
+
       - id: deploy
         name: Deploy Image to CapRover
         uses: caprover/deploy-from-github@v1.1.2

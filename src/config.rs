@@ -334,7 +334,7 @@ pub struct CoreConfig {
     pub timefusion_table_prefix:         String,
     #[serde(default)]
     pub timefusion_config_database_url:  Option<String>,
-    #[serde(default)]
+    #[serde(default = "d_true")]
     pub enable_batch_queue:              bool,
     #[serde(default = "d_batch_queue_capacity")]
     pub timefusion_batch_queue_capacity: usize,
@@ -559,6 +559,30 @@ pub struct MaintenanceConfig {
     pub timefusion_recompress_schedule:        String,
 }
 
+/// Which DataFusion `MemoryPool` to back the runtime with.
+///
+/// - `Greedy` (default): all consumers share the full pool; first-come,
+///   first-served. Right for write-heavy workloads where INSERTs dominate
+///   and per-statement memory needs vary widely (e.g. one batch is 50 MB
+///   of Arrow, another is 5 MB). FairSpillPool would slice the pool into
+///   per-consumer quotas (`pool / num_consumers`) and reject any consumer
+///   whose batch exceeded its slot — bit us in prod on 2026-05-28 when
+///   ~30 concurrent INSERTs each got a ~76 MB slot and every 700-row
+///   batch hit `Memory limit exceeded`.
+/// - `FairSpill`: slot-per-consumer fairness. Better for ad-hoc query
+///   workloads with many concurrent users where one large query
+///   shouldn't starve the others. Not the right default for ingest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPoolKind {
+    Greedy,
+    FairSpill,
+}
+
+fn d_memory_pool() -> MemoryPoolKind {
+    MemoryPoolKind::Greedy
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
     #[serde(default = "d_mem_gb")]
@@ -567,6 +591,8 @@ pub struct MemoryConfig {
     pub timefusion_memory_fraction:              f64,
     #[serde(default)]
     pub timefusion_sort_spill_reservation_bytes: Option<usize>,
+    #[serde(default = "d_memory_pool")]
+    pub timefusion_memory_pool:                  MemoryPoolKind,
     #[serde(default = "d_true")]
     pub timefusion_tracing_record_metrics:       bool,
 }
