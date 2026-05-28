@@ -177,6 +177,29 @@ impl LoggingSimpleQueryHandler {
     }
 }
 
+/// Rewrites Postgres synonyms that DataFusion's SQL parser doesn't accept.
+///
+/// `ABORT [ WORK | TRANSACTION ]` is a Postgres alias for `ROLLBACK`. Hasql's
+/// connection pool emits `ABORT` defensively on session acquisition to clear
+/// any leftover transaction state; without this rewrite, every Hasql client
+/// (e.g. monoscope) sees its first statement on each connection fail with
+/// `sql parser error: Expected: an SQL statement, found: ABORT`, which then
+/// poisons the whole session.
+fn rewrite_pg_synonyms(query: &str) -> std::borrow::Cow<'_, str> {
+    let stripped = query.trim_start();
+    if stripped.len() < 5 {
+        return std::borrow::Cow::Borrowed(query);
+    }
+    let (head, rest) = stripped.split_at(5);
+    if !head.eq_ignore_ascii_case("ABORT") {
+        return std::borrow::Cow::Borrowed(query);
+    }
+    if !(rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';')) {
+        return std::borrow::Cow::Borrowed(query);
+    }
+    std::borrow::Cow::Owned(format!("ROLLBACK{}", rest))
+}
+
 fn classify_query(query: &str) -> (&'static str, &'static str) {
     let q = query.trim().to_lowercase();
     if q.starts_with("select") || q.contains(" select ") {
@@ -231,6 +254,8 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let rewritten = rewrite_pg_synonyms(query);
+        let query = rewritten.as_ref();
         let span = tracing::Span::current();
         let (query_type, operation) = classify_query(query);
         span.record("query.type", query_type);
@@ -240,6 +265,31 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
 
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_pg_synonyms;
+
+    #[test]
+    fn abort_rewrites_to_rollback() {
+        assert_eq!(rewrite_pg_synonyms("ABORT"), "ROLLBACK");
+        assert_eq!(rewrite_pg_synonyms("ABORT;"), "ROLLBACK;");
+        assert_eq!(rewrite_pg_synonyms("  abort  "), "ROLLBACK  ");
+        assert_eq!(rewrite_pg_synonyms("Abort Work"), "ROLLBACK Work");
+        assert_eq!(rewrite_pg_synonyms("ABORT TRANSACTION;"), "ROLLBACK TRANSACTION;");
+    }
+
+    #[test]
+    fn non_abort_queries_are_borrowed_unchanged() {
+        // Cow::Borrowed is the fast path; we just check the content is identical.
+        assert_eq!(rewrite_pg_synonyms("SELECT 1"), "SELECT 1");
+        assert_eq!(rewrite_pg_synonyms("BEGIN"), "BEGIN");
+        assert_eq!(rewrite_pg_synonyms("ROLLBACK"), "ROLLBACK");
+        // Don't false-match identifiers/columns that start with ABORT.
+        assert_eq!(rewrite_pg_synonyms("SELECT aborted FROM t"), "SELECT aborted FROM t");
+        assert_eq!(rewrite_pg_synonyms("ABORTED"), "ABORTED");
     }
 }
 
