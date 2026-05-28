@@ -35,36 +35,24 @@ COPY schemas/ schemas/
 # Build the real release binary
 RUN cargo build --release
 
+# Pre-create app state dirs so they can be copied into the distroless
+# runtime (which has no shell to mkdir at runtime).
+RUN mkdir -p /app/queue_db /app/data
+
 ##############################
 #         Runtime Stage      #
 ##############################
-FROM ubuntu:20.04
+# Distroless/cc ships glibc 2.36 (matches builder), libssl3, and CA roots,
+# and runs as the built-in `nonroot` user (uid 65532). Previously this
+# stage was ubuntu:20.04 (glibc 2.31) which silently produced binaries
+# that crashed at startup with `GLIBC_2.32/2.33/2.34/2.35 not found`.
+FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
 
-# Install runtime dependencies
-RUN apt-get update && \
-    apt-get install -y ca-certificates libssl1.1 && \
-    rm -rf /var/lib/apt/lists/*
+COPY --from=builder --chown=nonroot:nonroot /app/target/release/timefusion /usr/local/bin/timefusion
+COPY --from=builder --chown=nonroot:nonroot /app/queue_db /app/queue_db
+COPY --from=builder --chown=nonroot:nonroot /app/data     /app/data
 
-# Create a non-root user
-RUN groupadd -r appgroup && useradd -r -g appgroup appuser
-
-# Create and set permissions for directories
-RUN mkdir -p /app/queue_db /app/data && \
-    chown -R appuser:appgroup /app /app/queue_db /app/data && \
-    chmod -R 775 /app /app/queue_db /app/data
-
-# Copy the compiled binary from the builder stage
-COPY --from=builder /app/target/release/timefusion /usr/local/bin/timefusion
-
-# Adjust ownership of the binary
-RUN chown appuser:appgroup /usr/local/bin/timefusion
-
-# Expose the required ports
 EXPOSE 80 5432
 
-# Switch to the non-root user
-USER appuser
-
-# Start the application
 ENTRYPOINT ["/usr/local/bin/timefusion"]
