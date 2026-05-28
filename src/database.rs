@@ -1068,10 +1068,18 @@ impl Database {
         let _ = options.set("datafusion.execution.memory_fraction", &memory_fraction.to_string());
         let _ = options.set("datafusion.execution.sort_spill_reservation_bytes", &sort_spill_reservation_bytes.to_string());
 
-        // Create runtime environment with FairSpillPool for per-query memory fairness
+        // Memory pool: defaults to Greedy (single global cap, no per-consumer slicing)
+        // for ingest-heavy workloads. Opt into FairSpill for ad-hoc multi-tenant
+        // query workloads via TIMEFUSION_MEMORY_POOL=fair_spill.
         let pool_size = (memory_limit_bytes as f64 * memory_fraction) as usize;
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
+            crate::config::MemoryPoolKind::Greedy =>
+                Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
+            crate::config::MemoryPoolKind::FairSpill =>
+                Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
+        };
         let runtime_env = RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)))
+            .with_memory_pool(pool)
             .build()
             .expect("Failed to create runtime environment");
 
