@@ -134,6 +134,16 @@ harness = false
 default = []
 test = []
 
+# Release builds prioritize binary size + runtime speed over compile time.
+# fat LTO + single codegen-unit lets the optimizer inline across crates;
+# `strip = "symbols"` drops debug symbols. Roughly halves the published
+# image size, mostly by shrinking the embedded binary. CI compile time
+# goes up — acceptable for ghcr.io tags.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
 # Local patch: arrow-pg 0.13.0's UUID parameter decoder calls
 # `portal.parameter::<String>`, which pgwire rejects for the UUID OID and
 # breaks any client (Hasql, tokio-postgres binary) sending UUIDs. Vendored
