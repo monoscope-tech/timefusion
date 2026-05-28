@@ -28,6 +28,59 @@ use arrow_pg::datatypes::df;
 use arrow_pg::datatypes::{arrow_schema_to_pg_fields, into_pg_type};
 use datafusion_pg_catalog::sql::PostgresCompatibilityParser;
 
+/// Rewrites Postgres command synonyms that DataFusion's SQL parser doesn't
+/// recognize. Applied to every incoming SQL string before parsing — covers
+/// both the simple-query and extended-query (parse) paths.
+///
+/// Currently handles:
+/// - `ABORT [ WORK | TRANSACTION ]` → `ROLLBACK [ WORK | TRANSACTION ]`.
+///   Postgres treats these as synonyms; Hasql's connection pool emits
+///   `ABORT` defensively on session acquisition, which would otherwise
+///   produce `sql parser error: Expected: an SQL statement, found: ABORT`
+///   and poison the session.
+///
+/// Returns `Cow::Borrowed` on the no-rewrite fast path so the common case
+/// pays only a short case-insensitive prefix check.
+fn rewrite_postgres_synonyms(sql: &str) -> std::borrow::Cow<'_, str> {
+    let stripped = sql.trim_start();
+    if stripped.len() < 5 {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    let (head, rest) = stripped.split_at(5);
+    if !head.eq_ignore_ascii_case("ABORT") {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    // Only treat as the command form when ABORT stands alone (not when it's
+    // a prefix of an identifier like `aborted`).
+    if !(rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';')) {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    std::borrow::Cow::Owned(format!("ROLLBACK{}", rest))
+}
+
+#[cfg(test)]
+mod synonym_tests {
+    use super::rewrite_postgres_synonyms as r;
+
+    #[test]
+    fn rewrites_abort_forms() {
+        assert_eq!(r("ABORT"), "ROLLBACK");
+        assert_eq!(r("ABORT;"), "ROLLBACK;");
+        assert_eq!(r("  abort  "), "ROLLBACK  ");
+        assert_eq!(r("Abort Work"), "ROLLBACK Work");
+        assert_eq!(r("ABORT TRANSACTION;"), "ROLLBACK TRANSACTION;");
+    }
+
+    #[test]
+    fn leaves_non_abort_alone() {
+        assert_eq!(r("SELECT 1"), "SELECT 1");
+        assert_eq!(r("BEGIN"), "BEGIN");
+        assert_eq!(r("ROLLBACK"), "ROLLBACK");
+        assert_eq!(r("SELECT aborted FROM t"), "SELECT aborted FROM t");
+        assert_eq!(r("ABORTED"), "ABORTED");
+    }
+}
+
 /// Simple startup handler that does no authentication
 pub struct SimpleStartupHandler;
 
@@ -125,6 +178,8 @@ impl SimpleQueryHandler for DfSessionService {
         PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
         log::debug!("Received query: {query}");
+        let rewritten = rewrite_postgres_synonyms(query);
+        let query = rewritten.as_ref();
         let statements = self
             .parser
             .sql_parser
@@ -348,6 +403,8 @@ impl QueryParser for Parser {
         C: ClientInfo + Unpin + Send + Sync,
     {
         log::debug!("Received parse extended query: {sql}");
+        let rewritten = rewrite_postgres_synonyms(sql);
+        let sql = rewritten.as_ref();
         let mut statements = self
             .sql_parser
             .parse(sql)
