@@ -268,31 +268,6 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::rewrite_pg_synonyms;
-
-    #[test]
-    fn abort_rewrites_to_rollback() {
-        assert_eq!(rewrite_pg_synonyms("ABORT"), "ROLLBACK");
-        assert_eq!(rewrite_pg_synonyms("ABORT;"), "ROLLBACK;");
-        assert_eq!(rewrite_pg_synonyms("  abort  "), "ROLLBACK  ");
-        assert_eq!(rewrite_pg_synonyms("Abort Work"), "ROLLBACK Work");
-        assert_eq!(rewrite_pg_synonyms("ABORT TRANSACTION;"), "ROLLBACK TRANSACTION;");
-    }
-
-    #[test]
-    fn non_abort_queries_are_borrowed_unchanged() {
-        // Cow::Borrowed is the fast path; we just check the content is identical.
-        assert_eq!(rewrite_pg_synonyms("SELECT 1"), "SELECT 1");
-        assert_eq!(rewrite_pg_synonyms("BEGIN"), "BEGIN");
-        assert_eq!(rewrite_pg_synonyms("ROLLBACK"), "ROLLBACK");
-        // Don't false-match identifiers/columns that start with ABORT.
-        assert_eq!(rewrite_pg_synonyms("SELECT aborted FROM t"), "SELECT aborted FROM t");
-        assert_eq!(rewrite_pg_synonyms("ABORTED"), "ABORTED");
-    }
-}
-
 /// Extended query handler with tracing
 pub struct LoggingExtendedQueryHandler {
     inner: DfSessionService,
@@ -375,4 +350,29 @@ pub async fn serve_with_logging(
     let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_config));
     datafusion_postgres::serve_with_handlers(handlers, options).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_pg_synonyms;
+
+    #[test]
+    fn abort_rewrites_to_rollback() {
+        assert_eq!(rewrite_pg_synonyms("ABORT"), "ROLLBACK");
+        assert_eq!(rewrite_pg_synonyms("ABORT;"), "ROLLBACK;");
+        assert_eq!(rewrite_pg_synonyms("  abort  "), "ROLLBACK  ");
+        assert_eq!(rewrite_pg_synonyms("Abort Work"), "ROLLBACK Work");
+        assert_eq!(rewrite_pg_synonyms("ABORT TRANSACTION;"), "ROLLBACK TRANSACTION;");
+    }
+
+    #[test]
+    fn non_abort_queries_are_borrowed_unchanged() {
+        // Cow::Borrowed is the fast path; we just check the content is identical.
+        assert_eq!(rewrite_pg_synonyms("SELECT 1"), "SELECT 1");
+        assert_eq!(rewrite_pg_synonyms("BEGIN"), "BEGIN");
+        assert_eq!(rewrite_pg_synonyms("ROLLBACK"), "ROLLBACK");
+        // Don't false-match identifiers/columns that start with ABORT.
+        assert_eq!(rewrite_pg_synonyms("SELECT aborted FROM t"), "SELECT aborted FROM t");
+        assert_eq!(rewrite_pg_synonyms("ABORTED"), "ABORTED");
+    }
 }
