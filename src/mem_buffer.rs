@@ -1591,6 +1591,48 @@ mod tests {
         assert_eq!(name_col.value(2), "c");
     }
 
+    // Regression: predicate/assignment exprs from the SQL planner carry table
+    // qualifiers (e.g. `Column { relation: Some("table1"), name: "id" }`), but
+    // DFSchema is built from the bare table schema. Without qualifier stripping,
+    // create_physical_expr fails with "No field named table1.id".
+    #[test]
+    fn test_delete_with_qualified_predicate() {
+        use datafusion::{
+            common::{Column, TableReference},
+            logical_expr::{Expr, lit},
+        };
+
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+        buffer.insert("project1", "table1", batch, ts).unwrap();
+
+        let predicate = Expr::Column(Column::new(Some(TableReference::bare("table1")), "id")).eq(lit(2i64));
+        let deleted = buffer.delete("project1", "table1", Some(&predicate)).unwrap();
+        assert_eq!(deleted, 1);
+    }
+
+    #[test]
+    fn test_update_with_qualified_predicate_and_assignment() {
+        use datafusion::{
+            common::{Column, TableReference},
+            logical_expr::{Expr, lit},
+        };
+
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
+        buffer.insert("project1", "table1", batch, ts).unwrap();
+
+        let predicate = Expr::Column(Column::new(Some(TableReference::bare("table1")), "id")).eq(lit(2i64));
+        // Assignment value also references a qualified column — the planner
+        // produces these when the SET RHS reads from the same table.
+        let value_expr = Expr::Column(Column::new(Some(TableReference::bare("table1")), "name"));
+        let assignments = vec![("name".to_string(), value_expr)];
+        let updated = buffer.update("project1", "table1", Some(&predicate), &assignments).unwrap();
+        assert_eq!(updated, 1);
+    }
+
     #[test]
     fn test_has_table() {
         let buffer = MemBuffer::new();

@@ -402,4 +402,49 @@ mod test_dml_operations {
 
         Ok(())
     }
+
+    // Regression: DataFusion's CommonSubexprEliminate optimizer wraps the UPDATE
+    // assignment Projection in an inner Projection that defines synthetic
+    // `__common_expr_*` columns. extract_dml_info used to overwrite the real
+    // assignments with that inner Projection's contents, so mem_buffer failed
+    // with "Column '__common_expr_1' not found".
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_with_common_subexpression() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let records = create_test_records(now);
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+
+        // `duration + 100` appears twice in SET — CSE-eligible subexpr that
+        // the optimizer hoists into a `__common_expr_*` alias.
+        info!("Executing UPDATE with CSE-eligible subexpression");
+        let df = ctx
+            .sql(
+                "UPDATE otel_logs_and_spans \
+                 SET duration = duration + 100, \
+                     status_message = CAST(duration + 100 AS VARCHAR) \
+                 WHERE project_id = 'test_project' AND name = 'Bob'",
+            )
+            .await?;
+        let result = df.collect().await?;
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(rows_updated, 1, "Expected Bob's row to be updated");
+
+        let df = ctx
+            .sql("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'")
+            .await?;
+        let results = df.collect().await?;
+        let duration = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(duration, 300, "Bob's duration should be 200 + 100 = 300");
+
+        Ok(())
+    }
 }
