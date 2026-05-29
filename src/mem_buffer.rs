@@ -22,6 +22,8 @@ use datafusion::{
 use parking_lot::Mutex;
 use tracing::{debug, info, instrument, warn};
 
+pub type FnRegistry = dyn datafusion::execution::FunctionRegistry + Send + Sync;
+
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
 // longer = larger Delta files. Matches default flush interval for aligned boundaries.
 // Note: Timestamps before 1970 (negative microseconds) produce negative bucket IDs,
@@ -228,14 +230,10 @@ fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray)
     arrow::compute::kernels::zip::zip(mask, &new_values, original).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
 }
 
-/// Parse a SQL WHERE clause / expression fragment into a DataFusion Expr.
-///
-/// `schema` provides column resolution (column refs nested inside function args
-/// require a non-empty schema, even though bare `col = 'x'` works against
-/// DFSchema::empty()). `registry`, when `Some`, lets the planner resolve UDF
-/// references — without it, any function call fails with
-/// "No functions registered with this context".
-fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>) -> DFResult<Expr> {
+/// Parse a SQL fragment into a DataFusion Expr. `schema` resolves column refs
+/// (column refs nested inside function args need a non-empty schema).
+/// `registry` resolves UDFs — required if the SQL has any function call.
+fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&FnRegistry>) -> DFResult<Expr> {
     let dialect = GenericDialect {};
     let sql_expr = SqlParser::new(&dialect)
         .try_with_sql(sql)
@@ -247,15 +245,8 @@ fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&(dyn data
     planner.sql_to_expr(sql_expr, schema, &mut Default::default())
 }
 
-/// Parse a SQL expression (for UPDATE SET values).
-fn parse_sql_expr(sql: &str, schema: &DFSchema, registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>) -> DFResult<Expr> {
-    parse_sql_predicate(sql, schema, registry)
-}
-
-/// Context provider that resolves UDF references through an optional FunctionRegistry.
-/// When `registry` is None, behaves as the previous EmptyContextProvider (no functions).
 struct RegistryContextProvider<'a> {
-    registry: Option<&'a (dyn datafusion::execution::FunctionRegistry + Send + Sync)>,
+    registry: Option<&'a FnRegistry>,
 }
 
 impl<'a> datafusion::sql::planner::ContextProvider for RegistryContextProvider<'a> {
@@ -1154,7 +1145,7 @@ impl MemBuffer {
     /// Parses the SQL WHERE clause and delegates to delete().
     #[instrument(skip(self, registry), fields(project_id, table_name))]
     pub fn delete_by_sql(
-        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>,
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, registry: Option<&FnRegistry>,
     ) -> DFResult<u64> {
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
@@ -1165,23 +1156,21 @@ impl MemBuffer {
     /// Parses the SQL WHERE clause and assignment expressions, then delegates to update().
     #[instrument(skip(self, assignments, registry), fields(project_id, table_name))]
     pub fn update_by_sql(
-        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)],
-        registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>,
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], registry: Option<&FnRegistry>,
     ) -> DFResult<u64> {
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
         let parsed_assignments: Vec<(String, Expr)> = assignments
             .iter()
-            .map(|(col, val_sql)| parse_sql_expr(val_sql, &df_schema, registry).map(|expr| (col.clone(), expr)))
+            .map(|(col, val_sql)| parse_sql_predicate(val_sql, &df_schema, registry).map(|expr| (col.clone(), expr)))
             .collect::<DFResult<Vec<_>>>()?;
         self.update(project_id, table_name, predicate.as_ref(), &parsed_assignments)
     }
 
-    /// Build a DFSchema for the in-memory table so SQL planning can resolve
-    /// column references. Returns DFSchema::empty() if the table isn't tracked
-    /// (no rows yet) — the caller will see "Column not found" rather than
-    /// silently mis-resolving.
-    fn df_schema_for(&self, project_id: &str, table_name: &str) -> DFResult<DFSchema> {
+    /// DFSchema of the in-memory table, or `DFSchema::empty()` if it isn't
+    /// tracked yet — empty schema raises "Column not found" downstream rather
+    /// than silently mis-resolving.
+    pub fn df_schema_for(&self, project_id: &str, table_name: &str) -> DFResult<DFSchema> {
         match self.get_table(project_id, table_name) {
             Some(table) => DFSchema::try_from(table.schema().as_ref().clone()),
             None => Ok(DFSchema::empty()),
@@ -1659,12 +1648,6 @@ mod tests {
         assert_eq!(updated, 1);
     }
 
-    // Regression: WAL replay re-parses UPDATE/DELETE predicate + assignment SQL
-    // via `parse_sql_predicate`. Before the fix, the planner used an empty
-    // ContextProvider, so any function call in the SQL (CAST is built-in, but
-    // `coalesce`, `to_char`, `variant_get`, etc. are UDFs) failed planning with
-    // "Internal error: No functions registered with this context" and the
-    // entry was silently quarantined — losing in-flight UPDATEs across restarts.
     fn test_table_df_schema() -> DFSchema {
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
@@ -1673,6 +1656,7 @@ mod tests {
         buffer.df_schema_for("p", "t").unwrap()
     }
 
+    // Regression: WAL replay used to fail "No functions registered" on any UDF.
     #[test]
     fn parse_sql_predicate_without_registry_rejects_udf() {
         let schema = test_table_df_schema();
@@ -1686,55 +1670,31 @@ mod tests {
     #[test]
     fn parse_sql_predicate_with_registry_handles_udf() {
         let schema = test_table_df_schema();
-        let mut ctx = datafusion::execution::context::SessionContext::new();
-        crate::functions::register_custom_functions(&mut ctx).unwrap();
-        let state = ctx.state();
-        let registry: &(dyn datafusion::execution::FunctionRegistry + Send + Sync) = &state;
-        super::parse_sql_predicate("coalesce(name, '') = 'x'", &schema, Some(registry)).expect("coalesce should resolve");
-        super::parse_sql_predicate("to_char(timestamp, 'YYYY') = '2024'", &schema, Some(registry)).expect("to_char should resolve");
+        let reg = crate::functions::function_registry().unwrap();
+        super::parse_sql_predicate("coalesce(name, '') = 'x'", &schema, Some(reg.as_ref())).expect("coalesce should resolve");
+        super::parse_sql_predicate("to_char(timestamp, 'YYYY') = '2024'", &schema, Some(reg.as_ref())).expect("to_char should resolve");
     }
 
+    // upper() — a UDF that survives logical->physical lowering (unlike coalesce
+    // which the optimizer rewrites to CASE).
     #[test]
     fn update_by_sql_with_udf_replays_when_registry_present() {
-        use datafusion::execution::context::SessionContext;
-
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
         let batch = create_multi_row_batch(vec![1, 2, 3], vec!["a", "b", "c"]);
         buffer.insert("project1", "table1", batch, ts).unwrap();
 
-        // Without a registry the same UPDATE would fail at parse time — that's
-        // the production WAL-replay bug. With the registry, it parses and applies.
-        let mut ctx = SessionContext::new();
-        crate::functions::register_custom_functions(&mut ctx).unwrap();
-        let state = ctx.state();
-        let registry: &(dyn datafusion::execution::FunctionRegistry + Send + Sync) = &state;
-
-        // length() is a default DataFusion UDF that survives straight through to
-        // physical exec (unlike coalesce, which the optimizer rewrites to CASE).
+        let reg = crate::functions::function_registry().unwrap();
         let updated = buffer
-            .update_by_sql(
-                "project1",
-                "table1",
-                Some("upper(name) = 'B'"),
-                &[("name".to_string(), "'updated'".to_string())],
-                Some(registry),
-            )
-            .expect("UDF-bearing UPDATE should replay successfully with registry");
+            .update_by_sql("project1", "table1", Some("upper(name) = 'B'"), &[("name".into(), "'updated'".into())], Some(reg.as_ref()))
+            .expect("UDF-bearing UPDATE should replay with registry");
         assert_eq!(updated, 1);
 
-        // Same call without registry returns an error rather than silently no-opping —
-        // proving the registry plumbing is what enables the replay.
         assert!(
             buffer
-                .update_by_sql(
-                    "project1",
-                    "table1",
-                    Some("upper(name) = 'A'"),
-                    &[("name".to_string(), "'x'".to_string())],
-                    None,
-                )
-                .is_err()
+                .update_by_sql("project1", "table1", Some("upper(name) = 'A'"), &[("name".into(), "'x'".into())], None)
+                .is_err(),
+            "without registry, UDF planning should fail rather than silently no-op"
         );
     }
 

@@ -410,6 +410,14 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     Ok(())
 }
 
+/// Build an Arc'd FunctionRegistry pre-populated with all custom UDFs. Used by
+/// WAL replay (so SQL with UDF refs re-plans correctly) and tests.
+pub fn function_registry() -> Result<Arc<dyn datafusion::execution::FunctionRegistry + Send + Sync>> {
+    let mut ctx = datafusion::execution::context::SessionContext::new();
+    register_custom_functions(&mut ctx)?;
+    Ok(Arc::new(ctx.state()))
+}
+
 /// `timefusion_set_clock(rfc3339_text)` → bigint micros-since-epoch.
 fn create_set_clock_udf() -> ScalarUDF {
     use datafusion::arrow::{
