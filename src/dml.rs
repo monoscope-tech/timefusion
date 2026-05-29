@@ -212,7 +212,7 @@ use crate::optimizers::extract_project_id_from_expr as extract_project_id;
 fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assignments: &mut [(String, Expr)]) -> Result<()> {
     use std::collections::HashMap;
 
-    use datafusion::common::tree_node::{TreeNode, Transformed};
+    use datafusion::common::tree_node::{Transformed, TreeNode};
 
     let mut subs: HashMap<String, Expr> = HashMap::new();
     for (expr, field) in proj.expr.iter().zip(proj.schema.fields()) {

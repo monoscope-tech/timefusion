@@ -474,7 +474,13 @@ impl BufferedWriteLayer {
                 },
                 WalOperation::Update => match deserialize_update_payload(&entry.data) {
                     Ok(payload) => {
-                        if let Err(e) = mem_buffer.update_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), &payload.assignments, registry_ref) {
+                        if let Err(e) = mem_buffer.update_by_sql(
+                            &entry.project_id,
+                            &entry.table_name,
+                            payload.predicate_sql.as_deref(),
+                            &payload.assignments,
+                            registry_ref,
+                        ) {
                             error!("WAL REPLAY FAILED: UPDATE for {}.{}: {}", entry.project_id, entry.table_name, e);
                             quarantine_entry(&quarantine_dir, &entry, "update_replay_failed", &e.to_string());
                         } else {

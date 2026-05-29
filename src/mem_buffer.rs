@@ -235,9 +235,7 @@ fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray)
 /// DFSchema::empty()). `registry`, when `Some`, lets the planner resolve UDF
 /// references — without it, any function call fails with
 /// "No functions registered with this context".
-fn parse_sql_predicate(
-    sql: &str, schema: &DFSchema, registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>,
-) -> DFResult<Expr> {
+fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>) -> DFResult<Expr> {
     let dialect = GenericDialect {};
     let sql_expr = SqlParser::new(&dialect)
         .try_with_sql(sql)
@@ -250,9 +248,7 @@ fn parse_sql_predicate(
 }
 
 /// Parse a SQL expression (for UPDATE SET values).
-fn parse_sql_expr(
-    sql: &str, schema: &DFSchema, registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>,
-) -> DFResult<Expr> {
+fn parse_sql_expr(sql: &str, schema: &DFSchema, registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>) -> DFResult<Expr> {
     parse_sql_predicate(sql, schema, registry)
 }
 
@@ -1158,8 +1154,7 @@ impl MemBuffer {
     /// Parses the SQL WHERE clause and delegates to delete().
     #[instrument(skip(self, registry), fields(project_id, table_name))]
     pub fn delete_by_sql(
-        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>,
-        registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>,
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, registry: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)>,
     ) -> DFResult<u64> {
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
