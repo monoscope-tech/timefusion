@@ -1144,9 +1144,7 @@ impl MemBuffer {
     /// Delete rows using a SQL predicate string (for WAL recovery).
     /// Parses the SQL WHERE clause and delegates to delete().
     #[instrument(skip(self, registry), fields(project_id, table_name))]
-    pub fn delete_by_sql(
-        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, registry: Option<&FnRegistry>,
-    ) -> DFResult<u64> {
+    pub fn delete_by_sql(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, registry: Option<&FnRegistry>) -> DFResult<u64> {
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
         self.delete(project_id, table_name, predicate.as_ref())
@@ -1686,14 +1684,18 @@ mod tests {
 
         let reg = crate::functions::function_registry().unwrap();
         let updated = buffer
-            .update_by_sql("project1", "table1", Some("upper(name) = 'B'"), &[("name".into(), "'updated'".into())], Some(reg.as_ref()))
+            .update_by_sql(
+                "project1",
+                "table1",
+                Some("upper(name) = 'B'"),
+                &[("name".into(), "'updated'".into())],
+                Some(reg.as_ref()),
+            )
             .expect("UDF-bearing UPDATE should replay with registry");
         assert_eq!(updated, 1);
 
         assert!(
-            buffer
-                .update_by_sql("project1", "table1", Some("upper(name) = 'A'"), &[("name".into(), "'x'".into())], None)
-                .is_err(),
+            buffer.update_by_sql("project1", "table1", Some("upper(name) = 'A'"), &[("name".into(), "'x'".into())], None).is_err(),
             "without registry, UDF planning should fail rather than silently no-op"
         );
     }
