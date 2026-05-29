@@ -68,7 +68,7 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
         })
     });
 
-    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone())?.with_delta_writer(delta_cb);
+    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), timefusion::functions::function_registry()?)?.with_delta_writer(delta_cb);
     let mut svc: Option<Arc<TantivyIndexService>> = None;
     if tantivy_enabled {
         let bucket = cfg_arc.aws.aws_s3_bucket.clone().unwrap();

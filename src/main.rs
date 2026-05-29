@@ -75,15 +75,19 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             })
         });
 
+    // Register UDFs on the real SessionContext up front so its FunctionRegistry
+    // doubles as the WAL-replay registry — no throwaway bootstrap context.
+    // Table providers depend on buffered_layer and are registered after recovery.
+    let mut session_context = Arc::new(db.clone()).create_session_context();
+    db.setup_session_udfs(&mut session_context)?;
+    let registry: Arc<timefusion::mem_buffer::FnRegistry> = Arc::new(session_context.state());
+
     // Tantivy sidecar indexes are always-on whenever at least one table has
     // `tantivy.indexed: true` fields in its YAML schema (or appears in the
     // optional `TIMEFUSION_TANTIVY_INDEXED_TABLES` override). The query layer
     // accelerates standard SQL predicates (`=`, `LIKE 'prefix%'`) via the
     // TantivyPredicateRewriter — callers don't need to know tantivy exists.
-    // Registry must be ready before recover_from_wal so UDF-bearing UPDATEs replay.
-    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone())?
-        .with_delta_writer(delta_write_callback)
-        .with_function_registry(timefusion::functions::function_registry()?);
+    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?.with_delta_writer(delta_write_callback);
     let mut tantivy_svc_for_metrics: Option<Arc<timefusion::tantivy_index::service::TantivyIndexService>> = None;
     let indexed_tables = cfg.tantivy.indexed_tables();
     if !indexed_tables.is_empty() {
@@ -134,8 +138,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Start maintenance schedulers for regular optimize and vacuum
     db = db.start_maintenance_schedulers().await?;
     let db = Arc::new(db);
-    let mut session_context = db.clone().create_session_context();
-    db.setup_session_context(&mut session_context)?;
+    // session_context was built earlier with UDFs registered; now that the
+    // buffered_layer is attached we can register the table providers that
+    // depend on it.
+    db.setup_session_tables(&mut session_context)?;
 
     // Start PGWire server
     let pg_port = cfg.core.pgwire_port;
