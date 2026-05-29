@@ -22,7 +22,7 @@ use datafusion::{
 use parking_lot::Mutex;
 use tracing::{debug, info, instrument, warn};
 
-pub type FnRegistry = dyn datafusion::execution::FunctionRegistry + Send + Sync;
+use crate::functions::FnRegistry;
 
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
 // longer = larger Delta files. Matches default flush interval for aligned boundaries.
