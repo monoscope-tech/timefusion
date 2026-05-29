@@ -86,7 +86,11 @@ async fn setup_s3_bench(name: &str) -> (SessionContext, Arc<Database>, String) {
             Ok(Vec::new())
         })
     });
-    let layer = Arc::new(BufferedWriteLayer::with_config(Arc::clone(&cfg), timefusion::functions::function_registry().unwrap()).unwrap().with_delta_writer(delta_cb));
+    let layer = Arc::new(
+        BufferedWriteLayer::with_config(Arc::clone(&cfg), timefusion::functions::function_registry().unwrap())
+            .unwrap()
+            .with_delta_writer(delta_cb),
+    );
     let db = db_for_cb.with_buffered_layer(Arc::clone(&layer));
 
     let pid = format!("bench_{}", &uuid::Uuid::new_v4().to_string()[..8]);
@@ -157,7 +161,8 @@ fn bench_inmemory_writes(c: &mut Criterion) {
     {
         let cfg = bench_config("wapi");
         unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
-        let layer = rt.block_on(async { Arc::new(BufferedWriteLayer::with_config(Arc::clone(&cfg), timefusion::functions::function_registry().unwrap()).unwrap()) });
+        let layer =
+            rt.block_on(async { Arc::new(BufferedWriteLayer::with_config(Arc::clone(&cfg), timefusion::functions::function_registry().unwrap()).unwrap()) });
         let db = rt.block_on(async { Arc::new(Database::with_config(cfg).await.unwrap().with_buffered_layer(layer)) });
         let pid = format!("bench_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let batches: Vec<_> = (0..10).map(|i| json_to_batch(vec![test_span(&format!("id_{i}"), "span", &pid)]).unwrap()).collect();
