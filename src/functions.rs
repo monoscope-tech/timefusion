@@ -410,12 +410,23 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     Ok(())
 }
 
-/// Build an Arc'd FunctionRegistry pre-populated with all custom UDFs. Used by
-/// WAL replay (so SQL with UDF refs re-plans correctly) and tests.
-pub fn function_registry() -> Result<Arc<dyn datafusion::execution::FunctionRegistry + Send + Sync>> {
+pub type FnRegistry = dyn datafusion::execution::FunctionRegistry + Send + Sync;
+
+/// Process-wide Arc'd FunctionRegistry pre-populated with all custom UDFs.
+/// Lazy-init via OnceLock so test/bench harnesses that build many layers don't
+/// re-register UDFs 20× per test. Production builds it once at startup either
+/// way.
+pub fn function_registry() -> Result<Arc<FnRegistry>> {
+    static CELL: std::sync::OnceLock<Arc<FnRegistry>> = std::sync::OnceLock::new();
+    if let Some(reg) = CELL.get() {
+        return Ok(Arc::clone(reg));
+    }
     let mut ctx = datafusion::execution::context::SessionContext::new();
     register_custom_functions(&mut ctx)?;
-    Ok(Arc::new(ctx.state()))
+    let arc: Arc<FnRegistry> = Arc::new(ctx.state());
+    // First-write-wins; if a parallel test won the race we just discard ours.
+    let _ = CELL.set(Arc::clone(&arc));
+    Ok(arc)
 }
 
 /// `timefusion_set_clock(rfc3339_text)` → bigint micros-since-epoch.

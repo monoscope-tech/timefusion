@@ -62,6 +62,11 @@ pub mod test_helpers {
         }
     }
 
+    /// Build a BufferedWriteLayer for tests/benches without repeating the registry boilerplate.
+    pub fn test_layer(cfg: Arc<AppConfig>) -> anyhow::Result<crate::buffered_write_layer::BufferedWriteLayer> {
+        crate::buffered_write_layer::BufferedWriteLayer::with_config(cfg, crate::functions::function_registry()?)
+    }
+
     pub fn json_to_batch(records: Vec<Value>) -> anyhow::Result<RecordBatch> {
         let target_schema = get_default_schema().schema_ref();
 

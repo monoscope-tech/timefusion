@@ -1123,9 +1123,7 @@ impl Database {
         SessionContext::new_with_state(session_state)
     }
 
-    /// Register UDFs only — safe to call before `with_buffered_layer`. Used by
-    /// main.rs to harvest a FunctionRegistry for WAL replay without standing up
-    /// a throwaway SessionContext.
+    /// Register UDFs only — safe to call before `with_buffered_layer`.
     pub fn setup_session_udfs(&self, ctx: &mut SessionContext) -> DFResult<()> {
         self.register_set_config_udf(ctx);
         // CRITICAL: Register custom functions BEFORE JSON functions to ensure VariantAwareExprPlanner

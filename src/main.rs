@@ -80,7 +80,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Table providers depend on buffered_layer and are registered after recovery.
     let mut session_context = Arc::new(db.clone()).create_session_context();
     db.setup_session_udfs(&mut session_context)?;
-    let registry: Arc<timefusion::mem_buffer::FnRegistry> = Arc::new(session_context.state());
+    let registry: Arc<timefusion::functions::FnRegistry> = Arc::new(session_context.state());
 
     // Tantivy sidecar indexes are always-on whenever at least one table has
     // `tantivy.indexed: true` fields in its YAML schema (or appears in the
@@ -138,9 +138,6 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Start maintenance schedulers for regular optimize and vacuum
     db = db.start_maintenance_schedulers().await?;
     let db = Arc::new(db);
-    // session_context was built earlier with UDFs registered; now that the
-    // buffered_layer is attached we can register the table providers that
-    // depend on it.
     db.setup_session_tables(&mut session_context)?;
 
     // Start PGWire server
