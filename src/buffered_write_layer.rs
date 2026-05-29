@@ -328,14 +328,21 @@ impl BufferedWriteLayer {
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
-        // Check memory pressure and trigger early flush if needed
+        // Check memory pressure and trigger early flush if needed.
+        // We use `flush_all_now` (not `flush_completed_buckets`) here because
+        // under memory pressure the data consuming the budget is almost
+        // always the *current* bucket — `flush_completed_buckets` only
+        // drains buckets older than `bucket_duration_secs`, which leaves
+        // the current-bucket pressure unrelieved and the next insert
+        // still fails. `flush_all_now` includes the current bucket and
+        // matches what an operator would do manually in this state.
         if self.is_memory_pressure() {
             warn!(
-                "Memory pressure detected ({}MB >= {}MB), triggering early flush",
+                "Memory pressure detected ({}MB >= {}MB), triggering early flush_all_now",
                 self.effective_memory_bytes() / (1024 * 1024),
                 self.config.buffer.max_memory_mb()
             );
-            if let Err(e) = self.flush_completed_buckets().await {
+            if let Err(e) = self.flush_all_now().await {
                 error!("Early flush due to memory pressure failed: {}", e);
             }
         }
