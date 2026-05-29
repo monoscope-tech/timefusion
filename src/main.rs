@@ -80,20 +80,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // optional `TIMEFUSION_TANTIVY_INDEXED_TABLES` override). The query layer
     // accelerates standard SQL predicates (`=`, `LIKE 'prefix%'`) via the
     // TantivyPredicateRewriter — callers don't need to know tantivy exists.
-    // Build a function registry now (UDFs only) so WAL replay can re-plan
-    // UPDATE/DELETE SQL that references functions like CAST/coalesce/to_char/
-    // variant_get. Without this, those entries fail replay with
-    // "No functions registered with this context" and are silently quarantined,
-    // dropping in-flight UPDATEs across restarts.
-    let registry_arc: Arc<dyn datafusion::execution::FunctionRegistry + Send + Sync> = {
-        let mut bootstrap_ctx = datafusion::execution::context::SessionContext::new();
-        timefusion::functions::register_custom_functions(&mut bootstrap_ctx)?;
-        Arc::new(bootstrap_ctx.state())
-    };
-
+    // Registry must be ready before recover_from_wal so UDF-bearing UPDATEs replay.
     let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone())?
         .with_delta_writer(delta_write_callback)
-        .with_function_registry(registry_arc);
+        .with_function_registry(timefusion::functions::function_registry()?);
     let mut tantivy_svc_for_metrics: Option<Arc<timefusion::tantivy_index::service::TantivyIndexService>> = None;
     let indexed_tables = cfg.tantivy.indexed_tables();
     if !indexed_tables.is_empty() {

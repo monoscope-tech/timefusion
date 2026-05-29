@@ -174,11 +174,8 @@ pub struct BufferedWriteLayer {
     flush_lock:             Mutex<()>,
     reserved_bytes:         AtomicUsize, // Memory reserved for in-flight writes
     pressure_notify:        Arc<Notify>, // Wakes flush task when pressure threshold crossed
-    // Function registry used to re-plan UPDATE/DELETE predicate + assignment SQL during
-    // WAL replay. Without this, any UPDATE referencing a function (CAST, coalesce,
-    // to_char, variant_get, etc.) fails replay with "No functions registered with this
-    // context" and gets silently quarantined.
-    function_registry:      Option<Arc<dyn datafusion::execution::FunctionRegistry + Send + Sync>>,
+    // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
+    function_registry:      Option<Arc<crate::mem_buffer::FnRegistry>>,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -230,10 +227,9 @@ impl BufferedWriteLayer {
         self
     }
 
-    /// Provide a function registry (typically a `SessionState`) so WAL replay can
-    /// re-plan UPDATE/DELETE SQL containing UDF references. MUST be called before
-    /// `recover_from_wal` for replay to succeed on function-bearing entries.
-    pub fn with_function_registry(mut self, registry: Arc<dyn datafusion::execution::FunctionRegistry + Send + Sync>) -> Self {
+    /// Must be set before `recover_from_wal` for UDF-bearing UPDATE/DELETE entries
+    /// to replay. Otherwise they're quarantined with a "No functions registered" error.
+    pub fn with_function_registry(mut self, registry: Arc<crate::mem_buffer::FnRegistry>) -> Self {
         self.function_registry = Some(registry);
         self
     }
@@ -425,12 +421,9 @@ impl BufferedWriteLayer {
         let quarantine_dir = self.wal.data_dir().join("quarantine");
         let registry = self.function_registry.clone();
         if registry.is_none() {
-            warn!(
-                "WAL recovery: no function registry configured — UPDATE/DELETE entries that reference UDFs (CAST, coalesce, to_char, variant_get, ...) will fail to replay. \
-                 Call BufferedWriteLayer::with_function_registry() before recover_from_wal()."
-            );
+            warn!("WAL recovery: no function registry — UDF-bearing UPDATE/DELETE entries will be quarantined.");
         }
-        let registry_ref: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)> = registry.as_deref();
+        let registry_ref: Option<&crate::mem_buffer::FnRegistry> = registry.as_deref();
         let (_total, error_count) = self.wal.for_each_entry(Some(cutoff), true, |entry| {
             match entry.operation {
                 WalOperation::Insert => match WalManager::deserialize_batch(&entry.data, &entry.table_name) {
