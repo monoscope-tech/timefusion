@@ -438,9 +438,7 @@ mod test_dml_operations {
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(rows_updated, 1, "Expected Bob's row to be updated");
 
-        let df = ctx
-            .sql("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'")
-            .await?;
+        let df = ctx.sql("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         let results = df.collect().await?;
         let duration = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(duration, 300, "Bob's duration should be 200 + 100 = 300");
