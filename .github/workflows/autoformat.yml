@@ -1,0 +1,72 @@
+name: Auto-format & Auto-fix
+
+# On every push to master, run `cargo fmt` and `cargo clippy --fix`, then
+# commit any changes back to master. Skips itself on bot-authored commits to
+# avoid infinite loops, and on PR merges that are already CI-clean.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  autofix:
+    # Skip when the previous commit was the bot itself (prevents loops) and
+    # when the commit message contains [skip autofmt].
+    if: |
+      github.event.head_commit.author.email != 'noreply@github.com' &&
+      !contains(github.event.head_commit.message, '[skip autofmt]') &&
+      !contains(github.event.head_commit.message, 'chore(autofmt)')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need write access via the default token; fetch full history so we
+          # can push the resulting commit cleanly.
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install nightly + stable toolchains
+        run: |
+          rustup toolchain install nightly --component rustfmt
+          rustup toolchain install stable --component clippy
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2
+
+      # rustfmt.toml uses nightly-only options — must invoke +nightly explicitly
+      # so it matches the CI fmt-check job.
+      - name: Run cargo fmt
+        run: cargo +nightly fmt --all
+
+      - name: Run cargo clippy --fix
+        # --allow-dirty because fmt may have already produced uncommitted changes.
+        # --allow-staged for the same reason in case any pre-stage runs.
+        # Intentionally non-fatal: clippy autofixes are best-effort. If a fix
+        # introduces a compile error, we revert and only push the fmt changes.
+        run: |
+          set +e
+          cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo "clippy --fix failed (likely couldn't auto-fix every warning); reverting clippy hunks only"
+            # Re-apply fmt result on top of HEAD without clippy's partial changes.
+            git checkout -- .
+            cargo +nightly fmt --all
+          fi
+          exit 0
+
+      - name: Commit & push if changed
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No formatting / clippy changes — nothing to push."
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m "chore(autofmt): apply cargo fmt + clippy --fix [skip autofmt]"
+          git push origin HEAD:master
