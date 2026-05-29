@@ -174,6 +174,11 @@ pub struct BufferedWriteLayer {
     flush_lock:             Mutex<()>,
     reserved_bytes:         AtomicUsize, // Memory reserved for in-flight writes
     pressure_notify:        Arc<Notify>, // Wakes flush task when pressure threshold crossed
+    // Function registry used to re-plan UPDATE/DELETE predicate + assignment SQL during
+    // WAL replay. Without this, any UPDATE referencing a function (CAST, coalesce,
+    // to_char, variant_get, etc.) fails replay with "No functions registered with this
+    // context" and gets silently quarantined.
+    function_registry:      Option<Arc<dyn datafusion::execution::FunctionRegistry + Send + Sync>>,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -210,6 +215,7 @@ impl BufferedWriteLayer {
             flush_lock: Mutex::new(()),
             reserved_bytes: AtomicUsize::new(0),
             pressure_notify: Arc::new(Notify::new()),
+            function_registry: None,
         })
     }
 
@@ -221,6 +227,14 @@ impl BufferedWriteLayer {
 
     pub fn with_delta_writer(mut self, callback: DeltaWriteCallback) -> Self {
         self.delta_write_callback = Some(callback);
+        self
+    }
+
+    /// Provide a function registry (typically a `SessionState`) so WAL replay can
+    /// re-plan UPDATE/DELETE SQL containing UDF references. MUST be called before
+    /// `recover_from_wal` for replay to succeed on function-bearing entries.
+    pub fn with_function_registry(mut self, registry: Arc<dyn datafusion::execution::FunctionRegistry + Send + Sync>) -> Self {
+        self.function_registry = Some(registry);
         self
     }
 
@@ -409,6 +423,14 @@ impl BufferedWriteLayer {
         let mem_buffer = &self.mem_buffer;
 
         let quarantine_dir = self.wal.data_dir().join("quarantine");
+        let registry = self.function_registry.clone();
+        if registry.is_none() {
+            warn!(
+                "WAL recovery: no function registry configured — UPDATE/DELETE entries that reference UDFs (CAST, coalesce, to_char, variant_get, ...) will fail to replay. \
+                 Call BufferedWriteLayer::with_function_registry() before recover_from_wal()."
+            );
+        }
+        let registry_ref: Option<&(dyn datafusion::execution::FunctionRegistry + Send + Sync)> = registry.as_deref();
         let (_total, error_count) = self.wal.for_each_entry(Some(cutoff), true, |entry| {
             match entry.operation {
                 WalOperation::Insert => match WalManager::deserialize_batch(&entry.data, &entry.table_name) {
@@ -420,7 +442,7 @@ impl BufferedWriteLayer {
                         match mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros) {
                             Ok(()) => entries_replayed += 1,
                             Err(e) => {
-                                error!("WAL CORRUPTION: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
+                                error!("WAL REPLAY FAILED: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
                                 quarantine_entry(&quarantine_dir, &entry, "insert_incompatible", &e.to_string());
                             }
                         }
@@ -435,8 +457,8 @@ impl BufferedWriteLayer {
                 },
                 WalOperation::Delete => match deserialize_delete_payload(&entry.data) {
                     Ok(payload) => {
-                        if let Err(e) = mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref()) {
-                            error!("WAL CORRUPTION: failed to replay DELETE for {}.{}: {}", entry.project_id, entry.table_name, e);
+                        if let Err(e) = mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), registry_ref) {
+                            error!("WAL REPLAY FAILED: DELETE for {}.{}: {}", entry.project_id, entry.table_name, e);
                             quarantine_entry(&quarantine_dir, &entry, "delete_replay_failed", &e.to_string());
                         } else {
                             deletes_replayed += 1;
@@ -452,8 +474,8 @@ impl BufferedWriteLayer {
                 },
                 WalOperation::Update => match deserialize_update_payload(&entry.data) {
                     Ok(payload) => {
-                        if let Err(e) = mem_buffer.update_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), &payload.assignments) {
-                            error!("WAL CORRUPTION: failed to replay UPDATE for {}.{}: {}", entry.project_id, entry.table_name, e);
+                        if let Err(e) = mem_buffer.update_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), &payload.assignments, registry_ref) {
+                            error!("WAL REPLAY FAILED: UPDATE for {}.{}: {}", entry.project_id, entry.table_name, e);
                             quarantine_entry(&quarantine_dir, &entry, "update_replay_failed", &e.to_string());
                         } else {
                             updates_replayed += 1;
