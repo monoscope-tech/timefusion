@@ -10,7 +10,7 @@ use arrow::{
 };
 use dashmap::DashMap;
 use datafusion::{
-    common::DFSchema,
+    common::{Column, DFSchema, tree_node::TreeNode},
     error::Result as DFResult,
     logical_expr::Expr,
     physical_expr::{create_physical_expr, execution_props::ExecutionProps},
@@ -377,6 +377,17 @@ fn bucket_overlaps_range(bucket: &TimeBucket, range: &(Option<i64>, Option<i64>)
         }
     }
     true
+}
+
+/// Strip table qualifiers from Column refs (e.g. `otel_logs_and_spans.timestamp` → `timestamp`)
+/// so exprs from SQL planning resolve against the bare-column DFSchema built from the
+/// in-memory table.
+fn strip_column_qualifiers(expr: Expr) -> DFResult<Expr> {
+    expr.transform(|e| match &e {
+        Expr::Column(col) => Ok(datafusion::common::tree_node::Transformed::yes(Expr::Column(Column::from_name(&col.name)))),
+        _ => Ok(datafusion::common::tree_node::Transformed::no(e)),
+    })
+    .map(|t| t.data)
 }
 
 impl MemBuffer {
@@ -976,7 +987,7 @@ impl MemBuffer {
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let props = ExecutionProps::new();
 
-        let physical_predicate = predicate.map(|p| create_physical_expr(p, &df_schema, &props)).transpose()?;
+        let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props)).transpose()?;
 
         let mut total_deleted = 0u64;
         let mut total_freed = 0usize;
@@ -1054,13 +1065,13 @@ impl MemBuffer {
         let df_schema = DFSchema::try_from(schema.as_ref().clone())?;
         let props = ExecutionProps::new();
 
-        let physical_predicate = predicate.map(|p| create_physical_expr(p, &df_schema, &props)).transpose()?;
+        let physical_predicate = predicate.map(|p| create_physical_expr(&strip_column_qualifiers(p.clone())?, &df_schema, &props)).transpose()?;
 
         // Pre-compile assignment expressions
         let physical_assignments: Vec<_> = assignments
             .iter()
             .map(|(col, expr)| {
-                let phys_expr = create_physical_expr(expr, &df_schema, &props)?;
+                let phys_expr = create_physical_expr(&strip_column_qualifiers(expr.clone())?, &df_schema, &props)?;
                 let col_idx = schema.index_of(col).map_err(|_| datafusion::error::DataFusionError::Execution(format!("Column '{}' not found", col)))?;
                 Ok((col_idx, phys_expr))
             })
