@@ -127,7 +127,15 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
     loop {
         match current_plan {
             LogicalPlan::Projection(proj) if extract_assignments => {
-                assignments = Some(extract_assignments_from_projection(proj)?);
+                match &mut assignments {
+                    // First Projection encountered: real UPDATE assignments.
+                    None => assignments = Some(extract_assignments_from_projection(proj)?),
+                    // Nested Projection (DataFusion CSE introduces one that defines
+                    // `__common_expr_*`). Inline its aliases into our assignments so
+                    // references to those synthetic columns resolve when we evaluate
+                    // physical exprs against the bare table schema below.
+                    Some(existing) => inline_projection_aliases(proj, existing)?,
+                }
                 current_plan = proj.input.as_ref();
             }
             LogicalPlan::Filter(filter) => {
@@ -197,6 +205,47 @@ fn extract_assignments_from_projection(proj: &datafusion::logical_expr::Projecti
 }
 
 use crate::optimizers::extract_project_id_from_expr as extract_project_id;
+
+/// Inline aliases from a nested (CSE) Projection into the existing UPDATE assignment
+/// exprs. Without this, refs like `__common_expr_1` survive into mem_buffer's physical
+/// expr evaluation against the bare table schema and fail with "Column not found".
+fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assignments: &mut [(String, Expr)]) -> Result<()> {
+    use std::collections::HashMap;
+
+    use datafusion::common::tree_node::{TreeNode, Transformed};
+
+    let mut subs: HashMap<String, Expr> = HashMap::new();
+    for (expr, field) in proj.expr.iter().zip(proj.schema.fields()) {
+        match expr {
+            Expr::Alias(alias) if alias.name != *field.name() || alias.name.starts_with("__common_expr_") => {
+                subs.insert(alias.name.clone(), (*alias.expr).clone());
+            }
+            Expr::Alias(alias) => {
+                // Pass-through alias matching the field name and not a CSE synthetic — skip.
+                let _ = alias;
+            }
+            _ => {}
+        }
+    }
+    if subs.is_empty() {
+        return Ok(());
+    }
+    for (_, value_expr) in assignments.iter_mut() {
+        let new_expr = value_expr
+            .clone()
+            .transform(|e| match &e {
+                Expr::Column(col) => match subs.get(&col.name) {
+                    Some(replacement) => Ok(Transformed::yes(replacement.clone())),
+                    None => Ok(Transformed::no(e)),
+                },
+                _ => Ok(Transformed::no(e)),
+            })
+            .map(|t| t.data)
+            .map_err(|e| DataFusionError::Execution(format!("Failed to inline CSE alias: {}", e)))?;
+        *value_expr = new_expr;
+    }
+    Ok(())
+}
 
 /// Unified DML execution plan
 #[derive(Clone)]
