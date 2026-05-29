@@ -192,7 +192,7 @@ async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Op
             Ok(post.into_iter().filter(|u| !pre_set.contains(u)).collect())
         })
     });
-    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone()).ok()?.with_delta_writer(delta_cb);
+    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), timefusion::functions::function_registry().unwrap()).ok()?.with_delta_writer(delta_cb);
     if tantivy_enabled {
         let bucket = cfg_arc.aws.aws_s3_bucket.clone().unwrap();
         let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg_arc.core.timefusion_table_prefix);

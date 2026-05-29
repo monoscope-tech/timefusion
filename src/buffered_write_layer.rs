@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
-    config::{self, AppConfig},
+    config::AppConfig,
     mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp},
     wal::{WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_update_payload},
 };
@@ -175,7 +175,7 @@ pub struct BufferedWriteLayer {
     reserved_bytes:         AtomicUsize, // Memory reserved for in-flight writes
     pressure_notify:        Arc<Notify>, // Wakes flush task when pressure threshold crossed
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
-    function_registry:      Option<Arc<crate::mem_buffer::FnRegistry>>,
+    function_registry:      Arc<crate::mem_buffer::FnRegistry>,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -185,8 +185,10 @@ impl std::fmt::Debug for BufferedWriteLayer {
 }
 
 impl BufferedWriteLayer {
-    /// Create a new BufferedWriteLayer with explicit config.
-    pub fn with_config(cfg: Arc<AppConfig>) -> anyhow::Result<Self> {
+    /// Create a new BufferedWriteLayer with explicit config and a function
+    /// registry. The registry MUST be the same one the runtime SessionContext
+    /// uses so WAL replay can resolve UDFs in stored UPDATE/DELETE SQL.
+    pub fn with_config(cfg: Arc<AppConfig>, function_registry: Arc<crate::mem_buffer::FnRegistry>) -> anyhow::Result<Self> {
         let wal = Arc::new(WalManager::with_fsync_mode_and_shards(
             cfg.core.wal_dir(),
             cfg.buffer.wal_fsync_mode(),
@@ -212,25 +214,12 @@ impl BufferedWriteLayer {
             flush_lock: Mutex::new(()),
             reserved_bytes: AtomicUsize::new(0),
             pressure_notify: Arc::new(Notify::new()),
-            function_registry: None,
+            function_registry,
         })
-    }
-
-    /// Create a new BufferedWriteLayer using global config (for production).
-    pub fn new() -> anyhow::Result<Self> {
-        let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
-        Self::with_config(Arc::new(cfg.clone()))
     }
 
     pub fn with_delta_writer(mut self, callback: DeltaWriteCallback) -> Self {
         self.delta_write_callback = Some(callback);
-        self
-    }
-
-    /// Must be set before `recover_from_wal` for UDF-bearing UPDATE/DELETE entries
-    /// to replay. Otherwise they're quarantined with a "No functions registered" error.
-    pub fn with_function_registry(mut self, registry: Arc<crate::mem_buffer::FnRegistry>) -> Self {
-        self.function_registry = Some(registry);
         self
     }
 
@@ -419,11 +408,7 @@ impl BufferedWriteLayer {
         let mem_buffer = &self.mem_buffer;
 
         let quarantine_dir = self.wal.data_dir().join("quarantine");
-        let registry = self.function_registry.clone();
-        if registry.is_none() {
-            warn!("WAL recovery: no function registry — UDF-bearing UPDATE/DELETE entries will be quarantined.");
-        }
-        let registry_ref: Option<&crate::mem_buffer::FnRegistry> = registry.as_deref();
+        let registry_ref: Option<&crate::mem_buffer::FnRegistry> = Some(self.function_registry.as_ref());
         let (_total, error_count) = self.wal.for_each_entry(Some(cutoff), true, |entry| {
             match entry.operation {
                 WalOperation::Insert => match WalManager::deserialize_batch(&entry.data, &entry.table_name) {
@@ -950,7 +935,7 @@ mod tests {
         let project = format!("p{}", test_id);
         let table = format!("t{}", test_id);
 
-        let layer = BufferedWriteLayer::with_config(cfg).unwrap();
+        let layer = BufferedWriteLayer::with_config(cfg, crate::functions::function_registry().unwrap()).unwrap();
         let batch = create_test_batch(&project);
 
         layer.insert(&project, &table, vec![batch.clone()]).await.unwrap();
@@ -977,7 +962,7 @@ mod tests {
 
         // First instance - write data
         {
-            let layer = BufferedWriteLayer::with_config(Arc::clone(&cfg)).unwrap();
+            let layer = BufferedWriteLayer::with_config(Arc::clone(&cfg), crate::functions::function_registry().unwrap()).unwrap();
             let batch = create_test_batch(&project);
             layer.insert(&project, &table, vec![batch]).await.unwrap();
             // Layer drops here - WAL data should be persisted
@@ -985,7 +970,7 @@ mod tests {
 
         // Second instance - recover from WAL
         {
-            let layer = BufferedWriteLayer::with_config(cfg).unwrap();
+            let layer = BufferedWriteLayer::with_config(cfg, crate::functions::function_registry().unwrap()).unwrap();
             let stats = layer.recover_from_wal().await.unwrap();
             assert!(stats.entries_replayed > 0, "Expected entries to be replayed from WAL");
 
@@ -1002,7 +987,7 @@ mod tests {
         let project = format!("p{}", test_id);
         let table = format!("t{}", test_id);
 
-        let layer = BufferedWriteLayer::with_config(cfg).unwrap();
+        let layer = BufferedWriteLayer::with_config(cfg, crate::functions::function_registry().unwrap()).unwrap();
         assert_eq!(layer.pressure_pct(), 0, "empty layer should report 0%");
 
         layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
@@ -1022,7 +1007,7 @@ mod tests {
         let project = format!("m{}", test_id);
         let table = format!("m{}", test_id);
 
-        let layer = BufferedWriteLayer::with_config(cfg).unwrap();
+        let layer = BufferedWriteLayer::with_config(cfg, crate::functions::function_registry().unwrap()).unwrap();
 
         // First insert should succeed
         let batch = create_test_batch(&project);

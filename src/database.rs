@@ -1123,14 +1123,24 @@ impl Database {
         SessionContext::new_with_state(session_state)
     }
 
-    /// Setup the session context with tables and register DataFusion tables
-    pub fn setup_session_context(&self, ctx: &mut SessionContext) -> DFResult<()> {
+    /// Register UDFs only — safe to call before `with_buffered_layer`. Used by
+    /// main.rs to harvest a FunctionRegistry for WAL replay without standing up
+    /// a throwaway SessionContext.
+    pub fn setup_session_udfs(&self, ctx: &mut SessionContext) -> DFResult<()> {
+        self.register_set_config_udf(ctx);
+        // CRITICAL: Register custom functions BEFORE JSON functions to ensure VariantAwareExprPlanner
+        // intercepts -> and ->> operators on Variant columns before JsonExprPlanner handles them as strings
+        crate::functions::register_custom_functions(ctx).map_err(|e| DataFusionError::Execution(format!("Failed to register custom functions: {}", e)))?;
+        self.register_json_functions(ctx);
+        Ok(())
+    }
+
+    /// Register routing + stats + pg_settings tables. Depends on `self.buffered_layer`
+    /// being set (stats table holds an Arc to it).
+    pub fn setup_session_tables(&self, ctx: &mut SessionContext) -> DFResult<()> {
         use crate::schema_loader::registry;
 
-        // Get batch queue from the app state if available
         let batch_queue = self.batch_queue.as_ref().map(Arc::clone);
-
-        // Register a routing table for each schema in the registry
         let registry = registry();
         for table_name in registry.list_tables() {
             if let Some(schema) = registry.get(&table_name) {
@@ -1141,7 +1151,6 @@ impl Database {
                     batch_queue.clone(),
                     table_name.clone(),
                 );
-
                 ctx.register_table(&table_name, Arc::new(routing_table))?;
                 info!("Registered ProjectRoutingTable for table '{}' with SessionContext", table_name);
             }
@@ -1156,16 +1165,14 @@ impl Database {
         )?;
 
         self.register_pg_settings_table(ctx)?;
-        self.register_set_config_udf(ctx);
-
-        // CRITICAL: Register custom functions BEFORE JSON functions to ensure VariantAwareExprPlanner
-        // intercepts -> and ->> operators on Variant columns before JsonExprPlanner handles them as strings
-        crate::functions::register_custom_functions(ctx).map_err(|e| DataFusionError::Execution(format!("Failed to register custom functions: {}", e)))?;
-
-        // JSON functions (JsonExprPlanner for -> and ->> on string columns - must come after Variant handlers)
-        self.register_json_functions(ctx);
-
         Ok(())
+    }
+
+    /// Setup the session context with both UDFs and tables. Preserves the legacy
+    /// table-then-UDF ordering for existing callers that wire everything up at once.
+    pub fn setup_session_context(&self, ctx: &mut SessionContext) -> DFResult<()> {
+        self.setup_session_tables(ctx)?;
+        self.setup_session_udfs(ctx)
     }
 
     /// Register PostgreSQL settings table for compatibility
