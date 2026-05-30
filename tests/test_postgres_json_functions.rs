@@ -62,6 +62,25 @@ mod test_json_functions {
     }
 
     #[tokio::test]
+    async fn test_to_jsonb_alias() -> Result<()> {
+        let db = Database::new().await?;
+        let db = std::sync::Arc::new(db);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        // to_jsonb is registered as an alias of to_json — Postgres syntax used by monoscope queries.
+        let df = ctx.sql(r#"SELECT to_jsonb('{"hello": "world"}') as result"#).await?;
+        let results = df.collect().await?;
+        assert_eq!(get_str(results[0].column(0).as_ref(), 0), r#"{"hello":"world"}"#);
+
+        let df = ctx.sql("SELECT to_jsonb(123) as result").await?;
+        let results = df.collect().await?;
+        assert_eq!(get_str(results[0].column(0).as_ref(), 0), "123");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_extract_epoch() -> Result<()> {
         // Initialize database
         let db = Database::new().await?;
