@@ -880,7 +880,7 @@ fn create_to_json_udf() -> ScalarUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ToJsonUDF {
     signature: Signature,
-    aliases: Vec<String>,
+    aliases:   Vec<String>,
 }
 
 impl ToJsonUDF {
@@ -888,7 +888,7 @@ impl ToJsonUDF {
         Self {
             signature: Signature::any(1, Volatility::Immutable),
             // `to_jsonb` is Postgres-only; TimeFusion stores JSON as Utf8View either way.
-            aliases: vec!["to_jsonb".to_string()],
+            aliases:   vec!["to_jsonb".to_string()],
         }
     }
 }
