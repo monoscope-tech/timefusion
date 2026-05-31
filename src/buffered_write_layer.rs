@@ -997,6 +997,53 @@ mod tests {
         assert!(pct < 5, "expected ~0% after tiny insert, got {pct}");
     }
 
+    /// Regression test for the 2026-05-28 monoscope dual-write outage.
+    ///
+    /// Bug: `insert()`'s pressure path called `flush_completed_buckets()`,
+    /// which only drains buckets older than `bucket_duration_secs`. Under
+    /// sustained ingest with near-now timestamps, ALL data goes into the
+    /// current bucket, the pressure flush is a no-op, the buffer counter
+    /// never decrements, and every subsequent insert fails with
+    /// `Memory limit exceeded`.
+    ///
+    /// We tighten the buffer so memory pressure trips after one batch
+    /// and verify that a second insert with the same near-now timestamp
+    /// (so it lands in the same "current" bucket) still succeeds — i.e.
+    /// the pressure flush actually freed memory. Pre-fix this would
+    /// fail with `Memory limit exceeded`.
+    #[tokio::test]
+    #[serial]
+    async fn test_memory_pressure_flushes_current_bucket() {
+        let dir = tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.core.timefusion_data_dir = dir.path().to_path_buf();
+        // Tiny budget — first insert pushes us over the pressure threshold.
+        cfg.buffer.timefusion_buffer_max_memory_mb = 1;
+        // Keep the default 600s bucket duration so the current bucket is
+        // definitely NOT yet "completed" — this is what exposed the bug.
+        let cfg = Arc::new(cfg);
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("p{}", test_id);
+        let table = format!("t{}", test_id);
+
+        let layer = BufferedWriteLayer::with_config(cfg).unwrap();
+
+        // First insert — fills buffer, no delta_write_callback configured
+        // so the eventual flush_all_now successfully no-ops the delta side
+        // and drains MemBuffer.
+        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+
+        // Second insert with the same near-now timestamp lands in the same
+        // current bucket. Pre-fix: this fails because `flush_completed_buckets`
+        // found nothing flushable. Post-fix: pressure path runs `flush_all_now`
+        // which drains the current bucket, so the second insert succeeds.
+        layer
+            .insert(&project, &table, vec![create_test_batch(&project)])
+            .await
+            .expect("second insert under memory pressure must succeed after current-bucket flush");
+    }
+
     #[tokio::test]
     async fn test_memory_reservation() {
         let dir = tempdir().unwrap();
