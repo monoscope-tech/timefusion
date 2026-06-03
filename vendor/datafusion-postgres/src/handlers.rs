@@ -231,16 +231,14 @@ impl SimpleQueryHandler for DfSessionService {
                 }
             };
 
-            if matches!(statement, sqlparser::ast::Statement::Insert(_)) {
-                let resp = map_rows_affected_for_insert(&df).await?;
+            if let Some(resp) = dml_completion(&df).await? {
                 results.push(resp);
             } else {
-                // For non-INSERT queries, return a regular Query response
                 let format_options =
                     Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-                let resp =
-                    df::encode_dataframe(df, &Format::UnifiedText, Some(format_options)).await?;
-                results.push(Response::Query(resp));
+                results.push(Response::Query(
+                    df::encode_dataframe(df, &Format::UnifiedText, Some(format_options)).await?,
+                ));
             }
         }
         Ok(results)
@@ -296,7 +294,7 @@ impl ExtendedQueryHandler for DfSessionService {
             }
         }
 
-        if let (_, Some((statement, plan))) = &portal.statement.statement {
+        if let (_, Some((_statement, plan))) = &portal.statement.statement {
             let param_types = planner::get_inferred_parameter_types(plan)
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
@@ -337,21 +335,19 @@ impl ExtendedQueryHandler for DfSessionService {
                 }
             };
 
-            if matches!(statement, sqlparser::ast::Statement::Insert(_)) {
-                let resp = map_rows_affected_for_insert(&dataframe).await?;
-
+            if let Some(resp) = dml_completion(&dataframe).await? {
                 Ok(resp)
             } else {
-                // For non-INSERT queries, return a regular Query response
                 let format_options =
                     Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-                let resp = df::encode_dataframe(
-                    dataframe,
-                    &portal.result_column_format,
-                    Some(format_options),
-                )
-                .await?;
-                Ok(Response::Query(resp))
+                Ok(Response::Query(
+                    df::encode_dataframe(
+                        dataframe,
+                        &portal.result_column_format,
+                        Some(format_options),
+                    )
+                    .await?,
+                ))
             }
         } else {
             Ok(Response::EmptyQuery)
@@ -359,28 +355,37 @@ impl ExtendedQueryHandler for DfSessionService {
     }
 }
 
-async fn map_rows_affected_for_insert(df: &DataFrame) -> PgWireResult<Response> {
-    // For INSERT queries, we need to execute the query to get the row count
-    // and return an Execution response with the proper tag
-    let result = df
+/// If `df` runs a DML/COPY plan, execute it and return a `CommandComplete`
+/// response with the right tag; otherwise return `None` so the caller falls
+/// back to the regular `Response::Query` path. Driving this off
+/// `LogicalPlan` (not the parsed AST) keeps the simple- and extended-query
+/// paths consistent with what DataFusion actually runs — statement-level
+/// rewrites can leave the AST in a non-Insert variant for what's really a write.
+async fn dml_completion(df: &DataFrame) -> PgWireResult<Option<Response>> {
+    use datafusion::arrow::array::UInt64Array;
+    use datafusion::logical_expr::dml::WriteOp;
+    let tag = match df.logical_plan() {
+        LogicalPlan::Dml(d) => match d.op {
+            WriteOp::Insert(_) => Tag::new("INSERT").with_oid(0),
+            WriteOp::Update => Tag::new("UPDATE"),
+            WriteOp::Delete => Tag::new("DELETE"),
+            WriteOp::Ctas => Tag::new("SELECT"),
+            WriteOp::Truncate => Tag::new("TRUNCATE"),
+        },
+        LogicalPlan::Copy(_) => Tag::new("COPY"),
+        _ => return Ok(None),
+    };
+    let batches = df
         .clone()
         .collect()
         .await
         .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-
-    // Extract count field from the first batch
-    let rows_affected = result
+    let rows = batches
         .first()
-        .and_then(|batch| batch.column_by_name("count"))
-        .and_then(|col| {
-            col.as_any()
-                .downcast_ref::<datafusion::arrow::array::UInt64Array>()
-        })
-        .map_or(0, |array| array.value(0) as usize);
-
-    // Create INSERT tag with the affected row count
-    let tag = Tag::new("INSERT").with_oid(0).with_rows(rows_affected);
-    Ok(Response::Execution(tag))
+        .and_then(|b| b.column_by_name("count"))
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .map_or(0, |a| a.value(0) as usize);
+    Ok(Some(Response::Execution(tag.with_rows(rows))))
 }
 
 pub struct Parser {
@@ -667,5 +672,65 @@ mod tests {
             .any(|m| matches!(m, PgWireBackendMessage::ParameterStatus(_)));
 
         assert!(!has_ps, "statement_timeout should not send ParameterStatus");
+    }
+
+    /// DML SQL exercised by both wire-path tests below. Sharing the list
+    /// keeps the simple- and extended-query coverage in lockstep.
+    const DML_CASES: &[&str] = &[
+        "INSERT INTO t VALUES (1, 'a')",
+        "UPDATE t SET name = 'x' WHERE id = 1",
+        "DELETE FROM t WHERE id = 1",
+    ];
+
+    /// DML must emit `Response::Execution` (→ `CommandComplete`), not
+    /// `Response::Query` (→ `TuplesOk`); clients decoding writes as
+    /// row-count-only treat the latter as a hard error and drop the row.
+    #[tokio::test]
+    async fn dml_returns_command_complete() {
+        let service = crate::testing::setup_handlers();
+        let mut client = MockClient::new();
+
+        <DfSessionService as SimpleQueryHandler>::do_query(
+            &service,
+            &mut client,
+            "CREATE TABLE t (id INT, name TEXT)",
+        )
+        .await
+        .unwrap();
+
+        for sql in DML_CASES {
+            let resp =
+                <DfSessionService as SimpleQueryHandler>::do_query(&service, &mut client, sql)
+                    .await
+                    .unwrap_or_else(|e| panic!("{sql} failed: {e:?}"));
+            assert!(
+                matches!(resp.as_slice(), [Response::Execution(_)]),
+                "{sql} must return Execution (CommandComplete), got {resp:?}"
+            );
+        }
+    }
+
+    /// Extended path optimises the plan before execution; confirm
+    /// `LogicalPlan::Dml` survives optimisation so `dml_completion` still
+    /// fires (otherwise the AST/plan desync silently returns).
+    #[tokio::test]
+    async fn dml_completion_survives_logical_optimisation() {
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE t (id INT, name TEXT)")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+
+        for sql in DML_CASES {
+            let df = ctx.sql(sql).await.unwrap();
+            let optimised = ctx.state().optimize(df.logical_plan()).unwrap();
+            let optimised_df = ctx.execute_logical_plan(optimised).await.unwrap();
+            assert!(
+                matches!(dml_completion(&optimised_df).await.unwrap(), Some(Response::Execution(_))),
+                "{sql}: optimised plan should still be detected as DML"
+            );
+        }
     }
 }
