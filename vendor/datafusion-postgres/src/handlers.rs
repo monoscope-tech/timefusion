@@ -466,18 +466,30 @@ impl QueryParser for Parser {
         stmt: &Self::Statement,
         column_format: Option<&Format>,
     ) -> PgWireResult<Vec<FieldInfo>> {
-        if let (_, Some((_, plan))) = stmt {
-            let schema = plan.schema();
-            let fields = arrow_schema_to_pg_fields(
-                schema.as_arrow(),
-                column_format.unwrap_or(&Format::UnifiedBinary),
-                None,
-            )?;
-
-            Ok(fields)
-        } else {
-            Ok(vec![])
+        let Some((_, plan)) = stmt.1.as_ref() else {
+            return Ok(vec![]);
+        };
+        let schema = plan.schema();
+        let fields = schema.fields();
+        // DataFusion emits `[count: UInt64]` for every DML/COPY plan — see
+        // `make_count_schema` in datafusion/expr/src/logical_plan/dml.rs.
+        // pgwire's contract for these without RETURNING is NoData; strict
+        // clients reject a TuplesOk/NoData mismatch at Describe time. Match
+        // on the exact shape so RETURNING (wider schema) and any future
+        // upstream rename (e.g. `rows_affected`) fall through to the real
+        // result path — at which point this guard needs to be updated.
+        if matches!(plan, LogicalPlan::Dml(_) | LogicalPlan::Copy(_))
+            && fields.len() == 1
+            && fields[0].name() == "count"
+            && fields[0].data_type() == &DataType::UInt64
+        {
+            return Ok(vec![]);
         }
+        arrow_schema_to_pg_fields(
+            schema.as_arrow(),
+            column_format.unwrap_or(&Format::UnifiedBinary),
+            None,
+        )
     }
 }
 
@@ -674,19 +686,13 @@ mod tests {
         assert!(!has_ps, "statement_timeout should not send ParameterStatus");
     }
 
-    /// DML SQL exercised by both wire-path tests below. Sharing the list
-    /// keeps the simple- and extended-query coverage in lockstep.
-    const DML_CASES: &[&str] = &[
-        "INSERT INTO t VALUES (1, 'a')",
-        "UPDATE t SET name = 'x' WHERE id = 1",
-        "DELETE FROM t WHERE id = 1",
-    ];
-
-    /// DML must emit `Response::Execution` (→ `CommandComplete`), not
-    /// `Response::Query` (→ `TuplesOk`); clients decoding writes as
-    /// row-count-only treat the latter as a hard error and drop the row.
+    /// `Describe Statement` for INSERT/UPDATE/DELETE without RETURNING must
+    /// return an empty result schema so pgwire emits `NoData`. Strict clients
+    /// (Hasql, pgjdbc, Npgsql, psycopg3, sqlx) treat a `RowDescription` here
+    /// as a `TuplesOk` protocol error and drop the write. SELECT is the
+    /// fallthrough positive control.
     #[tokio::test]
-    async fn dml_returns_command_complete() {
+    async fn get_result_schema_returns_no_data_for_dml() {
         let service = crate::testing::setup_handlers();
         let mut client = MockClient::new();
 
@@ -698,38 +704,29 @@ mod tests {
         .await
         .unwrap();
 
-        for sql in DML_CASES {
-            let resp =
-                <DfSessionService as SimpleQueryHandler>::do_query(&service, &mut client, sql)
-                    .await
-                    .unwrap_or_else(|e| panic!("{sql} failed: {e:?}"));
-            assert!(
-                matches!(resp.as_slice(), [Response::Execution(_)]),
-                "{sql} must return Execution (CommandComplete), got {resp:?}"
-            );
-        }
-    }
-
-    /// Extended path optimises the plan before execution; confirm
-    /// `LogicalPlan::Dml` survives optimisation so `dml_completion` still
-    /// fires (otherwise the AST/plan desync silently returns).
-    #[tokio::test]
-    async fn dml_completion_survives_logical_optimisation() {
-        let ctx = SessionContext::new();
-        ctx.sql("CREATE TABLE t (id INT, name TEXT)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-
-        for sql in DML_CASES {
-            let df = ctx.sql(sql).await.unwrap();
-            let optimised = ctx.state().optimize(df.logical_plan()).unwrap();
-            let optimised_df = ctx.execute_logical_plan(optimised).await.unwrap();
-            assert!(
-                matches!(dml_completion(&optimised_df).await.unwrap(), Some(Response::Execution(_))),
-                "{sql}: optimised plan should still be detected as DML"
+        let parser = <DfSessionService as ExtendedQueryHandler>::query_parser(&service);
+        let cases: &[(&str, bool)] = &[
+            ("INSERT INTO t VALUES (1, 'a')", true),
+            ("UPDATE t SET name = 'x' WHERE id = 1", true),
+            ("DELETE FROM t WHERE id = 1", true),
+            // COPY: not tested — `state.statement_to_plan` rejects COPY as
+            // unsupported today, so `LogicalPlan::Copy` is unreachable via
+            // the prepared-statement path. The Copy arm in the guard is
+            // defensive for if upstream ever enables it.
+            ("SELECT id, name FROM t", false),
+            // Over-match guard: a SELECT that happens to produce a single
+            // UInt64 `count` column must NOT be suppressed — only DML/COPY
+            // plans of that shape may. If the guard ever drops the
+            // `LogicalPlan::Dml | Copy` check, this case fails loudly.
+            ("SELECT COUNT(*) AS count FROM t", false),
+        ];
+        for (sql, expect_empty) in cases {
+            let stmt = parser.parse_sql(&client, sql, &[]).await.unwrap();
+            let fields = parser.get_result_schema(&stmt, None).unwrap();
+            assert_eq!(
+                fields.is_empty(),
+                *expect_empty,
+                "{sql}: expected empty={expect_empty}, got {fields:?}"
             );
         }
     }

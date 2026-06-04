@@ -84,6 +84,7 @@ fn small_table() -> TableSchema {
         }],
         z_order_columns: vec![],
         time_column:     None,
+        dedup_keys:      vec![],
         fields:          vec![
             ts_field("timestamp", false),
             FieldDef {
