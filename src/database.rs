@@ -1515,25 +1515,9 @@ impl Database {
             storage_options.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone());
         }
 
-        // Add DynamoDB locking configuration if enabled
-        if self.config.aws.is_dynamodb_locking_enabled() {
-            storage_options.insert("AWS_S3_LOCKING_PROVIDER".to_string(), "dynamodb".to_string());
-            if let Some(ref table) = self.config.aws.dynamodb.delta_dynamo_table_name {
-                storage_options.insert("DELTA_DYNAMO_TABLE_NAME".to_string(), table.clone());
-            }
-            if let Some(ref key) = self.config.aws.dynamodb.aws_access_key_id_dynamodb {
-                storage_options.insert("AWS_ACCESS_KEY_ID_DYNAMODB".to_string(), key.clone());
-            }
-            if let Some(ref secret) = self.config.aws.dynamodb.aws_secret_access_key_dynamodb {
-                storage_options.insert("AWS_SECRET_ACCESS_KEY_DYNAMODB".to_string(), secret.clone());
-            }
-            if let Some(ref region) = self.config.aws.dynamodb.aws_region_dynamodb {
-                storage_options.insert("AWS_REGION_DYNAMODB".to_string(), region.clone());
-            }
-            if let Some(ref endpoint) = self.config.aws.dynamodb.aws_endpoint_url_dynamodb {
-                storage_options.insert("AWS_ENDPOINT_URL_DYNAMODB".to_string(), endpoint.clone());
-            }
-        }
+        // Add DynamoDB locking configuration if enabled (same block the default
+        // storage-options builder uses).
+        self.config.aws.add_dynamodb_locking_options(&mut storage_options);
 
         info!(
             "Creating or loading custom table for project '{}' table '{}' at: {}",
