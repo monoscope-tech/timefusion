@@ -952,6 +952,24 @@ impl ScalarUDFImpl for ExtractEpochUDF {
     }
 }
 
+/// Downcast `array` to a primitive Arrow array and push each element into
+/// `values` as `json!(value)`, mapping nulls to `JsonValue::Null`.
+macro_rules! push_json_primitive {
+    ($array:expr, $values:expr, $ty:ty, $tyname:literal) => {{
+        let arr = $array
+            .as_any()
+            .downcast_ref::<$ty>()
+            .ok_or_else(|| DataFusionError::Execution(concat!("Failed to downcast to ", $tyname).to_string()))?;
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                $values.push(JsonValue::Null);
+            } else {
+                $values.push(json!(arr.value(i)));
+            }
+        }
+    }};
+}
+
 /// Convert Arrow array to JSON values
 fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonValue>> {
     let mut values = Vec::with_capacity(array.len());
@@ -977,45 +995,9 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
                 }
             }
         }
-        DataType::Int64 => {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to Int64Array".to_string()))?;
-            for i in 0..int_array.len() {
-                if int_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    values.push(json!(int_array.value(i)));
-                }
-            }
-        }
-        DataType::Float64 => {
-            let float_array = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to Float64Array".to_string()))?;
-            for i in 0..float_array.len() {
-                if float_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    values.push(json!(float_array.value(i)));
-                }
-            }
-        }
-        DataType::Boolean => {
-            let bool_array = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to BooleanArray".to_string()))?;
-            for i in 0..bool_array.len() {
-                if bool_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    values.push(json!(bool_array.value(i)));
-                }
-            }
-        }
+        DataType::Int64 => push_json_primitive!(array, values, Int64Array, "Int64Array"),
+        DataType::Float64 => push_json_primitive!(array, values, Float64Array, "Float64Array"),
+        DataType::Boolean => push_json_primitive!(array, values, BooleanArray, "BooleanArray"),
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let timestamp_array = array
                 .as_any()
