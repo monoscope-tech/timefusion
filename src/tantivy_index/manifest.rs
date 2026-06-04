@@ -79,11 +79,20 @@ pub async fn save(store: &dyn ObjectStore, table: &str, project_id: &str, manife
     Ok(())
 }
 
+/// Load the manifest, apply `f`, and save it back. The shared load/save
+/// skeleton behind `upsert` and `remove_many`.
+async fn mutate<F: FnOnce(&mut Manifest)>(store: &dyn ObjectStore, table: &str, project_id: &str, f: F) -> Result<()> {
+    let mut m = load(store, table, project_id).await?;
+    f(&mut m);
+    save(store, table, project_id, &m).await
+}
+
 /// Idempotent upsert: load, mutate, save.
 pub async fn upsert(store: &dyn ObjectStore, table: &str, project_id: &str, parquet_key: &str, entry: ManifestEntry) -> Result<()> {
-    let mut m = load(store, table, project_id).await?;
-    m.entries.insert(parquet_key.to_string(), entry);
-    save(store, table, project_id, &m).await
+    mutate(store, table, project_id, |m| {
+        m.entries.insert(parquet_key.to_string(), entry);
+    })
+    .await
 }
 
 /// Remove entries by parquet key (used during compaction GC).
@@ -91,9 +100,10 @@ pub async fn remove_many(store: &dyn ObjectStore, table: &str, project_id: &str,
     if parquet_keys.is_empty() {
         return Ok(());
     }
-    let mut m = load(store, table, project_id).await?;
-    for k in parquet_keys {
-        m.entries.remove(k);
-    }
-    save(store, table, project_id, &m).await
+    mutate(store, table, project_id, |m| {
+        for k in parquet_keys {
+            m.entries.remove(k);
+        }
+    })
+    .await
 }
