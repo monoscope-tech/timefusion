@@ -22,11 +22,29 @@ pub struct TableSchema {
     /// Defaults to `"timestamp"` for back-compat with existing schemas.
     #[serde(default)]
     pub time_column:     Option<String>,
+    /// Composite key for last-write-wins dedup at flush time. Empty = no dedup
+    /// (append-only). E.g. `[id, timestamp]`. Variant columns rejected at load.
+    /// Only collapses dupes inside one bucket; cross-bucket dupes need the
+    /// read-side row_number() rewrite.
+    #[serde(default)]
+    pub dedup_keys:      Vec<String>,
 }
 
 impl TableSchema {
     pub fn time_column_name(&self) -> &str {
         self.time_column.as_deref().unwrap_or("timestamp")
+    }
+
+    fn validate(&self) -> anyhow::Result<()> {
+        for k in &self.dedup_keys {
+            let f = self.fields.iter().find(|f| f.name == *k).ok_or_else(|| {
+                anyhow::anyhow!("schema `{}`: dedup_keys references unknown field `{}`", self.table_name, k)
+            })?;
+            if f.data_type == "Variant" {
+                anyhow::bail!("schema `{}`: dedup_keys cannot include Variant column `{}`", self.table_name, k);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -211,6 +229,9 @@ impl SchemaRegistry {
                 let content = file.contents_utf8().expect("Schema file should be UTF-8");
                 match serde_yaml::from_str::<TableSchema>(content) {
                     Ok(schema) => {
+                        if let Err(e) = schema.validate() {
+                            panic!("Invalid schema {:?}: {}", file.path(), e);
+                        }
                         schemas.insert(schema.table_name.clone(), schema);
                     }
                     Err(e) => {

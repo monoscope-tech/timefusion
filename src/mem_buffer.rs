@@ -4,9 +4,10 @@ use std::sync::{
 };
 
 use arrow::{
-    array::{Array, ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray},
-    compute::filter_record_batch,
+    array::{Array, ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray, UInt32Array},
+    compute::{concat_batches, filter_record_batch, take_record_batch},
     datatypes::{DataType, SchemaRef, TimeUnit},
+    row::{OwnedRow, RowConverter, SortField},
 };
 use dashmap::DashMap;
 use datafusion::{
@@ -235,6 +236,41 @@ fn apply_signed_delta(counter: &AtomicUsize, delta: i64) {
 
 pub fn estimate_batch_size(batch: &RecordBatch) -> usize {
     batch.get_array_memory_size() + BATCH_FIXED_OVERHEAD + batch.num_columns() * PER_COLUMN_OVERHEAD
+}
+
+/// Collapse rows in `batches` to one row per unique value of `keys`, keep-last.
+/// Empty `keys` or empty input → no-op. Surviving row order is preserved.
+/// Tiebreaker on identical key tuples: last occurrence in insertion order wins.
+/// Only collapses dupes inside this call's input — cross-bucket dupes need
+/// the read-side row_number() rewrite.
+pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String]) -> anyhow::Result<Vec<RecordBatch>> {
+    let Some(schema) = batches.first().map(|b| b.schema()) else { return Ok(batches) };
+    if keys.is_empty() {
+        return Ok(batches);
+    }
+    let combined = concat_batches(&schema, &batches)?;
+    let arrs: Vec<ArrayRef> = keys
+        .iter()
+        .map(|k| {
+            combined
+                .column_by_name(k)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("dedup key `{k}` missing from batch schema"))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let converter = RowConverter::new(arrs.iter().map(|a| SortField::new(a.data_type().clone())).collect())?;
+    let rows = converter.convert_columns(&arrs)?;
+    let mut last: std::collections::HashMap<OwnedRow, u32> = std::collections::HashMap::with_capacity(rows.num_rows());
+    for i in 0..rows.num_rows() {
+        last.insert(rows.row(i).owned(), i as u32);
+    }
+    if last.len() == rows.num_rows() {
+        // No duplicates — skip the take(), which would otherwise rebuild every column.
+        return Ok(vec![combined]);
+    }
+    let mut idx: Vec<u32> = last.into_values().collect();
+    idx.sort_unstable();
+    Ok(vec![take_record_batch(&combined, &UInt32Array::from(idx))?])
 }
 
 /// Merge two arrays based on a boolean mask.
@@ -1437,6 +1473,60 @@ mod tests {
         let id_array = Int64Array::from(vec![1]);
         let name_array = StringViewArray::from(vec!["test"]);
         RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
+    }
+
+    #[test]
+    fn dedup_batches_keep_last_on_composite_key() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8View, false),
+        ]));
+        let mk = |ts: Vec<i64>, ids: Vec<i64>, pl: Vec<&str>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(StringViewArray::from(pl)),
+                ],
+            )
+            .unwrap()
+        };
+        let batches = vec![
+            mk(vec![100, 200], vec![1, 2], vec!["v1-old", "v2-old"]),
+            mk(vec![100, 300], vec![1, 3], vec!["v1-new", "v3"]),
+            mk(vec![200], vec![2], vec!["v2-new"]),
+        ];
+        let keys = vec!["id".to_string(), "timestamp".to_string()];
+        let out = dedup_batches(batches, &keys).expect("dedup ok");
+        assert_eq!(out.len(), 1);
+        let b = &out[0];
+        assert_eq!(b.num_rows(), 3, "should collapse to 3 unique (id,ts)");
+        let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
+        let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        let got: Vec<(i64, &str)> = (0..b.num_rows()).map(|i| (ids.value(i), pl.value(i))).collect();
+        // Concat order = [(1,100,old), (2,200,old), (1,100,new), (3,300,v3), (2,200,new)];
+        // kept = surviving indices [2,3,4] sorted → (1,new), (3,v3), (2,new).
+        assert_eq!(got, vec![(1, "v1-new"), (3, "v3"), (2, "v2-new")]);
+    }
+
+    #[test]
+    fn dedup_batches_noop_when_keys_empty_or_input_empty() {
+        let empty: Vec<RecordBatch> = vec![];
+        assert!(dedup_batches(empty, &["id".to_string()]).unwrap().is_empty());
+
+        let batch = create_test_batch(123);
+        let out = dedup_batches(vec![batch.clone()], &[]).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].num_rows(), batch.num_rows());
+    }
+
+    #[test]
+    fn dedup_batches_errors_on_unknown_key() {
+        let batch = create_test_batch(1);
+        let err = dedup_batches(vec![batch], &["nonexistent".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("nonexistent"), "msg: {err}");
     }
 
     #[test]
