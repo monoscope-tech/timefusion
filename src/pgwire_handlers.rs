@@ -47,7 +47,7 @@ impl AuthConfig {
     /// PG wire protocol's cleartext handler treats `None` as "accept any",
     /// which is an open ingest endpoint when bound to 0.0.0.0.
     pub fn from_core(core: &crate::config::CoreConfig) -> anyhow::Result<Self> {
-        let allow_insecure = std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        let allow_insecure = crate::config::is_insecure_auth_allowed();
         match (&core.pgwire_password, allow_insecure) {
             (Some(p), _) if !p.is_empty() => Ok(Self {
                 username: core.pgwire_user.clone(),
@@ -241,6 +241,15 @@ fn sanitize_query(query: &str, operation: &str) -> String {
     }
 }
 
+/// Classify `query` and stamp the standard query/db tracing fields onto `span`.
+fn record_query_span(span: &tracing::Span, query: &str) {
+    let (query_type, operation) = classify_query(query);
+    span.record("query.type", query_type);
+    span.record("query.operation", operation);
+    span.record("db.operation", operation);
+    span.record("query.text", sanitize_query(query, operation).as_str());
+}
+
 #[async_trait]
 impl SimpleQueryHandler for LoggingSimpleQueryHandler {
     #[instrument(
@@ -257,11 +266,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let rewritten = rewrite_pg_synonyms(query);
         let query = rewritten.as_ref();
         let span = tracing::Span::current();
-        let (query_type, operation) = classify_query(query);
-        span.record("query.type", query_type);
-        span.record("query.operation", operation);
-        span.record("db.operation", operation);
-        span.record("query.text", sanitize_query(query, operation).as_str());
+        record_query_span(&span, query);
 
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span).await
@@ -330,11 +335,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
     {
         let span = tracing::Span::current();
         let query = &portal.statement.statement.0;
-        let (query_type, operation) = classify_query(query);
-        span.record("query.type", query_type);
-        span.record("query.operation", operation);
-        span.record("db.operation", operation);
-        span.record("query.text", sanitize_query(query, operation).as_str());
+        record_query_span(&span, query);
 
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows)
