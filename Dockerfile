@@ -18,11 +18,13 @@ RUN cargo install cargo-chef --locked
 # Cargo.toml / Cargo.lock / path-dep manifests change, so the cook layer below
 # stays cached across most edits.
 FROM chef AS planner
+# Only inputs cargo chef prepare actually reads: Cargo manifests + path-dep
+# manifests (in vendor/). NOT src/ or schemas/ — including them here would
+# bust the planner layer on every source edit, transitively invalidating
+# the cook layer and defeating cargo-chef's purpose.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto/ proto/
 COPY vendor/ vendor/
-COPY src/ src/
-COPY schemas/ schemas/
 RUN cargo chef prepare --recipe-path recipe.json
 
 ##############################
