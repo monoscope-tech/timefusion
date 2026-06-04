@@ -353,6 +353,19 @@ pub async fn serve_with_logging(
     Ok(())
 }
 
+/// Same as `serve_with_logging` but reuses an already-bound `TcpListener`.
+/// Lets `main.rs` pre-bind `:5432` before the slow Database/WAL recovery so
+/// clients connecting during startup see SQLSTATE 57P03 from the early-bind
+/// responder, then take over the same listener (no rebind window).
+pub async fn serve_with_listener(
+    listener: tokio::net::TcpListener, session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions,
+    auth_config: AuthConfig, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_config));
+    datafusion_postgres::serve_with_listener(listener, handlers, options, shutdown).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::rewrite_pg_synonyms;

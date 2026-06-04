@@ -46,6 +46,23 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Create Arc<AppConfig> for passing to components
     let cfg_arc = Arc::new(cfg.clone());
 
+    // Bind :5432 immediately, before the slow startup work (Database open,
+    // WAL recovery — up to ~15 min when WAL has accumulated). Clients
+    // connecting in this window get SQLSTATE 57P03 ("starting up") from
+    // the early-bind responder instead of ECONNREFUSED, which is what
+    // Hasql / pgjdbc / libpq expect during a backend restart and retry
+    // on cleanly. See pgwire_early_bind for the responder.
+    let pg_port = cfg.core.pgwire_port;
+    let pg_backlog = 4096u32;
+    let pg_listener = Arc::new(bind_pgwire_listener("0.0.0.0", pg_port, pg_backlog).await?);
+    info!("PGWire listener bound on :{} (backlog={}) before startup work begins", pg_port, pg_backlog);
+    let early_shutdown = tokio_util::sync::CancellationToken::new();
+    let early_shutdown_for_task = early_shutdown.clone();
+    let early_listener = Arc::clone(&pg_listener);
+    let early_task = tokio::spawn(async move {
+        timefusion::pgwire_early_bind::run_until_ready(&early_listener, early_shutdown_for_task).await;
+    });
+
     // Initialize database with explicit config
     let mut db = Database::with_config(Arc::clone(&cfg_arc)).await?;
     info!("Database initialized successfully");
@@ -157,9 +174,16 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let db = Arc::new(db);
     db.setup_session_tables(&mut session_context)?;
 
-    // Start PGWire server
-    let pg_port = cfg.core.pgwire_port;
-    info!("Starting PGWire server on port: {}", pg_port);
+    // Start PGWire server on the listener we pre-bound at the top of
+    // async_main. First, hand control of that listener back from the
+    // early-bind 57P03 responder.
+    info!("Stopping early-bind 57P03 responder; handing listener to real PGWire server");
+    early_shutdown.cancel();
+    let _ = early_task.await;
+    // Both Arc handles dropped now (early_task held the only other one);
+    // try_unwrap should succeed and give us the owned listener.
+    let listener = Arc::try_unwrap(pg_listener)
+        .map_err(|_| anyhow::anyhow!("PGWire listener still has outstanding Arc references after early-bind shutdown"))?;
 
     let auth_config = timefusion::pgwire_handlers::AuthConfig::from_core(&cfg.core)?;
 
@@ -170,9 +194,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let pgwire_shutdown = tokio_util::sync::CancellationToken::new();
     let pgwire_shutdown_for_task = pgwire_shutdown.clone();
     let pg_task = tokio::spawn(async move {
-        let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
+        let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string()).with_backlog(pg_backlog);
 
-        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(Arc::new(session_context), &opts, auth_config, async move {
+        if let Err(e) = timefusion::pgwire_handlers::serve_with_listener(listener, Arc::new(session_context), &opts, auth_config, async move {
             pgwire_shutdown_for_task.cancelled().await
         })
         .await
@@ -310,4 +334,19 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     telemetry::shutdown_telemetry();
 
     Ok(())
+}
+
+/// Bind the PGWire listener on `host:port` with an explicit backlog of
+/// `backlog`. Uses `TcpSocket` rather than `TcpListener::bind` so we
+/// control the backlog (mio's `bind` hardcodes 128); the kernel still
+/// clamps to `somaxconn`. Pulled out as its own function so the early
+/// 57P03 responder and the real server share one bind path.
+async fn bind_pgwire_listener(host: &str, port: u16, backlog: u32) -> anyhow::Result<tokio::net::TcpListener> {
+    use tokio::net::{lookup_host, TcpSocket};
+    let server_addr = format!("{host}:{port}");
+    let addr = lookup_host(&server_addr).await?.next().ok_or_else(|| anyhow::anyhow!("could not resolve {server_addr}"))?;
+    let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    Ok(socket.listen(backlog)?)
 }
