@@ -1,55 +1,49 @@
-use super::allocator::BlockStateTracker;
-use super::reader::ColReaderInfo;
-use super::{ReadConsistency, Walrus};
-use crate::wal::block::{Block, Entry, Metadata};
-use crate::wal::config::{MAX_BATCH_ENTRIES, PREFIX_META_SIZE, checksum64, debug_print};
-use std::io;
-use std::sync::{Arc, RwLock};
-
-use rkyv::{AlignedVec, Deserialize};
-
 #[cfg(target_os = "linux")]
-use crate::wal::config::USE_FD_BACKEND;
+use std::os::unix::io::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::Ordering;
+use std::{
+    io,
+    sync::{Arc, RwLock},
+};
 
 #[cfg(target_os = "linux")]
 use io_uring;
+use rkyv::{AlignedVec, Deserialize};
 
+use super::{ReadConsistency, Walrus, allocator::BlockStateTracker, reader::ColReaderInfo};
 #[cfg(target_os = "linux")]
-use std::os::unix::io::AsRawFd;
+use crate::wal::config::USE_FD_BACKEND;
+use crate::wal::{
+    block::{Block, Entry, Metadata},
+    config::{MAX_BATCH_ENTRIES, PREFIX_META_SIZE, checksum64, debug_print},
+};
 
 impl Walrus {
     pub fn read_next(&self, col_name: &str, checkpoint: bool) -> io::Result<Option<Entry>> {
         const TAIL_FLAG: u64 = 1u64 << 63;
         let info_arc = if let Some(arc) = {
-            let map = self.reader.data.read().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned")
-            })?;
+            let map = self.reader.data.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned"))?;
             map.get(col_name).cloned()
         } {
             arc
         } else {
-            let mut map = self.reader.data.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "reader map write lock poisoned")
-            })?;
+            let mut map = self.reader.data.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "reader map write lock poisoned"))?;
             map.entry(col_name.to_string())
                 .or_insert_with(|| {
                     Arc::new(RwLock::new(ColReaderInfo {
-                        chain: Vec::new(),
-                        cur_block_idx: 0,
-                        cur_block_offset: 0,
+                        chain:               Vec::new(),
+                        cur_block_idx:       0,
+                        cur_block_offset:    0,
                         reads_since_persist: 0,
-                        tail_block_id: 0,
-                        tail_offset: 0,
+                        tail_block_id:       0,
+                        tail_offset:         0,
                         hydrated_from_index: false,
                     }))
                 })
                 .clone()
         };
-        let mut info = info_arc
-            .write()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
+        let mut info = info_arc.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
         debug_print!(
             "[reader] read_next start: col={}, chain_len={}, idx={}, offset={}",
             col_name,
@@ -103,12 +97,7 @@ impl Walrus {
         // `Walrus::set_persisted_read_position`.
         if let Some((tail_block_id, tail_off)) = persisted_tail {
             if !info.chain.is_empty() {
-                if let Some((idx, block)) = info
-                    .chain
-                    .iter()
-                    .enumerate()
-                    .find(|(_, b)| b.id == tail_block_id)
-                {
+                if let Some((idx, block)) = info.chain.iter().enumerate().find(|(_, b)| b.id == tail_block_id) {
                     let used = block.used;
                     info.cur_block_idx = idx;
                     info.cur_block_offset = tail_off.min(used);
@@ -126,9 +115,7 @@ impl Walrus {
 
         loop {
             // Reacquire column lock at the start of each iteration
-            let mut info = info_arc.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "col info write lock poisoned")
-            })?;
+            let mut info = info_arc.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
             // Sealed chain path
             if info.cur_block_idx < info.chain.len() {
                 let idx = info.cur_block_idx;
@@ -183,12 +170,7 @@ impl Walrus {
                         return Ok(Some(entry));
                     }
                     Err(_) => {
-                        debug_print!(
-                            "[reader] read_next: read error col={}, block_id={}, offset={}",
-                            col_name,
-                            block.id,
-                            off
-                        );
+                        debug_print!("[reader] read_next: read error col={}, block_id={}, offset={}", col_name, block.id, off);
                         return Ok(None);
                     }
                 }
@@ -199,9 +181,7 @@ impl Walrus {
             drop(info);
 
             let writer_arc = {
-                let map = self.writers.read().map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "writers read lock poisoned")
-                })?;
+                let map = self.writers.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "writers read lock poisoned"))?;
                 match map.get(col_name) {
                     Some(w) => w.clone(),
                     None => return Ok(None),
@@ -211,27 +191,16 @@ impl Walrus {
 
             // If persisted tail points to a different block and that block is now sealed in chain, fold it
             // Reacquire column lock for folding/rebasing decisions
-            let mut info = info_arc.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "col info write lock poisoned")
-            })?;
+            let mut info = info_arc.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
             if let Some((tail_block_id, tail_off)) = persisted_tail {
                 if tail_block_id != active_block.id {
-                    if let Some((idx, _)) = info
-                        .chain
-                        .iter()
-                        .enumerate()
-                        .find(|(_, b)| b.id == tail_block_id)
-                    {
+                    if let Some((idx, _)) = info.chain.iter().enumerate().find(|(_, b)| b.id == tail_block_id) {
                         info.cur_block_idx = idx;
                         info.cur_block_offset = tail_off.min(info.chain[idx].used);
                         if checkpoint {
                             if self.should_persist(&mut info, true) {
                                 if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                    let _ = idx_guard.set(
-                                        col_name.to_string(),
-                                        info.cur_block_idx as u64,
-                                        info.cur_block_offset,
-                                    );
+                                    let _ = idx_guard.set(col_name.to_string(), info.cur_block_idx as u64, info.cur_block_offset);
                                 }
                             }
                         }
@@ -244,11 +213,7 @@ impl Walrus {
                         if checkpoint {
                             if self.should_persist(&mut info, true) {
                                 if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                                    let _ = idx_guard.set(
-                                        col_name.to_string(),
-                                        active_block.id | TAIL_FLAG,
-                                        0,
-                                    );
+                                    let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
                                 }
                             }
                         }
@@ -261,8 +226,7 @@ impl Walrus {
                 // the cursor on a previous call. Only the genuinely-fresh case (no
                 // in-memory state) needs the force-persist that initializes
                 // `(active_block | TAIL_FLAG, 0)` to claim the cursor.
-                let has_prior_state = info.tail_block_id == active_block.id
-                    && (info.tail_offset > 0 || info.cur_block_idx > 0 || info.cur_block_offset > 0);
+                let has_prior_state = info.tail_block_id == active_block.id && (info.tail_offset > 0 || info.cur_block_idx > 0 || info.cur_block_offset > 0);
                 if has_prior_state {
                     persisted_tail = Some((info.tail_block_id, info.tail_offset));
                 } else {
@@ -271,8 +235,7 @@ impl Walrus {
                 if checkpoint && !has_prior_state {
                     if self.should_persist(&mut info, true) {
                         if let Ok(mut idx_guard) = self.read_offset_index.write() {
-                            let _ =
-                                idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
+                            let _ = idx_guard.set(col_name.to_string(), active_block.id | TAIL_FLAG, 0);
                         }
                     }
                 }
@@ -303,9 +266,7 @@ impl Walrus {
                     Ok((entry, consumed)) => {
                         let new_off = tail_off + consumed as u64;
                         // Reacquire column lock to update in-memory progress, then decide persistence
-                        let mut info = info_arc.write().map_err(|_| {
-                            io::Error::new(io::ErrorKind::Other, "col info write lock poisoned")
-                        })?;
+                        let mut info = info_arc.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
                         let mut maybe_persist = None;
                         if checkpoint {
                             info.tail_block_id = active_block.id;
@@ -378,18 +339,13 @@ impl Walrus {
         }
     }
 
-    pub fn batch_read_for_topic(
-        &self,
-        col_name: &str,
-        max_bytes: usize,
-        checkpoint: bool,
-    ) -> io::Result<Vec<Entry>> {
+    pub fn batch_read_for_topic(&self, col_name: &str, max_bytes: usize, checkpoint: bool) -> io::Result<Vec<Entry>> {
         // Helper struct for read planning
         struct ReadPlan {
-            blk: Block,
-            start: u64,
-            end: u64,
-            is_tail: bool,
+            blk:       Block,
+            start:     u64,
+            end:       u64,
+            is_tail:   bool,
             chain_idx: Option<usize>,
         }
 
@@ -397,10 +353,7 @@ impl Walrus {
 
         // Pre-snapshot active writer state to avoid lock-order inversion later
         let writer_snapshot: Option<(Block, u64)> = {
-            let map = self
-                .writers
-                .read()
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "writers read lock poisoned"))?;
+            let map = self.writers.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "writers read lock poisoned"))?;
             match map.get(col_name).cloned() {
                 Some(w) => match w.snapshot_block() {
                     Ok(snapshot) => Some(snapshot),
@@ -412,34 +365,28 @@ impl Walrus {
 
         // 1) Get or create reader info
         let info_arc = if let Some(arc) = {
-            let map = self.reader.data.read().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned")
-            })?;
+            let map = self.reader.data.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned"))?;
             map.get(col_name).cloned()
         } {
             arc
         } else {
-            let mut map = self.reader.data.write().map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "reader map write lock poisoned")
-            })?;
+            let mut map = self.reader.data.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "reader map write lock poisoned"))?;
             map.entry(col_name.to_string())
                 .or_insert_with(|| {
                     Arc::new(RwLock::new(ColReaderInfo {
-                        chain: Vec::new(),
-                        cur_block_idx: 0,
-                        cur_block_offset: 0,
+                        chain:               Vec::new(),
+                        cur_block_idx:       0,
+                        cur_block_offset:    0,
                         reads_since_persist: 0,
-                        tail_block_id: 0,
-                        tail_offset: 0,
+                        tail_block_id:       0,
+                        tail_offset:         0,
                         hydrated_from_index: false,
                     }))
                 })
                 .clone()
         };
 
-        let mut info = info_arc
-            .write()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
+        let mut info = info_arc.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
 
         // Hydrate from index if needed
         let mut persisted_tail_for_fold: Option<(u64 /*block_id*/, u64 /*offset*/)> = None;
@@ -476,13 +423,7 @@ impl Walrus {
 
         // Fold persisted tail into sealed blocks if possible
         if let Some((tail_block_id, tail_off)) = persisted_tail_for_fold {
-            if let Some(idx) = info
-                .chain
-                .iter()
-                .enumerate()
-                .find(|(_, b)| b.id == tail_block_id)
-                .map(|(idx, _)| idx)
-            {
+            if let Some(idx) = info.chain.iter().enumerate().find(|(_, b)| b.id == tail_block_id).map(|(idx, _)| idx) {
                 let used = info.chain[idx].used;
                 info.cur_block_idx = idx;
                 info.cur_block_offset = tail_off.min(used);
@@ -524,11 +465,7 @@ impl Walrus {
         if cur_idx >= chain_len_at_plan {
             if let Some((active_block, written)) = writer_snapshot.clone() {
                 // Use in-memory tail progress if available for this block
-                let tail_start = if info.tail_block_id == active_block.id {
-                    info.tail_offset
-                } else {
-                    0
-                };
+                let tail_start = if info.tail_block_id == active_block.id { info.tail_offset } else { 0 };
                 if tail_start < written {
                     let end = written; // read up to current writer offset
                     plan.push(ReadPlan {
@@ -560,9 +497,7 @@ impl Walrus {
         let buffers = if USE_FD_BACKEND.load(Ordering::Relaxed) {
             // io_uring path
             let ring_size = (plan.len() + 64).min(4096) as u32;
-            let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| {
-                io::Error::new(io::ErrorKind::Other, format!("io_uring init failed: {}", e))
-            })?;
+            let mut ring = io_uring::IoUring::new(ring_size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("io_uring init failed: {}", e)))?;
 
             let mut temp_buffers: Vec<Vec<u8>> = vec![Vec::new(); plan.len()];
             let mut expected_sizes: Vec<usize> = vec![0; plan.len()];
@@ -582,17 +517,14 @@ impl Walrus {
                     ));
                 };
 
-                let read_op = io_uring::opcode::Read::new(fd, buffer.as_mut_ptr(), size as u32)
-                    .offset(file_offset)
-                    .build()
-                    .user_data(plan_idx as u64);
+                let read_op = io_uring::opcode::Read::new(fd, buffer.as_mut_ptr(), size as u32).offset(file_offset).build().user_data(plan_idx as u64);
 
                 temp_buffers[plan_idx] = buffer;
 
                 unsafe {
-                    ring.submission().push(&read_op).map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("io_uring push failed: {}", e))
-                    })?;
+                    ring.submission()
+                        .push(&read_op)
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("io_uring push failed: {}", e)))?;
                 }
             }
 
@@ -605,18 +537,12 @@ impl Walrus {
                     let plan_idx = cqe.user_data() as usize;
                     let got = cqe.result();
                     if got < 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("io_uring read failed: {}", got),
-                        ));
+                        return Err(io::Error::new(io::ErrorKind::Other, format!("io_uring read failed: {}", got)));
                     }
                     if (got as usize) != expected_sizes[plan_idx] {
                         return Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            format!(
-                                "short read: got {} bytes, expected {}",
-                                got, expected_sizes[plan_idx]
-                            ),
+                            format!("short read: got {} bytes, expected {}", got, expected_sizes[plan_idx]),
                         ));
                     }
                 }
@@ -673,8 +599,7 @@ impl Walrus {
                     break; // Not enough data for header
                 }
 
-                let meta_len =
-                    (buffer[buf_offset] as usize) | ((buffer[buf_offset + 1] as usize) << 8);
+                let meta_len = (buffer[buf_offset] as usize) | ((buffer[buf_offset + 1] as usize) << 8);
 
                 if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
                     // Invalid or zeroed header - stop parsing this block
@@ -700,9 +625,7 @@ impl Walrus {
                 }
 
                 // Enforce byte budget on payload bytes, but always allow at least one entry.
-                let next_total = total_data_bytes
-                    .checked_add(data_size)
-                    .unwrap_or(usize::MAX);
+                let next_total = total_data_bytes.checked_add(data_size).unwrap_or(usize::MAX);
                 if next_total > max_bytes && !entries.is_empty() {
                     break;
                 }
@@ -714,16 +637,11 @@ impl Walrus {
 
                 // Verify checksum
                 if checksum64(data_slice) != meta.checksum {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "checksum mismatch in batch read",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "checksum mismatch in batch read"));
                 }
 
                 // Add to results
-                entries.push(Entry {
-                    data: data_slice.to_vec(),
-                });
+                entries.push(Entry { data: data_slice.to_vec() });
                 total_data_bytes = next_total;
                 entries_parsed += 1;
 
@@ -763,7 +681,7 @@ impl Walrus {
                         info.tail_offset = final_tail_offset;
                         target = PersistTarget::Tail {
                             blk_id: final_tail_block_id,
-                            off: final_tail_offset,
+                            off:    final_tail_offset,
                         };
                     } else {
                         info.cur_block_idx = final_block_idx;
@@ -777,39 +695,27 @@ impl Walrus {
                 drop(info);
             } else {
                 // Reacquire to update
-                let mut info2 = info_arc.write().map_err(|_| {
-                    io::Error::new(io::ErrorKind::Other, "col info write lock poisoned")
-                })?;
+                let mut info2 = info_arc.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "col info write lock poisoned"))?;
                 if checkpoint {
                     if saw_tail {
                         info2.cur_block_idx = chain_len_at_plan;
                         info2.cur_block_offset = 0;
                         info2.tail_block_id = final_tail_block_id;
                         info2.tail_offset = final_tail_offset;
-                        if let ReadConsistency::AtLeastOnce { persist_every } =
-                            self.read_consistency
-                        {
+                        if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
                             // Clamp contribution so a single call can't reach the threshold
-                            let room = persist_every
-                                .saturating_sub(1)
-                                .saturating_sub(info2.reads_since_persist);
+                            let room = persist_every.saturating_sub(1).saturating_sub(info2.reads_since_persist);
                             let add = entries_parsed.min(room);
-                            info2.reads_since_persist =
-                                info2.reads_since_persist.saturating_add(add);
+                            info2.reads_since_persist = info2.reads_since_persist.saturating_add(add);
                             // target remains None here to avoid persisting to end in one batch
                         }
                     } else {
                         info2.cur_block_idx = final_block_idx;
                         info2.cur_block_offset = final_block_offset;
-                        if let ReadConsistency::AtLeastOnce { persist_every } =
-                            self.read_consistency
-                        {
-                            let room = persist_every
-                                .saturating_sub(1)
-                                .saturating_sub(info2.reads_since_persist);
+                        if let ReadConsistency::AtLeastOnce { persist_every } = self.read_consistency {
+                            let room = persist_every.saturating_sub(1).saturating_sub(info2.reads_since_persist);
                             let add = entries_parsed.min(room);
-                            info2.reads_since_persist =
-                                info2.reads_since_persist.saturating_add(add);
+                            info2.reads_since_persist = info2.reads_since_persist.saturating_add(add);
                         }
                     }
                 }

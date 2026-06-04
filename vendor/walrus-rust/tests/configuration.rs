@@ -1,11 +1,13 @@
 mod common;
 
+use std::{
+    fs,
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
+
 use common::{TestEnv, current_wal_dir, sanitize_key, wal_root_dir};
-use std::fs;
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
-use std::time::Instant;
 use walrus_rust::wal::{FsyncSchedule, ReadConsistency, Walrus};
 
 fn setup_env() -> TestEnv {
@@ -26,7 +28,6 @@ fn test_strictly_at_once_consistency() {
 
     drop(wal);
 
-
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
@@ -38,18 +39,13 @@ fn test_strictly_at_once_consistency() {
 fn test_at_least_once_consistency() {
     let _env = setup_env();
 
-
     let _wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
 }
 
 #[test]
 fn test_fsync_schedule() {
     let _env = setup_env();
-    let wal = Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::Milliseconds(1000),
-    )
-    .unwrap();
+    let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(1000)).unwrap();
     wal.append_for_topic("test", b"data").unwrap();
     let entry = wal.read_next("test", true).unwrap().unwrap();
     assert_eq!(entry.data, b"data");
@@ -58,12 +54,7 @@ fn test_fsync_schedule() {
 #[test]
 fn test_fsync_schedule_sync_each() {
     let _env = setup_env();
-    let wal = Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::SyncEach,
-    )
-    .unwrap();
-
+    let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::SyncEach).unwrap();
 
     wal.append_for_topic("sync_each_test", b"msg1").unwrap();
     wal.append_for_topic("sync_each_test", b"msg2").unwrap();
@@ -78,7 +69,6 @@ fn test_fsync_schedule_sync_each() {
     let entry3 = wal.read_next("sync_each_test", true).unwrap().unwrap();
     assert_eq!(entry3.data, b"msg3");
 
-
     assert!(wal.read_next("sync_each_test", true).unwrap().is_none());
 }
 
@@ -87,11 +77,7 @@ fn test_constructors() {
     let _env = setup_env();
     let wal1 = Walrus::new().unwrap();
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 5 }).unwrap();
-    let wal3 = Walrus::with_consistency_and_schedule(
-        ReadConsistency::AtLeastOnce { persist_every: 2 },
-        FsyncSchedule::Milliseconds(3000),
-    )
-    .unwrap();
+    let wal3 = Walrus::with_consistency_and_schedule(ReadConsistency::AtLeastOnce { persist_every: 2 }, FsyncSchedule::Milliseconds(3000)).unwrap();
 
     wal1.append_for_topic("test", b"data1").unwrap();
     wal2.append_for_topic("test", b"data2").unwrap();
@@ -107,8 +93,7 @@ fn test_crash_recovery_strictly_at_once() {
 
         for i in 1..=5 {
             let msg = format!("recovery_msg_{}", i);
-            wal.append_for_topic("recovery_test", msg.as_bytes())
-                .unwrap();
+            wal.append_for_topic("recovery_test", msg.as_bytes()).unwrap();
         }
 
         let entry1 = wal.read_next("recovery_test", true).unwrap().unwrap();
@@ -117,7 +102,6 @@ fn test_crash_recovery_strictly_at_once() {
         let entry2 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry2.data, b"recovery_msg_2");
     }
-
 
     thread::sleep(Duration::from_millis(50));
 
@@ -142,13 +126,11 @@ fn test_crash_recovery_at_least_once() {
     let _env = setup_env();
 
     {
-        let wal =
-            Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
 
         for i in 1..=7 {
             let msg = format!("at_least_once_msg_{}", i);
-            wal.append_for_topic("recovery_test", msg.as_bytes())
-                .unwrap();
+            wal.append_for_topic("recovery_test", msg.as_bytes()).unwrap();
         }
 
         let entry1 = wal.read_next("recovery_test", true).unwrap().unwrap();
@@ -158,12 +140,10 @@ fn test_crash_recovery_at_least_once() {
         assert_eq!(entry2.data, b"at_least_once_msg_2");
     }
 
-
     thread::sleep(Duration::from_millis(50));
 
     {
-        let wal =
-            Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
 
         let entry1 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry1.data, b"at_least_once_msg_1");
@@ -175,12 +155,10 @@ fn test_crash_recovery_at_least_once() {
         assert_eq!(entry3.data, b"at_least_once_msg_3");
     }
 
-
     thread::sleep(Duration::from_millis(50));
 
     {
-        let wal =
-            Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
+        let wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 3 }).unwrap();
 
         let entry4 = wal.read_next("recovery_test", true).unwrap().unwrap();
         assert_eq!(entry4.data, b"at_least_once_msg_4");
@@ -203,40 +181,25 @@ fn test_multiple_topics_different_consistency_behavior() {
 
     drop(wal);
 
-
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 2 }).unwrap();
 
-    assert_eq!(
-        wal2.read_next("topic_a", true).unwrap().unwrap().data,
-        b"a1"
-    );
-    assert_eq!(
-        wal2.read_next("topic_b", true).unwrap().unwrap().data,
-        b"b1"
-    );
+    assert_eq!(wal2.read_next("topic_a", true).unwrap().unwrap().data, b"a1");
+    assert_eq!(wal2.read_next("topic_b", true).unwrap().unwrap().data, b"b1");
 }
 
 #[test]
 fn test_configuration_with_concurrent_operations() {
     let _env = setup_env();
 
-    let wal = Arc::new(
-        Walrus::with_consistency_and_schedule(
-            ReadConsistency::StrictlyAtOnce,
-            FsyncSchedule::Milliseconds(2000),
-        )
-        .unwrap(),
-    );
+    let wal = Arc::new(Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(2000)).unwrap());
 
     let wal_writer = Arc::clone(&wal);
     let writer_handle = thread::spawn(move || {
         for i in 0..10 {
             let msg = format!("concurrent_msg_{}", i);
-            wal_writer
-                .append_for_topic("concurrent", msg.as_bytes())
-                .unwrap();
+            wal_writer.append_for_topic("concurrent", msg.as_bytes()).unwrap();
             thread::sleep(Duration::from_millis(10));
         }
     });
@@ -283,7 +246,6 @@ fn test_persist_every_zero_clamping() {
 
     drop(wal);
 
-
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::AtLeastOnce { persist_every: 0 }).unwrap();
@@ -296,21 +258,15 @@ fn test_persist_every_zero_clamping() {
 fn test_log_file_deletion_with_fast_fsync() {
     let _env = setup_env();
 
-    let wal = Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::Milliseconds(1),
-    )
-    .unwrap();
+    let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(1)).unwrap();
 
     test_println!("Creating first 999MB entry...");
     let large_data_1 = vec![0xAA; 999 * 1024 * 1024];
-    wal.append_for_topic("deletion_test", &large_data_1)
-        .unwrap();
+    wal.append_for_topic("deletion_test", &large_data_1).unwrap();
 
     test_println!("Creating second 999MB entry...");
     let large_data_2 = vec![0xBB; 999 * 1024 * 1024];
-    wal.append_for_topic("deletion_test", &large_data_2)
-        .unwrap();
+    wal.append_for_topic("deletion_test", &large_data_2).unwrap();
 
     let wal_dir = current_wal_dir();
     let files_after_writes = std::fs::read_dir(&wal_dir)
@@ -323,18 +279,12 @@ fn test_log_file_deletion_with_fast_fsync() {
         })
         .collect::<Vec<_>>();
 
-    test_println!(
-        "Files after writing 2x999MB entries: {}",
-        files_after_writes.len()
-    );
+    test_println!("Files after writing 2x999MB entries: {}", files_after_writes.len());
     for file in &files_after_writes {
         test_println!("  File: {:?}", file.file_name());
     }
 
-    assert!(
-        files_after_writes.len() >= 2,
-        "Should have at least 2 files after writing 2x999MB entries"
-    );
+    assert!(files_after_writes.len() >= 2, "Should have at least 2 files after writing 2x999MB entries");
 
     test_println!("Reading first entry (999MB)...");
     let entry1 = wal.read_next("deletion_test", true).unwrap().unwrap();
@@ -376,10 +326,7 @@ fn test_log_file_deletion_with_fast_fsync() {
         })
         .collect::<Vec<_>>();
 
-    test_println!(
-        "Files after reading first entry and waiting: {}",
-        files_after_read.len()
-    );
+    test_println!("Files after reading first entry and waiting: {}", files_after_read.len());
     for file in &files_after_read {
         test_println!("  File: {:?}", file.file_name());
     }
@@ -391,9 +338,7 @@ fn test_log_file_deletion_with_fast_fsync() {
             files_after_read.len()
         );
     } else {
-        test_println!(
-            "INFO: Files still present, deletion may require more time or different conditions"
-        );
+        test_println!("INFO: Files still present, deletion may require more time or different conditions");
     }
 
     test_println!("Reading second entry to verify WAL integrity...");
@@ -408,37 +353,24 @@ fn test_log_file_deletion_with_fast_fsync() {
 fn test_log_file_deletion_with_large_data() {
     let _env = setup_env();
 
-    let wal = Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::Milliseconds(1000),
-    )
-    .unwrap();
+    let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(1000)).unwrap();
 
     let data_size = 1024;
     let num_entries = 1000;
 
     for i in 0..num_entries {
         let data = format!("large_test_entry_{:04}_", i).repeat(data_size / 20);
-        wal.append_for_topic("large_deletion_test", data.as_bytes())
-            .unwrap();
+        wal.append_for_topic("large_deletion_test", data.as_bytes()).unwrap();
     }
 
     for i in 0..num_entries {
         let entry = wal.read_next("large_deletion_test", true).unwrap().unwrap();
         let expected_prefix = format!("large_test_entry_{:04}_", i);
         let entry_str = String::from_utf8_lossy(&entry.data);
-        assert!(
-            entry_str.starts_with(&expected_prefix),
-            "Entry {} doesn't start with expected prefix",
-            i
-        );
+        assert!(entry_str.starts_with(&expected_prefix), "Entry {} doesn't start with expected prefix", i);
     }
 
-    assert!(
-        wal.read_next("large_deletion_test", true)
-            .unwrap()
-            .is_none()
-    );
+    assert!(wal.read_next("large_deletion_test", true).unwrap().is_none());
 
     let wal_dir = current_wal_dir();
     let files_before = if wal_dir.exists() {
@@ -482,11 +414,7 @@ fn test_log_file_deletion_with_large_data() {
 fn test_file_state_tracking() {
     let _env = setup_env();
 
-    let wal = Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::Milliseconds(1000),
-    )
-    .unwrap();
+    let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::Milliseconds(1000)).unwrap();
 
     for i in 0..50 {
         let msg = format!("state_tracking_msg_{}", i);
@@ -495,14 +423,11 @@ fn test_file_state_tracking() {
 
     let wal_dir = current_wal_dir();
     assert!(wal_dir.exists());
-    let files_exist = std::fs::read_dir(&wal_dir)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .any(|entry| {
-            let binding = entry.file_name();
-            let name = binding.to_string_lossy();
-            !name.ends_with("_index.db") && !name.ends_with(".tmp")
-        });
+    let files_exist = std::fs::read_dir(&wal_dir).unwrap().filter_map(|entry| entry.ok()).any(|entry| {
+        let binding = entry.file_name();
+        let name = binding.to_string_lossy();
+        !name.ends_with("_index.db") && !name.ends_with(".tmp")
+    });
     assert!(files_exist, "Should have created log files");
 
     for i in 0..25 {
@@ -511,18 +436,12 @@ fn test_file_state_tracking() {
         assert_eq!(entry.data, expected.as_bytes());
     }
 
-    let files_still_exist = std::fs::read_dir(&wal_dir)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .any(|entry| {
-            let binding = entry.file_name();
-            let name = binding.to_string_lossy();
-            !name.ends_with("_index.db") && !name.ends_with(".tmp")
-        });
-    assert!(
-        files_still_exist,
-        "Files should still exist with unread data"
-    );
+    let files_still_exist = std::fs::read_dir(&wal_dir).unwrap().filter_map(|entry| entry.ok()).any(|entry| {
+        let binding = entry.file_name();
+        let name = binding.to_string_lossy();
+        !name.ends_with("_index.db") && !name.ends_with(".tmp")
+    });
+    assert!(files_still_exist, "Files should still exist with unread data");
 
     for i in 25..50 {
         let entry = wal.read_next("state_test", true).unwrap().unwrap();
@@ -540,14 +459,12 @@ fn key_based_instances_use_isolated_directories() {
     let analytics_key = env.unique_key("analytics");
 
     {
-        let wal =
-            Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce).unwrap();
         wal.append_for_topic("tx", b"txn-1").unwrap();
     }
 
     {
-        let wal = Walrus::with_consistency_for_key(&analytics_key, ReadConsistency::StrictlyAtOnce)
-            .unwrap();
+        let wal = Walrus::with_consistency_for_key(&analytics_key, ReadConsistency::StrictlyAtOnce).unwrap();
         wal.append_for_topic("events", b"evt-1").unwrap();
     }
 
@@ -563,10 +480,7 @@ fn key_based_instances_use_isolated_directories() {
         dir_names.contains(&sanitize_key(&analytics_key)),
         "expected analytics namespace directory to exist"
     );
-    assert!(
-        dir_names.contains(&sanitize_key(&tx_key)),
-        "expected transactions namespace directory to exist"
-    );
+    assert!(dir_names.contains(&sanitize_key(&tx_key)), "expected transactions namespace directory to exist");
 }
 
 #[test]
@@ -576,37 +490,28 @@ fn key_based_instances_recover_independently() {
     let analytics_key = env.unique_key("analytics");
 
     {
-        let wal =
-            Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce).unwrap();
+        let wal = Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce).unwrap();
         wal.append_for_topic("tx", b"a").unwrap();
         wal.append_for_topic("tx", b"b").unwrap();
     }
 
-
     thread::sleep(Duration::from_millis(50));
 
     {
-        let wal = Walrus::with_consistency_for_key(&analytics_key, ReadConsistency::StrictlyAtOnce)
-            .unwrap();
+        let wal = Walrus::with_consistency_for_key(&analytics_key, ReadConsistency::StrictlyAtOnce).unwrap();
         wal.append_for_topic("events", b"x").unwrap();
     }
 
-
     thread::sleep(Duration::from_millis(50));
 
-    let wal_tx =
-        Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal_tx = Walrus::with_consistency_for_key(&tx_key, ReadConsistency::StrictlyAtOnce).unwrap();
     assert_eq!(wal_tx.read_next("tx", true).unwrap().unwrap().data, b"a");
     assert_eq!(wal_tx.read_next("tx", true).unwrap().unwrap().data, b"b");
     assert!(wal_tx.read_next("tx", true).unwrap().is_none());
 
-    let wal_an =
-        Walrus::with_consistency_for_key(&analytics_key, ReadConsistency::StrictlyAtOnce).unwrap();
+    let wal_an = Walrus::with_consistency_for_key(&analytics_key, ReadConsistency::StrictlyAtOnce).unwrap();
     assert!(wal_an.read_next("tx", true).unwrap().is_none());
-    assert_eq!(
-        wal_an.read_next("events", true).unwrap().unwrap().data,
-        b"x"
-    );
+    assert_eq!(wal_an.read_next("events", true).unwrap().unwrap().data, b"x");
     assert!(wal_an.read_next("events", true).unwrap().is_none());
 }
 
@@ -621,9 +526,5 @@ fn key_names_are_sanitized_for_directories() {
     }
 
     let expected_dir = wal_root_dir().join(sanitize_key(key));
-    assert!(
-        expected_dir.is_dir(),
-        "expected namespace directory {:?} to exist",
-        expected_dir
-    );
+    assert!(expected_dir.is_dir(), "expected namespace directory {:?} to exist", expected_dir);
 }

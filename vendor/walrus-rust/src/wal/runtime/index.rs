@@ -1,17 +1,18 @@
-use crate::wal::paths::WalPathManager;
+use std::{collections::HashMap, fs};
+
 use rkyv::{Archive, Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
+
+use crate::wal::paths::WalPathManager;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub struct BlockPos {
-    pub cur_block_idx: u64,
+    pub cur_block_idx:    u64,
     pub cur_block_offset: u64,
 }
 
 pub struct WalIndex {
     store: HashMap<String, BlockPos>,
-    path: String,
+    path:  String,
 }
 
 impl WalIndex {
@@ -48,7 +49,7 @@ impl WalIndex {
         self.store.insert(
             key,
             BlockPos {
-                cur_block_idx: idx,
+                cur_block_idx:    idx,
                 cur_block_offset: offset,
             },
         );
@@ -69,12 +70,8 @@ impl WalIndex {
 
     fn persist(&self) -> std::io::Result<()> {
         let tmp_path = format!("{}.tmp", self.path);
-        let bytes = rkyv::to_bytes::<_, 256>(&self.store).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("index serialize failed: {:?}", e),
-            )
-        })?;
+        let bytes =
+            rkyv::to_bytes::<_, 256>(&self.store).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("index serialize failed: {:?}", e)))?;
 
         fs::write(&tmp_path, &bytes)?;
         fs::File::open(&tmp_path)?.sync_all()?;

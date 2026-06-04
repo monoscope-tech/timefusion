@@ -1,10 +1,13 @@
-use std::cell::RefCell;
-use std::fs;
-use std::path::PathBuf;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
+use std::{
+    cell::RefCell,
+    fs,
+    path::PathBuf,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[macro_export]
 macro_rules! test_println {
@@ -30,7 +33,7 @@ static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Default)]
 struct ThreadKeyState {
     active: Option<String>,
-    last: Option<String>,
+    last:   Option<String>,
 }
 
 thread_local! {
@@ -43,10 +46,7 @@ fn ensure_base_dir() -> PathBuf {
             let unique = format!(
                 "walrus-test-run-{}-{}",
                 std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
+                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
             );
             let dir = std::env::temp_dir().join(unique);
             let _ = fs::remove_dir_all(&dir);
@@ -64,26 +64,14 @@ fn next_namespace_key(counter: u64) -> String {
     format!(
         "test-key-{:x}-{:x}-{:x}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
         counter
     )
 }
 
 #[allow(dead_code)]
 pub fn sanitize_key(key: &str) -> String {
-    let mut sanitized: String = key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let mut sanitized: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
 
     if sanitized.trim_matches('_').is_empty() {
         sanitized = format!("ns_{:x}", checksum64(key.as_bytes()));
@@ -155,11 +143,7 @@ pub fn current_wal_dir() -> PathBuf {
     let mut base = ensure_base_dir();
     let key = THREAD_KEYS.with(|state| {
         let st = state.borrow();
-        st.active
-            .as_ref()
-            .or(st.last.as_ref())
-            .cloned()
-            .unwrap_or_else(|| "default".to_string())
+        st.active.as_ref().or(st.last.as_ref()).cloned().unwrap_or_else(|| "default".to_string())
     });
     base.push(sanitize_key(&key));
     base

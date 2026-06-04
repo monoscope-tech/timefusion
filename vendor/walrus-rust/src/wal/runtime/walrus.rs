@@ -1,20 +1,24 @@
-use crate::wal::block::{Block, Metadata};
-use crate::wal::config::{
-    DEFAULT_BLOCK_SIZE, FsyncSchedule, MAX_FILE_SIZE, PREFIX_META_SIZE, debug_print,
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    sync::{Arc, RwLock, mpsc},
 };
-use crate::wal::paths::WalPathManager;
-use crate::wal::storage::{SharedMmapKeeper, set_fsync_schedule};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::sync::mpsc;
-use std::sync::{Arc, RwLock};
 
-use super::WalIndex;
-use super::allocator::{BlockAllocator, BlockStateTracker, FileStateTracker, flush_check};
-use super::background::start_background_workers;
-use super::reader::Reader;
-use super::writer::Writer;
 use rkyv::Deserialize;
+
+use super::{
+    WalIndex,
+    allocator::{BlockAllocator, BlockStateTracker, FileStateTracker, flush_check},
+    background::start_background_workers,
+    reader::Reader,
+    writer::Writer,
+};
+use crate::wal::{
+    block::{Block, Metadata},
+    config::{DEFAULT_BLOCK_SIZE, FsyncSchedule, MAX_FILE_SIZE, PREFIX_META_SIZE, debug_print},
+    paths::WalPathManager,
+    storage::{SharedMmapKeeper, set_fsync_schedule},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ReadConsistency {
@@ -23,14 +27,14 @@ pub enum ReadConsistency {
 }
 
 pub struct Walrus {
-    pub(super) allocator: Arc<BlockAllocator>,
-    pub(super) reader: Arc<Reader>,
-    pub(super) writers: RwLock<HashMap<String, Arc<Writer>>>,
-    pub(super) fsync_tx: Arc<mpsc::Sender<String>>,
+    pub(super) allocator:         Arc<BlockAllocator>,
+    pub(super) reader:            Arc<Reader>,
+    pub(super) writers:           RwLock<HashMap<String, Arc<Writer>>>,
+    pub(super) fsync_tx:          Arc<mpsc::Sender<String>>,
     pub(super) read_offset_index: Arc<RwLock<WalIndex>>,
-    pub(super) read_consistency: ReadConsistency,
-    pub(super) fsync_schedule: FsyncSchedule,
-    pub(super) paths: Arc<WalPathManager>,
+    pub(super) read_consistency:  ReadConsistency,
+    pub(super) fsync_schedule:    FsyncSchedule,
+    pub(super) paths:             Arc<WalPathManager>,
 }
 
 impl Walrus {
@@ -42,10 +46,7 @@ impl Walrus {
         Self::with_consistency_and_schedule(mode, FsyncSchedule::Milliseconds(200))
     }
 
-    pub fn with_consistency_and_schedule(
-        mode: ReadConsistency,
-        fsync_schedule: FsyncSchedule,
-    ) -> std::io::Result<Self> {
+    pub fn with_consistency_and_schedule(mode: ReadConsistency, fsync_schedule: FsyncSchedule) -> std::io::Result<Self> {
         let paths = Arc::new(WalPathManager::default());
         Self::with_paths(paths, mode, fsync_schedule)
     }
@@ -58,20 +59,12 @@ impl Walrus {
         Self::with_consistency_and_schedule_for_key(key, mode, FsyncSchedule::Milliseconds(200))
     }
 
-    pub fn with_consistency_and_schedule_for_key(
-        key: &str,
-        mode: ReadConsistency,
-        fsync_schedule: FsyncSchedule,
-    ) -> std::io::Result<Self> {
+    pub fn with_consistency_and_schedule_for_key(key: &str, mode: ReadConsistency, fsync_schedule: FsyncSchedule) -> std::io::Result<Self> {
         let paths = WalPathManager::for_key(key);
         Self::with_paths(Arc::new(paths), mode, fsync_schedule)
     }
 
-    fn with_paths(
-        paths: Arc<WalPathManager>,
-        mode: ReadConsistency,
-        fsync_schedule: FsyncSchedule,
-    ) -> std::io::Result<Self> {
+    fn with_paths(paths: Arc<WalPathManager>, mode: ReadConsistency, fsync_schedule: FsyncSchedule) -> std::io::Result<Self> {
         debug_print!("[walrus] new");
 
         // Store the fsync schedule globally for SharedMmap::new to access
@@ -98,17 +91,13 @@ impl Walrus {
 
     pub(super) fn get_or_create_writer(&self, col_name: &str) -> std::io::Result<Arc<Writer>> {
         if let Some(writer) = {
-            let map = self.writers.read().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned")
-            })?;
+            let map = self.writers.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "writers read lock poisoned"))?;
             map.get(col_name).cloned()
         } {
             return Ok(writer);
         }
 
-        let mut map = self.writers.write().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "writers write lock poisoned")
-        })?;
+        let mut map = self.writers.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "writers write lock poisoned"))?;
 
         if let Some(writer) = map.get(col_name).cloned() {
             return Ok(writer);
@@ -211,12 +200,12 @@ impl Walrus {
 
                 // scan entries to compute used
                 let block_stub = Block {
-                    id: next_block_id as u64,
+                    id:        next_block_id as u64,
                     file_path: file_path.clone(),
-                    offset: block_offset,
-                    limit: DEFAULT_BLOCK_SIZE,
-                    mmap: mmap.clone(),
-                    used: 0,
+                    offset:    block_offset,
+                    limit:     DEFAULT_BLOCK_SIZE,
+                    mmap:      mmap.clone(),
+                    used:      0,
                 };
                 let mut in_block_off: u64 = 0;
                 loop {

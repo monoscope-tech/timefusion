@@ -1,18 +1,23 @@
-use crate::wal::config::{FsyncSchedule, USE_FD_BACKEND};
-use memmap2::MmapMut;
-use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::SystemTime;
-
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+use std::{
+    collections::HashMap,
+    fs::OpenOptions,
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::SystemTime,
+};
+
+use memmap2::MmapMut;
+
+use crate::wal::config::{FsyncSchedule, USE_FD_BACKEND};
 
 #[derive(Debug)]
 pub(crate) struct FdBackend {
     file: std::fs::File,
-    len: usize,
+    len:  usize,
 }
 
 impl FdBackend {
@@ -104,21 +109,14 @@ impl StorageImpl {
     }
 
     pub(crate) fn as_fd(&self) -> Option<&FdBackend> {
-        if let StorageImpl::Fd(fd) = self {
-            Some(fd)
-        } else {
-            None
-        }
+        if let StorageImpl::Fd(fd) = self { Some(fd) } else { None }
     }
 }
 
 static GLOBAL_FSYNC_SCHEDULE: OnceLock<FsyncSchedule> = OnceLock::new();
 
 fn should_use_o_sync() -> bool {
-    GLOBAL_FSYNC_SCHEDULE
-        .get()
-        .map(|s| matches!(s, FsyncSchedule::SyncEach))
-        .unwrap_or(false)
+    GLOBAL_FSYNC_SCHEDULE.get().map(|s| matches!(s, FsyncSchedule::SyncEach)).unwrap_or(false)
 }
 
 fn create_storage_impl(path: &str) -> std::io::Result<StorageImpl> {
@@ -136,7 +134,7 @@ fn create_storage_impl(path: &str) -> std::io::Result<StorageImpl> {
 
 #[derive(Debug)]
 pub(crate) struct SharedMmap {
-    storage: StorageImpl,
+    storage:         StorageImpl,
     last_touched_at: AtomicU64,
 }
 
@@ -200,9 +198,7 @@ pub(crate) struct SharedMmapKeeper {
 
 impl SharedMmapKeeper {
     fn new() -> Self {
-        Self {
-            data: HashMap::new(),
-        }
+        Self { data: HashMap::new() }
     }
 
     // Fast path: many readers concurrently
@@ -224,17 +220,13 @@ impl SharedMmapKeeper {
 
         // Double-check with a fresh read lock to avoid unnecessary write lock
         {
-            let keeper = keeper_lock.read().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper read lock poisoned")
-            })?;
+            let keeper = keeper_lock.read().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper read lock poisoned"))?;
             if let Some(existing) = keeper.data.get(path) {
                 return Ok(existing.clone());
             }
         }
 
-        let mut keeper = keeper_lock.write().map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper write lock poisoned")
-        })?;
+        let mut keeper = keeper_lock.write().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "mmap keeper write lock poisoned"))?;
         if let Some(existing) = keeper.data.get(path) {
             return Ok(existing.clone());
         }

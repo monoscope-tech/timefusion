@@ -1,28 +1,26 @@
 mod common;
 
+use std::{
+    fs::OpenOptions,
+    io::{Read, Seek, SeekFrom, Write},
+    thread,
+    time::Duration,
+};
+
 use common::{TestEnv, current_wal_dir};
-use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::thread;
-use std::time::Duration;
-use walrus_rust::ReadConsistency;
-use walrus_rust::wal::{Entry, WalIndex, Walrus};
+use walrus_rust::{
+    ReadConsistency,
+    wal::{Entry, WalIndex, Walrus},
+};
 
 fn setup_wal_env() -> TestEnv {
     TestEnv::new()
 }
 
 fn first_data_file() -> String {
-    let mut files: Vec<_> = std::fs::read_dir(current_wal_dir())
-        .unwrap()
-        .flatten()
-        .collect();
+    let mut files: Vec<_> = std::fs::read_dir(current_wal_dir()).unwrap().flatten().collect();
     files.sort_by_key(|e| e.file_name());
-    let p = files
-        .into_iter()
-        .find(|e| !e.file_name().to_string_lossy().ends_with("_index.db"))
-        .unwrap()
-        .path();
+    let p = files.into_iter().find(|e| !e.file_name().to_string_lossy().ends_with("_index.db")).unwrap().path();
     p.to_string_lossy().to_string()
 }
 
@@ -31,10 +29,7 @@ fn walindex_persists() {
     let _guard = setup_wal_env();
     let name = format!("unit_idx_{}", {
         use std::time::SystemTime;
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis()
     });
     let mut idx = WalIndex::new(&name).unwrap();
     idx.set("k".to_string(), 7, 99).unwrap();
@@ -58,18 +53,9 @@ fn large_entry_forces_block_seal() {
     wal.append_for_topic("t", &large_data_2).unwrap();
     wal.append_for_topic("t", &large_data_3).unwrap();
 
-    assert_eq!(
-        wal.read_next("t", true).unwrap().unwrap().data,
-        large_data_1
-    );
-    assert_eq!(
-        wal.read_next("t", true).unwrap().unwrap().data,
-        large_data_2
-    );
-    assert_eq!(
-        wal.read_next("t", true).unwrap().unwrap().data,
-        large_data_3
-    );
+    assert_eq!(wal.read_next("t", true).unwrap().unwrap().data, large_data_1);
+    assert_eq!(wal.read_next("t", true).unwrap().unwrap().data, large_data_2);
+    assert_eq!(wal.read_next("t", true).unwrap().unwrap().data, large_data_3);
 }
 
 #[test]
@@ -101,7 +87,6 @@ fn persists_read_offsets_across_restart() {
     wal.append_for_topic("t", b"b").unwrap();
     assert_eq!(wal.read_next("t", true).unwrap().unwrap().data, b"a");
 
-
     thread::sleep(Duration::from_millis(50));
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
     assert_eq!(wal2.read_next("t", true).unwrap().unwrap().data, b"b");
@@ -121,11 +106,7 @@ fn checksum_corruption_is_detected_via_public_api() {
     }
     if let Some(pos) = bytes.windows(6).position(|w| w == b"abcdef") {
         let flip_pos = pos + 2;
-        let mut f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
         f.seek(SeekFrom::Start(flip_pos as u64)).unwrap();
         f.write_all(&[bytes[flip_pos] ^ 0xFF]).unwrap();
     } else {
@@ -166,21 +147,17 @@ fn read_next_without_checkpoint_does_not_advance() {
     wal.append_for_topic("peek_topic", b"first").unwrap();
     wal.append_for_topic("peek_topic", b"second").unwrap();
 
-
     let first = wal.read_next("peek_topic", false).unwrap().unwrap();
     assert_eq!(first.data, b"first");
 
-
     let first_again = wal.read_next("peek_topic", false).unwrap().unwrap();
     assert_eq!(first_again.data, b"first");
-
 
     let committed_first = wal.read_next("peek_topic", true).unwrap().unwrap();
     assert_eq!(committed_first.data, b"first");
 
     let second = wal.read_next("peek_topic", true).unwrap().unwrap();
     assert_eq!(second.data, b"second");
-
 
     assert!(wal.read_next("peek_topic", true).unwrap().is_none());
 }
@@ -214,10 +191,8 @@ fn stress_many_topics_with_validation() {
         for entry_id in 0..entries_per_topic {
             let entry = wal.read_next(&topic, true).unwrap().unwrap();
 
-            let read_topic_id =
-                u32::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
-            let read_entry_id =
-                u32::from_le_bytes([entry.data[4], entry.data[5], entry.data[6], entry.data[7]]);
+            let read_topic_id = u32::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
+            let read_entry_id = u32::from_le_bytes([entry.data[4], entry.data[5], entry.data[6], entry.data[7]]);
 
             assert_eq!(read_topic_id, topic_id as u32);
             assert_eq!(read_entry_id, entry_id as u32);
@@ -253,16 +228,8 @@ fn stress_rapid_write_read_cycles() {
 
         let entry = wal.read_next(topic, true).unwrap().unwrap();
 
-        let read_cycle = u64::from_le_bytes([
-            entry.data[0],
-            entry.data[1],
-            entry.data[2],
-            entry.data[3],
-            entry.data[4],
-            entry.data[5],
-            entry.data[6],
-            entry.data[7],
-        ]);
+        let read_cycle =
+            u64::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3], entry.data[4], entry.data[5], entry.data[6], entry.data[7]]);
         assert_eq!(read_cycle, cycle as u64);
 
         assert_eq!(&entry.data[8..12], &[0xAA, 0xBB, 0xCC, 0xDD]);
@@ -281,22 +248,7 @@ fn stress_boundary_conditions() {
     let _guard = setup_wal_env();
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-    let test_sizes = vec![
-        0,
-        1,
-        63,
-        64,
-        65,
-        1023,
-        1024,
-        1025,
-        65535,
-        65536,
-        65537,
-        1024 * 1024 - 1,
-        1024 * 1024,
-        1024 * 1024 + 1,
-    ];
+    let test_sizes = vec![0, 1, 63, 64, 65, 1023, 1024, 1025, 65535, 65536, 65537, 1024 * 1024 - 1, 1024 * 1024, 1024 * 1024 + 1];
 
     for (i, &size) in test_sizes.iter().enumerate() {
         let topic = format!("boundary_{}", i);
@@ -312,13 +264,7 @@ fn stress_boundary_conditions() {
         assert_eq!(entry.data.len(), size);
 
         for (j, &byte) in entry.data.iter().enumerate() {
-            assert_eq!(
-                byte,
-                ((i + j) % 256) as u8,
-                "Mismatch at size {} byte {}",
-                size,
-                j
-            );
+            assert_eq!(byte, ((i + j) % 256) as u8, "Mismatch at size {} byte {}", size, j);
         }
     }
 }
@@ -331,17 +277,9 @@ fn stress_data_integrity_patterns() {
     let patterns = vec![
         ("zeros", vec![0u8; 1000]),
         ("ones", vec![0xFF; 1000]),
-        (
-            "alternating",
-            (0..1000)
-                .map(|i| if i % 2 == 0 { 0xAA } else { 0x55 })
-                .collect(),
-        ),
+        ("alternating", (0..1000).map(|i| if i % 2 == 0 { 0xAA } else { 0x55 }).collect()),
         ("sequential", (0..1000).map(|i| (i % 256) as u8).collect()),
-        (
-            "reverse",
-            (0..1000).map(|i| (255 - (i % 256)) as u8).collect(),
-        ),
+        ("reverse", (0..1000).map(|i| (255 - (i % 256)) as u8).collect()),
         ("random_seed", {
             let mut data = Vec::new();
             let mut seed = 12345u32;
@@ -393,10 +331,8 @@ fn stress_concurrent_topic_validation() {
         for round in 0..entries_per_topic {
             let entry = wal.read_next(&topic, true).unwrap().unwrap();
 
-            let read_topic_id =
-                u32::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
-            let read_round =
-                u32::from_le_bytes([entry.data[4], entry.data[5], entry.data[6], entry.data[7]]);
+            let read_topic_id = u32::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
+            let read_round = u32::from_le_bytes([entry.data[4], entry.data[5], entry.data[6], entry.data[7]]);
             let read_checksum = entry.data[8];
 
             assert_eq!(read_topic_id, topic_id as u32);
@@ -464,17 +400,9 @@ mod checksum_tests {
         }
 
         if let Some(pos) = bytes.windows(test_data.len()).position(|w| w == test_data) {
-            let mut f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .unwrap();
+            let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
             f.seek(SeekFrom::Start(pos as u64)).unwrap();
-            let corrupted = [
-                test_data[0] ^ 0xFF,
-                test_data[1] ^ 0xFF,
-                test_data[2] ^ 0xFF,
-            ];
+            let corrupted = [test_data[0] ^ 0xFF, test_data[1] ^ 0xFF, test_data[2] ^ 0xFF];
             f.write_all(&corrupted).unwrap();
             f.sync_all().unwrap();
         } else {
@@ -487,10 +415,7 @@ mod checksum_tests {
         match result {
             None => {}
             Some(entry) => {
-                assert_ne!(
-                    entry.data, test_data,
-                    "Corruption was not detected - got original data back"
-                );
+                assert_ne!(entry.data, test_data, "Corruption was not detected - got original data back");
             }
         }
     }
@@ -502,9 +427,7 @@ mod entry_tests {
     #[test]
     fn entry_creation_and_data_access() {
         let test_data = vec![1, 2, 3, 4, 5];
-        let entry = Entry {
-            data: test_data.clone(),
-        };
+        let entry = Entry { data: test_data.clone() };
 
         assert_eq!(entry.data, test_data);
         assert_eq!(entry.data.len(), 5);
@@ -519,9 +442,7 @@ mod entry_tests {
     #[test]
     fn entry_with_large_data() {
         let large_data = vec![42u8; 1024 * 1024];
-        let entry = Entry {
-            data: large_data.clone(),
-        };
+        let entry = Entry { data: large_data.clone() };
         assert_eq!(entry.data.len(), 1024 * 1024);
         assert_eq!(entry.data[0], 42);
         assert_eq!(entry.data[1024 * 1024 - 1], 42);
@@ -623,14 +544,8 @@ mod walrus_integration_tests {
         wal.append_for_topic("topic1", b"data1").unwrap();
         wal.append_for_topic("topic2", b"data2").unwrap();
 
-        assert_eq!(
-            wal.read_next("topic1", true).unwrap().unwrap().data,
-            b"data1"
-        );
-        assert_eq!(
-            wal.read_next("topic2", true).unwrap().unwrap().data,
-            b"data2"
-        );
+        assert_eq!(wal.read_next("topic1", true).unwrap().unwrap().data, b"data1");
+        assert_eq!(wal.read_next("topic2", true).unwrap().unwrap().data, b"data2");
 
         assert!(wal.read_next("topic1", true).unwrap().is_none());
         assert!(wal.read_next("topic2", true).unwrap().is_none());
@@ -647,10 +562,7 @@ mod walrus_integration_tests {
         }
 
         for expected in &entries {
-            assert_eq!(
-                wal.read_next("multi_topic", true).unwrap().unwrap().data,
-                expected.as_slice()
-            );
+            assert_eq!(wal.read_next("multi_topic", true).unwrap().unwrap().data, expected.as_slice());
         }
 
         assert!(wal.read_next("multi_topic", true).unwrap().is_none());
@@ -700,10 +612,7 @@ mod walrus_integration_tests {
         wal.append_for_topic("empty", b"not_empty").unwrap();
 
         assert_eq!(wal.read_next("empty", true).unwrap().unwrap().data, b"");
-        assert_eq!(
-            wal.read_next("empty", true).unwrap().unwrap().data,
-            b"not_empty"
-        );
+        assert_eq!(wal.read_next("empty", true).unwrap().unwrap().data, b"not_empty");
     }
 
     #[test]
@@ -721,10 +630,7 @@ mod walrus_integration_tests {
         }
 
         for i in 0..10 {
-            assert_eq!(
-                wal.read_next("topic_b", true).unwrap().unwrap().data,
-                &[i + 100]
-            );
+            assert_eq!(wal.read_next("topic_b", true).unwrap().unwrap().data, &[i + 100]);
         }
 
         for i in 5..10 {
@@ -738,25 +644,17 @@ mod walrus_integration_tests {
 
         {
             let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-            wal.append_for_topic("recovery_test", b"before_restart")
-                .unwrap();
-            wal.append_for_topic("recovery_test", b"also_before")
-                .unwrap();
+            wal.append_for_topic("recovery_test", b"before_restart").unwrap();
+            wal.append_for_topic("recovery_test", b"also_before").unwrap();
 
-            assert_eq!(
-                wal.read_next("recovery_test", true).unwrap().unwrap().data,
-                b"before_restart"
-            );
+            assert_eq!(wal.read_next("recovery_test", true).unwrap().unwrap().data, b"before_restart");
         }
 
         thread::sleep(Duration::from_millis(50));
 
         {
             let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
-            assert_eq!(
-                wal.read_next("recovery_test", true).unwrap().unwrap().data,
-                b"also_before"
-            );
+            assert_eq!(wal.read_next("recovery_test", true).unwrap().unwrap().data, b"also_before");
             assert!(wal.read_next("recovery_test", true).unwrap().is_none());
         }
     }
@@ -771,10 +669,7 @@ mod walrus_integration_tests {
         assert!(wal.read_next("test", true).unwrap().is_none());
 
         wal.append_for_topic("test", b"second").unwrap();
-        assert_eq!(
-            wal.read_next("test", true).unwrap().unwrap().data,
-            b"second"
-        );
+        assert_eq!(wal.read_next("test", true).unwrap().unwrap().data, b"second");
     }
 
     #[test]
@@ -790,21 +685,12 @@ mod walrus_integration_tests {
             wal.append_for_topic("topic_small", &[i as u8]).unwrap();
         }
 
-        assert_eq!(
-            wal.read_next("topic_large", true).unwrap().unwrap().data,
-            large_data
-        );
-        assert_eq!(
-            wal.read_next("topic_large", true).unwrap().unwrap().data,
-            large_data
-        );
+        assert_eq!(wal.read_next("topic_large", true).unwrap().unwrap().data, large_data);
+        assert_eq!(wal.read_next("topic_large", true).unwrap().unwrap().data, large_data);
         assert!(wal.read_next("topic_large", true).unwrap().is_none());
 
         for i in 0..100 {
-            assert_eq!(
-                wal.read_next("topic_small", true).unwrap().unwrap().data,
-                &[i as u8]
-            );
+            assert_eq!(wal.read_next("topic_small", true).unwrap().unwrap().data, &[i as u8]);
         }
         assert!(wal.read_next("topic_small", true).unwrap().is_none());
     }
@@ -850,8 +736,7 @@ mod stress_tests {
 
         for i in 0..num_entries {
             let data = format!("entry_{:04}", i);
-            wal.append_for_topic("stress_small", data.as_bytes())
-                .unwrap();
+            wal.append_for_topic("stress_small", data.as_bytes()).unwrap();
         }
 
         for i in 0..num_entries {

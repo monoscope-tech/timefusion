@@ -1,6 +1,8 @@
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    time::SystemTime,
+};
 
 // Global flag to choose backend
 pub(crate) static USE_FD_BACKEND: AtomicBool = AtomicBool::new(true);
@@ -52,14 +54,9 @@ pub(crate) fn now_millis_str() -> String {
     let mut observed = LAST_MILLIS.load(Ordering::Relaxed);
     loop {
         let system_ms_u64 = system_ms.try_into().unwrap_or(u64::MAX);
-        let candidate = if system_ms_u64 <= observed {
-            observed.saturating_add(1)
-        } else {
-            system_ms_u64
-        };
+        let candidate = if system_ms_u64 <= observed { observed.saturating_add(1) } else { system_ms_u64 };
 
-        match LAST_MILLIS.compare_exchange(observed, candidate, Ordering::AcqRel, Ordering::Acquire)
-        {
+        match LAST_MILLIS.compare_exchange(observed, candidate, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return candidate.to_string(),
             Err(actual) => observed = actual,
         }
@@ -79,22 +76,11 @@ pub(crate) fn checksum64(data: &[u8]) -> u64 {
 }
 
 pub(crate) fn wal_data_dir() -> PathBuf {
-    std::env::var_os("WALRUS_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("wal_files"))
+    std::env::var_os("WALRUS_DATA_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("wal_files"))
 }
 
 pub(crate) fn sanitize_namespace(key: &str) -> String {
-    let mut sanitized: String = key
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let mut sanitized: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' }).collect();
 
     if sanitized.trim_matches('_').is_empty() {
         sanitized = format!("ns_{:x}", checksum64(key.as_bytes()));
