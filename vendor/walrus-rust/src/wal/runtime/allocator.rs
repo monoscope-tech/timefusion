@@ -17,8 +17,8 @@ use crate::wal::{
 
 pub(super) struct BlockAllocator {
     next_block: UnsafeCell<Block>,
-    lock:       AtomicBool,
-    paths:      Arc<WalPathManager>,
+    lock: AtomicBool,
+    paths: Arc<WalPathManager>,
 }
 
 impl BlockAllocator {
@@ -113,12 +113,12 @@ impl BlockAllocator {
             debug_print!("[alloc] file rollover for sized alloc -> {}", data.file_path);
         }
         let ret = Block {
-            id:        data.id,
+            id: data.id,
             file_path: data.file_path.clone(),
-            offset:    data.offset,
-            limit:     alloc_size,
-            mmap:      data.mmap.clone(),
-            used:      0,
+            offset: data.offset,
+            limit: alloc_size,
+            mmap: data.mmap.clone(),
+            used: 0,
         };
         // register the new block before handing it out
         BlockStateTracker::register_block(ret.id as usize, &ret.file_path);
@@ -175,7 +175,7 @@ pub(super) fn flush_check(file_path: String) {
 
 struct BlockState {
     is_checkpointed: AtomicBool,
-    file_path:       String,
+    file_path: String,
 }
 
 pub(super) struct BlockStateTracker {}
@@ -191,7 +191,7 @@ impl BlockStateTracker {
         if let Ok(mut w) = map.write() {
             w.entry(block_id).or_insert_with(|| BlockState {
                 is_checkpointed: AtomicBool::new(false),
-                file_path:       file_path.to_string(),
+                file_path: file_path.to_string(),
             });
         }
     }
@@ -203,32 +203,42 @@ impl BlockStateTracker {
     }
 
     pub(super) fn set_checkpointed_true(block_id: usize) {
-        let path_opt = {
+        // Idempotent: only increment the file's checkpoint counter on the
+        // false→true transition. Prior to this, repeated calls would
+        // double-increment `checkpoint_block_ctr` (cursor rebases across
+        // chain resets, or the new fast-forward path in
+        // `set_persisted_read_position`), potentially overshooting `total`
+        // without ever clearing — and on the other side of the comparison,
+        // legitimately-checkpointed blocks could fail the `>= total` check
+        // if a parallel duplicate consumed the increment "budget" earlier.
+        let (path_opt, transitioned) = {
             let map = Self::map();
             if let Ok(r) = map.read() {
                 if let Some(b) = r.get(&block_id) {
-                    b.is_checkpointed.store(true, Ordering::Release);
-                    Some(b.file_path.clone())
+                    let prev = b.is_checkpointed.swap(true, Ordering::AcqRel);
+                    (Some(b.file_path.clone()), !prev)
                 } else {
-                    None
+                    (None, false)
                 }
             } else {
-                None
+                (None, false)
             }
         };
 
         if let Some(path) = path_opt {
-            FileStateTracker::inc_checkpoint_for_file(&path);
+            if transitioned {
+                FileStateTracker::inc_checkpoint_for_file(&path);
+            }
             flush_check(path);
         }
     }
 }
 
 struct FileState {
-    locked_block_ctr:     AtomicU16,
+    locked_block_ctr: AtomicU16,
     checkpoint_block_ctr: AtomicU16,
-    total_blocks:         AtomicU16,
-    is_fully_allocated:   AtomicBool,
+    total_blocks: AtomicU16,
+    is_fully_allocated: AtomicBool,
 }
 
 pub(super) struct FileStateTracker {}
@@ -243,10 +253,10 @@ impl FileStateTracker {
         let map = Self::map();
         let mut w = map.write().expect("file state map write lock poisoned");
         w.entry(file_path.to_string()).or_insert_with(|| FileState {
-            locked_block_ctr:     AtomicU16::new(0),
+            locked_block_ctr: AtomicU16::new(0),
             checkpoint_block_ctr: AtomicU16::new(0),
-            total_blocks:         AtomicU16::new(0),
-            is_fully_allocated:   AtomicBool::new(false),
+            total_blocks: AtomicU16::new(0),
+            is_fully_allocated: AtomicBool::new(false),
         });
     }
 

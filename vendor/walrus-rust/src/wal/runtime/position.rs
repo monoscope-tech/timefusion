@@ -10,7 +10,10 @@
 
 use std::io;
 
-use super::Walrus;
+use super::{
+    Walrus,
+    allocator::{BlockStateTracker, FileStateTracker},
+};
 
 const TAIL_FLAG: u64 = 1u64 << 63;
 
@@ -24,7 +27,7 @@ const TAIL_FLAG: u64 = 1u64 << 63;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WalPosition {
     pub block_id: u64,
-    pub offset:   u64,
+    pub offset: u64,
 }
 
 impl WalPosition {
@@ -50,7 +53,7 @@ impl Walrus {
                 let (block, written) = w.snapshot_block()?;
                 return Ok(WalPosition {
                     block_id: block.id,
-                    offset:   written,
+                    offset: written,
                 });
             }
         }
@@ -64,7 +67,7 @@ impl Walrus {
                     if let Some(last) = info.chain.last() {
                         return Ok(WalPosition {
                             block_id: last.id,
-                            offset:   last.used,
+                            offset: last.used,
                         });
                     }
                 }
@@ -111,14 +114,14 @@ impl Walrus {
         if chain_idx < info.chain.len() {
             Ok(Some(WalPosition {
                 block_id: info.chain[chain_idx].id,
-                offset:   pos.cur_block_offset,
+                offset: pos.cur_block_offset,
             }))
         } else if chain_idx == info.chain.len() && !info.chain.is_empty() {
             // Past the last sealed block; use the last block's tail.
             let last = info.chain.last().unwrap();
             Ok(Some(WalPosition {
                 block_id: last.id,
-                offset:   last.used,
+                offset: last.used,
             }))
         } else {
             Ok(None)
@@ -154,8 +157,46 @@ impl Walrus {
         }
         drop(idx_guard);
 
+        // Mark every sealed block strictly before `pos` as checkpointed. The
+        // normal advance path (`read_next`) does this lazily as the cursor
+        // walks past each block; a Delta-derived fast-forward (TimeFusion's
+        // `derive_wal_cursor_for_table`) bypasses `read_next` entirely, so
+        // without this loop the skipped-over blocks stay uncheckpointed
+        // forever and their containing files never become eligible for
+        // deletion (`flush_check` requires `checkpointed >= total`).
+        //
+        // We checkpoint a block when its id is strictly less than the target
+        // block_id, OR equal-id with the cursor having consumed past the
+        // block's `used` bytes (the same condition `read_next` uses).
+        self.checkpoint_blocks_before(col_name, pos);
+
         self.invalidate_hydration(col_name);
         Ok(())
+    }
+
+    /// Test/diagnostic accessor: per-block file accounting for the file
+    /// owning `block_id`. Returns `(checkpointed, total)` block counts on
+    /// that file — file becomes eligible for deletion when
+    /// `checkpointed >= total` (and unlocked, fully allocated). Useful for
+    /// regression tests covering the cursor fast-forward → file-reclaim
+    /// path; not part of normal runtime use.
+    #[doc(hidden)]
+    pub fn block_file_checkpoint_state(block_id: u64) -> Option<(u16, u16)> {
+        let path = BlockStateTracker::get_file_path_for_block(block_id as usize)?;
+        FileStateTracker::get_state_snapshot(&path).map(|(_l, c, t, _f)| (c, t))
+    }
+
+    fn checkpoint_blocks_before(&self, col_name: &str, pos: WalPosition) {
+        let Ok(map) = self.reader.data.read() else { return };
+        let Some(info_arc) = map.get(col_name).cloned() else { return };
+        drop(map);
+        let Ok(info) = info_arc.read() else { return };
+        for block in info.chain.iter() {
+            let past_block = block.id < pos.block_id || (block.id == pos.block_id && pos.offset >= block.used);
+            if past_block {
+                BlockStateTracker::set_checkpointed_true(block.id as usize);
+            }
+        }
     }
 
     fn find_chain_position(&self, col_name: &str, pos: WalPosition) -> Option<(u64, u64)> {
