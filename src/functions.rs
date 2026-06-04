@@ -54,6 +54,23 @@ fn extract_scalar_string(arg: &ColumnarValue, label: &str) -> datafusion::error:
     }
 }
 
+/// Emits the three boilerplate `ScalarUDFImpl` methods (`as_any`, `name`,
+/// `signature`) shared by every UDF in this module that stores its `Signature`
+/// in a `signature` field. `return_type` / `invoke_with_args` stay per-impl.
+macro_rules! scalar_udf_boilerplate {
+    ($name:literal) => {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn name(&self) -> &str {
+            $name
+        }
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+    };
+}
+
 // ============================================================================
 // Variant-Aware Expression Planner
 // ============================================================================
@@ -250,15 +267,7 @@ impl Default for JsonToPgTextUdf {
 }
 
 impl ScalarUDFImpl for JsonToPgTextUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "json_to_pg_text"
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("json_to_pg_text");
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8)
     }
@@ -535,17 +544,7 @@ impl ToCharUDF {
 }
 
 impl ScalarUDFImpl for ToCharUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "to_char"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("to_char");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8View)
@@ -651,17 +650,7 @@ impl AtTimeZoneUDF {
 }
 
 impl ScalarUDFImpl for AtTimeZoneUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "at_time_zone"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("at_time_zone");
 
     fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         match &arg_types[0] {
@@ -792,17 +781,7 @@ impl JsonBuildArrayUDF {
 }
 
 impl ScalarUDFImpl for JsonBuildArrayUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "json_build_array"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("json_build_array");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8View)
@@ -873,20 +852,10 @@ impl ToJsonUDF {
 }
 
 impl ScalarUDFImpl for ToJsonUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "to_json"
-    }
+    scalar_udf_boilerplate!("to_json");
 
     fn aliases(&self) -> &[String] {
         &self.aliases
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
@@ -934,17 +903,7 @@ impl ExtractEpochUDF {
 }
 
 impl ScalarUDFImpl for ExtractEpochUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "extract_epoch"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("extract_epoch");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Float64)
@@ -1364,17 +1323,7 @@ impl ApproxPercentileUDF {
 }
 
 impl ScalarUDFImpl for ApproxPercentileUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "approx_percentile"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("approx_percentile");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Float64)
@@ -1472,17 +1421,7 @@ impl JsonbPathExistsUDF {
 }
 
 impl ScalarUDFImpl for JsonbPathExistsUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "jsonb_path_exists"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("jsonb_path_exists");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Boolean)
