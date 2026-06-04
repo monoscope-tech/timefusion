@@ -60,20 +60,25 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     // Create buffered layer with delta write callback
     let db_for_callback = db.clone();
-    let delta_write_callback: timefusion::buffered_write_layer::DeltaWriteCallback =
-        Arc::new(move |project_id: String, table_name: String, batches: Vec<arrow::array::RecordBatch>| {
+    let delta_write_callback: timefusion::buffered_write_layer::DeltaWriteCallback = Arc::new(
+        move |project_id: String,
+              table_name: String,
+              batches: Vec<arrow::array::RecordBatch>,
+              wal_watermark: timefusion::buffered_write_layer::DeltaWatermark| {
             let db = db_for_callback.clone();
             Box::pin(async move {
                 // Capture pre-state file URIs so we can derive the post-write delta.
                 let pre = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
-                // skip_queue=true to write directly to Delta
-                db.insert_records_batch(&project_id, &table_name, batches, true).await?;
+                // skip_queue=true to write directly to Delta. Watermark goes into
+                // Delta commit metadata for crash-mid-flush recovery.
+                db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await?;
                 let post = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
                 let pre_set: std::collections::HashSet<String> = pre.into_iter().collect();
                 let added: Vec<String> = post.into_iter().filter(|u| !pre_set.contains(u)).collect();
                 Ok(added)
             })
-        });
+        },
+    );
 
     // Register UDFs on the real SessionContext up front so its FunctionRegistry
     // doubles as the WAL-replay registry — no throwaway bootstrap context.
@@ -120,6 +125,18 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         error!("Failed to initialize OTel metrics: {} — continuing without metrics export", e);
     }
 
+    // Before WAL replay, fast-forward walrus cursors to whatever each table's
+    // latest Delta commits say is durable. Closes the crash-mid-flush window
+    // where Delta committed but `advance_by_counts` didn't finish — without
+    // this, replay re-injects entries already in Delta and the next flush
+    // double-writes them. Best-effort: missing/older metadata falls back to
+    // the locally-fsynced walrus state (today's at-least-once behaviour).
+    match db.derive_wal_cursors_from_delta(buffered_layer.wal()).await {
+        Ok(0) => info!("Delta-derived cursor: no advancement needed (clean shutdown)"),
+        Ok(n) => info!("Delta-derived cursor: advanced {} shard(s) past Delta watermark", n),
+        Err(e) => warn!("Delta-derived cursor derivation failed (continuing with local cursor): {}", e),
+    }
+
     // Recover from WAL on startup
     info!("Starting WAL recovery...");
     let recovery_stats = buffered_layer.recover_from_wal().await?;
@@ -146,10 +163,23 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     let auth_config = timefusion::pgwire_handlers::AuthConfig::from_core(&cfg.core)?;
 
+    // PGWire shutdown signal: when cancelled, the accept loop in
+    // `serve_with_handlers` stops accepting new connections so the
+    // BufferedWriteLayer flush isn't racing fresh inserts. Already-accepted
+    // connections finish on their own spawned tasks.
+    let pgwire_shutdown = tokio_util::sync::CancellationToken::new();
+    let pgwire_shutdown_for_task = pgwire_shutdown.clone();
     let pg_task = tokio::spawn(async move {
         let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
 
-        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(Arc::new(session_context), &opts, auth_config).await {
+        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(
+            Arc::new(session_context),
+            &opts,
+            auth_config,
+            async move { pgwire_shutdown_for_task.cancelled().await },
+        )
+        .await
+        {
             error!("PGWire server error: {}", e);
         }
     });
@@ -217,9 +247,17 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     };
 
-    // Wait for shutdown signal
+    // Wait for shutdown signal. Borrow `pg_task` so we can still await it
+    // in the drain phase below — the select! only watches it for early
+    // failure, not for ownership.
+    let mut pg_task = pg_task;
     tokio::select! {
-        _ = pg_task => {error!("PGWire server task failed")},
+        res = &mut pg_task => {
+            match res {
+                Ok(()) => error!("PGWire server task ended unexpectedly"),
+                Err(e) => error!("PGWire server task panicked: {}", e),
+            }
+        },
         _ = tokio::signal::ctrl_c() => {
             info!("Received SIGINT, initiating graceful shutdown");
         }
@@ -229,11 +267,26 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
 
     // Drain order matters:
+    // 0. Stop PGWire from accepting new connections. Without this, the
+    //    BufferedWriteLayer flush below races fresh inserts that pile back
+    //    into MemBuffer + WAL, defeating the whole point of a graceful
+    //    shutdown.
     // 1. Tell gRPC to stop accepting new connections. tonic's
     //    serve_with_shutdown then waits for existing streams to complete.
     // 2. Once gRPC is done, the buffered layer no longer receives new
     //    writes — safe to flush + checkpoint.
     // 3. Shut down database (cache, foyer, log store).
+    pgwire_shutdown.cancel();
+    let pgwire_drain_deadline = Duration::from_secs(cfg.buffer.timefusion_shutdown_timeout_secs.max(5));
+    match tokio::time::timeout(pgwire_drain_deadline, pg_task).await {
+        Ok(Ok(())) => info!("PGWire drained cleanly"),
+        Ok(Err(e)) => error!("PGWire task panicked during drain: {}", e),
+        Err(_) => warn!(
+            "PGWire drain exceeded {}s — proceeding with flush; some in-flight queries may be reset",
+            pgwire_drain_deadline.as_secs()
+        ),
+    }
+
     grpc_shutdown.cancel();
     let grpc_drain_deadline = Duration::from_secs(cfg.buffer.timefusion_shutdown_timeout_secs.max(5));
     match tokio::time::timeout(grpc_drain_deadline, grpc_task).await {

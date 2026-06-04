@@ -148,7 +148,7 @@ async fn process_one(db: &Database, msg: WriteBatch) -> WriteAck {
     let result = decode_and_insert(&msg.arrow_ipc, |batch| {
         let project_id = project_id.clone();
         let table_name = table_name.clone();
-        async move { db.insert_records_batch(&project_id, &table_name, vec![batch], false).await }
+        async move { db.insert_records_batch(&project_id, &table_name, vec![batch], false, None).await }
     })
     .await;
 

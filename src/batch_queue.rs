@@ -39,7 +39,7 @@ impl BatchQueue {
                             for (project_id, batches) in grouped {
                                 let count = batches.len();
                                 let row_counts: Vec<usize> = batches.iter().map(|b| b.num_rows()).collect();
-                                if let Err(e) = db.insert_records_batch(&project_id, "otel_logs_and_spans", batches, true).await {
+                                if let Err(e) = db.insert_records_batch(&project_id, "otel_logs_and_spans", batches, true, None).await {
                                     error!("Failed to insert {} batches for project {}: {}", count, project_id, e);
                                 } else {
                                     info!("Inserted {} batches with rows {:?} for project {}", count, row_counts, project_id);

@@ -141,6 +141,9 @@ pub struct MemBuffer {
     /// Reduces 3 hash lookups to 1 for table access.
     tables:               DashMap<TableKey, Arc<TableBuffer>>,
     estimated_bytes:      AtomicUsize,
+    /// Mirrors `WalManager::shards_per_topic` so `FlushableBucket.wal_shard_counts`
+    /// is always sized correctly when snapshotted at seal time.
+    shards_per_topic:     usize,
     /// LRU cache of per-bucket tantivy indexes. Lives at the MemBuffer
     /// level (not on individual TimeBuckets) so the LRU has a global view
     /// for byte-budget eviction. Entries are dropped:
@@ -176,15 +179,36 @@ pub struct TimeBucket {
     memory_bytes:  AtomicUsize,
     min_timestamp: AtomicI64,
     max_timestamp: AtomicI64,
+    /// Per-shard count of WAL entries that landed in this bucket. Indexed
+    /// by walrus shard id; grows on demand on first append-into-shard.
+    /// Snapshotted into `FlushableBucket.wal_shard_counts` at seal time so
+    /// `Wal::advance_by_counts` can move the cursor by exactly these counts
+    /// after a successful Delta commit — never past entries belonging to
+    /// the open follow-on bucket.
+    wal_shard_counts: Mutex<Vec<u64>>,
+    /// Per-shard walrus position recorded *after* this bucket's last append
+    /// landed on that shard. `None` for shards this bucket never wrote to.
+    /// Snapshotted into `FlushableBucket.wal_positions` at seal time and
+    /// written into the Delta commit metadata so crash-mid-flush recovery
+    /// can derive the cursor from Delta atomically with the flushed rows.
+    wal_positions:    Mutex<Vec<Option<walrus_rust::WalPosition>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FlushableBucket {
-    pub project_id: String,
-    pub table_name: String,
-    pub bucket_id:  i64,
-    pub batches:    Vec<RecordBatch>,
-    pub row_count:  usize,
+    pub project_id:       String,
+    pub table_name:       String,
+    pub bucket_id:        i64,
+    pub batches:          Vec<RecordBatch>,
+    pub row_count:        usize,
+    /// Per-shard WAL-entry count snapshotted at seal time. Drives
+    /// `Wal::advance_by_counts` after a successful flush.
+    pub wal_shard_counts: Vec<u64>,
+    /// Per-shard walrus position immediately past this bucket's last entry,
+    /// snapshotted at seal time. `None` for shards this bucket didn't touch.
+    /// Written into Delta commit metadata so a crash between Delta commit
+    /// and `advance_by_counts` can recover the cursor from Delta on restart.
+    pub wal_positions:    Vec<Option<walrus_rust::WalPosition>>,
 }
 
 #[derive(Debug, Default)]
@@ -398,13 +422,22 @@ impl MemBuffer {
     }
 
     pub fn new_with_max_index_bytes(text_index_max_bytes: usize) -> Self {
+        Self::new_with_max_index_bytes_and_shards(text_index_max_bytes, 4)
+    }
+
+    pub fn new_with_max_index_bytes_and_shards(text_index_max_bytes: usize, shards_per_topic: usize) -> Self {
         Self {
             tables: DashMap::new(),
             estimated_bytes: AtomicUsize::new(0),
+            shards_per_topic,
             text_index_cache: parking_lot::Mutex::new(lru::LruCache::unbounded()),
             text_index_bytes: AtomicUsize::new(0),
             text_index_max_bytes,
         }
+    }
+
+    pub fn shards_per_topic(&self) -> usize {
+        self.shards_per_topic
     }
 
     /// Approximate bytes currently held by cached per-bucket text indexes.
@@ -546,6 +579,31 @@ impl MemBuffer {
         // budget to other buckets immediately.
         self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
         Ok(())
+    }
+
+    /// Record that `count` WAL entries for `(project_id, table_name)` were
+    /// appended to walrus `shard`, attributing them to the MemBuffer bucket
+    /// covering `timestamp_micros`. Called by the write path *after*
+    /// `Wal::append*` returns the chosen shard. Not called during WAL replay
+    /// (those entries are *read from* walrus, not appended to it).
+    ///
+    /// No-op if the bucket doesn't exist — the caller must have already
+    /// inserted into the same bucket via `insert` / `insert_batches`, so
+    /// missing-bucket here would mean a TOCTOU race we don't currently
+    /// expose (insert + record are both synchronous, no await between them
+    /// at the call site).
+    pub fn record_wal_append(
+        &self, project_id: &str, table_name: &str, timestamp_micros: i64, shard: usize, count: u64,
+        position: Option<walrus_rust::WalPosition>,
+    ) {
+        let key = Self::make_key(project_id, table_name);
+        let Some(table) = self.tables.get(&key) else {
+            return;
+        };
+        let bucket_id = Self::compute_bucket_id(timestamp_micros);
+        if let Some(bucket) = table.buckets.get(&bucket_id) {
+            bucket.record_wal_append(shard, count, position);
+        }
     }
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
@@ -893,12 +951,16 @@ impl MemBuffer {
                 if batches.is_empty() {
                     continue;
                 }
+                let wal_shard_counts = bucket.snapshot_wal_shard_counts(self.shards_per_topic);
+                let wal_positions = bucket.snapshot_wal_positions(self.shards_per_topic);
                 result.push(FlushableBucket {
                     project_id: project_id.to_string(),
                     table_name: table_name.to_string(),
                     bucket_id,
                     batches,
+                    wal_positions,
                     row_count: bucket.row_count.load(Ordering::Relaxed),
+                    wal_shard_counts,
                 });
             }
         }
@@ -1269,12 +1331,62 @@ impl TableBuffer {
 impl TimeBucket {
     fn new() -> Self {
         Self {
-            batches:       Mutex::new(Vec::new()),
-            row_count:     AtomicUsize::new(0),
-            memory_bytes:  AtomicUsize::new(0),
-            min_timestamp: AtomicI64::new(i64::MAX),
-            max_timestamp: AtomicI64::new(i64::MIN),
+            batches:          Mutex::new(Vec::new()),
+            row_count:        AtomicUsize::new(0),
+            memory_bytes:     AtomicUsize::new(0),
+            min_timestamp:    AtomicI64::new(i64::MAX),
+            max_timestamp:    AtomicI64::new(i64::MIN),
+            wal_shard_counts: Mutex::new(Vec::new()),
+            wal_positions:    Mutex::new(Vec::new()),
         }
+    }
+
+    /// Record `count` WAL entries appended to `shard` for this bucket, plus
+    /// the walrus position immediately past the last entry on that shard.
+    /// Subsequent appends to the same `(bucket, shard)` overwrite the
+    /// position with a monotonically-greater value; the final snapshot at
+    /// seal time reflects the bucket's last entry on each touched shard.
+    fn record_wal_append(&self, shard: usize, count: u64, position: Option<walrus_rust::WalPosition>) {
+        let mut g = self.wal_shard_counts.lock();
+        if g.len() <= shard {
+            g.resize(shard + 1, 0);
+        }
+        g[shard] += count;
+        drop(g);
+        if let Some(pos) = position {
+            let mut p = self.wal_positions.lock();
+            if p.len() <= shard {
+                p.resize(shard + 1, None);
+            }
+            // Monotonicity is guaranteed by walrus, but be defensive against
+            // any out-of-order callers (e.g. retries) by keeping the max.
+            p[shard] = Some(match p[shard] {
+                Some(prev) if prev > pos => prev,
+                _ => pos,
+            });
+        }
+    }
+
+    fn snapshot_wal_shard_counts(&self, shards_per_topic: usize) -> Vec<u64> {
+        let g = self.wal_shard_counts.lock();
+        let mut out = vec![0u64; shards_per_topic];
+        for (i, &c) in g.iter().enumerate() {
+            if i < shards_per_topic {
+                out[i] = c;
+            }
+        }
+        out
+    }
+
+    fn snapshot_wal_positions(&self, shards_per_topic: usize) -> Vec<Option<walrus_rust::WalPosition>> {
+        let g = self.wal_positions.lock();
+        let mut out = vec![None; shards_per_topic];
+        for (i, p) in g.iter().enumerate() {
+            if i < shards_per_topic {
+                out[i] = *p;
+            }
+        }
+        out
     }
 
     fn update_timestamps(&self, timestamp: i64) {

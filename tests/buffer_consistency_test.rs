@@ -62,7 +62,7 @@ async fn test_insert_query(mode: BufferMode) -> Result<()> {
 
     let records = create_records(&project_id, 10);
     let batch = json_to_batch(records)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
     let result = ctx
         .sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
@@ -85,7 +85,7 @@ async fn test_select_columns(mode: BufferMode) -> Result<()> {
     db.setup_session_context(&mut ctx)?;
 
     let batch = json_to_batch(vec![test_span("test1", "my_span", &project_id)])?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
     let result = ctx
         .sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
@@ -110,7 +110,7 @@ async fn test_update(mode: BufferMode) -> Result<()> {
 
     let records = create_records(&project_id, 3);
     let batch = json_to_batch(records)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
     ctx.sql(&format!(
         "UPDATE otel_logs_and_spans SET duration = 999 WHERE project_id = '{}' AND name = 'name_1'",
@@ -151,7 +151,7 @@ async fn test_delete(mode: BufferMode) -> Result<()> {
 
     let records = create_records(&project_id, 5);
     let batch = json_to_batch(records)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
     ctx.sql(&format!(
         "DELETE FROM otel_logs_and_spans WHERE project_id = '{}' AND name = 'name_2'",
@@ -183,7 +183,7 @@ async fn test_aggregations(mode: BufferMode) -> Result<()> {
 
     let records = create_records(&project_id, 10);
     let batch = json_to_batch(records)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
     let result = ctx
         .sql(&format!(
@@ -223,7 +223,7 @@ async fn test_partial_flush_union() -> Result<()> {
 
     // Insert first batch directly to Delta (skip_queue=true)
     let batch1 = json_to_batch(create_records(&project_id, 50))?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch1], true).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch1], true, None).await?;
 
     // Insert second batch to buffer only (skip_queue=false, no callback so no flush to Delta)
     let now = chrono::Utc::now();
@@ -243,7 +243,7 @@ async fn test_partial_flush_union() -> Result<()> {
         })
         .collect();
     let batch2 = json_to_batch(records2)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch2], false).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch2], false, None).await?;
 
     // Query should return all 100 rows (50 from Delta + 50 from buffer)
     let result = ctx
@@ -265,7 +265,7 @@ async fn test_delta_only_query() -> Result<()> {
 
     // Insert directly to Delta (skip_queue=true)
     let batch1 = json_to_batch(create_records(&project_id, 30))?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch1], true).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch1], true, None).await?;
 
     // Insert to buffer only (skip_queue=false, no callback so stays in buffer)
     let now = chrono::Utc::now();
@@ -285,7 +285,7 @@ async fn test_delta_only_query() -> Result<()> {
         })
         .collect();
     let batch2 = json_to_batch(records2)?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch2], false).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch2], false, None).await?;
 
     // Delta-only query should return only Delta data (30 rows)
     let delta_result = db
@@ -320,7 +320,7 @@ async fn test_immediate_flush_drains_buffer() -> Result<()> {
 
     // Insert with immediate mode through buffer (skip_queue=false)
     let batch = json_to_batch(create_records(&project_id, 10))?;
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
 
     // Buffer should be empty after immediate flush (flush drains buffer even without callback)
     assert!(layer.is_empty(), "Buffer should be empty after immediate flush");
