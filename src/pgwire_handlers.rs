@@ -345,10 +345,13 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
 
 /// Start the server with custom handlers
 pub async fn serve_with_logging(
-    session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
+    session_context: Arc<SessionContext>,
+    options: &datafusion_postgres::ServerOptions,
+    auth_config: AuthConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_config));
-    datafusion_postgres::serve_with_handlers(handlers, options).await?;
+    datafusion_postgres::serve_with_handlers(handlers, options, shutdown).await?;
     Ok(())
 }
 

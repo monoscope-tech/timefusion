@@ -93,7 +93,7 @@ pub async fn serve(
     // Create the handler factory with authentication
     let factory = Arc::new(HandlerFactory::new(session_context));
 
-    serve_with_handlers(factory, opts).await
+    serve_with_handlers(factory, opts, std::future::pending::<()>()).await
 }
 
 /// Serve the Datafusion `SessionContext` with Postgres protocol, using custom
@@ -109,7 +109,7 @@ pub async fn serve_with_hooks(
     // Create the handler factory with authentication
     let factory = Arc::new(HandlerFactory::new_with_hooks(session_context, hooks));
 
-    serve_with_handlers(factory, opts).await
+    serve_with_handlers(factory, opts, std::future::pending::<()>()).await
 }
 
 /// Serve with custom pgwire handlers
@@ -117,9 +117,15 @@ pub async fn serve_with_hooks(
 /// This function allows you to rewrite some of the built-in logic including
 /// authentication and query processing. You can Implement your own
 /// `PgWireServerHandlers` by reusing `DfSessionService`.
+///
+/// `shutdown` is a future that, when it resolves, stops the accept loop.
+/// Already-accepted connections keep going on their spawned tasks — the
+/// listener just stops minting new ones. Pass `std::future::pending()` (or
+/// equivalent never-firing future) if you don't need shutdown signalling.
 pub async fn serve_with_handlers(
     handlers: Arc<impl PgWireServerHandlers + Sync + Send + 'static>,
     opts: &ServerOptions,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
     // Set up TLS if configured
     let tls_acceptor =
@@ -156,39 +162,50 @@ pub async fn serve_with_handlers(
         None
     };
 
-    // Accept incoming connections
+    // Accept incoming connections until `shutdown` resolves. Existing
+    // connections keep going on their spawned tasks — they're not cancelled
+    // here; the caller is responsible for waiting for them to drain.
+    tokio::pin!(shutdown);
     loop {
-        match listener.accept().await {
-            Ok((socket, addr)) => {
-                let factory_ref = handlers.clone();
-                let tls_acceptor_ref = tls_acceptor.clone();
-                let limiter_ref = connection_limiter.clone();
-
-                tokio::spawn(async move {
-                    // Check connection limit if configured
-                    let _permit = if let Some(ref semaphore) = limiter_ref {
-                        match semaphore.try_acquire() {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
-                                warn!("Connection rejected from {addr}: max connections ({max_conn_count}) reached");
-                                return;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Err(e) = process_socket(socket, tls_acceptor_ref, factory_ref).await {
-                        warn!("Error processing socket from {addr}: {e}");
-                    }
-                    // Permit is automatically released when _permit is dropped
-                });
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                info!("PGWire: shutdown signal received, stopping accept loop");
+                break;
             }
-            Err(e) => {
-                warn!("Error accept socket: {e}");
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((socket, addr)) => {
+                        let factory_ref = handlers.clone();
+                        let tls_acceptor_ref = tls_acceptor.clone();
+                        let limiter_ref = connection_limiter.clone();
+
+                        tokio::spawn(async move {
+                            let _permit = if let Some(ref semaphore) = limiter_ref {
+                                match semaphore.try_acquire() {
+                                    Ok(permit) => Some(permit),
+                                    Err(_) => {
+                                        warn!("Connection rejected from {addr}: max connections ({max_conn_count}) reached");
+                                        return;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Err(e) = process_socket(socket, tls_acceptor_ref, factory_ref).await {
+                                warn!("Error processing socket from {addr}: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        warn!("Error accept socket: {e}");
+                    }
+                }
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

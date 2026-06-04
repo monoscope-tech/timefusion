@@ -122,12 +122,22 @@ pub mod test_helpers {
     }
 
     pub fn test_span(id: &str, name: &str, project_id: &str) -> Value {
+        test_span_ts(id, name, project_id, chrono::Utc::now().timestamp_micros())
+    }
+
+    /// Like `test_span` but with an explicit timestamp, for tests that need
+    /// rows to land in a specific MemBuffer bucket.
+    pub fn test_span_ts(id: &str, name: &str, project_id: &str, ts_micros: i64) -> Value {
+        let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros)
+            .unwrap_or_else(chrono::Utc::now)
+            .date_naive()
+            .to_string();
         json!({
-            "timestamp": chrono::Utc::now().timestamp_micros(),
+            "timestamp": ts_micros,
             "id": id,
             "name": name,
             "project_id": project_id,
-            "date": chrono::Utc::now().date_naive().to_string(),
+            "date": date,
             "hashes": [],
             "summary": vec![format!("Test span: {}", name)]
         })

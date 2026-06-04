@@ -105,7 +105,12 @@ const_default!(d_retention_mins: u64 = 70);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
 const_default!(d_wal_shards_per_topic: usize = 4);
-const_default!(d_shutdown_timeout: u64 = 5);
+// Per-phase ceiling for each serial shutdown step (PGWire drain → gRPC drain →
+// BufferedWriteLayer flush). 5s — the previous default — was below realistic
+// flush time for any non-trivial MemBuffer and caused the post-deploy WAL
+// replay we saw 2026-06-03. The Docker `StopGracePeriod` external cap should
+// be set ≥ `3 × this` to give all three phases room.
+const_default!(d_shutdown_timeout: u64 = 180);
 const_default!(d_wal_corruption_threshold: usize = 10);
 const_default!(d_flush_parallelism: usize = 4);
 const_default!(d_wal_fsync_ms: u64 = 200);
@@ -444,8 +449,13 @@ impl BufferConfig {
         self.timefusion_pressure_flush_pct.min(100)
     }
 
-    pub fn compute_shutdown_timeout(&self, current_memory_mb: usize) -> Duration {
-        Duration::from_secs((self.timefusion_shutdown_timeout_secs.max(1) + (current_memory_mb / 100) as u64).min(300))
+    /// Per-phase shutdown ceiling. Was previously
+    /// `timeout_secs + memory_mb/100` capped at 300s, but the buffer-size
+    /// heuristic was never calibrated against real flush throughput and the
+    /// cap fell below realistic flush time for 5 GiB+ buffers. A single
+    /// number an operator can reason about beats a hidden formula.
+    pub fn compute_shutdown_timeout(&self, _current_memory_mb: usize) -> Duration {
+        Duration::from_secs(self.timefusion_shutdown_timeout_secs.max(1))
     }
 }
 
