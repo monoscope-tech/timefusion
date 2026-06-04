@@ -449,12 +449,8 @@ impl BufferConfig {
         self.timefusion_pressure_flush_pct.min(100)
     }
 
-    /// Per-phase shutdown ceiling. Was previously
-    /// `timeout_secs + memory_mb/100` capped at 300s, but the buffer-size
-    /// heuristic was never calibrated against real flush throughput and the
-    /// cap fell below realistic flush time for 5 GiB+ buffers. A single
-    /// number an operator can reason about beats a hidden formula.
-    pub fn compute_shutdown_timeout(&self, _current_memory_mb: usize) -> Duration {
+    /// Per-phase shutdown ceiling, in seconds.
+    pub fn compute_shutdown_timeout(&self) -> Duration {
         Duration::from_secs(self.timefusion_shutdown_timeout_secs.max(1))
     }
 }

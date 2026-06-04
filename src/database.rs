@@ -176,10 +176,7 @@ fn max_watermark_across_commits<'a>(
     for info in commit_infos {
         for (shard, p) in parse_watermark_from_json(info, shards).into_iter().enumerate() {
             let Some(candidate) = p else { continue };
-            acc[shard] = Some(match acc[shard] {
-                Some(prev) if prev > candidate => prev,
-                _ => candidate,
-            });
+            acc[shard] = Some(acc[shard].map_or(candidate, |prev: walrus_rust::WalPosition| prev.max(candidate)));
         }
     }
     acc
@@ -1868,6 +1865,9 @@ impl Database {
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
 
         // Retry logic for concurrent writes
+        // Hoist out of the retry loop — the watermark is the same on every attempt.
+        let commit_properties = watermark.map(build_watermark_commit_properties);
+
         let max_retries = 5;
         let mut retry_count = 0;
         let mut last_error = None;
@@ -1882,7 +1882,6 @@ impl Database {
             }
 
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
-            let commit_properties = watermark.map(build_watermark_commit_properties);
             let write_result = async {
                 // Schema evolution enabled: new columns will be automatically added to the table
                 let mut builder = table
@@ -1892,7 +1891,7 @@ impl Database {
                     .with_writer_properties(writer_properties.clone())
                     .with_save_mode(deltalake::protocol::SaveMode::Append)
                     .with_schema_mode(deltalake::operations::write::SchemaMode::Merge);
-                if let Some(cp) = commit_properties {
+                if let Some(cp) = commit_properties.clone() {
                     builder = builder.with_commit_properties(cp);
                 }
                 builder.await
@@ -1973,29 +1972,26 @@ impl Database {
     /// metadata is logged and skipped (walrus's locally-fsynced cursor wins),
     /// so this can't make recovery worse than today's at-least-once behaviour.
     pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::wal::WalManager) -> anyhow::Result<usize> {
-        let topics = wal.list_topics()?;
-        let mut advanced = 0usize;
-        for topic in topics {
-            let Some((project_id, table_name)) = topic.split_once(':') else {
-                continue;
-            };
-            advanced += self.derive_wal_cursor_for_table(wal, project_id, table_name).await.unwrap_or(0);
-        }
-        Ok(advanced)
+        use futures::stream::{self, StreamExt};
+        let pairs = wal.list_topic_pairs()?;
+        // Cap concurrency to bound S3 connections at startup.
+        let totals: Vec<usize> = stream::iter(pairs)
+            .map(|(project_id, table_name)| async move {
+                self.derive_wal_cursor_for_table(wal, &project_id, &table_name).await.unwrap_or(0)
+            })
+            .buffer_unordered(8)
+            .collect()
+            .await;
+        Ok(totals.into_iter().sum())
     }
 
     async fn derive_wal_cursor_for_table(
         &self, wal: &crate::wal::WalManager, project_id: &str, table_name: &str,
     ) -> anyhow::Result<usize> {
-        // Scan the most recent commits and take per-shard MAX. Replay-derived
-        // commits without a watermark contribute nothing and don't reset the
-        // MAX — that's deliberate so we cover the case where a normal commit
-        // (with watermark) is followed by replay-derived commits before crash.
+        // Scan recent commits; replay-derived commits without a watermark
+        // contribute nothing so they can't reset the MAX backward.
         const SCAN_DEPTH: usize = 16;
-        let table_ref = match self.resolve_table(project_id, table_name).await {
-            Ok(r) => r,
-            Err(_) => return Ok(0),
-        };
+        let Ok(table_ref) = self.resolve_table(project_id, table_name).await else { return Ok(0) };
         let table = table_ref.read().await;
         let commits: Vec<_> = match table.history(Some(SCAN_DEPTH)).await {
             Ok(it) => it.collect(),
@@ -2008,21 +2004,14 @@ impl Database {
 
         let shards = wal.shards_per_topic();
         let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), shards);
-
-        if delta_max.iter().all(|p| p.is_none()) {
-            return Ok(0);
-        }
-
         let local = wal.persisted_read_positions(project_id, table_name).unwrap_or_else(|_| vec![None; shards]);
+
         let mut to_set = local.clone();
         let mut any_advance = 0usize;
         for shard in 0..shards {
             let Some(dpos) = delta_max[shard] else { continue };
-            let advance = match local[shard] {
-                Some(lpos) => dpos > lpos,
-                None => !dpos.is_origin(),
-            };
-            if advance {
+            let ahead = local[shard].map_or(!dpos.is_origin(), |lpos| dpos > lpos);
+            if ahead {
                 to_set[shard] = Some(dpos);
                 any_advance += 1;
             }
