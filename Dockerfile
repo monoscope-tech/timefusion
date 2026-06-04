@@ -1,46 +1,59 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.6
 
 ##############################
-#         Builder Stage      #
+#         Chef base          #
 ##############################
-FROM rust:1.91-slim-bookworm AS builder
+FROM rust:1.91-slim-bookworm AS chef
 WORKDIR /app
-
-# Install build dependencies. protoc is required by tonic-prost-build (build.rs).
+# protoc is required by tonic-prost-build (build.rs).
 RUN apt-get update && \
     apt-get install -y pkg-config libssl-dev protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
-
-# Copy Cargo manifests, build.rs, proto files (needed by build.rs at compile
-# time), and vendored path-dep crates referenced in Cargo.toml.
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY proto/ proto/
-COPY vendor/ vendor/
-
-# Create dummy bench files (one per [[bench]] in Cargo.toml) and a dummy main
-# to allow dependency caching without the full source tree.
-RUN mkdir src && echo "fn main() {}" > src/main.rs && \
-    mkdir benches && \
-    echo "fn main() {}" > benches/core_benchmarks.rs && \
-    echo "fn main() {}" > benches/tantivy_benchmarks.rs && \
-    echo "fn main() {}" > benches/sort_layout_benchmarks.rs
-
-# Build a dummy release binary (to cache dependencies)
-RUN cargo build --release
-
-# Copy the full source code
-COPY src/ src/
-COPY schemas/ schemas/
-
-# Build the real release binary
-RUN cargo build --release
-
-# Pre-create app state dirs so they can be copied into the distroless
-# runtime (which has no shell to mkdir at runtime).
-RUN mkdir -p /app/queue_db /app/data
+RUN cargo install cargo-chef --version 0.1.77 --locked
 
 ##############################
-#         Runtime Stage      #
+#         Planner            #
+##############################
+# Emit recipe.json describing the dep graph. Recipe content only changes when
+# Cargo.toml / Cargo.lock / path-dep manifests change, so the cook layer below
+# stays cached across most edits.
+FROM chef AS planner
+# Only inputs cargo chef prepare actually reads: Cargo manifests + path-dep
+# manifests (in vendor/). NOT src/, schemas/, or proto/ — including them
+# here would bust the planner layer on edits unrelated to the dep graph,
+# defeating cargo-chef's purpose. vendor/ is copied in full (manifests +
+# source) since separating them isn't worth the Dockerfile complexity.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY vendor/ vendor/
+RUN cargo chef prepare --recipe-path recipe.json
+
+##############################
+#         Builder            #
+##############################
+FROM chef AS builder
+# Cook compiles only dependencies. Docker layer-caches this step; cache-to:
+# type=gha,mode=max in deploy.yml persists the layer across CI runs. Layer
+# invalidates only when recipe.json changes (i.e. the dep graph changes),
+# not on every src/ or proto/ edit. vendor/ is required here for the same
+# reason as in the planner stage (path-deps) — the duplication is necessary.
+COPY --from=planner /app/recipe.json recipe.json
+COPY vendor/ vendor/
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+
+# Now compile the real binary. Deps are already built, so this only rebuilds
+# the crate itself when src/, build.rs, or proto/ change. proto/ must be
+# copied *after* cook so .proto edits don't bust the dep-compile layer.
+COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto/ proto/
+COPY src/ src/
+COPY schemas/ schemas/
+RUN cargo build --release --locked
+
+# App state dirs (distroless runtime has no shell to mkdir at runtime).
+RUN mkdir -p /queue_db /data
+
+##############################
+#         Runtime            #
 ##############################
 # Distroless/cc ships glibc 2.36 (matches builder), libssl3, and CA roots,
 # and runs as the built-in `nonroot` user (uid 65532). Previously this
@@ -50,8 +63,8 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
 
 COPY --from=builder --chown=nonroot:nonroot /app/target/release/timefusion /usr/local/bin/timefusion
-COPY --from=builder --chown=nonroot:nonroot /app/queue_db /app/queue_db
-COPY --from=builder --chown=nonroot:nonroot /app/data     /app/data
+COPY --from=builder --chown=nonroot:nonroot /queue_db /app/queue_db
+COPY --from=builder --chown=nonroot:nonroot /data     /app/data
 
 EXPOSE 80 5432
 
