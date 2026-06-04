@@ -78,7 +78,9 @@ mod pgwire_dml_tag {
             for _ in 0..100 {
                 if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
                     tokio::spawn(async move {
-                        if let Err(e) = conn.await { eprintln!("conn error: {e}"); }
+                        if let Err(e) = conn.await {
+                            eprintln!("conn error: {e}");
+                        }
                     });
                     return Ok(client);
                 }
@@ -87,11 +89,15 @@ mod pgwire_dml_tag {
             Err(anyhow::anyhow!("Failed to connect"))
         }
 
-        async fn client(&self) -> Result<Client> { Self::connect(self.port).await }
+        async fn client(&self) -> Result<Client> {
+            Self::connect(self.port).await
+        }
     }
 
     impl Drop for TestServer {
-        fn drop(&mut self) { self.shutdown.notify_one(); }
+        fn drop(&mut self) {
+            self.shutdown.notify_one();
+        }
     }
 
     /// Hasql/pgjdbc poison-row surface: prepared DML must describe as NoData.
@@ -102,12 +108,22 @@ mod pgwire_dml_tag {
         let client = server.client().await?;
 
         let cases: &[(&str, String)] = &[
-            ("INSERT", format!("{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, $3, $4, $5, $6, ARRAY[]::text[], $7)")),
-            ("UPDATE", "UPDATE otel_logs_and_spans SET status_message = $1 WHERE project_id = $2 AND id = $3".into()),
+            (
+                "INSERT",
+                format!("{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, $3, $4, $5, $6, ARRAY[]::text[], $7)"),
+            ),
+            (
+                "UPDATE",
+                "UPDATE otel_logs_and_spans SET status_message = $1 WHERE project_id = $2 AND id = $3".into(),
+            ),
             ("DELETE", "DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2".into()),
             // Variant column path — exercises VariantInsertRewriter, monoscope's actual prod path.
-            ("Variant INSERT", "INSERT INTO variant_bench (project_id, date, timestamp, id, shape, payload, payload_json) \
-                                VALUES ($1, CURRENT_DATE, NOW(), $2, 'flat', $3, $4)".into()),
+            (
+                "Variant INSERT",
+                "INSERT INTO variant_bench (project_id, date, timestamp, id, shape, payload, payload_json) \
+                                VALUES ($1, CURRENT_DATE, NOW(), $2, 'flat', $3, $4)"
+                    .into(),
+            ),
         ];
 
         for (label, sql) in cases {
@@ -153,7 +169,9 @@ mod pgwire_dml_tag {
         let mut conn = sqlx::postgres::PgConnection::connect(&url).await?;
 
         let describe = conn
-            .describe(&format!("{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])"))
+            .describe(&format!(
+                "{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])"
+            ))
             .await?;
         assert!(
             describe.columns.is_empty(),
@@ -174,9 +192,7 @@ mod pgwire_dml_tag {
         let server = TestServer::start().await?;
         let client = server.client().await?;
         let id = Uuid::new_v4().to_string();
-        let sql = format!(
-            "{SPAN_INSERT_COLS} VALUES ('test_project', CURRENT_DATE, NOW(), '{id}', 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])"
-        );
+        let sql = format!("{SPAN_INSERT_COLS} VALUES ('test_project', CURRENT_DATE, NOW(), '{id}', 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])");
         let msgs = client.simple_query(&sql).await?;
         assert!(
             !msgs.iter().any(|m| matches!(m, SimpleQueryMessage::Row(_))),
