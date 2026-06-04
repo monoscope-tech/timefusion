@@ -559,8 +559,7 @@ impl WalManager {
         self.check_shard_len("advance_by_counts", counts.len())?;
         let topic = Self::make_topic(project_id, table_name);
         let mut total = 0u64;
-        for shard in 0..self.shards_per_topic {
-            let target = counts[shard];
+        for (shard, &target) in counts.iter().enumerate() {
             if target == 0 {
                 continue;
             }

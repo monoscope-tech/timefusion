@@ -34,6 +34,7 @@ fn table() -> TableSchema {
         }],
         z_order_columns: vec![],
         time_column:     None,
+        dedup_keys:      vec![],
         fields:          vec![
             FieldDef {
                 name:         "timestamp".into(),
@@ -182,11 +183,11 @@ async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Op
     let cfg_arc = make_app_cfg(test_id, tantivy_enabled);
     let mut db = Database::with_config(cfg_arc.clone()).await.ok()?;
     let db_for_cb = db.clone();
-    let delta_cb: DeltaWriteCallback = Arc::new(move |project_id, table_name, batches| {
+    let delta_cb: DeltaWriteCallback = Arc::new(move |project_id, table_name, batches, _watermark| {
         let db = db_for_cb.clone();
         Box::pin(async move {
             let pre = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
-            db.insert_records_batch(&project_id, &table_name, batches, true).await?;
+            db.insert_records_batch(&project_id, &table_name, batches, true, None).await?;
             let post = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
             let pre_set: std::collections::HashSet<String> = pre.into_iter().collect();
             Ok(post.into_iter().filter(|u| !pre_set.contains(u)).collect())
@@ -229,7 +230,7 @@ async fn setup_bench_db(test_id: &str, tantivy_enabled: bool, rows: usize) -> Op
         })
         .collect();
     let batch = json_to_batch(recs).ok()?;
-    db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], false).await.ok()?;
+    db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], false, None).await.ok()?;
     db.buffered_layer().cloned()?.flush_all_now().await.ok()?;
     Some((db, ctx, project))
 }

@@ -33,6 +33,7 @@ fn schema_with(level_indexed: bool) -> TableSchema {
         }],
         z_order_columns: vec![],
         time_column:     None,
+        dedup_keys:      vec![],
         fields:          vec![
             FieldDef {
                 name:         "timestamp".into(),

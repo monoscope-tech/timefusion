@@ -66,7 +66,7 @@ async fn setup_read_bench(name: &str, pre_insert: usize) -> (SessionContext, Arc
     let pid = format!("bench_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     for i in 0..pre_insert {
         let batch = json_to_batch(vec![test_span(&format!("id_{i}"), &format!("span_{i}"), &pid)]).unwrap();
-        db.insert_records_batch(&pid, "otel_logs_and_spans", vec![batch], false).await.unwrap();
+        db.insert_records_batch(&pid, "otel_logs_and_spans", vec![batch], false, None).await.unwrap();
     }
     (ctx, db, pid)
 }
@@ -78,10 +78,10 @@ async fn setup_s3_bench(name: &str) -> (SessionContext, Arc<Database>, String) {
 
     let db_for_cb = Database::with_config(Arc::clone(&cfg)).await.unwrap();
     let db_clone = db_for_cb.clone();
-    let delta_cb: timefusion::buffered_write_layer::DeltaWriteCallback = Arc::new(move |project_id, table_name, batches| {
+    let delta_cb: timefusion::buffered_write_layer::DeltaWriteCallback = Arc::new(move |project_id, table_name, batches, _watermark| {
         let db = db_clone.clone();
         Box::pin(async move {
-            db.insert_records_batch(&project_id, &table_name, batches, true).await?;
+            db.insert_records_batch(&project_id, &table_name, batches, true, None).await?;
             Ok(Vec::new())
         })
     });
@@ -164,7 +164,7 @@ fn bench_inmemory_writes(c: &mut Criterion) {
             let (db, pid, batches) = (db.clone(), pid.clone(), batches.clone());
             b.to_async(&rt).iter(|| {
                 let (db, pid, batches) = (db.clone(), pid.clone(), batches.clone());
-                async move { db.insert_records_batch(&pid, "otel_logs_and_spans", batches, false).await.unwrap() }
+                async move { db.insert_records_batch(&pid, "otel_logs_and_spans", batches, false, None).await.unwrap() }
             })
         });
     }
