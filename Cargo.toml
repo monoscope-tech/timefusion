@@ -82,7 +82,7 @@ parking_lot = "0.12"
 envy = "0.4"
 tdigests = "1.0"
 bincode = { version = "2.0", features = ["serde"] }
-walrus-rust = "0.2.0"
+walrus-rust = { path = "vendor/walrus-rust" }
 thiserror = "2.0"
 strum = { version = "0.27", features = ["derive"] }
 datafusion-variant = { git = "https://github.com/datafusion-contrib/datafusion-variant.git", branch = "main" }
