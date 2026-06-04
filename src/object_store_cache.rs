@@ -319,6 +319,9 @@ impl SharedFoyerCache {
 }
 
 /// Foyer-based hybrid cache implementation for object store
+#[derive(derive_more::Display, derive_more::Debug)]
+#[display("FoyerHybridCachedObjectStore({})", inner)]
+#[debug("FoyerHybridCachedObjectStore {{ inner: {} }}", inner)]
 pub struct FoyerObjectStoreCache {
     inner:            Arc<dyn ObjectStore>,
     cache:            FoyerCache,
@@ -1005,18 +1008,6 @@ impl ObjectStore for FoyerObjectStoreCache {
         self.inner.copy_opts(from, to, options).await?;
         self.invalidate_for_delete(to).await;
         Ok(())
-    }
-}
-
-impl std::fmt::Display for FoyerObjectStoreCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FoyerHybridCachedObjectStore({})", self.inner)
-    }
-}
-
-impl std::fmt::Debug for FoyerObjectStoreCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FoyerHybridCachedObjectStore {{ inner: {} }}", self.inner)
     }
 }
 
