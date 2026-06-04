@@ -8606,8 +8606,6 @@ dependencies = [
 [[package]]
 name = "walrus-rust"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f182e7d2b475348cb1411f03547d3df1d6f218650378a23c76d64c7c58373f82"
 dependencies = [
  "io-uring",
  "libc",
