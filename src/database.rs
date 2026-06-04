@@ -122,36 +122,82 @@ fn build_optimize_session_state() -> datafusion::execution::session_state::Sessi
 
 /// Cast Variant struct columns (Struct{BinaryView,BinaryView}) to the
 /// Binary-backed form delta-kernel's `unshredded_variant()` requires on
-/// Serialize a per-shard walrus watermark into the `commitInfo.info` map
-/// under the `timefusion.wal_watermark` key. Only shards this bucket
-/// actually wrote to are included — others are absent rather than `null`
-/// so a recovery scan can compute the per-shard max across multiple recent
-/// commits without ambiguity. Returns an empty `CommitProperties` when the
-/// watermark contains no positions (e.g. WAL-replay-derived buckets).
-fn build_watermark_commit_properties(
+/// On-disk key for the WAL watermark stored in `commitInfo.info`. Constant so
+/// the writer (this file) and reader (`derive_wal_cursor_for_table`) can't
+/// drift, and the roundtrip test below pins the format.
+const WAL_WATERMARK_KEY: &str = "timefusion.wal_watermark";
+
+/// Serialize a per-shard watermark to the JSON map shape we store in
+/// `commitInfo.info[WAL_WATERMARK_KEY]`. Only shards with a position are
+/// included — absent shards mean "no constraint from this commit", which is
+/// how the per-shard MAX aggregation across commits ignores them.
+fn serialize_watermark_to_json(
     watermark: &crate::buffered_write_layer::DeltaWatermark,
-) -> CommitProperties {
-    use std::collections::HashMap;
-    let entries: serde_json::Map<String, serde_json::Value> = watermark
+) -> serde_json::Map<String, serde_json::Value> {
+    watermark
         .iter()
         .enumerate()
         .filter_map(|(shard, pos)| {
-            pos.map(|p| {
-                (
-                    shard.to_string(),
-                    serde_json::json!({ "block_id": p.block_id, "offset": p.offset }),
-                )
-            })
+            pos.map(|p| (shard.to_string(), serde_json::json!({ "block_id": p.block_id, "offset": p.offset })))
         })
-        .collect();
+        .collect()
+}
+
+/// Inverse of `serialize_watermark_to_json`. Out-of-range or malformed shards
+/// are dropped silently — schema-evolution-friendly: future writers can add
+/// fields without breaking older readers.
+fn parse_watermark_from_json(
+    info: &std::collections::HashMap<String, serde_json::Value>, shards: usize,
+) -> Vec<Option<walrus_rust::WalPosition>> {
+    let mut out = vec![None; shards];
+    let Some(wm) = info.get(WAL_WATERMARK_KEY).and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (shard_str, pos_val) in wm {
+        let Ok(shard) = shard_str.parse::<usize>() else { continue };
+        if shard >= shards {
+            continue;
+        }
+        let block_id = pos_val.get("block_id").and_then(|v| v.as_u64()).unwrap_or(0);
+        let offset = pos_val.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+        out[shard] = Some(walrus_rust::WalPosition { block_id, offset });
+    }
+    out
+}
+
+/// Take the per-shard MAX position across a sequence of commit-info maps.
+/// `None` for a shard means no commit observed had a position for it.
+/// Used during startup to compute the cursor each shard should sit at to
+/// be consistent with all recent Delta commits.
+fn max_watermark_across_commits<'a>(
+    commit_infos: impl IntoIterator<Item = &'a std::collections::HashMap<String, serde_json::Value>>, shards: usize,
+) -> Vec<Option<walrus_rust::WalPosition>> {
+    let mut acc = vec![None; shards];
+    for info in commit_infos {
+        for (shard, p) in parse_watermark_from_json(info, shards).into_iter().enumerate() {
+            let Some(candidate) = p else { continue };
+            acc[shard] = Some(match acc[shard] {
+                Some(prev) if prev > candidate => prev,
+                _ => candidate,
+            });
+        }
+    }
+    acc
+}
+
+/// Build [`CommitProperties`] carrying the watermark under [`WAL_WATERMARK_KEY`].
+/// Empty when the watermark has no positions (e.g. WAL-replay-derived buckets);
+/// delta-rs writes the commit without the key in that case, and recovery
+/// silently skips that commit.
+fn build_watermark_commit_properties(
+    watermark: &crate::buffered_write_layer::DeltaWatermark,
+) -> CommitProperties {
+    let entries = serialize_watermark_to_json(watermark);
     if entries.is_empty() {
         return CommitProperties::default();
     }
-    let mut meta = HashMap::new();
-    meta.insert(
-        "timefusion.wal_watermark".to_string(),
-        serde_json::Value::Object(entries),
-    );
+    let mut meta = std::collections::HashMap::new();
+    meta.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(entries));
     CommitProperties::default().with_metadata(meta)
 }
 
@@ -1961,25 +2007,7 @@ impl Database {
         drop(table);
 
         let shards = wal.shards_per_topic();
-        let mut delta_max: Vec<Option<walrus_rust::WalPosition>> = vec![None; shards];
-        for ci in &commits {
-            let Some(wm) = ci.info.get("timefusion.wal_watermark").and_then(|v| v.as_object()) else {
-                continue;
-            };
-            for (shard_str, pos_val) in wm {
-                let Ok(shard) = shard_str.parse::<usize>() else { continue };
-                if shard >= shards {
-                    continue;
-                }
-                let block_id = pos_val.get("block_id").and_then(|v| v.as_u64()).unwrap_or(0);
-                let offset = pos_val.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-                let candidate = walrus_rust::WalPosition { block_id, offset };
-                delta_max[shard] = Some(match delta_max[shard] {
-                    Some(prev) if prev > candidate => prev,
-                    _ => candidate,
-                });
-            }
-        }
+        let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), shards);
 
         if delta_max.iter().all(|p| p.is_none()) {
             return Ok(0);
@@ -3372,6 +3400,93 @@ mod tests {
 
     use super::*;
     use crate::{config::AppConfig, test_utils::test_helpers::*};
+
+    /// Roundtrip the watermark through serialize → JSON → parse. Pins the
+    /// on-disk format so a future change to `serialize_watermark_to_json`
+    /// can't silently break `derive_wal_cursors_from_delta`. Absent shards
+    /// stay absent (not coerced to ORIGIN) — that's required for the
+    /// per-shard MAX aggregation to ignore commits that didn't touch a shard.
+    #[test]
+    fn watermark_serialize_parse_roundtrip() {
+        use walrus_rust::WalPosition;
+        let wm = vec![
+            Some(WalPosition { block_id: 7, offset: 1024 }),
+            None,
+            Some(WalPosition { block_id: 9, offset: 0 }),
+            None,
+        ];
+        let json = serialize_watermark_to_json(&wm);
+        let mut info = std::collections::HashMap::new();
+        info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
+        let parsed = parse_watermark_from_json(&info, wm.len());
+        assert_eq!(parsed, wm);
+    }
+
+    /// All-None watermark serializes to an empty object, which
+    /// `build_watermark_commit_properties` turns into a default
+    /// `CommitProperties` (no metadata written). Recovery sees no key and
+    /// silently skips the commit — same path as old commits from before
+    /// this feature landed.
+    #[test]
+    fn watermark_all_none_omits_metadata() {
+        let wm: crate::buffered_write_layer::DeltaWatermark = vec![None, None, None];
+        assert!(serialize_watermark_to_json(&wm).is_empty());
+        let mut info = std::collections::HashMap::new();
+        info.insert(
+            WAL_WATERMARK_KEY.to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        );
+        assert!(parse_watermark_from_json(&info, 3).iter().all(|p| p.is_none()));
+    }
+
+    /// Per-shard MAX across commits: a shard's position is whichever commit
+    /// observed the furthest. A commit missing a shard contributes nothing
+    /// (replay-derived commits without watermarks must not reset the MAX).
+    #[test]
+    fn watermark_max_across_commits_takes_per_shard_furthest() {
+        use walrus_rust::WalPosition;
+        let mk_info = |entries: &[(usize, u64, u64)]| {
+            let map: serde_json::Map<String, serde_json::Value> = entries
+                .iter()
+                .map(|(s, b, o)| (s.to_string(), serde_json::json!({ "block_id": b, "offset": o })))
+                .collect();
+            let mut info = std::collections::HashMap::new();
+            info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(map));
+            info
+        };
+        // Commit A: shard 0 at (5, 100), shard 1 at (5, 50)
+        let a = mk_info(&[(0, 5, 100), (1, 5, 50)]);
+        // Commit B: shard 0 at (6, 0) — past A on shard 0; nothing for shard 1
+        let b = mk_info(&[(0, 6, 0)]);
+        // Commit C: replay-derived, no watermark key at all
+        let c: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+        // Commit D: shard 1 at (5, 30) — BEHIND A on shard 1; must lose to A
+        let d = mk_info(&[(1, 5, 30)]);
+
+        let max = max_watermark_across_commits([&a, &b, &c, &d], 3);
+        assert_eq!(max[0], Some(WalPosition { block_id: 6, offset: 0 }));
+        assert_eq!(max[1], Some(WalPosition { block_id: 5, offset: 50 }));
+        assert_eq!(max[2], None, "shard 2 unwritten by all commits stays None");
+    }
+
+    /// Out-of-range shard indices in the JSON (e.g. a writer with more shards
+    /// than this reader configures) are dropped silently. Avoids panicking
+    /// on a config-skew restart.
+    #[test]
+    fn watermark_parse_ignores_out_of_range_shards() {
+        let mut info = std::collections::HashMap::new();
+        info.insert(
+            WAL_WATERMARK_KEY.to_string(),
+            serde_json::json!({
+                "0": {"block_id": 1, "offset": 10},
+                "99": {"block_id": 1, "offset": 999},
+                "garbage": {"block_id": 1, "offset": 0},
+            }),
+        );
+        let parsed = parse_watermark_from_json(&info, 4);
+        assert_eq!(parsed[0], Some(walrus_rust::WalPosition { block_id: 1, offset: 10 }));
+        assert!(parsed[1..].iter().all(|p| p.is_none()));
+    }
 
     /// Helper function to extract string value from array column, handling different string array types
     fn get_str(array: &dyn Array, idx: usize) -> String {
