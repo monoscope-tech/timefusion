@@ -50,16 +50,14 @@ fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
 type DmlInfo = (String, String, Option<Expr>, Option<Vec<(String, Expr)>>);
 
 /// Custom query planner that intercepts DML operations
+#[derive(derive_more::Debug)]
 pub struct DmlQueryPlanner {
+    #[debug(skip)]
     planner:        DefaultPhysicalPlanner,
+    #[debug(skip)]
     database:       Arc<Database>,
+    #[debug(skip)]
     buffered_layer: Option<Arc<BufferedWriteLayer>>,
-}
-
-impl std::fmt::Debug for DmlQueryPlanner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DmlQueryPlanner").finish()
-    }
 }
 
 impl DmlQueryPlanner {
@@ -248,30 +246,23 @@ fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assign
 }
 
 /// Unified DML execution plan
-#[derive(Clone)]
+#[derive(Clone, derive_more::Debug)]
 pub struct DmlExec {
     op_type:        DmlOperation,
     table_name:     String,
     project_id:     String,
     predicate:      Option<Expr>,
     assignments:    Vec<(String, Expr)>,
+    #[debug(skip)]
     input:          Arc<dyn ExecutionPlan>,
+    #[debug(skip)]
     database:       Arc<Database>,
+    #[debug(skip)]
     buffered_layer: Option<Arc<BufferedWriteLayer>>,
+    #[debug(skip)]
     session:        Arc<dyn Session>,
+    #[debug(skip)]
     properties:     Arc<PlanProperties>,
-}
-
-impl std::fmt::Debug for DmlExec {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DmlExec")
-            .field("op_type", &self.op_type)
-            .field("table_name", &self.table_name)
-            .field("project_id", &self.project_id)
-            .field("predicate", &self.predicate)
-            .field("assignments", &self.assignments)
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, strum::Display, strum::AsRefStr)]

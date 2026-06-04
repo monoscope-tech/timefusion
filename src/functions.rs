@@ -33,6 +33,44 @@ fn scalar_to_string(scalar: &ScalarValue) -> Option<String> {
     }
 }
 
+/// Pull a single UTF-8 string out of a scalar-or-length-1-array argument.
+/// Used by UDFs whose Nth argument is a constant string (format, timezone,
+/// etc.). `label` names the argument in error messages.
+fn extract_scalar_string(arg: &ColumnarValue, label: &str) -> datafusion::error::Result<String> {
+    let not_utf8 = || DataFusionError::Execution(format!("{label} must be a UTF8 string"));
+    let not_scalar = || DataFusionError::Execution(format!("{label} must be a scalar value"));
+    match arg {
+        ColumnarValue::Scalar(scalar) => scalar_to_string(scalar).ok_or_else(not_utf8),
+        ColumnarValue::Array(arr) => {
+            // `&&` short-circuits so is_null(0) is never called on an empty array.
+            if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
+                if a.len() == 1 && !a.is_null(0) { Ok(a.value(0).to_string()) } else { Err(not_scalar()) }
+            } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+                if a.len() == 1 && !a.is_null(0) { Ok(a.value(0).to_string()) } else { Err(not_scalar()) }
+            } else {
+                Err(not_utf8())
+            }
+        }
+    }
+}
+
+/// Emits the three boilerplate `ScalarUDFImpl` methods (`as_any`, `name`,
+/// `signature`) shared by every UDF in this module that stores its `Signature`
+/// in a `signature` field. `return_type` / `invoke_with_args` stay per-impl.
+macro_rules! scalar_udf_boilerplate {
+    ($name:literal) => {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn name(&self) -> &str {
+            $name
+        }
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+    };
+}
+
 // ============================================================================
 // Variant-Aware Expression Planner
 // ============================================================================
@@ -229,15 +267,7 @@ impl Default for JsonToPgTextUdf {
 }
 
 impl ScalarUDFImpl for JsonToPgTextUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn name(&self) -> &str {
-        "json_to_pg_text"
-    }
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("json_to_pg_text");
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8)
     }
@@ -514,17 +544,7 @@ impl ToCharUDF {
 }
 
 impl ScalarUDFImpl for ToCharUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "to_char"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("to_char");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8View)
@@ -545,28 +565,7 @@ impl ScalarUDFImpl for ToCharUDF {
         };
 
         // Extract format string
-        let format_str = match &args[1] {
-            ColumnarValue::Scalar(scalar) => {
-                scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("Format string must be a UTF8 string".to_string()))?
-            }
-            ColumnarValue::Array(arr) => {
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
-                    if str_arr.len() == 1 && !str_arr.is_null(0) {
-                        str_arr.value(0).to_string()
-                    } else {
-                        return Err(DataFusionError::Execution("Format string must be a scalar value".to_string()));
-                    }
-                } else if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                    if str_arr.len() == 1 && !str_arr.is_null(0) {
-                        str_arr.value(0).to_string()
-                    } else {
-                        return Err(DataFusionError::Execution("Format string must be a scalar value".to_string()));
-                    }
-                } else {
-                    return Err(DataFusionError::Execution("Format string must be a UTF8 string".to_string()));
-                }
-            }
-        };
+        let format_str = extract_scalar_string(&args[1], "Format string")?;
 
         let result = format_timestamps(&timestamp_array, &format_str)?;
         Ok(ColumnarValue::Array(result))
@@ -651,17 +650,7 @@ impl AtTimeZoneUDF {
 }
 
 impl ScalarUDFImpl for AtTimeZoneUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "at_time_zone"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("at_time_zone");
 
     fn return_type(&self, arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         match &arg_types[0] {
@@ -685,28 +674,7 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
         };
 
         // Extract timezone string
-        let tz_str = match &args[1] {
-            ColumnarValue::Scalar(scalar) => {
-                scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("Timezone must be a UTF8 string".to_string()))?
-            }
-            ColumnarValue::Array(arr) => {
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
-                    if str_arr.len() == 1 && !str_arr.is_null(0) {
-                        str_arr.value(0).to_string()
-                    } else {
-                        return Err(DataFusionError::Execution("Timezone must be a scalar string value".to_string()));
-                    }
-                } else if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                    if str_arr.len() == 1 && !str_arr.is_null(0) {
-                        str_arr.value(0).to_string()
-                    } else {
-                        return Err(DataFusionError::Execution("Timezone must be a scalar string value".to_string()));
-                    }
-                } else {
-                    return Err(DataFusionError::Execution("Timezone must be a UTF8 string".to_string()));
-                }
-            }
-        };
+        let tz_str = extract_scalar_string(&args[1], "Timezone")?;
 
         let result = convert_timezone(&timestamp_array, &tz_str)?;
         Ok(ColumnarValue::Array(result))
@@ -813,17 +781,7 @@ impl JsonBuildArrayUDF {
 }
 
 impl ScalarUDFImpl for JsonBuildArrayUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "json_build_array"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("json_build_array");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8View)
@@ -894,20 +852,10 @@ impl ToJsonUDF {
 }
 
 impl ScalarUDFImpl for ToJsonUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "to_json"
-    }
+    scalar_udf_boilerplate!("to_json");
 
     fn aliases(&self) -> &[String] {
         &self.aliases
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
@@ -955,17 +903,7 @@ impl ExtractEpochUDF {
 }
 
 impl ScalarUDFImpl for ExtractEpochUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "extract_epoch"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("extract_epoch");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Float64)
@@ -1014,6 +952,24 @@ impl ScalarUDFImpl for ExtractEpochUDF {
     }
 }
 
+/// Downcast `array` to a primitive Arrow array and push each element into
+/// `values` as `json!(value)`, mapping nulls to `JsonValue::Null`.
+macro_rules! push_json_primitive {
+    ($array:expr, $values:expr, $ty:ty, $tyname:literal) => {{
+        let arr = $array
+            .as_any()
+            .downcast_ref::<$ty>()
+            .ok_or_else(|| DataFusionError::Execution(concat!("Failed to downcast to ", $tyname).to_string()))?;
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                $values.push(JsonValue::Null);
+            } else {
+                $values.push(json!(arr.value(i)));
+            }
+        }
+    }};
+}
+
 /// Convert Arrow array to JSON values
 fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonValue>> {
     let mut values = Vec::with_capacity(array.len());
@@ -1039,45 +995,9 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
                 }
             }
         }
-        DataType::Int64 => {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to Int64Array".to_string()))?;
-            for i in 0..int_array.len() {
-                if int_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    values.push(json!(int_array.value(i)));
-                }
-            }
-        }
-        DataType::Float64 => {
-            let float_array = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to Float64Array".to_string()))?;
-            for i in 0..float_array.len() {
-                if float_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    values.push(json!(float_array.value(i)));
-                }
-            }
-        }
-        DataType::Boolean => {
-            let bool_array = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to BooleanArray".to_string()))?;
-            for i in 0..bool_array.len() {
-                if bool_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    values.push(json!(bool_array.value(i)));
-                }
-            }
-        }
+        DataType::Int64 => push_json_primitive!(array, values, Int64Array, "Int64Array"),
+        DataType::Float64 => push_json_primitive!(array, values, Float64Array, "Float64Array"),
+        DataType::Boolean => push_json_primitive!(array, values, BooleanArray, "BooleanArray"),
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let timestamp_array = array
                 .as_any()
@@ -1385,17 +1305,7 @@ impl ApproxPercentileUDF {
 }
 
 impl ScalarUDFImpl for ApproxPercentileUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "approx_percentile"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("approx_percentile");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Float64)
@@ -1493,17 +1403,7 @@ impl JsonbPathExistsUDF {
 }
 
 impl ScalarUDFImpl for JsonbPathExistsUDF {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &str {
-        "jsonb_path_exists"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
+    scalar_udf_boilerplate!("jsonb_path_exists");
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Boolean)

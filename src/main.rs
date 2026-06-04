@@ -189,7 +189,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // PGWIRE_PASSWORD — opt out for local dev only via
     // TIMEFUSION_ALLOW_INSECURE_AUTH=true.
     let grpc_token = {
-        let allow_insecure = std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        let allow_insecure = config::is_insecure_auth_allowed();
         match (&cfg.core.grpc_token, allow_insecure) {
             (Some(t), _) if !t.is_empty() => Some(t.clone()),
             (_, true) => {

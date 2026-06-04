@@ -37,6 +37,13 @@ pub fn config() -> &'static AppConfig {
     CONFIG.get().expect("Config not initialized. Call init_config() first.")
 }
 
+/// Whether the operator has opted into open auth for local dev via
+/// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Both the pgwire and gRPC auth
+/// paths gate their fail-secure defaults on this flag.
+pub fn is_insecure_auth_allowed() -> bool {
+    std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
 // Macro to generate const default functions for serde
 macro_rules! const_default {
     ($name:ident: bool = $val:expr) => {
@@ -317,15 +324,31 @@ impl AwsConfig {
         insert_opt!(opts, "AWS_ALLOW_HTTP", self.aws_allow_http);
         opts.insert("AWS_ENDPOINT_URL".into(), endpoint_override.unwrap_or(&self.aws_s3_endpoint).to_string());
 
-        if self.is_dynamodb_locking_enabled() {
-            opts.insert("AWS_S3_LOCKING_PROVIDER".into(), "dynamodb".into());
-            insert_opt!(opts, "DELTA_DYNAMO_TABLE_NAME", self.dynamodb.delta_dynamo_table_name);
-            insert_opt!(opts, "AWS_ACCESS_KEY_ID_DYNAMODB", self.dynamodb.aws_access_key_id_dynamodb);
-            insert_opt!(opts, "AWS_SECRET_ACCESS_KEY_DYNAMODB", self.dynamodb.aws_secret_access_key_dynamodb);
-            insert_opt!(opts, "AWS_REGION_DYNAMODB", self.dynamodb.aws_region_dynamodb);
-            insert_opt!(opts, "AWS_ENDPOINT_URL_DYNAMODB", self.dynamodb.aws_endpoint_url_dynamodb);
-        }
+        self.add_dynamodb_locking_options(&mut opts);
         opts
+    }
+
+    /// Append the DynamoDB-locking storage options when locking is enabled.
+    /// Shared by `build_storage_options` and the per-project custom-table path
+    /// in `database.rs`, which builds its S3 credentials from a different
+    /// source but needs the identical DynamoDB block.
+    pub fn add_dynamodb_locking_options(&self, opts: &mut HashMap<String, String>) {
+        if !self.is_dynamodb_locking_enabled() {
+            return;
+        }
+        opts.insert("AWS_S3_LOCKING_PROVIDER".into(), "dynamodb".into());
+        let entries = [
+            ("DELTA_DYNAMO_TABLE_NAME", &self.dynamodb.delta_dynamo_table_name),
+            ("AWS_ACCESS_KEY_ID_DYNAMODB", &self.dynamodb.aws_access_key_id_dynamodb),
+            ("AWS_SECRET_ACCESS_KEY_DYNAMODB", &self.dynamodb.aws_secret_access_key_dynamodb),
+            ("AWS_REGION_DYNAMODB", &self.dynamodb.aws_region_dynamodb),
+            ("AWS_ENDPOINT_URL_DYNAMODB", &self.dynamodb.aws_endpoint_url_dynamodb),
+        ];
+        for (key, val) in entries {
+            if let Some(v) = val {
+                opts.insert(key.into(), v.clone());
+            }
+        }
     }
 }
 
