@@ -33,6 +33,27 @@ fn scalar_to_string(scalar: &ScalarValue) -> Option<String> {
     }
 }
 
+/// Pull a single UTF-8 string out of a scalar-or-length-1-array argument.
+/// Used by UDFs whose Nth argument is a constant string (format, timezone,
+/// etc.). `label` names the argument in error messages.
+fn extract_scalar_string(arg: &ColumnarValue, label: &str) -> datafusion::error::Result<String> {
+    let not_utf8 = || DataFusionError::Execution(format!("{label} must be a UTF8 string"));
+    let not_scalar = || DataFusionError::Execution(format!("{label} must be a scalar value"));
+    match arg {
+        ColumnarValue::Scalar(scalar) => scalar_to_string(scalar).ok_or_else(not_utf8),
+        ColumnarValue::Array(arr) => {
+            // `&&` short-circuits so is_null(0) is never called on an empty array.
+            if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
+                if a.len() == 1 && !a.is_null(0) { Ok(a.value(0).to_string()) } else { Err(not_scalar()) }
+            } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+                if a.len() == 1 && !a.is_null(0) { Ok(a.value(0).to_string()) } else { Err(not_scalar()) }
+            } else {
+                Err(not_utf8())
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Variant-Aware Expression Planner
 // ============================================================================
@@ -545,28 +566,7 @@ impl ScalarUDFImpl for ToCharUDF {
         };
 
         // Extract format string
-        let format_str = match &args[1] {
-            ColumnarValue::Scalar(scalar) => {
-                scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("Format string must be a UTF8 string".to_string()))?
-            }
-            ColumnarValue::Array(arr) => {
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
-                    if str_arr.len() == 1 && !str_arr.is_null(0) {
-                        str_arr.value(0).to_string()
-                    } else {
-                        return Err(DataFusionError::Execution("Format string must be a scalar value".to_string()));
-                    }
-                } else if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                    if str_arr.len() == 1 && !str_arr.is_null(0) {
-                        str_arr.value(0).to_string()
-                    } else {
-                        return Err(DataFusionError::Execution("Format string must be a scalar value".to_string()));
-                    }
-                } else {
-                    return Err(DataFusionError::Execution("Format string must be a UTF8 string".to_string()));
-                }
-            }
-        };
+        let format_str = extract_scalar_string(&args[1], "Format string")?;
 
         let result = format_timestamps(&timestamp_array, &format_str)?;
         Ok(ColumnarValue::Array(result))
@@ -685,28 +685,7 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
         };
 
         // Extract timezone string
-        let tz_str = match &args[1] {
-            ColumnarValue::Scalar(scalar) => {
-                scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("Timezone must be a UTF8 string".to_string()))?
-            }
-            ColumnarValue::Array(arr) => {
-                if let Some(str_arr) = arr.as_any().downcast_ref::<StringViewArray>() {
-                    if str_arr.len() == 1 && !str_arr.is_null(0) {
-                        str_arr.value(0).to_string()
-                    } else {
-                        return Err(DataFusionError::Execution("Timezone must be a scalar string value".to_string()));
-                    }
-                } else if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-                    if str_arr.len() == 1 && !str_arr.is_null(0) {
-                        str_arr.value(0).to_string()
-                    } else {
-                        return Err(DataFusionError::Execution("Timezone must be a scalar string value".to_string()));
-                    }
-                } else {
-                    return Err(DataFusionError::Execution("Timezone must be a UTF8 string".to_string()));
-                }
-            }
-        };
+        let tz_str = extract_scalar_string(&args[1], "Timezone")?;
 
         let result = convert_timezone(&timestamp_array, &tz_str)?;
         Ok(ColumnarValue::Array(result))
