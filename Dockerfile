@@ -9,7 +9,7 @@ WORKDIR /app
 RUN apt-get update && \
     apt-get install -y pkg-config libssl-dev protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
-RUN cargo install cargo-chef --locked
+RUN cargo install cargo-chef --version 0.1.77 --locked
 
 ##############################
 #         Planner            #
