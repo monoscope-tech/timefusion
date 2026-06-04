@@ -683,4 +683,39 @@ mod tests {
         assert!(!has_ps, "statement_timeout should not send ParameterStatus");
     }
 
+    /// `Describe Statement` for INSERT/UPDATE/DELETE without RETURNING must
+    /// return an empty result schema so pgwire emits `NoData`. Strict clients
+    /// (Hasql, pgjdbc, Npgsql, psycopg3, sqlx) treat a `RowDescription` here
+    /// as a `TuplesOk` protocol error and drop the write. SELECT is the
+    /// fallthrough positive control.
+    #[tokio::test]
+    async fn get_result_schema_returns_no_data_for_dml() {
+        let service = crate::testing::setup_handlers();
+        let mut client = MockClient::new();
+
+        <DfSessionService as SimpleQueryHandler>::do_query(
+            &service,
+            &mut client,
+            "CREATE TABLE t (id INT, name TEXT)",
+        )
+        .await
+        .unwrap();
+
+        let parser = <DfSessionService as ExtendedQueryHandler>::query_parser(&service);
+        let cases: &[(&str, bool)] = &[
+            ("INSERT INTO t VALUES (1, 'a')", true),
+            ("UPDATE t SET name = 'x' WHERE id = 1", true),
+            ("DELETE FROM t WHERE id = 1", true),
+            ("SELECT id, name FROM t", false),
+        ];
+        for (sql, expect_empty) in cases {
+            let stmt = parser.parse_sql(&client, sql, &[]).await.unwrap();
+            let fields = parser.get_result_schema(&stmt, None).unwrap();
+            assert_eq!(
+                fields.is_empty(),
+                *expect_empty,
+                "{sql}: expected empty={expect_empty}, got {fields:?}"
+            );
+        }
+    }
 }
