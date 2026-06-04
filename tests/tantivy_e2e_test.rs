@@ -57,11 +57,11 @@ async fn build_db(test_id: &str, tantivy_enabled: bool) -> Result<(Database, Ses
 
     // BufferedWriteLayer with delta writer
     let db_for_cb = db.clone();
-    let delta_cb: DeltaWriteCallback = Arc::new(move |project_id, table_name, batches| {
+    let delta_cb: DeltaWriteCallback = Arc::new(move |project_id, table_name, batches, _wm| {
         let db = db_for_cb.clone();
         Box::pin(async move {
             let pre = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
-            db.insert_records_batch(&project_id, &table_name, batches, true).await?;
+            db.insert_records_batch(&project_id, &table_name, batches, true, None).await?;
             let post = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
             let pre_set: std::collections::HashSet<String> = pre.into_iter().collect();
             Ok(post.into_iter().filter(|u| !pre_set.contains(u)).collect())
@@ -172,8 +172,8 @@ async fn delta_flushed_text_match_matches_baseline() -> Result<()> {
         ("c", "payment", "charge succeeded"),
         ("d", "payment", "charge failed: declined card"),
     ];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], true).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], true).await?;
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], true, None).await?;
+    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], true, None).await?;
 
     // No tantivy index was built (skip_queue=true bypasses BufferedWriteLayer).
     // Search returns None → no prefilter applied → UDF post-filter does the work.
@@ -204,8 +204,8 @@ async fn membuffer_only_level_eq_falls_back_correctly() -> Result<()> {
         ("x2", "service-a", "operation failed"),
         ("x3", "service-b", "request timeout"),
     ];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false).await?;
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
+    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
@@ -227,7 +227,7 @@ async fn tantivy_indexer_actually_writes_manifest_when_flush_routes_through_buff
     let svc = svc.expect("service should be present when tantivy is enabled");
     let p = unique_project();
 
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("f1", "svc", "hello world")])], false).await?;
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("f1", "svc", "hello world")])], false, None).await?;
 
     let layer = db.buffered_layer().cloned().expect("layer present");
     layer.flush_all_now().await?;
@@ -257,12 +257,12 @@ async fn mixed_membuffer_and_delta_level_eq_returns_union() -> Result<()> {
     let p = unique_project();
 
     let delta_rows = vec![("d-old1", "n", "old failed operation"), ("d-old2", "n", "old successful operation")];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, delta_rows.clone())], true).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, delta_rows)], true).await?;
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, delta_rows.clone())], true, None).await?;
+    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, delta_rows)], true, None).await?;
 
     let mem_rows = vec![("m-new1", "n", "new failed operation"), ("m-new2", "n", "new clean operation")];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, mem_rows.clone())], false).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, mem_rows)], false).await?;
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, mem_rows.clone())], false, None).await?;
+    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, mem_rows)], false, None).await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
@@ -285,9 +285,9 @@ async fn compaction_gc_drops_stale_indexes_keeps_live_ones() -> Result<()> {
     let svc = svc.expect("tantivy enabled");
     let p = unique_project();
 
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("g1", "n", "first")])], false).await?;
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("g1", "n", "first")])], false, None).await?;
     db.buffered_layer().cloned().unwrap().flush_all_now().await?;
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("g2", "n", "second")])], false).await?;
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("g2", "n", "second")])], false, None).await?;
     db.buffered_layer().cloned().unwrap().flush_all_now().await?;
 
     let m_before = timefusion::tantivy_index::manifest::load(svc.object_store.as_ref(), TABLE, &p).await?;
@@ -326,8 +326,8 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
         ("k3", "billing", "charge declined"),
         ("k4", "billing", "charge succeeded"),
     ];
-    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false).await?;
-    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false).await?;
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
+    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
 
     // Flush so tantivy indexes are produced and the membuffer is emptied.
     db.buffered_layer().cloned().unwrap().flush_all_now().await?;

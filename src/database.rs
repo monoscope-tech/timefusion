@@ -122,6 +122,39 @@ fn build_optimize_session_state() -> datafusion::execution::session_state::Sessi
 
 /// Cast Variant struct columns (Struct{BinaryView,BinaryView}) to the
 /// Binary-backed form delta-kernel's `unshredded_variant()` requires on
+/// Serialize a per-shard walrus watermark into the `commitInfo.info` map
+/// under the `timefusion.wal_watermark` key. Only shards this bucket
+/// actually wrote to are included — others are absent rather than `null`
+/// so a recovery scan can compute the per-shard max across multiple recent
+/// commits without ambiguity. Returns an empty `CommitProperties` when the
+/// watermark contains no positions (e.g. WAL-replay-derived buckets).
+fn build_watermark_commit_properties(
+    watermark: &crate::buffered_write_layer::DeltaWatermark,
+) -> CommitProperties {
+    use std::collections::HashMap;
+    let entries: serde_json::Map<String, serde_json::Value> = watermark
+        .iter()
+        .enumerate()
+        .filter_map(|(shard, pos)| {
+            pos.map(|p| {
+                (
+                    shard.to_string(),
+                    serde_json::json!({ "block_id": p.block_id, "offset": p.offset }),
+                )
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return CommitProperties::default();
+    }
+    let mut meta = HashMap::new();
+    meta.insert(
+        "timefusion.wal_watermark".to_string(),
+        serde_json::Value::Object(entries),
+    );
+    CommitProperties::default().with_metadata(meta)
+}
+
 /// write. No-op for any column that's not a Variant struct or already in
 /// Binary form. Called from `insert_records_batch` right before the
 /// Delta write so MemBuffer can keep its natural BinaryView layout
@@ -1718,7 +1751,10 @@ impl Database {
             use_queue = Empty,
         )
     )]
-    pub async fn insert_records_batch(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool) -> Result<()> {
+    pub async fn insert_records_batch(
+        &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool,
+        watermark: Option<&crate::buffered_write_layer::DeltaWatermark>,
+    ) -> Result<()> {
         let span = tracing::Span::current();
         // Normalize timezone-as-offset (`+00:00`) timestamp columns to the
         // IANA `"UTC"` form. Delta-rs Arrow→Delta schema conversion only
@@ -1800,16 +1836,20 @@ impl Database {
             }
 
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
+            let commit_properties = watermark.map(build_watermark_commit_properties);
             let write_result = async {
                 // Schema evolution enabled: new columns will be automatically added to the table
-                table
+                let mut builder = table
                     .clone()
                     .write(batches.clone())
                     .with_partition_columns(schema.partitions.clone())
                     .with_writer_properties(writer_properties.clone())
                     .with_save_mode(deltalake::protocol::SaveMode::Append)
-                    .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
-                    .await
+                    .with_schema_mode(deltalake::operations::write::SchemaMode::Merge);
+                if let Some(cp) = commit_properties {
+                    builder = builder.with_commit_properties(cp);
+                }
+                builder.await
             }
             .instrument(write_span)
             .await;
@@ -1875,6 +1915,100 @@ impl Database {
             max_retries,
             last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
         ))
+    }
+
+    /// Read the latest commit metadata for each WAL topic and fast-forward the
+    /// walrus persisted-read cursor to `max(local, delta)` per shard. Closes
+    /// the crash-mid-flush window where Delta committed but `advance_by_counts`
+    /// didn't finish — without this, restart replays entries already in Delta
+    /// and the next flush writes them a second time.
+    ///
+    /// Must run *before* `recover_from_wal`. Best-effort: any failure to read
+    /// metadata is logged and skipped (walrus's locally-fsynced cursor wins),
+    /// so this can't make recovery worse than today's at-least-once behaviour.
+    pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::wal::WalManager) -> anyhow::Result<usize> {
+        let topics = wal.list_topics()?;
+        let mut advanced = 0usize;
+        for topic in topics {
+            let Some((project_id, table_name)) = topic.split_once(':') else {
+                continue;
+            };
+            advanced += self.derive_wal_cursor_for_table(wal, project_id, table_name).await.unwrap_or(0);
+        }
+        Ok(advanced)
+    }
+
+    async fn derive_wal_cursor_for_table(
+        &self, wal: &crate::wal::WalManager, project_id: &str, table_name: &str,
+    ) -> anyhow::Result<usize> {
+        // Scan the most recent commits and take per-shard MAX. Replay-derived
+        // commits without a watermark contribute nothing and don't reset the
+        // MAX — that's deliberate so we cover the case where a normal commit
+        // (with watermark) is followed by replay-derived commits before crash.
+        const SCAN_DEPTH: usize = 16;
+        let table_ref = match self.resolve_table(project_id, table_name).await {
+            Ok(r) => r,
+            Err(_) => return Ok(0),
+        };
+        let table = table_ref.read().await;
+        let commits: Vec<_> = match table.history(Some(SCAN_DEPTH)).await {
+            Ok(it) => it.collect(),
+            Err(e) => {
+                debug!("derive_wal_cursor: history unavailable for {}/{}: {}", project_id, table_name, e);
+                return Ok(0);
+            }
+        };
+        drop(table);
+
+        let shards = wal.shards_per_topic();
+        let mut delta_max: Vec<Option<walrus_rust::WalPosition>> = vec![None; shards];
+        for ci in &commits {
+            let Some(wm) = ci.info.get("timefusion.wal_watermark").and_then(|v| v.as_object()) else {
+                continue;
+            };
+            for (shard_str, pos_val) in wm {
+                let Ok(shard) = shard_str.parse::<usize>() else { continue };
+                if shard >= shards {
+                    continue;
+                }
+                let block_id = pos_val.get("block_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let offset = pos_val.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                let candidate = walrus_rust::WalPosition { block_id, offset };
+                delta_max[shard] = Some(match delta_max[shard] {
+                    Some(prev) if prev > candidate => prev,
+                    _ => candidate,
+                });
+            }
+        }
+
+        if delta_max.iter().all(|p| p.is_none()) {
+            return Ok(0);
+        }
+
+        let local = wal.persisted_read_positions(project_id, table_name).unwrap_or_else(|_| vec![None; shards]);
+        let mut to_set = local.clone();
+        let mut any_advance = 0usize;
+        for shard in 0..shards {
+            let Some(dpos) = delta_max[shard] else { continue };
+            let advance = match local[shard] {
+                Some(lpos) => dpos > lpos,
+                None => !dpos.is_origin(),
+            };
+            if advance {
+                to_set[shard] = Some(dpos);
+                any_advance += 1;
+            }
+        }
+        if any_advance > 0 {
+            let positions: Vec<walrus_rust::WalPosition> =
+                to_set.into_iter().map(|p| p.unwrap_or(walrus_rust::WalPosition::ORIGIN)).collect();
+            wal.set_persisted_positions(project_id, table_name, &positions)?;
+            info!(
+                "Delta-derived cursor advance: project={}, table={}, shards_advanced={}",
+                project_id, table_name, any_advance
+            );
+        }
+        Ok(any_advance)
     }
 
     /// Optimize the Delta table using Z-ordering on timestamp and id columns
@@ -2803,7 +2937,7 @@ impl DataSink for ProjectRoutingTable {
 
             let insert_span = tracing::trace_span!(parent: &span, "delta_table.insert", project_id = %project_id, rows = row_count);
             self.database
-                .insert_records_batch(&project_id, &self.table_name, batches, false)
+                .insert_records_batch(&project_id, &self.table_name, batches, false, None)
                 .instrument(insert_span)
                 .await
                 .map_err(|e| DataFusionError::Execution(format!("Insert error for project {} table {}: {}", project_id, self.table_name, e)))?;
@@ -3294,7 +3428,7 @@ mod tests {
             let today = chrono::Utc::now().date_naive();
 
             let batch = json_to_batch(vec![test_span("rc1", "span1", &project_id)])?;
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
             let table_ref = get_unified_delta_table(db.unified_tables(), "otel_logs_and_spans").await.expect("table created");
 
@@ -3333,7 +3467,7 @@ mod tests {
 
             // Test basic insert
             let batch = json_to_batch(vec![test_span("test1", "span1", &project_id)])?;
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
             // Verify count
             let result = ctx
@@ -3374,7 +3508,7 @@ mod tests {
             // Insert data for multiple projects
             for project in &projects {
                 let batch = json_to_batch(vec![test_span(&format!("id_{}", project), &format!("span_{}", project), project)])?;
-                db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true).await?;
+                db.insert_records_batch(project, "otel_logs_and_spans", vec![batch], true, None).await?;
             }
 
             // Verify project isolation
@@ -3444,7 +3578,7 @@ mod tests {
             ];
 
             let batch = json_to_batch(records)?;
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
             // Test filtering by level
             let result = ctx
@@ -3502,7 +3636,7 @@ mod tests {
 
             // Insert via API first
             let batch = json_to_batch(vec![test_span("id1", "name1", &proj1)])?;
-            db.insert_records_batch(&proj1, "otel_logs_and_spans", vec![batch], true).await?;
+            db.insert_records_batch(&proj1, "otel_logs_and_spans", vec![batch], true, None).await?;
 
             // Insert via SQL
             let sql = format!(
@@ -3622,7 +3756,7 @@ mod tests {
             ];
 
             let batch = json_to_batch(records)?;
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
             // First check if any records were inserted - need to specify project_id
             let all_records = ctx
@@ -3700,7 +3834,7 @@ mod tests {
                 tokio::spawn(async move {
                     let batch_id = format!("batch_{}", i);
                     let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project)])?;
-                    db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true).await.map(|_| batch_id)
+                    db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await.map(|_| batch_id)
                 })
             });
 
@@ -3743,7 +3877,7 @@ mod tests {
                 tokio::spawn(async move {
                     let batch_id = format!("init_batch_{}", i);
                     let batch = json_to_batch(vec![test_span(&batch_id, &format!("test_{}", batch_id), &project_id)])?;
-                    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await.map(|_| project_id)
+                    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await.map(|_| project_id)
                 })
             });
 
@@ -3828,7 +3962,7 @@ mod tests {
                 let project_id = format!("project_{}", i);
                 handles.push(tokio::spawn(async move {
                     let batch = json_to_batch(vec![test_span(&format!("id_{}", i), &format!("span_{}", i), &project_id)])?;
-                    db_clone.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true).await?;
+                    db_clone.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
                     Ok::<_, anyhow::Error>(())
                 }));
             }

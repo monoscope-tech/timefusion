@@ -67,6 +67,54 @@ impl Walrus {
         Ok(WalPosition::ORIGIN)
     }
 
+    /// Read the persisted read cursor for `col_name` without consuming.
+    /// Returns `None` when no cursor has been persisted yet (column never
+    /// read) or when the persisted state can't be mapped back to a public
+    /// position (e.g. an internal chain index pointing past current chain).
+    /// `Some(WalPosition::ORIGIN)` means "cursor at start of log".
+    pub fn persisted_read_position(&self, col_name: &str) -> io::Result<Option<WalPosition>> {
+        let idx_guard = self
+            .read_offset_index
+            .read()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "index lock poisoned"))?;
+        let Some(pos) = idx_guard.get(col_name) else {
+            return Ok(None);
+        };
+        if (pos.cur_block_idx & TAIL_FLAG) != 0 {
+            let block_id = pos.cur_block_idx & (!TAIL_FLAG);
+            return Ok(Some(WalPosition { block_id, offset: pos.cur_block_offset }));
+        }
+        // Chain-index form — resolve to a persistent block_id via the reader's chain.
+        drop(idx_guard);
+        let map = self.reader.data.read().ok();
+        let Some(map) = map else {
+            return Ok(None);
+        };
+        let info_arc = match map.get(col_name) {
+            Some(a) => a.clone(),
+            None => return Ok(Some(WalPosition::ORIGIN)),
+        };
+        drop(map);
+        let info = info_arc.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "col info lock poisoned"))?;
+        let idx = self
+            .read_offset_index
+            .read()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "index lock poisoned"))?;
+        let Some(pos) = idx.get(col_name) else {
+            return Ok(None);
+        };
+        let chain_idx = pos.cur_block_idx as usize;
+        if chain_idx < info.chain.len() {
+            Ok(Some(WalPosition { block_id: info.chain[chain_idx].id, offset: pos.cur_block_offset }))
+        } else if chain_idx == info.chain.len() && !info.chain.is_empty() {
+            // Past the last sealed block; use the last block's tail.
+            let last = info.chain.last().unwrap();
+            Ok(Some(WalPosition { block_id: last.id, offset: last.used }))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Set the persisted-read cursor for `col_name` to `pos`. Atomic fsync
     /// (via `WalIndex::set`).
     ///

@@ -9,7 +9,7 @@ use bincode::{Decode, Encode};
 use dashmap::DashSet;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
-use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
+use walrus_rust::{FsyncSchedule, ReadConsistency, WalPosition, Walrus};
 
 #[derive(Debug, Error)]
 pub enum WalError {
@@ -31,6 +31,8 @@ pub enum WalError {
     Io(#[from] std::io::Error),
     #[error("No record batch found in data")]
     EmptyBatch,
+    #[error("Internal WAL invariant violated: {0}")]
+    Internal(String),
 }
 
 /// Magic bytes to identify the WAL format ("WAL2").
@@ -303,8 +305,11 @@ impl WalManager {
         topic.split_once(':').map(|(p, t)| (p.to_string(), t.to_string()))
     }
 
+    /// Returns the shard the entry was appended to. Callers must record this
+    /// against their MemBuffer bucket so the WAL cursor can later be advanced
+    /// by exactly the right count per shard (see `advance_by_counts`).
     #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
-    pub fn append(&self, project_id: &str, table_name: &str, batch: &RecordBatch) -> Result<(), WalError> {
+    pub fn append(&self, project_id: &str, table_name: &str, batch: &RecordBatch) -> Result<usize, WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
@@ -312,11 +317,13 @@ impl WalManager {
         self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
         debug!("WAL append INSERT: topic={}, shard={}, rows={}", topic, shard, batch.num_rows());
-        Ok(())
+        Ok(shard)
     }
 
+    /// Returns `(shard, entry_count)` — every batch becomes one walrus entry
+    /// on the chosen shard, so `entry_count == batches.len()`.
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
-    pub fn append_batch(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) -> Result<(), WalError> {
+    pub fn append_batch(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) -> Result<(usize, usize), WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
@@ -329,11 +336,11 @@ impl WalManager {
         self.wal.batch_append_for_topic(&walrus_key, &payload_refs)?;
         self.persist_topic(&topic);
         debug!("WAL batch append INSERT: topic={}, shard={}, batches={}", topic, shard, batches.len());
-        Ok(())
+        Ok((shard, batches.len()))
     }
 
     #[instrument(skip(self), fields(project_id, table_name))]
-    pub fn append_delete(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>) -> Result<(), WalError> {
+    pub fn append_delete(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>) -> Result<usize, WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
@@ -347,11 +354,11 @@ impl WalManager {
         self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
         self.persist_topic(&topic);
         debug!("WAL append DELETE: topic={}, shard={}, predicate={:?}", topic, shard, predicate_sql);
-        Ok(())
+        Ok(shard)
     }
 
     #[instrument(skip(self, assignments), fields(project_id, table_name))]
-    pub fn append_update(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)]) -> Result<(), WalError> {
+    pub fn append_update(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)]) -> Result<usize, WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
@@ -369,7 +376,7 @@ impl WalManager {
             predicate_sql,
             assignments.len()
         );
-        Ok(())
+        Ok(shard)
     }
 
     #[instrument(skip(self), fields(project_id, table_name))]
@@ -529,25 +536,112 @@ impl WalManager {
         Ok(self.known_topics.iter().map(|t| t.clone()).collect())
     }
 
-    #[instrument(skip(self))]
-    pub fn checkpoint(&self, project_id: &str, table_name: &str) -> Result<(), WalError> {
+    /// Advance the walrus read cursor by exactly `counts[shard]` entries on
+    /// each shard for `(project_id, table_name)`. Callers pass the per-shard
+    /// WAL-entry counts they recorded against a successfully-flushed bucket
+    /// (snapshotted at bucket-seal time) — so the cursor advances only over
+    /// rows that are definitely in Delta now, never past entries belonging
+    /// to a still-accumulating bucket.
+    ///
+    /// `counts.len()` must equal `shards_per_topic`.
+    ///
+    /// Replaces the older `checkpoint`, which drained each shard to its tail
+    /// regardless of bucket boundaries and silently lost entries belonging
+    /// to the open follow-on bucket on crash.
+    #[instrument(skip(self, counts))]
+    pub fn advance_by_counts(&self, project_id: &str, table_name: &str, counts: &[u64]) -> Result<(), WalError> {
+        if counts.len() != self.shards_per_topic {
+            return Err(WalError::Internal(format!(
+                "advance_by_counts: counts.len()={} but shards_per_topic={}",
+                counts.len(),
+                self.shards_per_topic
+            )));
+        }
         let topic = Self::make_topic(project_id, table_name);
-        let mut count = 0;
+        let mut total = 0u64;
         for shard in 0..self.shards_per_topic {
+            let target = counts[shard];
+            if target == 0 {
+                continue;
+            }
             let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
-            loop {
+            let mut consumed = 0u64;
+            while consumed < target {
                 match self.wal.read_next(&walrus_key, true) {
-                    Ok(Some(_)) => count += 1,
-                    Ok(None) => break,
+                    Ok(Some(_)) => consumed += 1,
+                    Ok(None) => {
+                        warn!(
+                            "advance_by_counts short read: topic={}, shard={}, expected={}, got={} — cursor may be behind expected position",
+                            topic, shard, target, consumed
+                        );
+                        break;
+                    }
                     Err(e) => {
-                        warn!("Error during checkpoint for {} shard {}: {}", topic, shard, e);
+                        warn!("Error during advance_by_counts for {} shard {}: {}", topic, shard, e);
                         break;
                     }
                 }
             }
+            total += consumed;
         }
-        if count > 0 {
-            debug!("WAL checkpoint: topic={}, consumed={}", topic, count);
+        if total > 0 {
+            debug!("WAL advance: topic={}, consumed={}", topic, total);
+        }
+        Ok(())
+    }
+
+    /// Snapshot the current walrus tail position per shard for `(project, table)`.
+    /// Returns a `Vec<WalPosition>` of length `shards_per_topic`. Shards that have
+    /// never been written return [`WalPosition::ORIGIN`].
+    ///
+    /// Used at bucket-seal time to capture the watermark that the bucket's flush
+    /// will reach when its WAL entries are consumed — this watermark is then
+    /// written into the corresponding Delta commit's metadata so that, on
+    /// crash-mid-flush recovery, the cursor can be derived from Delta atomically
+    /// with the flushed rows.
+    pub fn current_position(&self, project_id: &str, table_name: &str) -> Result<Vec<WalPosition>, WalError> {
+        (0..self.shards_per_topic)
+            .map(|shard| {
+                let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
+                self.wal.current_position(&walrus_key).map_err(WalError::Io)
+            })
+            .collect()
+    }
+
+    /// Read the walrus persisted-read cursor per shard for `(project, table)`.
+    /// `None` for shards whose cursor has never been persisted (fresh column).
+    pub fn persisted_read_positions(
+        &self, project_id: &str, table_name: &str,
+    ) -> Result<Vec<Option<WalPosition>>, WalError> {
+        (0..self.shards_per_topic)
+            .map(|shard| {
+                let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
+                self.wal.persisted_read_position(&walrus_key).map_err(WalError::Io)
+            })
+            .collect()
+    }
+
+    /// Set the walrus persisted-read cursor per shard for `(project, table)`.
+    /// `positions.len()` must equal `shards_per_topic`. Positions of
+    /// [`WalPosition::ORIGIN`] reset the cursor to start-of-log.
+    ///
+    /// Used at startup to fast-forward the cursor to a Delta-derived watermark
+    /// when Delta is ahead of locally-fsynced walrus state (the
+    /// crash-mid-flush case where Delta committed but `advance_by_counts`
+    /// didn't finish).
+    pub fn set_persisted_positions(
+        &self, project_id: &str, table_name: &str, positions: &[WalPosition],
+    ) -> Result<(), WalError> {
+        if positions.len() != self.shards_per_topic {
+            return Err(WalError::Internal(format!(
+                "set_persisted_positions: positions.len()={} but shards_per_topic={}",
+                positions.len(),
+                self.shards_per_topic
+            )));
+        }
+        for (shard, pos) in positions.iter().enumerate() {
+            let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
+            self.wal.set_persisted_read_position(&walrus_key, *pos).map_err(WalError::Io)?;
         }
         Ok(())
     }

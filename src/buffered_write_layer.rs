@@ -151,7 +151,16 @@ pub struct FlushStats {
 ///   are compacted away)
 ///
 /// This is critical for WAL checkpoint safety - we only mark entries as consumed after successful commit.
-pub type DeltaWriteCallback = Arc<dyn Fn(String, String, Vec<RecordBatch>) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> + Send + Sync>;
+/// Per-shard walrus watermark snapshot at bucket-seal time. `None` for shards
+/// the bucket never wrote to. The callback writes this into the Delta commit
+/// metadata so a crash-mid-flush can derive the cursor from Delta on restart.
+pub type DeltaWatermark = Vec<Option<walrus_rust::WalPosition>>;
+
+pub type DeltaWriteCallback = Arc<
+    dyn Fn(String, String, Vec<RecordBatch>, DeltaWatermark) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>>
+        + Send
+        + Sync,
+>;
 
 /// Optional callback invoked AFTER a successful Delta commit. Receives the
 /// `(project_id, table_name, batches, added_file_uris)` and is responsible
@@ -201,7 +210,10 @@ impl BufferedWriteLayer {
         // and indexed columns are a fraction of total row bytes. 25% is a
         // soft ceiling — LRU drops oldest entries before this is exceeded.
         let text_index_max_bytes = (cfg.buffer.max_memory_mb() / 4).max(16) * 1024 * 1024;
-        let mem_buffer = Arc::new(MemBuffer::new_with_max_index_bytes(text_index_max_bytes));
+        let mem_buffer = Arc::new(MemBuffer::new_with_max_index_bytes_and_shards(
+            text_index_max_bytes,
+            wal.shards_per_topic(),
+        ));
 
         Ok(Self {
             config: cfg,
@@ -358,13 +370,40 @@ impl BufferedWriteLayer {
         // MemBuffer is DashMap-based and already concurrent-safe.
         let result: anyhow::Result<()> = (|| {
             // Step 1: Write to WAL for durability (sharded, parallel-safe).
-            self.wal.append_batch(project_id, table_name, &batches)?;
+            // `append_batch` returns `(shard, count)`; record both against the
+            // MemBuffer bucket so `advance_by_counts` on flush can move the
+            // cursor by exactly this much per shard (and not past entries
+            // belonging to the open follow-on bucket).
+            let (shard, _count) = self.wal.append_batch(project_id, table_name, &batches)?;
 
-            // Step 2: Write to MemBuffer for fast queries.
+            // Snapshot the post-append walrus position on this shard. Becomes
+            // the watermark written to Delta commit metadata at flush so an
+            // exact-once cursor can be derived on crash recovery. Best-effort:
+            // a read failure here just means this bucket's contribution to the
+            // watermark is omitted (the watermark still works at coarser
+            // bucket granularity via siblings).
+            let post_append_position = self
+                .wal
+                .current_position(project_id, table_name)
+                .ok()
+                .and_then(|positions| positions.get(shard).copied());
+
+            // Step 2: Write to MemBuffer for fast queries and attribute one
+            // WAL entry per batch to its destination bucket (batches in one
+            // append all land on the same shard, but may straddle bucket
+            // boundaries if their timestamps differ).
             let now = crate::clock::now_micros();
             for batch in &batches {
                 let timestamp_micros = extract_min_timestamp(batch).unwrap_or(now);
                 self.mem_buffer.insert(project_id, table_name, batch.clone(), timestamp_micros)?;
+                self.mem_buffer.record_wal_append(
+                    project_id,
+                    table_name,
+                    timestamp_micros,
+                    shard,
+                    1,
+                    post_append_position,
+                );
             }
 
             Ok(())
@@ -386,6 +425,13 @@ impl BufferedWriteLayer {
 
         debug!("BufferedWriteLayer insert complete: project={}, table={}", project_id, table_name);
         Ok(())
+    }
+
+    /// Exposed so startup can run `derive_wal_cursors_from_delta` on the same
+    /// `WalManager` instance the layer owns — no second `Walrus` handle, no
+    /// shadow state.
+    pub fn wal(&self) -> &Arc<WalManager> {
+        &self.wal
     }
 
     #[instrument(skip(self))]
@@ -653,8 +699,16 @@ impl BufferedWriteLayer {
     /// for durability. We only checkpoint WAL after this returns successfully.
     async fn flush_bucket(&self, bucket: &FlushableBucket) -> anyhow::Result<()> {
         let added_files = if let Some(ref callback) = self.delta_write_callback {
-            // Await ensures Delta commit completes before we return
-            callback(bucket.project_id.clone(), bucket.table_name.clone(), bucket.batches.clone()).await?
+            // Await ensures Delta commit completes before we return. The
+            // wal_positions snapshot becomes the watermark recorded in
+            // commit metadata for exact-once crash recovery.
+            callback(
+                bucket.project_id.clone(),
+                bucket.table_name.clone(),
+                bucket.batches.clone(),
+                bucket.wal_positions.clone(),
+            )
+            .await?
         } else {
             warn!("No delta write callback configured, skipping flush");
             Vec::new()
@@ -692,8 +746,8 @@ impl BufferedWriteLayer {
     }
 
     fn checkpoint_and_drain(&self, bucket: &FlushableBucket) {
-        if let Err(e) = self.wal.checkpoint(&bucket.project_id, &bucket.table_name) {
-            warn!("WAL checkpoint failed: {}", e);
+        if let Err(e) = self.wal.advance_by_counts(&bucket.project_id, &bucket.table_name, &bucket.wal_shard_counts) {
+            warn!("WAL advance_by_counts failed: {}", e);
         }
         self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
     }
@@ -995,6 +1049,154 @@ mod tests {
         assert!(pct <= 100, "pressure must be bounded 0..=100, got {pct}");
         // Tiny batch on 4GB default budget — should be effectively 0%.
         assert!(pct < 5, "expected ~0% after tiny insert, got {pct}");
+    }
+
+    /// After an insert, the FlushableBucket snapshot must carry per-shard
+    /// counts whose total equals the number of WAL entries appended. Before
+    /// this regression test the counts didn't exist and `wal.checkpoint`
+    /// drained the whole column to its tail.
+    #[tokio::test]
+    async fn wal_shard_counts_recorded_on_insert() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("c{}", test_id);
+        let table = format!("c{}", test_id);
+
+        let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        // 3 batches → 3 WAL entries on one shard for this insert.
+        let batches = vec![
+            create_test_batch(&project),
+            create_test_batch(&project),
+            create_test_batch(&project),
+        ];
+        layer.insert(&project, &table, batches).await.unwrap();
+
+        let buckets = layer.mem_buffer.get_all_buckets();
+        let target: Vec<_> = buckets.iter().filter(|b| b.project_id == project && b.table_name == table).collect();
+        assert!(!target.is_empty(), "expected at least one bucket for the inserted rows");
+        let total: u64 = target.iter().flat_map(|b| b.wal_shard_counts.iter()).sum();
+        assert_eq!(total, 3, "per-shard counts must sum to total WAL entries appended");
+    }
+
+    /// Flushing a sealed bucket must NOT advance the walrus cursor past
+    /// entries belonging to a still-open follow-on bucket. Before this fix,
+    /// `wal.checkpoint` drained to walrus tail and silently consumed the
+    /// open bucket's entries — on crash they were lost (cursor said
+    /// "consumed", Delta didn't have them, MemBuffer was volatile).
+    ///
+    /// We exercise it by inserting into bucket B (older timestamp, sealed),
+    /// inserting into bucket B' (current timestamp, open), force-flushing B
+    /// only, then asserting B''s entries still exist in WAL by replaying
+    /// recovery into a fresh layer.
+    #[serial]
+    #[tokio::test]
+    async fn flush_does_not_consume_open_bucket_wal_entries() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial]
+        // protects the global.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("o{}", test_id);
+        let table = format!("o{}", test_id);
+
+        // Use a stub delta callback so flush succeeds without S3.
+        let delta_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delta_calls_cb = delta_calls.clone();
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _batches, _wm| {
+            let c = delta_calls_cb.clone();
+            Box::pin(async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+        }));
+        let layer = Arc::new(layer);
+
+        // Insert "old" rows into a stale bucket (one bucket-duration in the past).
+        let bucket_dur_micros = crate::mem_buffer::bucket_duration_micros();
+        let now = crate::clock::now_micros();
+        let old_ts = now - 2 * bucket_dur_micros;
+        let old_batch = crate::test_utils::test_helpers::json_to_batch(vec![
+            crate::test_utils::test_helpers::test_span_ts("old", "spanA", &project, old_ts),
+        ])
+        .unwrap();
+        layer.insert(&project, &table, vec![old_batch]).await.unwrap();
+
+        // Insert "current" rows into the open follow-on bucket.
+        let new_batch = create_test_batch(&project);
+        layer.insert(&project, &table, vec![new_batch]).await.unwrap();
+
+        // Flush only completed (= old) buckets. Open bucket stays in MemBuffer + WAL.
+        layer.flush_completed_buckets().await.unwrap();
+        assert!(delta_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1, "old bucket should have flushed");
+
+        // Drop this layer; spin up a fresh one and recover. The open bucket's
+        // WAL entry must still be there.
+        drop(layer);
+        let layer2 = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        let stats = layer2.recover_from_wal().await.unwrap();
+        assert!(
+            stats.entries_replayed >= 1,
+            "open-bucket WAL entry must survive flush of the sealed bucket; replayed={}",
+            stats.entries_replayed
+        );
+    }
+
+    /// On flush, the Delta write callback must receive a per-shard watermark
+    /// that contains a non-origin position for whichever shard the bucket's
+    /// appends landed on. Proves the seal-time snapshot in
+    /// `FlushableBucket.wal_positions` propagates through `flush_bucket` →
+    /// callback intact. Without this the watermark would never reach Delta
+    /// commit metadata and Step 5 recovery would silently no-op.
+    #[serial]
+    #[tokio::test]
+    async fn flush_callback_receives_per_shard_watermark() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("w{}", test_id);
+        let table = format!("w{}", test_id);
+
+        let captured_wm: Arc<std::sync::Mutex<Option<crate::buffered_write_layer::DeltaWatermark>>> = Arc::new(std::sync::Mutex::new(None));
+        let captured_wm_cb = captured_wm.clone();
+
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _batches, wm| {
+            let captured = captured_wm_cb.clone();
+            Box::pin(async move {
+                *captured.lock().unwrap() = Some(wm);
+                Ok(Vec::new())
+            })
+        }));
+        let layer = Arc::new(layer);
+
+        // Insert into a sealed (past-cutoff) bucket so flush_completed_buckets picks it up.
+        let bucket_dur_micros = crate::mem_buffer::bucket_duration_micros();
+        let old_ts = crate::clock::now_micros() - 2 * bucket_dur_micros;
+        let old_batch = crate::test_utils::test_helpers::json_to_batch(vec![
+            crate::test_utils::test_helpers::test_span_ts("seal", "spanA", &project, old_ts),
+        ])
+        .unwrap();
+        layer.insert(&project, &table, vec![old_batch]).await.unwrap();
+
+        layer.flush_completed_buckets().await.unwrap();
+
+        let wm = captured_wm.lock().unwrap().clone().expect("callback must have been invoked with a watermark");
+        assert_eq!(wm.len(), layer.wal().shards_per_topic(), "watermark must have one entry per shard");
+        let non_origin: Vec<_> = wm.iter().enumerate().filter_map(|(s, p)| p.filter(|p| !p.is_origin()).map(|p| (s, p))).collect();
+        assert_eq!(
+            non_origin.len(),
+            1,
+            "exactly one shard should carry a non-origin position (the one we appended to); got {:?}",
+            wm
+        );
     }
 
     #[tokio::test]

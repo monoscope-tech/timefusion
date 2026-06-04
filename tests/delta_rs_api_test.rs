@@ -49,7 +49,7 @@ async fn test_add_actions_table_statistics() -> Result<()> {
     // Insert multiple batches to create multiple files
     for i in 0..3 {
         let batch = json_to_batch(vec![test_span(&format!("id_{}", i), &format!("span_{}", i), "stats_project")])?;
-        db.insert_records_batch("stats_project", "otel_logs_and_spans", vec![batch], true).await?;
+        db.insert_records_batch("stats_project", "otel_logs_and_spans", vec![batch], true, None).await?;
     }
 
     // Query to verify data exists
@@ -70,7 +70,7 @@ async fn test_partition_column_ordering() -> Result<()> {
 
     // Insert data to trigger table creation via CreateBuilder
     let batch = json_to_batch(vec![test_span("partition_test_id", "partition_test", "partition_project")])?;
-    db.insert_records_batch("partition_project", "otel_logs_and_spans", vec![batch], true).await?;
+    db.insert_records_batch("partition_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
     // Query and verify partition columns (project_id, date) are present and filterable
     let result = ctx
@@ -95,7 +95,7 @@ async fn test_table_state_refresh() -> Result<()> {
 
     // Insert initial data
     let batch = json_to_batch(vec![test_span("refresh_id_1", "span_1", "refresh_project")])?;
-    db.insert_records_batch("refresh_project", "otel_logs_and_spans", vec![batch], true).await?;
+    db.insert_records_batch("refresh_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
     // Verify first record
     let result = ctx.sql("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'refresh_project'").await?.collect().await?;
@@ -104,7 +104,7 @@ async fn test_table_state_refresh() -> Result<()> {
 
     // Insert more data (triggers update_state internally)
     let batch = json_to_batch(vec![test_span("refresh_id_2", "span_2", "refresh_project")])?;
-    db.insert_records_batch("refresh_project", "otel_logs_and_spans", vec![batch], true).await?;
+    db.insert_records_batch("refresh_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
     // Verify both records are visible (confirms state refresh worked)
     let result = ctx.sql("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = 'refresh_project'").await?.collect().await?;

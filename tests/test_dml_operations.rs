@@ -98,7 +98,7 @@ mod test_dml_operations {
         let records = create_test_records(now);
         let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
 
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Test UPDATE with WHERE clause
         info!("Executing UPDATE query");
@@ -154,7 +154,7 @@ mod test_dml_operations {
         let records = create_test_records(now);
         let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
 
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Test DELETE with WHERE clause
         info!("Executing DELETE query");
@@ -252,7 +252,7 @@ mod test_dml_operations {
         ];
 
         let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Delete all ERROR level records
         let df = ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?;
@@ -300,7 +300,7 @@ mod test_dml_operations {
         let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
 
         // Insert directly to Delta (skip_queue=true)
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Update multiple columns at once
         info!("Executing multi-column UPDATE query");
@@ -380,7 +380,7 @@ mod test_dml_operations {
         ];
 
         let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // Verify initial count
         let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
@@ -421,7 +421,7 @@ mod test_dml_operations {
         let now = chrono::Utc::now();
         let records = create_test_records(now);
         let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
-        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true).await?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
         // `duration + 100` appears twice in SET — CSE-eligible subexpr that
         // the optimizer hoists into a `__common_expr_*` alias.
