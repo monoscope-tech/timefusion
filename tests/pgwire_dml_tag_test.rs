@@ -8,7 +8,6 @@
 //!
 //! Requires MinIO on 127.0.0.1:9000 (`make minio-start`).
 
-#[cfg(test)]
 mod pgwire_dml_tag {
     use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -47,7 +46,7 @@ mod pgwire_dml_tag {
         async fn start() -> Result<Self> {
             timefusion::test_utils::init_test_logging();
             let test_id = Uuid::new_v4().to_string();
-            let port = 5433 + rand::rng().random_range(1..100) as u16;
+            let port = 5433 + rand::rng().random_range(1..2000) as u16;
             let cfg = create_test_config(&test_id);
             let db = Arc::new(Database::with_config(cfg).await?);
             db.get_or_create_table("test_project", "otel_logs_and_spans").await?;
@@ -58,7 +57,7 @@ mod pgwire_dml_tag {
             tokio::spawn(async move {
                 let mut ctx = db_clone.clone().create_session_context();
                 db_clone.setup_session_context(&mut ctx).expect("setup ctx");
-                let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
+                let opts = ServerOptions::new().with_port(port).with_host("127.0.0.1".to_string());
                 let auth = timefusion::pgwire_handlers::AuthConfig {
                     username: "postgres".into(),
                     password: Some("postgres".into()),
@@ -166,6 +165,9 @@ mod pgwire_dml_tag {
 
     /// Simple-query path: no `Row` messages may precede `CommandComplete`.
     /// `simple_query` exposes the raw stream where `execute` would discard rows.
+    /// SQL is built by interpolation (not parameterised) because simple-query
+    /// is by definition the no-parameters wire path — `$N` placeholders only
+    /// exist in the extended/prepared protocol.
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn simple_query_insert_sends_no_row_messages() -> Result<()> {

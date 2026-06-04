@@ -471,10 +471,13 @@ impl QueryParser for Parser {
         };
         let schema = plan.schema();
         let fields = schema.fields();
-        // DataFusion's synthetic `count: UInt64` DML schema must not be
-        // announced as RowDescription — strict clients reject NoData/Tuples
-        // mismatch at Describe time. Match on the exact shape so RETURNING
-        // (wider schema) falls through to the real result path.
+        // DataFusion emits `[count: UInt64]` for every DML/COPY plan — see
+        // `make_count_schema` in datafusion/expr/src/logical_plan/dml.rs.
+        // pgwire's contract for these without RETURNING is NoData; strict
+        // clients reject a TuplesOk/NoData mismatch at Describe time. Match
+        // on the exact shape so RETURNING (wider schema) and any future
+        // upstream rename (e.g. `rows_affected`) fall through to the real
+        // result path — at which point this guard needs to be updated.
         if matches!(plan, LogicalPlan::Dml(_) | LogicalPlan::Copy(_))
             && fields.len() == 1
             && fields[0].name() == "count"
@@ -702,11 +705,19 @@ mod tests {
         .unwrap();
 
         let parser = <DfSessionService as ExtendedQueryHandler>::query_parser(&service);
+        // COPY is rejected by `state.statement_to_plan`, so `LogicalPlan::Copy`
+        // can't be reached via the prepared-statement path today — the Copy
+        // arm in the guard is defensive for if upstream ever enables it.
         let cases: &[(&str, bool)] = &[
             ("INSERT INTO t VALUES (1, 'a')", true),
             ("UPDATE t SET name = 'x' WHERE id = 1", true),
             ("DELETE FROM t WHERE id = 1", true),
             ("SELECT id, name FROM t", false),
+            // Over-match guard: a SELECT that happens to produce a single
+            // UInt64 `count` column must NOT be suppressed — only DML/COPY
+            // plans of that shape may. If the guard ever drops the
+            // `LogicalPlan::Dml | Copy` check, this case fails loudly.
+            ("SELECT COUNT(*) AS count FROM t", false),
         ];
         for (sql, expect_empty) in cases {
             let stmt = parser.parse_sql(&client, sql, &[]).await.unwrap();
