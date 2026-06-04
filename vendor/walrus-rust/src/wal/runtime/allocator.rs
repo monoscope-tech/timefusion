@@ -1,18 +1,24 @@
-use crate::wal::block::Block;
-use crate::wal::config::{DEFAULT_BLOCK_SIZE, MAX_ALLOC, MAX_FILE_SIZE, debug_print};
-use crate::wal::paths::WalPathManager;
-use crate::wal::storage::{SharedMmap, SharedMmapKeeper};
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::{
+    cell::UnsafeCell,
+    collections::HashMap,
+    sync::{
+        Arc, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicU16, Ordering},
+    },
+};
 
 use super::DELETION_TX;
+use crate::wal::{
+    block::Block,
+    config::{DEFAULT_BLOCK_SIZE, MAX_ALLOC, MAX_FILE_SIZE, debug_print},
+    paths::WalPathManager,
+    storage::{SharedMmap, SharedMmapKeeper},
+};
 
 pub(super) struct BlockAllocator {
     next_block: UnsafeCell<Block>,
-    lock: AtomicBool,
-    paths: Arc<WalPathManager>,
+    lock:       AtomicBool,
+    paths:      Arc<WalPathManager>,
 }
 
 impl BlockAllocator {
@@ -91,12 +97,7 @@ impl BlockAllocator {
         }
         let alloc_units = (want_bytes + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
         let alloc_size = alloc_units * DEFAULT_BLOCK_SIZE;
-        debug_print!(
-            "[alloc] alloc_block: want_bytes={}, units={}, size={}",
-            want_bytes,
-            alloc_units,
-            alloc_size
-        );
+        debug_print!("[alloc] alloc_block: want_bytes={}, units={}, size={}", want_bytes, alloc_units, alloc_size);
 
         self.lock();
         // SAFETY: Guarded by `self.lock()` above, providing exclusive access
@@ -109,18 +110,15 @@ impl BlockAllocator {
             data.offset = 0;
             // mark the previous file fully allocated now
             FileStateTracker::set_fully_allocated(prev_block_file_path);
-            debug_print!(
-                "[alloc] file rollover for sized alloc -> {}",
-                data.file_path
-            );
+            debug_print!("[alloc] file rollover for sized alloc -> {}", data.file_path);
         }
         let ret = Block {
-            id: data.id,
+            id:        data.id,
             file_path: data.file_path.clone(),
-            offset: data.offset,
-            limit: alloc_size,
-            mmap: data.mmap.clone(),
-            used: 0,
+            offset:    data.offset,
+            limit:     alloc_size,
+            mmap:      data.mmap.clone(),
+            used:      0,
         };
         // register the new block before handing it out
         BlockStateTracker::register_block(ret.id as usize, &ret.file_path);
@@ -145,11 +143,7 @@ impl BlockAllocator {
     */
     fn lock(&self) {
         // Spin lock implementation
-        while self
-            .lock
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        while self.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             std::hint::spin_loop();
         }
     }
@@ -169,9 +163,7 @@ unsafe impl Send for BlockAllocator {}
 
 pub(super) fn flush_check(file_path: String) {
     // readiness check fast path; hook actual reclamation later
-    if let Some((locked, checkpointed, total, fully_allocated)) =
-        FileStateTracker::get_state_snapshot(&file_path)
-    {
+    if let Some((locked, checkpointed, total, fully_allocated)) = FileStateTracker::get_state_snapshot(&file_path) {
         let ready_to_delete = fully_allocated && locked == 0 && total > 0 && checkpointed >= total;
         if ready_to_delete {
             if let Some(tx) = DELETION_TX.get() {
@@ -183,7 +175,7 @@ pub(super) fn flush_check(file_path: String) {
 
 struct BlockState {
     is_checkpointed: AtomicBool,
-    file_path: String,
+    file_path:       String,
 }
 
 pub(super) struct BlockStateTracker {}
@@ -199,7 +191,7 @@ impl BlockStateTracker {
         if let Ok(mut w) = map.write() {
             w.entry(block_id).or_insert_with(|| BlockState {
                 is_checkpointed: AtomicBool::new(false),
-                file_path: file_path.to_string(),
+                file_path:       file_path.to_string(),
             });
         }
     }
@@ -233,10 +225,10 @@ impl BlockStateTracker {
 }
 
 struct FileState {
-    locked_block_ctr: AtomicU16,
+    locked_block_ctr:     AtomicU16,
     checkpoint_block_ctr: AtomicU16,
-    total_blocks: AtomicU16,
-    is_fully_allocated: AtomicBool,
+    total_blocks:         AtomicU16,
+    is_fully_allocated:   AtomicBool,
 }
 
 pub(super) struct FileStateTracker {}
@@ -251,10 +243,10 @@ impl FileStateTracker {
         let map = Self::map();
         let mut w = map.write().expect("file state map write lock poisoned");
         w.entry(file_path.to_string()).or_insert_with(|| FileState {
-            locked_block_ctr: AtomicU16::new(0),
+            locked_block_ctr:     AtomicU16::new(0),
             checkpoint_block_ctr: AtomicU16::new(0),
-            total_blocks: AtomicU16::new(0),
-            is_fully_allocated: AtomicBool::new(false),
+            total_blocks:         AtomicU16::new(0),
+            is_fully_allocated:   AtomicBool::new(false),
         });
     }
 

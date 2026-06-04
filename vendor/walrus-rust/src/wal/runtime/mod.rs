@@ -1,5 +1,4 @@
-use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, mpsc};
 
 mod allocator;
 mod background;

@@ -172,12 +172,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let pg_task = tokio::spawn(async move {
         let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
 
-        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(
-            Arc::new(session_context),
-            &opts,
-            auth_config,
-            async move { pgwire_shutdown_for_task.cancelled().await },
-        )
+        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(Arc::new(session_context), &opts, auth_config, async move {
+            pgwire_shutdown_for_task.cancelled().await
+        })
         .await
         {
             error!("PGWire server error: {}", e);

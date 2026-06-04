@@ -1,23 +1,28 @@
-use crate::wal::config::{FsyncSchedule, debug_print};
-use crate::wal::storage::{StorageImpl, open_storage_for_path};
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
-
-use super::DELETION_TX;
-
-#[cfg(target_os = "linux")]
-use crate::wal::config::USE_FD_BACKEND;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
 
 #[cfg(target_os = "linux")]
 use io_uring;
+
+use super::DELETION_TX;
+#[cfg(target_os = "linux")]
+use crate::wal::config::USE_FD_BACKEND;
+use crate::wal::{
+    config::{FsyncSchedule, debug_print},
+    storage::{StorageImpl, open_storage_for_path},
+};
 
 pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mpsc::Sender<String>> {
     let (tx, rx) = mpsc::channel::<String>();
@@ -98,16 +103,13 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
                         for (i, (raw_fd, _path)) in fsync_batch.iter().enumerate() {
                             let fd = io_uring::types::Fd(*raw_fd);
 
-                            let fsync_op =
-                                io_uring::opcode::Fsync::new(fd).build().user_data(i as u64);
+                            let fsync_op = io_uring::opcode::Fsync::new(fd).build().user_data(i as u64);
 
                             unsafe {
                                 if ring.submission().push(&fsync_op).is_err() {
                                     // Submission queue full, submit current batch
                                     ring.submit().expect("Failed to submit fsync batch");
-                                    ring.submission()
-                                        .push(&fsync_op)
-                                        .expect("Failed to push fsync op");
+                                    ring.submission().push(&fsync_op).expect("Failed to push fsync op");
                                 }
                             }
                         }
@@ -115,10 +117,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
                         // Single syscall to submit all fsync operations!
                         match ring.submit_and_wait(fsync_batch.len()) {
                             Ok(submitted) => {
-                                debug_print!(
-                                    "[flush] submitted {} fsync ops in one syscall",
-                                    submitted
-                                );
+                                debug_print!("[flush] submitted {} fsync ops in one syscall", submitted);
                             }
                             Err(e) => {
                                 debug_print!("[flush] failed to submit fsync batch: {}", e);
@@ -133,11 +132,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
 
                                 if result < 0 {
                                     let (_fd, path) = &fsync_batch[idx];
-                                    debug_print!(
-                                        "[flush] fsync error for {}: error code {}",
-                                        path,
-                                        result
-                                    );
+                                    debug_print!("[flush] fsync error for {}: error code {}", path, result);
                                 }
                             }
                         }
@@ -174,10 +169,7 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
             let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= 1000 {
                 // WARN: we clean up once every 1000 times the fsync runs
-                if tick
-                    .compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
+                if tick.compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                     let mut empty: HashMap<String, StorageImpl> = HashMap::new();
                     std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
 

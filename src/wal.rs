@@ -590,10 +590,7 @@ impl WalManager {
         Ok(())
     }
 
-    fn for_each_shard<T>(
-        &self, project_id: &str, table_name: &str,
-        mut f: impl FnMut(&str) -> std::io::Result<T>,
-    ) -> Result<Vec<T>, WalError> {
+    fn for_each_shard<T>(&self, project_id: &str, table_name: &str, mut f: impl FnMut(&str) -> std::io::Result<T>) -> Result<Vec<T>, WalError> {
         (0..self.shards_per_topic)
             .map(|shard| f(&Self::walrus_topic_key(project_id, table_name, shard)).map_err(WalError::Io))
             .collect()
@@ -617,27 +614,21 @@ impl WalManager {
 
     /// Snapshot the walrus write tail on a single shard. No-allocation variant
     /// for the per-insert hot path.
-    pub fn current_position_for_shard(
-        &self, project_id: &str, table_name: &str, shard: usize,
-    ) -> Result<WalPosition, WalError> {
+    pub fn current_position_for_shard(&self, project_id: &str, table_name: &str, shard: usize) -> Result<WalPosition, WalError> {
         let key = Self::walrus_topic_key(project_id, table_name, shard);
         self.wal.current_position(&key).map_err(WalError::Io)
     }
 
     /// Read the walrus persisted-read cursor per shard. `None` for shards
     /// whose cursor has never been persisted.
-    pub fn persisted_read_positions(
-        &self, project_id: &str, table_name: &str,
-    ) -> Result<Vec<Option<WalPosition>>, WalError> {
+    pub fn persisted_read_positions(&self, project_id: &str, table_name: &str) -> Result<Vec<Option<WalPosition>>, WalError> {
         self.for_each_shard(project_id, table_name, |k| self.wal.persisted_read_position(k))
     }
 
     /// Set the walrus persisted-read cursor per shard. Used at startup to
     /// fast-forward to a Delta-derived watermark when Delta is ahead of
     /// locally-fsynced walrus state.
-    pub fn set_persisted_positions(
-        &self, project_id: &str, table_name: &str, positions: &[WalPosition],
-    ) -> Result<(), WalError> {
+    pub fn set_persisted_positions(&self, project_id: &str, table_name: &str, positions: &[WalPosition]) -> Result<(), WalError> {
         self.check_shard_len("set_persisted_positions", positions.len())?;
         for (shard, pos) in positions.iter().enumerate() {
             let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);

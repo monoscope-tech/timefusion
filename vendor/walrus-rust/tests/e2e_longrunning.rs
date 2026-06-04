@@ -1,11 +1,13 @@
 mod common;
 
+use std::{
+    collections::HashMap,
+    thread,
+    time::{Duration, Instant},
+};
+
 use common::TestEnv;
-use std::collections::HashMap;
-use std::thread;
-use std::time::{Duration, Instant};
-use walrus_rust::ReadConsistency;
-use walrus_rust::wal::Walrus;
+use walrus_rust::{ReadConsistency, wal::Walrus};
 
 fn setup_env() -> TestEnv {
     TestEnv::new()
@@ -36,11 +38,7 @@ fn e2e_sustained_mixed_workload() {
         for worker_id in 0..2 {
             let topic = format!("med_freq_{}", worker_id);
             let counter = write_counts.get(&topic).unwrap_or(&0);
-            let data = format!(
-                "medium_frequency_data_with_more_content_{}_{}",
-                worker_id, counter
-            )
-            .repeat(10);
+            let data = format!("medium_frequency_data_with_more_content_{}_{}", worker_id, counter).repeat(10);
             if wal.append_for_topic(&topic, data.as_bytes()).is_ok() {
                 *write_counts.entry(topic).or_insert(0) += 1;
             }
@@ -97,18 +95,10 @@ fn e2e_sustained_mixed_workload() {
     test_println!("  Validation errors: {}", validation_errors);
     test_println!("  Duration: {:?}", start_time.elapsed());
 
-    assert!(
-        total_writes > 100,
-        "Expected > 100 writes, got {}",
-        total_writes
-    );
+    assert!(total_writes > 100, "Expected > 100 writes, got {}", total_writes);
     assert!(total_reads > 50, "Expected > 50 reads, got {}", total_reads);
 
-    assert_eq!(
-        validation_errors, 0,
-        "Data integrity validation failed: {} errors",
-        validation_errors
-    );
+    assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
 }
 
 #[test]
@@ -170,19 +160,13 @@ fn e2e_realistic_application_simulation() {
                 error_id,
                 start_time.elapsed().as_millis(),
                 error_id * 1000,
-                "at PaymentProcessor.process(PaymentProcessor.java:123)\\n"
-                    .repeat((error_id % 10 + 1) as usize)
+                "at PaymentProcessor.process(PaymentProcessor.java:123)\\n".repeat((error_id % 10 + 1) as usize)
             );
             let _ = wal.append_for_topic("error_logs", error_log.as_bytes());
             error_id += 1;
         }
 
-        let topics = vec![
-            "user_activity",
-            "transactions",
-            "system_metrics",
-            "error_logs",
-        ];
+        let topics = vec!["user_activity", "transactions", "system_metrics", "error_logs"];
         for topic in &topics {
             if let Some(entry) = wal.read_next(topic, true).unwrap() {
                 processed_count += 1;
@@ -190,9 +174,7 @@ fn e2e_realistic_application_simulation() {
                 let data_str = String::from_utf8_lossy(&entry.data);
                 let is_valid = match *topic {
                     "user_activity" => {
-                        data_str.contains("\"action\":\"page_view\"")
-                            && data_str.contains("\"page\":\"/dashboard\"")
-                            && data_str.contains("\"user_id\":")
+                        data_str.contains("\"action\":\"page_view\"") && data_str.contains("\"page\":\"/dashboard\"") && data_str.contains("\"user_id\":")
                     }
                     "transactions" => {
                         data_str.contains("\"tx_id\":")
@@ -232,17 +214,9 @@ fn e2e_realistic_application_simulation() {
     test_println!("  Validation errors: {}", validation_errors);
     test_println!("  Duration: {:?}", start_time.elapsed());
 
-    assert!(
-        processed_count > 100,
-        "Expected > 100 processed entries, got {}",
-        processed_count
-    );
+    assert!(processed_count > 100, "Expected > 100 processed entries, got {}", processed_count);
 
-    assert_eq!(
-        validation_errors, 0,
-        "Data integrity validation failed: {} errors",
-        validation_errors
-    );
+    assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
 }
 
 #[test]
@@ -251,11 +225,7 @@ fn e2e_recovery_and_persistence_marathon() {
 
     let total_cycles = 5;
     let entries_per_cycle = 1000;
-    let topics = vec![
-        "persistent_topic_1",
-        "persistent_topic_2",
-        "persistent_topic_3",
-    ];
+    let topics = vec!["persistent_topic_1", "persistent_topic_2", "persistent_topic_3"];
 
     let mut expected_data: HashMap<String, Vec<String>> = HashMap::new();
     for topic in &topics {
@@ -322,19 +292,7 @@ fn e2e_recovery_and_persistence_marathon() {
     test_println!("  Remaining entries read: {}", total_read);
     test_println!("  Validation errors: {}", validation_errors);
 
-
-
-
-
-
-
-
-
-    assert_eq!(
-        validation_errors, 0,
-        "Data integrity validation failed: {} errors",
-        validation_errors
-    );
+    assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
 }
 
 #[test]
@@ -351,9 +309,7 @@ fn e2e_massive_data_throughput_test() {
     let mut entries_read = 0u64;
     let mut validation_errors = 0u64;
 
-    let topics = (0..4)
-        .map(|i| format!("throughput_topic_{}", i))
-        .collect::<Vec<_>>();
+    let topics = (0..4).map(|i| format!("throughput_topic_{}", i)).collect::<Vec<_>>();
     let mut counter = 0u64;
     let mut topic_index = 0;
 
@@ -380,13 +336,11 @@ fn e2e_massive_data_throughput_test() {
                 entries_read += 1;
 
                 let data_str = String::from_utf8_lossy(&entry.data);
-                let expected_worker_id =
-                    topic.chars().last().unwrap().to_digit(10).unwrap() as usize;
+                let expected_worker_id = topic.chars().last().unwrap().to_digit(10).unwrap() as usize;
                 let expected_prefix = format!("throughput_data_worker_{}_", expected_worker_id);
 
                 let size_valid = entry.data.len() >= 1024 && entry.data.len() <= 5120;
-                let content_valid =
-                    data_str.starts_with(&expected_prefix) && data_str.ends_with('x');
+                let content_valid = data_str.starts_with(&expected_prefix) && data_str.ends_with('x');
 
                 if !size_valid || !content_valid {
                     validation_errors += 1;
@@ -407,57 +361,21 @@ fn e2e_massive_data_throughput_test() {
 
     test_println!("E2E Massive Throughput Results:");
     test_println!("  Duration: {:?}", elapsed);
-    test_println!(
-        "  Bytes written: {} ({:.2} MB)",
-        bytes_written,
-        bytes_written as f64 / 1_000_000.0
-    );
-    test_println!(
-        "  Bytes read: {} ({:.2} MB)",
-        bytes_read,
-        bytes_read as f64 / 1_000_000.0
-    );
+    test_println!("  Bytes written: {} ({:.2} MB)", bytes_written, bytes_written as f64 / 1_000_000.0);
+    test_println!("  Bytes read: {} ({:.2} MB)", bytes_read, bytes_read as f64 / 1_000_000.0);
     test_println!("  Entries written: {}", entries_written);
     test_println!("  Entries read: {}", entries_read);
     test_println!("  Validation errors: {}", validation_errors);
-    test_println!(
-        "  Write throughput: {:.2} MB/s",
-        (bytes_written as f64 / 1_000_000.0) / elapsed.as_secs_f64()
-    );
-    test_println!(
-        "  Read throughput: {:.2} MB/s",
-        (bytes_read as f64 / 1_000_000.0) / elapsed.as_secs_f64()
-    );
-    test_println!(
-        "  Write rate: {:.2} entries/s",
-        entries_written as f64 / elapsed.as_secs_f64()
-    );
-    test_println!(
-        "  Read rate: {:.2} entries/s",
-        entries_read as f64 / elapsed.as_secs_f64()
-    );
+    test_println!("  Write throughput: {:.2} MB/s", (bytes_written as f64 / 1_000_000.0) / elapsed.as_secs_f64());
+    test_println!("  Read throughput: {:.2} MB/s", (bytes_read as f64 / 1_000_000.0) / elapsed.as_secs_f64());
+    test_println!("  Write rate: {:.2} entries/s", entries_written as f64 / elapsed.as_secs_f64());
+    test_println!("  Read rate: {:.2} entries/s", entries_read as f64 / elapsed.as_secs_f64());
 
-    assert!(
-        bytes_written > 1_000_000,
-        "Expected > 1MB written, got {} bytes",
-        bytes_written
-    );
-    assert!(
-        entries_written > 100,
-        "Expected > 100 entries written, got {}",
-        entries_written
-    );
-    assert!(
-        bytes_read > 100_000,
-        "Expected > 100KB read, got {} bytes",
-        bytes_read
-    );
+    assert!(bytes_written > 1_000_000, "Expected > 1MB written, got {} bytes", bytes_written);
+    assert!(entries_written > 100, "Expected > 100 entries written, got {}", entries_written);
+    assert!(bytes_read > 100_000, "Expected > 100KB read, got {} bytes", bytes_read);
 
-    assert_eq!(
-        validation_errors, 0,
-        "Data integrity validation failed: {} errors",
-        validation_errors
-    );
+    assert_eq!(validation_errors, 0, "Data integrity validation failed: {} errors", validation_errors);
 }
 
 #[test]
@@ -553,14 +471,9 @@ fn e2e_system_stress_and_stability() {
     test_println!("  Read validation errors: {}", read_validation_errors);
     test_println!(
         "  Success rate: {:.2}%",
-        (successful_operations as f64
-            / (successful_operations + write_errors + read_errors) as f64)
-            * 100.0
+        (successful_operations as f64 / (successful_operations + write_errors + read_errors) as f64) * 100.0
     );
-    test_println!(
-        "  Operations/sec: {:.2}",
-        successful_operations as f64 / elapsed.as_secs_f64()
-    );
+    test_println!("  Operations/sec: {:.2}", successful_operations as f64 / elapsed.as_secs_f64());
 
     assert!(
         successful_operations > 200,
@@ -571,18 +484,10 @@ fn e2e_system_stress_and_stability() {
     let total_ops = successful_operations + write_errors + read_errors;
     if total_ops > 0 {
         let error_rate = (write_errors + read_errors) as f64 / total_ops as f64;
-        assert!(
-            error_rate < 0.10,
-            "Error rate too high: {:.2}%",
-            error_rate * 100.0
-        );
+        assert!(error_rate < 0.10, "Error rate too high: {:.2}%", error_rate * 100.0);
     }
 
-    assert_eq!(
-        read_validation_errors, 0,
-        "Data integrity validation failed: {} errors",
-        read_validation_errors
-    );
+    assert_eq!(read_validation_errors, 0, "Data integrity validation failed: {} errors", read_validation_errors);
 }
 
 #[test]
@@ -612,10 +517,7 @@ fn e2e_performance_benchmark() {
     test_println!("Write Results:");
     test_println!("  Operations: {}", write_count);
     test_println!("  Bytes: {} KB", write_bytes / 1024);
-    test_println!(
-        "  Throughput: {:.0} ops/sec",
-        write_count as f64 / write_elapsed.as_secs_f64()
-    );
+    test_println!("  Throughput: {:.0} ops/sec", write_count as f64 / write_elapsed.as_secs_f64());
 
     let start = Instant::now();
     let mut read_count = 0u64;
@@ -634,21 +536,10 @@ fn e2e_performance_benchmark() {
     test_println!("Read Results:");
     test_println!("  Operations: {}", read_count);
     test_println!("  Bytes: {} KB", read_bytes / 1024);
-    test_println!(
-        "  Throughput: {:.0} ops/sec",
-        read_count as f64 / read_elapsed.as_secs_f64()
-    );
+    test_println!("  Throughput: {:.0} ops/sec", read_count as f64 / read_elapsed.as_secs_f64());
 
-    assert!(
-        write_count > 10,
-        "Write throughput too low: {} ops",
-        write_count
-    );
-    assert!(
-        read_count > 5,
-        "Read throughput too low: {} ops",
-        read_count
-    );
+    assert!(write_count > 10, "Write throughput too low: {} ops", write_count);
+    assert!(read_count > 5, "Read throughput too low: {} ops", read_count);
 
     test_println!("Performance benchmark completed!");
 }

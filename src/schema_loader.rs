@@ -37,9 +37,11 @@ impl TableSchema {
 
     fn validate(&self) -> anyhow::Result<()> {
         for k in &self.dedup_keys {
-            let f = self.fields.iter().find(|f| f.name == *k).ok_or_else(|| {
-                anyhow::anyhow!("schema `{}`: dedup_keys references unknown field `{}`", self.table_name, k)
-            })?;
+            let f = self
+                .fields
+                .iter()
+                .find(|f| f.name == *k)
+                .ok_or_else(|| anyhow::anyhow!("schema `{}`: dedup_keys references unknown field `{}`", self.table_name, k))?;
             if f.data_type == "Variant" {
                 anyhow::bail!("schema `{}`: dedup_keys cannot include Variant column `{}`", self.table_name, k);
             }

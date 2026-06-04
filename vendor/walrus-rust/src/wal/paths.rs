@@ -1,7 +1,10 @@
+use std::{
+    cell::RefCell,
+    fs,
+    path::{Path, PathBuf},
+};
+
 use crate::wal::config::{MAX_FILE_SIZE, now_millis_str, sanitize_namespace, wal_data_dir};
-use std::cell::RefCell;
-use std::fs;
-use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub(crate) struct WalPathManager {

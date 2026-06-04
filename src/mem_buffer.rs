@@ -175,11 +175,11 @@ pub struct TableBuffer {
 }
 
 pub struct TimeBucket {
-    batches:       Mutex<Vec<RecordBatch>>,
-    row_count:     AtomicUsize,
-    memory_bytes:  AtomicUsize,
-    min_timestamp: AtomicI64,
-    max_timestamp: AtomicI64,
+    batches:         Mutex<Vec<RecordBatch>>,
+    row_count:       AtomicUsize,
+    memory_bytes:    AtomicUsize,
+    min_timestamp:   AtomicI64,
+    max_timestamp:   AtomicI64,
     /// Per-shard WAL-entry counts (drive `advance_by_counts` on flush) and
     /// post-append walrus positions (written to Delta commit metadata for
     /// crash-mid-flush recovery). One mutex so a single append updates both
@@ -244,19 +244,16 @@ pub fn estimate_batch_size(batch: &RecordBatch) -> usize {
 /// Only collapses dupes inside this call's input — cross-bucket dupes need
 /// the read-side row_number() rewrite.
 pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String]) -> anyhow::Result<Vec<RecordBatch>> {
-    let Some(schema) = batches.first().map(|b| b.schema()) else { return Ok(batches) };
+    let Some(schema) = batches.first().map(|b| b.schema()) else {
+        return Ok(batches);
+    };
     if keys.is_empty() {
         return Ok(batches);
     }
     let combined = concat_batches(&schema, &batches)?;
     let arrs: Vec<ArrayRef> = keys
         .iter()
-        .map(|k| {
-            combined
-                .column_by_name(k)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("dedup key `{k}` missing from batch schema"))
-        })
+        .map(|k| combined.column_by_name(k).cloned().ok_or_else(|| anyhow::anyhow!("dedup key `{k}` missing from batch schema")))
         .collect::<anyhow::Result<_>>()?;
     let converter = RowConverter::new(arrs.iter().map(|a| SortField::new(a.data_type().clone())).collect())?;
     let rows = converter.convert_columns(&arrs)?;
@@ -624,8 +621,7 @@ impl MemBuffer {
     /// expose (insert + record are both synchronous, no await between them
     /// at the call site).
     pub fn record_wal_append(
-        &self, project_id: &str, table_name: &str, timestamp_micros: i64, shard: usize, count: u64,
-        position: Option<walrus_rust::WalPosition>,
+        &self, project_id: &str, table_name: &str, timestamp_micros: i64, shard: usize, count: u64, position: Option<walrus_rust::WalPosition>,
     ) {
         let key = Self::make_key(project_id, table_name);
         let Some(table) = self.tables.get(&key) else {

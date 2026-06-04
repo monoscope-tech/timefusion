@@ -16,7 +16,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use walrus_rust::{Walrus, ReadConsistency};
+//! use walrus_rust::{ReadConsistency, Walrus};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! // Create a new WAL instance
@@ -55,11 +55,7 @@
 //! let wal = Walrus::new()?;
 //!
 //! // Atomic batch write (all-or-nothing)
-//! let batch = vec![
-//!     b"entry 1".as_slice(),
-//!     b"entry 2".as_slice(),
-//!     b"entry 3".as_slice(),
-//! ];
+//! let batch = vec![b"entry 1".as_slice(), b"entry 2".as_slice(), b"entry 3".as_slice()];
 //! wal.batch_append_for_topic("events", &batch)?;
 //!
 //! // Batch read with byte limit (returns at least 1 entry if available)
@@ -77,7 +73,7 @@
 //! Control the trade-off between durability and performance:
 //!
 //! ```rust,no_run
-//! use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+//! use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! // Strict consistency - every read checkpoint is persisted immediately
@@ -85,9 +81,9 @@
 //!
 //! // At-least-once delivery - persist every N reads (higher throughput)
 //! // This allows replaying up to N entries after a crash
-//! let wal = Walrus::with_consistency(
-//!     ReadConsistency::AtLeastOnce { persist_every: 1000 }
-//! )?;
+//! let wal = Walrus::with_consistency(ReadConsistency::AtLeastOnce {
+//!     persist_every: 1000,
+//! })?;
 //! # Ok(())
 //! # }
 //! ```
@@ -97,25 +93,25 @@
 //! Configure when data is flushed to disk:
 //!
 //! ```rust,no_run
-//! use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+//! use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! // Fsync every 500ms (default is 200ms)
 //! let wal = Walrus::with_consistency_and_schedule(
 //!     ReadConsistency::StrictlyAtOnce,
-//!     FsyncSchedule::Milliseconds(500)
+//!     FsyncSchedule::Milliseconds(500),
 //! )?;
 //!
 //! // Fsync after every single write (maximum durability, lower throughput)
 //! let wal = Walrus::with_consistency_and_schedule(
 //!     ReadConsistency::StrictlyAtOnce,
-//!     FsyncSchedule::SyncEach
+//!     FsyncSchedule::SyncEach,
 //! )?;
 //!
 //! // Never fsync (maximum throughput, no durability guarantees)
 //! let wal = Walrus::with_consistency_and_schedule(
 //!     ReadConsistency::StrictlyAtOnce,
-//!     FsyncSchedule::NoFsync
+//!     FsyncSchedule::NoFsync,
 //! )?;
 //! # Ok(())
 //! # }
@@ -126,7 +122,7 @@
 //! Create isolated WAL instances with separate storage directories:
 //!
 //! ```rust,no_run
-//! use walrus_rust::{Walrus, ReadConsistency, FsyncSchedule};
+//! use walrus_rust::{FsyncSchedule, ReadConsistency, Walrus};
 //!
 //! # fn main() -> std::io::Result<()> {
 //! // Create a namespaced WAL (stored in wal_files/<sanitized-key>/)
@@ -136,14 +132,16 @@
 //! // With custom consistency
 //! let wal = Walrus::with_consistency_for_key(
 //!     "my-app",
-//!     ReadConsistency::AtLeastOnce { persist_every: 100 }
+//!     ReadConsistency::AtLeastOnce { persist_every: 100 },
 //! )?;
 //!
 //! // With full configuration
 //! let wal = Walrus::with_consistency_and_schedule_for_key(
 //!     "my-app",
-//!     ReadConsistency::AtLeastOnce { persist_every: 1000 },
-//!     FsyncSchedule::Milliseconds(500)
+//!     ReadConsistency::AtLeastOnce {
+//!         persist_every: 1000,
+//!     },
+//!     FsyncSchedule::Milliseconds(500),
 //! )?;
 //! # Ok(())
 //! # }
@@ -183,7 +181,7 @@
 //! ### Selecting a Backend
 //!
 //! ```rust,no_run
-//! use walrus_rust::{enable_fd_backend, disable_fd_backend};
+//! use walrus_rust::{disable_fd_backend, enable_fd_backend};
 //!
 //! // Use FD backend (default - uses io_uring for batches on Linux)
 //! enable_fd_backend();
@@ -251,7 +249,4 @@
 
 #![recursion_limit = "256"]
 pub mod wal;
-pub use wal::{
-    Entry, FsyncSchedule, ReadConsistency, WalIndex, WalPosition, Walrus, disable_fd_backend,
-    enable_fd_backend,
-};
+pub use wal::{Entry, FsyncSchedule, ReadConsistency, WalIndex, WalPosition, Walrus, disable_fd_backend, enable_fd_backend};

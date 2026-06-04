@@ -156,11 +156,8 @@ pub struct FlushStats {
 /// metadata so a crash-mid-flush can derive the cursor from Delta on restart.
 pub type DeltaWatermark = Vec<Option<walrus_rust::WalPosition>>;
 
-pub type DeltaWriteCallback = Arc<
-    dyn Fn(String, String, Vec<RecordBatch>, DeltaWatermark) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>>
-        + Send
-        + Sync,
->;
+pub type DeltaWriteCallback =
+    Arc<dyn Fn(String, String, Vec<RecordBatch>, DeltaWatermark) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> + Send + Sync>;
 
 /// Optional callback invoked AFTER a successful Delta commit. Receives the
 /// `(project_id, table_name, batches, added_file_uris)` and is responsible
@@ -210,10 +207,7 @@ impl BufferedWriteLayer {
         // and indexed columns are a fraction of total row bytes. 25% is a
         // soft ceiling — LRU drops oldest entries before this is exceeded.
         let text_index_max_bytes = (cfg.buffer.max_memory_mb() / 4).max(16) * 1024 * 1024;
-        let mem_buffer = Arc::new(MemBuffer::new_with_max_index_bytes_and_shards(
-            text_index_max_bytes,
-            wal.shards_per_topic(),
-        ));
+        let mem_buffer = Arc::new(MemBuffer::new_with_max_index_bytes_and_shards(text_index_max_bytes, wal.shards_per_topic()));
 
         Ok(Self {
             config: cfg,
@@ -388,14 +382,7 @@ impl BufferedWriteLayer {
             for batch in &batches {
                 let timestamp_micros = extract_min_timestamp(batch).unwrap_or(now);
                 self.mem_buffer.insert(project_id, table_name, batch.clone(), timestamp_micros)?;
-                self.mem_buffer.record_wal_append(
-                    project_id,
-                    table_name,
-                    timestamp_micros,
-                    shard,
-                    1,
-                    post_append_position,
-                );
+                self.mem_buffer.record_wal_append(project_id, table_name, timestamp_micros, shard, 1, post_append_position);
             }
 
             Ok(())
@@ -693,9 +680,7 @@ impl BufferedWriteLayer {
         // Last-write-wins dedup on the per-table key set from schema YAML.
         // Empty key list = pass-through. Runs before both Delta write and the
         // tantivy sidecar so both see the same row set.
-        let dedup_keys = crate::schema_loader::get_schema(&bucket.table_name)
-            .map(|s| s.dedup_keys.as_slice())
-            .unwrap_or(&[]);
+        let dedup_keys = crate::schema_loader::get_schema(&bucket.table_name).map(|s| s.dedup_keys.as_slice()).unwrap_or(&[]);
         let batches = crate::mem_buffer::dedup_batches(bucket.batches.clone(), dedup_keys)?;
         let after: usize = batches.iter().map(|b| b.num_rows()).sum();
         if bucket.row_count > after {
@@ -1070,11 +1055,7 @@ mod tests {
 
         let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
         // 3 batches → 3 WAL entries on one shard for this insert.
-        let batches = vec![
-            create_test_batch(&project),
-            create_test_batch(&project),
-            create_test_batch(&project),
-        ];
+        let batches = vec![create_test_batch(&project), create_test_batch(&project), create_test_batch(&project)];
         layer.insert(&project, &table, batches).await.unwrap();
 
         let buckets = layer.mem_buffer.get_all_buckets();
@@ -1125,10 +1106,8 @@ mod tests {
         let bucket_dur_micros = crate::mem_buffer::bucket_duration_micros();
         let now = crate::clock::now_micros();
         let old_ts = now - 2 * bucket_dur_micros;
-        let old_batch = crate::test_utils::test_helpers::json_to_batch(vec![
-            crate::test_utils::test_helpers::test_span_ts("old", "spanA", &project, old_ts),
-        ])
-        .unwrap();
+        let old_batch =
+            crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span_ts("old", "spanA", &project, old_ts)]).unwrap();
         layer.insert(&project, &table, vec![old_batch]).await.unwrap();
 
         // Insert "current" rows into the open follow-on bucket.
@@ -1185,10 +1164,8 @@ mod tests {
         // Insert into a sealed (past-cutoff) bucket so flush_completed_buckets picks it up.
         let bucket_dur_micros = crate::mem_buffer::bucket_duration_micros();
         let old_ts = crate::clock::now_micros() - 2 * bucket_dur_micros;
-        let old_batch = crate::test_utils::test_helpers::json_to_batch(vec![
-            crate::test_utils::test_helpers::test_span_ts("seal", "spanA", &project, old_ts),
-        ])
-        .unwrap();
+        let old_batch =
+            crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span_ts("seal", "spanA", &project, old_ts)]).unwrap();
         layer.insert(&project, &table, vec![old_batch]).await.unwrap();
 
         layer.flush_completed_buckets().await.unwrap();

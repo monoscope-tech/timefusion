@@ -1,13 +1,9 @@
 mod common;
 
+use std::{fs, sync::Arc, thread, time::Duration};
+
 use common::{TestEnv, current_wal_dir};
-use std::fs;
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
-use walrus_rust::FsyncSchedule;
-use walrus_rust::ReadConsistency;
-use walrus_rust::wal::Walrus;
+use walrus_rust::{FsyncSchedule, ReadConsistency, wal::Walrus};
 
 fn setup_test_env() -> TestEnv {
     TestEnv::new()
@@ -16,11 +12,7 @@ fn setup_test_env() -> TestEnv {
 fn first_data_file() -> String {
     let mut files: Vec<_> = fs::read_dir(current_wal_dir()).unwrap().flatten().collect();
     files.sort_by_key(|e| e.file_name());
-    let p = files
-        .into_iter()
-        .find(|e| !e.file_name().to_string_lossy().ends_with("_index.db"))
-        .unwrap()
-        .path();
+    let p = files.into_iter().find(|e| !e.file_name().to_string_lossy().ends_with("_index.db")).unwrap().path();
     p.to_string_lossy().to_string()
 }
 
@@ -30,10 +22,8 @@ fn integration_basic_write_read_cycle() {
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-    wal.append_for_topic("test_topic", b"Hello, World!")
-        .unwrap();
-    wal.append_for_topic("test_topic", b"Second message")
-        .unwrap();
+    wal.append_for_topic("test_topic", b"Hello, World!").unwrap();
+    wal.append_for_topic("test_topic", b"Second message").unwrap();
 
     let entry1 = wal.read_next("test_topic", true).unwrap().unwrap();
     assert_eq!(entry1.data, b"Hello, World!");
@@ -106,13 +96,7 @@ fn integration_utf8_strings() {
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-    let utf8_strings = vec![
-        "Hello, World!",
-        "Café ☕",
-        "こんにちは",
-        "Rust is awesome!",
-        "Ñoño niño",
-    ];
+    let utf8_strings = vec!["Hello, World!", "Café ☕", "こんにちは", "Rust is awesome!", "Ñoño niño"];
 
     for (i, s) in utf8_strings.iter().enumerate() {
         let topic = format!("utf8_{}", i);
@@ -243,9 +227,7 @@ fn integration_concurrent_writes() {
             let topic = format!("concurrent_{}", thread_id);
             for msg_id in 0..messages_per_thread {
                 let message = format!("Thread {} Message {}", thread_id, msg_id);
-                wal_clone
-                    .append_for_topic(&topic, message.as_bytes())
-                    .unwrap();
+                wal_clone.append_for_topic(&topic, message.as_bytes()).unwrap();
                 thread::sleep(Duration::from_millis(1));
             }
         });
@@ -303,10 +285,7 @@ fn integration_nonexistent_topic() {
     wal.append_for_topic("existing", b"data").unwrap();
     assert!(wal.read_next("different", true).unwrap().is_none());
 
-    assert_eq!(
-        wal.read_next("existing", true).unwrap().unwrap().data,
-        b"data"
-    );
+    assert_eq!(wal.read_next("existing", true).unwrap().unwrap().data, b"data");
 }
 
 #[test]
@@ -337,19 +316,11 @@ fn integration_large_topic_names() {
     let long_topic = "a".repeat(15);
     let very_long_topic = "b".repeat(18);
 
-    wal.append_for_topic(&long_topic, b"long topic data")
-        .unwrap();
-    wal.append_for_topic(&very_long_topic, b"very long topic data")
-        .unwrap();
+    wal.append_for_topic(&long_topic, b"long topic data").unwrap();
+    wal.append_for_topic(&very_long_topic, b"very long topic data").unwrap();
 
-    assert_eq!(
-        wal.read_next(&long_topic, true).unwrap().unwrap().data,
-        b"long topic data"
-    );
-    assert_eq!(
-        wal.read_next(&very_long_topic, true).unwrap().unwrap().data,
-        b"very long topic data"
-    );
+    assert_eq!(wal.read_next(&long_topic, true).unwrap().unwrap().data, b"long topic data");
+    assert_eq!(wal.read_next(&very_long_topic, true).unwrap().unwrap().data, b"very long topic data");
 }
 
 #[test]
@@ -441,10 +412,7 @@ fn integration_corruption_detection_comprehensive() {
     let path = first_data_file();
     let mut file_data = std::fs::read(&path).unwrap();
 
-    if let Some(pos) = file_data
-        .windows(test_data.len())
-        .position(|w| w == test_data)
-    {
+    if let Some(pos) = file_data.windows(test_data.len()).position(|w| w == test_data) {
         for i in 0..5 {
             if pos + i < file_data.len() {
                 file_data[pos + i] ^= 0xFF;
@@ -458,10 +426,7 @@ fn integration_corruption_detection_comprehensive() {
         match wal2.read_next(topic, true).unwrap() {
             None => {}
             Some(corrupted_entry) => {
-                assert_ne!(
-                    corrupted_entry.data, test_data,
-                    "Corruption not detected - data should be different"
-                );
+                assert_ne!(corrupted_entry.data, test_data, "Corruption not detected - data should be different");
             }
         }
     }
@@ -471,11 +436,7 @@ fn integration_corruption_detection_comprehensive() {
 fn integration_extreme_topic_count() {
     let _env = setup_test_env();
 
-    let wal = Walrus::with_consistency_and_schedule(
-        ReadConsistency::StrictlyAtOnce,
-        FsyncSchedule::SyncEach,
-    )
-    .unwrap();
+    let wal = Walrus::with_consistency_and_schedule(ReadConsistency::StrictlyAtOnce, FsyncSchedule::SyncEach).unwrap();
     let num_topics = 5000;
 
     for topic_id in 0..num_topics {
@@ -499,16 +460,8 @@ fn integration_extreme_topic_count() {
         let topic = format!("extreme_topic_{:06}", topic_id);
         let entry = wal.read_next(&topic, true).unwrap().unwrap();
 
-        let read_topic_id = u64::from_le_bytes([
-            entry.data[0],
-            entry.data[1],
-            entry.data[2],
-            entry.data[3],
-            entry.data[4],
-            entry.data[5],
-            entry.data[6],
-            entry.data[7],
-        ]);
+        let read_topic_id =
+            u64::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3], entry.data[4], entry.data[5], entry.data[6], entry.data[7]]);
 
         assert_eq!(read_topic_id, topic_id as u64);
 
@@ -600,18 +553,8 @@ fn integration_persistence_stress_with_validation() {
             for entry_id in (entries_per_topic / 2)..entries_per_topic {
                 let entry = wal.read_next(&topic, true).unwrap().unwrap();
 
-                let read_topic_id = u32::from_le_bytes([
-                    entry.data[0],
-                    entry.data[1],
-                    entry.data[2],
-                    entry.data[3],
-                ]);
-                let read_entry_id = u32::from_le_bytes([
-                    entry.data[4],
-                    entry.data[5],
-                    entry.data[6],
-                    entry.data[7],
-                ]);
+                let read_topic_id = u32::from_le_bytes([entry.data[0], entry.data[1], entry.data[2], entry.data[3]]);
+                let read_entry_id = u32::from_le_bytes([entry.data[4], entry.data[5], entry.data[6], entry.data[7]]);
                 let read_timestamp = u64::from_le_bytes([
                     entry.data[8],
                     entry.data[9],
@@ -646,21 +589,10 @@ fn integration_data_pattern_stress() {
     let patterns = vec![
         ("all_zeros", vec![0u8; 10000]),
         ("all_ones", vec![0xFF; 10000]),
-        (
-            "alternating_bytes",
-            (0..10000)
-                .map(|i| if i % 2 == 0 { 0x00 } else { 0xFF })
-                .collect(),
-        ),
+        ("alternating_bytes", (0..10000).map(|i| if i % 2 == 0 { 0x00 } else { 0xFF }).collect()),
         ("incremental", (0..10000).map(|i| (i % 256) as u8).collect()),
-        (
-            "decremental",
-            (0..10000).map(|i| (255 - (i % 256)) as u8).collect(),
-        ),
-        (
-            "repeating_pattern",
-            vec![0xAA, 0xBB, 0xCC, 0xDD].repeat(2500),
-        ),
+        ("decremental", (0..10000).map(|i| (255 - (i % 256)) as u8).collect()),
+        ("repeating_pattern", vec![0xAA, 0xBB, 0xCC, 0xDD].repeat(2500)),
         ("pseudo_random", {
             let mut data = Vec::new();
             let mut seed = 0x12345678u32;
@@ -678,11 +610,7 @@ fn integration_data_pattern_stress() {
 
     for (pattern_name, expected_data) in patterns {
         let entry = wal.read_next(&pattern_name, true).unwrap().unwrap();
-        assert_eq!(
-            entry.data, expected_data,
-            "Pattern '{}' was corrupted during storage/retrieval",
-            pattern_name
-        );
+        assert_eq!(entry.data, expected_data, "Pattern '{}' was corrupted during storage/retrieval", pattern_name);
     }
 }
 
@@ -692,14 +620,7 @@ fn integration_special_topic_names() {
 
     let wal = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
-    let topics = vec![
-        "topic-with-dashes",
-        "topic_with_underscores",
-        "topic.with.dots",
-        "topic123",
-        "UPPERCASE_TOPIC",
-        "MixedCaseTopic",
-    ];
+    let topics = vec!["topic-with-dashes", "topic_with_underscores", "topic.with.dots", "topic123", "UPPERCASE_TOPIC", "MixedCaseTopic"];
 
     for (i, topic) in topics.iter().enumerate() {
         let data = format!("Data for topic {}", i);
@@ -724,24 +645,16 @@ fn exactly_once_delivery_guarantee() {
     }
 
     for i in 0..5 {
-        assert_eq!(
-            wal.read_next("exactly_once", true).unwrap().unwrap().data,
-            &[i]
-        );
+        assert_eq!(wal.read_next("exactly_once", true).unwrap().unwrap().data, &[i]);
     }
 
     drop(wal);
-
-
 
     thread::sleep(Duration::from_millis(50));
 
     let wal2 = Walrus::with_consistency(ReadConsistency::StrictlyAtOnce).unwrap();
 
     for i in 5..10 {
-        assert_eq!(
-            wal2.read_next("exactly_once", true).unwrap().unwrap().data,
-            &[i]
-        );
+        assert_eq!(wal2.read_next("exactly_once", true).unwrap().unwrap().data, &[i]);
     }
 }
