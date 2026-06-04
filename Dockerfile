@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.6
 
 ##############################
 #         Builder Stage      #
@@ -6,38 +6,29 @@
 FROM rust:1.91-slim-bookworm AS builder
 WORKDIR /app
 
-# Install build dependencies. protoc is required by tonic-prost-build (build.rs).
+# protoc is required by tonic-prost-build (build.rs).
 RUN apt-get update && \
     apt-get install -y pkg-config libssl-dev protobuf-compiler && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy Cargo manifests, build.rs, proto files (needed by build.rs at compile
-# time), and vendored path-dep crates referenced in Cargo.toml.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto/ proto/
 COPY vendor/ vendor/
-
-# Create dummy bench files (one per [[bench]] in Cargo.toml) and a dummy main
-# to allow dependency caching without the full source tree.
-RUN mkdir src && echo "fn main() {}" > src/main.rs && \
-    mkdir benches && \
-    echo "fn main() {}" > benches/core_benchmarks.rs && \
-    echo "fn main() {}" > benches/tantivy_benchmarks.rs && \
-    echo "fn main() {}" > benches/sort_layout_benchmarks.rs
-
-# Build a dummy release binary (to cache dependencies)
-RUN cargo build --release
-
-# Copy the full source code
 COPY src/ src/
 COPY schemas/ schemas/
 
-# Build the real release binary
-RUN cargo build --release
+# BuildKit cache mounts let the cargo registry and target/ dir survive across
+# CI runs (combined with `cache-to: type=gha` in the workflow). This replaces
+# the previous dummy-main scaffolding, which only cached when Cargo.toml was
+# unchanged and never reused target/ between builds.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --locked && \
+    cp target/release/timefusion /timefusion
 
-# Pre-create app state dirs so they can be copied into the distroless
-# runtime (which has no shell to mkdir at runtime).
-RUN mkdir -p /app/queue_db /app/data
+# App state dirs (distroless runtime has no shell to mkdir at runtime).
+RUN mkdir -p /queue_db /data
 
 ##############################
 #         Runtime Stage      #
@@ -49,9 +40,9 @@ RUN mkdir -p /app/queue_db /app/data
 FROM gcr.io/distroless/cc-debian12:nonroot
 WORKDIR /app
 
-COPY --from=builder --chown=nonroot:nonroot /app/target/release/timefusion /usr/local/bin/timefusion
-COPY --from=builder --chown=nonroot:nonroot /app/queue_db /app/queue_db
-COPY --from=builder --chown=nonroot:nonroot /app/data     /app/data
+COPY --from=builder --chown=nonroot:nonroot /timefusion /usr/local/bin/timefusion
+COPY --from=builder --chown=nonroot:nonroot /queue_db /app/queue_db
+COPY --from=builder --chown=nonroot:nonroot /data     /app/data
 
 EXPOSE 80 5432
 

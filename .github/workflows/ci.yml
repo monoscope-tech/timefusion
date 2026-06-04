@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Incremental compilation bloats the cache without helping CI (no warm
+  # incremental state across runs). Disabling it makes target/ smaller and
+  # speeds up sccache hit rates.
+  CARGO_INCREMENTAL: "0"
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   fmt:
@@ -27,34 +33,13 @@ jobs:
           components: rustfmt
       - run: cargo +nightly fmt --all --check
 
-  clippy:
-    name: Clippy
+  # Combined clippy + test. `cargo clippy` implies `cargo check`, and both
+  # share ~all artifacts with `cargo test` — running them in one job lets
+  # them reuse target/ instead of recompiling the world per-job.
+  build-test:
+    name: Clippy & Test
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets --all-features
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       AWS_SDK_LOAD_CONFIG: "false"
       AWS_ENDPOINT_URL: http://127.0.0.1:9000
@@ -98,9 +83,18 @@ jobs:
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: mozilla-actions/sccache-action@v0.0.5
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: build-test
 
-      - name: Run all tests
-        run: cargo test --all-features
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features --locked
