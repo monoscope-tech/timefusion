@@ -705,13 +705,14 @@ mod tests {
         .unwrap();
 
         let parser = <DfSessionService as ExtendedQueryHandler>::query_parser(&service);
-        // COPY is rejected by `state.statement_to_plan`, so `LogicalPlan::Copy`
-        // can't be reached via the prepared-statement path today — the Copy
-        // arm in the guard is defensive for if upstream ever enables it.
         let cases: &[(&str, bool)] = &[
             ("INSERT INTO t VALUES (1, 'a')", true),
             ("UPDATE t SET name = 'x' WHERE id = 1", true),
             ("DELETE FROM t WHERE id = 1", true),
+            // COPY: not tested — `state.statement_to_plan` rejects COPY as
+            // unsupported today, so `LogicalPlan::Copy` is unreachable via
+            // the prepared-statement path. The Copy arm in the guard is
+            // defensive for if upstream ever enables it.
             ("SELECT id, name FROM t", false),
             // Over-match guard: a SELECT that happens to produce a single
             // UInt64 `count` column must NOT be suppressed — only DML/COPY

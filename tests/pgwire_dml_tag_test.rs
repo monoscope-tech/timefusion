@@ -11,12 +11,11 @@
 mod pgwire_dml_tag {
     use std::{path::PathBuf, sync::Arc, time::Duration};
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use datafusion_postgres::ServerOptions;
-    use rand::RngExt;
     use serial_test::serial;
     use timefusion::{config::AppConfig, database::Database};
-    use tokio::sync::Notify;
+    use tokio::{net::TcpListener, sync::Notify};
     use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
     use uuid::Uuid;
 
@@ -46,10 +45,16 @@ mod pgwire_dml_tag {
         async fn start() -> Result<Self> {
             timefusion::test_utils::init_test_logging();
             let test_id = Uuid::new_v4().to_string();
-            let port = 5433 + rand::rng().random_range(1..2000) as u16;
+            // OS-assigned free port: bind, capture, drop. The tiny race window
+            // before the server re-binds is harmless in practice.
+            let port = TcpListener::bind("127.0.0.1:0").await?.local_addr()?.port();
             let cfg = create_test_config(&test_id);
             let db = Arc::new(Database::with_config(cfg).await?);
+            // Pre-create both tables touched by the suite so failures here
+            // (e.g. Variant schema misconfig) surface deterministically rather
+            // than as a confusing lazy-create error during prepare().
             db.get_or_create_table("test_project", "otel_logs_and_spans").await?;
+            db.get_or_create_table("test_project", "variant_bench").await?;
 
             let db_clone = db.clone();
             let shutdown = Arc::new(Notify::new());
@@ -74,19 +79,25 @@ mod pgwire_dml_tag {
         }
 
         async fn connect(port: u16) -> Result<Client> {
-            let conn_str = format!("host=localhost port={port} user=postgres password=postgres");
-            for _ in 0..100 {
-                if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
-                    tokio::spawn(async move {
-                        if let Err(e) = conn.await {
-                            eprintln!("conn error: {e}");
-                        }
-                    });
-                    return Ok(client);
+            let conn_str = format!("host=127.0.0.1 port={port} user=postgres password=postgres");
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut last_err = None;
+            while tokio::time::Instant::now() < deadline {
+                match tokio_postgres::connect(&conn_str, NoTls).await {
+                    Ok((client, conn)) => {
+                        tokio::spawn(async move {
+                            if let Err(e) = conn.await {
+                                eprintln!("conn error: {e}");
+                            }
+                        });
+                        return Ok(client);
+                    }
+                    Err(e) => last_err = Some(e),
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Err(anyhow::anyhow!("Failed to connect"))
+            Err(last_err.map(anyhow::Error::from).unwrap_or_else(|| anyhow::anyhow!("no connect attempt")))
+                .context("pgwire server did not accept connections within 10s")
         }
 
         async fn client(&self) -> Result<Client> {
