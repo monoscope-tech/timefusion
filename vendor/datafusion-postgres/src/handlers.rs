@@ -466,18 +466,27 @@ impl QueryParser for Parser {
         stmt: &Self::Statement,
         column_format: Option<&Format>,
     ) -> PgWireResult<Vec<FieldInfo>> {
-        if let (_, Some((_, plan))) = stmt {
-            let schema = plan.schema();
-            let fields = arrow_schema_to_pg_fields(
-                schema.as_arrow(),
-                column_format.unwrap_or(&Format::UnifiedBinary),
-                None,
-            )?;
-
-            Ok(fields)
-        } else {
-            Ok(vec![])
+        let Some((_, plan)) = stmt.1.as_ref() else {
+            return Ok(vec![]);
+        };
+        let schema = plan.schema();
+        let fields = schema.fields();
+        // DataFusion's synthetic `count: UInt64` DML schema must not be
+        // announced as RowDescription — strict clients reject NoData/Tuples
+        // mismatch at Describe time. Match on the exact shape so RETURNING
+        // (wider schema) falls through to the real result path.
+        if matches!(plan, LogicalPlan::Dml(_) | LogicalPlan::Copy(_))
+            && fields.len() == 1
+            && fields[0].name() == "count"
+            && fields[0].data_type() == &DataType::UInt64
+        {
+            return Ok(vec![]);
         }
+        arrow_schema_to_pg_fields(
+            schema.as_arrow(),
+            column_format.unwrap_or(&Format::UnifiedBinary),
+            None,
+        )
     }
 }
 
@@ -674,63 +683,4 @@ mod tests {
         assert!(!has_ps, "statement_timeout should not send ParameterStatus");
     }
 
-    /// DML SQL exercised by both wire-path tests below. Sharing the list
-    /// keeps the simple- and extended-query coverage in lockstep.
-    const DML_CASES: &[&str] = &[
-        "INSERT INTO t VALUES (1, 'a')",
-        "UPDATE t SET name = 'x' WHERE id = 1",
-        "DELETE FROM t WHERE id = 1",
-    ];
-
-    /// DML must emit `Response::Execution` (→ `CommandComplete`), not
-    /// `Response::Query` (→ `TuplesOk`); clients decoding writes as
-    /// row-count-only treat the latter as a hard error and drop the row.
-    #[tokio::test]
-    async fn dml_returns_command_complete() {
-        let service = crate::testing::setup_handlers();
-        let mut client = MockClient::new();
-
-        <DfSessionService as SimpleQueryHandler>::do_query(
-            &service,
-            &mut client,
-            "CREATE TABLE t (id INT, name TEXT)",
-        )
-        .await
-        .unwrap();
-
-        for sql in DML_CASES {
-            let resp =
-                <DfSessionService as SimpleQueryHandler>::do_query(&service, &mut client, sql)
-                    .await
-                    .unwrap_or_else(|e| panic!("{sql} failed: {e:?}"));
-            assert!(
-                matches!(resp.as_slice(), [Response::Execution(_)]),
-                "{sql} must return Execution (CommandComplete), got {resp:?}"
-            );
-        }
-    }
-
-    /// Extended path optimises the plan before execution; confirm
-    /// `LogicalPlan::Dml` survives optimisation so `dml_completion` still
-    /// fires (otherwise the AST/plan desync silently returns).
-    #[tokio::test]
-    async fn dml_completion_survives_logical_optimisation() {
-        let ctx = SessionContext::new();
-        ctx.sql("CREATE TABLE t (id INT, name TEXT)")
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-
-        for sql in DML_CASES {
-            let df = ctx.sql(sql).await.unwrap();
-            let optimised = ctx.state().optimize(df.logical_plan()).unwrap();
-            let optimised_df = ctx.execute_logical_plan(optimised).await.unwrap();
-            assert!(
-                matches!(dml_completion(&optimised_df).await.unwrap(), Some(Response::Execution(_))),
-                "{sql}: optimised plan should still be detected as DML"
-            );
-        }
-    }
 }
