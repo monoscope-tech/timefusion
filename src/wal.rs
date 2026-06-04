@@ -536,6 +536,12 @@ impl WalManager {
         Ok(self.known_topics.iter().map(|t| t.clone()).collect())
     }
 
+    /// Same as `list_topics` but parsed into `(project_id, table_name)` pairs.
+    /// Callers iterating topics shouldn't need to know the joining convention.
+    pub fn list_topic_pairs(&self) -> Result<Vec<(String, String)>, WalError> {
+        Ok(self.known_topics.iter().filter_map(|t| Self::parse_topic(&t)).collect())
+    }
+
     /// Advance the walrus read cursor by exactly `counts[shard]` entries on
     /// each shard for `(project_id, table_name)`. Callers pass the per-shard
     /// WAL-entry counts they recorded against a successfully-flushed bucket
@@ -550,13 +556,7 @@ impl WalManager {
     /// to the open follow-on bucket on crash.
     #[instrument(skip(self, counts))]
     pub fn advance_by_counts(&self, project_id: &str, table_name: &str, counts: &[u64]) -> Result<(), WalError> {
-        if counts.len() != self.shards_per_topic {
-            return Err(WalError::Internal(format!(
-                "advance_by_counts: counts.len()={} but shards_per_topic={}",
-                counts.len(),
-                self.shards_per_topic
-            )));
-        }
+        self.check_shard_len("advance_by_counts", counts.len())?;
         let topic = Self::make_topic(project_id, table_name);
         let mut total = 0u64;
         for shard in 0..self.shards_per_topic {
@@ -590,55 +590,55 @@ impl WalManager {
         Ok(())
     }
 
-    /// Snapshot the current walrus tail position per shard for `(project, table)`.
-    /// Returns a `Vec<WalPosition>` of length `shards_per_topic`. Shards that have
-    /// never been written return [`WalPosition::ORIGIN`].
-    ///
-    /// Used at bucket-seal time to capture the watermark that the bucket's flush
-    /// will reach when its WAL entries are consumed — this watermark is then
-    /// written into the corresponding Delta commit's metadata so that, on
-    /// crash-mid-flush recovery, the cursor can be derived from Delta atomically
-    /// with the flushed rows.
-    pub fn current_position(&self, project_id: &str, table_name: &str) -> Result<Vec<WalPosition>, WalError> {
+    fn for_each_shard<T>(
+        &self, project_id: &str, table_name: &str,
+        mut f: impl FnMut(&str) -> std::io::Result<T>,
+    ) -> Result<Vec<T>, WalError> {
         (0..self.shards_per_topic)
-            .map(|shard| {
-                let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
-                self.wal.current_position(&walrus_key).map_err(WalError::Io)
-            })
+            .map(|shard| f(&Self::walrus_topic_key(project_id, table_name, shard)).map_err(WalError::Io))
             .collect()
     }
 
-    /// Read the walrus persisted-read cursor per shard for `(project, table)`.
-    /// `None` for shards whose cursor has never been persisted (fresh column).
+    fn check_shard_len(&self, label: &str, len: usize) -> Result<(), WalError> {
+        if len != self.shards_per_topic {
+            return Err(WalError::Internal(format!(
+                "{}: len={} but shards_per_topic={}",
+                label, len, self.shards_per_topic
+            )));
+        }
+        Ok(())
+    }
+
+    /// Snapshot the walrus write tail per shard. Used at bucket-seal time to
+    /// capture the watermark recorded in Delta commit metadata.
+    pub fn current_position(&self, project_id: &str, table_name: &str) -> Result<Vec<WalPosition>, WalError> {
+        self.for_each_shard(project_id, table_name, |k| self.wal.current_position(k))
+    }
+
+    /// Snapshot the walrus write tail on a single shard. No-allocation variant
+    /// for the per-insert hot path.
+    pub fn current_position_for_shard(
+        &self, project_id: &str, table_name: &str, shard: usize,
+    ) -> Result<WalPosition, WalError> {
+        let key = Self::walrus_topic_key(project_id, table_name, shard);
+        self.wal.current_position(&key).map_err(WalError::Io)
+    }
+
+    /// Read the walrus persisted-read cursor per shard. `None` for shards
+    /// whose cursor has never been persisted.
     pub fn persisted_read_positions(
         &self, project_id: &str, table_name: &str,
     ) -> Result<Vec<Option<WalPosition>>, WalError> {
-        (0..self.shards_per_topic)
-            .map(|shard| {
-                let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
-                self.wal.persisted_read_position(&walrus_key).map_err(WalError::Io)
-            })
-            .collect()
+        self.for_each_shard(project_id, table_name, |k| self.wal.persisted_read_position(k))
     }
 
-    /// Set the walrus persisted-read cursor per shard for `(project, table)`.
-    /// `positions.len()` must equal `shards_per_topic`. Positions of
-    /// [`WalPosition::ORIGIN`] reset the cursor to start-of-log.
-    ///
-    /// Used at startup to fast-forward the cursor to a Delta-derived watermark
-    /// when Delta is ahead of locally-fsynced walrus state (the
-    /// crash-mid-flush case where Delta committed but `advance_by_counts`
-    /// didn't finish).
+    /// Set the walrus persisted-read cursor per shard. Used at startup to
+    /// fast-forward to a Delta-derived watermark when Delta is ahead of
+    /// locally-fsynced walrus state.
     pub fn set_persisted_positions(
         &self, project_id: &str, table_name: &str, positions: &[WalPosition],
     ) -> Result<(), WalError> {
-        if positions.len() != self.shards_per_topic {
-            return Err(WalError::Internal(format!(
-                "set_persisted_positions: positions.len()={} but shards_per_topic={}",
-                positions.len(),
-                self.shards_per_topic
-            )));
-        }
+        self.check_shard_len("set_persisted_positions", positions.len())?;
         for (shard, pos) in positions.iter().enumerate() {
             let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
             self.wal.set_persisted_read_position(&walrus_key, *pos).map_err(WalError::Io)?;

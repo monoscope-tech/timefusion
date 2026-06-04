@@ -376,17 +376,9 @@ impl BufferedWriteLayer {
             // belonging to the open follow-on bucket).
             let (shard, _count) = self.wal.append_batch(project_id, table_name, &batches)?;
 
-            // Snapshot the post-append walrus position on this shard. Becomes
-            // the watermark written to Delta commit metadata at flush so an
-            // exact-once cursor can be derived on crash recovery. Best-effort:
-            // a read failure here just means this bucket's contribution to the
-            // watermark is omitted (the watermark still works at coarser
-            // bucket granularity via siblings).
-            let post_append_position = self
-                .wal
-                .current_position(project_id, table_name)
-                .ok()
-                .and_then(|positions| positions.get(shard).copied());
+            // Best-effort post-append snapshot; failure just omits this
+            // bucket's watermark contribution for this shard.
+            let post_append_position = self.wal.current_position_for_shard(project_id, table_name, shard).ok();
 
             // Step 2: Write to MemBuffer for fast queries and attribute one
             // WAL entry per batch to its destination bucket (batches in one
@@ -758,11 +750,8 @@ impl BufferedWriteLayer {
 
         // Signal background tasks to stop
         self.shutdown.cancel();
-
-        // Compute dynamic timeout based on current buffer size
-        let current_memory_mb = self.mem_buffer.estimated_memory_bytes() / (1024 * 1024);
-        let task_timeout = self.config.buffer.compute_shutdown_timeout(current_memory_mb);
-        debug!("Shutdown timeout: {:?} for {}MB buffer", task_timeout, current_memory_mb);
+        let task_timeout = self.config.buffer.compute_shutdown_timeout();
+        debug!("Shutdown timeout: {:?}", task_timeout);
 
         // Wait for background tasks to complete (with timeout)
         let handles: Vec<JoinHandle<()>> = {
