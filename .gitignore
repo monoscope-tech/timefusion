@@ -1,4 +1,5 @@
 /target
+vendor/*/target/
 /queue_db
 .env
 .env.prod
