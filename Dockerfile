@@ -19,11 +19,11 @@ RUN cargo install cargo-chef --version 0.1.77 --locked
 # stays cached across most edits.
 FROM chef AS planner
 # Only inputs cargo chef prepare actually reads: Cargo manifests + path-dep
-# manifests (in vendor/). NOT src/ or schemas/ — including them here would
-# bust the planner layer on every source edit, transitively invalidating
-# the cook layer and defeating cargo-chef's purpose.
+# manifests (in vendor/). NOT src/, schemas/, or proto/ — including them
+# here would bust the planner layer on edits unrelated to the dep graph,
+# defeating cargo-chef's purpose. vendor/ is copied in full (manifests +
+# source) since separating them isn't worth the Dockerfile complexity.
 COPY Cargo.toml Cargo.lock build.rs ./
-COPY proto/ proto/
 COPY vendor/ vendor/
 RUN cargo chef prepare --recipe-path recipe.json
 
@@ -34,15 +34,17 @@ FROM chef AS builder
 # Cook compiles only dependencies. Docker layer-caches this step; cache-to:
 # type=gha,mode=max in deploy.yml persists the layer across CI runs. Layer
 # invalidates only when recipe.json changes (i.e. the dep graph changes),
-# not on every src/ edit like the previous dummy-main pattern.
+# not on every src/ or proto/ edit. vendor/ is required here for the same
+# reason as in the planner stage (path-deps) — the duplication is necessary.
 COPY --from=planner /app/recipe.json recipe.json
-COPY proto/ proto/
 COPY vendor/ vendor/
 RUN cargo chef cook --release --locked --recipe-path recipe.json
 
 # Now compile the real binary. Deps are already built, so this only rebuilds
-# the crate itself when src/ changes.
+# the crate itself when src/, build.rs, or proto/ change. proto/ must be
+# copied *after* cook so .proto edits don't bust the dep-compile layer.
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY proto/ proto/
 COPY src/ src/
 COPY schemas/ schemas/
 RUN cargo build --release --locked
