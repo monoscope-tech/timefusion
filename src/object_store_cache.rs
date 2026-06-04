@@ -861,14 +861,6 @@ impl FoyerObjectStoreCache {
             cache_hit = Empty,
         )
     )]
-    #[instrument(
-        name = "foyer_cache.head",
-        skip_all,
-        fields(
-            location = %location,
-            cache_hit = Empty,
-        )
-    )]
     async fn head_cached(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
         let span = tracing::Span::current();
         let cache_key = Self::make_cache_key(location);

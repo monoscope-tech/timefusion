@@ -37,6 +37,13 @@ pub fn config() -> &'static AppConfig {
     CONFIG.get().expect("Config not initialized. Call init_config() first.")
 }
 
+/// Whether the operator has opted into open auth for local dev via
+/// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Both the pgwire and gRPC auth
+/// paths gate their fail-secure defaults on this flag.
+pub fn is_insecure_auth_allowed() -> bool {
+    std::env::var("TIMEFUSION_ALLOW_INSECURE_AUTH").map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
 // Macro to generate const default functions for serde
 macro_rules! const_default {
     ($name:ident: bool = $val:expr) => {
