@@ -690,6 +690,22 @@ impl BufferedWriteLayer {
     /// The callback MUST complete the Delta commit before returning Ok - this is critical
     /// for durability. We only checkpoint WAL after this returns successfully.
     async fn flush_bucket(&self, bucket: &FlushableBucket) -> anyhow::Result<()> {
+        // Last-write-wins dedup on the per-table key set from schema YAML.
+        // Empty key list = pass-through. Runs before both Delta write and the
+        // tantivy sidecar so both see the same row set.
+        let dedup_keys = crate::schema_loader::get_schema(&bucket.table_name)
+            .map(|s| s.dedup_keys.as_slice())
+            .unwrap_or(&[]);
+        let batches = crate::mem_buffer::dedup_batches(bucket.batches.clone(), dedup_keys)?;
+        let after: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if bucket.row_count > after {
+            let dropped = bucket.row_count - after;
+            crate::metrics::record_dedup_dropped(dropped as u64);
+            debug!(
+                "Dedup dropped {} rows: project={}, table={}, bucket_id={}",
+                dropped, bucket.project_id, bucket.table_name, bucket.bucket_id
+            );
+        }
         let added_files = if let Some(ref callback) = self.delta_write_callback {
             // Await ensures Delta commit completes before we return. The
             // wal_positions snapshot becomes the watermark recorded in
@@ -697,7 +713,7 @@ impl BufferedWriteLayer {
             callback(
                 bucket.project_id.clone(),
                 bucket.table_name.clone(),
-                bucket.batches.clone(),
+                batches.clone(),
                 bucket.wal_positions.clone(),
             )
             .await?
@@ -709,7 +725,7 @@ impl BufferedWriteLayer {
         // We still count the failure so ops can alert on accumulating index
         // drift (silent UDF-fallback degradation is otherwise invisible).
         if let Some(ref idx_cb) = self.tantivy_index_callback
-            && let Err(e) = idx_cb(bucket.project_id.clone(), bucket.table_name.clone(), bucket.batches.clone(), added_files).await
+            && let Err(e) = idx_cb(bucket.project_id.clone(), bucket.table_name.clone(), batches, added_files).await
         {
             crate::metrics::record_tantivy_build_failure();
             warn!(

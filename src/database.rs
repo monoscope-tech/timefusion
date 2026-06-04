@@ -3301,6 +3301,7 @@ mod writer_properties_tests {
             z_order_columns: vec![],
             fields,
             time_column: None,
+            dedup_keys: vec![],
         }
     }
 

@@ -51,6 +51,7 @@ pub struct MetricsRegistry {
     pub tantivy_prefilter_skipped:  Counter<u64>,
     pub tantivy_prefilter_errors:   Counter<u64>,
     pub tantivy_build_failures:     Counter<u64>,
+    pub dedup_dropped_rows:         Counter<u64>,
 }
 
 impl MetricsRegistry {
@@ -85,6 +86,10 @@ impl MetricsRegistry {
             tantivy_build_failures:     meter
                 .u64_counter("timefusion.tantivy.build_failures")
                 .with_description("Post-flush tantivy index builds that errored — accumulating drift means queries silently fall back to UDF scan")
+                .build(),
+            dedup_dropped_rows:         meter
+                .u64_counter("timefusion.flush.dedup_dropped_rows")
+                .with_description("Rows collapsed by per-table dedup_keys (last-write-wins) before Delta commit")
                 .build(),
         }
     }
@@ -319,5 +324,11 @@ pub fn record_tantivy_prefilter_error() {
 pub fn record_tantivy_build_failure() {
     if let Some(m) = METRICS.get() {
         m.tantivy_build_failures.add(1, &[]);
+    }
+}
+
+pub fn record_dedup_dropped(rows: u64) {
+    if let Some(m) = METRICS.get() {
+        m.dedup_dropped_rows.add(rows, &[]);
     }
 }
