@@ -23,6 +23,7 @@ use datafusion::{
 use serde_json::{Value as JsonValue, json};
 use tdigests::TDigest;
 
+use crate::arrow_access::StrAccessor;
 use crate::error_ext::{ArrowResultExt, ExecResultExt};
 use crate::schema_loader::is_variant_type;
 
@@ -43,14 +44,9 @@ fn extract_scalar_string(arg: &ColumnarValue, label: &str) -> datafusion::error:
     match arg {
         ColumnarValue::Scalar(scalar) => scalar_to_string(scalar).ok_or_else(not_utf8),
         ColumnarValue::Array(arr) => {
+            let a = StrAccessor::try_new(arr).map_err(|_| not_utf8())?;
             // `&&` short-circuits so is_null(0) is never called on an empty array.
-            if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
-                if a.len() == 1 && !a.is_null(0) { Ok(a.value(0).to_string()) } else { Err(not_scalar()) }
-            } else if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
-                if a.len() == 1 && !a.is_null(0) { Ok(a.value(0).to_string()) } else { Err(not_scalar()) }
-            } else {
-                Err(not_utf8())
-            }
+            if a.len() == 1 && !a.is_null(0) { Ok(a.value(0).to_string()) } else { Err(not_scalar()) }
         }
     }
 }
@@ -1626,39 +1622,20 @@ fn simple_path_to_variant_path(raw: &str) -> Option<parquet_variant::VariantPath
 
 /// Evaluate JSONPath on a JSON string array
 fn evaluate_jsonpath_on_json_string(array: &ArrayRef, json_path: &serde_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
-    let mut builder = BooleanArray::builder(array.len());
-
-    // Handle different string types
-    if let Some(string_array) = array.as_any().downcast_ref::<StringViewArray>() {
-        for i in 0..string_array.len() {
-            if string_array.is_null(i) {
-                builder.append_null();
-            } else {
-                let json_str = string_array.value(i);
-                let result = match serde_json::from_str::<JsonValue>(json_str) {
-                    Ok(json_value) => !json_path.query(&json_value).is_empty(),
-                    Err(_) => false, // Invalid JSON returns false
-                };
-                builder.append_value(result);
-            }
+    let strings = StrAccessor::try_new(array)
+        .map_err(|_| DataFusionError::Execution("jsonb_path_exists requires JSON string or Variant input".to_string()))?;
+    let mut builder = BooleanArray::builder(strings.len());
+    for i in 0..strings.len() {
+        if strings.is_null(i) {
+            builder.append_null();
+        } else {
+            // Invalid JSON returns false.
+            let result = match serde_json::from_str::<JsonValue>(strings.value(i)) {
+                Ok(json_value) => !json_path.query(&json_value).is_empty(),
+                Err(_) => false,
+            };
+            builder.append_value(result);
         }
-    } else if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-        for i in 0..string_array.len() {
-            if string_array.is_null(i) {
-                builder.append_null();
-            } else {
-                let json_str = string_array.value(i);
-                let result = match serde_json::from_str::<JsonValue>(json_str) {
-                    Ok(json_value) => !json_path.query(&json_value).is_empty(),
-                    Err(_) => false,
-                };
-                builder.append_value(result);
-            }
-        }
-    } else {
-        return Err(DataFusionError::Execution(
-            "jsonb_path_exists requires JSON string or Variant input".to_string(),
-        ));
     }
 
     Ok(Arc::new(builder.finish()))

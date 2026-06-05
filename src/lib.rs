@@ -1,5 +1,6 @@
 #![recursion_limit = "512"]
 
+pub mod arrow_access;
 pub mod autotune;
 pub mod batch_queue;
 pub mod buffered_write_layer;
