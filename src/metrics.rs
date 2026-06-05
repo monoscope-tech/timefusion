@@ -36,63 +36,41 @@ use crate::{buffered_write_layer::BufferedWriteLayer, config::TelemetryConfig, t
 
 static METRICS: OnceLock<MetricsRegistry> = OnceLock::new();
 
-/// Holds counters that need to be incremented from the hot path. Gauges are
-/// observed by callback and don't need to live here.
-pub struct MetricsRegistry {
-    pub ingest_inserts:             Counter<u64>,
-    pub ingest_rows:                Counter<u64>,
-    pub ingest_errors:              Counter<u64>,
-    pub wal_corruption:             Counter<u64>,
-    pub flush_completed:            Counter<u64>,
-    pub flush_failed:               Counter<u64>,
-    pub query_executions:           Counter<u64>,
-    pub tantivy_prefilter_attempts: Counter<u64>,
-    pub tantivy_prefilter_used:     Counter<u64>,
-    pub tantivy_prefilter_skipped:  Counter<u64>,
-    pub tantivy_prefilter_errors:   Counter<u64>,
-    pub tantivy_build_failures:     Counter<u64>,
-    pub dedup_dropped_rows:         Counter<u64>,
+/// Declares the counter registry struct and its `new()` builder from a single
+/// list of `field => "metric.id": "description"` entries, so adding a counter
+/// is a one-line change with no risk of the field and registration drifting.
+macro_rules! counter_registry {
+    ($($field:ident => $id:literal : $desc:literal),+ $(,)?) => {
+        /// Holds counters that need to be incremented from the hot path. Gauges
+        /// are observed by callback and don't need to live here.
+        pub struct MetricsRegistry {
+            $(pub $field: Counter<u64>,)+
+        }
+
+        impl MetricsRegistry {
+            fn new(meter: &Meter) -> Self {
+                Self {
+                    $($field: meter.u64_counter($id).with_description($desc).build(),)+
+                }
+            }
+        }
+    };
 }
 
-impl MetricsRegistry {
-    fn new(meter: &Meter) -> Self {
-        Self {
-            ingest_inserts:             meter.u64_counter("timefusion.ingest.inserts").with_description("Ingest insert calls accepted").build(),
-            ingest_rows:                meter.u64_counter("timefusion.ingest.rows").with_description("Rows accepted into MemBuffer").build(),
-            ingest_errors:              meter.u64_counter("timefusion.ingest.errors").with_description("Ingest call failures").build(),
-            wal_corruption:             meter
-                .u64_counter("timefusion.wal.corruption_events")
-                .with_description("WAL entries that failed to deserialize or replay")
-                .build(),
-            flush_completed:            meter.u64_counter("timefusion.flush.completed").with_description("Flush cycles that committed to Delta").build(),
-            flush_failed:               meter.u64_counter("timefusion.flush.failed").with_description("Flush cycles that errored").build(),
-            query_executions:           meter.u64_counter("timefusion.query.executions").with_description("SQL query plans executed").build(),
-            tantivy_prefilter_attempts: meter
-                .u64_counter("timefusion.tantivy.prefilter_attempts")
-                .with_description("Queries where at least one text_match predicate triggered a tantivy lookup")
-                .build(),
-            tantivy_prefilter_used:     meter
-                .u64_counter("timefusion.tantivy.prefilter_used")
-                .with_description("Queries where the tantivy id-set prefilter was applied to the Delta scan")
-                .build(),
-            tantivy_prefilter_skipped:  meter
-                .u64_counter("timefusion.tantivy.prefilter_skipped")
-                .with_description("Queries where tantivy lookup was attempted but pushdown was skipped (no index, hit cap, or low selectivity)")
-                .build(),
-            tantivy_prefilter_errors:   meter
-                .u64_counter("timefusion.tantivy.prefilter_errors")
-                .with_description("Tantivy lookups that errored (S3 down, parse failure, etc.)")
-                .build(),
-            tantivy_build_failures:     meter
-                .u64_counter("timefusion.tantivy.build_failures")
-                .with_description("Post-flush tantivy index builds that errored — accumulating drift means queries silently fall back to UDF scan")
-                .build(),
-            dedup_dropped_rows:         meter
-                .u64_counter("timefusion.flush.dedup_dropped_rows")
-                .with_description("Rows collapsed by per-table dedup_keys (last-write-wins) before Delta commit")
-                .build(),
-        }
-    }
+counter_registry! {
+    ingest_inserts             => "timefusion.ingest.inserts": "Ingest insert calls accepted",
+    ingest_rows                => "timefusion.ingest.rows": "Rows accepted into MemBuffer",
+    ingest_errors              => "timefusion.ingest.errors": "Ingest call failures",
+    wal_corruption             => "timefusion.wal.corruption_events": "WAL entries that failed to deserialize or replay",
+    flush_completed            => "timefusion.flush.completed": "Flush cycles that committed to Delta",
+    flush_failed               => "timefusion.flush.failed": "Flush cycles that errored",
+    query_executions           => "timefusion.query.executions": "SQL query plans executed",
+    tantivy_prefilter_attempts => "timefusion.tantivy.prefilter_attempts": "Queries where at least one text_match predicate triggered a tantivy lookup",
+    tantivy_prefilter_used     => "timefusion.tantivy.prefilter_used": "Queries where the tantivy id-set prefilter was applied to the Delta scan",
+    tantivy_prefilter_skipped  => "timefusion.tantivy.prefilter_skipped": "Queries where tantivy lookup was attempted but pushdown was skipped (no index, hit cap, or low selectivity)",
+    tantivy_prefilter_errors   => "timefusion.tantivy.prefilter_errors": "Tantivy lookups that errored (S3 down, parse failure, etc.)",
+    tantivy_build_failures     => "timefusion.tantivy.build_failures": "Post-flush tantivy index builds that errored — accumulating drift means queries silently fall back to UDF scan",
+    dedup_dropped_rows         => "timefusion.flush.dedup_dropped_rows": "Rows collapsed by per-table dedup_keys (last-write-wins) before Delta commit",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -149,60 +127,43 @@ pub fn init_metrics(
         })
         .build();
 
-    let bl_for_pressure = buffered_layer.clone();
-    meter
-        .u64_observable_gauge("timefusion.mem_buffer.pressure_pct")
-        .with_description("MemBuffer memory pressure as percentage of max")
-        .with_callback(move |obs| {
-            if let Some(layer) = bl_for_pressure.upgrade() {
-                obs.observe(layer.snapshot_stats().pressure_pct as u64, &[]);
-            }
-        })
-        .build();
+    // Each simple gauge upgrades the Weak, snapshots stats, and observes one
+    // derived value. The macro captures that shape so each metric is a single
+    // line; gauges with conditional/Option logic (oldest bucket age, index lag)
+    // stay spelled out below.
+    macro_rules! layer_gauge {
+        ($id:literal, $desc:literal, |$s:ident| $value:expr) => {{
+            let weak = buffered_layer.clone();
+            meter
+                .u64_observable_gauge($id)
+                .with_description($desc)
+                .with_callback(move |obs| {
+                    if let Some(layer) = weak.upgrade() {
+                        let $s = layer.snapshot_stats();
+                        obs.observe($value, &[]);
+                    }
+                })
+                .build();
+        }};
+    }
 
-    let bl_for_bytes = buffered_layer.clone();
-    meter
-        .u64_observable_gauge("timefusion.mem_buffer.estimated_bytes")
-        .with_description("MemBuffer estimated heap residency in bytes")
-        .with_callback(move |obs| {
-            if let Some(layer) = bl_for_bytes.upgrade() {
-                obs.observe(layer.snapshot_stats().mem_estimated_bytes as u64, &[]);
-            }
-        })
-        .build();
-
-    let bl_for_rows = buffered_layer.clone();
-    meter
-        .u64_observable_gauge("timefusion.mem_buffer.rows")
-        .with_description("Total rows in MemBuffer across all projects/tables")
-        .with_callback(move |obs| {
-            if let Some(layer) = bl_for_rows.upgrade() {
-                obs.observe(layer.snapshot_stats().mem_total_rows as u64, &[]);
-            }
-        })
-        .build();
-
-    let bl_for_wal = buffered_layer.clone();
-    meter
-        .u64_observable_gauge("timefusion.wal.disk_bytes")
-        .with_description("Disk bytes occupied by WAL shards")
-        .with_callback(move |obs| {
-            if let Some(layer) = bl_for_wal.upgrade() {
-                obs.observe(layer.snapshot_stats().wal_disk_bytes, &[]);
-            }
-        })
-        .build();
-
-    let bl_for_wal_files = buffered_layer.clone();
-    meter
-        .u64_observable_gauge("timefusion.wal.files")
-        .with_description("Number of WAL segment files on disk")
-        .with_callback(move |obs| {
-            if let Some(layer) = bl_for_wal_files.upgrade() {
-                obs.observe(layer.snapshot_stats().wal_files as u64, &[]);
-            }
-        })
-        .build();
+    layer_gauge!(
+        "timefusion.mem_buffer.pressure_pct",
+        "MemBuffer memory pressure as percentage of max",
+        |s| s.pressure_pct as u64
+    );
+    layer_gauge!(
+        "timefusion.mem_buffer.estimated_bytes",
+        "MemBuffer estimated heap residency in bytes",
+        |s| s.mem_estimated_bytes as u64
+    );
+    layer_gauge!(
+        "timefusion.mem_buffer.rows",
+        "Total rows in MemBuffer across all projects/tables",
+        |s| s.mem_total_rows as u64
+    );
+    layer_gauge!("timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
+    layer_gauge!("timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
 
     // Index lag: how far behind ingest the newest published tantivy index is.
     // Computed as max(0, now - newest_max_timestamp). Surfaces the post-flush
@@ -275,12 +236,6 @@ pub fn record_ingest_error(project_id: &str, table_name: &str) {
     }
 }
 
-pub fn record_wal_corruption() {
-    if let Some(m) = METRICS.get() {
-        m.wal_corruption.add(1, &[]);
-    }
-}
-
 pub fn record_flush(success: bool) {
     if let Some(m) = METRICS.get() {
         if success {
@@ -291,40 +246,28 @@ pub fn record_flush(success: bool) {
     }
 }
 
-pub fn record_query() {
-    if let Some(m) = METRICS.get() {
-        m.query_executions.add(1, &[]);
-    }
+/// Generates the no-attribute "increment by one" recorders. Each no-ops if
+/// metrics weren't initialized.
+macro_rules! simple_recorders {
+    ($($fn_name:ident => $field:ident),+ $(,)?) => {
+        $(
+            pub fn $fn_name() {
+                if let Some(m) = METRICS.get() {
+                    m.$field.add(1, &[]);
+                }
+            }
+        )+
+    };
 }
 
-pub fn record_tantivy_prefilter_attempt() {
-    if let Some(m) = METRICS.get() {
-        m.tantivy_prefilter_attempts.add(1, &[]);
-    }
-}
-
-pub fn record_tantivy_prefilter_used() {
-    if let Some(m) = METRICS.get() {
-        m.tantivy_prefilter_used.add(1, &[]);
-    }
-}
-
-pub fn record_tantivy_prefilter_skipped() {
-    if let Some(m) = METRICS.get() {
-        m.tantivy_prefilter_skipped.add(1, &[]);
-    }
-}
-
-pub fn record_tantivy_prefilter_error() {
-    if let Some(m) = METRICS.get() {
-        m.tantivy_prefilter_errors.add(1, &[]);
-    }
-}
-
-pub fn record_tantivy_build_failure() {
-    if let Some(m) = METRICS.get() {
-        m.tantivy_build_failures.add(1, &[]);
-    }
+simple_recorders! {
+    record_wal_corruption => wal_corruption,
+    record_query => query_executions,
+    record_tantivy_prefilter_attempt => tantivy_prefilter_attempts,
+    record_tantivy_prefilter_used => tantivy_prefilter_used,
+    record_tantivy_prefilter_skipped => tantivy_prefilter_skipped,
+    record_tantivy_prefilter_error => tantivy_prefilter_errors,
+    record_tantivy_build_failure => tantivy_build_failures,
 }
 
 pub fn record_dedup_dropped(rows: u64) {

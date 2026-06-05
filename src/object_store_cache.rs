@@ -306,19 +306,30 @@ impl SharedFoyerCache {
 
     /// Invalidate checkpoint cache for a given table URI
     pub fn invalidate_checkpoint_cache(&self, table_uri: &str) {
-        // Extract table path from URI (remove s3:// or other prefixes)
-        let table_path = if let Some(idx) = table_uri.find("://") { &table_uri[idx + 3..] } else { table_uri };
-
-        // Remove any trailing slashes
-        let table_path = table_path.trim_end_matches('/');
-
+        let table_path = table_path_from_uri(table_uri);
         let last_checkpoint_key = format!("{}/_delta_log/_last_checkpoint", table_path);
         info!("Invalidating _last_checkpoint cache for table: {}", table_path);
         self.cache.remove(&last_checkpoint_key);
     }
 }
 
+/// Strip the `scheme://` prefix and trailing slashes from a table URI, yielding
+/// the bare table path used to build `_delta_log` cache keys.
+fn table_path_from_uri(table_uri: &str) -> &str {
+    let table_path = table_uri.find("://").map(|idx| &table_uri[idx + 3..]).unwrap_or(table_uri);
+    table_path.trim_end_matches('/')
+}
+
+/// Whether a cached object is a Parquet data file (vs. Delta log / checkpoint
+/// metadata), which governs TTL and metadata-cache behavior.
+fn is_parquet_file(location: &Path) -> bool {
+    location.as_ref().ends_with(".parquet")
+}
+
 /// Foyer-based hybrid cache implementation for object store
+#[derive(derive_more::Display, derive_more::Debug)]
+#[display("FoyerHybridCachedObjectStore({})", inner)]
+#[debug("FoyerHybridCachedObjectStore {{ inner: {} }}", inner)]
 pub struct FoyerObjectStoreCache {
     inner:            Arc<dyn ObjectStore>,
     cache:            FoyerCache,
@@ -356,12 +367,7 @@ impl FoyerObjectStoreCache {
 
     /// Explicitly invalidate checkpoint cache for a given table
     pub async fn invalidate_checkpoint_cache(&self, table_uri: &str) {
-        // Extract table path from URI (remove s3:// or other prefixes)
-        let table_path = if let Some(idx) = table_uri.find("://") { &table_uri[idx + 3..] } else { table_uri };
-
-        // Remove any trailing slashes
-        let table_path = table_path.trim_end_matches('/');
-
+        let table_path = table_path_from_uri(table_uri);
         let last_checkpoint_path = format!("{}/_delta_log/_last_checkpoint", table_path);
         let cache_key = last_checkpoint_path.clone();
         info!("Explicitly invalidating and refreshing _last_checkpoint cache for table: {}", table_path);
@@ -372,23 +378,9 @@ impl FoyerObjectStoreCache {
         // Immediately fetch and cache the new version
         let location = Path::from(last_checkpoint_path);
         if let Ok(get_result) = self.inner.get(&location).await {
-            use futures::TryStreamExt;
-            let data = match get_result.payload {
-                GetResultPayload::Stream(s) => {
-                    if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
-                        chunks.concat()
-                    } else {
-                        vec![]
-                    }
-                }
-                GetResultPayload::File(mut file, _) => {
-                    use std::io::Read;
-                    let mut buf = Vec::new();
-                    if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
-                }
-            };
+            let (data, meta) = Self::collect_payload(get_result).await;
             if !data.is_empty() {
-                self.cache.insert(cache_key, CacheValue::new(data, get_result.meta));
+                self.cache.insert(cache_key, CacheValue::new(data, meta));
                 debug!("Proactively refreshed _last_checkpoint cache after invalidation");
             }
         }
@@ -543,24 +535,9 @@ impl FoyerObjectStoreCache {
                         let handle = tokio::spawn(async move {
                             debug!("Background refresh for _last_checkpoint: {}", location);
                             if let Ok(result) = inner.get(&location).await {
-                                // Collect payload for caching
-                                use futures::TryStreamExt;
-                                let data = match result.payload {
-                                    GetResultPayload::Stream(s) => {
-                                        if let Ok(chunks) = s.try_collect::<Vec<Bytes>>().await {
-                                            chunks.concat()
-                                        } else {
-                                            vec![]
-                                        }
-                                    }
-                                    GetResultPayload::File(mut file, _) => {
-                                        use std::io::Read;
-                                        let mut buf = Vec::new();
-                                        if file.read_to_end(&mut buf).is_ok() { buf } else { vec![] }
-                                    }
-                                };
+                                let (data, meta) = FoyerObjectStoreCache::collect_payload(result).await;
                                 if !data.is_empty() {
-                                    cache.insert(key.clone(), CacheValue::new(data, result.meta));
+                                    cache.insert(key.clone(), CacheValue::new(data, meta));
                                 }
                             }
                             refreshing.remove(&key);
@@ -596,7 +573,7 @@ impl FoyerObjectStoreCache {
             } else {
                 self.update_stats(|s| s.hits += 1).await;
                 span.record("cache_hit", true);
-                let is_parquet = location.as_ref().ends_with(".parquet");
+                let is_parquet = is_parquet_file(location);
                 debug!(
                     "Foyer cache HIT for: {} (avoiding S3 access, parquet={}, TTL={}s, age={}ms, size={} bytes)",
                     location,
@@ -616,7 +593,7 @@ impl FoyerObjectStoreCache {
             s.inner_gets += 1;
         })
         .await;
-        let is_parquet = location.as_ref().ends_with(".parquet");
+        let is_parquet = is_parquet_file(location);
         let ttl = self.get_ttl_for_path(location);
         debug!(
             "Foyer cache MISS for: {} (fetching from S3, parquet={}, TTL={}s)",
@@ -668,14 +645,14 @@ impl FoyerObjectStoreCache {
             range.start = range.start,
             range.end = range.end,
             range.size = range.end - range.start,
-            is_parquet = location.as_ref().ends_with(".parquet"),
+            is_parquet = is_parquet_file(location),
             cache_hit = Empty,
             is_metadata = Empty,
         )
     )]
     async fn get_range_cached(&self, location: &Path, range: Range<u64>) -> ObjectStoreResult<Bytes> {
         let span = tracing::Span::current();
-        let is_parquet = location.as_ref().ends_with(".parquet");
+        let is_parquet = is_parquet_file(location);
 
         // First check if we have the full file cached
         let full_cache_key = Self::make_cache_key(location);
@@ -861,14 +838,6 @@ impl FoyerObjectStoreCache {
             cache_hit = Empty,
         )
     )]
-    #[instrument(
-        name = "foyer_cache.head",
-        skip_all,
-        fields(
-            location = %location,
-            cache_hit = Empty,
-        )
-    )]
     async fn head_cached(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
         let span = tracing::Span::current();
         let cache_key = Self::make_cache_key(location);
@@ -891,7 +860,7 @@ impl FoyerObjectStoreCache {
     async fn put_cached(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
         self.update_stats(|s| s.inner_puts += 1).await;
         let payload_size = payload.content_length();
-        let is_parquet = location.as_ref().ends_with(".parquet");
+        let is_parquet = is_parquet_file(location);
 
         debug!("S3 PUT request starting: {} (size: {} bytes, parquet: {})", location, payload_size, is_parquet);
         let start_time = std::time::Instant::now();
@@ -924,7 +893,7 @@ impl FoyerObjectStoreCache {
     /// Invalidate cache for delete/copy destination
     async fn invalidate_for_delete(&self, location: &Path) {
         self.cache.remove(&Self::make_cache_key(location));
-        if location.as_ref().ends_with(".parquet") {
+        if is_parquet_file(location) {
             self.invalidate_metadata_cache(location).await;
         }
     }
@@ -987,7 +956,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             .inspect(move |res| {
                 if let Ok(path) = res {
                     cache.remove(&path.to_string());
-                    if path.as_ref().ends_with(".parquet") {
+                    if is_parquet_file(path) {
                         // Best-effort: we can't enumerate metadata keys without head;
                         // remove the most common ones by reusing the same heuristic offsets.
                         let _ = &metadata_cache;
@@ -1013,18 +982,6 @@ impl ObjectStore for FoyerObjectStoreCache {
         self.inner.copy_opts(from, to, options).await?;
         self.invalidate_for_delete(to).await;
         Ok(())
-    }
-}
-
-impl std::fmt::Display for FoyerObjectStoreCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FoyerHybridCachedObjectStore({})", self.inner)
-    }
-}
-
-impl std::fmt::Debug for FoyerObjectStoreCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FoyerHybridCachedObjectStore {{ inner: {} }}", self.inner)
     }
 }
 

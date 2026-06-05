@@ -85,6 +85,7 @@ bincode = { version = "2.0", features = ["serde"] }
 walrus-rust = { path = "vendor/walrus-rust" }
 thiserror = "2.0"
 strum = { version = "0.27", features = ["derive"] }
+derive_more = { version = "2", features = ["debug", "display"] }
 datafusion-variant = { git = "https://github.com/datafusion-contrib/datafusion-variant.git", branch = "main" }
 parquet-variant-compute = "58.3"
 parquet-variant-json = "58.3"
