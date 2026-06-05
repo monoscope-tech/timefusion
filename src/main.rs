@@ -46,6 +46,23 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Create Arc<AppConfig> for passing to components
     let cfg_arc = Arc::new(cfg.clone());
 
+    // Bind :5432 immediately, before the slow startup work (Database open,
+    // WAL recovery — up to ~15 min when WAL has accumulated). Clients
+    // connecting in this window get SQLSTATE 57P03 ("starting up") from
+    // the early-bind responder instead of ECONNREFUSED, which is what
+    // Hasql / pgjdbc / libpq expect during a backend restart and retry
+    // on cleanly. See pgwire_early_bind for the responder.
+    let pg_opts = ServerOptions::new().with_host("0.0.0.0".to_string()).with_port(cfg.core.pgwire_port);
+    let pg_listener = datafusion_postgres::bind_listener(pg_opts.host(), *pg_opts.port(), *pg_opts.backlog()).await?;
+    let early_shutdown = tokio_util::sync::CancellationToken::new();
+    let early_task = tokio::spawn({
+        let shutdown = early_shutdown.clone();
+        async move {
+            timefusion::pgwire_early_bind::run_until_ready(&pg_listener, shutdown).await;
+            pg_listener
+        }
+    });
+
     // Initialize database with explicit config
     let mut db = Database::with_config(Arc::clone(&cfg_arc)).await?;
     info!("Database initialized successfully");
@@ -157,9 +174,18 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let db = Arc::new(db);
     db.setup_session_tables(&mut session_context)?;
 
-    // Start PGWire server
-    let pg_port = cfg.core.pgwire_port;
-    info!("Starting PGWire server on port: {}", pg_port);
+    // Start PGWire server on the listener we pre-bound at the top of
+    // async_main. First, hand control of that listener back from the
+    // early-bind 57P03 responder.
+    //
+    // Ownership handoff: the listener was moved into early_task and is
+    // returned as its final value, so `early_task.await?` hands back the
+    // owned TcpListener — no Arc, no rebind, no ECONNREFUSED window.
+    // handle_one tasks accepted just before shutdown may still be running;
+    // they own only the accepted sockets and complete independently.
+    info!("startup complete, transferring :5432 from early-bind 57P03 responder to real PGWire server");
+    early_shutdown.cancel();
+    let listener = early_task.await?;
 
     let auth_config = timefusion::pgwire_handlers::AuthConfig::from_core(&cfg.core)?;
 
@@ -168,16 +194,14 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // BufferedWriteLayer flush isn't racing fresh inserts. Already-accepted
     // connections finish on their own spawned tasks.
     let pgwire_shutdown = tokio_util::sync::CancellationToken::new();
-    let pgwire_shutdown_for_task = pgwire_shutdown.clone();
-    let pg_task = tokio::spawn(async move {
-        let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string());
-
-        if let Err(e) = timefusion::pgwire_handlers::serve_with_logging(Arc::new(session_context), &opts, auth_config, async move {
-            pgwire_shutdown_for_task.cancelled().await
-        })
-        .await
-        {
-            error!("PGWire server error: {}", e);
+    let pg_task = tokio::spawn({
+        let shutdown = pgwire_shutdown.clone();
+        async move {
+            if let Err(e) =
+                timefusion::pgwire_handlers::serve_with_listener(listener, Arc::new(session_context), &pg_opts, auth_config, shutdown.cancelled_owned()).await
+            {
+                error!("PGWire server error: {}", e);
+            }
         }
     });
 

@@ -10,7 +10,10 @@
 
 use std::io;
 
-use super::Walrus;
+use super::{
+    Walrus,
+    allocator::{BlockStateTracker, FileStateTracker},
+};
 
 const TAIL_FLAG: u64 = 1u64 << 63;
 
@@ -154,8 +157,60 @@ impl Walrus {
         }
         drop(idx_guard);
 
+        // Mark every sealed block strictly before `pos` as checkpointed. The
+        // normal advance path (`read_next`) does this lazily as the cursor
+        // walks past each block; a Delta-derived fast-forward (TimeFusion's
+        // `derive_wal_cursor_for_table`) bypasses `read_next` entirely, so
+        // without this loop the skipped-over blocks stay uncheckpointed
+        // forever and their containing files never become eligible for
+        // deletion (`flush_check` requires `checkpointed >= total`).
+        //
+        // We checkpoint a block when its id is strictly less than the target
+        // block_id, OR equal-id with the cursor having consumed past the
+        // block's `used` bytes (the same condition `read_next` uses).
+        self.checkpoint_blocks_before(col_name, pos);
+
         self.invalidate_hydration(col_name);
         Ok(())
+    }
+
+    /// Test/diagnostic accessor: per-block file accounting for the file
+    /// owning `block_id`. Returns `(checkpointed, total)` block counts on
+    /// that file — file becomes eligible for deletion when
+    /// `checkpointed >= total` (and unlocked, fully allocated). Useful for
+    /// regression tests covering the cursor fast-forward → file-reclaim
+    /// path; not part of normal runtime use.
+    // test-only: kept `pub` so cross-crate regression tests in tests/position.rs
+    // can probe file-level checkpoint counts after fast-forward.
+    #[doc(hidden)]
+    pub fn block_file_checkpoint_state(block_id: u64) -> Option<(u16, u16)> {
+        let path = BlockStateTracker::get_file_path_for_block(block_id as usize)?;
+        FileStateTracker::get_state_snapshot(&path).map(|(_l, c, t, _f)| (c, t))
+    }
+
+    fn checkpoint_blocks_before(&self, col_name: &str, pos: WalPosition) {
+        // Lock sequence: (1) reader.data read → clone info_arc → drop,
+        // (2) info_arc read held while iterating chain,
+        // (3) per-block: BlockStateTracker::map read inside set_checkpointed_true,
+        //     then a channel send via flush_check. All three are distinct locks
+        //     so the nested acquisition order is fixed → no deadlock potential.
+        let Ok(map) = self.reader.data.read() else { return };
+        let Some(info_arc) = map.get(col_name).cloned() else { return };
+        drop(map);
+        let Ok(info) = info_arc.read() else { return };
+        for block in info.chain.iter() {
+            // Matches read_next's "past block" predicate. If pos lands exactly
+            // at the active head (block.id == pos.block_id, pos.offset == used)
+            // the block is sealed as far as the cursor is concerned — the
+            // writer can still append, but those future bytes belong to the
+            // *next* logical chunk for this reader. A concurrent append only
+            // grows `block.used`; it never invalidates an already-observed
+            // (id, used) tuple, so no race with appends.
+            let past_block = block.id < pos.block_id || (block.id == pos.block_id && pos.offset >= block.used);
+            if past_block {
+                BlockStateTracker::set_checkpointed_true(block.id as usize);
+            }
+        }
     }
 
     fn find_chain_position(&self, col_name: &str, pos: WalPosition) -> Option<(u64, u64)> {
