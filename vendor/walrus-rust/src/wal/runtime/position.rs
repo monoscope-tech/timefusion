@@ -189,11 +189,23 @@ impl Walrus {
     }
 
     fn checkpoint_blocks_before(&self, col_name: &str, pos: WalPosition) {
+        // Lock sequence: (1) reader.data read → clone info_arc → drop,
+        // (2) info_arc read held while iterating chain,
+        // (3) per-block: BlockStateTracker::map read inside set_checkpointed_true,
+        //     then a channel send via flush_check. All three are distinct locks
+        //     so the nested acquisition order is fixed → no deadlock potential.
         let Ok(map) = self.reader.data.read() else { return };
         let Some(info_arc) = map.get(col_name).cloned() else { return };
         drop(map);
         let Ok(info) = info_arc.read() else { return };
         for block in info.chain.iter() {
+            // Matches read_next's "past block" predicate. If pos lands exactly
+            // at the active head (block.id == pos.block_id, pos.offset == used)
+            // the block is sealed as far as the cursor is concerned — the
+            // writer can still append, but those future bytes belong to the
+            // *next* logical chunk for this reader. A concurrent append only
+            // grows `block.used`; it never invalidates an already-observed
+            // (id, used) tuple, so no race with appends.
             let past_block = block.id < pos.block_id || (block.id == pos.block_id && pos.offset >= block.used);
             if past_block {
                 BlockStateTracker::set_checkpointed_true(block.id as usize);

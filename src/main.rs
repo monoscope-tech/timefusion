@@ -177,8 +177,13 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Start PGWire server on the listener we pre-bound at the top of
     // async_main. First, hand control of that listener back from the
     // early-bind 57P03 responder.
+    //
+    // Ownership handoff: the listener was moved into early_task and is
+    // returned as its final value, so `early_task.await?` hands back the
+    // owned TcpListener — no Arc, no rebind, no ECONNREFUSED window.
     // handle_one tasks accepted just before shutdown may still be running;
     // they own only the accepted sockets and complete independently.
+    info!("startup complete, transferring :5432 from early-bind 57P03 responder to real PGWire server");
     early_shutdown.cancel();
     let listener = early_task.await?;
 

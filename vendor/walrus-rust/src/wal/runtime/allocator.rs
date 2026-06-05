@@ -232,7 +232,9 @@ impl BlockStateTracker {
             // Deliberate: call flush_check even when no transition happened.
             // It acts as a retry for files whose previous checkpoint observation
             // raced `set_fully_allocated` and didn't reclaim — replays of the
-            // same block_id can still close out the file.
+            // same block_id can still close out the file. Tradeoff: a slightly
+            // hotter DELETION_TX channel (one extra send per duplicate call)
+            // in exchange for correctness against racing observers.
             flush_check(path);
         }
     }

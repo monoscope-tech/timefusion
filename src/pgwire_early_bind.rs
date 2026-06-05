@@ -258,12 +258,20 @@ mod tests {
         // First connection holds the only permit — never sends startup, so it
         // sits inside handle_one's read awaiting bytes.
         let _holder = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Second connection hits the cap; should receive 57P03 inline.
-        let mut cap_client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        // Server writes the canned frame without waiting for a startup message.
-        tokio::time::timeout(Duration::from_secs(2), assert_57p03(&mut cap_client)).await.unwrap();
+        // Poll for cap behaviour rather than sleeping a fixed amount: open
+        // probes until one comes back with the canned 57P03 frame, confirming
+        // the holder has the permit and the cap fast-path is firing.
+        // Robust on loaded CI runners.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut probe = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            if tokio::time::timeout(Duration::from_millis(200), assert_57p03(&mut probe)).await.is_ok() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "cap fast-path never observed");
+            tokio::task::yield_now().await;
+        }
 
         shutdown.cancel();
         let _ = task.await;

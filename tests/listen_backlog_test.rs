@@ -108,6 +108,11 @@ async fn listen_backlog_overflows_at_128_when_accept_stalls() {
     //    fails, either the OS isn't enforcing the backlog (unlikely) or the
     //    fix has landed (raise the burst, or delete this test as obsolete).
     let failed = refused + timed_out;
+    // Strict assertion is Linux-only: some kernels (e.g. macOS dev hosts)
+    // silently queue beyond the requested backlog, which would produce
+    // spurious failures here. The eprintln! below still surfaces the
+    // observed counts on every platform.
+    #[cfg(target_os = "linux")]
     assert!(
         failed > 0,
         "expected backlog overflow to refuse/timeout some of {BURST} connects, \

@@ -144,6 +144,10 @@ pub async fn bind_listener(host: &str, port: u16, backlog: u32) -> Result<TcpLis
             .ok_or_else(|| IOError::new(ErrorKind::InvalidInput, format!("could not resolve {server_addr}")))?,
     };
     let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    // SO_REUSEADDR on Linux/macOS only governs TIME_WAIT reuse. On Windows it
+    // additionally allows another process to steal the port — so skip it
+    // there to keep the dev experience safe.
+    #[cfg(not(windows))]
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     let listener = socket.listen(backlog)?;
@@ -178,9 +182,10 @@ pub async fn serve_with_listener(
         None
     };
 
-    // Note: opts.backlog reflects the options object, not necessarily the
-    // listening socket — callers passing a pre-bound listener may have set a
-    // different backlog at bind time.
+    // Note: opts.host / opts.port / opts.backlog reflect the options object,
+    // not necessarily the listening socket — callers passing a pre-bound
+    // listener may have used different values at bind time. Only TLS config
+    // and connection-limit fields from opts affect behaviour from here on.
     let local_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".to_string());
     let tls_label = if tls_acceptor.is_some() { "TLS" } else { "unencrypted" };
     info!("Listening on {local_addr} ({tls_label})");
