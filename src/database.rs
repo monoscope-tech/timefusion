@@ -55,6 +55,17 @@ pub async fn get_custom_delta_table(custom_tables: &CustomProjectTables, project
     custom_tables.read().await.get(&(project_id.to_string(), table_name.to_string())).cloned()
 }
 
+/// Human-readable label for a table in maintenance logs. Unified tables (empty
+/// `project_id`) render as `unified table 'X'`; isolated project tables render
+/// as `custom project 'P' table 'X'`.
+fn table_label(project_id: &str, table_name: &str) -> String {
+    if project_id.is_empty() {
+        format!("unified table '{table_name}'")
+    } else {
+        format!("custom project '{project_id}' table '{table_name}'")
+    }
+}
+
 /// Get a Delta table from unified tables by table_name
 pub async fn get_unified_delta_table(unified_tables: &UnifiedTables, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
     unified_tables.read().await.get(table_name).cloned()
@@ -811,9 +822,39 @@ impl Database {
         Ok(self)
     }
 
+    /// Register an async cron job on `scheduler`, hiding the
+    /// `move |_,_| { let db = db.clone(); Box::pin(async move { .. }) }` plumbing
+    /// that every maintenance job would otherwise repeat. The closure receives a
+    /// fresh `Arc<Self>` handle per run.
+    async fn add_async_job<F, Fut>(scheduler: &tokio_cron_scheduler::JobScheduler, schedule: &str, db: &Arc<Self>, f: F) -> Result<()>
+    where
+        F: Fn(Arc<Self>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let f = Arc::new(f);
+        let db = db.clone();
+        let job = tokio_cron_scheduler::Job::new_async(schedule, move |_, _| {
+            let db = db.clone();
+            let f = f.clone();
+            Box::pin(async move { f(db).await })
+        })?;
+        scheduler.add(job).await?;
+        Ok(())
+    }
+
+    /// Snapshot of every table (unified + custom) as `(project_id, table_name, table)`.
+    /// `project_id` is empty for unified tables. Clones the `Arc` handles and releases
+    /// the map locks before returning, so callers don't hold them across long per-table work.
+    async fn all_tables(&self) -> Vec<(String, String, Arc<RwLock<DeltaTable>>)> {
+        let mut out: Vec<(String, String, Arc<RwLock<DeltaTable>>)> =
+            self.unified_tables.read().await.iter().map(|(name, t)| (String::new(), name.clone(), t.clone())).collect();
+        out.extend(self.custom_project_tables.read().await.iter().map(|((pid, name), t)| (pid.clone(), name.clone(), t.clone())));
+        out
+    }
+
     /// Start background maintenance schedulers for optimize and vacuum operations
     pub async fn start_maintenance_schedulers(self) -> Result<Self> {
-        use tokio_cron_scheduler::{Job, JobScheduler};
+        use tokio_cron_scheduler::JobScheduler;
 
         let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
@@ -824,31 +865,17 @@ impl Database {
         if !light_optimize_schedule.is_empty() {
             info!("Light optimize job scheduled with cron expression: {}", light_optimize_schedule);
 
-            let light_optimize_job = Job::new_async(light_optimize_schedule, {
-                let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move {
-                        info!("Running scheduled light optimize on recent small files");
-                        // Optimize unified tables
-                        for (table_name, table) in db.unified_tables.read().await.iter() {
-                            match db.optimize_table_light(table, table_name).await {
-                                Ok(_) => info!("Light optimize completed for unified table '{}'", table_name),
-                                Err(e) => error!("Light optimize failed for unified table '{}': {}", table_name, e),
-                            }
-                        }
-                        // Optimize custom project tables
-                        for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                            match db.optimize_table_light(table, table_name).await {
-                                Ok(_) => info!("Light optimize completed for custom project '{}' table '{}'", project_id, table_name),
-                                Err(e) => error!("Light optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e),
-                            }
-                        }
-                    })
+            Self::add_async_job(&scheduler, light_optimize_schedule, &db, |db| async move {
+                info!("Running scheduled light optimize on recent small files");
+                for (project_id, table_name, table) in db.all_tables().await {
+                    let label = table_label(&project_id, &table_name);
+                    match db.optimize_table_light(&table, &table_name).await {
+                        Ok(_) => info!("Light optimize completed for {label}"),
+                        Err(e) => error!("Light optimize failed for {label}: {e}"),
+                    }
                 }
-            })?;
-
-            scheduler.add(light_optimize_job).await?;
+            })
+            .await?;
         } else {
             info!("Light optimize job scheduling skipped - empty schedule");
         }
@@ -862,29 +889,15 @@ impl Database {
                 optimize_schedule
             );
 
-            let optimize_job = Job::new_async(optimize_schedule, {
-                let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move {
-                        info!("Running scheduled optimize on all tables");
-                        // Optimize unified tables
-                        for (table_name, table) in db.unified_tables.read().await.iter() {
-                            if let Err(e) = db.optimize_table(table, table_name, None).await {
-                                error!("Optimize failed for unified table '{}': {}", table_name, e);
-                            }
-                        }
-                        // Optimize custom project tables
-                        for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                            if let Err(e) = db.optimize_table(table, table_name, None).await {
-                                error!("Optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e);
-                            }
-                        }
-                    })
+            Self::add_async_job(&scheduler, optimize_schedule, &db, |db| async move {
+                info!("Running scheduled optimize on all tables");
+                for (project_id, table_name, table) in db.all_tables().await {
+                    if let Err(e) = db.optimize_table(&table, &table_name, None).await {
+                        error!("Optimize failed for {}: {}", table_label(&project_id, &table_name), e);
+                    }
                 }
-            })?;
-
-            scheduler.add(optimize_job).await?;
+            })
+            .await?;
         } else {
             info!("Optimize job scheduling skipped - empty schedule");
         }
@@ -907,30 +920,20 @@ impl Database {
             // vacuum; we don't need to keep extending the window indefinitely.
             let cold_upper = (self.config.maintenance.timefusion_vacuum_retention_hours / 24).max(cold_cutoff + 60);
 
-            let recompress_job = Job::new_async(recompress_schedule.as_str(), {
-                let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move {
-                        info!("Running scheduled tier recompression");
-                        // Flatten unified + custom tables into one (name, table) list.
-                        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
-                            db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
-                        targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
-                        // Cool tier first, then cold — order matters only at
-                        // the cutoff boundary where files may need two hops.
-                        for (name, table) in &targets {
-                            if let Err(e) = db.recompress_tier_window(table, name, cool_cutoff, cold_cutoff, zstd_cool).await {
-                                error!("Recompress (cool tier) failed for '{}': {}", name, e);
-                            }
-                            if let Err(e) = db.recompress_tier_window(table, name, cold_cutoff, cold_upper, zstd_cold).await {
-                                error!("Recompress (cold tier) failed for '{}': {}", name, e);
-                            }
-                        }
-                    })
+            Self::add_async_job(&scheduler, recompress_schedule.as_str(), &db, move |db| async move {
+                info!("Running scheduled tier recompression");
+                // Cool tier first, then cold — order matters only at the cutoff
+                // boundary where files may need two hops.
+                for (_project_id, name, table) in db.all_tables().await {
+                    if let Err(e) = db.recompress_tier_window(&table, &name, cool_cutoff, cold_cutoff, zstd_cool).await {
+                        error!("Recompress (cool tier) failed for '{}': {}", name, e);
+                    }
+                    if let Err(e) = db.recompress_tier_window(&table, &name, cold_cutoff, cold_upper, zstd_cold).await {
+                        error!("Recompress (cold tier) failed for '{}': {}", name, e);
+                    }
                 }
-            })?;
-            scheduler.add(recompress_job).await?;
+            })
+            .await?;
         } else {
             info!("Recompress job scheduling skipped - empty schedule");
         }
@@ -942,95 +945,51 @@ impl Database {
         if !vacuum_schedule.is_empty() {
             info!("Vacuum job scheduled with cron expression: {}", vacuum_schedule);
 
-            let vacuum_job = Job::new_async(vacuum_schedule.as_str(), {
-                let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move {
-                        info!("Running scheduled vacuum on all tables");
-                        let retention_hours = vacuum_retention;
-
-                        // Vacuum unified tables
-                        for (table_name, table) in db.unified_tables.read().await.iter() {
-                            info!("Vacuuming unified table '{}' (retention: {}h)", table_name, retention_hours);
-                            db.vacuum_table(table, retention_hours).await;
-                        }
-                        // Vacuum custom project tables
-                        for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                            info!(
-                                "Vacuuming custom project '{}' table '{}' (retention: {}h)",
-                                project_id, table_name, retention_hours
-                            );
-                            db.vacuum_table(table, retention_hours).await;
-                        }
-                    })
+            Self::add_async_job(&scheduler, vacuum_schedule.as_str(), &db, move |db| async move {
+                info!("Running scheduled vacuum on all tables");
+                let retention_hours = vacuum_retention;
+                for (project_id, table_name, table) in db.all_tables().await {
+                    info!("Vacuuming {} (retention: {}h)", table_label(&project_id, &table_name), retention_hours);
+                    db.vacuum_table(&table, retention_hours).await;
                 }
-            })?;
-
-            scheduler.add(vacuum_job).await?;
+            })
+            .await?;
         } else {
             info!("Vacuum job scheduling skipped - empty schedule");
         }
 
         // Cache stats job - every 5 minutes
-        let cache_stats_job = Job::new_async("0 */5 * * * *", {
-            let db = db.clone();
-            move |_, _| {
-                let db = db.clone();
-                Box::pin(async move {
-                    // Log Foyer cache stats if available
-                    if let Some(ref cache) = db.object_store_cache {
-                        cache.log_stats().await;
-                    }
-
-                    // Log statistics cache stats
-                    let (used, capacity) = db.statistics_extractor.get_cache_stats().await;
-                    info!("Statistics cache: {}/{} entries used", used, capacity);
-                })
+        Self::add_async_job(&scheduler, "0 */5 * * * *", &db, |db| async move {
+            // Log Foyer cache stats if available
+            if let Some(ref cache) = db.object_store_cache {
+                cache.log_stats().await;
             }
-        })?;
 
-        scheduler.add(cache_stats_job).await?;
+            // Log statistics cache stats
+            let (used, capacity) = db.statistics_extractor.get_cache_stats().await;
+            info!("Statistics cache: {}/{} entries used", used, capacity);
+        })
+        .await?;
 
         // Statistics refresh job - every 15 minutes
-        let stats_refresh_job = Job::new_async("0 */15 * * * *", {
-            let db = db.clone();
-            move |_, _| {
-                let db = db.clone();
-                Box::pin(async move {
-                    info!("Refreshing Delta Lake statistics cache");
-                    db.statistics_extractor.clear_cache().await;
+        Self::add_async_job(&scheduler, "0 */15 * * * *", &db, |db| async move {
+            info!("Refreshing Delta Lake statistics cache");
+            db.statistics_extractor.clear_cache().await;
 
-                    // Pre-warm cache for unified tables
-                    for (table_name, table) in db.unified_tables.read().await.iter() {
-                        let table = table.read().await;
-                        let current_version = table.version().unwrap_or(0);
-                        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
-                        let schema = schema_def.schema_ref();
-                        // Use empty string for project_id since unified tables are shared
-                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, "", table_name, &schema).await {
-                            error!("Failed to refresh statistics for unified table '{}': {}", table_name, e);
-                        } else {
-                            debug!("Refreshed statistics for unified table '{}' (version {})", table_name, current_version);
-                        }
-                    }
-                    // Pre-warm cache for custom project tables
-                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                        let table = table.read().await;
-                        let current_version = table.version().unwrap_or(0);
-                        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
-                        let schema = schema_def.schema_ref();
-                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, project_id, table_name, &schema).await {
-                            error!("Failed to refresh statistics for {}:{}: {}", project_id, table_name, e);
-                        } else {
-                            debug!("Refreshed statistics for {}:{} (version {})", project_id, table_name, current_version);
-                        }
-                    }
-                })
+            for (project_id, table_name, table) in db.all_tables().await {
+                let label = table_label(&project_id, &table_name);
+                let table = table.read().await;
+                let current_version = table.version().unwrap_or(0);
+                let schema_def = get_schema(&table_name).unwrap_or_else(get_default_schema);
+                let schema = schema_def.schema_ref();
+                if let Err(e) = db.statistics_extractor.extract_statistics(&table, &project_id, &table_name, &schema).await {
+                    error!("Failed to refresh statistics for {label}: {e}");
+                } else {
+                    debug!("Refreshed statistics for {label} (version {current_version})");
+                }
             }
-        })?;
-
-        scheduler.add(stats_refresh_job).await?;
+        })
+        .await?;
 
         // Start the scheduler
         scheduler.start().await?;
