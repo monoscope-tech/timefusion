@@ -784,6 +784,17 @@ impl WalManager {
         for (topic, snapshot_positions) in &snap.entries {
             let Some((project_id, table_name)) = Self::parse_topic(topic) else { continue };
             if snapshot_positions.len() != self.shards_per_topic {
+                // load_cursor_snapshot already rejects whole-file mismatches;
+                // hitting this means a per-entry corruption. Surface it so a
+                // future "why didn't this table restore?" investigation has
+                // a thread to pull on.
+                warn!(
+                    "cursor snapshot entry for {}/{} has {} shards but topic has {} — skipping",
+                    project_id,
+                    table_name,
+                    snapshot_positions.len(),
+                    self.shards_per_topic
+                );
                 continue;
             }
             // Seed `known_topics` so a later list_topic_pairs() includes a
@@ -1025,11 +1036,9 @@ mod tests {
     /// Scope note: this exercises the *idempotent* path — walrus's own fsync
     /// already persisted shard 0's advance to disk in Process A, so when
     /// Process B opens the same dir, restore finds nothing to advance and
-    /// returns 0 tables. The scenario the snapshot actually *rescues* is a
-    /// hard kill where walrus's in-memory cursor moved but its fsync hadn't
-    /// landed — hard to simulate here without injecting into walrus's
-    /// internal state, so it's covered by the prod canary in the plan
-    /// instead.
+    /// returns 0 tables. The rescue path (snapshot is ahead of walrus's
+    /// own fsynced state) is covered by
+    /// [`cursor_snapshot_restore_advances_walrus_past_local_state`].
     #[test]
     fn cursor_snapshot_roundtrip_restores_persisted_positions() {
         let dir = tempfile::tempdir().unwrap();
@@ -1115,11 +1124,20 @@ mod tests {
         let path = dir.path().to_path_buf();
         let wal = WalManager::with_fsync_mode_and_shards(path, crate::config::WalFsyncMode::SyncEach, 4).unwrap();
 
-        // Walrus knows nothing about ("p", "t") yet → all shards None.
-        assert!(wal.persisted_read_positions("p", "t").unwrap().iter().all(Option::is_none));
+        // Walrus uses a process-global `WALRUS_DATA_DIR` so other tests may
+        // have seeded state for shared collection keys. Use a per-test
+        // unique topic name so the hashed walrus key is guaranteed fresh.
+        let table = format!(
+            "rescue_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        );
+        let project = "p";
+
+        let before = wal.persisted_read_positions(project, &table).unwrap();
+        assert!(before.iter().all(Option::is_none), "fresh walrus key must have no persisted cursor");
 
         let mut entries = std::collections::BTreeMap::new();
-        entries.insert(WalManager::make_topic("p", "t"), vec![Some((7u64, 42u64)), None, Some((3, 0)), None]);
+        entries.insert(WalManager::make_topic(project, &table), vec![Some((7u64, 42u64)), None, Some((3, 0)), None]);
         let snap = CursorSnapshot {
             version: SNAPSHOT_VERSION,
             written_at_micros: 0,
@@ -1130,7 +1148,7 @@ mod tests {
         let tables_advanced = wal.restore_cursor_snapshot(&snap).unwrap();
         assert_eq!(tables_advanced, 1, "the one snapshot table must advance from origin");
 
-        let after = wal.persisted_read_positions("p", "t").unwrap();
+        let after = wal.persisted_read_positions(project, &table).unwrap();
         assert_eq!(after[0].map(|p| (p.block_id, p.offset)), Some((7, 42)));
         assert_eq!(after[2].map(|p| (p.block_id, p.offset)), Some((3, 0)));
     }
@@ -1149,6 +1167,32 @@ mod tests {
         assert!(tmp.exists());
         drop(WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap());
         assert!(!tmp.exists(), "init must sweep leftover tmp file");
+    }
+
+    /// Simulates the BufferedWriteLayer write_post_flush_snapshot recovery
+    /// path: if `write_cursor_snapshot` fails after a previous good write,
+    /// the caller must remove the now-stale file so the next boot's shallow
+    /// verifier doesn't trust it. Failure is forced by putting a directory
+    /// in the spot the atomic-rename tmp would occupy — `fs::write` to a
+    /// directory path errors, so the rename never happens.
+    #[test]
+    fn write_cursor_snapshot_failure_leaves_stale_file_to_be_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        wal.write_cursor_snapshot(true).unwrap();
+        let target = path.join(".timefusion_meta/cursor_snapshot.json");
+        let tmp = path.join(".timefusion_meta/cursor_snapshot.json.tmp");
+        assert!(target.exists());
+
+        // Force the next write to fail by squatting on the tmp path with a dir.
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(wal.write_cursor_snapshot(false).is_err(), "tmp-path collision must fail the write");
+        assert!(target.exists(), "stale snapshot still on disk after failed write");
+
+        // BufferedWriteLayer's recovery: delete the stale file.
+        wal.delete_cursor_snapshot().unwrap();
+        assert!(!target.exists(), "delete clears the stale snapshot");
     }
 
     /// `delete_cursor_snapshot` removes a present file and is a no-op when

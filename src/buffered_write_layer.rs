@@ -759,6 +759,13 @@ impl BufferedWriteLayer {
     /// would let the (shallow) boot verifier skip commits made since the
     /// last successful write. Removing it forces a fresh Delta scan, which
     /// is correct-but-slow rather than fast-but-wrong.
+    ///
+    /// Callers: `flush_completed_buckets` (guards on `any_ok`) and
+    /// `flush_all_now` (guards on `stats.buckets_flushed > 0`). Shutdown's
+    /// per-bucket loop deliberately does NOT call this — the trailing
+    /// `write_cursor_snapshot(true)` in `shutdown()` writes the
+    /// definitive `clean_shutdown=true` snapshot and supersedes any
+    /// dirty one we'd write here.
     fn write_post_flush_snapshot(&self) {
         if let Err(e) = self.wal.write_cursor_snapshot(false) {
             debug!("write_cursor_snapshot (post-flush) failed: {}", e);
