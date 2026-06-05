@@ -92,6 +92,11 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 let post = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
                 let pre_set: std::collections::HashSet<String> = pre.into_iter().collect();
                 let added: Vec<String> = post.into_iter().filter(|u| !pre_set.contains(u)).collect();
+                // Warm the just-flushed files into the cache so the first
+                // dashboard read of this partition hits Foyer, not S3.
+                // Best-effort and non-blocking; clone since `added` is also
+                // returned for the sidecar tantivy indexer.
+                db.warm_cache_for_table(&project_id, &table_name, added.clone()).await;
                 Ok(added)
             })
         },

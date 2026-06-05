@@ -174,6 +174,8 @@ const_default!(d_light_optimize_target: i64 = 16 * 1024 * 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 const_default!(d_vacuum_schedule: String = "0 0 2 * * *");
+const_default!(d_warm_recency_days: u64 = 2);
+const_default!(d_warm_concurrency: usize = 4);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
@@ -553,6 +555,26 @@ pub struct MaintenanceConfig {
     pub timefusion_vacuum_schedule:            String,
     #[serde(default = "d_recompress_schedule")]
     pub timefusion_recompress_schedule:        String,
+    /// Proactively warm the Foyer cache for files written by a flush/optimize
+    /// commit, so recent partitions dashboards read don't cold-start after
+    /// every compaction. Footers are always warmed when enabled.
+    #[serde(default = "d_true")]
+    pub timefusion_warm_after_compaction:      bool,
+    /// In addition to footers, warm the full file contents into the main
+    /// (full-file) cache. Off by default — footers carry most of the
+    /// planning-latency win at a fraction of the bytes; enable for data-read
+    /// warmth on the hottest partitions.
+    #[serde(default)]
+    pub timefusion_warm_full_files:            bool,
+    /// Only warm files whose `date=` partition is within this many days of
+    /// today. Bounds warming to the partitions dashboards actually query.
+    /// 0 = no recency limit.
+    #[serde(default = "d_warm_recency_days")]
+    pub timefusion_warm_recency_days:          u64,
+    /// Max concurrent warm fetches per commit. Bounds the S3 GET burst a
+    /// warm job adds right after a compaction.
+    #[serde(default = "d_warm_concurrency")]
+    pub timefusion_warm_concurrency:           usize,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.
@@ -633,6 +655,10 @@ mod tests {
         assert_eq!(config.core.pgwire_port, 5432);
         assert_eq!(config.buffer.timefusion_flush_interval_secs, 600);
         assert_eq!(config.cache.timefusion_foyer_memory_mb, 512);
+        assert!(config.maintenance.timefusion_warm_after_compaction);
+        assert!(!config.maintenance.timefusion_warm_full_files);
+        assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);
+        assert_eq!(config.maintenance.timefusion_warm_concurrency, 4);
     }
 
     #[test]

@@ -326,6 +326,40 @@ fn is_parquet_file(location: &Path) -> bool {
     location.as_ref().ends_with(".parquet")
 }
 
+/// Best-effort: warm the Parquet footer of `location` into the cache by issuing
+/// a ranged GET of the last `metadata_size_hint` bytes through `store`. When
+/// `store` is a [`FoyerObjectStoreCache`], that ranged GET lands in the
+/// metadata cache, so subsequent query planning (footer parse, row-group
+/// stats, schema, pruning) pays zero S3 round-trips. The single `head` resolves
+/// the file size needed to address the tail.
+///
+/// Strictly best-effort: every error is swallowed and reported via the return
+/// value. Warming must never affect correctness or a caller's commit. Returns
+/// `true` if the footer range was fetched.
+pub async fn warm_footer(store: &dyn ObjectStore, location: &Path, metadata_size_hint: u64) -> bool {
+    let size = match store.head(location).await {
+        Ok(meta) => meta.size,
+        Err(_) => return false,
+    };
+    if size == 0 {
+        return false;
+    }
+    let start = size.saturating_sub(metadata_size_hint.max(1));
+    let opts = GetOptions {
+        range: Some(GetRange::Bounded(start..size)),
+        ..Default::default()
+    };
+    store.get_opts(location, opts).await.is_ok()
+}
+
+/// Best-effort: warm the full contents of `location` into the cache via a plain
+/// GET through `store`. For a [`FoyerObjectStoreCache`] this populates the main
+/// (full-file) cache so ranged data reads — DataFusion row-group scans — hit
+/// Foyer instead of S3. Errors are swallowed; see [`warm_footer`].
+pub async fn warm_full(store: &dyn ObjectStore, location: &Path) -> bool {
+    store.get_opts(location, GetOptions::default()).await.is_ok()
+}
+
 /// Foyer-based hybrid cache implementation for object store
 #[derive(derive_more::Display, derive_more::Debug)]
 #[display("FoyerHybridCachedObjectStore({})", inner)]
@@ -1403,6 +1437,79 @@ mod tests {
         cache.shutdown().await?;
 
         // Clean up cache directory after test
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_warm_footer_primes_metadata_cache() -> anyhow::Result<()> {
+        let test_id = format!("warm_footer_{}", std::process::id());
+        let inner = Arc::new(InMemory::new());
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.parquet_metadata_size_hint = 1024; // 1KB footer
+        });
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+
+        // Write the file straight to the inner store so nothing is cached yet —
+        // this simulates a multipart compaction output that bypassed put_cached.
+        let file_size = 10 * 1024;
+        let path = Path::from("table/date=2026-06-05/part-0.parquet");
+        inner.put(&path, PutPayload::from(Bytes::from(vec![b'x'; file_size]))).await?;
+        cache.reset_stats().await;
+
+        // Warm the footer. The ranged GET should populate the metadata cache.
+        assert!(warm_footer(&cache, &path, 1024).await);
+
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.metadata.misses, 1, "warm should fetch the footer once");
+        assert_eq!(stats.metadata.hits, 0);
+
+        // A subsequent read of the same footer range is now a metadata HIT —
+        // i.e. query planning pays zero S3 round-trips post-warm.
+        let metadata_range = (file_size - 1024) as u64..file_size as u64;
+        let _ = cache.get_range(&path, metadata_range).await?;
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.metadata.hits, 1, "footer read should hit after warm");
+
+        cache.shutdown().await?;
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_warm_full_primes_main_cache() -> anyhow::Result<()> {
+        let test_id = format!("warm_full_{}", std::process::id());
+        let inner = Arc::new(InMemory::new());
+        let config = FoyerCacheConfig::test_config(&test_id);
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+
+        let file_size = 8 * 1024;
+        let path = Path::from("table/date=2026-06-05/part-1.parquet");
+        inner.put(&path, PutPayload::from(Bytes::from(vec![b'y'; file_size]))).await?;
+        cache.reset_stats().await;
+
+        // Warm the full file into the main cache. The warm itself incurs one
+        // miss (the fetch from the inner store); reset so we isolate the
+        // post-warm read behavior.
+        assert!(warm_full(&cache, &path).await);
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.misses, 1, "warm should fetch the full file once");
+        cache.reset_stats().await;
+
+        // Any subsequent data read is served from the full-file cache (main HIT),
+        // never falling back to S3.
+        let _ = cache.get_range(&path, 0..1024).await?;
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.hits, 1, "data read should hit main cache after full warm");
+        assert_eq!(stats.main.misses, 0);
+
+        cache.shutdown().await?;
         let _ = std::fs::remove_dir_all(&cache_dir);
         Ok(())
     }
