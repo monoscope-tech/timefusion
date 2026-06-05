@@ -193,8 +193,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         let shutdown = pgwire_shutdown.clone();
         async move {
             if let Err(e) =
-                timefusion::pgwire_handlers::serve_with_listener(listener, Arc::new(session_context), &pg_opts, auth_config, shutdown.cancelled_owned())
-                    .await
+                timefusion::pgwire_handlers::serve_with_listener(listener, Arc::new(session_context), &pg_opts, auth_config, shutdown.cancelled_owned()).await
             {
                 error!("PGWire server error: {}", e);
             }
@@ -331,4 +330,3 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     Ok(())
 }
-

@@ -27,7 +27,7 @@ const TAIL_FLAG: u64 = 1u64 << 63;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WalPosition {
     pub block_id: u64,
-    pub offset: u64,
+    pub offset:   u64,
 }
 
 impl WalPosition {
@@ -53,7 +53,7 @@ impl Walrus {
                 let (block, written) = w.snapshot_block()?;
                 return Ok(WalPosition {
                     block_id: block.id,
-                    offset: written,
+                    offset:   written,
                 });
             }
         }
@@ -67,7 +67,7 @@ impl Walrus {
                     if let Some(last) = info.chain.last() {
                         return Ok(WalPosition {
                             block_id: last.id,
-                            offset: last.used,
+                            offset:   last.used,
                         });
                     }
                 }
@@ -114,14 +114,14 @@ impl Walrus {
         if chain_idx < info.chain.len() {
             Ok(Some(WalPosition {
                 block_id: info.chain[chain_idx].id,
-                offset: pos.cur_block_offset,
+                offset:   pos.cur_block_offset,
             }))
         } else if chain_idx == info.chain.len() && !info.chain.is_empty() {
             // Past the last sealed block; use the last block's tail.
             let last = info.chain.last().unwrap();
             Ok(Some(WalPosition {
                 block_id: last.id,
-                offset: last.used,
+                offset:   last.used,
             }))
         } else {
             Ok(None)
