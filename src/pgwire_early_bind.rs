@@ -226,6 +226,20 @@ mod tests {
         let _ = task.await;
     }
 
+    /// A client that connects but never sends a startup message must be
+    /// closed after STARTUP_READ_TIMEOUT instead of holding the slot forever.
+    #[tokio::test(start_paused = true)]
+    async fn silent_client_closed_after_timeout() {
+        let (port, shutdown, task) = spawn_acceptor().await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // No bytes sent; advance virtual time past the timeout.
+        tokio::time::advance(STARTUP_READ_TIMEOUT + Duration::from_secs(1)).await;
+        let mut tail = [0u8; 1];
+        assert_eq!(client.read(&mut tail).await.unwrap(), 0, "server must close after timeout");
+        shutdown.cancel();
+        let _ = task.await;
+    }
+
     /// At the handler cap, excess connections still receive 57P03 (sent
     /// synchronously via try_write) rather than RST — Hasql/libpq treat RST
     /// as ECONNREFUSED, which is the failure mode this responder exists to
