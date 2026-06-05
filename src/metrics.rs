@@ -71,6 +71,7 @@ counter_registry! {
     tantivy_prefilter_errors   => "timefusion.tantivy.prefilter_errors": "Tantivy lookups that errored (S3 down, parse failure, etc.)",
     tantivy_build_failures     => "timefusion.tantivy.build_failures": "Post-flush tantivy index builds that errored — accumulating drift means queries silently fall back to UDF scan",
     dedup_dropped_rows         => "timefusion.flush.dedup_dropped_rows": "Rows collapsed by per-table dedup_keys (last-write-wins) before Delta commit",
+    compaction_dedup_dropped_rows => "timefusion.compaction.dedup_dropped_rows": "Rows collapsed by Delta-vs-Delta dedup compaction (cross-flush duplicates)",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -273,5 +274,11 @@ simple_recorders! {
 pub fn record_dedup_dropped(rows: u64) {
     if let Some(m) = METRICS.get() {
         m.dedup_dropped_rows.add(rows, &[]);
+    }
+}
+
+pub fn record_compaction_dedup_dropped(rows: u64) {
+    if let Some(m) = METRICS.get() {
+        m.compaction_dedup_dropped_rows.add(rows, &[]);
     }
 }

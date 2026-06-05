@@ -422,6 +422,11 @@ pub struct Database {
     object_store_cache:              Option<Arc<SharedFoyerCache>>,
     statistics_extractor:            Arc<DeltaStatisticsExtractor>,
     last_written_versions:           Arc<RwLock<HashMap<(String, String), u64>>>,
+    /// Per-table file count at last dedup sweep. Used to skip the partition
+    /// scan when no Delta commits have landed since — bounds Foyer churn.
+    /// Key is `table_name` for unified tables and `project_id:table_name`
+    /// for custom-project tables (matches scheduler keying).
+    last_dedup_file_counts:          Arc<RwLock<HashMap<String, usize>>>,
     buffered_layer:                  Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
     tantivy_search:                  Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
     tantivy_indexer:                 Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
@@ -711,6 +716,7 @@ impl Database {
             object_store_cache,
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
+            last_dedup_file_counts: Arc::new(RwLock::new(HashMap::new())),
             buffered_layer: None,
             tantivy_search: None,
             tantivy_indexer: None,
@@ -805,8 +811,14 @@ impl Database {
                     let db = db.clone();
                     Box::pin(async move {
                         info!("Running scheduled light optimize on recent small files");
-                        // Optimize unified tables
+                        // Optimize unified tables. Run dedup FIRST so the
+                        // light compact bin-packs already-deduped files —
+                        // otherwise compact would rewrite the duplicates into
+                        // a single file that we'd then have to rewrite again.
                         for (table_name, table) in db.unified_tables.read().await.iter() {
+                            if let Err(e) = db.dedup_today_partitions(table, table_name, table_name).await {
+                                error!("Dedup sweep failed for unified table '{}': {}", table_name, e);
+                            }
                             match db.optimize_table_light(table, table_name).await {
                                 Ok(_) => info!("Light optimize completed for unified table '{}'", table_name),
                                 Err(e) => error!("Light optimize failed for unified table '{}': {}", table_name, e),
@@ -814,6 +826,10 @@ impl Database {
                         }
                         // Optimize custom project tables
                         for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                            let key = format!("{}:{}", project_id, table_name);
+                            if let Err(e) = db.dedup_today_partitions(table, table_name, &key).await {
+                                error!("Dedup sweep failed for custom project '{}' table '{}': {}", project_id, table_name, e);
+                            }
                             match db.optimize_table_light(table, table_name).await {
                                 Ok(_) => info!("Light optimize completed for custom project '{}' table '{}'", project_id, table_name),
                                 Err(e) => error!("Light optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e),
@@ -1014,8 +1030,23 @@ impl Database {
         Ok(self)
     }
 
-    /// Create and configure a SessionContext with DataFusion settings
+    /// Create a SessionContext for the pgwire endpoint. Includes
+    /// `VariantPgwireRootWrap`, which serializes Variant SELECT outputs to
+    /// JSON text for the pg wire protocol.
     pub fn create_session_context(self: Arc<Self>) -> SessionContext {
+        self.create_session_context_inner(true)
+    }
+
+    /// Create a SessionContext for internal SQL (no wire format coupled).
+    /// Omits `VariantPgwireRootWrap` so Variant columns flow through as
+    /// `Struct{Binary, Binary}` — what Arrow IPC, delta-kernel writes, and
+    /// downstream Variant UDFs consume natively. Use this when the result
+    /// won't be encoded into pgwire text.
+    pub fn create_internal_session_context(self: Arc<Self>) -> SessionContext {
+        self.create_session_context_inner(false)
+    }
+
+    fn create_session_context_inner(self: Arc<Self>, include_pgwire_wrap: bool) -> SessionContext {
         use std::sync::Arc;
 
         use datafusion::{
@@ -1112,10 +1143,15 @@ impl Database {
             options: tracing_options,
         );
 
-        // Create session state with tracing rule and DML support
-        // Rule ordering: VariantInsertRewriter runs BEFORE TypeCoercion (rewrites string->json_to_variant)
-        //                VariantSelectRewriter runs AFTER TypeCoercion (wraps Variant cols with variant_to_json)
-        let analyzer_rules: Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> = vec![
+        // Create session state with tracing rule and DML support.
+        // Rule ordering:
+        //   VariantInsertRewriter           BEFORE TypeCoercion (rewrites Utf8 → json_to_variant)
+        //   VariantTableScanSchemaPatch     AFTER  TypeCoercion (un-lies ProjectRoutingTable's Utf8View schema → real Variant)
+        //   VariantPgwireRootWrap           AFTER  VariantTableScanSchemaPatch (wraps root Variant projections with variant_to_json for pgwire text format)
+        // The wire-wrap rule is registered here because this context drives
+        // pgwire. Non-pgwire callers use `create_internal_session_context`,
+        // which excludes the wrap rule so SELECTs return binary Variant.
+        let mut analyzer_rules: Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> = vec![
             Arc::new(datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction::new()),
             Arc::new(crate::optimizers::VariantInsertRewriter),
             // Tantivy predicate rewriter runs BEFORE TypeCoercion so the
@@ -1123,8 +1159,11 @@ impl Database {
             // other UDF args (Utf8 vs Utf8View etc).
             Arc::new(crate::optimizers::TantivyPredicateRewriter),
             Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
-            Arc::new(crate::optimizers::VariantSelectRewriter),
+            Arc::new(crate::optimizers::VariantTableScanSchemaPatch),
         ];
+        if include_pgwire_wrap {
+            analyzer_rules.push(Arc::new(crate::optimizers::VariantPgwireRootWrap));
+        }
 
         let session_state = SessionStateBuilder::new()
             .with_config(options.into())
@@ -2196,6 +2235,186 @@ impl Database {
         Ok(())
     }
 
+    /// Cross-flush dedup compaction: reads a partition's current Delta rows,
+    /// collapses duplicates by the schema's `dedup_keys` (last-write-wins),
+    /// and writes the result back with `replace_where` on the partition.
+    /// No-op when the schema has no `dedup_keys` or no duplicates are found
+    /// (avoids gratuitous rewrites + Foyer cache churn).
+    ///
+    /// `project_id`/`date` form the partition predicate. For unified tables
+    /// these are both partition columns; for custom-project tables (`date`-
+    /// only) the `project_id` filter is still a valid row predicate.
+    ///
+    /// Returns the number of rows dropped (0 = nothing to do).
+    pub async fn dedup_partition(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
+    ) -> Result<u64> {
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        if schema.dedup_keys.is_empty() {
+            return Ok(0);
+        }
+        let date_str = date.to_string();
+
+        // Read the partition directly from the DeltaTable as a TableProvider
+        // in a fresh, minimal session. The only load-bearing reason to bypass
+        // ProjectRoutingTable is the MemBuffer union: dedup rewrites the
+        // partition via `replace_where`, so including MemBuffer rows would
+        // flush them prematurely and double-write on the next real flush.
+        // To reuse ProjectRoutingTable here, it would need an opt-in
+        // delta-only scan mode (skip the MemBuffer union) — a feature, not a
+        // cleanup. Other concerns are already neutral: both the main and the
+        // `build_optimize_session_state` sessions set
+        // `schema_force_view_types=false` (delta-kernel's `unshredded_variant()`
+        // requires Binary, not BinaryView), and the JSON wire wrap lives only
+        // on the pgwire context (`create_internal_session_context` omits it),
+        // so neither would fire on the routing path even if it were used.
+        use deltalake::delta_datafusion::TableProviderBuilder;
+        let (snapshot, log_store) = {
+            let table = table_ref.read().await;
+            (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
+        };
+        let provider = TableProviderBuilder::default()
+            .with_log_store(log_store)
+            .with_eager_snapshot(snapshot)
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
+        let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state());
+        let scan_name = "__dedup_src";
+        ctx.register_table(scan_name, Arc::new(provider))?;
+        let select = format!(
+            "SELECT * FROM {} WHERE project_id = '{}' AND date = DATE '{}'",
+            scan_name, project_id, date_str
+        );
+        let batches = ctx.sql(&select).await?.collect().await?;
+        let before: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if before == 0 {
+            return Ok(0);
+        }
+        let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys)?;
+        let after: usize = deduped.iter().map(|b| b.num_rows()).sum();
+        if before == after {
+            return Ok(0);
+        }
+        let dropped = (before - after) as u64;
+
+        // Variant struct columns may still be BinaryView if the partition mixes
+        // tiers — cast to Binary so the delta-kernel write accepts the schema.
+        let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
+        let predicate = format!("project_id = '{}' AND date = '{}'", project_id, date_str);
+
+        // OCC retry — same shape as optimize_table_light_inner. Best-effort;
+        // if we give up after retries, the next scheduler tick will retry.
+        const MAX_RETRIES: usize = 4;
+        let mut last_err: Option<deltalake::DeltaTableError> = None;
+        for attempt in 0..MAX_RETRIES {
+            let table_clone = {
+                let table = table_ref.read().await;
+                table.clone()
+            };
+            let result = table_clone
+                .write(deduped.clone())
+                .with_partition_columns(schema.partitions.clone())
+                .with_writer_properties(writer_properties.clone())
+                .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
+                .with_replace_where(predicate.clone())
+                .await;
+            match result {
+                Ok(new_table) => {
+                    *table_ref.write().await = new_table;
+                    crate::metrics::record_compaction_dedup_dropped(dropped);
+                    info!(
+                        "dedup compaction: table={} project={} date={} dropped={} (before={} after={})",
+                        table_name, project_id, date_str, dropped, before, after
+                    );
+                    return Ok(dropped);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_conflict = msg.contains("concurrent transaction") || msg.contains("Commit failed");
+                    if is_conflict && attempt + 1 < MAX_RETRIES {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(150u64 << attempt)).await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(anyhow::anyhow!("dedup_partition write failed: {}", e));
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "dedup_partition exhausted retries: {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    }
+
+    /// Run `dedup_partition` for every `(project_id, today)` pair that has
+    /// data in this table. Skips entirely when the table's file count hasn't
+    /// changed since the last sweep (no commits = no new dupes). Best-effort:
+    /// per-partition errors are logged and the sweep continues.
+    ///
+    /// `dedup_key` matches the scheduler's keying so unified and custom-
+    /// project tables don't collide in the dedup-skip cache.
+    pub async fn dedup_today_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str) -> Result<()> {
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        if schema.dedup_keys.is_empty() {
+            return Ok(());
+        }
+        let today = Utc::now().date_naive();
+        let date_marker = format!("date={}", today);
+
+        // Collect file URIs matching today's date and extract project_id from
+        // the path. Holds the read lock only briefly.
+        let uris: Vec<String> = {
+            let table = table_ref.read().await;
+            table.get_file_uris()?.filter(|u| u.contains(&date_marker)).collect()
+        };
+        // Skip the scan if no commits have landed since last sweep.
+        {
+            let last = self.last_dedup_file_counts.read().await;
+            if last.get(dedup_key).copied() == Some(uris.len()) {
+                debug!("dedup sweep: table={} unchanged ({} files) — skipping", table_name, uris.len());
+                return Ok(());
+            }
+        }
+
+        // Extract distinct project_ids from `project_id={...}/date=...` segments.
+        // Unified tables embed it; custom-project tables don't and we fall back
+        // to a single sweep with project_id = "default".
+        let mut project_ids: std::collections::BTreeSet<String> = uris
+            .iter()
+            .filter_map(|uri| {
+                uri.split('/')
+                    .find_map(|seg| seg.strip_prefix("project_id=").map(|s| s.to_string()))
+            })
+            .collect();
+        if project_ids.is_empty() {
+            project_ids.insert("default".to_string());
+        }
+
+        let mut total_dropped = 0u64;
+        for pid in &project_ids {
+            match self.dedup_partition(table_ref, table_name, pid, today).await {
+                Ok(d) => total_dropped += d,
+                Err(e) => warn!("dedup sweep: project={} date={} table={} failed: {}", pid, today, table_name, e),
+            }
+        }
+        // Refresh cached file count *after* any rewrites so the next tick
+        // compares against the post-dedup state.
+        let post_count = table_ref.read().await.get_file_uris()?.filter(|u| u.contains(&date_marker)).count();
+        self.last_dedup_file_counts.write().await.insert(dedup_key.to_string(), post_count);
+        if total_dropped > 0 {
+            info!(
+                "dedup sweep: table={} key={} projects={} total_dropped={}",
+                table_name,
+                dedup_key,
+                project_ids.len(),
+                total_dropped
+            );
+        }
+        Ok(())
+    }
+
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         let start_time = std::time::Instant::now();
         let today = Utc::now().date_naive();
@@ -3036,8 +3255,10 @@ impl TableProvider for ProjectRoutingTable {
         }
 
         // Variant binary flows through scans untouched; downstream nodes
-        // (variant_get, ->, ->>) consume it directly. JSON serialization
-        // happens only at the root projection via VariantSelectRewriter.
+        // (variant_get, ->, ->>) consume it directly. For pgwire SELECTs,
+        // JSON serialization happens only at the root projection via
+        // VariantPgwireRootWrap; internal SQL contexts skip that rule and
+        // keep Variant binary end-to-end.
         let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> { Ok(plan) };
 
         // Check if buffered layer is configured
