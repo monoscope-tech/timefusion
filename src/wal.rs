@@ -66,9 +66,19 @@ fn snap_to_pos((block_id, offset): SnapPos) -> WalPosition {
 /// Serialized form of every known topic's per-shard persisted-read cursor.
 /// Written after every successful Delta flush + on graceful shutdown; read
 /// on boot to skip the Delta scan when the cursor is known-current.
+///
+/// Correctness assumes this timefusion process is the **only** writer to its
+/// Delta tables — `BufferedWriteLayer::flush` is the sole commit path. If you
+/// ever run a parallel writer (manual `OPTIMIZE`, an external delta-rs
+/// client, a sister process) between a clean-shutdown snapshot and the next
+/// boot, delete `cursor_snapshot.json` to force a Delta reconciliation; the
+/// `clean_shutdown` flag alone won't catch out-of-band commits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorSnapshot {
     pub version:           u32,
+    /// Wall-clock micros (`clock::now_micros`) at write time. Informational
+    /// only — surfaced in the boot log so operators can spot a stale
+    /// snapshot, but not enforced as a max-age gate.
     pub written_at_micros: i64,
     pub shards_per_topic:  usize,
     /// True only when written by the graceful-shutdown path. Boot uses this
@@ -747,8 +757,11 @@ impl WalManager {
     /// Fast-forward walrus persisted-read cursors from a loaded snapshot.
     /// Returns the number of shards that advanced (i.e. snapshot was ahead of
     /// the locally-fsynced walrus state).
+    /// Returns the number of *tables* where at least one shard moved (not the
+    /// total shard-advance count — that's per-call via
+    /// [`merge_persisted_positions`]).
     pub fn restore_cursor_snapshot(&self, snap: &CursorSnapshot) -> Result<usize, WalError> {
-        let mut advanced = 0usize;
+        let mut tables_advanced = 0usize;
         for (topic, snapshot_positions) in &snap.entries {
             let Some((project_id, table_name)) = Self::parse_topic(topic) else { continue };
             if snapshot_positions.len() != self.shards_per_topic {
@@ -760,10 +773,10 @@ impl WalManager {
 
             let candidate: Vec<Option<WalPosition>> = snapshot_positions.iter().map(|p| p.map(snap_to_pos)).collect();
             if self.merge_persisted_positions(&project_id, &table_name, &candidate)? > 0 {
-                advanced += 1;
+                tables_advanced += 1;
             }
         }
-        Ok(advanced)
+        Ok(tables_advanced)
     }
 
     /// Fast-forward each shard's persisted-read cursor to `candidate[shard]`
@@ -1034,15 +1047,51 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
-        let meta = path.join(".timefusion_meta");
-        std::fs::create_dir_all(&meta).unwrap();
-        // Write a syntactically valid JSON with a bumped version.
+        // `.timefusion_meta/` is guaranteed by WalManager construction.
         std::fs::write(
-            meta.join("cursor_snapshot.json"),
+            path.join(".timefusion_meta/cursor_snapshot.json"),
             br#"{"version":999,"written_at_micros":0,"shards_per_topic":4,"clean_shutdown":true,"entries":{}}"#,
         )
         .unwrap();
         assert!(wal.load_cursor_snapshot().is_none());
+    }
+
+    /// If an operator changes `TIMEFUSION_WAL_SHARDS_PER_TOPIC` between
+    /// restarts, the snapshot's per-shard layout is incompatible. Reject it
+    /// so the boot falls through to the Delta scan rather than restoring
+    /// shard-misaligned positions.
+    #[test]
+    fn cursor_snapshot_rejects_shard_count_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        {
+            let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+            wal.append("proj", "tbl", &create_test_batch()).unwrap();
+            wal.advance_by_counts("proj", "tbl", &[1, 0, 0, 0]).unwrap();
+            wal.write_cursor_snapshot(true).unwrap();
+        }
+        // Re-open with a different shard count — load must refuse.
+        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 8).unwrap();
+        assert!(wal.load_cursor_snapshot().is_none());
+    }
+
+    /// A snapshot written from the flush path (clean_shutdown=false) loads
+    /// fine but must not let the boot path skip the Delta verifier — that
+    /// gate is reserved for the graceful-shutdown marker.
+    #[test]
+    fn cursor_snapshot_dirty_path_loads_but_signals_unclean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        wal.append("proj", "tbl", &create_test_batch()).unwrap();
+        wal.advance_by_counts("proj", "tbl", &[1, 0, 0, 0]).unwrap();
+        wal.write_cursor_snapshot(false).unwrap();
+
+        let snap = wal.load_cursor_snapshot().expect("dirty snapshot must still be loadable");
+        assert!(!snap.clean_shutdown, "dirty snapshot must not claim clean_shutdown");
+        // Sanity: restore is still safe (idempotent on matching state).
+        let tables_advanced = wal.restore_cursor_snapshot(&snap).unwrap();
+        assert_eq!(tables_advanced, 0);
     }
 
     #[test]

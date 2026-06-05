@@ -151,11 +151,11 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let skip_delta_scan = if let Some(snap) = wal_ref.load_cursor_snapshot() {
         let age_secs = timefusion::clock::now_micros().saturating_sub(snap.written_at_micros) / 1_000_000;
         match wal_ref.restore_cursor_snapshot(&snap) {
-            Ok(advanced) => {
+            Ok(tables_advanced) => {
                 info!(
-                    "Cursor snapshot restored: {} table(s) seeded, {} advanced, clean_shutdown={}, age={}s",
+                    "Cursor snapshot restored: {} table(s) seeded, {} table(s) advanced, clean_shutdown={}, age={}s",
                     snap.entries.len(),
-                    advanced,
+                    tables_advanced,
                     snap.clean_shutdown,
                     age_secs
                 );
