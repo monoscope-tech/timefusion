@@ -7,6 +7,7 @@ use arrow_ipc::{
 };
 use bincode::{Decode, Encode};
 use dashmap::DashSet;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
 use walrus_rust::{FsyncSchedule, ReadConsistency, WalPosition, Walrus};
@@ -47,6 +48,35 @@ const WAL_MAGIC: [u8; 4] = [0x57, 0x41, 0x4C, 0x32];
 /// written by a different version, so existing data must be wiped on bump.
 const WAL_VERSION: u8 = 1;
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
+/// On-disk format version for `cursor_snapshot.json`. Bump on any breaking
+/// schema change so older readers fall back to the Delta scan instead of
+/// silently misinterpreting the file.
+const SNAPSHOT_VERSION: u32 = 1;
+
+/// `WalPosition` serialized as `(block_id, offset)` — tuples already have
+/// Serialize/Deserialize, so we skip the mirror struct.
+type SnapPos = (u64, u64);
+fn pos_to_snap(p: WalPosition) -> SnapPos {
+    (p.block_id, p.offset)
+}
+fn snap_to_pos((block_id, offset): SnapPos) -> WalPosition {
+    WalPosition { block_id, offset }
+}
+
+/// Serialized form of every known topic's per-shard persisted-read cursor.
+/// Written after every successful Delta flush + on graceful shutdown; read
+/// on boot to skip the Delta scan when the cursor is known-current.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CursorSnapshot {
+    pub version:           u32,
+    pub written_at_micros: i64,
+    pub shards_per_topic:  usize,
+    /// True only when written by the graceful-shutdown path. Boot uses this
+    /// flag to decide whether the Delta verifier can be skipped entirely.
+    pub clean_shutdown:    bool,
+    /// `"project_id:table_name"` → per-shard cursor (None = never written).
+    pub entries:           std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
+}
 /// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
 const MAX_BATCH_SIZE: usize = 100 * 1024 * 1024;
 /// Fsync schedule interval in milliseconds - balances durability with performance
@@ -640,6 +670,123 @@ impl WalManager {
         &self.data_dir
     }
 
+    fn cursor_snapshot_path(&self) -> PathBuf {
+        self.data_dir.join(".timefusion_meta").join("cursor_snapshot.json")
+    }
+
+    /// Capture every known topic's per-shard persisted-read cursor to a single
+    /// JSON file on local disk. On boot, the file lets us skip
+    /// `derive_wal_cursors_from_delta`'s ~6.5-minute R2 scan when it's known
+    /// to be current — the dominant cold-boot cost.
+    ///
+    /// `clean_shutdown=true` is set only by the graceful-shutdown path; flush
+    /// callers pass false so a hard kill still falls back to the Delta scan
+    /// to verify the cursor.
+    ///
+    /// Atomic: writes to `.tmp` then renames. Best-effort: returns Err but the
+    /// caller logs-and-continues — a missing snapshot only costs us the next
+    /// boot's fast path, never correctness.
+    pub fn write_cursor_snapshot(&self, clean_shutdown: bool) -> Result<(), WalError> {
+        let mut entries = std::collections::BTreeMap::new();
+        for (project_id, table_name) in self.list_topic_pairs()? {
+            let positions = match self.persisted_read_positions(&project_id, &table_name) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("write_cursor_snapshot: skipping {}/{}: {}", project_id, table_name, e);
+                    continue;
+                }
+            };
+            entries.insert(Self::make_topic(&project_id, &table_name), positions.into_iter().map(|p| p.map(pos_to_snap)).collect());
+        }
+        let snap = CursorSnapshot {
+            version: SNAPSHOT_VERSION,
+            written_at_micros: crate::clock::now_micros(),
+            shards_per_topic: self.shards_per_topic,
+            clean_shutdown,
+            entries,
+        };
+        // `.timefusion_meta/` is created in `with_fsync_mode_and_shards`; no
+        // create_dir_all needed on every flush.
+        let target = self.cursor_snapshot_path();
+        let tmp = target.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(&snap).map_err(|e| WalError::Internal(format!("cursor snapshot encode: {}", e)))?;
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, &target)?;
+        Ok(())
+    }
+
+    /// Read the cursor snapshot if present. Returns None on missing/parse/version
+    /// mismatch so the boot path falls through to Delta reconciliation.
+    pub fn load_cursor_snapshot(&self) -> Option<CursorSnapshot> {
+        let path = self.cursor_snapshot_path();
+        let bytes = std::fs::read(&path).ok()?;
+        let snap: CursorSnapshot = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("cursor snapshot at {:?} unreadable, falling back to Delta scan: {}", path, e);
+                return None;
+            }
+        };
+        if snap.version != SNAPSHOT_VERSION {
+            warn!("cursor snapshot version {} != {} — ignoring", snap.version, SNAPSHOT_VERSION);
+            return None;
+        }
+        if snap.shards_per_topic != self.shards_per_topic {
+            warn!(
+                "cursor snapshot shards_per_topic {} != current {} — ignoring (config changed)",
+                snap.shards_per_topic, self.shards_per_topic
+            );
+            return None;
+        }
+        Some(snap)
+    }
+
+    /// Fast-forward walrus persisted-read cursors from a loaded snapshot.
+    /// Returns the number of shards that advanced (i.e. snapshot was ahead of
+    /// the locally-fsynced walrus state).
+    pub fn restore_cursor_snapshot(&self, snap: &CursorSnapshot) -> Result<usize, WalError> {
+        let mut advanced = 0usize;
+        for (topic, snapshot_positions) in &snap.entries {
+            let Some((project_id, table_name)) = Self::parse_topic(topic) else { continue };
+            if snapshot_positions.len() != self.shards_per_topic {
+                continue;
+            }
+            // Seed `known_topics` so a later list_topic_pairs() includes a
+            // table that hasn't yet been re-touched in this process.
+            self.persist_topic(topic);
+
+            let candidate: Vec<Option<WalPosition>> = snapshot_positions.iter().map(|p| p.map(snap_to_pos)).collect();
+            if self.merge_persisted_positions(&project_id, &table_name, &candidate)? > 0 {
+                advanced += 1;
+            }
+        }
+        Ok(advanced)
+    }
+
+    /// Fast-forward each shard's persisted-read cursor to `candidate[shard]`
+    /// when the candidate is strictly ahead. Returns the number of shards
+    /// that moved. Shared by snapshot restore and Delta-derived reconciliation.
+    pub fn merge_persisted_positions(&self, project_id: &str, table_name: &str, candidate: &[Option<WalPosition>]) -> Result<usize, WalError> {
+        if candidate.len() != self.shards_per_topic {
+            return Ok(0);
+        }
+        let local = self.persisted_read_positions(project_id, table_name).unwrap_or_else(|_| vec![None; self.shards_per_topic]);
+        let mut to_set: Vec<WalPosition> = local.iter().map(|p| p.unwrap_or(WalPosition::ORIGIN)).collect();
+        let mut advanced = 0usize;
+        for shard in 0..self.shards_per_topic {
+            let Some(cand) = candidate[shard] else { continue };
+            let ahead = local[shard].map_or(!cand.is_origin(), |lpos| cand > lpos);
+            if ahead {
+                to_set[shard] = cand;
+                advanced += 1;
+            }
+        }
+        if advanced > 0 {
+            self.set_persisted_positions(project_id, table_name, &to_set)?;
+        }
+        Ok(advanced)
+    }
+
     /// Configured number of walrus collections per logical topic. Reported
     /// out for `timefusion.stats()` so operators can see effective parallelism.
     pub fn shards_per_topic(&self) -> usize {
@@ -833,6 +980,66 @@ mod tests {
                 "({p1:?},{t1:?}) and ({p2:?},{t2:?}) collide"
             );
         }
+    }
+
+    /// Round-trip cursor snapshot: write, drop the manager, re-open, restore.
+    /// Verifies the on-disk file is enough to fast-forward walrus cursors on
+    /// a fresh process without touching Delta — the whole point of the fast
+    /// boot path.
+    #[test]
+    fn cursor_snapshot_roundtrip_restores_persisted_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // Process A: append, advance cursor, write snapshot with clean flag.
+        {
+            let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+            let batch = create_test_batch();
+            wal.append("proj", "tbl", &batch).unwrap();
+            // Advance by 1 on the only shard we wrote to (round-robin picks
+            // shard 0 first for an unseen topic).
+            wal.advance_by_counts("proj", "tbl", &[1, 0, 0, 0]).unwrap();
+            let before = wal.persisted_read_positions("proj", "tbl").unwrap();
+            assert!(before[0].is_some_and(|p| !p.is_origin()), "advance must move shard 0 off origin");
+
+            wal.write_cursor_snapshot(true).unwrap();
+            assert!(path.join(".timefusion_meta/cursor_snapshot.json").exists());
+        }
+
+        // Process B: fresh manager, snapshot present, no walrus state mutation
+        // beyond what restore does.
+        {
+            let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+            let snap = wal.load_cursor_snapshot().expect("snapshot loadable");
+            assert!(snap.clean_shutdown);
+            assert_eq!(snap.shards_per_topic, 4);
+            assert!(snap.entries.contains_key("proj:tbl"));
+
+            // Restore is idempotent — walrus state already reflects the
+            // advance, so `restore` advances 0 shards but seeds known_topics.
+            let advanced = wal.restore_cursor_snapshot(&snap).unwrap();
+            assert_eq!(advanced, 0, "snapshot positions match walrus's own fsynced state");
+            assert!(wal.list_topic_pairs().unwrap().iter().any(|(p, t)| p == "proj" && t == "tbl"));
+        }
+    }
+
+    /// Snapshot version mismatch (or a corrupted file) must return None so
+    /// boot falls through to the Delta scan rather than misinterpreting the
+    /// payload.
+    #[test]
+    fn cursor_snapshot_rejects_version_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        let meta = path.join(".timefusion_meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        // Write a syntactically valid JSON with a bumped version.
+        std::fs::write(
+            meta.join("cursor_snapshot.json"),
+            br#"{"version":999,"written_at_micros":0,"shards_per_topic":4,"clean_shutdown":true,"entries":{}}"#,
+        )
+        .unwrap();
+        assert!(wal.load_cursor_snapshot().is_none());
     }
 
     #[test]

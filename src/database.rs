@@ -1886,11 +1886,9 @@ impl Database {
     /// so this can't make recovery worse than today's at-least-once behaviour.
     pub async fn derive_wal_cursors_from_delta(&self, wal: &crate::wal::WalManager) -> anyhow::Result<usize> {
         use futures::stream::{self, StreamExt};
-        let pairs = wal.list_topic_pairs()?;
-        // Cap concurrency to bound S3 connections at startup.
-        let totals: Vec<usize> = stream::iter(pairs)
+        let totals: Vec<usize> = stream::iter(wal.list_topic_pairs()?)
             .map(|(project_id, table_name)| async move { self.derive_wal_cursor_for_table(wal, &project_id, &table_name).await.unwrap_or(0) })
-            .buffer_unordered(8)
+            .buffer_unordered(self.config.buffer.delta_scan_concurrency())
             .collect()
             .await;
         Ok(totals.into_iter().sum())
@@ -1899,12 +1897,11 @@ impl Database {
     async fn derive_wal_cursor_for_table(&self, wal: &crate::wal::WalManager, project_id: &str, table_name: &str) -> anyhow::Result<usize> {
         // Scan recent commits; replay-derived commits without a watermark
         // contribute nothing so they can't reset the MAX backward.
-        const SCAN_DEPTH: usize = 16;
         let Ok(table_ref) = self.resolve_table(project_id, table_name).await else {
             return Ok(0);
         };
         let table = table_ref.read().await;
-        let commits: Vec<_> = match table.history(Some(SCAN_DEPTH)).await {
+        let commits: Vec<_> = match table.history(Some(self.config.buffer.delta_scan_depth())).await {
             Ok(it) => it.collect(),
             Err(e) => {
                 debug!("derive_wal_cursor: history unavailable for {}/{}: {}", project_id, table_name, e);
@@ -1913,29 +1910,12 @@ impl Database {
         };
         drop(table);
 
-        let shards = wal.shards_per_topic();
-        let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), shards);
-        let local = wal.persisted_read_positions(project_id, table_name).unwrap_or_else(|_| vec![None; shards]);
-
-        let mut to_set = local.clone();
-        let mut any_advance = 0usize;
-        for shard in 0..shards {
-            let Some(dpos) = delta_max[shard] else { continue };
-            let ahead = local[shard].map_or(!dpos.is_origin(), |lpos| dpos > lpos);
-            if ahead {
-                to_set[shard] = Some(dpos);
-                any_advance += 1;
-            }
+        let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), wal.shards_per_topic());
+        let advanced = wal.merge_persisted_positions(project_id, table_name, &delta_max)?;
+        if advanced > 0 {
+            info!("Delta-derived cursor advance: project={}, table={}, shards_advanced={}", project_id, table_name, advanced);
         }
-        if any_advance > 0 {
-            let positions: Vec<walrus_rust::WalPosition> = to_set.into_iter().map(|p| p.unwrap_or(walrus_rust::WalPosition::ORIGIN)).collect();
-            wal.set_persisted_positions(project_id, table_name, &positions)?;
-            info!(
-                "Delta-derived cursor advance: project={}, table={}, shards_advanced={}",
-                project_id, table_name, any_advance
-            );
-        }
-        Ok(any_advance)
+        Ok(advanced)
     }
 
     /// Optimize the Delta table using Z-ordering on timestamp and id columns

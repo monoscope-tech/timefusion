@@ -742,6 +742,12 @@ impl BufferedWriteLayer {
         if let Err(e) = self.wal.advance_by_counts(&bucket.project_id, &bucket.table_name, &bucket.wal_shard_counts) {
             warn!("WAL advance_by_counts failed: {}", e);
         }
+        // Persist the post-advance cursor so the next boot can skip the
+        // Delta scan. Hard-kill in-between means `clean_shutdown=false` and
+        // the boot path still runs the (shortened) verifier. Best-effort.
+        if let Err(e) = self.wal.write_cursor_snapshot(false) {
+            debug!("write_cursor_snapshot (post-flush) failed: {}", e);
+        }
         self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
     }
 
@@ -780,6 +786,14 @@ impl BufferedWriteLayer {
                 Ok(()) => self.checkpoint_and_drain(&bucket),
                 Err(e) => error!("Shutdown flush failed for bucket {}: {}", bucket.bucket_id, e),
             }
+        }
+
+        // Final cursor snapshot with the clean-shutdown marker — boot can
+        // then skip `derive_wal_cursors_from_delta` entirely (~6.5 min saved
+        // on the next start).
+        match self.wal.write_cursor_snapshot(true) {
+            Ok(()) => info!("Cursor snapshot written (clean_shutdown=true)"),
+            Err(e) => warn!("Cursor snapshot on shutdown failed: {} — next boot will Delta-scan", e),
         }
 
         info!("BufferedWriteLayer shutdown complete");
