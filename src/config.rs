@@ -121,11 +121,13 @@ const_default!(d_shutdown_timeout: u64 = 180);
 const_default!(d_wal_corruption_threshold: usize = 10);
 const_default!(d_flush_parallelism: usize = 4);
 // Cold-boot Delta cursor reconciliation. R2 happily takes 64+ concurrent
-// gets per bucket; the original 8 left ~8× headroom. Depth 2 is enough to
-// catch one writer that committed after our last snapshot — the snapshot
-// itself replaces the older 16-deep scan.
+// gets per bucket; the original 8 left ~8× headroom. Depth 8 is half the
+// original 16 (the snapshot replaces the bulk of the scan) but keeps a
+// safety margin: if a few snapshot writes failed silently before reboot,
+// depth-2 could miss the legitimate cursor advance. Tune via env if the
+// fallback Delta scan is the bottleneck.
 const_default!(d_delta_scan_concurrency: usize = 64);
-const_default!(d_delta_scan_depth: usize = 2);
+const_default!(d_delta_scan_depth: usize = 8);
 const_default!(d_wal_fsync_ms: u64 = 200);
 // MemBuffer bucket window (seconds). Smaller windows free RAM sooner because
 // the previous bucket becomes flushable sooner; larger windows amortize into

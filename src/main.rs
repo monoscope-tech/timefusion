@@ -149,6 +149,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // shorter) Delta verifier to catch commits made after the last snapshot.
     let wal_ref = buffered_layer.wal();
     let skip_delta_scan = if let Some(snap) = wal_ref.load_cursor_snapshot() {
+        // Surfaced in the boot log only — not gating the skip. See CursorSnapshot
+        // docs for the single-writer assumption and the `rm` escape hatch.
         let age_secs = timefusion::clock::now_micros().saturating_sub(snap.written_at_micros) / 1_000_000;
         match wal_ref.restore_cursor_snapshot(&snap) {
             Ok(tables_advanced) => {

@@ -87,6 +87,7 @@ pub struct CursorSnapshot {
     /// `"project_id:table_name"` → per-shard cursor (None = never written).
     pub entries:           std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
 }
+
 /// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
 const MAX_BATCH_SIZE: usize = 100 * 1024 * 1024;
 /// Fsync schedule interval in milliseconds - balances durability with performance
@@ -728,6 +729,18 @@ impl WalManager {
         Ok(())
     }
 
+    /// Remove the on-disk cursor snapshot. Called after a snapshot write
+    /// fails so the next boot doesn't fall back to stale-but-readable state
+    /// and shallow-scan over commits made since the last good write. NotFound
+    /// is silently ignored (caller's intent — "no file" is the goal state).
+    pub fn delete_cursor_snapshot(&self) -> Result<(), WalError> {
+        match std::fs::remove_file(self.cursor_snapshot_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(WalError::Io(e)),
+        }
+    }
+
     /// Read the cursor snapshot if present. Returns None on missing/parse/version
     /// mismatch so the boot path falls through to Delta reconciliation.
     pub fn load_cursor_snapshot(&self) -> Option<CursorSnapshot> {
@@ -999,9 +1012,18 @@ mod tests {
     }
 
     /// Round-trip cursor snapshot: write, drop the manager, re-open, restore.
-    /// Verifies the on-disk file is enough to fast-forward walrus cursors on
+    /// Verifies the on-disk file is enough to seed walrus's known_topics on
     /// a fresh process without touching Delta — the whole point of the fast
     /// boot path.
+    ///
+    /// Scope note: this exercises the *idempotent* path — walrus's own fsync
+    /// already persisted shard 0's advance to disk in Process A, so when
+    /// Process B opens the same dir, restore finds nothing to advance and
+    /// returns 0 tables. The scenario the snapshot actually *rescues* is a
+    /// hard kill where walrus's in-memory cursor moved but its fsync hadn't
+    /// landed — hard to simulate here without injecting into walrus's
+    /// internal state, so it's covered by the prod canary in the plan
+    /// instead.
     #[test]
     fn cursor_snapshot_roundtrip_restores_persisted_positions() {
         let dir = tempfile::tempdir().unwrap();
@@ -1073,6 +1095,24 @@ mod tests {
         // Re-open with a different shard count — load must refuse.
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 8).unwrap();
         assert!(wal.load_cursor_snapshot().is_none());
+    }
+
+    /// `delete_cursor_snapshot` removes a present file and is a no-op when
+    /// absent. The flush path calls this on write failure to keep boot from
+    /// restoring stale state.
+    #[test]
+    fn delete_cursor_snapshot_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        // Missing → Ok.
+        wal.delete_cursor_snapshot().unwrap();
+        wal.write_cursor_snapshot(true).unwrap();
+        assert!(path.join(".timefusion_meta/cursor_snapshot.json").exists());
+        wal.delete_cursor_snapshot().unwrap();
+        assert!(!path.join(".timefusion_meta/cursor_snapshot.json").exists());
+        // Second call must still be Ok.
+        wal.delete_cursor_snapshot().unwrap();
     }
 
     /// A snapshot written from the flush path (clean_shutdown=false) loads

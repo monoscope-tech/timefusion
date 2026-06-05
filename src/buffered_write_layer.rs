@@ -650,10 +650,12 @@ impl BufferedWriteLayer {
             .await;
 
         // Process results: checkpoint WAL and drain MemBuffer for successful flushes
+        let mut any_ok = false;
         for (bucket, result) in flush_results {
             match result {
                 Ok(()) => {
                     self.checkpoint_and_drain(&bucket);
+                    any_ok = true;
                     crate::metrics::record_flush(true);
                     debug!(
                         "Flushed bucket: project={}, table={}, bucket_id={}, rows={}",
@@ -668,6 +670,9 @@ impl BufferedWriteLayer {
                     );
                 }
             }
+        }
+        if any_ok {
+            self.write_post_flush_snapshot();
         }
 
         Ok(())
@@ -742,13 +747,25 @@ impl BufferedWriteLayer {
         if let Err(e) = self.wal.advance_by_counts(&bucket.project_id, &bucket.table_name, &bucket.wal_shard_counts) {
             warn!("WAL advance_by_counts failed: {}", e);
         }
-        // Persist the post-advance cursor so the next boot can skip the
-        // Delta scan. Hard-kill in-between means `clean_shutdown=false` and
-        // the boot path still runs the (shortened) verifier. Best-effort.
+        self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
+    }
+
+    /// Persist a `clean_shutdown=false` cursor snapshot for the next boot.
+    /// Called once per flush cycle (not per bucket) — the snapshot reads
+    /// every topic's positions, so collapsing N per-bucket calls into one
+    /// post-cycle write turns this from O(N²) into O(N).
+    ///
+    /// On write failure we delete any pre-existing snapshot: a stale file
+    /// would let the (shallow) boot verifier skip commits made since the
+    /// last successful write. Removing it forces a fresh Delta scan, which
+    /// is correct-but-slow rather than fast-but-wrong.
+    fn write_post_flush_snapshot(&self) {
         if let Err(e) = self.wal.write_cursor_snapshot(false) {
             debug!("write_cursor_snapshot (post-flush) failed: {}", e);
+            if let Err(rm_err) = self.wal.delete_cursor_snapshot() {
+                debug!("delete stale cursor snapshot after write failure also failed: {}", rm_err);
+            }
         }
-        self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
     }
 
     #[instrument(skip(self))]
@@ -835,6 +852,9 @@ impl BufferedWriteLayer {
                     stats.buckets_failed += 1;
                 }
             }
+        }
+        if stats.buckets_flushed > 0 {
+            self.write_post_flush_snapshot();
         }
         Ok(stats)
     }
