@@ -35,18 +35,38 @@ const MAX_CONCURRENT_EARLY_HANDLERS: usize = 512;
 
 /// Run the 57P03 acceptor on `listener` until `shutdown` is cancelled.
 pub async fn run_until_ready(listener: &TcpListener, shutdown: CancellationToken) {
+    accept_loop(listener, shutdown, MAX_CONCURRENT_EARLY_HANDLERS).await;
+}
+
+async fn accept_loop(listener: &TcpListener, shutdown: CancellationToken, max_handlers: usize) {
     let response: Arc<[u8]> = build_starting_up_response().into();
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EARLY_HANDLERS));
+    let permits = Arc::new(tokio::sync::Semaphore::new(max_handlers));
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             res = listener.accept() => match res {
-                Ok((sock, addr)) => {
-                    let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                        debug!("early-bind: at handler cap, dropping conn from {addr}");
-                        drop(sock);
-                        continue;
+                Ok((mut sock, addr)) => {
+                    let permit = match Arc::clone(&permits).try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            // Capacity exhausted (probable reconnect storm). Send the
+                            // canned 57P03 frame and close — dropping the socket without
+                            // a response would RST, which Hasql/libpq treat as
+                            // ECONNREFUSED (the exact failure mode this responder exists
+                            // to avoid). The fast-path task skips the 10s startup wait
+                            // so it's bounded by accept rate × write latency (~ms).
+                            warn!("early-bind: at {max_handlers}-handler cap, fast-responding to {addr}");
+                            let resp = Arc::clone(&response);
+                            tokio::spawn(async move {
+                                let _ = tokio::time::timeout(Duration::from_secs(1), async move {
+                                    let _ = sock.write_all(&resp).await;
+                                    let _ = sock.shutdown().await;
+                                })
+                                .await;
+                            });
+                            continue;
+                        }
                     };
                     let resp = Arc::clone(&response);
                     tokio::spawn(async move {
@@ -202,6 +222,32 @@ mod tests {
         client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
         client.write_all(params).await.unwrap();
         assert_57p03(&mut client).await;
+        shutdown.cancel();
+        let _ = task.await;
+    }
+
+    /// At the handler cap, excess connections still receive 57P03 (sent
+    /// synchronously via try_write) rather than RST — Hasql/libpq treat RST
+    /// as ECONNREFUSED, which is the failure mode this responder exists to
+    /// avoid.
+    #[tokio::test]
+    async fn cap_serves_57p03_synchronously_without_spawning() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let task = tokio::spawn(async move { accept_loop(&listener, token, 1).await });
+
+        // First connection holds the only permit — never sends startup, so it
+        // sits inside handle_one's read awaiting bytes.
+        let _holder = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Second connection hits the cap; should receive 57P03 inline.
+        let mut cap_client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        // Server writes the canned frame without waiting for a startup message.
+        tokio::time::timeout(Duration::from_secs(2), assert_57p03(&mut cap_client)).await.unwrap();
+
         shutdown.cancel();
         let _ = task.await;
     }

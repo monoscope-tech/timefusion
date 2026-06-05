@@ -140,7 +140,9 @@ pub async fn bind_listener(host: &str, port: u16, backlog: u32) -> Result<TcpLis
     let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
-    socket.listen(backlog)
+    let listener = socket.listen(backlog)?;
+    info!("Bound PGWire listener on {server_addr} (backlog={backlog}); kernel clamps to net.core.somaxconn");
+    Ok(listener)
 }
 
 /// Like `serve_with_handlers`, but accepts an already-bound `TcpListener`.
