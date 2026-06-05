@@ -35,8 +35,8 @@ async fn setup_test_database() -> Result<(Database, datafusion::prelude::Session
 // `std::env::set_var("TIMEFUSION_TABLE_PREFIX", ...)`. But `config::init_config`
 // is OnceLock-cached, so only the first test's prefix takes effect; subsequent
 // tests share that same Delta table and contend with whatever state earlier
-// tests committed. On CI's MinIO without DynamoDB locking, the contention
-// retries past the 15-minute job budget. They run cleanly in isolation
+// tests committed. On CI's MinIO the contention retries past the 15-minute
+// job budget. They run cleanly in isolation
 // (`cargo test --test delta_rs_api_test test_NAME -- --ignored`).
 
 /// Tests that add_actions_table returns correct file statistics after inserts

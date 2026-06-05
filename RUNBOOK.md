@@ -196,8 +196,6 @@ Likely causes:
 1. **S3 connectivity** — check `aws s3 ls` to your bucket from the host.
 2. **Delta callback panic** — check process logs for "Failed to flush
    bucket". May indicate a schema mismatch.
-3. **DynamoDB lock contention** (if `aws_s3_locking_provider=dynamodb`) —
-   check DynamoDB throttling metrics.
 
 Mitigation: if S3 is recovered, flushes resume on next interval. If
 not, drain the host: `kubectl drain --grace-period=$LONG` so the

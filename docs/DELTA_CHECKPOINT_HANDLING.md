@@ -87,7 +87,6 @@ The cache implementation in `src/object_store_cache.rs` includes:
 
 1. **Pattern-Based Invalidation**: Foyer doesn't support wildcard cache removal, so we can't invalidate all checkpoint files at once
 2. **Network Latency**: Even with cache disabled, network latency to S3 may still cause brief inconsistencies
-3. **DynamoDB Locking**: For strong consistency, use DynamoDB locking as described in DELTA_CONFIG.md
 
 ## Testing
 

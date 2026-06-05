@@ -152,11 +152,8 @@ const_default!(d_zstd_level: i32 = 3);
 // Tiered compression by partition age. Hot writes prioritize ingest latency;
 // older data is rewritten at progressively higher levels by `recompress_tier`.
 const_default!(d_zstd_level_warm: i32 = 9);
-const_default!(d_zstd_level_cool: i32 = 15);
 const_default!(d_zstd_level_cold: i32 = 19);
-const_default!(d_warm_cutoff_days: u64 = 1);
-const_default!(d_cool_cutoff_days: u64 = 7);
-const_default!(d_cold_cutoff_days: u64 = 30);
+const_default!(d_cold_cutoff_days: u64 = 14);
 const_default!(d_recompress_schedule: String = "0 0 3 * * *");
 const_default!(d_row_group_size: usize = 134_217_728); // 128MB
 const_default!(d_checkpoint_interval: u64 = 10);
@@ -283,31 +280,9 @@ pub struct AwsConfig {
     pub aws_s3_bucket:         Option<String>,
     #[serde(default)]
     pub aws_allow_http:        Option<String>,
-    #[serde(flatten)]
-    pub dynamodb:              DynamoDbConfig,
-}
-
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct DynamoDbConfig {
-    #[serde(default)]
-    pub aws_s3_locking_provider:        Option<String>,
-    #[serde(default)]
-    pub delta_dynamo_table_name:        Option<String>,
-    #[serde(default)]
-    pub aws_access_key_id_dynamodb:     Option<String>,
-    #[serde(default)]
-    pub aws_secret_access_key_dynamodb: Option<String>,
-    #[serde(default)]
-    pub aws_region_dynamodb:            Option<String>,
-    #[serde(default)]
-    pub aws_endpoint_url_dynamodb:      Option<String>,
 }
 
 impl AwsConfig {
-    pub fn is_dynamodb_locking_enabled(&self) -> bool {
-        self.dynamodb.aws_s3_locking_provider.as_deref() == Some("dynamodb")
-    }
-
     pub fn build_storage_options(&self, endpoint_override: Option<&str>) -> HashMap<String, String> {
         macro_rules! insert_opt {
             ($opts:expr, $key:expr, $val:expr) => {
@@ -323,32 +298,7 @@ impl AwsConfig {
         insert_opt!(opts, "AWS_REGION", self.aws_default_region);
         insert_opt!(opts, "AWS_ALLOW_HTTP", self.aws_allow_http);
         opts.insert("AWS_ENDPOINT_URL".into(), endpoint_override.unwrap_or(&self.aws_s3_endpoint).to_string());
-
-        self.add_dynamodb_locking_options(&mut opts);
         opts
-    }
-
-    /// Append the DynamoDB-locking storage options when locking is enabled.
-    /// Shared by `build_storage_options` and the per-project custom-table path
-    /// in `database.rs`, which builds its S3 credentials from a different
-    /// source but needs the identical DynamoDB block.
-    pub fn add_dynamodb_locking_options(&self, opts: &mut HashMap<String, String>) {
-        if !self.is_dynamodb_locking_enabled() {
-            return;
-        }
-        opts.insert("AWS_S3_LOCKING_PROVIDER".into(), "dynamodb".into());
-        let entries = [
-            ("DELTA_DYNAMO_TABLE_NAME", &self.dynamodb.delta_dynamo_table_name),
-            ("AWS_ACCESS_KEY_ID_DYNAMODB", &self.dynamodb.aws_access_key_id_dynamodb),
-            ("AWS_SECRET_ACCESS_KEY_DYNAMODB", &self.dynamodb.aws_secret_access_key_dynamodb),
-            ("AWS_REGION_DYNAMODB", &self.dynamodb.aws_region_dynamodb),
-            ("AWS_ENDPOINT_URL_DYNAMODB", &self.dynamodb.aws_endpoint_url_dynamodb),
-        ];
-        for (key, val) in entries {
-            if let Some(v) = val {
-                opts.insert(key.into(), v.clone());
-            }
-        }
     }
 }
 
@@ -546,14 +496,8 @@ pub struct ParquetConfig {
     pub timefusion_zstd_compression_level: i32,
     #[serde(default = "d_zstd_level_warm")]
     pub timefusion_zstd_level_warm:        i32,
-    #[serde(default = "d_zstd_level_cool")]
-    pub timefusion_zstd_level_cool:        i32,
     #[serde(default = "d_zstd_level_cold")]
     pub timefusion_zstd_level_cold:        i32,
-    #[serde(default = "d_warm_cutoff_days")]
-    pub timefusion_warm_cutoff_days:       u64,
-    #[serde(default = "d_cool_cutoff_days")]
-    pub timefusion_cool_cutoff_days:       u64,
     #[serde(default = "d_cold_cutoff_days")]
     pub timefusion_cold_cutoff_days:       u64,
     #[serde(default = "d_row_group_size")]
