@@ -872,7 +872,10 @@ impl Database {
         let zstd_cold = self.config.parquet.timefusion_zstd_level_cold;
 
         if !recompress_schedule.is_empty() {
-            info!("Recompress job scheduled: {} (warm→cold@{}d zstd={})", recompress_schedule, cold_cutoff, zstd_cold);
+            info!(
+                "Recompress job scheduled: {} (warm→cold@{}d zstd={})",
+                recompress_schedule, cold_cutoff, zstd_cold
+            );
             // Cold sweep upper bound — partitions older than this fall under
             // vacuum; we don't need to keep extending the window indefinitely.
             let cold_upper = (self.config.maintenance.timefusion_vacuum_retention_hours / 24).max(cold_cutoff + 60);
