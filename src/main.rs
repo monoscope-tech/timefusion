@@ -52,7 +52,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // the early-bind responder instead of ECONNREFUSED, which is what
     // Hasql / pgjdbc / libpq expect during a backend restart and retry
     // on cleanly. See pgwire_early_bind for the responder.
-    let pg_listener = bind_pgwire_listener("0.0.0.0", cfg.core.pgwire_port, 4096).await?;
+    let pg_opts = ServerOptions::new().with_host("0.0.0.0".to_string()).with_port(cfg.core.pgwire_port);
+    let pg_listener = datafusion_postgres::bind_listener(pg_opts.host(), *pg_opts.port(), *pg_opts.backlog()).await?;
+    info!("PGWire listener bound on {}:{} (backlog={}) before startup work begins", pg_opts.host(), pg_opts.port(), pg_opts.backlog());
     let early_shutdown = tokio_util::sync::CancellationToken::new();
     let early_task = tokio::spawn({
         let shutdown = early_shutdown.clone();
@@ -191,11 +193,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let pg_task = tokio::spawn({
         let shutdown = pgwire_shutdown.clone();
         async move {
-            // host/port/backlog already applied at bind time; opts only
-            // contributes TLS + max_connections from here on.
-            let opts = ServerOptions::new();
             if let Err(e) =
-                timefusion::pgwire_handlers::serve_with_listener(listener, Arc::new(session_context), &opts, auth_config, shutdown.cancelled_owned())
+                timefusion::pgwire_handlers::serve_with_listener(listener, Arc::new(session_context), &pg_opts, auth_config, shutdown.cancelled_owned())
                     .await
             {
                 error!("PGWire server error: {}", e);
@@ -334,14 +333,3 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bind via `TcpSocket` so we can pass an explicit `backlog`
-/// (`TcpListener::bind` hardcodes 128; kernel still clamps to `somaxconn`).
-async fn bind_pgwire_listener(host: &str, port: u16, backlog: u32) -> anyhow::Result<tokio::net::TcpListener> {
-    use tokio::net::{lookup_host, TcpSocket};
-    let server_addr = format!("{host}:{port}");
-    let addr = lookup_host(&server_addr).await?.next().ok_or_else(|| anyhow::anyhow!("could not resolve {server_addr}"))?;
-    let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    Ok(socket.listen(backlog)?)
-}

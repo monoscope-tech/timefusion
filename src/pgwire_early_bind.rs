@@ -9,8 +9,7 @@
 //! hard error. Hand the same `TcpListener` to `serve_with_listener` once
 //! ready: no rebind, no ECONNREFUSED window.
 
-use std::io;
-use std::sync::Arc;
+use std::{io, sync::Arc, time::Duration};
 
 use datafusion_postgres::pgwire::messages::startup::{GssEncRequest, SslRequest};
 use tokio::{
@@ -23,7 +22,7 @@ use tracing::{debug, warn};
 const SSL_REQUEST_CODE: u32 = SslRequest::BODY_MAGIC_NUMBER as u32;
 const GSS_REQUEST_CODE: u32 = GssEncRequest::BODY_MAGIC_NUMBER as u32;
 const MAX_STARTUP_BYTES: u64 = 64 * 1024;
-const STARTUP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const STARTUP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run the 57P03 acceptor on `listener` until `shutdown` is cancelled.
 pub async fn run_until_ready(listener: &TcpListener, shutdown: CancellationToken) {
@@ -52,6 +51,10 @@ pub async fn run_until_ready(listener: &TcpListener, shutdown: CancellationToken
 async fn handle_one(mut sock: TcpStream, response: &[u8]) -> io::Result<()> {
     // SSL/GSS negotiation precedes the real StartupMessage; both are 8 bytes
     // (length + magic). Drain whichever shape arrives, then send 57P03.
+    // pg length fields include the 4-byte length itself. In the non-SSL branch
+    // we've also consumed the 4-byte code → drain `len - 8`; in the SSL/GSS
+    // branch we've consumed only the length of the *real* startup → drain
+    // `real_len - 4`.
     let len = sock.read_u32().await? as u64;
     let code = sock.read_u32().await?;
     if code == SSL_REQUEST_CODE || code == GSS_REQUEST_CODE {
@@ -98,6 +101,8 @@ fn build_starting_up_response() -> Vec<u8> {
 mod tests {
     use super::*;
 
+    const PROTO_3_0: u32 = 0x0003_0000;
+
     #[test]
     fn response_frame_has_expected_shape() {
         let msg = build_starting_up_response();
@@ -135,7 +140,7 @@ mod tests {
         let (port, shutdown, task) = spawn_acceptor().await;
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         client.write_all(&8u32.to_be_bytes()).await.unwrap();
-        client.write_all(&196608u32.to_be_bytes()).await.unwrap();
+        client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
         assert_57p03(&mut client).await;
         let mut tail = [0u8; 1];
         assert_eq!(client.read(&mut tail).await.unwrap(), 0, "server must close after error");
@@ -152,7 +157,7 @@ mod tests {
         client.read_exact(&mut n_reply).await.unwrap();
         assert_eq!(n_reply[0], b'N');
         client.write_all(&8u32.to_be_bytes()).await.unwrap();
-        client.write_all(&196608u32.to_be_bytes()).await.unwrap();
+        client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
         assert_57p03(&mut client).await;
         shutdown.cancel();
         let _ = task.await;
@@ -166,5 +171,36 @@ mod tests {
     #[tokio::test]
     async fn responds_to_gss_request_then_startup() {
         negotiation_then_startup(GSS_REQUEST_CODE).await;
+    }
+
+    /// Exercises drain_body with n > 0 (the no-params test sends len=8, n=0).
+    #[tokio::test]
+    async fn drains_startup_params_then_responds() {
+        let (port, shutdown, task) = spawn_acceptor().await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let params = b"user\0foo\0database\0bar\0\0";
+        let len = (4 + 4 + params.len()) as u32;
+        client.write_all(&len.to_be_bytes()).await.unwrap();
+        client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
+        client.write_all(params).await.unwrap();
+        assert_57p03(&mut client).await;
+        shutdown.cancel();
+        let _ = task.await;
+    }
+
+    /// Oversized declared length must trip the MAX_STARTUP_BYTES guard;
+    /// the server drops the connection without sending a response.
+    #[tokio::test]
+    async fn rejects_oversized_startup() {
+        let (port, shutdown, task) = spawn_acceptor().await;
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let oversized = (MAX_STARTUP_BYTES as u32) + 1024;
+        client.write_all(&oversized.to_be_bytes()).await.unwrap();
+        client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
+        let mut tag = [0u8; 1];
+        let n = client.read(&mut tag).await.unwrap();
+        assert_eq!(n, 0, "server must drop connection on oversized startup");
+        shutdown.cancel();
+        let _ = task.await;
     }
 }

@@ -123,13 +123,16 @@ pub async fn serve_with_hooks(session_context: Arc<SessionContext>, opts: &Serve
 pub async fn serve_with_handlers(
     handlers: Arc<impl PgWireServerHandlers + Sync + Send + 'static>, opts: &ServerOptions, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), std::io::Error> {
-    // Bind to the specified host and port. Use `TcpSocket` instead of
-    // `TcpListener::bind` so we can request a real backlog — mio hardcodes
-    // 128, which trivially overflows under thundering-herd reconnects (e.g.
-    // background jobs retrying on exp-backoff) and produces ECONNREFUSED on
-    // hosts with `tcp_abort_on_overflow=1`. The kernel will still clamp to
-    // `somaxconn`, so the host sysctl must also be raised in deploy config.
-    let server_addr = format!("{}:{}", opts.host, opts.port);
+    let listener = bind_listener(&opts.host, opts.port, opts.backlog).await?;
+    serve_with_listener(listener, handlers, opts, shutdown).await
+}
+
+/// Bind a TCP listener via `TcpSocket` so the caller can request a real
+/// `backlog` — `TcpListener::bind` hardcodes 128 via mio, which trivially
+/// overflows under thundering-herd reconnects. The kernel still clamps to
+/// `somaxconn`, so the host sysctl must match.
+pub async fn bind_listener(host: &str, port: u16, backlog: u32) -> Result<TcpListener, std::io::Error> {
+    let server_addr = format!("{host}:{port}");
     let addr = lookup_host(&server_addr)
         .await?
         .next()
@@ -137,8 +140,7 @@ pub async fn serve_with_handlers(
     let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
-    let listener = socket.listen(opts.backlog)?;
-    serve_with_listener(listener, handlers, opts, shutdown).await
+    socket.listen(backlog)
 }
 
 /// Like `serve_with_handlers`, but accepts an already-bound `TcpListener`.
@@ -169,11 +171,8 @@ pub async fn serve_with_listener(
     };
 
     let local_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".to_string());
-    if tls_acceptor.is_some() {
-        info!("Listening on {local_addr} with TLS encryption");
-    } else {
-        info!("Listening on {local_addr} (unencrypted)");
-    }
+    let tls_label = if tls_acceptor.is_some() { "TLS" } else { "unencrypted" };
+    info!("Listening on {local_addr} ({tls_label}, backlog={})", opts.backlog);
 
     // Connection limiter (if configured)
     let max_conn_count = opts.max_connections;
