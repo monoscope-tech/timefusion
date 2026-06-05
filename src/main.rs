@@ -52,15 +52,14 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // the early-bind responder instead of ECONNREFUSED, which is what
     // Hasql / pgjdbc / libpq expect during a backend restart and retry
     // on cleanly. See pgwire_early_bind for the responder.
-    let pg_port = cfg.core.pgwire_port;
-    let pg_backlog = 4096u32;
-    let pg_listener = Arc::new(bind_pgwire_listener("0.0.0.0", pg_port, pg_backlog).await?);
-    info!("PGWire listener bound on :{} (backlog={}) before startup work begins", pg_port, pg_backlog);
+    let pg_listener = bind_pgwire_listener("0.0.0.0", cfg.core.pgwire_port, 4096).await?;
     let early_shutdown = tokio_util::sync::CancellationToken::new();
-    let early_shutdown_for_task = early_shutdown.clone();
-    let early_listener = Arc::clone(&pg_listener);
-    let early_task = tokio::spawn(async move {
-        timefusion::pgwire_early_bind::run_until_ready(&early_listener, early_shutdown_for_task).await;
+    let early_task = tokio::spawn({
+        let shutdown = early_shutdown.clone();
+        async move {
+            timefusion::pgwire_early_bind::run_until_ready(&pg_listener, shutdown).await;
+            pg_listener
+        }
     });
 
     // Initialize database with explicit config
@@ -177,13 +176,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Start PGWire server on the listener we pre-bound at the top of
     // async_main. First, hand control of that listener back from the
     // early-bind 57P03 responder.
-    info!("Stopping early-bind 57P03 responder; handing listener to real PGWire server");
+    // handle_one tasks accepted just before shutdown may still be running;
+    // they own only the accepted sockets and complete independently.
     early_shutdown.cancel();
-    let _ = early_task.await;
-    // Both Arc handles dropped now (early_task held the only other one);
-    // try_unwrap should succeed and give us the owned listener.
-    let listener = Arc::try_unwrap(pg_listener)
-        .map_err(|_| anyhow::anyhow!("PGWire listener still has outstanding Arc references after early-bind shutdown"))?;
+    let listener = early_task.await?;
 
     let auth_config = timefusion::pgwire_handlers::AuthConfig::from_core(&cfg.core)?;
 
@@ -192,16 +188,18 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // BufferedWriteLayer flush isn't racing fresh inserts. Already-accepted
     // connections finish on their own spawned tasks.
     let pgwire_shutdown = tokio_util::sync::CancellationToken::new();
-    let pgwire_shutdown_for_task = pgwire_shutdown.clone();
-    let pg_task = tokio::spawn(async move {
-        let opts = ServerOptions::new().with_port(pg_port).with_host("0.0.0.0".to_string()).with_backlog(pg_backlog);
-
-        if let Err(e) = timefusion::pgwire_handlers::serve_with_listener(listener, Arc::new(session_context), &opts, auth_config, async move {
-            pgwire_shutdown_for_task.cancelled().await
-        })
-        .await
-        {
-            error!("PGWire server error: {}", e);
+    let pg_task = tokio::spawn({
+        let shutdown = pgwire_shutdown.clone();
+        async move {
+            // host/port/backlog already applied at bind time; opts only
+            // contributes TLS + max_connections from here on.
+            let opts = ServerOptions::new();
+            if let Err(e) =
+                timefusion::pgwire_handlers::serve_with_listener(listener, Arc::new(session_context), &opts, auth_config, shutdown.cancelled_owned())
+                    .await
+            {
+                error!("PGWire server error: {}", e);
+            }
         }
     });
 
@@ -336,11 +334,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Bind the PGWire listener on `host:port` with an explicit backlog of
-/// `backlog`. Uses `TcpSocket` rather than `TcpListener::bind` so we
-/// control the backlog (mio's `bind` hardcodes 128); the kernel still
-/// clamps to `somaxconn`. Pulled out as its own function so the early
-/// 57P03 responder and the real server share one bind path.
+/// Bind via `TcpSocket` so we can pass an explicit `backlog`
+/// (`TcpListener::bind` hardcodes 128; kernel still clamps to `somaxconn`).
 async fn bind_pgwire_listener(host: &str, port: u16, backlog: u32) -> anyhow::Result<tokio::net::TcpListener> {
     use tokio::net::{lookup_host, TcpSocket};
     let server_addr = format!("{host}:{port}");

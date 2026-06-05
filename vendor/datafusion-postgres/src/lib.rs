@@ -170,9 +170,9 @@ pub async fn serve_with_listener(
 
     let local_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".to_string());
     if tls_acceptor.is_some() {
-        info!("Listening on {local_addr} with TLS encryption (backlog requested={})", opts.backlog);
+        info!("Listening on {local_addr} with TLS encryption");
     } else {
-        info!("Listening on {local_addr} (unencrypted, backlog requested={})", opts.backlog);
+        info!("Listening on {local_addr} (unencrypted)");
     }
 
     // Connection limiter (if configured)
