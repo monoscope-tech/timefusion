@@ -108,6 +108,7 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
 serial_test = "3.2.0"
+tokio = { version = "1.48", features = ["test-util"] }
 datafusion-common = "53.1.0"
 tokio-postgres = { version = "0.7.10", features = ["with-chrono-0_4"] }
 scopeguard = "1.2.0"

@@ -353,6 +353,18 @@ pub async fn serve_with_logging(
     Ok(())
 }
 
+/// Variant of `serve_with_logging` over a pre-bound listener. The listener's
+/// host/port/backlog were set at bind time; `options` here contributes only
+/// TLS config and connection-limit settings.
+pub async fn serve_with_listener(
+    listener: tokio::net::TcpListener, session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_config));
+    datafusion_postgres::serve_with_listener(listener, handlers, options, shutdown).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::rewrite_pg_synonyms;

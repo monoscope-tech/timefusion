@@ -203,22 +203,38 @@ impl BlockStateTracker {
     }
 
     pub(super) fn set_checkpointed_true(block_id: usize) {
-        let path_opt = {
+        // Idempotent: only increment the file's checkpoint counter on the
+        // false→true transition. Prior to this, repeated calls would
+        // double-increment `checkpoint_block_ctr` (cursor rebases across
+        // chain resets, or the new fast-forward path in
+        // `set_persisted_read_position`), potentially overshooting `total`
+        // without ever clearing — and on the other side of the comparison,
+        // legitimately-checkpointed blocks could fail the `>= total` check
+        // if a parallel duplicate consumed the increment "budget" earlier.
+        let (path_opt, transitioned) = {
             let map = Self::map();
             if let Ok(r) = map.read() {
                 if let Some(b) = r.get(&block_id) {
-                    b.is_checkpointed.store(true, Ordering::Release);
-                    Some(b.file_path.clone())
+                    let prev = b.is_checkpointed.swap(true, Ordering::AcqRel);
+                    (Some(b.file_path.clone()), !prev)
                 } else {
-                    None
+                    (None, false)
                 }
             } else {
-                None
+                (None, false)
             }
         };
 
         if let Some(path) = path_opt {
-            FileStateTracker::inc_checkpoint_for_file(&path);
+            if transitioned {
+                FileStateTracker::inc_checkpoint_for_file(&path);
+            }
+            // Deliberate: call flush_check even when no transition happened.
+            // It acts as a retry for files whose previous checkpoint observation
+            // raced `set_fully_allocated` and didn't reclaim — replays of the
+            // same block_id can still close out the file. Tradeoff: a slightly
+            // hotter DELETION_TX channel (one extra send per duplicate call)
+            // in exchange for correctness against racing observers.
             flush_check(path);
         }
     }
