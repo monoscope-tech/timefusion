@@ -229,6 +229,10 @@ impl BlockStateTracker {
             if transitioned {
                 FileStateTracker::inc_checkpoint_for_file(&path);
             }
+            // Deliberate: call flush_check even when no transition happened.
+            // It acts as a retry for files whose previous checkpoint observation
+            // raced `set_fully_allocated` and didn't reclaim — replays of the
+            // same block_id can still close out the file.
             flush_check(path);
         }
     }

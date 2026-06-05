@@ -8,6 +8,7 @@ pub mod testing;
 
 use std::fs::File;
 use std::io::{BufReader, Error as IOError, ErrorKind};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
@@ -133,10 +134,15 @@ pub async fn serve_with_handlers(
 /// `somaxconn`, so the host sysctl must match.
 pub async fn bind_listener(host: &str, port: u16, backlog: u32) -> Result<TcpListener, std::io::Error> {
     let server_addr = format!("{host}:{port}");
-    let addr = lookup_host(&server_addr)
-        .await?
-        .next()
-        .ok_or_else(|| IOError::new(ErrorKind::InvalidInput, format!("could not resolve {server_addr}")))?;
+    // Skip the async resolver round-trip when host parses as a literal IP
+    // (the common 0.0.0.0 / :: case). lookup_host is only needed for names.
+    let addr = match server_addr.parse::<SocketAddr>() {
+        Ok(a) => a,
+        Err(_) => lookup_host(&server_addr)
+            .await?
+            .next()
+            .ok_or_else(|| IOError::new(ErrorKind::InvalidInput, format!("could not resolve {server_addr}")))?,
+    };
     let socket = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;

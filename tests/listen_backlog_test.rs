@@ -185,6 +185,9 @@ async fn larger_backlog_eliminates_overflow_under_same_burst() {
         );
     }
 
+    // Assertion is Linux-only: on macOS, kern.ipc.somaxconn often clamps below
+    // BACKLOG, so we can't enforce a strict ok==BURST contract. The eprintln!
+    // above surfaces the macOS case as a diagnostic.
     #[cfg(target_os = "linux")]
     assert_eq!(
         ok, BURST,
@@ -228,19 +231,12 @@ async fn worker_starvation_causes_backlog_overflow_under_burst() {
         }
     });
 
-    // Saturate every worker with a CPU-bound spin. This is the bit that
-    // mimics heavy query execution starving the accept task.
-    let hogs: Vec<_> = (0..2)
-        .map(|_| {
-            tokio::task::spawn_blocking(move || {
-                // spawn_blocking would NOT starve the runtime — use a normal
-                // tokio::spawn with a CPU-bound loop instead so it occupies
-                // a runtime worker.
-            })
-        })
-        .collect();
-    drop(hogs);
-
+    // Saturate every worker with a CPU-bound spin. This mimics heavy query
+    // execution starving the accept task.
+    //
+    // NOTE: tokio::task::spawn_blocking does NOT starve the runtime — it runs
+    // on a dedicated blocking pool. Use tokio::spawn with a tight CPU-bound
+    // loop (no .await points) so the work actually pins a runtime worker.
     let hogs: Vec<_> = (0..2)
         .map(|i| {
             tokio::spawn(async move {

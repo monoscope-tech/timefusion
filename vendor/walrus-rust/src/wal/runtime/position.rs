@@ -180,6 +180,8 @@ impl Walrus {
     /// `checkpointed >= total` (and unlocked, fully allocated). Useful for
     /// regression tests covering the cursor fast-forward → file-reclaim
     /// path; not part of normal runtime use.
+    // test-only: kept `pub` so cross-crate regression tests in tests/position.rs
+    // can probe file-level checkpoint counts after fast-forward.
     #[doc(hidden)]
     pub fn block_file_checkpoint_state(block_id: u64) -> Option<(u16, u16)> {
         let path = BlockStateTracker::get_file_path_for_block(block_id as usize)?;
