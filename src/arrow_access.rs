@@ -66,4 +66,10 @@ impl<'a> StrAccessor<'a> {
             Self::View(a) => a.value(i),
         }
     }
+
+    /// Null-aware read: `None` if row `i` is null, else the string value.
+    #[inline]
+    pub fn get(&self, i: usize) -> Option<&str> {
+        if self.is_null(i) { None } else { Some(self.value(i)) }
+    }
 }

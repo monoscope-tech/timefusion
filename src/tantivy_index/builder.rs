@@ -17,7 +17,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::{
-    array::{Array, ArrayRef, AsArray, ListArray, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray},
+    array::{Array, ArrayRef, ListArray, StringArray, StringViewArray, StructArray, TimestampMicrosecondArray},
     datatypes::DataType,
     record_batch::RecordBatch,
 };
@@ -26,6 +26,7 @@ use parquet_variant_json::VariantToJson;
 use tantivy::{Index, IndexWriter, doc, schema::Schema as TSchema};
 
 use crate::{
+    arrow_access::StrAccessor,
     schema_loader::TableSchema,
     tantivy_index::schema::{BuiltSchema, build_for_table},
 };
@@ -152,17 +153,8 @@ impl ColKind {
 }
 
 fn string_extractor(col: &ArrayRef) -> Result<Box<dyn Fn(usize) -> Option<String> + '_>> {
-    Ok(match col.data_type() {
-        DataType::Utf8 => {
-            let a = col.as_string::<i32>();
-            Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i).to_string()) })
-        }
-        DataType::Utf8View => {
-            let a = col.as_string_view();
-            Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i).to_string()) })
-        }
-        other => bail!("id column must be Utf8/Utf8View, got {other:?}"),
-    })
+    let a = StrAccessor::try_new(col).map_err(|_| anyhow!("id column must be Utf8/Utf8View, got {:?}", col.data_type()))?;
+    Ok(Box::new(move |i| a.get(i).map(str::to_string)))
 }
 
 fn list_to_text(arr: &ListArray, row: usize) -> Result<Option<String>> {

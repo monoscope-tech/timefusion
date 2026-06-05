@@ -12,13 +12,15 @@
 use std::{any::Any, sync::Arc};
 
 use arrow::{
-    array::{Array, ArrayRef, BooleanBuilder, StringArray, StringViewArray},
+    array::{ArrayRef, BooleanBuilder},
     datatypes::DataType,
 };
 use datafusion::{
     common::Result as DFResult,
     logical_expr::{ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility},
 };
+
+use crate::arrow_access::StrAccessor;
 
 pub const TEXT_MATCH_NAME: &str = "text_match";
 
@@ -86,18 +88,11 @@ impl ScalarUDFImpl for TextMatchUdf {
 }
 
 fn string_extractor(arr: &ArrayRef) -> Box<dyn Fn(usize) -> Option<String> + '_> {
-    match arr.data_type() {
-        DataType::Utf8 => {
-            let a = arr.as_any().downcast_ref::<StringArray>().unwrap();
-            Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i).to_string()) })
-        }
-        DataType::Utf8View => {
-            let a = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
-            Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i).to_string()) })
-        }
+    match StrAccessor::try_new(arr) {
+        Ok(a) => Box::new(move |i| a.get(i).map(str::to_string)),
         // Variant or anything else — degrade to never-match (tantivy still works
         // on the indexed side; mem-buffer post-filter would need json eval here).
-        _ => Box::new(|_| None),
+        Err(_) => Box::new(|_| None),
     }
 }
 
