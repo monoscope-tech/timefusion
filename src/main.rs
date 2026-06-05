@@ -53,8 +53,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Hasql / pgjdbc / libpq expect during a backend restart and retry
     // on cleanly. See pgwire_early_bind for the responder.
     let pg_opts = ServerOptions::new().with_host("0.0.0.0".to_string()).with_port(cfg.core.pgwire_port);
-    let pg_listener = datafusion_postgres::bind_listener(pg_opts.host(), *pg_opts.port(), *pg_opts.backlog()).await?;
-    info!("PGWire listener bound on {}:{} (backlog={}) before startup work begins", pg_opts.host(), pg_opts.port(), pg_opts.backlog());
+    let (host, port, backlog) = (pg_opts.host().clone(), *pg_opts.port(), *pg_opts.backlog());
+    let pg_listener = datafusion_postgres::bind_listener(&host, port, backlog).await?;
+    info!("PGWire listener bound on {host}:{port} (backlog={backlog}) before startup work begins");
     let early_shutdown = tokio_util::sync::CancellationToken::new();
     let early_task = tokio::spawn({
         let shutdown = early_shutdown.clone();

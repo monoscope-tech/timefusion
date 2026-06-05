@@ -170,9 +170,12 @@ pub async fn serve_with_listener(
         None
     };
 
+    // Note: opts.backlog reflects the options object, not necessarily the
+    // listening socket — callers passing a pre-bound listener may have set a
+    // different backlog at bind time.
     let local_addr = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".to_string());
     let tls_label = if tls_acceptor.is_some() { "TLS" } else { "unencrypted" };
-    info!("Listening on {local_addr} ({tls_label}, backlog={})", opts.backlog);
+    info!("Listening on {local_addr} ({tls_label})");
 
     // Connection limiter (if configured)
     let max_conn_count = opts.max_connections;

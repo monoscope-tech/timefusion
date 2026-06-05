@@ -21,20 +21,36 @@ use tracing::{debug, warn};
 
 const SSL_REQUEST_CODE: u32 = SslRequest::BODY_MAGIC_NUMBER as u32;
 const GSS_REQUEST_CODE: u32 = GssEncRequest::BODY_MAGIC_NUMBER as u32;
+/// Cap on the StartupMessage size we'll drain. Real pg clients send well
+/// under 1 KiB; 64 KiB is comfortably above any legitimate payload and
+/// bounds the work a malformed/hostile client can force on us.
 const MAX_STARTUP_BYTES: u64 = 64 * 1024;
 const STARTUP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard cap on concurrent early-bind handlers. A thundering-herd reconnect
+/// storm during startup could otherwise spawn unbounded tasks, each holding
+/// a socket FD for up to STARTUP_READ_TIMEOUT. Excess connections are accepted
+/// and immediately dropped (closing the socket); clients see this as a reset
+/// and retry, same as if the kernel had dropped the SYN.
+const MAX_CONCURRENT_EARLY_HANDLERS: usize = 512;
 
 /// Run the 57P03 acceptor on `listener` until `shutdown` is cancelled.
 pub async fn run_until_ready(listener: &TcpListener, shutdown: CancellationToken) {
     let response: Arc<[u8]> = build_starting_up_response().into();
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EARLY_HANDLERS));
     loop {
         tokio::select! {
             biased;
             _ = shutdown.cancelled() => return,
             res = listener.accept() => match res {
                 Ok((sock, addr)) => {
+                    let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                        debug!("early-bind: at handler cap, dropping conn from {addr}");
+                        drop(sock);
+                        continue;
+                    };
                     let resp = Arc::clone(&response);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         match tokio::time::timeout(STARTUP_READ_TIMEOUT, handle_one(sock, &resp)).await {
                             Err(_) => debug!("early-bind: timeout waiting for startup from {addr}"),
                             Ok(Err(e)) => debug!("early-bind: short-circuit conn from {addr}: {e}"),
@@ -71,9 +87,9 @@ async fn handle_one(mut sock: TcpStream, response: &[u8]) -> io::Result<()> {
 }
 
 async fn drain_body(sock: &mut TcpStream, remaining: Option<u64>) -> io::Result<()> {
-    let n = remaining.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "startup length below header"))?;
+    let n = remaining.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "startup length below 8-byte header"))?;
     if n > MAX_STARTUP_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("startup body too large: {n}")));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("startup body {n} exceeds {MAX_STARTUP_BYTES}-byte cap")));
     }
     tokio::io::copy(&mut sock.take(n), &mut tokio::io::sink()).await?;
     Ok(())
@@ -159,6 +175,8 @@ mod tests {
         client.write_all(&8u32.to_be_bytes()).await.unwrap();
         client.write_all(&PROTO_3_0.to_be_bytes()).await.unwrap();
         assert_57p03(&mut client).await;
+        let mut tail = [0u8; 1];
+        assert_eq!(client.read(&mut tail).await.unwrap(), 0, "server must close after error");
         shutdown.cancel();
         let _ = task.await;
     }
