@@ -23,6 +23,7 @@ use datafusion::{
 use parking_lot::Mutex;
 use tracing::{debug, info, instrument, warn};
 
+use crate::error_ext::ArrowResultExt;
 use crate::functions::FnRegistry;
 
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
@@ -275,11 +276,11 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String]) -> anyhow::Resu
 fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray) -> DFResult<ArrayRef> {
     // Cast new_values to match original's type if they differ (e.g., Utf8 -> Utf8View)
     let new_values = if original.data_type() != new_values.data_type() {
-        arrow::compute::cast(new_values, original.data_type()).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+        arrow::compute::cast(new_values, original.data_type()).into_df()?
     } else {
         new_values.clone()
     };
-    arrow::compute::kernels::zip::zip(mask, &new_values, original).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::kernels::zip::zip(mask, &new_values, original).into_df()
 }
 
 /// Parse a SQL fragment into a DataFusion Expr. `schema` resolves column refs
@@ -1216,7 +1217,7 @@ impl MemBuffer {
                         .collect::<DFResult<Vec<_>>>()?;
 
                     let new_batch =
-                        RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                        RecordBatch::try_new(batch.schema(), new_columns).into_df()?;
                     bucket_delta += estimate_batch_size(&new_batch) as i64 - old_size as i64;
                     Ok(new_batch)
                 })

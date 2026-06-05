@@ -19,7 +19,7 @@ use datafusion::{
 };
 use tracing::{Instrument, error, field::Empty, info, instrument};
 
-use crate::{buffered_write_layer::BufferedWriteLayer, database::Database};
+use crate::{buffered_write_layer::BufferedWriteLayer, database::Database, error_ext::ExecResultExt};
 
 /// Build a clean SessionState with config + runtime from the given session but with
 /// delta-rs's DeltaPlanner instead of our custom DmlQueryPlanner.
@@ -239,7 +239,7 @@ fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assign
                 _ => Ok(Transformed::no(e)),
             })
             .map(|t| t.data)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to inline CSE alias: {}", e)))?;
+            .exec_context("Failed to inline CSE alias")?;
         *value_expr = new_expr;
     }
     Ok(())
@@ -547,7 +547,7 @@ pub async fn perform_delta_update(
         builder
             .await
             .map(|(table, metrics)| (table, metrics.num_updated_rows as u64))
-            .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta UPDATE: {}", e)))
+            .exec_context("Failed to execute Delta UPDATE")
     })
     .await;
 
@@ -583,7 +583,7 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
         builder
             .await
             .map(|(table, metrics)| (table, metrics.num_deleted_rows.unwrap_or(0) as u64))
-            .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta DELETE: {}", e)))
+            .exec_context("Failed to execute Delta DELETE")
     })
     .await;
 
@@ -611,7 +611,7 @@ where
     // where a concurrent DELETE/UPDATE could commit a new version that we'd then
     // overwrite with the stale snapshot from the closure's clone.
     let mut guard = table_lock.write().await;
-    guard.update_state().await.map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
+    guard.update_state().await.exec_context("Failed to refresh table state")?;
     let (new_table, rows_affected) = operation(guard.clone()).await?;
     *guard = new_table;
     Ok(rows_affected)
@@ -629,5 +629,5 @@ fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
             _ => Ok(datafusion::common::tree_node::Transformed::no(e)),
         })
         .map(|t| t.data)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to convert expression: {}", e)))
+        .exec_context("Failed to convert expression")
 }

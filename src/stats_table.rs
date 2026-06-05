@@ -20,12 +20,12 @@ use datafusion::{
     catalog::Session,
     common::Result as DFResult,
     datasource::{MemTable, TableProvider, TableType},
-    error::DataFusionError,
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
 };
 
 use crate::buffered_write_layer::BufferedWriteLayer;
+use crate::error_ext::ArrowResultExt;
 
 #[derive(Debug)]
 pub struct StatsTableProvider {
@@ -95,7 +95,7 @@ impl StatsTableProvider {
         let values: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
 
         let cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(components)), Arc::new(StringArray::from(keys)), Arc::new(StringArray::from(values))];
-        RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(Arc::clone(&self.schema), cols).into_df()
     }
 }
 

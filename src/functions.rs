@@ -23,6 +23,7 @@ use datafusion::{
 use serde_json::{Value as JsonValue, json};
 use tdigests::TDigest;
 
+use crate::error_ext::{ArrowResultExt, ExecResultExt};
 use crate::schema_loader::is_variant_type;
 
 /// Extract a String from any ScalarValue string type (Utf8, Utf8View, LargeUtf8)
@@ -279,7 +280,7 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
         };
         // Cast once to Utf8 — collapses Utf8/Utf8View/LargeUtf8 to a single
         // concrete shape, single pass over rows.
-        let utf8 = cast(&arr, &DataType::Utf8).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let utf8 = cast(&arr, &DataType::Utf8).into_df()?;
         let strs = utf8
             .as_any()
             .downcast_ref::<StringArray>()
@@ -481,7 +482,7 @@ fn create_set_clock_udf() -> ScalarUDF {
                 continue;
             }
             let t = chrono::DateTime::parse_from_rfc3339(s.value(i))
-                .map_err(|e| DataFusionError::Execution(format!("invalid rfc3339: {e}")))?
+                .exec_context("invalid rfc3339")?
                 .timestamp_micros();
             b.append_value(crate::clock::set_micros(t));
         }
@@ -1429,7 +1430,7 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
         };
 
         // Parse the JSONPath expression
-        let json_path = serde_json_path::JsonPath::parse(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {}", e)))?;
+        let json_path = serde_json_path::JsonPath::parse(&path_str).exec_context("Invalid JSONPath")?;
 
         // Process based on input type
         let result = if is_variant_type(json_array.data_type()) {
@@ -1535,7 +1536,7 @@ fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &serde_json_path::J
     if let Some(variant_path) = simple_path_to_variant_path(raw_path) {
         use parquet_variant_compute::{GetOptions, variant_get};
         let opts = GetOptions::new_with_path(variant_path);
-        let extracted = variant_get(array, opts).map_err(|e| DataFusionError::Execution(format!("variant_get failed: {e}")))?;
+        let extracted = variant_get(array, opts).exec_context("variant_get failed")?;
         // Path exists ↔ extracted row is non-null. is_null/is_not_null arrays
         // honor underlying null buffer cheaply (no per-row decode).
         let mut builder = BooleanArray::builder(extracted.len());
