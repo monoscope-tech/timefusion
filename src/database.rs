@@ -1913,7 +1913,10 @@ impl Database {
         let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), wal.shards_per_topic());
         let advanced = wal.merge_persisted_positions(project_id, table_name, &delta_max)?;
         if advanced > 0 {
-            info!("Delta-derived cursor advance: project={}, table={}, shards_advanced={}", project_id, table_name, advanced);
+            info!(
+                "Delta-derived cursor advance: project={}, table={}, shards_advanced={}",
+                project_id, table_name, advanced
+            );
         }
         Ok(advanced)
     }

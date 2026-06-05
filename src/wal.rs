@@ -696,7 +696,10 @@ impl WalManager {
                     continue;
                 }
             };
-            entries.insert(Self::make_topic(&project_id, &table_name), positions.into_iter().map(|p| p.map(pos_to_snap)).collect());
+            entries.insert(
+                Self::make_topic(&project_id, &table_name),
+                positions.into_iter().map(|p| p.map(pos_to_snap)).collect(),
+            );
         }
         let snap = CursorSnapshot {
             version: SNAPSHOT_VERSION,
