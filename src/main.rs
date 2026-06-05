@@ -174,6 +174,12 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     if skip_delta_scan {
         info!("Skipping Delta-derived cursor reconciliation (cursor snapshot is clean)");
     } else {
+        info!(
+            "Running Delta-derived cursor reconciliation (snapshot missing/dirty); scan_depth={}, concurrency={} \
+             — set TIMEFUSION_DELTA_SCAN_DEPTH higher if a deployment lost more commits than that since its last clean state",
+            cfg.buffer.delta_scan_depth(),
+            cfg.buffer.delta_scan_concurrency()
+        );
         match db.derive_wal_cursors_from_delta(wal_ref).await {
             Ok(0) => info!("Delta-derived cursor: no advancement needed"),
             Ok(n) => info!("Delta-derived cursor: advanced {} shard(s) past Delta watermark", n),

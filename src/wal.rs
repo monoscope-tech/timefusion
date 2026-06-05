@@ -207,6 +207,11 @@ impl WalManager {
             }
         }
 
+        // Sweep a leftover snapshot tmp file from a crash between
+        // `fs::write(tmp)` and `fs::rename(tmp, target)`. Harmless if it
+        // sticks around but trivial to clean here.
+        let _ = std::fs::remove_file(meta_dir.join("cursor_snapshot.json.tmp"));
+
         let shards_per_topic = shards_per_topic.max(1);
         info!(
             "WAL initialized at {:?}, known topics: {}, shards/topic: {}",
@@ -723,6 +728,9 @@ impl WalManager {
         // create_dir_all needed on every flush.
         let target = self.cursor_snapshot_path();
         let tmp = target.with_extension("json.tmp");
+        // Defensive: serde_json::to_vec on a struct with only primitive +
+        // standard-collection fields is infallible. Keep the map_err so a
+        // future field addition (custom Serialize) still surfaces clearly.
         let bytes = serde_json::to_vec(&snap).map_err(|e| WalError::Internal(format!("cursor snapshot encode: {}", e)))?;
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, &target)?;
@@ -768,8 +776,6 @@ impl WalManager {
     }
 
     /// Fast-forward walrus persisted-read cursors from a loaded snapshot.
-    /// Returns the number of shards that advanced (i.e. snapshot was ahead of
-    /// the locally-fsynced walrus state).
     /// Returns the number of *tables* where at least one shard moved (not the
     /// total shard-advance count — that's per-call via
     /// [`merge_persisted_positions`]).
@@ -1095,6 +1101,54 @@ mod tests {
         // Re-open with a different shard count — load must refuse.
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 8).unwrap();
         assert!(wal.load_cursor_snapshot().is_none());
+    }
+
+    /// Rescue path: walrus has no fsynced state for this topic (simulating a
+    /// crash that lost the persisted cursor while the WAL files themselves
+    /// survived). Restore from a hand-crafted snapshot pointing past origin
+    /// must actually move walrus's persisted_read_position forward — this
+    /// is the scenario the snapshot exists to handle, distinct from the
+    /// idempotent path in `..._roundtrip_restores_persisted_positions`.
+    #[test]
+    fn cursor_snapshot_restore_advances_walrus_past_local_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let wal = WalManager::with_fsync_mode_and_shards(path, crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+
+        // Walrus knows nothing about ("p", "t") yet → all shards None.
+        assert!(wal.persisted_read_positions("p", "t").unwrap().iter().all(Option::is_none));
+
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(WalManager::make_topic("p", "t"), vec![Some((7u64, 42u64)), None, Some((3, 0)), None]);
+        let snap = CursorSnapshot {
+            version: SNAPSHOT_VERSION,
+            written_at_micros: 0,
+            shards_per_topic: 4,
+            clean_shutdown: true,
+            entries,
+        };
+        let tables_advanced = wal.restore_cursor_snapshot(&snap).unwrap();
+        assert_eq!(tables_advanced, 1, "the one snapshot table must advance from origin");
+
+        let after = wal.persisted_read_positions("p", "t").unwrap();
+        assert_eq!(after[0].map(|p| (p.block_id, p.offset)), Some((7, 42)));
+        assert_eq!(after[2].map(|p| (p.block_id, p.offset)), Some((3, 0)));
+    }
+
+    /// On crash between `fs::write(tmp)` and `fs::rename(tmp, target)` we
+    /// leave `cursor_snapshot.json.tmp` behind. The next WalManager init
+    /// must sweep it so it doesn't accumulate over many crash-restart cycles.
+    #[test]
+    fn cursor_snapshot_tmp_swept_on_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        // First init creates `.timefusion_meta/`.
+        drop(WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap());
+        let tmp = path.join(".timefusion_meta/cursor_snapshot.json.tmp");
+        std::fs::write(&tmp, b"partial").unwrap();
+        assert!(tmp.exists());
+        drop(WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap());
+        assert!(!tmp.exists(), "init must sweep leftover tmp file");
     }
 
     /// `delete_cursor_snapshot` removes a present file and is a no-op when
