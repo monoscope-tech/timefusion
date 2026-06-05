@@ -226,7 +226,7 @@ MemBuffer
 
 ```rust
 AppConfig {
-    aws: AwsConfig,              // S3/DynamoDB credentials and endpoints
+    aws: AwsConfig,              // S3 credentials and endpoints
     core: CoreConfig,            // Data directory, PGWire port, table prefix
     buffer: BufferConfig,        // Flush intervals, memory limits, WAL settings
     cache: CacheConfig,          // Foyer cache sizes, TTL

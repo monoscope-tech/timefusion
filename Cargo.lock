@@ -7887,7 +7887,6 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "aws-config",
- "aws-sdk-dynamodb",
  "aws-sdk-s3",
  "aws-types",
  "base64",

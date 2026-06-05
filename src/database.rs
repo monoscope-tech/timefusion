@@ -458,7 +458,7 @@ impl Database {
         crate::dml::perform_delta_delete(self, table_name, project_id, predicate, session).await
     }
 
-    /// Build storage options with consistent configuration including DynamoDB locking if enabled
+    /// Build storage options with consistent configuration for S3.
     fn build_storage_options(&self) -> HashMap<String, String> {
         let storage_options = self.config.aws.build_storage_options(self.default_s3_endpoint.as_deref());
 
@@ -660,30 +660,6 @@ impl Database {
         let aws_url = Url::parse(aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
         info!("AWS handlers registered");
-
-        // Check for DynamoDB locking configuration
-        if cfg.aws.is_dynamodb_locking_enabled() {
-            if let Some(ref table) = cfg.aws.dynamodb.delta_dynamo_table_name {
-                info!("DynamoDB locking enabled with table: {}", table);
-
-                if let Some(ref endpoint) = cfg.aws.dynamodb.aws_endpoint_url_dynamodb {
-                    info!("DynamoDB endpoint: {}", endpoint);
-                }
-                if let Some(ref region) = cfg.aws.dynamodb.aws_region_dynamodb {
-                    info!("DynamoDB region: {}", region);
-                }
-                info!(
-                    "DynamoDB credentials configured: access_key={}, secret_key={}",
-                    cfg.aws.dynamodb.aws_access_key_id_dynamodb.is_some(),
-                    cfg.aws.dynamodb.aws_secret_access_key_dynamodb.is_some()
-                );
-            }
-        } else {
-            info!(
-                "DynamoDB locking not configured. AWS_S3_LOCKING_PROVIDER={:?}, DELTA_DYNAMO_TABLE_NAME={:?}",
-                cfg.aws.dynamodb.aws_s3_locking_provider, cfg.aws.dynamodb.delta_dynamo_table_name
-            );
-        }
 
         // Store default S3 settings for unconfigured mode
         let default_s3_bucket = cfg.aws.aws_s3_bucket.clone();
@@ -888,20 +864,15 @@ impl Database {
             info!("Optimize job scheduling skipped - empty schedule");
         }
 
-        // Recompress job - daily tier upgrade for cool (7-30d) and cold (30d+).
+        // Recompress job - daily tier upgrade for cold (14d+).
         // Skips partitions whose probe file already advertises the target tier
         // via Parquet footer metadata, so re-runs are cheap on stable data.
         let recompress_schedule = self.config.maintenance.timefusion_recompress_schedule.clone();
-        let cool_cutoff = self.config.parquet.timefusion_cool_cutoff_days;
         let cold_cutoff = self.config.parquet.timefusion_cold_cutoff_days;
-        let zstd_cool = self.config.parquet.timefusion_zstd_level_cool;
         let zstd_cold = self.config.parquet.timefusion_zstd_level_cold;
 
         if !recompress_schedule.is_empty() {
-            info!(
-                "Recompress job scheduled: {} (warm→cool@{}d zstd={}, cool→cold@{}d zstd={})",
-                recompress_schedule, cool_cutoff, zstd_cool, cold_cutoff, zstd_cold
-            );
+            info!("Recompress job scheduled: {} (warm→cold@{}d zstd={})", recompress_schedule, cold_cutoff, zstd_cold);
             // Cold sweep upper bound — partitions older than this fall under
             // vacuum; we don't need to keep extending the window indefinitely.
             let cold_upper = (self.config.maintenance.timefusion_vacuum_retention_hours / 24).max(cold_cutoff + 60);
@@ -916,12 +887,7 @@ impl Database {
                         let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
                             db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
                         targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
-                        // Cool tier first, then cold — order matters only at
-                        // the cutoff boundary where files may need two hops.
                         for (name, table) in &targets {
-                            if let Err(e) = db.recompress_tier_window(table, name, cool_cutoff, cold_cutoff, zstd_cool).await {
-                                error!("Recompress (cool tier) failed for '{}': {}", name, e);
-                            }
                             if let Err(e) = db.recompress_tier_window(table, name, cold_cutoff, cold_upper, zstd_cold).await {
                                 error!("Recompress (cold tier) failed for '{}': {}", name, e);
                             }
@@ -1515,10 +1481,6 @@ impl Database {
             storage_options.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone());
         }
 
-        // Add DynamoDB locking configuration if enabled (same block the default
-        // storage-options builder uses).
-        self.config.aws.add_dynamodb_locking_options(&mut storage_options);
-
         info!(
             "Creating or loading custom table for project '{}' table '{}' at: {}",
             project_id, table_name, storage_uri
@@ -1720,14 +1682,6 @@ impl Database {
         }
 
         let store = builder.build()?;
-
-        // Log if DynamoDB locking is enabled for this store
-        if storage_options.get("AWS_S3_LOCKING_PROVIDER") == Some(&"dynamodb".to_string())
-            && let Some(table_name) = storage_options.get("DELTA_DYNAMO_TABLE_NAME")
-        {
-            debug!("Object store configured with DynamoDB locking using table: {}", table_name);
-        }
-
         Ok(Arc::new(store))
     }
 
@@ -1885,16 +1839,12 @@ impl Database {
                     if error_str.contains("already exists")
                         || error_str.contains("conflict")
                         || error_str.contains("version")
-                        || error_str.contains("ConditionalCheckFailedException")
                         || error_str.contains("concurrent modification")
                     {
-                        // This is a version conflict or DynamoDB locking conflict, retry
+                        // Version conflict, retry with backoff.
                         retry_count += 1;
                         last_error = Some(e);
-                        debug!(
-                            "Delta write conflict detected (possibly DynamoDB lock conflict), retrying... (attempt {}/{})",
-                            retry_count, max_retries
-                        );
+                        debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, max_retries);
 
                         // Exponential backoff for better handling of concurrent writes
                         let backoff_ms = 100 * (2_u64.pow(retry_count.min(5)));
@@ -3858,9 +3808,8 @@ mod tests {
     // wedge in the shared GHA test process because `config::init_config()` uses a
     // OnceLock — so every test inherits the *first* test's TIMEFUSION_TABLE_PREFIX.
     // By the time a "concurrent" test runs, the table has accumulated versions
-    // from earlier tests and 3-way commit contention without DynamoDB locking
-    // (CI runs with AWS_S3_LOCKING_PROVIDER="") retries past any reasonable
-    // timeout. Run with `cargo test -- --ignored` locally to exercise them.
+    // from earlier tests and 3-way commit contention retries past any
+    // reasonable timeout. Run with `cargo test -- --ignored` locally.
     #[serial]
     #[ignore = "wedges under shared-state CI; see comment above. Run with cargo test -- --ignored"]
     #[tokio::test(flavor = "multi_thread")]

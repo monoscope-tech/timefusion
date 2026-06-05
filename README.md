@@ -50,7 +50,6 @@ Traditional time-series databases force you to choose between performance, cost,
 
 ### Operations
 
-- 🔐 **Distributed Locking**: DynamoDB-based locking for multi-instance deployments
 - 📈 **Connection Limiting**: Built-in proxy to prevent overload
 - 🛡️ **Graceful Degradation**: Continues operating even under extreme load
 - 📝 **Comprehensive Logging**: Structured logs with tracing support
@@ -61,7 +60,6 @@ Traditional time-series databases force you to choose between performance, cost,
 
 - Rust 1.75+ (for building from source)
 - S3-compatible object storage (AWS S3, MinIO, etc.)
-- (Optional) DynamoDB table for distributed locking
 
 ### Installation
 
@@ -277,11 +275,11 @@ TimeFusion combines best-in-class technologies to deliver exceptional performanc
 │    Protocol     │     │  (DataFusion)    │     │   on S3/MinIO   │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
                                │                           │
-                               ▼                           ▼
-                        ┌─────────────┐            ┌─────────────┐
-                        │ Memory/Disk │            │  DynamoDB   │
-                        │    Cache    │            │  (Locking)  │
-                        └─────────────┘            └─────────────┘
+                               ▼
+                        ┌─────────────┐
+                        │ Memory/Disk │
+                        │    Cache    │
+                        └─────────────┘
 ```
 
 ### Technology Stack
