@@ -232,6 +232,38 @@ Mitigation: copy quarantine files off-host for forensic analysis,
 then delete (they're not source-of-truth). Set
 `TIMEFUSION_WAL_CORRUPTION_THRESHOLD=1` if you want fail-fast.
 
+### Stale cursor snapshot
+
+The fast-boot path restores `<wal>/.timefusion_meta/cursor_snapshot.json`
+to skip the per-table Delta scan. The snapshot is rewritten after every
+flush cycle (`clean_shutdown=false`) and on graceful shutdown
+(`clean_shutdown=true`). When a write fails (disk full, perms, etc.)
+the post-flush helper deletes the now-stale file so the next boot
+reconciles against Delta.
+
+Failure mode this runbook addresses: both the write **and** the delete
+fail (e.g. `meta_dir` became read-only). The pre-existing snapshot then
+survives indefinitely. On the next boot it seeds cursors, then the
+Delta verifier runs with `TIMEFUSION_DELTA_SCAN_DEPTH` (default 8). If
+more than 8 commits accumulated since the last good write, the cursor
+is left behind — Delta will be re-scanned on those commits at the next
+flush ("at-least-once").
+
+Signals to watch:
+- repeated `warn!` lines like `write_cursor_snapshot (post-flush) failed`
+  or `delete stale cursor snapshot also failed`.
+- on boot, `Cursor snapshot restored … age=<large>h` — a 24h+ age also
+  fires its own warn.
+
+Recovery:
+```sh
+# inside the container
+rm /app/data/timefusion/wal/.timefusion_meta/cursor_snapshot.json
+```
+Forces the next boot to run the full Delta verifier. Optionally raise
+`TIMEFUSION_DELTA_SCAN_DEPTH` (env var, hot-restart) if you suspect
+many commits to recover. Fix the underlying perms/disk issue separately.
+
 ### Cold-start taking > 5 minutes
 
 WAL replay is taking too long. Causes:

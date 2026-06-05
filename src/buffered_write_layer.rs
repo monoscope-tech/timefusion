@@ -650,10 +650,12 @@ impl BufferedWriteLayer {
             .await;
 
         // Process results: checkpoint WAL and drain MemBuffer for successful flushes
+        let mut any_ok = false;
         for (bucket, result) in flush_results {
             match result {
                 Ok(()) => {
                     self.checkpoint_and_drain(&bucket);
+                    any_ok = true;
                     crate::metrics::record_flush(true);
                     debug!(
                         "Flushed bucket: project={}, table={}, bucket_id={}, rows={}",
@@ -668,6 +670,9 @@ impl BufferedWriteLayer {
                     );
                 }
             }
+        }
+        if any_ok {
+            self.write_post_flush_snapshot().await;
         }
 
         Ok(())
@@ -745,6 +750,48 @@ impl BufferedWriteLayer {
         self.mem_buffer.drain_bucket(&bucket.project_id, &bucket.table_name, bucket.bucket_id);
     }
 
+    /// Persist a `clean_shutdown=false` cursor snapshot for the next boot.
+    /// Called once per flush cycle (not per bucket) — the snapshot reads
+    /// every topic's positions, so collapsing N per-bucket calls into one
+    /// post-cycle write turns this from O(N²) into O(N).
+    ///
+    /// On write failure we delete any pre-existing snapshot: a stale file
+    /// would let the (shallow) boot verifier skip commits made since the
+    /// last successful write. Removing it forces a fresh Delta scan, which
+    /// is correct-but-slow rather than fast-but-wrong.
+    ///
+    /// Callers: `flush_completed_buckets` (guards on `any_ok`) and
+    /// `flush_all_now` (guards on `stats.buckets_flushed > 0`). Shutdown's
+    /// per-bucket loop deliberately does NOT call this — the trailing
+    /// `write_cursor_snapshot(true)` in `shutdown()` writes the
+    /// definitive `clean_shutdown=true` snapshot and supersedes any
+    /// dirty one we'd write here.
+    async fn write_post_flush_snapshot(&self) {
+        // Local-disk JSON write + rename is normally <1 ms but the call is on
+        // a Tokio worker thread; offload to a blocking pool so a slow mount
+        // (network-backed WAL dir, hung syscall) can't stall the flush task.
+        let wal = self.wal.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = wal.write_cursor_snapshot(false) {
+                // Silent failure erodes the fast-boot guarantee over time —
+                // surface at warn! so an operator at info level notices.
+                warn!("write_cursor_snapshot (post-flush) failed: {} — will delete stale snapshot", e);
+                if let Err(rm_err) = wal.delete_cursor_snapshot() {
+                    // Worse: stale snapshot survives → next boot may restore
+                    // outdated cursors and the shallow Delta verifier (default
+                    // depth 8) can miss commits made since the last good write.
+                    // See RUNBOOK.md "Stale cursor snapshot" for recovery.
+                    warn!(
+                        "delete stale cursor snapshot also failed: {} — next boot may restore stale state; \
+                         delete `.timefusion_meta/cursor_snapshot.json` manually if symptoms appear",
+                        rm_err
+                    );
+                }
+            }
+        })
+        .await;
+    }
+
     #[instrument(skip(self))]
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("BufferedWriteLayer shutdown initiated");
@@ -780,6 +827,16 @@ impl BufferedWriteLayer {
                 Ok(()) => self.checkpoint_and_drain(&bucket),
                 Err(e) => error!("Shutdown flush failed for bucket {}: {}", bucket.bucket_id, e),
             }
+        }
+
+        // Final cursor snapshot with the clean-shutdown marker — boot can
+        // then skip `derive_wal_cursors_from_delta` entirely (~6.5 min saved
+        // on the next start).
+        let wal_for_snap = self.wal.clone();
+        match tokio::task::spawn_blocking(move || wal_for_snap.write_cursor_snapshot(true)).await {
+            Ok(Ok(())) => info!("Cursor snapshot written (clean_shutdown=true)"),
+            Ok(Err(e)) => warn!("Cursor snapshot on shutdown failed: {} — next boot will Delta-scan", e),
+            Err(join_err) => warn!("Cursor snapshot blocking task panicked: {} — next boot will Delta-scan", join_err),
         }
 
         info!("BufferedWriteLayer shutdown complete");
@@ -821,6 +878,9 @@ impl BufferedWriteLayer {
                     stats.buckets_failed += 1;
                 }
             }
+        }
+        if stats.buckets_flushed > 0 {
+            self.write_post_flush_snapshot().await;
         }
         Ok(stats)
     }
