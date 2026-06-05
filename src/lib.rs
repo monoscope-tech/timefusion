@@ -6,6 +6,7 @@ pub mod buffered_write_layer;
 pub mod clock;
 pub mod config;
 pub mod database;
+pub mod dedup_exec;
 pub mod dml;
 pub mod functions;
 pub mod grpc_handlers;

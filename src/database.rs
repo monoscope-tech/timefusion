@@ -2857,6 +2857,32 @@ impl ProjectRoutingTable {
     async fn scan_delta_table(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Dedup wrapping needs the dedup_key columns in the scan output even
+        // when the caller didn't request them (e.g. `SELECT name WHERE id=…`).
+        // Resolve the gating decision up-front so we can augment `projection`
+        // before delegating, then strip the extra columns at the end.
+        let table_schema = crate::schema_loader::get_schema(&self.table_name);
+        let dedup_keys: Vec<String> = table_schema.map(|s| s.dedup_keys.clone()).unwrap_or_default();
+        let need_dedup = !dedup_keys.is_empty()
+            && crate::dedup_exec::table_has_any_overlap(table, &dedup_keys)
+                .map_err(|e| DataFusionError::External(format!("overlap check failed: {e}").into()))?;
+        let original_projection = projection;
+        let augmented_projection: Option<Vec<usize>> = if need_dedup {
+            // Append any dedup_key indices missing from the caller's projection.
+            let mut proj: Vec<usize> = projection.cloned().unwrap_or_else(|| (0..self.schema.fields().len()).collect());
+            for key in &dedup_keys {
+                if let Some(idx) = self.schema.fields().iter().position(|f| f.name() == key)
+                    && !proj.contains(&idx)
+                {
+                    proj.push(idx);
+                }
+            }
+            Some(proj)
+        } else {
+            projection.cloned()
+        };
+        let projection = augmented_projection.as_ref();
+
         table.update_datafusion_session(state).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         // Build the delta-rs table provider with our session so its scan
@@ -2904,7 +2930,89 @@ impl ProjectRoutingTable {
             None => self.schema.clone(),
         };
 
-        Self::coerce_plan_to_schema(delta_plan, &target_schema)
+        let coerced = Self::coerce_plan_to_schema(delta_plan, &target_schema)?;
+        if !need_dedup {
+            return Ok(coerced);
+        }
+        let wrapped = Self::wrap_with_read_dedup(coerced, &dedup_keys)?;
+
+        // If we augmented the projection (added dedup_keys not requested by
+        // the caller), strip them with a final ProjectionExec so downstream
+        // sees the original projected schema.
+        let augmented = augmented_projection.as_ref().unwrap();
+        let original_len = original_projection.map(|p| p.len()).unwrap_or(self.schema.fields().len());
+        if augmented.len() == original_len {
+            return Ok(wrapped);
+        }
+        let wrapped_schema = wrapped.schema();
+        let project_exprs: Vec<(Arc<dyn datafusion::physical_expr::PhysicalExpr>, String)> = (0..original_len)
+            .map(|i| {
+                let field = wrapped_schema.field(i);
+                let col: Arc<dyn datafusion::physical_expr::PhysicalExpr> = Arc::new(PhysicalColumn::new(field.name(), i));
+                (col, field.name().clone())
+            })
+            .collect();
+        Ok(Arc::new(datafusion::physical_plan::projection::ProjectionExec::try_new(project_exprs, wrapped)?))
+    }
+
+    /// Sort by `dedup_keys` ASC + `timestamp` DESC, then collapse duplicates
+    /// in a streaming DeduplicateExec. The DESC tiebreaker on `timestamp`
+    /// is harmless when `timestamp` is already in `dedup_keys` (the next
+    /// sort column is ignored). For schemas where it isn't, picking the
+    /// most-recent `timestamp` matches the last-write-wins intent.
+    fn wrap_with_read_dedup(plan: Arc<dyn ExecutionPlan>, dedup_keys: &[String]) -> DFResult<Arc<dyn ExecutionPlan>> {
+        use datafusion::{
+            arrow::compute::SortOptions,
+            physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column as PhysCol},
+            physical_plan::{
+                Partitioning, repartition::RepartitionExec, sorts::sort_preserving_merge::SortPreservingMergeExec, sorts::sort::SortExec,
+            },
+        };
+
+        let schema = plan.schema();
+        // Map dedup_key names to projection indices; missing column = drop the
+        // wrapper rather than crash (read still correct, just not deduped).
+        let mut key_idx: Vec<usize> = Vec::with_capacity(dedup_keys.len());
+        for k in dedup_keys {
+            let Some(i) = schema.fields().iter().position(|f| f.name() == k) else {
+                return Ok(plan);
+            };
+            key_idx.push(i);
+        }
+
+        // Sort key: dedup_keys ASC, then timestamp DESC as tiebreaker so the
+        // newest row in a duplicate group is emitted first (and DeduplicateExec
+        // keeps the first per key tuple).
+        let mut sort_exprs: Vec<PhysicalSortExpr> = key_idx
+            .iter()
+            .map(|&i| PhysicalSortExpr::new(Arc::new(PhysCol::new(schema.field(i).name(), i)), SortOptions { descending: false, nulls_first: true }))
+            .collect();
+        if let Some(ts_idx) = schema.fields().iter().position(|f| f.name() == "timestamp")
+            && !key_idx.contains(&ts_idx)
+        {
+            sort_exprs.push(PhysicalSortExpr::new(
+                Arc::new(PhysCol::new(schema.field(ts_idx).name(), ts_idx)),
+                SortOptions { descending: true, nulls_first: false },
+            ));
+        }
+        let ordering = LexOrdering::new(sort_exprs).ok_or_else(|| DataFusionError::Internal("empty dedup sort ordering".into()))?;
+
+        // DeduplicateExec demands SinglePartition; multi-partition Delta scans
+        // funnel through SortPreservingMergeExec, single-partition scans use
+        // SortExec directly.
+        let parts = plan.properties().partitioning.partition_count();
+        let sorted: Arc<dyn ExecutionPlan> = if parts <= 1 {
+            Arc::new(SortExec::new(ordering, plan))
+        } else {
+            // Sort each partition independently, then merge into one stream.
+            let per_part = Arc::new(SortExec::new(ordering.clone(), plan));
+            let merged = Arc::new(SortPreservingMergeExec::new(ordering, per_part));
+            // SortPreservingMergeExec outputs 1 partition already; no
+            // RepartitionExec needed. Hint to the type system:
+            let _ = Partitioning::UnknownPartitioning(1);
+            merged
+        };
+        Ok(Arc::new(crate::dedup_exec::DeduplicateExec::new(sorted, key_idx)))
     }
 
     /// Wrap an execution plan with type coercion if the output schema doesn't match the target.
