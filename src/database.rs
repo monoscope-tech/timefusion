@@ -36,6 +36,7 @@ use url::Url;
 
 use crate::{
     config::{self, AppConfig},
+    error_ext::{ArrowResultExt, ExecResultExt},
     object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
     schema_loader::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type},
     statistics::DeltaStatisticsExtractor,
@@ -220,7 +221,7 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
             .zip(struct_fields.iter())
             .map(|(arr, f)| -> DFResult<arrow::array::ArrayRef> {
                 if matches!(f.data_type(), DataType::BinaryView) {
-                    cast(arr, &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                    cast(arr, &DataType::Binary).into_df()
                 } else {
                     Ok(arr.clone())
                 }
@@ -245,7 +246,7 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
         return Ok(batch);
     }
     let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(new_schema, new_cols).into_df()
 }
 
 fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
@@ -297,7 +298,7 @@ fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
         return Ok(batch);
     }
     let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(new_schema, new_cols).into_df()
 }
 
 fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
@@ -329,8 +330,8 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
         // our schema declares). Both Delta reads and MemBuffer end up as
         // Binary → no per-row casts on the read path.
         let arr: StructArray = builder.build().into();
-        let metadata = cast(arr.column(0), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        let value = cast(arr.column(1), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let metadata = cast(arr.column(0), &DataType::Binary).into_df()?;
+        let value = cast(arr.column(1), &DataType::Binary).into_df()?;
         let fields = vec![
             Arc::new(Field::new(crate::schema_loader::VARIANT_METADATA_FIELD, DataType::Binary, false)),
             Arc::new(Field::new(crate::schema_loader::VARIANT_VALUE_FIELD, DataType::Binary, false)),
@@ -367,7 +368,7 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
     }
 
     let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
-    RecordBatch::try_new(new_schema, columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(new_schema, columns).into_df()
 }
 
 // Fallback ZSTD level when a configured/tier level is rejected as out-of-range.
@@ -1181,7 +1182,7 @@ impl Database {
         self.register_set_config_udf(ctx);
         // CRITICAL: Register custom functions BEFORE JSON functions to ensure VariantAwareExprPlanner
         // intercepts -> and ->> operators on Variant columns before JsonExprPlanner handles them as strings
-        crate::functions::register_custom_functions(ctx).map_err(|e| DataFusionError::Execution(format!("Failed to register custom functions: {}", e)))?;
+        crate::functions::register_custom_functions(ctx).exec_context("Failed to register custom functions")?;
         self.register_json_functions(ctx);
         Ok(())
     }
@@ -1383,7 +1384,7 @@ impl Database {
                 if should_update {
                     self.update_table(table, "", table_name)
                         .await
-                        .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
+                        .exec_context("Failed to update table")?;
                 }
 
                 return Ok(Arc::clone(table));
@@ -1393,7 +1394,7 @@ impl Database {
         // Not in cache, create/load it
         self.get_or_create_unified_table(table_name)
             .await
-            .map_err(|e| DataFusionError::Execution(format!("Failed to get or create unified table: {}", e)))
+            .exec_context("Failed to get or create unified table")
     }
 
     /// Resolve a custom project table (isolated table for projects with their own S3 bucket)
@@ -1414,7 +1415,7 @@ impl Database {
                 if should_update {
                     self.update_table(table, project_id, table_name)
                         .await
-                        .map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
+                        .exec_context("Failed to update table")?;
                 }
 
                 return Ok(Arc::clone(table));
@@ -1424,7 +1425,7 @@ impl Database {
         // Not in cache, create/load it
         self.get_or_create_custom_table(project_id, table_name)
             .await
-            .map_err(|e| DataFusionError::Execution(format!("Failed to get or create custom table: {}", e)))
+            .exec_context("Failed to get or create custom table")
     }
 
     #[instrument(
