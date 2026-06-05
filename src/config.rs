@@ -120,6 +120,14 @@ const_default!(d_wal_shards_per_topic: usize = 4);
 const_default!(d_shutdown_timeout: u64 = 180);
 const_default!(d_wal_corruption_threshold: usize = 10);
 const_default!(d_flush_parallelism: usize = 4);
+// Cold-boot Delta cursor reconciliation. R2 happily takes 64+ concurrent
+// gets per bucket; the original 8 left ~8× headroom. Depth 8 is half the
+// original 16 (the snapshot replaces the bulk of the scan) but keeps a
+// safety margin: if a few snapshot writes failed silently before reboot,
+// depth-2 could miss the legitimate cursor advance. Tune via env if the
+// fallback Delta scan is the bottleneck.
+const_default!(d_delta_scan_concurrency: usize = 64);
+const_default!(d_delta_scan_depth: usize = 8);
 const_default!(d_wal_fsync_ms: u64 = 200);
 // MemBuffer bucket window (seconds). Smaller windows free RAM sooner because
 // the previous bucket becomes flushable sooner; larger windows amortize into
@@ -367,6 +375,15 @@ pub struct BufferConfig {
     /// at the cost of O(shards) recovery memory and more file handles.
     #[serde(default = "d_wal_shards_per_topic")]
     pub timefusion_wal_shards_per_topic:     usize,
+    /// Max concurrent S3/R2 reads when reconciling per-table Delta watermarks
+    /// at boot. Only used when the cursor snapshot is missing or stale.
+    #[serde(default = "d_delta_scan_concurrency")]
+    pub timefusion_delta_scan_concurrency:   usize,
+    /// Per-table Delta commit history depth scanned at boot. The cursor
+    /// snapshot covers the bulk of the watermark; this only needs to catch
+    /// a writer that committed after the last snapshot was written.
+    #[serde(default = "d_delta_scan_depth")]
+    pub timefusion_delta_scan_depth:         usize,
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
@@ -398,6 +415,12 @@ impl BufferConfig {
     }
     pub fn flush_parallelism(&self) -> usize {
         self.timefusion_flush_parallelism.max(1)
+    }
+    pub fn delta_scan_concurrency(&self) -> usize {
+        self.timefusion_delta_scan_concurrency.max(1)
+    }
+    pub fn delta_scan_depth(&self) -> usize {
+        self.timefusion_delta_scan_depth.max(1)
     }
     pub fn flush_immediately(&self) -> bool {
         self.timefusion_flush_immediately

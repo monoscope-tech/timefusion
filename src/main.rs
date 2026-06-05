@@ -142,16 +142,51 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         error!("Failed to initialize OTel metrics: {} — continuing without metrics export", e);
     }
 
-    // Before WAL replay, fast-forward walrus cursors to whatever each table's
-    // latest Delta commits say is durable. Closes the crash-mid-flush window
-    // where Delta committed but `advance_by_counts` didn't finish — without
-    // this, replay re-injects entries already in Delta and the next flush
-    // double-writes them. Best-effort: missing/older metadata falls back to
-    // the locally-fsynced walrus state (today's at-least-once behaviour).
-    match db.derive_wal_cursors_from_delta(buffered_layer.wal()).await {
-        Ok(0) => info!("Delta-derived cursor: no advancement needed (clean shutdown)"),
-        Ok(n) => info!("Delta-derived cursor: advanced {} shard(s) past Delta watermark", n),
-        Err(e) => warn!("Delta-derived cursor derivation failed (continuing with local cursor): {}", e),
+    // Fast-forward walrus cursors before WAL replay so we don't re-inject
+    // entries Delta already has. Fast path: a `clean_shutdown=true` snapshot
+    // on local disk lets us skip the ~6.5-min R2 scan entirely. Dirty/missing
+    // snapshot still seeds positions, then falls through to the (env-tuned,
+    // shorter) Delta verifier to catch commits made after the last snapshot.
+    let wal_ref = buffered_layer.wal();
+    let skip_delta_scan = if let Some(snap) = wal_ref.load_cursor_snapshot() {
+        // Surfaced in the boot log only — not gating the skip. See CursorSnapshot
+        // docs for the single-writer assumption and the `rm` escape hatch.
+        // Backwards clock skew (NTP correction, snapshot ported across hosts)
+        // is clamped to 0 by `saturating_sub` rather than wrapping negative.
+        let age_secs = timefusion::clock::now_micros().saturating_sub(snap.written_at_micros) / 1_000_000;
+        match wal_ref.restore_cursor_snapshot(&snap) {
+            Ok(tables_advanced) => {
+                info!(
+                    "Cursor snapshot restored: {} table(s) seeded, {} table(s) advanced, clean_shutdown={}, age={}s",
+                    snap.entries.len(),
+                    tables_advanced,
+                    snap.clean_shutdown,
+                    age_secs
+                );
+                snap.clean_shutdown
+            }
+            Err(e) => {
+                warn!("Cursor snapshot restore failed, falling back to Delta scan: {}", e);
+                false
+            }
+        }
+    } else {
+        false
+    };
+    if skip_delta_scan {
+        info!("Skipping Delta-derived cursor reconciliation (cursor snapshot is clean)");
+    } else {
+        info!(
+            "Running Delta-derived cursor reconciliation (snapshot missing/dirty); scan_depth={}, concurrency={} \
+             — set TIMEFUSION_DELTA_SCAN_DEPTH higher if a deployment lost more commits than that since its last clean state",
+            cfg.buffer.delta_scan_depth(),
+            cfg.buffer.delta_scan_concurrency()
+        );
+        match db.derive_wal_cursors_from_delta(wal_ref).await {
+            Ok(0) => info!("Delta-derived cursor: no advancement needed"),
+            Ok(n) => info!("Delta-derived cursor: advanced {} shard(s) past Delta watermark", n),
+            Err(e) => warn!("Delta-derived cursor derivation failed (continuing with local cursor): {}", e),
+        }
     }
 
     // Recover from WAL on startup
