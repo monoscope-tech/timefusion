@@ -412,6 +412,16 @@ fn apply_predicate(batch: &RecordBatch, pred: &Arc<dyn datafusion::physical_expr
     filter_record_batch(batch, mask).unwrap_or_else(|_| batch.clone())
 }
 
+/// Apply an optional compiled predicate to a bucket snapshot, dropping
+/// non-matching rows and any batch that ends up empty. `None` returns the
+/// snapshot unchanged.
+fn filter_snapshot(snapshot: Vec<RecordBatch>, pred: &Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>) -> Vec<RecordBatch> {
+    match pred {
+        Some(p) => snapshot.iter().map(|b| apply_predicate(b, p)).filter(|b| b.num_rows() > 0).collect(),
+        None => snapshot,
+    }
+}
+
 /// Check if a bucket's time range overlaps with the query range.
 fn bucket_overlaps_range(bucket: &TimeBucket, range: &(Option<i64>, Option<i64>)) -> bool {
     let (min_filter, max_filter) = range;
@@ -810,10 +820,7 @@ impl MemBuffer {
                 // Hold the lock only long enough to clone Arc'd batch refs; release
                 // before filtering so writers / concurrent readers aren't blocked.
                 let snapshot: Vec<RecordBatch> = bucket.batches.lock().iter().cloned().collect();
-                match &pred {
-                    Some(p) => results.extend(snapshot.iter().map(|b| apply_predicate(b, p)).filter(|b| b.num_rows() > 0)),
-                    None => results.extend(snapshot),
-                }
+                results.extend(filter_snapshot(snapshot, &pred));
             }
         }
 
@@ -842,10 +849,7 @@ impl MemBuffer {
                     if snapshot.is_empty() {
                         continue;
                     }
-                    let out: Vec<RecordBatch> = match &pred {
-                        Some(p) => snapshot.iter().map(|b| apply_predicate(b, p)).filter(|b| b.num_rows() > 0).collect(),
-                        None => snapshot,
-                    };
+                    let out = filter_snapshot(snapshot, &pred);
                     if !out.is_empty() {
                         partitions.push(out);
                     }
