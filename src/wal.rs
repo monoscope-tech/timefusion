@@ -772,6 +772,20 @@ impl WalManager {
             );
             return None;
         }
+        // 24h is well past the normal restart cadence; an older snapshot
+        // usually means the file was ported across hosts, the system clock
+        // moved backward, or the process was offline for an extended window.
+        // Surface it but still trust the snapshot — clean_shutdown is the
+        // gate, age is informational.
+        const STALE_AFTER_MICROS: i64 = 24 * 3600 * 1_000_000;
+        let age_micros = crate::clock::now_micros().saturating_sub(snap.written_at_micros);
+        if age_micros > STALE_AFTER_MICROS {
+            warn!(
+                "cursor snapshot is unusually old: age={}h, clean_shutdown={} — check for clock skew, ported data dir, or long downtime",
+                age_micros / 3_600_000_000,
+                snap.clean_shutdown
+            );
+        }
         Some(snap)
     }
 
@@ -1169,6 +1183,36 @@ mod tests {
         assert!(!tmp.exists(), "init must sweep leftover tmp file");
     }
 
+    /// Worst case for `write_post_flush_snapshot`: the meta dir is
+    /// read-only so the tmp write fails AND the subsequent
+    /// `delete_cursor_snapshot` also fails (POSIX unlink needs write on the
+    /// parent). The stale snapshot survives — documented in RUNBOOK.md as
+    /// "Stale cursor snapshot." The unit invariant we lock in here is just
+    /// that both calls return Err cleanly without panicking, so the flush
+    /// task can carry on.
+    #[cfg(unix)]
+    #[test]
+    fn write_and_delete_both_fail_under_readonly_meta_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        wal.write_cursor_snapshot(true).unwrap();
+        let meta = path.join(".timefusion_meta");
+        let target = meta.join("cursor_snapshot.json");
+
+        // Lock the meta dir: r-x only.
+        let original = std::fs::metadata(&meta).unwrap().permissions();
+        std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        assert!(wal.write_cursor_snapshot(false).is_err(), "write into RO dir must fail");
+        assert!(wal.delete_cursor_snapshot().is_err(), "unlink under RO parent must fail");
+        assert!(target.exists(), "stale snapshot survives both failures");
+
+        // Restore so tempdir teardown can clean up.
+        std::fs::set_permissions(&meta, original).unwrap();
+    }
+
     /// Simulates the BufferedWriteLayer write_post_flush_snapshot recovery
     /// path: if `write_cursor_snapshot` fails after a previous good write,
     /// the caller must remove the now-stale file so the next boot's shallow
@@ -1176,7 +1220,7 @@ mod tests {
     /// in the spot the atomic-rename tmp would occupy — `fs::write` to a
     /// directory path errors, so the rename never happens.
     #[test]
-    fn write_cursor_snapshot_failure_leaves_stale_file_to_be_swept() {
+    fn write_cursor_snapshot_failure_requires_caller_to_delete_stale_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
