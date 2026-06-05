@@ -73,6 +73,7 @@ counter_registry! {
     dedup_dropped_rows         => "timefusion.flush.dedup_dropped_rows": "Rows collapsed by per-table dedup_keys (last-write-wins) before Delta commit",
     optimize_partitions_rewritten => "timefusion.optimize.partitions_rewritten": "Date partitions rewritten by full (z-order) optimize",
     optimize_partitions_skipped   => "timefusion.optimize.partitions_skipped": "Date partitions skipped by full optimize because their file set was unchanged since the last run (cache churn avoided)",
+    compaction_dedup_dropped_rows => "timefusion.compaction.dedup_dropped_rows": "Rows collapsed by Delta-vs-Delta dedup compaction (cross-flush duplicates)",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -275,6 +276,12 @@ simple_recorders! {
 pub fn record_dedup_dropped(rows: u64) {
     if let Some(m) = METRICS.get() {
         m.dedup_dropped_rows.add(rows, &[]);
+    }
+}
+
+pub fn record_compaction_dedup_dropped(rows: u64) {
+    if let Some(m) = METRICS.get() {
+        m.compaction_dedup_dropped_rows.add(rows, &[]);
     }
 }
 

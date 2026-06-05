@@ -452,6 +452,10 @@ pub struct Database {
     object_store_cache:              Option<Arc<SharedFoyerCache>>,
     statistics_extractor:            Arc<DeltaStatisticsExtractor>,
     last_written_versions:           Arc<RwLock<HashMap<(String, String), u64>>>,
+    /// Delta snapshot version at last dedup sweep, per scheduler key. Skips
+    /// the sweep when the version hasn't moved (no commits → no new dupes).
+    /// Same unbounded-growth caveat as `last_written_versions`.
+    last_dedup_versions:             Arc<RwLock<HashMap<String, u64>>>,
     buffered_layer:                  Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
     tantivy_search:                  Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
     tantivy_indexer:                 Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
@@ -750,6 +754,7 @@ impl Database {
             object_store_cache,
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
+            last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             buffered_layer: None,
             tantivy_search: None,
             tantivy_indexer: None,
@@ -845,8 +850,14 @@ impl Database {
                     let db = db.clone();
                     Box::pin(async move {
                         info!("Running scheduled light optimize on recent small files");
-                        // Optimize unified tables
+                        // Optimize unified tables. Run dedup FIRST so the
+                        // light compact bin-packs already-deduped files —
+                        // otherwise compact would rewrite the duplicates into
+                        // a single file that we'd then have to rewrite again.
                         for (table_name, table) in db.unified_tables.read().await.iter() {
+                            if let Err(e) = db.dedup_today_partitions(table, table_name, table_name).await {
+                                error!("Dedup sweep failed for unified table '{}': {}", table_name, e);
+                            }
                             match db.optimize_table_light(table, table_name).await {
                                 Ok(_) => info!("Light optimize completed for unified table '{}'", table_name),
                                 Err(e) => error!("Light optimize failed for unified table '{}': {}", table_name, e),
@@ -854,6 +865,10 @@ impl Database {
                         }
                         // Optimize custom project tables
                         for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                            let key = format!("{}:{}", project_id, table_name);
+                            if let Err(e) = db.dedup_today_partitions(table, table_name, &key).await {
+                                error!("Dedup sweep failed for custom project '{}' table '{}': {}", project_id, table_name, e);
+                            }
                             match db.optimize_table_light(table, table_name).await {
                                 Ok(_) => info!("Light optimize completed for custom project '{}' table '{}'", project_id, table_name),
                                 Err(e) => error!("Light optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e),
@@ -2496,6 +2511,168 @@ impl Database {
             if let Err(e) = self.recompress_partition(table_ref, table_name, date, target_level).await {
                 warn!("recompress_tier_window: skipping date={} after error: {}", date, e);
             }
+        }
+        Ok(())
+    }
+
+    /// Cross-flush dedup: collapse a `(project_id, date)` partition by the
+    /// schema's `dedup_keys` (last-write-wins) and write back via
+    /// `replace_where`. No-op on no dedup_keys / no duplicates (avoids
+    /// gratuitous Foyer churn). Returns rows dropped.
+    pub async fn dedup_partition(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate) -> Result<u64> {
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        if schema.dedup_keys.is_empty() {
+            return Ok(0);
+        }
+        let date_str = date.to_string();
+
+        // Bypass ProjectRoutingTable: its MemBuffer union would feed in-flight
+        // rows to dedup, then `replace_where` would write them to Delta —
+        // double-writing on the next real flush.
+        use deltalake::delta_datafusion::TableProviderBuilder;
+        let (snapshot, log_store) = {
+            let table = table_ref.read().await;
+            (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
+        };
+        let provider = TableProviderBuilder::default()
+            .with_log_store(log_store)
+            .with_eager_snapshot(snapshot)
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
+        let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state());
+        let scan_name = "__dedup_src";
+        ctx.register_table(scan_name, Arc::new(provider))?;
+        // project_id is currently always a UUID/controlled identifier, but defend in depth: escape single quotes
+        // so a future caller can't inject SQL through the partition predicate. date_str comes from NaiveDate::to_string
+        // and is already safe.
+        let safe_pid = project_id.replace('\'', "''");
+        let select = format!("SELECT * FROM {} WHERE project_id = '{}' AND date = DATE '{}'", scan_name, safe_pid, date_str);
+        let batches = ctx.sql(&select).await?.collect().await?;
+        let before: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if before == 0 {
+            return Ok(0);
+        }
+        let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys)?;
+        let after: usize = deduped.iter().map(|b| b.num_rows()).sum();
+        if before == after {
+            return Ok(0);
+        }
+        let dropped = (before - after) as u64;
+
+        // Variant struct columns may still be BinaryView if the partition mixes
+        // tiers — cast to Binary so the delta-kernel write accepts the schema.
+        let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
+        let predicate = format!("project_id = '{}' AND date = '{}'", safe_pid, date_str);
+
+        // OCC retry — same shape as optimize_table_light_inner. Best-effort;
+        // exhaustion bubbles up as Err (the caller in `dedup_today_partitions`
+        // logs and continues), so the partition only retries when the next
+        // scheduler tick sees a file-count change.
+        const MAX_RETRIES: usize = 4;
+        let mut last_err: Option<deltalake::DeltaTableError> = None;
+        for attempt in 0..MAX_RETRIES {
+            let table_clone = {
+                let table = table_ref.read().await;
+                table.clone()
+            };
+            let result = table_clone
+                .write(deduped.clone())
+                .with_partition_columns(schema.partitions.clone())
+                .with_writer_properties(writer_properties.clone())
+                .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
+                .with_replace_where(predicate.clone())
+                .await;
+            match result {
+                Ok(new_table) => {
+                    *table_ref.write().await = new_table;
+                    crate::metrics::record_compaction_dedup_dropped(dropped);
+                    info!(
+                        "dedup compaction: table={} project={} date={} dropped={} (before={} after={})",
+                        table_name, project_id, date_str, dropped, before, after
+                    );
+                    return Ok(dropped);
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_conflict = msg.contains("concurrent transaction") || msg.contains("Commit failed");
+                    if !is_conflict || attempt + 1 == MAX_RETRIES {
+                        return Err(anyhow::anyhow!("dedup_partition write failed: {}", e));
+                    }
+                    debug!(
+                        "dedup_partition OCC conflict (attempt {}/{}): table={} project={} date={}",
+                        attempt + 1,
+                        MAX_RETRIES,
+                        table_name,
+                        project_id,
+                        date_str
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(150u64 << attempt)).await;
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "dedup_partition exhausted retries: {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    }
+
+    /// Sweep every `(project_id, today)` partition in this table via
+    /// `dedup_partition`. Skips when Delta version is unchanged since the
+    /// last sweep. Best-effort: per-partition errors are logged.
+    pub async fn dedup_today_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str) -> Result<()> {
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        if schema.dedup_keys.is_empty() {
+            return Ok(());
+        }
+        let today = Utc::now().date_naive();
+        let date_marker = format!("date={}", today);
+
+        let (pre_version, project_ids) = {
+            let table = table_ref.read().await;
+            let v = table.version().unwrap_or(0);
+            let pids: std::collections::HashSet<String> = table
+                .get_file_uris()?
+                .filter(|u| u.contains(&date_marker))
+                .filter_map(|uri| uri.split('/').find_map(|seg| seg.strip_prefix("project_id=").map(str::to_string)))
+                .collect();
+            (v, pids)
+        };
+        if self.last_dedup_versions.read().await.get(dedup_key).copied() == Some(pre_version) {
+            debug!("dedup sweep: table={} version={} unchanged — skipping", table_name, pre_version);
+            return Ok(());
+        }
+        // Custom-project tables don't embed project_id in the path; sweep "default".
+        let project_ids = if project_ids.is_empty() { std::iter::once("default".to_string()).collect() } else { project_ids };
+
+        let mut total_dropped = 0u64;
+        let mut any_ok = false;
+        for pid in &project_ids {
+            match self.dedup_partition(table_ref, table_name, pid, today).await {
+                Ok(d) => {
+                    total_dropped += d;
+                    any_ok = true;
+                }
+                Err(e) => warn!("dedup sweep: project={} date={} table={} failed: {}", pid, today, table_name, e),
+            }
+        }
+        // Only refresh the skip cache when at least one partition ran cleanly,
+        // so persistent failures don't silently suppress future sweeps.
+        // TODO: same unbounded-growth caveat as `last_written_versions`.
+        if any_ok {
+            let post_version = table_ref.read().await.version().unwrap_or(pre_version);
+            self.last_dedup_versions.write().await.insert(dedup_key.to_string(), post_version);
+        }
+        if total_dropped > 0 {
+            info!(
+                "dedup sweep: table={} key={} projects={} total_dropped={}",
+                table_name,
+                dedup_key,
+                project_ids.len(),
+                total_dropped
+            );
         }
         Ok(())
     }
