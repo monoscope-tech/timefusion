@@ -25,6 +25,15 @@ FROM chef AS planner
 # source) since separating them isn't worth the Dockerfile complexity.
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY vendor/ vendor/
+# Stub auto-discovered targets so `cargo metadata` (run by cargo chef prepare)
+# can parse the manifest without the real sources. recipe.json content depends
+# only on the dep graph, not on these stubs, so the builder cook layer stays
+# cached across src/ edits.
+RUN mkdir -p src benches && \
+    echo 'fn main() {}' > src/main.rs && \
+    echo 'fn main() {}' > benches/core_benchmarks.rs && \
+    echo 'fn main() {}' > benches/tantivy_benchmarks.rs && \
+    echo 'fn main() {}' > benches/sort_layout_benchmarks.rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 ##############################
