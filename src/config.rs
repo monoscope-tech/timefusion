@@ -145,7 +145,7 @@ const_default!(d_pressure_flush_pct: u32 = 75);
 //   "none"      — never fsync (test/throwaway data only)
 const_default!(d_wal_fsync_mode: String = "ms");
 const_default!(d_wal_max_files: usize = 200);
-const_default!(d_foyer_memory_mb: usize = 512);
+const_default!(d_foyer_memory_mb: usize = 1024);
 // Local disk is cheap and fast relative to S3 GETs, so default the cache large
 // — servers run 500GB–1TB cache volumes. foyer creates the backing file sparse
 // (no upfront allocation), but this is the logical ceiling at which it starts
@@ -698,7 +698,7 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.core.pgwire_port, 5432);
         assert_eq!(config.buffer.timefusion_flush_interval_secs, 600);
-        assert_eq!(config.cache.timefusion_foyer_memory_mb, 512);
+        assert_eq!(config.cache.timefusion_foyer_memory_mb, 1024);
         assert_eq!(config.cache.timefusion_foyer_disk_gb, 500);
         assert_eq!(config.cache.disk_size_bytes(), 500 * 1024 * 1024 * 1024);
         assert_eq!(config.cache.timefusion_warm_inline_max_mb, 0);

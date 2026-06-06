@@ -698,7 +698,9 @@ impl FoyerObjectStoreCache {
                     current_millis().saturating_sub(value.timestamp_millis),
                     value.data.len()
                 );
-                return Ok(Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone()));
+                let result = Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone());
+                self.maybe_touch(&self.cache, &cache_key, entry.clone(), self.config.l1_max_entry_bytes);
+                return Ok(result);
             }
         }
 
@@ -787,7 +789,9 @@ impl FoyerObjectStoreCache {
                     is_parquet,
                     current_millis().saturating_sub(value.timestamp_millis)
                 );
-                return Ok(Bytes::from(value.data[range.start as usize..range.end as usize].to_vec()));
+                let sliced = Bytes::from(value.data[range.start as usize..range.end as usize].to_vec());
+                self.maybe_touch(&self.cache, &full_cache_key, entry.clone(), self.config.l1_max_entry_bytes);
+                return Ok(sliced);
             }
         }
 
@@ -828,7 +832,10 @@ impl FoyerObjectStoreCache {
                             value.data.len(),
                             current_millis().saturating_sub(value.timestamp_millis)
                         );
-                        return Ok(Bytes::from(value.data.clone()));
+                        let sliced = Bytes::from(value.data.clone());
+                        // l1_max=0: metadata entries are tiny, always keep in L1.
+                        self.maybe_touch(&self.metadata_cache, &range_cache_key, entry.clone(), 0);
+                        return Ok(sliced);
                     }
                 }
 
@@ -1040,6 +1047,38 @@ impl FoyerObjectStoreCache {
             return;
         }
         insert_main(&self.cache, Self::make_cache_key(location), value, self.config.l1_max_entry_bytes);
+    }
+
+    /// Sliding-TTL refresh: keep an entry at most `ttl` past its *last query*
+    /// rather than its insertion. On a hit, once an entry is more than halfway
+    /// to expiry, re-insert it with a fresh timestamp so frequently-queried
+    /// data survives indefinitely while cold data still ages out after `ttl`.
+    ///
+    /// Throttled (the halfway gate + one in-flight refresh per key) so a hot
+    /// entry is rewritten at most once per `ttl/2`, and run in the background
+    /// off a cheap `entry` clone so the read never blocks on the re-insert (the
+    /// data clone happens in the spawned task, not on the query path).
+    fn maybe_touch(&self, cache: &FoyerCache, key: &str, entry: foyer::HybridCacheEntry<String, CacheValue>, l1_max_entry_bytes: usize) {
+        let age = current_millis().saturating_sub(entry.value().timestamp_millis);
+        if age.saturating_mul(2) <= self.config.ttl.as_millis() as u64 {
+            return; // still fresh enough — don't churn the cache
+        }
+        if !self.refreshing.insert(key.to_string()) {
+            return; // a refresh is already in flight for this key
+        }
+        let cache = cache.clone();
+        let refreshing = self.refreshing.clone();
+        let key = key.to_string();
+        let handle = tokio::spawn(async move {
+            let v = entry.value();
+            insert_main(&cache, key.clone(), CacheValue::new(v.data.clone(), v.meta.clone()), l1_max_entry_bytes);
+            refreshing.remove(&key);
+        });
+        if let Ok(mut tasks) = self.background_tasks.try_lock() {
+            tasks.spawn(async move {
+                let _ = handle.await;
+            });
+        }
     }
 }
 
@@ -1719,6 +1758,40 @@ mod tests {
             256 * 1024 * 1024,
             "configured block size acts as a floor"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sliding_ttl_refresh_on_query() -> anyhow::Result<()> {
+        let test_id = format!("sliding_ttl_{}", std::process::id());
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.ttl = Duration::from_millis(1000);
+        });
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let inner = Arc::new(InMemory::new());
+        let cache = FoyerObjectStoreCache::new(inner, config).await?;
+
+        let path = Path::from("table/part-hot.parquet");
+        cache.put(&path, PutPayload::from(Bytes::from(vec![b'h'; 4096]))).await?;
+
+        // Query past the halfway point (ttl/2 = 500ms) → triggers a sliding-TTL
+        // refresh that re-stamps the entry to "now".
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _ = cache.get(&path).await?; // hit + background touch
+        tokio::time::sleep(Duration::from_millis(200)).await; // let the re-insert land
+
+        // Now ~1200ms since the original insert (> base TTL) but well within the
+        // refreshed window — a non-sliding TTL would have expired this entry.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        cache.reset_stats().await;
+        let _ = cache.get(&path).await?;
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.hits, 1, "queried entry should survive past base TTL via sliding refresh");
+        assert_eq!(stats.main.misses, 0);
+
+        cache.shutdown().await?;
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
     }
 
     #[test]
