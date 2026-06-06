@@ -1647,21 +1647,61 @@ impl Database {
         // bucket-relative paths. `table_url()` may carry a `?endpoint=...`
         // query string that `get_file_uris()` omits — strip it before matching.
         let prefix = table_uri.split('?').next().unwrap_or(&table_uri).trim_end_matches('/').to_string();
-        let cutoff = (recency_days > 0).then(|| Utc::now().date_naive() - chrono::Duration::days(recency_days as i64));
+        // Cap the day count before the i64 cast — recency_days is a config
+        // value so overflow can't happen in practice, but a silent wrap would
+        // turn a misconfiguration into "warm nothing". 3650d (~10y) is well
+        // past any partition we'd query.
+        let cutoff = (recency_days > 0).then(|| Utc::now().date_naive() - chrono::Duration::days(recency_days.min(3650) as i64));
 
+        let mut dropped = 0usize;
         let paths: Vec<object_store::path::Path> = uris
             .into_iter()
             .filter(|u| u.ends_with(".parquet"))
             .filter(|u| within_recency(u, cutoff))
-            .filter_map(|u| u.strip_prefix(&prefix).map(|rel| object_store::path::Path::from(rel.trim_start_matches('/'))))
+            .filter_map(|u| match u.strip_prefix(&prefix) {
+                Some(rel) => Some(object_store::path::Path::from(rel.trim_start_matches('/'))),
+                None => {
+                    // Prefix mismatch (e.g. trailing-slash or query-string
+                    // drift between table_url() and get_file_uris()). Warming
+                    // this file would address the wrong key, so skip it — but
+                    // log so a systematic mismatch is diagnosable instead of a
+                    // silent no-op.
+                    if dropped == 0 {
+                        debug!("warm: URI {} does not start with table prefix {}; skipping (warm only)", u, prefix);
+                    }
+                    dropped += 1;
+                    None
+                }
+            })
             .collect();
 
+        if dropped > 0 {
+            debug!("warm: skipped {} file(s) that did not relativize against prefix {}", dropped, prefix);
+        }
         if paths.is_empty() {
             return;
         }
 
         tokio::spawn(async move {
             let count = paths.len();
+            // Baseline the cache stats *before* warming: the warm GETs are all
+            // misses (they fetch from the inner store to populate Foyer), so a
+            // post-warm hit rate would read artificially low. The real
+            // beneficiary is the next dashboard query — log the pre-warm
+            // steady-state rate as the relevant baseline.
+            let baseline = match &stats_cache {
+                Some(cache) => {
+                    let s = cache.get_stats().await.main;
+                    let rate = if s.hits + s.misses > 0 {
+                        (s.hits as f64 / (s.hits + s.misses) as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    Some(rate)
+                }
+                None => None,
+            };
+
             futures::stream::iter(paths)
                 .for_each_concurrent(concurrency, |path| {
                     let store = object_store.clone();
@@ -1674,39 +1714,37 @@ impl Database {
                 })
                 .await;
 
-            if let Some(cache) = stats_cache {
-                let stats = cache.get_stats().await;
-                let main = &stats.main;
-                let hit_rate = if main.hits + main.misses > 0 {
-                    (main.hits as f64 / (main.hits + main.misses) as f64) * 100.0
-                } else {
-                    0.0
-                };
-                info!(
-                    "Cache warm complete: {} files warmed (full={}); foyer main hit rate now {:.2}% (hits={}, misses={})",
-                    count, warm_full_files, hit_rate, main.hits, main.misses
-                );
-            } else {
-                info!("Cache warm complete: {} files warmed (full={})", count, warm_full_files);
+            match baseline {
+                Some(rate) => info!(
+                    "Cache warm complete: {} files warmed (full={}); foyer main hit rate before warm was {:.2}% (next query benefits)",
+                    count, warm_full_files, rate
+                ),
+                None => info!("Cache warm complete: {} files warmed (full={})", count, warm_full_files),
             }
         });
     }
 
     /// Warm the cache for files added by a just-committed flush/optimize on the
-    /// given logical table. Resolves the table to its cached object store and
-    /// defers to [`Self::warm_cache_for_uris`]. No-op when warming is disabled
-    /// or the list is empty.
-    pub async fn warm_cache_for_table(&self, project_id: &str, table_name: &str, uris: Vec<String>) {
+    /// given logical table. Fire-and-forget: resolving the table (which may
+    /// issue a rate-limited PG roundtrip) and taking the read lock both happen
+    /// inside a spawned task, so the caller — notably the flush callback — is
+    /// never blocked. No-op when warming is disabled or the list is empty.
+    pub fn warm_cache_for_table(&self, project_id: &str, table_name: &str, uris: Vec<String>) {
         if uris.is_empty() || !self.config.maintenance.timefusion_warm_after_compaction {
             return;
         }
-        if let Ok(table_ref) = self.resolve_table(project_id, table_name).await {
-            let (store, table_uri) = {
-                let t = table_ref.read().await;
-                (t.log_store().object_store(None), t.table_url().to_string())
-            };
-            self.warm_cache_for_uris(store, table_uri, uris);
-        }
+        let db = self.clone();
+        let project_id = project_id.to_string();
+        let table_name = table_name.to_string();
+        tokio::spawn(async move {
+            if let Ok(table_ref) = db.resolve_table(&project_id, &table_name).await {
+                let (store, table_uri) = {
+                    let t = table_ref.read().await;
+                    (t.log_store().object_store(None), t.table_url().to_string())
+                };
+                db.warm_cache_for_uris(store, table_uri, uris);
+            }
+        });
     }
 
     pub async fn get_or_create_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
@@ -3418,6 +3456,30 @@ mod tests {
 
     use super::*;
     use crate::{config::AppConfig, test_utils::test_helpers::*};
+
+    #[test]
+    fn test_within_recency() {
+        let cutoff = chrono::NaiveDate::from_ymd_opt(2026, 6, 4);
+
+        // Files on/after the cutoff date are warmed.
+        assert!(within_recency("s3://b/t/date=2026-06-06/part-0.parquet", cutoff));
+        assert!(within_recency("s3://b/t/date=2026-06-04/part-0.parquet", cutoff), "cutoff is inclusive");
+        // Older partitions are skipped.
+        assert!(!within_recency("s3://b/t/date=2026-06-01/part-0.parquet", cutoff));
+
+        // No `date=` segment → warm (don't silently skip an unclassifiable file).
+        assert!(within_recency("s3://b/t/part-0.parquet", cutoff));
+        // Unparseable date → warm.
+        assert!(within_recency("s3://b/t/date=not-a-date/part-0.parquet", cutoff));
+        // Truncated date (segment shorter than YYYY-MM-DD) → warm.
+        assert!(within_recency("s3://b/t/date=2026-06", cutoff));
+
+        // None cutoff → no recency limit, always warm even very old partitions.
+        assert!(within_recency("s3://b/t/date=2000-01-01/part-0.parquet", None));
+
+        // Nested partitioning (project_id then date) still locates `date=`.
+        assert!(!within_recency("s3://b/t/project_id=default/date=2026-05-01/part.parquet", cutoff));
+    }
 
     /// Roundtrip the watermark through serialize → JSON → parse. Pins the
     /// on-disk format so a future change to `serialize_watermark_to_json`
