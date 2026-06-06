@@ -81,15 +81,9 @@ fn should_refresh_table(current_version: Option<u64>, last_written_version: Opti
 /// unparseable, returns `true` (warm rather than silently skip a file we can't
 /// classify). A `None` cutoff means "no recency limit".
 fn within_recency(uri: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
-    let Some(cutoff) = cutoff else { return true };
-    match uri
-        .find("date=")
-        .and_then(|i| uri.get(i + 5..i + 15))
-        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-    {
-        Some(date) => date >= cutoff,
-        None => true,
-    }
+    // Single source of truth for `date=` partition recency parsing, shared with
+    // the object-store cache admission window.
+    crate::object_store_cache::date_partition_within(uri, cutoff)
 }
 
 // Helper function to extract project_id from a batch
@@ -1631,7 +1625,7 @@ impl Database {
     /// concurrency-bounded task and never affects the commit. Files are filtered
     /// to partitions within `timefusion_warm_recency_days` so we don't spend S3
     /// GETs (and evict useful entries) warming cold partitions nobody reads.
-    fn warm_cache_for_uris(&self, object_store: Arc<dyn object_store::ObjectStore>, table_uri: String, uris: Vec<String>) {
+    async fn warm_cache_for_uris(&self, object_store: Arc<dyn object_store::ObjectStore>, table_uri: String, uris: Vec<String>) {
         let maint = &self.config.maintenance;
         if !maint.timefusion_warm_after_compaction || uris.is_empty() {
             return;
@@ -1682,46 +1676,47 @@ impl Database {
             return;
         }
 
-        tokio::spawn(async move {
-            let count = paths.len();
-            // Baseline the cache stats *before* warming: the warm GETs are all
-            // misses (they fetch from the inner store to populate Foyer), so a
-            // post-warm hit rate would read artificially low. The real
-            // beneficiary is the next dashboard query — log the pre-warm
-            // steady-state rate as the relevant baseline.
-            let baseline = match &stats_cache {
-                Some(cache) => {
-                    let s = cache.get_stats().await.main;
-                    let rate = if s.hits + s.misses > 0 {
-                        (s.hits as f64 / (s.hits + s.misses) as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    Some(rate)
-                }
-                None => None,
-            };
-
-            futures::stream::iter(paths)
-                .for_each_concurrent(concurrency, |path| {
-                    let store = object_store.clone();
-                    async move {
-                        let _ = crate::object_store_cache::warm_footer(store.as_ref(), &path, metadata_size_hint).await;
-                        if warm_full_files {
-                            let _ = crate::object_store_cache::warm_full(store.as_ref(), &path).await;
-                        }
-                    }
-                })
-                .await;
-
-            match baseline {
-                Some(rate) => info!(
-                    "Cache warm complete: {} files warmed (full={}); foyer main hit rate before warm was {:.2}% (next query benefits)",
-                    count, warm_full_files, rate
-                ),
-                None => info!("Cache warm complete: {} files warmed (full={})", count, warm_full_files),
+        let count = paths.len();
+        // Baseline the cache stats *before* warming: the warm GETs are all
+        // misses (they fetch from the inner store to populate Foyer), so a
+        // post-warm hit rate would read artificially low. The real
+        // beneficiary is the next dashboard query — log the pre-warm
+        // steady-state rate as the relevant baseline.
+        let baseline = match &stats_cache {
+            Some(cache) => {
+                let s = cache.get_stats().await.main;
+                let rate = if s.hits + s.misses > 0 {
+                    (s.hits as f64 / (s.hits + s.misses) as f64) * 100.0
+                } else {
+                    0.0
+                };
+                Some(rate)
             }
-        });
+            None => None,
+        };
+
+        // Labelled scope rather than `full=true/false` so warm logs are easy to
+        // filter (e.g. in Loki) by what was actually primed.
+        let scope = if warm_full_files { "full" } else { "footer-only" };
+        futures::stream::iter(paths)
+            .for_each_concurrent(concurrency, |path| {
+                let store = object_store.clone();
+                async move {
+                    let _ = crate::object_store_cache::warm_footer(store.as_ref(), &path, metadata_size_hint).await;
+                    if warm_full_files {
+                        let _ = crate::object_store_cache::warm_full(store.as_ref(), &path).await;
+                    }
+                }
+            })
+            .await;
+
+        match baseline {
+            Some(rate) => info!(
+                "Cache warm complete: {} files warmed (scope={}); foyer main hit rate before warm was {:.2}% (next query benefits)",
+                count, scope, rate
+            ),
+            None => info!("Cache warm complete: {} files warmed (scope={})", count, scope),
+        }
     }
 
     /// Proactively evict the cached full-file bytes of files a compaction
@@ -1773,9 +1768,45 @@ impl Database {
                     let t = table_ref.read().await;
                     (t.log_store().object_store(None), t.table_url().to_string())
                 };
-                db.warm_cache_for_uris(store, table_uri, uris);
+                // Already inside a detached task — await the warm directly
+                // instead of spawning a second nested task.
+                db.warm_cache_for_uris(store, table_uri, uris).await;
             }
         });
+    }
+
+    /// Atomically swap a freshly-optimized `new_table` in under the write lock,
+    /// then refresh the cache for the file-set delta vs `pre_uris`: warm the
+    /// files this optimize added and evict the ones it tombstoned. Returns the
+    /// new table's live file URIs (captured before the swap) for callers that
+    /// need them (e.g. the tantivy GC hook).
+    ///
+    /// Both optimize paths — full Z-order and light — funnel through here so the
+    /// warm/evict pair can't drift; the evict call was once missing from the
+    /// light path, and a single helper keeps them in lockstep.
+    async fn swap_and_refresh_cache(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        // Capture live URIs off `new_table` *before* the swap moves it in.
+        let live_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+        let live_set: std::collections::HashSet<&String> = live_uris.iter().collect();
+        let added: Vec<String> = live_uris.iter().filter(|u| !pre_uris.contains(*u)).cloned().collect();
+        let removed: Vec<String> = pre_uris.iter().filter(|u| !live_set.contains(u)).cloned().collect();
+        let warm_store = new_table.log_store().object_store(None);
+        let warm_table_uri = new_table.table_url().to_string();
+        {
+            let mut table = table_ref.write().await;
+            *table = new_table;
+        }
+        // Eviction is in-cache only (cheap), so run it inline. Warming issues S3
+        // GETs, so detach it — the maintenance loop shouldn't block on priming
+        // the cache (preserves the previous in-`warm_cache_for_uris` spawn).
+        self.evict_cache_for_uris(&warm_table_uri, &removed);
+        let db = self.clone();
+        tokio::spawn(async move {
+            db.warm_cache_for_uris(warm_store, warm_table_uri, added).await;
+        });
+        live_uris
     }
 
     pub async fn get_or_create_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
@@ -2179,24 +2210,10 @@ impl Database {
                     let compression_ratio = metrics.num_files_removed as f64 / metrics.num_files_added as f64;
                     info!("Optimization compression ratio: {:.2}x", compression_ratio);
                 }
-                // Capture live file URIs from the new table *before* taking
-                // the write lock to swap it in — used by the tantivy GC hook
-                // below to drop indexes whose covered files no longer exist.
-                let live_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                // Warm the cache for newly-added files before they're queried,
-                // so the post-compaction dashboards don't cold-start to S3, and
-                // evict the files this optimize tombstoned. Captured off
-                // `new_table` so they're independent of the swap below.
-                let live_set: std::collections::HashSet<&String> = live_uris.iter().collect();
-                let added: Vec<String> = live_uris.iter().filter(|u| !pre_uris.contains(*u)).cloned().collect();
-                let removed: Vec<String> = pre_uris.iter().filter(|u| !live_set.contains(u)).cloned().collect();
-                let warm_store = new_table.log_store().object_store(None);
-                let warm_table_uri = new_table.table_url().to_string();
-                let mut table = table_ref.write().await;
-                *table = new_table;
-                drop(table);
-                self.evict_cache_for_uris(&warm_table_uri, &removed);
-                self.warm_cache_for_uris(warm_store, warm_table_uri, added);
+                // Swap the optimized table in and refresh the cache (warm
+                // newly-added files, evict tombstoned ones). Returns the new
+                // live file URIs for the tantivy GC hook below.
+                let live_uris = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                 // Tantivy compaction GC — drop sidecar indexes for files that
                 // were rewritten away. Best-effort: errors are logged.
                 if let Some(svc) = self.tantivy_indexer().cloned() {
@@ -2451,20 +2468,10 @@ impl Database {
                         metrics.num_files_removed,
                         metrics.num_files_added
                     );
-                    // Warm the freshly-compacted files (today's hot partition)
-                    // before the next dashboard read hits them cold from S3, and
-                    // evict the small files this optimize just tombstoned.
-                    let post_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                    let post_set: std::collections::HashSet<&String> = post_uris.iter().collect();
-                    let added: Vec<String> = post_uris.iter().filter(|u| !pre_uris.contains(*u)).cloned().collect();
-                    let removed: Vec<String> = pre_uris.iter().filter(|u| !post_set.contains(u)).cloned().collect();
-                    let warm_store = new_table.log_store().object_store(None);
-                    let warm_table_uri = new_table.table_url().to_string();
-                    let mut table = table_ref.write().await;
-                    *table = new_table;
-                    drop(table);
-                    self.evict_cache_for_uris(&warm_table_uri, &removed);
-                    self.warm_cache_for_uris(warm_store, warm_table_uri, added);
+                    // Swap the optimized table in and refresh the cache (warm
+                    // freshly-compacted files, evict the small files just
+                    // tombstoned) via the shared helper.
+                    let _ = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                     return Ok(());
                 }
                 Err(e) => {

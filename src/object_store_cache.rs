@@ -414,7 +414,15 @@ pub async fn warm_footer(store: &dyn ObjectStore, location: &Path, metadata_size
 /// (full-file) cache so ranged data reads — DataFusion row-group scans — hit
 /// Foyer instead of S3. Errors are swallowed; see [`warm_footer`].
 pub async fn warm_full(store: &dyn ObjectStore, location: &Path) -> bool {
-    store.get_opts(location, GetOptions::default()).await.is_ok()
+    // Explicitly drain the body: `GetResult`'s payload is a stream, and a
+    // generic store may not have read it yet by the time `get_opts` returns.
+    // (`FoyerObjectStoreCache` populates the cache eagerly inside `get_opts`,
+    // but consuming the bytes keeps this correct for any inner store and is
+    // a no-op cost there.)
+    match store.get_opts(location, GetOptions::default()).await {
+        Ok(result) => result.bytes().await.is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// Whether `location` should be admitted to the cache given the recent-days
@@ -423,19 +431,30 @@ pub async fn warm_full(store: &dyn ObjectStore, location: &Path) -> bool {
 ///
 /// Keeps cold-tier rewrites (recompress of week+-old partitions) out of the
 /// cache so recent data stays local and old data is served from S3.
-fn is_within_recent_window(location: &Path, recent_days: usize) -> bool {
-    if recent_days == 0 {
-        return true;
-    }
-    let s = location.as_ref();
+/// Parse the `date=YYYY-MM-DD` partition segment from `s` and return whether it
+/// is on or after `cutoff`. Strings without a parseable date segment (Delta log,
+/// checkpoints) are always within the window; a `None` cutoff means no age limit.
+///
+/// Shared by the cache-admission window here and the compaction-warm recency
+/// filter in `database.rs` so the two parsers can't drift.
+pub fn date_partition_within(s: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
+    let Some(cutoff) = cutoff else { return true };
     match s
         .find("date=")
         .and_then(|i| s.get(i + 5..i + 15))
         .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
     {
-        Some(date) => date >= Utc::now().date_naive() - chrono::Duration::days(recent_days as i64),
+        Some(date) => date >= cutoff,
         None => true,
     }
+}
+
+fn is_within_recent_window(location: &Path, recent_days: usize) -> bool {
+    if recent_days == 0 {
+        return true;
+    }
+    let cutoff = Utc::now().date_naive() - chrono::Duration::days(recent_days as i64);
+    date_partition_within(location.as_ref(), Some(cutoff))
 }
 
 /// Insert into the main full-file cache, steering large entries to disk-only
@@ -1068,7 +1087,9 @@ impl FoyerObjectStoreCache {
     /// data clone happens in the spawned task, not on the query path).
     fn maybe_touch(&self, cache: &FoyerCache, key: &str, entry: foyer::HybridCacheEntry<String, CacheValue>, l1_max_entry_bytes: usize) {
         let age = current_millis().saturating_sub(entry.value().timestamp_millis);
-        if age.saturating_mul(2) <= self.config.ttl.as_millis() as u64 {
+        // `as_millis()` is u128; clamp before the u64 cast so an absurdly large
+        // configured TTL can't silently truncate into a tiny value.
+        if age.saturating_mul(2) <= self.config.ttl.as_millis().min(u64::MAX as u128) as u64 {
             return; // still fresh enough — don't churn the cache
         }
         if !self.refreshing.insert(key.to_string()) {
@@ -1082,6 +1103,11 @@ impl FoyerObjectStoreCache {
             insert_main(&cache, key.clone(), CacheValue::new(v.data.clone(), v.meta.clone()), l1_max_entry_bytes);
             refreshing.remove(&key);
         });
+        // Best-effort join registration: if the lock is contended we drop the
+        // handle and the refresh task simply detaches — it still runs to
+        // completion, it just won't be awaited by `background_tasks` on
+        // shutdown. So `background_tasks` is not an exhaustive registry of
+        // in-flight refreshes; don't assume it joins every one.
         if let Ok(mut tasks) = self.background_tasks.try_lock() {
             tasks.spawn(async move {
                 let _ = handle.await;
@@ -1143,7 +1169,15 @@ impl MultipartUpload for CachingMultipartUpload {
                 e_tag:         result.e_tag.clone(),
                 version:       result.version.clone(),
             };
-            insert_main(&self.cache, self.location.to_string(), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
+            // Use the same key derivation as the read path so a multipart-warmed
+            // entry is found by a later GET even if `make_cache_key` ever does
+            // more than `location.to_string()`.
+            insert_main(
+                &self.cache,
+                FoyerObjectStoreCache::make_cache_key(&self.location),
+                CacheValue::new(buf, meta),
+                self.l1_max_entry_bytes,
+            );
             debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
         }
         Ok(result)
@@ -1951,6 +1985,51 @@ mod tests {
 
         cache.shutdown().await?;
         let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    /// Guards key consistency across the three cache paths that derive a key
+    /// independently: the multipart-write warm (`complete()`), the read path
+    /// (`make_cache_key`), and the compaction eviction path (`evict_data_entry`
+    /// on a relativized object path). If any of them diverged, a multipart-warmed
+    /// entry would either never be read back or never be evicted.
+    #[tokio::test]
+    async fn test_multipart_warm_read_and_evict_key_consistency() -> anyhow::Result<()> {
+        use object_store::MultipartUpload;
+
+        let inner = Arc::new(InMemory::new());
+        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("mpu_key_consistency")).await?;
+        let cache = FoyerObjectStoreCache::new_with_shared_cache(inner, &shared);
+        cache.reset_stats().await;
+
+        // Warm via the multipart-write path.
+        let path = Path::from("table/date=2026-06-05/part.parquet");
+        let data = Bytes::from(vec![b'z'; 64 * 1024]);
+        let mut upload = cache.put_multipart(&path).await?;
+        upload.put_part(data.clone().into()).await?;
+        upload.complete().await?;
+
+        // Read path: a plain GET must find the entry the multipart write warmed —
+        // i.e. `complete()` inserted under the same key the read derives. A key
+        // mismatch would surface here as a miss + an S3 fetch.
+        let _ = cache.get(&path).await?;
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.hits, 1, "multipart-warmed entry must be found by a plain GET (warm/read key match)");
+        assert_eq!(stats.main.misses, 0, "no S3 read needed after multipart capture");
+
+        // Eviction path: the compaction hook evicts by the relativized object
+        // path. It must target the same key warming/reads use, or tombstoned
+        // files would linger. Assert at the in-memory layer — foyer removes the
+        // on-disk copy asynchronously, so the memory layer is the deterministic
+        // signal (mirrors test_evict_data_entry_removes_cached_file).
+        assert!(shared.cache.memory().contains(&path.to_string()), "warmed entry should be in the in-memory cache");
+        shared.evict_data_entry(&path.to_string());
+        assert!(
+            !shared.cache.memory().contains(&path.to_string()),
+            "evict must drop the same key warming/reads use"
+        );
+
+        cache.shutdown().await?;
         Ok(())
     }
 }
