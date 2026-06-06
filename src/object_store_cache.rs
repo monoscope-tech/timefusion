@@ -360,6 +360,14 @@ impl SharedFoyerCache {
         info!("Invalidating _last_checkpoint cache for table: {}", table_path);
         self.cache.remove(&last_checkpoint_key);
     }
+
+    /// Best-effort eviction of a main (full-file) cache entry by its key — the
+    /// relativized object path, matching `make_cache_key`. Used to proactively
+    /// drop the (now dead) full-file bytes of a file a compaction tombstoned,
+    /// instead of waiting for VACUUM / TTL / LRU to reclaim them.
+    pub fn evict_data_entry(&self, key: &str) {
+        self.cache.remove(key);
+    }
 }
 
 /// Strip the `scheme://` prefix and trailing slashes from a table URI, yielding
@@ -1791,6 +1799,34 @@ mod tests {
 
         cache.shutdown().await?;
         let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_evict_data_entry_removes_cached_file() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        let shared = SharedFoyerCache::new(FoyerCacheConfig::test_config("evict_entry")).await?;
+        let cache = FoyerObjectStoreCache::new_with_shared_cache(inner, &shared);
+        cache.reset_stats().await;
+
+        let path = Path::from("table/date=2026-06-05/part.parquet");
+        cache.put(&path, PutPayload::from(Bytes::from(vec![b'a'; 4096]))).await?;
+        let _ = cache.get(&path).await?;
+        assert_eq!(cache.get_stats().await.main.hits, 1, "freshly written file should be cached");
+        assert!(shared.cache.memory().contains(&path.to_string()), "freshly read file should be in the in-memory cache");
+
+        // Proactive eviction (what the compaction path does for tombstoned
+        // files) drops the entry from the in-memory cache immediately. foyer's
+        // HybridCache::remove deletes the on-disk copy asynchronously, so we
+        // assert on the memory layer for a deterministic result; the dead bytes
+        // are reclaimed from disk shortly after rather than waiting for VACUUM.
+        shared.evict_data_entry(&path.to_string());
+        assert!(
+            !shared.cache.memory().contains(&path.to_string()),
+            "evicted entry should be dropped from the in-memory cache"
+        );
+
+        cache.shutdown().await?;
         Ok(())
     }
 

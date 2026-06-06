@@ -1724,6 +1724,37 @@ impl Database {
         });
     }
 
+    /// Proactively evict the cached full-file bytes of files a compaction
+    /// tombstoned (present pre-commit, gone post-commit), so dead compaction
+    /// outputs don't linger in the cache until VACUUM / TTL / LRU reclaims them.
+    ///
+    /// Correctness is unaffected: the files still exist in S3 until VACUUM, so a
+    /// straggler query holding the old Delta snapshot just re-reads them from S3
+    /// (a cache miss), never a wrong result. Cheap and in-cache only (no S3),
+    /// so it runs inline.
+    fn evict_cache_for_uris(&self, table_uri: &str, removed: &[String]) {
+        if !self.config.maintenance.timefusion_evict_after_compaction || removed.is_empty() {
+            return;
+        }
+        let Some(cache) = self.object_store_cache.as_ref() else {
+            return;
+        };
+        // Same relativization as warm_cache_for_uris: the cache keys full files
+        // by their object-store-relative path.
+        let prefix = table_uri.split('?').next().unwrap_or(table_uri).trim_end_matches('/');
+        let mut evicted = 0usize;
+        for u in removed {
+            if let Some(rel) = u.strip_prefix(prefix) {
+                let key = object_store::path::Path::from(rel.trim_start_matches('/')).to_string();
+                cache.evict_data_entry(&key);
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            debug!("Evicted {} tombstoned file(s) from cache after compaction", evicted);
+        }
+    }
+
     /// Warm the cache for files added by a just-committed flush/optimize on the
     /// given logical table. Fire-and-forget: resolving the table (which may
     /// issue a rate-limited PG roundtrip) and taking the read lock both happen
@@ -2076,9 +2107,10 @@ impl Database {
             table.clone()
         };
 
-        // Pre-state file set, used to derive the files this optimize *adds* so
-        // we can warm only those into the cache (see warm_cache_for_uris).
-        let pre_uris: std::collections::HashSet<String> = if self.config.maintenance.timefusion_warm_after_compaction {
+        // Pre-state file set, used to derive the files this optimize *adds*
+        // (to warm) and *removes* (to evict) — see warm/evict_cache_for_uris.
+        let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+        let pre_uris: std::collections::HashSet<String> = if track_files {
             table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default()
         } else {
             Default::default()
@@ -2152,14 +2184,18 @@ impl Database {
                 // below to drop indexes whose covered files no longer exist.
                 let live_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
                 // Warm the cache for newly-added files before they're queried,
-                // so the post-compaction dashboards don't cold-start to S3.
-                // Captured off `new_table` so it's independent of the swap below.
+                // so the post-compaction dashboards don't cold-start to S3, and
+                // evict the files this optimize tombstoned. Captured off
+                // `new_table` so they're independent of the swap below.
+                let live_set: std::collections::HashSet<&String> = live_uris.iter().collect();
                 let added: Vec<String> = live_uris.iter().filter(|u| !pre_uris.contains(*u)).cloned().collect();
+                let removed: Vec<String> = pre_uris.iter().filter(|u| !live_set.contains(u)).cloned().collect();
                 let warm_store = new_table.log_store().object_store(None);
                 let warm_table_uri = new_table.table_url().to_string();
                 let mut table = table_ref.write().await;
                 *table = new_table;
                 drop(table);
+                self.evict_cache_for_uris(&warm_table_uri, &removed);
                 self.warm_cache_for_uris(warm_store, warm_table_uri, added);
                 // Tantivy compaction GC — drop sidecar indexes for files that
                 // were rewritten away. Best-effort: errors are logged.
@@ -2370,9 +2406,11 @@ impl Database {
                 let table = table_ref.read().await;
                 table.clone()
             };
-            // Pre-state file set for deriving the files this optimize adds,
-            // so warming touches only the freshly-written (cold) outputs.
-            let pre_uris: std::collections::HashSet<String> = if self.config.maintenance.timefusion_warm_after_compaction {
+            // Pre-state file set for deriving the files this optimize adds (to
+            // warm) and removes (to evict).
+            let track_files =
+                self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+            let pre_uris: std::collections::HashSet<String> = if track_files {
                 table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default()
             } else {
                 Default::default()
@@ -2414,14 +2452,18 @@ impl Database {
                         metrics.num_files_added
                     );
                     // Warm the freshly-compacted files (today's hot partition)
-                    // before the next dashboard read hits them cold from S3.
+                    // before the next dashboard read hits them cold from S3, and
+                    // evict the small files this optimize just tombstoned.
                     let post_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                    let added: Vec<String> = post_uris.into_iter().filter(|u| !pre_uris.contains(u)).collect();
+                    let post_set: std::collections::HashSet<&String> = post_uris.iter().collect();
+                    let added: Vec<String> = post_uris.iter().filter(|u| !pre_uris.contains(*u)).cloned().collect();
+                    let removed: Vec<String> = pre_uris.iter().filter(|u| !post_set.contains(u)).cloned().collect();
                     let warm_store = new_table.log_store().object_store(None);
                     let warm_table_uri = new_table.table_url().to_string();
                     let mut table = table_ref.write().await;
                     *table = new_table;
                     drop(table);
+                    self.evict_cache_for_uris(&warm_table_uri, &removed);
                     self.warm_cache_for_uris(warm_store, warm_table_uri, added);
                     return Ok(());
                 }

@@ -619,6 +619,12 @@ pub struct MaintenanceConfig {
     /// warm job adds right after a compaction.
     #[serde(default = "d_warm_concurrency")]
     pub timefusion_warm_concurrency:           usize,
+    /// After a compaction commit, proactively evict the cached full-file bytes
+    /// of the files it tombstoned (no longer in the live set), instead of
+    /// waiting for VACUUM / TTL / LRU to reclaim them. Cheap (in-cache only, no
+    /// S3) and keeps the cache from filling with dead compaction outputs.
+    #[serde(default = "d_true")]
+    pub timefusion_evict_after_compaction:     bool,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.
@@ -707,6 +713,7 @@ mod tests {
         assert_eq!(config.cache.timefusion_foyer_l1_max_entry_mb, 16);
         assert_eq!(config.cache.timefusion_cache_recent_days, 8);
         assert!(config.maintenance.timefusion_warm_after_compaction);
+        assert!(config.maintenance.timefusion_evict_after_compaction);
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 4);
