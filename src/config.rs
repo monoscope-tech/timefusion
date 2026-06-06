@@ -499,6 +499,14 @@ pub struct CacheConfig {
     /// acts as a *floor*: `from_app_config` automatically raises the effective
     /// block size to 2x the compaction target size, so the two can't drift out
     /// of sync if an operator bumps the target. Default 256MB.
+    ///
+    /// Memory note: this also bounds the transient buffer each multipart-write
+    /// warm holds in heap (see `timefusion_warm_inline_max_mb`). Up to
+    /// `timefusion_warm_concurrency` compactions can run at once, so the worst
+    /// case is `block_size_mb * warm_concurrency` of transient heap during a
+    /// busy maintenance window (e.g. 256MB x 4 = 1GB). On smaller-memory
+    /// instances set `timefusion_warm_inline_max_mb` to cap this independently
+    /// of the on-disk block size.
     #[serde(default = "d_foyer_block_size_mb")]
     pub timefusion_foyer_block_size_mb:        usize,
     /// Entries larger than this (MB) are inserted disk-only (foyer

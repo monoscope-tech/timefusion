@@ -394,6 +394,13 @@ fn is_parquet_file(location: &Path) -> bool {
 /// value. Warming must never affect correctness or a caller's commit. Returns
 /// `true` if the footer range was fetched.
 pub async fn warm_footer(store: &dyn ObjectStore, location: &Path, metadata_size_hint: u64) -> bool {
+    // HEAD-then-bounded-GET (two round-trips) rather than a single
+    // `GetRange::Suffix(metadata_size_hint)`: the suffix form would save the
+    // HEAD, but our cache keys ranges by absolute `start..end` (see
+    // `make_range_cache_key`), so we need the file size to compute the same
+    // bounded range a later footer read will request — otherwise the warmed
+    // bytes land under a key no read hits. The HEAD also primes the metadata
+    // cache. Suffix ranges are also not universally supported across stores.
     let size = match store.head(location).await {
         Ok(meta) => meta.size,
         Err(_) => return false,
@@ -425,12 +432,6 @@ pub async fn warm_full(store: &dyn ObjectStore, location: &Path) -> bool {
     }
 }
 
-/// Whether `location` should be admitted to the cache given the recent-days
-/// window. Parses the `date=YYYY-MM-DD` partition segment; paths without one
-/// (Delta log, checkpoints) are always admitted. 0 days = no age limit.
-///
-/// Keeps cold-tier rewrites (recompress of week+-old partitions) out of the
-/// cache so recent data stays local and old data is served from S3.
 /// Parse the `date=YYYY-MM-DD` partition segment from `s` and return whether it
 /// is on or after `cutoff`. Strings without a parseable date segment (Delta log,
 /// checkpoints) are always within the window; a `None` cutoff means no age limit.
@@ -449,6 +450,12 @@ pub fn date_partition_within(s: &str, cutoff: Option<chrono::NaiveDate>) -> bool
     }
 }
 
+/// Whether `location` should be admitted to the cache given the recent-days
+/// window. Paths without a `date=YYYY-MM-DD` segment (Delta log, checkpoints)
+/// are always admitted. 0 days = no age limit.
+///
+/// Keeps cold-tier rewrites (recompress of week+-old partitions) out of the
+/// cache so recent data stays local and old data is served from S3.
 fn is_within_recent_window(location: &Path, recent_days: usize) -> bool {
     if recent_days == 0 {
         return true;

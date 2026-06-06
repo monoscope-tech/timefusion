@@ -1738,15 +1738,29 @@ impl Database {
         // by their object-store-relative path.
         let prefix = table_uri.split('?').next().unwrap_or(table_uri).trim_end_matches('/');
         let mut evicted = 0usize;
+        let mut dropped = 0usize;
         for u in removed {
             if let Some(rel) = u.strip_prefix(prefix) {
                 let key = object_store::path::Path::from(rel.trim_start_matches('/')).to_string();
                 cache.evict_data_entry(&key);
                 evicted += 1;
+            } else {
+                // Prefix mismatch (trailing-slash or query-string drift between
+                // table_url() and get_file_uris()) — we'd evict the wrong key, so
+                // skip. Log like the warm path: a systematic mismatch here means
+                // tombstoned files linger in cache until TTL/LRU, which is worth
+                // diagnosing rather than silently swallowing.
+                if dropped == 0 {
+                    debug!("evict: URI {} does not start with table prefix {}; skipping (evict only)", u, prefix);
+                }
+                dropped += 1;
             }
         }
         if evicted > 0 {
             debug!("Evicted {} tombstoned file(s) from cache after compaction", evicted);
+        }
+        if dropped > 0 {
+            debug!("evict: skipped {} file(s) that did not relativize against prefix {}", dropped, prefix);
         }
     }
 
