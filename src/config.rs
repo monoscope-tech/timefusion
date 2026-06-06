@@ -146,7 +146,12 @@ const_default!(d_pressure_flush_pct: u32 = 75);
 const_default!(d_wal_fsync_mode: String = "ms");
 const_default!(d_wal_max_files: usize = 200);
 const_default!(d_foyer_memory_mb: usize = 512);
-const_default!(d_foyer_disk_gb: usize = 100);
+// Local disk is cheap and fast relative to S3 GETs, so default the cache large
+// — servers run 500GB–1TB cache volumes. foyer creates the backing file sparse
+// (no upfront allocation), but this is the logical ceiling at which it starts
+// evicting, so it MUST stay <= the cache volume's free space or writes hit
+// ENOSPC before eviction kicks in. Lower it on smaller disks.
+const_default!(d_foyer_disk_gb: usize = 500);
 const_default!(d_foyer_ttl: u64 = 604_800); // 7 days
 const_default!(d_foyer_shards: usize = 8);
 const_default!(d_foyer_file_size_mb: usize = 32);
@@ -485,9 +490,10 @@ pub struct CacheConfig {
     pub timefusion_foyer_metadata_shards:      usize,
     /// Disk block size (MB) for the main data cache. The block is foyer's
     /// minimal eviction unit AND its size caps the largest entry that can land
-    /// on disk — so this must be >= the largest file we want cached locally
-    /// (i.e. >= the compaction target size). Default 256MB comfortably fits the
-    /// 128MB full-compaction outputs.
+    /// on disk — so it must be >= the largest file we want cached locally. This
+    /// acts as a *floor*: `from_app_config` automatically raises the effective
+    /// block size to 2x the compaction target size, so the two can't drift out
+    /// of sync if an operator bumps the target. Default 256MB.
     #[serde(default = "d_foyer_block_size_mb")]
     pub timefusion_foyer_block_size_mb:        usize,
     /// Entries larger than this (MB) are inserted disk-only (foyer
@@ -693,6 +699,8 @@ mod tests {
         assert_eq!(config.core.pgwire_port, 5432);
         assert_eq!(config.buffer.timefusion_flush_interval_secs, 600);
         assert_eq!(config.cache.timefusion_foyer_memory_mb, 512);
+        assert_eq!(config.cache.timefusion_foyer_disk_gb, 500);
+        assert_eq!(config.cache.disk_size_bytes(), 500 * 1024 * 1024 * 1024);
         assert_eq!(config.cache.timefusion_warm_inline_max_mb, 0);
         assert_eq!(config.cache.timefusion_foyer_block_size_mb, 256);
         assert_eq!(config.cache.block_size_bytes(), 256 * 1024 * 1024);

@@ -155,22 +155,38 @@ impl Default for FoyerCacheConfig {
 
 impl FoyerCacheConfig {
     pub fn from_app_config(cfg: &crate::config::AppConfig) -> Self {
+        // The disk block size caps the largest file that can be cached locally,
+        // and compaction writes files at ~the optimize target size. Floor the
+        // block at 2x that target so the two stay in lockstep automatically —
+        // an operator can raise timefusion_optimize_target_size without
+        // silently losing the ability to cache the bigger outputs. The
+        // configured block size acts as a lower bound / explicit override.
+        let optimize_target = cfg.parquet.timefusion_optimize_target_size.max(0) as usize;
+        let block_size_bytes = cfg.cache.block_size_bytes().max(optimize_target.saturating_mul(2));
+        let disk_size_bytes = cfg.cache.disk_size_bytes();
+        if block_size_bytes > disk_size_bytes {
+            tracing::warn!(
+                "Foyer disk block size ({}MB) exceeds disk capacity ({}MB) — large files won't persist to disk. Raise timefusion_foyer_disk_gb or lower the optimize target.",
+                block_size_bytes / 1024 / 1024,
+                disk_size_bytes / 1024 / 1024
+            );
+        }
         Self {
-            memory_size_bytes:          cfg.cache.memory_size_bytes(),
-            disk_size_bytes:            cfg.cache.disk_size_bytes(),
-            ttl:                        cfg.cache.ttl(),
-            cache_dir:                  cfg.core.cache_dir(),
-            shards:                     cfg.cache.timefusion_foyer_shards,
-            file_size_bytes:            cfg.cache.file_size_bytes(),
-            enable_stats:               cfg.cache.stats_enabled(),
+            memory_size_bytes: cfg.cache.memory_size_bytes(),
+            disk_size_bytes,
+            ttl: cfg.cache.ttl(),
+            cache_dir: cfg.core.cache_dir(),
+            shards: cfg.cache.timefusion_foyer_shards,
+            file_size_bytes: cfg.cache.file_size_bytes(),
+            enable_stats: cfg.cache.stats_enabled(),
             parquet_metadata_size_hint: cfg.cache.timefusion_parquet_metadata_size_hint,
             metadata_memory_size_bytes: cfg.cache.metadata_memory_size_bytes(),
-            metadata_disk_size_bytes:   cfg.cache.metadata_disk_size_bytes(),
-            metadata_shards:            cfg.cache.timefusion_foyer_metadata_shards,
-            warm_inline_max_bytes:      cfg.cache.warm_inline_max_bytes(),
-            block_size_bytes:           cfg.cache.block_size_bytes(),
-            l1_max_entry_bytes:         cfg.cache.l1_max_entry_bytes(),
-            cache_recent_days:          cfg.cache.timefusion_cache_recent_days,
+            metadata_disk_size_bytes: cfg.cache.metadata_disk_size_bytes(),
+            metadata_shards: cfg.cache.timefusion_foyer_metadata_shards,
+            warm_inline_max_bytes: cfg.cache.warm_inline_max_bytes(),
+            block_size_bytes,
+            l1_max_entry_bytes: cfg.cache.l1_max_entry_bytes(),
+            cache_recent_days: cfg.cache.timefusion_cache_recent_days,
         }
     }
 
@@ -1676,6 +1692,33 @@ mod tests {
         cache.shutdown().await?;
         let _ = std::fs::remove_dir_all(&cache_dir);
         Ok(())
+    }
+
+    #[test]
+    fn test_block_size_tracks_optimize_target() {
+        use crate::config::AppConfig;
+        let mut cfg = AppConfig::default();
+
+        // Defaults: 2x the 128MB target == the 256MB configured floor.
+        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 256 * 1024 * 1024);
+
+        // Raise the optimize target past the floor → block auto-tracks to 2x,
+        // so big outputs stay cacheable without touching the cache config.
+        cfg.parquet.timefusion_optimize_target_size = 512 * 1024 * 1024;
+        assert_eq!(
+            FoyerCacheConfig::from_app_config(&cfg).block_size_bytes,
+            1024 * 1024 * 1024,
+            "block size should track 2x the optimize target"
+        );
+
+        // With a small target, the configured block size is the floor.
+        cfg.parquet.timefusion_optimize_target_size = 16 * 1024 * 1024;
+        cfg.cache.timefusion_foyer_block_size_mb = 256;
+        assert_eq!(
+            FoyerCacheConfig::from_app_config(&cfg).block_size_bytes,
+            256 * 1024 * 1024,
+            "configured block size acts as a floor"
+        );
     }
 
     #[test]
