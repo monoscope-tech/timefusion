@@ -112,6 +112,9 @@ pub struct FoyerCacheConfig {
     pub metadata_disk_size_bytes:   usize,
     /// Number of shards for metadata cache
     pub metadata_shards:            usize,
+    /// Max bytes buffered to warm the cache inline from a multipart write
+    /// (see `CachingMultipartUpload`). 0 disables inline multipart capture.
+    pub warm_inline_max_bytes:      usize,
 }
 
 impl Default for FoyerCacheConfig {
@@ -128,6 +131,7 @@ impl Default for FoyerCacheConfig {
             metadata_memory_size_bytes: 67_108_864,  // 64MB
             metadata_disk_size_bytes:   536_870_912, // 512MB
             metadata_shards:            4,           // Fewer shards for metadata cache
+            warm_inline_max_bytes:      33_554_432,  // 32MB
         }
     }
 }
@@ -146,6 +150,7 @@ impl FoyerCacheConfig {
             metadata_memory_size_bytes: cfg.cache.metadata_memory_size_bytes(),
             metadata_disk_size_bytes:   cfg.cache.metadata_disk_size_bytes(),
             metadata_shards:            cfg.cache.timefusion_foyer_metadata_shards,
+            warm_inline_max_bytes:      cfg.cache.warm_inline_max_bytes(),
         }
     }
 
@@ -164,6 +169,7 @@ impl FoyerCacheConfig {
             metadata_memory_size_bytes: 10 * 1024 * 1024, // 10MB for tests
             metadata_disk_size_bytes:   50 * 1024 * 1024, // 50MB for tests
             metadata_shards:            2,
+            warm_inline_max_bytes:      4 * 1024 * 1024, // 4MB for tests
         }
     }
 
@@ -896,6 +902,11 @@ impl FoyerObjectStoreCache {
         let payload_size = payload.content_length();
         let is_parquet = is_parquet_file(location);
 
+        // Keep a cheap (Arc-backed) handle to the payload so we can warm the
+        // cache from the bytes we already hold — no need to re-download what we
+        // just wrote to S3.
+        let payload_for_cache = payload.clone();
+
         debug!("S3 PUT request starting: {} (size: {} bytes, parquet: {})", location, payload_size, is_parquet);
         let start_time = std::time::Instant::now();
         let result = self.inner.put_opts(location, payload, opts).await?;
@@ -907,17 +918,29 @@ impl FoyerObjectStoreCache {
             is_parquet
         );
 
-        // After successful write, update the cache with the new data
-        self.update_stats(|s| s.inner_gets += 1).await;
-        if let Ok(get_result) = self.inner.get(location).await {
-            let (data, meta) = Self::collect_payload(get_result).await;
-            if !data.is_empty() {
-                let size = meta.size;
-                self.cache.insert(Self::make_cache_key(location), CacheValue::new(data, meta));
-                debug!("Updated cache after write: {} (size: {} bytes)", location, size);
+        // Warm the cache directly from the just-written bytes — a range-agnostic
+        // full-file entry, so any subsequent ranged read is served by a slice.
+        // ObjectMeta is reconstructed from the PutResult (e_tag/version) and the
+        // known payload size; no post-write GET.
+        if payload_size > 0 {
+            let mut data = Vec::with_capacity(payload_size);
+            for chunk in payload_for_cache.iter() {
+                data.extend_from_slice(chunk);
             }
+            let meta = ObjectMeta {
+                location:      location.clone(),
+                last_modified: Utc::now(),
+                size:          payload_size as u64,
+                e_tag:         result.e_tag.clone(),
+                version:       result.version.clone(),
+            };
+            self.cache.insert(Self::make_cache_key(location), CacheValue::new(data, meta));
+            debug!("Warmed cache from write payload: {} (size: {} bytes)", location, payload_size);
         }
 
+        // Overwrites land a fresh full-file entry (checked first on read), but
+        // stale per-range metadata entries from a previous version of this key
+        // must still be dropped.
         if is_parquet {
             self.invalidate_metadata_cache(location).await;
         }
@@ -933,6 +956,70 @@ impl FoyerObjectStoreCache {
     }
 }
 
+/// Wraps an inner [`MultipartUpload`] to tee written bytes into a bounded
+/// buffer, so the completed file can be inserted into the cache directly — we
+/// never re-download a file we just streamed to S3. If the upload grows past
+/// `max_warm_bytes` the buffer is dropped and the rest streams through
+/// un-captured (large compaction outputs fall back to the selective
+/// post-commit warm path); this bounds both transient memory and L1 cache
+/// pressure. Strictly best-effort: failure to capture never affects the write.
+struct CachingMultipartUpload {
+    inner:          Box<dyn MultipartUpload>,
+    location:       Path,
+    cache:          FoyerCache,
+    /// `None` once the cap was exceeded (capture abandoned for this upload).
+    buffer:         Option<Vec<u8>>,
+    max_warm_bytes: usize,
+}
+
+impl std::fmt::Debug for CachingMultipartUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachingMultipartUpload").field("location", &self.location).finish()
+    }
+}
+
+#[async_trait]
+impl MultipartUpload for CachingMultipartUpload {
+    fn put_part(&mut self, data: PutPayload) -> object_store::UploadPart {
+        if let Some(buf) = self.buffer.as_mut() {
+            if buf.len().saturating_add(data.content_length()) > self.max_warm_bytes {
+                // Too big to warm without risking memory / L1 eviction — give
+                // up capturing for this upload.
+                self.buffer = None;
+            } else {
+                for chunk in data.iter() {
+                    buf.extend_from_slice(chunk);
+                }
+            }
+        }
+        self.inner.put_part(data)
+    }
+
+    async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
+        let result = self.inner.complete().await?;
+        if let Some(buf) = self.buffer.take()
+            && !buf.is_empty()
+        {
+            let size = buf.len() as u64;
+            let meta = ObjectMeta {
+                location:      self.location.clone(),
+                last_modified: Utc::now(),
+                size,
+                e_tag:         result.e_tag.clone(),
+                version:       result.version.clone(),
+            };
+            self.cache.insert(self.location.to_string(), CacheValue::new(buf, meta));
+            debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
+        }
+        Ok(result)
+    }
+
+    async fn abort(&mut self) -> ObjectStoreResult<()> {
+        self.buffer = None;
+        self.inner.abort().await
+    }
+}
+
 #[async_trait]
 impl ObjectStore for FoyerObjectStoreCache {
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
@@ -940,7 +1027,21 @@ impl ObjectStore for FoyerObjectStoreCache {
     }
 
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
+        let inner = self.inner.put_multipart_opts(location, opts).await?;
+        // Parquet writers (flush + compaction outputs) stream large files via
+        // multipart. Tee the written bytes into a bounded buffer so the
+        // completed file warms the cache directly — no re-download of what we
+        // just uploaded. Disabled (pass-through) when the cap is 0.
+        if self.config.warm_inline_max_bytes == 0 {
+            return Ok(inner);
+        }
+        Ok(Box::new(CachingMultipartUpload {
+            inner,
+            location: location.clone(),
+            cache: self.cache.clone(),
+            buffer: Some(Vec::new()),
+            max_warm_bytes: self.config.warm_inline_max_bytes,
+        }))
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
@@ -1038,7 +1139,7 @@ mod tests {
 
         let stats = cache.get_stats().await;
         assert_eq!(stats.main.inner_puts, 1);
-        assert_eq!(stats.main.inner_gets, 1); // We fetch after write to cache it
+        assert_eq!(stats.main.inner_gets, 0); // Cached directly from the write payload — no re-fetch
 
         // First get - cache hit (since we cache on write)
         let result = cache.get(&path).await?;
@@ -1050,7 +1151,7 @@ mod tests {
         assert_eq!(bytes[0], data);
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 1); // No additional fetch needed
+        assert_eq!(stats.main.inner_gets, 0); // No fetch needed - cached from write payload
         assert_eq!(stats.main.misses, 0);
         assert_eq!(stats.main.hits, 1);
 
@@ -1063,7 +1164,7 @@ mod tests {
         assert_eq!(bytes2[0], data);
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 1); // Still just the one from write
+        assert_eq!(stats.main.inner_gets, 0); // Still no fetch - served from cache
         assert_eq!(stats.main.hits, 2); // Two cache hits total
         assert_eq!(stats.main.misses, 0);
 
@@ -1117,7 +1218,7 @@ mod tests {
         }
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 3); // From the writes
+        assert_eq!(stats.main.inner_gets, 0); // Cached from write payloads — no re-fetch
         assert_eq!(stats.main.misses, 0);
         assert_eq!(stats.main.hits, 3);
 
@@ -1134,7 +1235,7 @@ mod tests {
         }
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 3); // No new inner gets
+        assert_eq!(stats.main.inner_gets, 0); // No inner gets at all
         assert_eq!(stats.main.hits, 6); // Total 6 hits (3 per read)
 
         info!("Cache successfully prevented {} S3 accesses", stats.main.hits);
@@ -1203,7 +1304,7 @@ mod tests {
         assert_eq!(bytes[0].len(), large_data.len());
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 1); // From the write
+        assert_eq!(stats.main.inner_gets, 0); // Cached from write payload — no re-fetch
         assert_eq!(stats.main.hits, 1);
 
         // Second get - cache hit
@@ -1215,7 +1316,7 @@ mod tests {
         assert_eq!(bytes2[0].len(), large_data.len());
 
         let stats = cache.get_stats().await;
-        assert_eq!(stats.main.inner_gets, 1); // Still just from the write
+        assert_eq!(stats.main.inner_gets, 0); // Still no fetch - served from cache
         assert_eq!(stats.main.hits, 2); // Two cache hits total
 
         info!("Large file test - main cache hits: {}, misses: {}", stats.main.hits, stats.main.misses);
@@ -1437,6 +1538,61 @@ mod tests {
         cache.shutdown().await?;
 
         // Clean up cache directory after test
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multipart_capture_warms_cache() -> anyhow::Result<()> {
+        use object_store::MultipartUpload;
+
+        let test_id = format!("mpu_capture_{}", std::process::id());
+        let inner = Arc::new(InMemory::new());
+        // Cap at 1MB so we can exercise both the captured and skipped paths.
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.warm_inline_max_bytes = 1024 * 1024;
+        });
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        cache.reset_stats().await;
+
+        // Small multipart write (under the cap) → captured into the cache on
+        // complete, with no re-download.
+        let small_path = Path::from("table/date=2026-06-05/small.parquet");
+        let small_data = Bytes::from(vec![b'a'; 256 * 1024]);
+        let mut upload = cache.put_multipart(&small_path).await?;
+        upload.put_part(small_data.clone().into()).await?;
+        upload.complete().await?;
+
+        // A read is served entirely from cache — the multipart write warmed it.
+        let result = cache.get(&small_path).await?;
+        use futures::TryStreamExt;
+        let bytes: Vec<Bytes> = match result.payload {
+            GetResultPayload::Stream(s) => s.try_collect().await?,
+            _ => panic!("Expected stream"),
+        };
+        assert_eq!(bytes.concat().len(), small_data.len());
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.hits, 1, "small multipart write should warm the cache");
+        assert_eq!(stats.main.misses, 0, "no S3 read needed after multipart capture");
+
+        // Large multipart write (over the cap) → capture abandoned, streams
+        // through, so the first read is a genuine miss.
+        cache.reset_stats().await;
+        let big_path = Path::from("table/date=2026-06-05/big.parquet");
+        let big_chunk = Bytes::from(vec![b'b'; 768 * 1024]);
+        let mut upload = cache.put_multipart(&big_path).await?;
+        upload.put_part(big_chunk.clone().into()).await?; // 768KB
+        upload.put_part(big_chunk.clone().into()).await?; // 1.5MB total > 1MB cap
+        upload.complete().await?;
+
+        let _ = cache.get(&big_path).await?;
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.misses, 1, "over-cap multipart write should not be cached inline");
+
+        cache.shutdown().await?;
         let _ = std::fs::remove_dir_all(&cache_dir);
         Ok(())
     }

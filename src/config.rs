@@ -155,6 +155,7 @@ const_default!(d_metadata_size_hint: usize = 1_048_576);
 const_default!(d_metadata_memory_mb: usize = 512);
 const_default!(d_metadata_disk_gb: usize = 5);
 const_default!(d_metadata_shards: usize = 4);
+const_default!(d_warm_inline_max_mb: usize = 32);
 const_default!(d_page_rows: usize = 20_000);
 const_default!(d_zstd_level: i32 = 3);
 // Tiered compression by partition age. Hot writes prioritize ingest latency;
@@ -479,6 +480,13 @@ pub struct CacheConfig {
     pub timefusion_foyer_metadata_disk_gb:     usize,
     #[serde(default = "d_metadata_shards")]
     pub timefusion_foyer_metadata_shards:      usize,
+    /// Cap (MB) on the in-flight buffer used to warm the cache directly from a
+    /// multipart write, so we don't re-download a file we just streamed to S3.
+    /// Uploads above this stream through un-captured (large compaction outputs
+    /// fall back to the selective post-commit warm) — this bounds both memory
+    /// use and L1 cache pressure. 0 disables inline multipart capture.
+    #[serde(default = "d_warm_inline_max_mb")]
+    pub timefusion_warm_inline_max_mb:         usize,
     #[serde(default)]
     pub timefusion_foyer_disabled:             bool,
 }
@@ -504,6 +512,9 @@ impl CacheConfig {
     }
     pub fn metadata_memory_size_bytes(&self) -> usize {
         self.timefusion_foyer_metadata_memory_mb * 1024 * 1024
+    }
+    pub fn warm_inline_max_bytes(&self) -> usize {
+        self.timefusion_warm_inline_max_mb * 1024 * 1024
     }
     pub fn metadata_disk_size_bytes(&self) -> usize {
         self.timefusion_foyer_metadata_disk_mb
@@ -655,6 +666,8 @@ mod tests {
         assert_eq!(config.core.pgwire_port, 5432);
         assert_eq!(config.buffer.timefusion_flush_interval_secs, 600);
         assert_eq!(config.cache.timefusion_foyer_memory_mb, 512);
+        assert_eq!(config.cache.timefusion_warm_inline_max_mb, 32);
+        assert_eq!(config.cache.warm_inline_max_bytes(), 32 * 1024 * 1024);
         assert!(config.maintenance.timefusion_warm_after_compaction);
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);
