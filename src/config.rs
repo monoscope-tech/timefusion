@@ -155,7 +155,10 @@ const_default!(d_metadata_size_hint: usize = 1_048_576);
 const_default!(d_metadata_memory_mb: usize = 512);
 const_default!(d_metadata_disk_gb: usize = 5);
 const_default!(d_metadata_shards: usize = 4);
-const_default!(d_warm_inline_max_mb: usize = 32);
+const_default!(d_warm_inline_max_mb: usize = 0);
+const_default!(d_foyer_block_size_mb: usize = 256);
+const_default!(d_l1_max_entry_mb: usize = 16);
+const_default!(d_cache_recent_days: usize = 8);
 const_default!(d_page_rows: usize = 20_000);
 const_default!(d_zstd_level: i32 = 3);
 // Tiered compression by partition age. Hot writes prioritize ingest latency;
@@ -480,11 +483,29 @@ pub struct CacheConfig {
     pub timefusion_foyer_metadata_disk_gb:     usize,
     #[serde(default = "d_metadata_shards")]
     pub timefusion_foyer_metadata_shards:      usize,
-    /// Cap (MB) on the in-flight buffer used to warm the cache directly from a
-    /// multipart write, so we don't re-download a file we just streamed to S3.
-    /// Uploads above this stream through un-captured (large compaction outputs
-    /// fall back to the selective post-commit warm) — this bounds both memory
-    /// use and L1 cache pressure. 0 disables inline multipart capture.
+    /// Disk block size (MB) for the main data cache. The block is foyer's
+    /// minimal eviction unit AND its size caps the largest entry that can land
+    /// on disk — so this must be >= the largest file we want cached locally
+    /// (i.e. >= the compaction target size). Default 256MB comfortably fits the
+    /// 128MB full-compaction outputs.
+    #[serde(default = "d_foyer_block_size_mb")]
+    pub timefusion_foyer_block_size_mb:        usize,
+    /// Entries larger than this (MB) are inserted disk-only (foyer
+    /// `Location::OnDisk`) so warming a big compaction output doesn't evict the
+    /// hot small-entry working set from L1 memory. Small entries keep the
+    /// default L1+disk placement for fastest repeat reads. 0 = always use L1.
+    #[serde(default = "d_l1_max_entry_mb")]
+    pub timefusion_foyer_l1_max_entry_mb:      usize,
+    /// Don't admit writes whose `date=` partition is older than this many days
+    /// (e.g. cold-tier recompress rewrites) — recent data stays local, old data
+    /// is served from S3. 0 = no age limit. Pairs with the cache TTL, which
+    /// governs how long an admitted entry survives before falling back to S3.
+    #[serde(default = "d_cache_recent_days")]
+    pub timefusion_cache_recent_days:          usize,
+    /// Optional extra cap (MB) on the in-flight buffer used to warm the cache
+    /// directly from a multipart write (so we don't re-download a file we just
+    /// streamed to S3). Always bounded by the disk block size; 0 = bound only
+    /// by the block size.
     #[serde(default = "d_warm_inline_max_mb")]
     pub timefusion_warm_inline_max_mb:         usize,
     #[serde(default)]
@@ -515,6 +536,12 @@ impl CacheConfig {
     }
     pub fn warm_inline_max_bytes(&self) -> usize {
         self.timefusion_warm_inline_max_mb * 1024 * 1024
+    }
+    pub fn block_size_bytes(&self) -> usize {
+        self.timefusion_foyer_block_size_mb * 1024 * 1024
+    }
+    pub fn l1_max_entry_bytes(&self) -> usize {
+        self.timefusion_foyer_l1_max_entry_mb * 1024 * 1024
     }
     pub fn metadata_disk_size_bytes(&self) -> usize {
         self.timefusion_foyer_metadata_disk_mb
@@ -666,8 +693,11 @@ mod tests {
         assert_eq!(config.core.pgwire_port, 5432);
         assert_eq!(config.buffer.timefusion_flush_interval_secs, 600);
         assert_eq!(config.cache.timefusion_foyer_memory_mb, 512);
-        assert_eq!(config.cache.timefusion_warm_inline_max_mb, 32);
-        assert_eq!(config.cache.warm_inline_max_bytes(), 32 * 1024 * 1024);
+        assert_eq!(config.cache.timefusion_warm_inline_max_mb, 0);
+        assert_eq!(config.cache.timefusion_foyer_block_size_mb, 256);
+        assert_eq!(config.cache.block_size_bytes(), 256 * 1024 * 1024);
+        assert_eq!(config.cache.timefusion_foyer_l1_max_entry_mb, 16);
+        assert_eq!(config.cache.timefusion_cache_recent_days, 8);
         assert!(config.maintenance.timefusion_warm_after_compaction);
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);

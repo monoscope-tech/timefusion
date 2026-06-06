@@ -9,7 +9,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashSet;
-use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, PsyncIoEngineConfig};
+use foyer::{
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, HybridCacheProperties, Location,
+    PsyncIoEngineConfig,
+};
 use futures::stream::BoxStream;
 use object_store::{
     Attributes, CopyOptions, GetOptions, GetRange, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt,
@@ -112,9 +115,20 @@ pub struct FoyerCacheConfig {
     pub metadata_disk_size_bytes:   usize,
     /// Number of shards for metadata cache
     pub metadata_shards:            usize,
-    /// Max bytes buffered to warm the cache inline from a multipart write
-    /// (see `CachingMultipartUpload`). 0 disables inline multipart capture.
+    /// Optional extra cap on bytes buffered to warm the cache inline from a
+    /// multipart write (see `CachingMultipartUpload`). Always bounded by
+    /// `block_size_bytes`; 0 = bound only by the block size.
     pub warm_inline_max_bytes:      usize,
+    /// Disk block size for the main data cache — foyer's eviction unit and the
+    /// hard cap on the largest entry that can persist to disk. Must be >= the
+    /// largest file we want cached (compaction target size).
+    pub block_size_bytes:           usize,
+    /// Entries larger than this are inserted disk-only (`Location::OnDisk`) so
+    /// they don't evict the hot L1 working set. 0 = always use L1.
+    pub l1_max_entry_bytes:         usize,
+    /// Don't admit writes whose `date=` partition is older than this many days.
+    /// 0 = no age limit.
+    pub cache_recent_days:          usize,
 }
 
 impl Default for FoyerCacheConfig {
@@ -131,7 +145,10 @@ impl Default for FoyerCacheConfig {
             metadata_memory_size_bytes: 67_108_864,  // 64MB
             metadata_disk_size_bytes:   536_870_912, // 512MB
             metadata_shards:            4,           // Fewer shards for metadata cache
-            warm_inline_max_bytes:      33_554_432,  // 32MB
+            warm_inline_max_bytes:      0,           // bound by block size
+            block_size_bytes:           268_435_456, // 256MB — fits 128MB compaction outputs
+            l1_max_entry_bytes:         16_777_216,  // 16MB
+            cache_recent_days:          8,
         }
     }
 }
@@ -151,6 +168,9 @@ impl FoyerCacheConfig {
             metadata_disk_size_bytes:   cfg.cache.metadata_disk_size_bytes(),
             metadata_shards:            cfg.cache.timefusion_foyer_metadata_shards,
             warm_inline_max_bytes:      cfg.cache.warm_inline_max_bytes(),
+            block_size_bytes:           cfg.cache.block_size_bytes(),
+            l1_max_entry_bytes:         cfg.cache.l1_max_entry_bytes(),
+            cache_recent_days:          cfg.cache.timefusion_cache_recent_days,
         }
     }
 
@@ -169,7 +189,10 @@ impl FoyerCacheConfig {
             metadata_memory_size_bytes: 10 * 1024 * 1024, // 10MB for tests
             metadata_disk_size_bytes:   50 * 1024 * 1024, // 50MB for tests
             metadata_shards:            2,
-            warm_inline_max_bytes:      4 * 1024 * 1024, // 4MB for tests
+            warm_inline_max_bytes:      0,               // bound by block size
+            block_size_bytes:           4 * 1024 * 1024, // 4MB — must be <= test disk size
+            l1_max_entry_bytes:         1024 * 1024,     // 1MB
+            cache_recent_days:          0,               // no age limit in tests (avoid date flakiness)
         }
     }
 
@@ -229,9 +252,10 @@ impl SharedFoyerCache {
     /// Create a new shared Foyer cache
     pub async fn new(config: FoyerCacheConfig) -> anyhow::Result<Self> {
         info!(
-            "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, ttl: {}s, parquet_metadata_hint: {}KB)",
+            "Initializing shared Foyer hybrid cache (memory: {}MB, disk: {}GB, block: {}MB, ttl: {}s, parquet_metadata_hint: {}KB)",
             config.memory_size_bytes / 1024 / 1024,
             config.disk_size_bytes / 1024 / 1024 / 1024,
+            config.block_size_bytes / 1024 / 1024,
             config.ttl.as_secs(),
             config.parquet_metadata_size_hint / 1024
         );
@@ -255,8 +279,11 @@ impl SharedFoyerCache {
             .storage()
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
+                // Block size caps the largest entry that can land on disk, so the
+                // main data cache uses a block big enough to hold full compaction
+                // outputs (128MB) — otherwise they'd silently never persist.
                 BlockEngineConfig::new(FsDeviceBuilder::new(&config.cache_dir).with_capacity(config.disk_size_bytes).build()?)
-                    .with_block_size(config.file_size_bytes),
+                    .with_block_size(config.block_size_bytes),
             )
             .build()
             .await?;
@@ -364,6 +391,39 @@ pub async fn warm_footer(store: &dyn ObjectStore, location: &Path, metadata_size
 /// Foyer instead of S3. Errors are swallowed; see [`warm_footer`].
 pub async fn warm_full(store: &dyn ObjectStore, location: &Path) -> bool {
     store.get_opts(location, GetOptions::default()).await.is_ok()
+}
+
+/// Whether `location` should be admitted to the cache given the recent-days
+/// window. Parses the `date=YYYY-MM-DD` partition segment; paths without one
+/// (Delta log, checkpoints) are always admitted. 0 days = no age limit.
+///
+/// Keeps cold-tier rewrites (recompress of week+-old partitions) out of the
+/// cache so recent data stays local and old data is served from S3.
+fn is_within_recent_window(location: &Path, recent_days: usize) -> bool {
+    if recent_days == 0 {
+        return true;
+    }
+    let s = location.as_ref();
+    match s
+        .find("date=")
+        .and_then(|i| s.get(i + 5..i + 15))
+        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+    {
+        Some(date) => date >= Utc::now().date_naive() - chrono::Duration::days(recent_days as i64),
+        None => true,
+    }
+}
+
+/// Insert into the main full-file cache, steering large entries to disk-only
+/// (`Location::OnDisk`, which makes them phantom in L1) so warming a 128MB
+/// compaction output doesn't evict the hot small-entry working set from memory.
+/// Small entries keep the default L1+disk placement for fastest repeat reads.
+fn insert_main(cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_bytes: usize) {
+    if l1_max_entry_bytes > 0 && value.data.len() > l1_max_entry_bytes {
+        cache.insert_with_properties(key, value, HybridCacheProperties::default().with_location(Location::OnDisk));
+    } else {
+        cache.insert(key, value);
+    }
 }
 
 /// Foyer-based hybrid cache implementation for object store
@@ -673,7 +733,7 @@ impl FoyerObjectStoreCache {
             }
         };
 
-        self.cache.insert(cache_key, CacheValue::new(data.clone(), result.meta.clone()));
+        self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()));
         Ok(Self::make_get_result(Bytes::from(data), result.meta))
     }
 
@@ -921,7 +981,8 @@ impl FoyerObjectStoreCache {
         // Warm the cache directly from the just-written bytes — a range-agnostic
         // full-file entry, so any subsequent ranged read is served by a slice.
         // ObjectMeta is reconstructed from the PutResult (e_tag/version) and the
-        // known payload size; no post-write GET.
+        // known payload size; no post-write GET. insert_main_value applies the
+        // recent-days window and large-entry disk steering.
         if payload_size > 0 {
             let mut data = Vec::with_capacity(payload_size);
             for chunk in payload_for_cache.iter() {
@@ -934,7 +995,7 @@ impl FoyerObjectStoreCache {
                 e_tag:         result.e_tag.clone(),
                 version:       result.version.clone(),
             };
-            self.cache.insert(Self::make_cache_key(location), CacheValue::new(data, meta));
+            self.insert_main_value(location, CacheValue::new(data, meta));
             debug!("Warmed cache from write payload: {} (size: {} bytes)", location, payload_size);
         }
 
@@ -954,6 +1015,16 @@ impl FoyerObjectStoreCache {
             self.invalidate_metadata_cache(location).await;
         }
     }
+
+    /// Admit a full-file entry to the main cache, honoring the recent-days
+    /// window (cold/old partitions are skipped → served from S3) and steering
+    /// large entries to disk-only so they don't evict the L1 hot set.
+    fn insert_main_value(&self, location: &Path, value: CacheValue) {
+        if !is_within_recent_window(location, self.config.cache_recent_days) {
+            return;
+        }
+        insert_main(&self.cache, Self::make_cache_key(location), value, self.config.l1_max_entry_bytes);
+    }
 }
 
 /// Wraps an inner [`MultipartUpload`] to tee written bytes into a bounded
@@ -964,12 +1035,13 @@ impl FoyerObjectStoreCache {
 /// post-commit warm path); this bounds both transient memory and L1 cache
 /// pressure. Strictly best-effort: failure to capture never affects the write.
 struct CachingMultipartUpload {
-    inner:          Box<dyn MultipartUpload>,
-    location:       Path,
-    cache:          FoyerCache,
+    inner:              Box<dyn MultipartUpload>,
+    location:           Path,
+    cache:              FoyerCache,
     /// `None` once the cap was exceeded (capture abandoned for this upload).
-    buffer:         Option<Vec<u8>>,
-    max_warm_bytes: usize,
+    buffer:             Option<Vec<u8>>,
+    max_warm_bytes:     usize,
+    l1_max_entry_bytes: usize,
 }
 
 impl std::fmt::Debug for CachingMultipartUpload {
@@ -1008,7 +1080,7 @@ impl MultipartUpload for CachingMultipartUpload {
                 e_tag:         result.e_tag.clone(),
                 version:       result.version.clone(),
             };
-            self.cache.insert(self.location.to_string(), CacheValue::new(buf, meta));
+            insert_main(&self.cache, self.location.to_string(), CacheValue::new(buf, meta), self.l1_max_entry_bytes);
             debug!("Warmed cache from multipart write: {} (size: {} bytes)", self.location, size);
         }
         Ok(result)
@@ -1028,19 +1100,27 @@ impl ObjectStore for FoyerObjectStoreCache {
 
     async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
         let inner = self.inner.put_multipart_opts(location, opts).await?;
+        // Skip capture for cold-partition rewrites (e.g. tier recompress of
+        // week+-old data) — recent data stays local, old data is served from S3.
+        if !is_within_recent_window(location, self.config.cache_recent_days) {
+            return Ok(inner);
+        }
         // Parquet writers (flush + compaction outputs) stream large files via
         // multipart. Tee the written bytes into a bounded buffer so the
         // completed file warms the cache directly — no re-download of what we
-        // just uploaded. Disabled (pass-through) when the cap is 0.
-        if self.config.warm_inline_max_bytes == 0 {
-            return Ok(inner);
+        // just uploaded. Cap the buffer at the disk block size (the largest
+        // entry foyer can persist), optionally tightened by warm_inline_max_bytes.
+        let mut cap = self.config.block_size_bytes;
+        if self.config.warm_inline_max_bytes > 0 {
+            cap = cap.min(self.config.warm_inline_max_bytes);
         }
         Ok(Box::new(CachingMultipartUpload {
             inner,
             location: location.clone(),
             cache: self.cache.clone(),
             buffer: Some(Vec::new()),
-            max_warm_bytes: self.config.warm_inline_max_bytes,
+            max_warm_bytes: cap,
+            l1_max_entry_bytes: self.config.l1_max_entry_bytes,
         }))
     }
 
@@ -1548,7 +1628,8 @@ mod tests {
 
         let test_id = format!("mpu_capture_{}", std::process::id());
         let inner = Arc::new(InMemory::new());
-        // Cap at 1MB so we can exercise both the captured and skipped paths.
+        // Tighten the inline cap to 1MB (below the 4MB block size) so we can
+        // exercise both the captured and skipped paths.
         let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
             c.warm_inline_max_bytes = 1024 * 1024;
         });
@@ -1591,6 +1672,57 @@ mod tests {
         let _ = cache.get(&big_path).await?;
         let stats = cache.get_stats().await;
         assert_eq!(stats.main.misses, 1, "over-cap multipart write should not be cached inline");
+
+        cache.shutdown().await?;
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_within_recent_window() {
+        let today = Utc::now().date_naive();
+        let recent = Path::from(format!("t/date={}/part.parquet", today));
+        let old = Path::from(format!("t/date={}/part.parquet", today - chrono::Duration::days(30)));
+
+        // Recent partitions are admitted; week+-old ones are skipped.
+        assert!(is_within_recent_window(&recent, 8));
+        assert!(!is_within_recent_window(&old, 8));
+        // 0 = no age limit → everything admitted.
+        assert!(is_within_recent_window(&old, 0));
+        // No date= segment (Delta log, checkpoints) → always admitted.
+        assert!(is_within_recent_window(&Path::from("t/_delta_log/00001.json"), 8));
+    }
+
+    #[tokio::test]
+    async fn test_recent_window_skips_old_partition_writes() -> anyhow::Result<()> {
+        let test_id = format!("recent_window_{}", std::process::id());
+        let inner = Arc::new(InMemory::new());
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.cache_recent_days = 8; // enforce the window in this test
+        });
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        cache.reset_stats().await;
+
+        let today = Utc::now().date_naive();
+        let recent = Path::from(format!("t/date={}/part.parquet", today));
+        let old = Path::from(format!("t/date={}/part.parquet", today - chrono::Duration::days(30)));
+        let data = Bytes::from(vec![b'a'; 4096]);
+
+        // Recent write is admitted → served from cache (no S3 read).
+        cache.put(&recent, PutPayload::from(data.clone())).await?;
+        let _ = cache.get(&recent).await?;
+        assert_eq!(cache.get_stats().await.main.hits, 1, "recent write should be cached");
+
+        // Old-partition write is NOT admitted → read falls through to S3 (miss).
+        cache.reset_stats().await;
+        cache.put(&old, PutPayload::from(data.clone())).await?;
+        let _ = cache.get(&old).await?;
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.hits, 0, "old-partition write should not be cached");
+        assert_eq!(stats.main.misses, 1, "old partition served from S3");
 
         cache.shutdown().await?;
         let _ = std::fs::remove_dir_all(&cache_dir);
