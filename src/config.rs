@@ -176,7 +176,12 @@ const_default!(d_row_group_size: usize = 134_217_728); // 128MB
 const_default!(d_checkpoint_interval: u64 = 10);
 const_default!(d_optimize_target: i64 = 128 * 1024 * 1024);
 const_default!(d_stats_cache_size: usize = 50);
-const_default!(d_vacuum_retention: u64 = 72);
+// Observability data is high-churn and rarely time-traveled; the only hard
+// floor is that retention must outlive any in-flight query (which holds a Delta
+// snapshot referencing files vacuum would delete). With no query running beyond
+// ~1h, 48h is a 48x safety margin while reclaiming tombstoned bytes far sooner
+// than the old 72h default.
+const_default!(d_vacuum_retention: u64 = 48);
 const_default!(d_optimize_window_hours: u64 = 48);
 const_default!(d_compact_min_files: usize = 5);
 const_default!(d_light_optimize_target: i64 = 16 * 1024 * 1024);
