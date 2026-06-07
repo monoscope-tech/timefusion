@@ -49,6 +49,10 @@ pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
 // Key: (project_id, table_name) -> DeltaTable
 pub type CustomProjectTables = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
 
+// Per-table (keyed by storage URL), per-date set of live file URIs at the last
+// successful z-order optimize. Backs the ZOrder idempotence guard.
+type ZOrderFilesets = Arc<RwLock<HashMap<String, HashMap<chrono::NaiveDate, std::collections::HashSet<String>>>>>;
+
 /// Get a Delta table from custom project tables by project_id and table_name
 pub async fn get_custom_delta_table(custom_tables: &CustomProjectTables, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
     custom_tables.read().await.get(&(project_id.to_string(), table_name.to_string())).cloned()
@@ -451,6 +455,15 @@ pub struct Database {
     buffered_layer:                  Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
     tantivy_search:                  Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
     tantivy_indexer:                 Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
+    /// Per-table, per-date set of live file URIs as of the last successful full
+    /// (z-order) optimize. delta-rs's ZOrder planner has no idempotence guard —
+    /// it rewrites every file in the window on every run, even sealed days that
+    /// didn't change, minting cold multipart objects that cold-start the
+    /// object-store cache (which PR #39 then has to re-warm). This lets
+    /// `optimize_table` skip a sealed partition whose file set is unchanged.
+    /// Keyed by table storage URL (unique per physical table). In-memory only:
+    /// a restart re-z-orders each partition once, which is harmless.
+    zorder_filesets:                 ZOrderFilesets,
 }
 
 impl Database {
@@ -740,6 +753,7 @@ impl Database {
             buffered_layer: None,
             tantivy_search: None,
             tantivy_indexer: None,
+            zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
         };
 
         Ok(db)
@@ -2154,34 +2168,73 @@ impl Database {
     pub async fn optimize_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, _target_size: Option<i64>) -> Result<()> {
         let start_time = std::time::Instant::now();
         let window_hours = self.config.maintenance.timefusion_optimize_window_hours.max(1);
-        info!("Starting Delta table optimization with Z-ordering (last {} hours)", window_hours);
 
         let table_clone = {
             let table = table_ref.read().await;
             table.clone()
         };
 
+        // Candidate date partitions in the window (today .. today-num_days).
+        let now = Utc::now();
+        let today = now.date_naive();
+        let num_days = (window_hours / 24).max(1);
+        let window_dates: Vec<chrono::NaiveDate> = (0..=num_days).map(|days_ago| (now - chrono::Duration::days(days_ago as i64)).date_naive()).collect();
+
+        // Snapshot the current live file set once: drives both the ZOrder
+        // idempotence guard (below) and PR #39's warm/evict (`pre_uris`).
+        let all_uris: Vec<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+        let table_url = table_clone.table_url().to_string();
+        let current = Self::filesets_for_dates(&all_uris, &window_dates);
+
         // Pre-state file set, used to derive the files this optimize *adds*
         // (to warm) and *removes* (to evict) — see warm/evict_cache_for_uris.
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
-        let pre_uris: std::collections::HashSet<String> = if track_files {
-            table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default()
-        } else {
-            Default::default()
-        };
+        let pre_uris: std::collections::HashSet<String> = if track_files { all_uris.iter().cloned().collect() } else { Default::default() };
 
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
-        // Generate partition filters for each date in the configurable window
-        let now = Utc::now();
-        let num_days = (window_hours / 24).max(1);
-        let partition_filters: Vec<PartitionFilter> = (0..=num_days)
-            .filter_map(|days_ago| {
-                let date = (now - chrono::Duration::days(days_ago as i64)).date_naive();
-                PartitionFilter::try_from(("date", "=", date.to_string().as_str())).ok()
-            })
-            .collect();
-        info!("Optimizing files from {} date partitions", partition_filters.len());
+        // delta-rs ZOrder has NO idempotence guard (unlike Compact it does no
+        // size / single-file / already-sorted check): it rewrites every file in
+        // the selected partitions on every run, even sealed days that didn't
+        // change — and PR #39 then has to re-warm all those cold rewrites. Skip
+        // any partition whose live file set is identical to the last successful
+        // optimize. `today` is always processed (growing leading edge).
+        let kept_dates: Vec<chrono::NaiveDate> = {
+            let guard = self.zorder_filesets.read().await;
+            let prev = guard.get(&table_url);
+            window_dates
+                .iter()
+                .filter(|d| match current.get(*d) {
+                    None => false,
+                    Some(cur) if cur.is_empty() => false,
+                    Some(cur) => **d == today || prev.and_then(|m| m.get(*d)).map(|p| p != cur).unwrap_or(true),
+                })
+                .copied()
+                .collect()
+        };
+        let skipped = window_dates.len().saturating_sub(kept_dates.len());
+
+        if kept_dates.is_empty() {
+            info!(
+                "optimize: table={} all {} window partitions unchanged since last run — skipping (cache churn avoided)",
+                table_name,
+                window_dates.len()
+            );
+            crate::metrics::record_optimize_partitions(0, skipped as u64);
+            return Ok(());
+        }
+
+        info!(
+            "Starting optimize (z-order): table={} rewriting {} of {} window partitions, skipping {} unchanged (last {}h)",
+            table_name,
+            kept_dates.len(),
+            window_dates.len(),
+            skipped,
+            window_hours
+        );
+
+        let partition_filters: Vec<PartitionFilter> =
+            kept_dates.iter().filter_map(|d| PartitionFilter::try_from(("date", "=", d.to_string().as_str())).ok()).collect();
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         // Full Z-order optimize runs every 30 min over a 48h window — promote
@@ -2211,6 +2264,22 @@ impl Database {
 
         match optimize_result {
             Ok((new_table, metrics)) => {
+                // Record the post-commit file set for the partitions we
+                // rewrote so the next run skips them if nothing changes. Done
+                // before the min_files early-return so state stays consistent
+                // even when we don't adopt the new handle (delta-rs has already
+                // committed the rewrite by this point regardless).
+                {
+                    let new_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                    let new_sets = Self::filesets_for_dates(&new_uris, &kept_dates);
+                    let mut guard = self.zorder_filesets.write().await;
+                    let entry = guard.entry(table_url.clone()).or_default();
+                    for d in &kept_dates {
+                        entry.insert(*d, new_sets.get(d).cloned().unwrap_or_default());
+                    }
+                }
+                crate::metrics::record_optimize_partitions(kept_dates.len() as u64, skipped as u64);
+
                 let min_files = self.config.maintenance.timefusion_compact_min_files;
                 if metrics.total_considered_files < min_files {
                     debug!(
@@ -2268,6 +2337,24 @@ impl Database {
                 Err(anyhow::anyhow!("Table optimization failed: {}", e))
             }
         }
+    }
+
+    /// Group live file URIs by their `date=YYYY-MM-DD` Hive partition, for the
+    /// given dates only. URIs not matching any of `dates` are ignored. Every
+    /// requested date gets an entry (possibly empty) so the idempotence guard
+    /// can tell "no files" from "not looked at".
+    fn filesets_for_dates(uris: &[String], dates: &[chrono::NaiveDate]) -> HashMap<chrono::NaiveDate, std::collections::HashSet<String>> {
+        let markers: Vec<(chrono::NaiveDate, String)> = dates.iter().map(|d| (*d, format!("date={d}"))).collect();
+        let mut out: HashMap<chrono::NaiveDate, std::collections::HashSet<String>> = dates.iter().map(|d| (*d, std::collections::HashSet::new())).collect();
+        for uri in uris {
+            for (d, marker) in &markers {
+                if uri.contains(marker) {
+                    out.get_mut(d).expect("date pre-seeded").insert(uri.clone());
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Rewrites a date partition at a higher ZSTD level using Z-order (or
@@ -3627,6 +3714,44 @@ mod tests {
         let parsed = parse_watermark_from_json(&info, 4);
         assert_eq!(parsed[0], Some(walrus_rust::WalPosition { block_id: 1, offset: 10 }));
         assert!(parsed[1..].iter().all(|p| p.is_none()));
+    }
+
+    /// `filesets_for_dates` buckets URIs by their `date=` partition and
+    /// pre-seeds every requested date (so the guard can tell "empty" from
+    /// "absent"). URIs outside the requested dates are dropped.
+    #[test]
+    fn filesets_for_dates_groups_by_partition() {
+        use std::collections::HashSet;
+        let d0 = chrono::NaiveDate::from_ymd_opt(2026, 6, 6).unwrap();
+        let d1 = chrono::NaiveDate::from_ymd_opt(2026, 6, 5).unwrap();
+        let uris = vec![
+            "s3://b/t/date=2026-06-06/part-a.parquet".to_string(),
+            "s3://b/t/date=2026-06-06/part-b.parquet".to_string(),
+            "s3://b/t/date=2026-06-05/part-c.parquet".to_string(),
+            "s3://b/t/date=2026-06-01/part-x.parquet".to_string(), // outside window
+        ];
+        let sets = Database::filesets_for_dates(&uris, &[d0, d1]);
+        assert_eq!(sets[&d0].len(), 2);
+        assert_eq!(sets[&d1], HashSet::from(["s3://b/t/date=2026-06-05/part-c.parquet".to_string()]));
+        // A date with no files is still present (empty), not missing.
+        let d2 = chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap();
+        let sets = Database::filesets_for_dates(&uris, &[d2]);
+        assert!(sets[&d2].is_empty());
+    }
+
+    /// Two identical file sets compare equal (→ partition skipped); adding a
+    /// file makes them differ (→ partition re-optimized). This is the core of
+    /// the ZOrder idempotence guard.
+    #[test]
+    fn filesets_equal_only_when_unchanged() {
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 6, 6).unwrap();
+        let base = vec!["s3://b/t/date=2026-06-06/a.parquet".to_string()];
+        let plus = vec!["s3://b/t/date=2026-06-06/a.parquet".to_string(), "s3://b/t/date=2026-06-06/b.parquet".to_string()];
+        let a = Database::filesets_for_dates(&base, &[d]);
+        let b = Database::filesets_for_dates(&base, &[d]);
+        let c = Database::filesets_for_dates(&plus, &[d]);
+        assert_eq!(a[&d], b[&d]);
+        assert_ne!(a[&d], c[&d]);
     }
 
     /// Helper function to extract string value from array column, handling different string array types
