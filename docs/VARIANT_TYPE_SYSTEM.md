@@ -74,7 +74,7 @@ The rewriter:
 
 ### SELECT: Automatic Variant → JSON Conversion
 
-When selecting Variant columns, the `VariantSelectRewriter` wraps them with `variant_to_json()` for PostgreSQL wire protocol compatibility:
+When selecting Variant columns over pgwire, `VariantPgwireRootWrap` wraps them with `variant_to_json()` for wire-protocol compatibility (companion to `VariantTableScanSchemaPatch`, which restores the real Variant type on the scan side). Internal SQL contexts skip the wrap and receive binary Variant end-to-end.
 
 **Before rewrite:**
 ```sql

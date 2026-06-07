@@ -309,7 +309,7 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
 /// their first arg and bail with "Extension type name missing" when the
 /// field lacks the `ARROW:extension:name = arrow.parquet.variant` marker.
 /// That marker survives in the LogicalPlan's `projected_schema` (set by
-/// `VariantSelectRewriter::patch_table_scan` and by `SchemaRegistry`'s
+/// `VariantTableScanSchemaPatch` and by `SchemaRegistry`'s
 /// `fields()`), but is stripped on the way to the physical executor's
 /// per-row Field — so any SELECT touching a Variant column would panic at
 /// execution time. We re-stamp the marker here right before delegating.

@@ -1,26 +1,32 @@
-//! Variant-aware SELECT-plan post-processing.
+//! Variant-aware analyzer rules.
 //!
-//! Two passes, both gated on the plan being a non-DML (SELECT-like) plan:
+//! Two independent rules, both gated on the plan being non-DML:
 //!
-//! 1. **TableScan schema patch.** TimeFusion's `ProjectRoutingTable::schema()`
-//!    returns a *lying* schema that substitutes Variant columns with
-//!    `Utf8View` so DataFusion's INSERT-VALUES type checker accepts raw
-//!    JSON string literals. For SELECT plans we want the real Variant
-//!    type so downstream UDFs (`variant_get`, `jsonb_path_exists`, …)
-//!    receive Struct{Binary,Binary} and call
+//! 1. **`VariantTableScanSchemaPatch`** — always-on. TimeFusion's
+//!    `ProjectRoutingTable::schema()` returns a *lying* schema that substitutes
+//!    Variant columns with `Utf8View` so DataFusion's INSERT-VALUES type
+//!    checker accepts raw JSON string literals. For SELECT plans we want the
+//!    real Variant type so downstream UDFs (`variant_get`,
+//!    `jsonb_path_exists`, …) receive Struct{Binary,Binary} and call
 //!    `parquet_variant_compute::variant_get` directly. We walk each
 //!    `LogicalPlan::TableScan`, downcast its source to
 //!    `DefaultTableSource → ProjectRoutingTable`, and rebuild the scan's
 //!    `projected_schema` with Variant types restored.
 //!
-//! 2. **Root-projection JSON wrap.** Bare `SELECT payload` from a pgwire
-//!    client must serialize the Variant to JSON text for the wire. We
-//!    used to do this at the scan boundary (`VariantToJsonExec`) which
-//!    forced every intermediate operator to deal with Utf8 and made
-//!    Variant slower than plain JSON text. Now we wrap only the
-//!    *outermost* Projection — peeling Sort/Limit/Distinct/SubqueryAlias —
-//!    so intermediate `variant_get` / `jsonb_path_exists` etc. operate
-//!    on the binary Variant.
+//! 2. **`VariantPgwireRootWrap`** — wire-format concern, register only on
+//!    session contexts that drive pgwire. Bare `SELECT payload` from a pgwire
+//!    client must serialize the Variant to JSON text for the wire (Postgres
+//!    has no native Variant type). We wrap only the *outermost* Projection —
+//!    peeling Sort/Limit/Distinct/SubqueryAlias/Filter — so intermediate
+//!    `variant_get` / `jsonb_path_exists` etc. operate on the binary Variant.
+//!    Internal SQL contexts (see `Database::create_internal_session_context`)
+//!    omit this rule and receive binary Variant end-to-end.
+//!
+//! Lives in the analyzer because `datafusion-postgres`'s
+//! `DfSessionService::do_query` seals the plan→encode path; intercepting
+//! between planning and `arrow_pg::encode_dataframe` would require
+//! reimplementing the handler. The pgwire-binding is made explicit by
+//! registering this rule only on pgwire-facing session contexts.
 
 use std::sync::Arc;
 
@@ -39,40 +45,51 @@ use tracing::{debug, warn};
 
 use crate::{database::ProjectRoutingTable, functions::VariantToJsonExtUdf, schema_loader::is_variant_type};
 
+/// Rule #1 from the module overview. The bottom-up `recompute_schema` after
+/// each node is load-bearing: without it, intermediate Projection/Sort/Filter
+/// DFSchemas stay cached as `Utf8View` and `VariantPgwireRootWrap`'s
+/// `is_variant_expr` check sees the stale type.
 #[derive(Debug, Default)]
-pub struct VariantSelectRewriter;
+pub struct VariantTableScanSchemaPatch;
 
-impl AnalyzerRule for VariantSelectRewriter {
+impl AnalyzerRule for VariantTableScanSchemaPatch {
     fn name(&self) -> &str {
-        "variant_select_rewriter"
+        "variant_table_scan_schema_patch"
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        // Skip DML entirely. DML targets aren't a wire projection (no
-        // variant_to_json wrap needed), and DML's input scans are already
-        // handled by VariantInsertRewriter wrapping literals with
-        // json_to_variant; injecting a Variant-typed schema there would
+        // Skip DML: input scans are handled by VariantInsertRewriter wrapping
+        // Utf8 literals with json_to_variant; patching to Variant here would
         // mismatch the writer's expected Utf8 input.
         if matches!(plan, LogicalPlan::Dml(_)) {
             return Ok(plan);
         }
-        // Pass 1: bottom-up: patch each TableScan's projected_schema so
-        // Variant columns carry the real Variant type, then recompute every
-        // parent's cached DFSchema so the new type propagates up through
-        // intermediate Projections / Sorts / Filters. Without the per-node
-        // recompute, `wrap_projection`'s `is_variant_expr` check sees a
-        // stale Utf8View type from a parent's cached schema and skips
-        // wrapping (e.g. `ORDER BY x LIMIT n` introduces an outer
-        // Projection over a Sort whose schema must be re-derived).
-        let patched = plan
+        Ok(plan
             .transform_up(|node| {
                 let patched = patch_table_scan(node)?.data;
                 Ok(Transformed::yes(patched.recompute_schema()?))
             })?
-            .data;
-        // Pass 2: wrap Variant-typed projections at the topmost SELECT
-        // projection with variant_to_json for the wire.
-        wrap_root_projection(patched)
+            .data)
+    }
+}
+
+/// Rule #2 from the module overview. The peel set (Sort, Limit, Distinct,
+/// SubqueryAlias, Filter) is what makes intermediate UDFs see binary Variant;
+/// for un-peelable shapes (Union/Aggregate/Join/Window) a top-level
+/// Projection is added above them.
+#[derive(Debug, Default)]
+pub struct VariantPgwireRootWrap;
+
+impl AnalyzerRule for VariantPgwireRootWrap {
+    fn name(&self) -> &str {
+        "variant_pgwire_root_wrap"
+    }
+
+    fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
+        if matches!(plan, LogicalPlan::Dml(_)) {
+            return Ok(plan);
+        }
+        wrap_root_projection(plan)
     }
 }
 
@@ -332,7 +349,7 @@ mod peel_tests {
 
     fn analyze(plan: LogicalPlan) -> LogicalPlan {
         let cfg = ConfigOptions::default();
-        VariantSelectRewriter.analyze(plan, &cfg).unwrap()
+        VariantPgwireRootWrap.analyze(plan, &cfg).unwrap()
     }
 
     fn is_variant_to_json_call(expr: &Expr) -> bool {
@@ -357,6 +374,20 @@ mod peel_tests {
     fn wraps_bare_projection() {
         let out = analyze(variant_projection());
         assert!(is_variant_to_json_call(first_projection_expr(&out)));
+    }
+
+    /// Pins the rule split: `VariantTableScanSchemaPatch` must NEVER wrap with
+    /// `variant_to_json` — that's strictly `VariantPgwireRootWrap`'s job. This
+    /// is the invariant that lets internal SQL contexts skip the pgwire rule
+    /// and still get binary Variant end-to-end.
+    #[test]
+    fn schema_patch_does_not_introduce_variant_to_json_wrap() {
+        let cfg = ConfigOptions::default();
+        let out = VariantTableScanSchemaPatch.analyze(variant_projection(), &cfg).unwrap();
+        assert!(
+            !is_variant_to_json_call(first_projection_expr(&out)),
+            "schema patch rule must leave projection expr untouched; only pgwire-wrap rule injects variant_to_json"
+        );
     }
 
     #[test]

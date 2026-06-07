@@ -8,7 +8,7 @@ use datafusion::{
 };
 pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;
-pub use variant_select_rewriter::VariantSelectRewriter;
+pub use variant_select_rewriter::{VariantPgwireRootWrap, VariantTableScanSchemaPatch};
 
 /// Utilities for converting timestamp filters to date partition filters
 /// for better partition pruning in Delta Lake

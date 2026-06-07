@@ -113,7 +113,8 @@ Client SELECT
 ┌─────────────────────────────────────────────────────────────────┐
 │ 1. PGWire parses SQL                                            │
 │ 2. DataFusion analyzes query                                    │
-│    └── VariantSelectRewriter wraps Variant→variant_to_json()    │
+│    ├── VariantTableScanSchemaPatch restores Variant types       │
+│    └── VariantPgwireRootWrap → variant_to_json() (pgwire only)  │
 │ 3. VariantAwareExprPlanner handles -> and ->> operators         │
 │ 4. Physical planning                                            │
 └─────────────────────────────────────────────────────────────────┘
@@ -247,11 +248,17 @@ AppConfig {
    - Wraps Utf8/Utf8View literals with `json_to_variant()` UDF
    - Applies recursively to Values and Projection nodes
 
-2. **VariantSelectRewriter** (`src/optimizers/variant_select_rewriter.rs`)
-   - Intercepts `LogicalPlan::Projection`
-   - Checks if expression result type is Variant (via `is_variant_type()`)
-   - Wraps with `variant_to_json()` for PostgreSQL wire protocol
-   - Preserves column aliases
+2. **VariantTableScanSchemaPatch** (`src/optimizers/variant_select_rewriter.rs`, always-on)
+   - Bottom-up `transform_up` over `LogicalPlan::TableScan`
+   - Replaces `Utf8View` columns the routing-table lying-schema returned with
+     real Variant types so downstream UDFs receive `Struct{Binary,Binary}`
+   - Recomputes parent schemas so the type propagates through cached DFSchemas
+
+3. **VariantPgwireRootWrap** (same file, pgwire sessions only)
+   - Wraps the outermost Projection's Variant exprs with `variant_to_json()`
+   - Peels Sort/Limit/Distinct/SubqueryAlias/Filter to find the wire-output Projection
+   - Internal SQL contexts (`Database::create_internal_session_context`) omit
+     this rule and receive binary Variant end-to-end
 
 ### Physical Planner
 

@@ -187,7 +187,7 @@ mod integration {
         assert_eq!(total, 6);
 
         // Targeted column selection — keeps the test focused on a specific row's
-        // typed columns. VariantSelectRewriter already serializes Variant columns
+        // typed columns. VariantPgwireRootWrap already serializes Variant columns
         // to JSON at the root projection, so `SELECT *` would also work end-to-end;
         // this assertion just doesn't need every field.
         let row = client
@@ -365,7 +365,7 @@ mod integration {
     /// End-to-end coverage of the Variant pipeline:
     ///   INSERT (Utf8 literal → VariantInsertRewriter wraps with json_to_variant)
     ///   → Delta/MemBuffer (binary Variant storage)
-    ///   → SELECT (VariantSelectRewriter wraps root projection with variant_to_json)
+    ///   → SELECT (VariantPgwireRootWrap wraps root projection with variant_to_json)
     ///   → pgwire (wire bytes are JSON text, not raw binary)
     /// Regression guard for PR's core contract.
     ///
@@ -407,7 +407,7 @@ mod integration {
         assert_eq!(parsed["http"]["method"], "GET");
         assert_eq!(parsed["user"], "alice");
 
-        // Sort/Limit peel path: VariantSelectRewriter must wrap through Sort+Limit.
+        // Sort/Limit peel path: VariantPgwireRootWrap must wrap through Sort+Limit.
         let row = client
             .query_one(
                 "SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2 \
