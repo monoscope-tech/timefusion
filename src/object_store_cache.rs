@@ -394,13 +394,24 @@ fn is_parquet_file(location: &Path) -> bool {
 /// value. Warming must never affect correctness or a caller's commit. Returns
 /// `true` if the footer range was fetched.
 pub async fn warm_footer(store: &dyn ObjectStore, location: &Path, metadata_size_hint: u64) -> bool {
-    // HEAD-then-bounded-GET (two round-trips) rather than a single
-    // `GetRange::Suffix(metadata_size_hint)`: the suffix form would save the
-    // HEAD, but our cache keys ranges by absolute `start..end` (see
-    // `make_range_cache_key`), so we need the file size to compute the same
-    // bounded range a later footer read will request — otherwise the warmed
-    // bytes land under a key no read hits. The HEAD also primes the metadata
-    // cache. Suffix ranges are also not universally supported across stores.
+    // Single suffix GET: the response carries the resolved absolute range + total
+    // size, so a `FoyerObjectStoreCache` caches the footer under the same
+    // absolute key a later bounded footer read requests — one round-trip, no
+    // separate HEAD. Falls back to HEAD + bounded GET for stores that don't
+    // support suffix ranges.
+    let opts = GetOptions {
+        range: Some(GetRange::Suffix(metadata_size_hint.max(1))),
+        ..Default::default()
+    };
+    match store.get_opts(location, opts).await {
+        Ok(result) => result.bytes().await.is_ok(),
+        Err(_) => warm_footer_via_head(store, location, metadata_size_hint).await,
+    }
+}
+
+/// HEAD + bounded-GET fallback for [`warm_footer`] when the store doesn't
+/// support suffix ranges. Two round-trips, but always correct.
+async fn warm_footer_via_head(store: &dyn ObjectStore, location: &Path, metadata_size_hint: u64) -> bool {
     let size = match store.head(location).await {
         Ok(meta) => meta.size,
         Err(_) => return false,
@@ -561,6 +572,14 @@ impl FoyerObjectStoreCache {
 
     fn make_range_cache_key(location: &Path, range: &Range<u64>) -> String {
         format!("{}#range:{}-{}", location, range.start, range.end)
+    }
+
+    /// Key for a path's `ObjectMeta` in the metadata cache, kept distinct from
+    /// range keys (`#range:`). Delta data files are immutable, so a path's
+    /// size/etag is stable for the cache TTL — caching it lets footer reads skip
+    /// the per-read HEAD.
+    fn make_meta_cache_key(location: &Path) -> String {
+        format!("{}#meta", location)
     }
 
     /// Invalidate all metadata cache entries for a given file
@@ -831,8 +850,36 @@ impl FoyerObjectStoreCache {
 
         // For Parquet files, implement smart caching based on the range
         if is_parquet {
-            // First get the file size to determine if this is a metadata request
-            let file_meta = match self.inner.head(location).await {
+            // Probe the metadata range cache *before* any HEAD: its key is just
+            // (location, range), so a steady-state footer read served from cache
+            // pays zero S3 round-trips. Data ranges aren't stored here and fall
+            // through to the size-based classification below.
+            let range_cache_key = Self::make_range_cache_key(location, &range);
+            if let Ok(Some(entry)) = self.metadata_cache.get(&range_cache_key).await {
+                let value = entry.value();
+                if !value.is_expired(self.config.ttl) {
+                    self.update_metadata_stats(|s| s.hits += 1).await;
+                    span.record("cache_hit", true);
+                    span.record("is_metadata", true);
+                    debug!(
+                        "Metadata cache HIT for: {} (range: {}..{}, size: {} bytes, age={}ms)",
+                        location,
+                        range.start,
+                        range.end,
+                        value.data.len(),
+                        current_millis().saturating_sub(value.timestamp_millis)
+                    );
+                    let sliced = Bytes::from(value.data.clone());
+                    // l1_max=0: metadata entries are tiny, always keep in L1.
+                    self.maybe_touch(&self.metadata_cache, &range_cache_key, entry.clone(), 0);
+                    return Ok(sliced);
+                }
+            }
+
+            // Range-cache miss: we need the file size to classify the request and
+            // to stamp the cached range's meta. Use the cached ObjectMeta
+            // (immutable Delta files) so this HEAD is paid at most once per file.
+            let file_meta = match self.head_cached(location).await {
                 Ok(meta) => meta,
                 Err(e) => {
                     debug!("Failed to get metadata for {}: {}", location, e);
@@ -848,31 +895,6 @@ impl FoyerObjectStoreCache {
             span.record("is_metadata", is_metadata_request);
 
             if is_metadata_request {
-                // For metadata requests, use the metadata cache
-                let range_cache_key = Self::make_range_cache_key(location, &range);
-
-                // Check if we have this specific range cached in the metadata cache
-                if let Ok(Some(entry)) = self.metadata_cache.get(&range_cache_key).await {
-                    let value = entry.value();
-                    let ttl = self.config.ttl; // Use unified TTL
-                    if !value.is_expired(ttl) {
-                        self.update_metadata_stats(|s| s.hits += 1).await;
-                        span.record("cache_hit", true);
-                        debug!(
-                            "Metadata cache HIT for: {} (range: {}..{}, size: {} bytes, age={}ms)",
-                            location,
-                            range.start,
-                            range.end,
-                            value.data.len(),
-                            current_millis().saturating_sub(value.timestamp_millis)
-                        );
-                        let sliced = Bytes::from(value.data.clone());
-                        // l1_max=0: metadata entries are tiny, always keep in L1.
-                        self.maybe_touch(&self.metadata_cache, &range_cache_key, entry.clone(), 0);
-                        return Ok(sliced);
-                    }
-                }
-
                 // Cache miss for metadata range - fetch just the range
                 span.record("cache_hit", false);
                 self.update_metadata_stats(|s| {
@@ -987,6 +1009,27 @@ impl FoyerObjectStoreCache {
         Ok(result)
     }
 
+    /// Resolve a path's `ObjectMeta` from cache only (no S3). Checks the
+    /// full-file cache, then — for immutable parquet data files — the dedicated
+    /// meta cache. Returns `None` if neither has a live entry.
+    async fn cached_meta(&self, location: &Path) -> Option<ObjectMeta> {
+        if let Ok(Some(entry)) = self.cache.get(&Self::make_cache_key(location)).await {
+            let value = entry.value();
+            if !value.is_expired(self.get_ttl_for_path(location)) {
+                return Some(value.meta.clone());
+            }
+        }
+        if is_parquet_file(location)
+            && let Ok(Some(entry)) = self.metadata_cache.get(&Self::make_meta_cache_key(location)).await
+        {
+            let value = entry.value();
+            if !value.is_expired(self.config.ttl) {
+                return Some(value.meta.clone());
+            }
+        }
+        None
+    }
+
     #[instrument(
         name = "foyer_cache.head",
         skip_all,
@@ -997,20 +1040,20 @@ impl FoyerObjectStoreCache {
     )]
     async fn head_cached(&self, location: &Path) -> ObjectStoreResult<ObjectMeta> {
         let span = tracing::Span::current();
-        let cache_key = Self::make_cache_key(location);
-
-        if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
-            let value = entry.value();
-            let ttl = self.get_ttl_for_path(location);
-            if !value.is_expired(ttl) {
-                span.record("cache_hit", true);
-                return Ok(value.meta.clone());
-            }
+        if let Some(meta) = self.cached_meta(location).await {
+            span.record("cache_hit", true);
+            return Ok(meta);
         }
 
         span.record("cache_hit", false);
         let inner_span = tracing::trace_span!(parent: &span, "s3.head", location = %location);
-        self.inner.head(location).instrument(inner_span).await
+        let meta = self.inner.head(location).instrument(inner_span).await?;
+        // Cache immutable parquet meta so later footer reads skip the HEAD. Skip
+        // mutable paths (Delta log / _last_checkpoint can be rewritten in place).
+        if is_parquet_file(location) {
+            self.metadata_cache.insert(Self::make_meta_cache_key(location), CacheValue::new(Vec::new(), meta.clone()));
+        }
+        Ok(meta)
     }
 
     /// Core put logic: writes to inner store, then caches the new data
@@ -1251,6 +1294,69 @@ impl ObjectStore for FoyerObjectStoreCache {
                 meta,
                 attributes: Attributes::new(),
                 range: range.start..range.start + data_len,
+            });
+        }
+        // Suffix range (footer warm + any suffix reader): resolve to an absolute
+        // range so it shares cache keys with bounded footer reads. If we already
+        // know the size (cached meta), reuse the bounded path for free; otherwise
+        // a single suffix GET to the inner store learns the absolute range + size
+        // from the response — one round-trip, no separate HEAD.
+        if let Some(GetRange::Suffix(n)) = options.range
+            && options.if_match.is_none()
+            && options.if_none_match.is_none()
+            && options.if_modified_since.is_none()
+            && options.if_unmodified_since.is_none()
+        {
+            let n = n.max(1);
+            if let Some(meta) = self.cached_meta(location).await {
+                let range = meta.size.saturating_sub(n)..meta.size;
+                let bytes = self.get_range_cached(location, range.clone()).await?;
+                let data_len = bytes.len() as u64;
+                return Ok(GetResult {
+                    payload: GetResultPayload::Stream(Box::pin(futures::stream::once(async move { Ok(bytes) }))),
+                    meta,
+                    attributes: Attributes::new(),
+                    range: range.start..range.start + data_len,
+                });
+            }
+            let result = self
+                .inner
+                .get_opts(location, GetOptions {
+                    range: Some(GetRange::Suffix(n)),
+                    ..Default::default()
+                })
+                .await?;
+            let meta = result.meta.clone();
+            let abs_range = result.range.clone();
+            let attributes = result.attributes.clone();
+            let bytes = result.bytes().await?;
+            self.update_metadata_stats(|s| {
+                s.misses += 1;
+                s.inner_gets += 1;
+            })
+            .await;
+            // Populate both the footer-range cache (under the absolute key bounded
+            // reads use) and the immutable-meta cache, so the next footer read is
+            // a pure cache hit.
+            if is_parquet_file(location) {
+                let range_meta = ObjectMeta {
+                    location:      location.clone(),
+                    last_modified: meta.last_modified,
+                    size:          bytes.len() as u64,
+                    e_tag:         meta.e_tag.clone(),
+                    version:       meta.version.clone(),
+                };
+                self.metadata_cache
+                    .insert(Self::make_range_cache_key(location, &abs_range), CacheValue::new(bytes.to_vec(), range_meta));
+                self.metadata_cache
+                    .insert(Self::make_meta_cache_key(location), CacheValue::new(Vec::new(), meta.clone()));
+            }
+            let data_len = bytes.len() as u64;
+            return Ok(GetResult {
+                payload: GetResultPayload::Stream(Box::pin(futures::stream::once(async move { Ok(bytes) }))),
+                meta,
+                attributes,
+                range: abs_range.start..abs_range.start + data_len,
             });
         }
         // Bypass cache for complex (conditional / non-bounded) requests
@@ -2037,6 +2143,107 @@ mod tests {
         );
 
         cache.shutdown().await?;
+        Ok(())
+    }
+
+    /// Wraps an `InMemory` store and counts S3-equivalent round-trips, so tests
+    /// can assert that warming + reads issue the expected number of HEADs/GETs.
+    /// `head()` is an extension method that routes through `get_opts(head:true)`,
+    /// so we count it there.
+    #[derive(Debug)]
+    struct CountingStore {
+        inner: Arc<InMemory>,
+        heads: Arc<std::sync::atomic::AtomicUsize>,
+        gets:  Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::fmt::Display for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingStore {
+        async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> ObjectStoreResult<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> ObjectStoreResult<GetResult> {
+            use std::sync::atomic::Ordering;
+            if options.head {
+                self.heads.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.gets.fetch_add(1, Ordering::Relaxed);
+            }
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(&self, locations: BoxStream<'static, ObjectStoreResult<Path>>) -> BoxStream<'static, ObjectStoreResult<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Locks in both performance wins: a suffix-based footer warm is a single GET
+    /// (no HEAD), and a later footer read of a warmed file is a pure cache hit —
+    /// zero S3 round-trips (no HEAD to classify, no GET).
+    #[tokio::test]
+    async fn test_warm_footer_eliminates_read_path_heads() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mem = Arc::new(InMemory::new());
+        let file_size = 10 * 1024usize;
+        let path = Path::from("table/date=2026-06-05/part-heads.parquet");
+        mem.put(&path, PutPayload::from(Bytes::from(vec![b'x'; file_size]))).await?;
+
+        let heads = Arc::new(AtomicUsize::new(0));
+        let gets = Arc::new(AtomicUsize::new(0));
+        let counting = Arc::new(CountingStore {
+            inner: mem.clone(),
+            heads: heads.clone(),
+            gets:  gets.clone(),
+        });
+
+        let config = FoyerCacheConfig::test_config_with("warm_footer_heads", |c| {
+            c.parquet_metadata_size_hint = 1024;
+        });
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let cache = FoyerObjectStoreCache::new(counting, config).await?;
+        cache.reset_stats().await;
+
+        // Footer warm: a single suffix GET, no HEAD.
+        assert!(warm_footer(&cache, &path, 1024).await);
+        assert_eq!(heads.load(Ordering::Relaxed), 0, "suffix warm must not issue a HEAD");
+        assert_eq!(gets.load(Ordering::Relaxed), 1, "suffix warm is a single GET");
+
+        // A later footer read of the warmed file is served entirely from cache:
+        // no HEAD to classify the range, no GET for the bytes.
+        let footer = (file_size - 1024) as u64..file_size as u64;
+        let bytes = cache.get_range(&path, footer).await?;
+        assert_eq!(bytes.len(), 1024);
+        assert_eq!(heads.load(Ordering::Relaxed), 0, "warmed footer read must not HEAD");
+        assert_eq!(gets.load(Ordering::Relaxed), 1, "warmed footer read must not GET (still just the warm)");
+        assert_eq!(cache.get_stats().await.metadata.hits, 1, "footer served from the metadata cache");
+
+        cache.shutdown().await?;
+        let _ = std::fs::remove_dir_all(&cache_dir);
         Ok(())
     }
 }
