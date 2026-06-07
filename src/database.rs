@@ -76,6 +76,32 @@ fn should_refresh_table(current_version: Option<u64>, last_written_version: Opti
     }
 }
 
+/// Whether `uri` belongs to a partition no older than `cutoff` (inclusive).
+/// Parses the `date=YYYY-MM-DD` Hive partition segment; if absent or
+/// unparseable, returns `true` (warm rather than silently skip a file we can't
+/// classify). A `None` cutoff means "no recency limit".
+fn within_recency(uri: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
+    // Single source of truth for `date=` partition recency parsing, shared with
+    // the object-store cache admission window.
+    crate::object_store_cache::date_partition_within(uri, cutoff)
+}
+
+/// The cache-key prefix for a table: its URI minus any `?endpoint=...` query
+/// string (`table_url()` may carry one; `get_file_uris()` omits it) and trailing
+/// slash. File URIs are relativized against this to form cache keys.
+fn table_cache_prefix(table_uri: &str) -> &str {
+    table_uri.split('?').next().unwrap_or(table_uri).trim_end_matches('/')
+}
+
+/// Relativize an absolute file URI against a `table_cache_prefix`, yielding the
+/// bucket-relative path the cached object store keys full files by. `None` on
+/// prefix mismatch (trailing-slash or query-string drift between `table_url()`
+/// and `get_file_uris()`). Shared by the warm and evict paths so a single-char
+/// difference can't desync which key was warmed vs. evicted.
+fn relativize_to_prefix(prefix: &str, uri: &str) -> Option<object_store::path::Path> {
+    uri.strip_prefix(prefix).map(|rel| object_store::path::Path::from(rel.trim_start_matches('/')))
+}
+
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     use datafusion::arrow::array::{StringArray, StringViewArray};
@@ -1604,6 +1630,208 @@ impl Database {
         Ok(uris)
     }
 
+    /// Best-effort warm of the Foyer cache for parquet files just written by a
+    /// flush or optimize commit. Reuses the read path so the recent partitions
+    /// dashboards query don't cold-start after every compaction: a ranged GET
+    /// of each new footer primes the metadata cache (query planning pays zero
+    /// S3 round-trips), and — when `timefusion_warm_full_files` is set — a full
+    /// GET primes the main cache for data reads.
+    ///
+    /// Non-blocking and strictly best-effort: the whole job runs in a detached,
+    /// concurrency-bounded task and never affects the commit. Files are filtered
+    /// to partitions within `timefusion_warm_recency_days` so we don't spend S3
+    /// GETs (and evict useful entries) warming cold partitions nobody reads.
+    async fn warm_cache_for_uris(&self, object_store: Arc<dyn object_store::ObjectStore>, table_uri: String, uris: Vec<String>) {
+        let maint = &self.config.maintenance;
+        if !maint.timefusion_warm_after_compaction || uris.is_empty() {
+            return;
+        }
+        let warm_full_files = maint.timefusion_warm_full_files;
+        let recency_days = maint.timefusion_warm_recency_days;
+        let concurrency = maint.timefusion_warm_concurrency.max(1);
+        let metadata_size_hint = self.config.cache.timefusion_parquet_metadata_size_hint as u64;
+        let stats_cache = self.object_store_cache.clone();
+
+        // Relativize absolute s3:// URIs against the table root: the cached
+        // object store consumes bucket-relative paths.
+        let prefix = table_cache_prefix(&table_uri);
+        // Cap the day count before the i64 cast — recency_days is a config
+        // value so overflow can't happen in practice, but a silent wrap would
+        // turn a misconfiguration into "warm nothing". 3650d (~10y) is well
+        // past any partition we'd query.
+        let cutoff = (recency_days > 0).then(|| Utc::now().date_naive() - chrono::Duration::days(recency_days.min(3650) as i64));
+
+        let mut dropped = 0usize;
+        let paths: Vec<object_store::path::Path> = uris
+            .into_iter()
+            .filter(|u| u.ends_with(".parquet"))
+            .filter(|u| within_recency(u, cutoff))
+            .filter_map(|u| match relativize_to_prefix(prefix, &u) {
+                Some(path) => Some(path),
+                None => {
+                    // Prefix mismatch (e.g. trailing-slash or query-string
+                    // drift between table_url() and get_file_uris()). Warming
+                    // this file would address the wrong key, so skip it — but
+                    // log so a systematic mismatch is diagnosable instead of a
+                    // silent no-op.
+                    if dropped == 0 {
+                        debug!("warm: URI {} does not start with table prefix {}; skipping (warm only)", u, prefix);
+                    }
+                    dropped += 1;
+                    None
+                }
+            })
+            .collect();
+
+        if dropped > 0 {
+            debug!("warm: skipped {} file(s) that did not relativize against prefix {}", dropped, prefix);
+        }
+        if paths.is_empty() {
+            return;
+        }
+
+        let count = paths.len();
+        // Baseline the cache stats *before* warming: the warm GETs are all
+        // misses (they fetch from the inner store to populate Foyer), so a
+        // post-warm hit rate would read artificially low. The real
+        // beneficiary is the next dashboard query — log the pre-warm
+        // steady-state rate as the relevant baseline.
+        let baseline = match &stats_cache {
+            Some(cache) => {
+                let s = cache.get_stats().await.main;
+                let rate = if s.hits + s.misses > 0 { (s.hits as f64 / (s.hits + s.misses) as f64) * 100.0 } else { 0.0 };
+                Some(rate)
+            }
+            None => None,
+        };
+
+        // Labelled scope rather than `full=true/false` so warm logs are easy to
+        // filter (e.g. in Loki) by what was actually primed.
+        let scope = if warm_full_files { "full" } else { "footer-only" };
+        futures::stream::iter(paths)
+            .for_each_concurrent(concurrency, |path| {
+                let store = object_store.clone();
+                async move {
+                    let _ = crate::object_store_cache::warm_footer(store.as_ref(), &path, metadata_size_hint).await;
+                    if warm_full_files {
+                        let _ = crate::object_store_cache::warm_full(store.as_ref(), &path).await;
+                    }
+                }
+            })
+            .await;
+
+        match baseline {
+            Some(rate) => info!(
+                "Cache warm complete: {} files warmed (scope={}); foyer main hit rate before warm was {:.2}% (next query benefits)",
+                count, scope, rate
+            ),
+            None => info!("Cache warm complete: {} files warmed (scope={})", count, scope),
+        }
+    }
+
+    /// Proactively evict the cached full-file bytes of files a compaction
+    /// tombstoned (present pre-commit, gone post-commit), so dead compaction
+    /// outputs don't linger in the cache until VACUUM / TTL / LRU reclaims them.
+    ///
+    /// Correctness is unaffected: the files still exist in S3 until VACUUM, so a
+    /// straggler query holding the old Delta snapshot just re-reads them from S3
+    /// (a cache miss), never a wrong result. Cheap and in-cache only (no S3),
+    /// so it runs inline.
+    fn evict_cache_for_uris(&self, table_uri: &str, removed: &[String]) {
+        if !self.config.maintenance.timefusion_evict_after_compaction || removed.is_empty() {
+            return;
+        }
+        let Some(cache) = self.object_store_cache.as_ref() else {
+            return;
+        };
+        // Same relativization as warm_cache_for_uris: the cache keys full files
+        // by their object-store-relative path.
+        let prefix = table_cache_prefix(table_uri);
+        let mut evicted = 0usize;
+        let mut dropped = 0usize;
+        for u in removed {
+            if let Some(path) = relativize_to_prefix(prefix, u) {
+                cache.evict_data_entry(path.as_ref());
+                evicted += 1;
+            } else {
+                // Prefix mismatch (trailing-slash or query-string drift between
+                // table_url() and get_file_uris()) — we'd evict the wrong key, so
+                // skip. Log like the warm path: a systematic mismatch here means
+                // tombstoned files linger in cache until TTL/LRU, which is worth
+                // diagnosing rather than silently swallowing.
+                if dropped == 0 {
+                    debug!("evict: URI {} does not start with table prefix {}; skipping (evict only)", u, prefix);
+                }
+                dropped += 1;
+            }
+        }
+        if evicted > 0 {
+            debug!("Evicted {} tombstoned file(s) from cache after compaction", evicted);
+        }
+        if dropped > 0 {
+            debug!("evict: skipped {} file(s) that did not relativize against prefix {}", dropped, prefix);
+        }
+    }
+
+    /// Warm the cache for files added by a just-committed flush/optimize on the
+    /// given logical table. Fire-and-forget: resolving the table (which may
+    /// issue a rate-limited PG roundtrip) and taking the read lock both happen
+    /// inside a spawned task, so the caller — notably the flush callback — is
+    /// never blocked. No-op when warming is disabled or the list is empty.
+    pub fn warm_cache_for_table(&self, project_id: &str, table_name: &str, uris: Vec<String>) {
+        if uris.is_empty() || !self.config.maintenance.timefusion_warm_after_compaction {
+            return;
+        }
+        let db = self.clone();
+        let project_id = project_id.to_string();
+        let table_name = table_name.to_string();
+        tokio::spawn(async move {
+            if let Ok(table_ref) = db.resolve_table(&project_id, &table_name).await {
+                let (store, table_uri) = {
+                    let t = table_ref.read().await;
+                    (t.log_store().object_store(None), t.table_url().to_string())
+                };
+                // Already inside a detached task — await the warm directly
+                // instead of spawning a second nested task.
+                db.warm_cache_for_uris(store, table_uri, uris).await;
+            }
+        });
+    }
+
+    /// Atomically swap a freshly-optimized `new_table` in under the write lock,
+    /// then refresh the cache for the file-set delta vs `pre_uris`: warm the
+    /// files this optimize added and evict the ones it tombstoned. Returns the
+    /// new table's live file URIs (captured before the swap) for callers that
+    /// need them (e.g. the tantivy GC hook).
+    ///
+    /// Both optimize paths — full Z-order and light — funnel through here so the
+    /// warm/evict pair can't drift; the evict call was once missing from the
+    /// light path, and a single helper keeps them in lockstep.
+    async fn swap_and_refresh_cache(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        // Capture live URIs off `new_table` *before* the swap moves it in.
+        let live_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+        let live_set: std::collections::HashSet<&String> = live_uris.iter().collect();
+        let added: Vec<String> = live_uris.iter().filter(|u| !pre_uris.contains(*u)).cloned().collect();
+        let removed: Vec<String> = pre_uris.iter().filter(|u| !live_set.contains(u)).cloned().collect();
+        let warm_store = new_table.log_store().object_store(None);
+        let warm_table_uri = new_table.table_url().to_string();
+        {
+            let mut table = table_ref.write().await;
+            *table = new_table;
+        }
+        // Eviction is in-cache only (cheap), so run it inline. Warming issues S3
+        // GETs, so detach it — the maintenance loop shouldn't block on priming
+        // the cache (preserves the previous in-`warm_cache_for_uris` spawn).
+        self.evict_cache_for_uris(&warm_table_uri, &removed);
+        let db = self.clone();
+        tokio::spawn(async move {
+            db.warm_cache_for_uris(warm_store, warm_table_uri, added).await;
+        });
+        live_uris
+    }
+
     pub async fn get_or_create_table(&self, project_id: &str, table_name: &str) -> Result<Arc<RwLock<DeltaTable>>> {
         // Route to appropriate table based on whether project has custom storage
         if self.has_custom_storage(project_id, table_name).await {
@@ -1933,6 +2161,15 @@ impl Database {
             table.clone()
         };
 
+        // Pre-state file set, used to derive the files this optimize *adds*
+        // (to warm) and *removes* (to evict) — see warm/evict_cache_for_uris.
+        let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+        let pre_uris: std::collections::HashSet<String> = if track_files {
+            table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default()
+        } else {
+            Default::default()
+        };
+
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
         // Generate partition filters for each date in the configurable window
@@ -1996,13 +2233,10 @@ impl Database {
                     let compression_ratio = metrics.num_files_removed as f64 / metrics.num_files_added as f64;
                     info!("Optimization compression ratio: {:.2}x", compression_ratio);
                 }
-                // Capture live file URIs from the new table *before* taking
-                // the write lock to swap it in — used by the tantivy GC hook
-                // below to drop indexes whose covered files no longer exist.
-                let live_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                let mut table = table_ref.write().await;
-                *table = new_table;
-                drop(table);
+                // Swap the optimized table in and refresh the cache (warm
+                // newly-added files, evict tombstoned ones). Returns the new
+                // live file URIs for the tantivy GC hook below.
+                let live_uris = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                 // Tantivy compaction GC — drop sidecar indexes for files that
                 // were rewritten away. Best-effort: errors are logged.
                 if let Some(svc) = self.tantivy_indexer().cloned() {
@@ -2212,6 +2446,14 @@ impl Database {
                 let table = table_ref.read().await;
                 table.clone()
             };
+            // Pre-state file set for deriving the files this optimize adds (to
+            // warm) and removes (to evict).
+            let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+            let pre_uris: std::collections::HashSet<String> = if track_files {
+                table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default()
+            } else {
+                Default::default()
+            };
             if attempt == 0 {
                 info!("Light optimizing files from date: {}", today);
             } else {
@@ -2248,8 +2490,10 @@ impl Database {
                         metrics.num_files_removed,
                         metrics.num_files_added
                     );
-                    let mut table = table_ref.write().await;
-                    *table = new_table;
+                    // Swap the optimized table in and refresh the cache (warm
+                    // freshly-compacted files, evict the small files just
+                    // tombstoned) via the shared helper.
+                    let _ = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -3283,6 +3527,30 @@ mod tests {
 
     use super::*;
     use crate::{config::AppConfig, test_utils::test_helpers::*};
+
+    #[test]
+    fn test_within_recency() {
+        let cutoff = chrono::NaiveDate::from_ymd_opt(2026, 6, 4);
+
+        // Files on/after the cutoff date are warmed.
+        assert!(within_recency("s3://b/t/date=2026-06-06/part-0.parquet", cutoff));
+        assert!(within_recency("s3://b/t/date=2026-06-04/part-0.parquet", cutoff), "cutoff is inclusive");
+        // Older partitions are skipped.
+        assert!(!within_recency("s3://b/t/date=2026-06-01/part-0.parquet", cutoff));
+
+        // No `date=` segment → warm (don't silently skip an unclassifiable file).
+        assert!(within_recency("s3://b/t/part-0.parquet", cutoff));
+        // Unparseable date → warm.
+        assert!(within_recency("s3://b/t/date=not-a-date/part-0.parquet", cutoff));
+        // Truncated date (segment shorter than YYYY-MM-DD) → warm.
+        assert!(within_recency("s3://b/t/date=2026-06", cutoff));
+
+        // None cutoff → no recency limit, always warm even very old partitions.
+        assert!(within_recency("s3://b/t/date=2000-01-01/part-0.parquet", None));
+
+        // Nested partitioning (project_id then date) still locates `date=`.
+        assert!(!within_recency("s3://b/t/project_id=default/date=2026-05-01/part.parquet", cutoff));
+    }
 
     /// Roundtrip the watermark through serialize → JSON → parse. Pins the
     /// on-disk format so a future change to `serialize_watermark_to_json`
