@@ -4,6 +4,11 @@ use serde::Deserialize;
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
+/// Bytes per MiB / GiB — used by the `*_bytes()` size accessors below so the
+/// `* 1024 * 1024` chains don't repeat (and read as the unit they mean).
+const MIB: usize = 1024 * 1024;
+const GIB: usize = 1024 * 1024 * 1024;
+
 /// Load config from environment variables.
 pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
     // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
@@ -542,29 +547,28 @@ impl CacheConfig {
         self.timefusion_foyer_stats.eq_ignore_ascii_case("true")
     }
     pub fn memory_size_bytes(&self) -> usize {
-        self.timefusion_foyer_memory_mb * 1024 * 1024
+        self.timefusion_foyer_memory_mb * MIB
     }
     pub fn disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_disk_mb.map_or(self.timefusion_foyer_disk_gb * 1024 * 1024 * 1024, |mb| mb * 1024 * 1024)
+        self.timefusion_foyer_disk_mb.map_or(self.timefusion_foyer_disk_gb * GIB, |mb| mb * MIB)
     }
     pub fn file_size_bytes(&self) -> usize {
-        self.timefusion_foyer_file_size_mb * 1024 * 1024
+        self.timefusion_foyer_file_size_mb * MIB
     }
     pub fn metadata_memory_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_memory_mb * 1024 * 1024
+        self.timefusion_foyer_metadata_memory_mb * MIB
     }
     pub fn warm_inline_max_bytes(&self) -> usize {
-        self.timefusion_warm_inline_max_mb * 1024 * 1024
+        self.timefusion_warm_inline_max_mb * MIB
     }
     pub fn block_size_bytes(&self) -> usize {
-        self.timefusion_foyer_block_size_mb * 1024 * 1024
+        self.timefusion_foyer_block_size_mb * MIB
     }
     pub fn l1_max_entry_bytes(&self) -> usize {
-        self.timefusion_foyer_l1_max_entry_mb * 1024 * 1024
+        self.timefusion_foyer_l1_max_entry_mb * MIB
     }
     pub fn metadata_disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_disk_mb
-            .map_or(self.timefusion_foyer_metadata_disk_gb * 1024 * 1024 * 1024, |mb| mb * 1024 * 1024)
+        self.timefusion_foyer_metadata_disk_mb.map_or(self.timefusion_foyer_metadata_disk_gb * GIB, |mb| mb * MIB)
     }
 }
 

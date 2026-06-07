@@ -497,6 +497,19 @@ fn insert_main(cache: &FoyerCache, key: String, value: CacheValue, l1_max_entry_
     }
 }
 
+/// Synthesize an `ObjectMeta` for a just-written object from its `PutResult`
+/// (e_tag/version) and known size — lets the write path warm the cache without
+/// a post-write GET just to learn the metadata.
+fn put_result_meta(location: Path, size: u64, result: &PutResult) -> ObjectMeta {
+    ObjectMeta {
+        location,
+        last_modified: Utc::now(),
+        size,
+        e_tag: result.e_tag.clone(),
+        version: result.version.clone(),
+    }
+}
+
 /// Foyer-based hybrid cache implementation for object store
 #[derive(derive_more::Display, derive_more::Debug)]
 #[display("FoyerHybridCachedObjectStore({})", inner)]
@@ -1098,13 +1111,7 @@ impl FoyerObjectStoreCache {
             for chunk in payload_for_cache.iter() {
                 data.extend_from_slice(chunk);
             }
-            let meta = ObjectMeta {
-                location:      location.clone(),
-                last_modified: Utc::now(),
-                size:          payload_size as u64,
-                e_tag:         result.e_tag.clone(),
-                version:       result.version.clone(),
-            };
+            let meta = put_result_meta(location.clone(), payload_size as u64, &result);
             self.insert_main_value(location, CacheValue::new(data, meta));
             debug!("Warmed cache from write payload: {} (size: {} bytes)", location, payload_size);
         }
@@ -1223,13 +1230,7 @@ impl MultipartUpload for CachingMultipartUpload {
             && !buf.is_empty()
         {
             let size = buf.len() as u64;
-            let meta = ObjectMeta {
-                location: self.location.clone(),
-                last_modified: Utc::now(),
-                size,
-                e_tag: result.e_tag.clone(),
-                version: result.version.clone(),
-            };
+            let meta = put_result_meta(self.location.clone(), size, &result);
             // Use the same key derivation as the read path so a multipart-warmed
             // entry is found by a later GET even if `make_cache_key` ever does
             // more than `location.to_string()`.
