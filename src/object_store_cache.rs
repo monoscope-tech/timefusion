@@ -253,6 +253,11 @@ impl CacheStats {
 type FoyerCache = Arc<HybridCache<String, CacheValue>>;
 type StatsRef = Arc<RwLock<CacheStats>>;
 
+/// Floor for the foyer disk block (region) size. Matches the legacy default
+/// (`timefusion_foyer_file_size_mb`), small enough that even a modest disk
+/// budget yields several regions.
+const MIN_DISK_BLOCK_BYTES: usize = 4 * 1024 * 1024;
+
 /// Shared Foyer cache that can be used across multiple object stores
 #[derive(Debug)]
 pub struct SharedFoyerCache {
@@ -286,6 +291,16 @@ impl SharedFoyerCache {
         let metadata_cache_dir = config.cache_dir.join("metadata");
         std::fs::create_dir_all(&metadata_cache_dir)?;
 
+        // Block size caps the largest entry that can land on disk, so the main
+        // data cache wants a block big enough to hold full compaction outputs
+        // (128MB) — otherwise they'd silently never persist. But foyer carves the
+        // device into block-sized regions: a block >= the device leaves zero
+        // usable regions and every disk insert stalls (a 256MB block on a 50MB
+        // dev wedged CI). Cap the block at a quarter of the device so there are
+        // always several regions, never below the legacy 4MB granularity, and
+        // never above the device itself.
+        let data_block_size = config.block_size_bytes.min(config.disk_size_bytes / 4).max(MIN_DISK_BLOCK_BYTES).min(config.disk_size_bytes);
+
         let cache = HybridCacheBuilder::new()
             .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(config.memory_size_bytes)
@@ -294,11 +309,7 @@ impl SharedFoyerCache {
             .storage()
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
-                // Block size caps the largest entry that can land on disk, so the
-                // main data cache uses a block big enough to hold full compaction
-                // outputs (128MB) — otherwise they'd silently never persist.
-                BlockEngineConfig::new(FsDeviceBuilder::new(&config.cache_dir).with_capacity(config.disk_size_bytes).build()?)
-                    .with_block_size(config.block_size_bytes),
+                BlockEngineConfig::new(FsDeviceBuilder::new(&config.cache_dir).with_capacity(config.disk_size_bytes).build()?).with_block_size(data_block_size),
             )
             .build()
             .await?;
