@@ -10,8 +10,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashSet;
 use foyer::{
-    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, HybridCacheProperties, Location,
-    PsyncIoEngineConfig,
+    BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder, HybridCachePolicy, HybridCacheProperties, Location, PsyncIoEngineConfig,
 };
 use futures::stream::BoxStream;
 use object_store::{
@@ -451,11 +450,7 @@ pub async fn warm_full(store: &dyn ObjectStore, location: &Path) -> bool {
 /// filter in `database.rs` so the two parsers can't drift.
 pub fn date_partition_within(s: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
     let Some(cutoff) = cutoff else { return true };
-    match s
-        .find("date=")
-        .and_then(|i| s.get(i + 5..i + 15))
-        .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
-    {
+    match s.find("date=").and_then(|i| s.get(i + 5..i + 15)).and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok()) {
         Some(date) => date >= cutoff,
         None => true,
     }
@@ -1213,11 +1208,11 @@ impl MultipartUpload for CachingMultipartUpload {
         {
             let size = buf.len() as u64;
             let meta = ObjectMeta {
-                location:      self.location.clone(),
+                location: self.location.clone(),
                 last_modified: Utc::now(),
                 size,
-                e_tag:         result.e_tag.clone(),
-                version:       result.version.clone(),
+                e_tag: result.e_tag.clone(),
+                version: result.version.clone(),
             };
             // Use the same key derivation as the read path so a multipart-warmed
             // entry is found by a later GET even if `make_cache_key` ever does
@@ -1321,10 +1316,13 @@ impl ObjectStore for FoyerObjectStoreCache {
             }
             let result = self
                 .inner
-                .get_opts(location, GetOptions {
-                    range: Some(GetRange::Suffix(n)),
-                    ..Default::default()
-                })
+                .get_opts(
+                    location,
+                    GetOptions {
+                        range: Some(GetRange::Suffix(n)),
+                        ..Default::default()
+                    },
+                )
                 .await?;
             let meta = result.meta.clone();
             let abs_range = result.range.clone();
@@ -1348,8 +1346,7 @@ impl ObjectStore for FoyerObjectStoreCache {
                 };
                 self.metadata_cache
                     .insert(Self::make_range_cache_key(location, &abs_range), CacheValue::new(bytes.to_vec(), range_meta));
-                self.metadata_cache
-                    .insert(Self::make_meta_cache_key(location), CacheValue::new(Vec::new(), meta.clone()));
+                self.metadata_cache.insert(Self::make_meta_cache_key(location), CacheValue::new(Vec::new(), meta.clone()));
             }
             let data_len = bytes.len() as u64;
             return Ok(GetResult {
@@ -1960,14 +1957,17 @@ mod tests {
         cache.put(&path, PutPayload::from(Bytes::from(vec![b'a'; 4096]))).await?;
         let _ = cache.get(&path).await?;
         assert_eq!(cache.get_stats().await.main.hits, 1, "freshly written file should be cached");
-        assert!(shared.cache.memory().contains(&path.to_string()), "freshly read file should be in the in-memory cache");
+        assert!(
+            shared.cache.memory().contains(&path.to_string()),
+            "freshly read file should be in the in-memory cache"
+        );
 
         // Proactive eviction (what the compaction path does for tombstoned
         // files) drops the entry from the in-memory cache immediately. foyer's
         // HybridCache::remove deletes the on-disk copy asynchronously, so we
         // assert on the memory layer for a deterministic result; the dead bytes
         // are reclaimed from disk shortly after rather than waiting for VACUUM.
-        shared.evict_data_entry(&path.to_string());
+        shared.evict_data_entry(path.as_ref());
         assert!(
             !shared.cache.memory().contains(&path.to_string()),
             "evicted entry should be dropped from the in-memory cache"
@@ -2135,8 +2135,11 @@ mod tests {
         // files would linger. Assert at the in-memory layer — foyer removes the
         // on-disk copy asynchronously, so the memory layer is the deterministic
         // signal (mirrors test_evict_data_entry_removes_cached_file).
-        assert!(shared.cache.memory().contains(&path.to_string()), "warmed entry should be in the in-memory cache");
-        shared.evict_data_entry(&path.to_string());
+        assert!(
+            shared.cache.memory().contains(&path.to_string()),
+            "warmed entry should be in the in-memory cache"
+        );
+        shared.evict_data_entry(path.as_ref());
         assert!(
             !shared.cache.memory().contains(&path.to_string()),
             "evict must drop the same key warming/reads use"

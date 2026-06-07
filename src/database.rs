@@ -1685,11 +1685,7 @@ impl Database {
         let baseline = match &stats_cache {
             Some(cache) => {
                 let s = cache.get_stats().await.main;
-                let rate = if s.hits + s.misses > 0 {
-                    (s.hits as f64 / (s.hits + s.misses) as f64) * 100.0
-                } else {
-                    0.0
-                };
+                let rate = if s.hits + s.misses > 0 { (s.hits as f64 / (s.hits + s.misses) as f64) * 100.0 } else { 0.0 };
                 Some(rate)
             }
             None => None,
@@ -2439,8 +2435,7 @@ impl Database {
             };
             // Pre-state file set for deriving the files this optimize adds (to
             // warm) and removes (to evict).
-            let track_files =
-                self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+            let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
             let pre_uris: std::collections::HashSet<String> = if track_files {
                 table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default()
             } else {

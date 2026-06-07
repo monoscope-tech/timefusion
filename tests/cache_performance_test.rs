@@ -186,17 +186,18 @@ async fn test_parquet_metadata_cache_performance() -> Result<()> {
 
     // Configure cache with metadata optimization
     let config = FoyerCacheConfig {
-        memory_size_bytes:          50 * 1024 * 1024,  // 50MB
-        disk_size_bytes:            100 * 1024 * 1024, // 100MB
-        ttl:                        std::time::Duration::from_secs(300),
-        cache_dir:                  std::path::PathBuf::from("/tmp/test_parquet_metadata_perf"),
-        shards:                     4,
-        file_size_bytes:            4 * 1024 * 1024, // 4MB
-        enable_stats:               true,
+        memory_size_bytes: 50 * 1024 * 1024, // 50MB
+        disk_size_bytes: 100 * 1024 * 1024,  // 100MB
+        ttl: std::time::Duration::from_secs(300),
+        cache_dir: std::path::PathBuf::from("/tmp/test_parquet_metadata_perf"),
+        shards: 4,
+        file_size_bytes: 4 * 1024 * 1024, // 4MB
+        enable_stats: true,
         parquet_metadata_size_hint: 1_048_576,        // 1MB
         metadata_memory_size_bytes: 20 * 1024 * 1024, // 20MB
-        metadata_disk_size_bytes:   50 * 1024 * 1024, // 50MB
-        metadata_shards:            2,
+        metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB
+        metadata_shards: 2,
+        ..Default::default()
     };
 
     // Clean up cache directory
