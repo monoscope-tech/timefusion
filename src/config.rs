@@ -4,6 +4,11 @@ use serde::Deserialize;
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
+/// Bytes per MiB / GiB — used by the `*_bytes()` size accessors below so the
+/// `* 1024 * 1024` chains don't repeat (and read as the unit they mean).
+const MIB: usize = 1024 * 1024;
+const GIB: usize = 1024 * 1024 * 1024;
+
 /// Load config from environment variables.
 pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
     // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
@@ -145,8 +150,13 @@ const_default!(d_pressure_flush_pct: u32 = 75);
 //   "none"      — never fsync (test/throwaway data only)
 const_default!(d_wal_fsync_mode: String = "ms");
 const_default!(d_wal_max_files: usize = 200);
-const_default!(d_foyer_memory_mb: usize = 512);
-const_default!(d_foyer_disk_gb: usize = 100);
+const_default!(d_foyer_memory_mb: usize = 1024);
+// Local disk is cheap and fast relative to S3 GETs, so default the cache large
+// — servers run 500GB–1TB cache volumes. foyer creates the backing file sparse
+// (no upfront allocation), but this is the logical ceiling at which it starts
+// evicting, so it MUST stay <= the cache volume's free space or writes hit
+// ENOSPC before eviction kicks in. Lower it on smaller disks.
+const_default!(d_foyer_disk_gb: usize = 500);
 const_default!(d_foyer_ttl: u64 = 604_800); // 7 days
 const_default!(d_foyer_shards: usize = 8);
 const_default!(d_foyer_file_size_mb: usize = 32);
@@ -155,6 +165,10 @@ const_default!(d_metadata_size_hint: usize = 1_048_576);
 const_default!(d_metadata_memory_mb: usize = 512);
 const_default!(d_metadata_disk_gb: usize = 5);
 const_default!(d_metadata_shards: usize = 4);
+const_default!(d_warm_inline_max_mb: usize = 0);
+const_default!(d_foyer_block_size_mb: usize = 256);
+const_default!(d_l1_max_entry_mb: usize = 16);
+const_default!(d_cache_recent_days: usize = 8);
 const_default!(d_page_rows: usize = 20_000);
 const_default!(d_zstd_level: i32 = 3);
 // Tiered compression by partition age. Hot writes prioritize ingest latency;
@@ -167,13 +181,20 @@ const_default!(d_row_group_size: usize = 134_217_728); // 128MB
 const_default!(d_checkpoint_interval: u64 = 10);
 const_default!(d_optimize_target: i64 = 128 * 1024 * 1024);
 const_default!(d_stats_cache_size: usize = 50);
-const_default!(d_vacuum_retention: u64 = 72);
+// Observability data is high-churn and rarely time-traveled; the only hard
+// floor is that retention must outlive any in-flight query (which holds a Delta
+// snapshot referencing files vacuum would delete). With no query running beyond
+// ~1h, 48h is a 48x safety margin while reclaiming tombstoned bytes far sooner
+// than the old 72h default.
+const_default!(d_vacuum_retention: u64 = 48);
 const_default!(d_optimize_window_hours: u64 = 48);
 const_default!(d_compact_min_files: usize = 5);
 const_default!(d_light_optimize_target: i64 = 16 * 1024 * 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 const_default!(d_vacuum_schedule: String = "0 0 2 * * *");
+const_default!(d_warm_recency_days: u64 = 2);
+const_default!(d_warm_concurrency: usize = 4);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
@@ -477,6 +498,40 @@ pub struct CacheConfig {
     pub timefusion_foyer_metadata_disk_gb:     usize,
     #[serde(default = "d_metadata_shards")]
     pub timefusion_foyer_metadata_shards:      usize,
+    /// Disk block size (MB) for the main data cache. The block is foyer's
+    /// minimal eviction unit AND its size caps the largest entry that can land
+    /// on disk — so it must be >= the largest file we want cached locally. This
+    /// acts as a *floor*: `from_app_config` automatically raises the effective
+    /// block size to 2x the compaction target size, so the two can't drift out
+    /// of sync if an operator bumps the target. Default 256MB.
+    ///
+    /// Memory note: this also bounds the transient buffer each multipart-write
+    /// warm holds in heap (see `timefusion_warm_inline_max_mb`). Up to
+    /// `timefusion_warm_concurrency` compactions can run at once, so the worst
+    /// case is `block_size_mb * warm_concurrency` of transient heap during a
+    /// busy maintenance window (e.g. 256MB x 4 = 1GB). On smaller-memory
+    /// instances set `timefusion_warm_inline_max_mb` to cap this independently
+    /// of the on-disk block size.
+    #[serde(default = "d_foyer_block_size_mb")]
+    pub timefusion_foyer_block_size_mb:        usize,
+    /// Entries larger than this (MB) are inserted disk-only (foyer
+    /// `Location::OnDisk`) so warming a big compaction output doesn't evict the
+    /// hot small-entry working set from L1 memory. Small entries keep the
+    /// default L1+disk placement for fastest repeat reads. 0 = always use L1.
+    #[serde(default = "d_l1_max_entry_mb")]
+    pub timefusion_foyer_l1_max_entry_mb:      usize,
+    /// Don't admit writes whose `date=` partition is older than this many days
+    /// (e.g. cold-tier recompress rewrites) — recent data stays local, old data
+    /// is served from S3. 0 = no age limit. Pairs with the cache TTL, which
+    /// governs how long an admitted entry survives before falling back to S3.
+    #[serde(default = "d_cache_recent_days")]
+    pub timefusion_cache_recent_days:          usize,
+    /// Optional extra cap (MB) on the in-flight buffer used to warm the cache
+    /// directly from a multipart write (so we don't re-download a file we just
+    /// streamed to S3). Always bounded by the disk block size; 0 = bound only
+    /// by the block size.
+    #[serde(default = "d_warm_inline_max_mb")]
+    pub timefusion_warm_inline_max_mb:         usize,
     #[serde(default)]
     pub timefusion_foyer_disabled:             bool,
 }
@@ -492,20 +547,28 @@ impl CacheConfig {
         self.timefusion_foyer_stats.eq_ignore_ascii_case("true")
     }
     pub fn memory_size_bytes(&self) -> usize {
-        self.timefusion_foyer_memory_mb * 1024 * 1024
+        self.timefusion_foyer_memory_mb * MIB
     }
     pub fn disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_disk_mb.map_or(self.timefusion_foyer_disk_gb * 1024 * 1024 * 1024, |mb| mb * 1024 * 1024)
+        self.timefusion_foyer_disk_mb.map_or(self.timefusion_foyer_disk_gb * GIB, |mb| mb * MIB)
     }
     pub fn file_size_bytes(&self) -> usize {
-        self.timefusion_foyer_file_size_mb * 1024 * 1024
+        self.timefusion_foyer_file_size_mb * MIB
     }
     pub fn metadata_memory_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_memory_mb * 1024 * 1024
+        self.timefusion_foyer_metadata_memory_mb * MIB
+    }
+    pub fn warm_inline_max_bytes(&self) -> usize {
+        self.timefusion_warm_inline_max_mb * MIB
+    }
+    pub fn block_size_bytes(&self) -> usize {
+        self.timefusion_foyer_block_size_mb * MIB
+    }
+    pub fn l1_max_entry_bytes(&self) -> usize {
+        self.timefusion_foyer_l1_max_entry_mb * MIB
     }
     pub fn metadata_disk_size_bytes(&self) -> usize {
-        self.timefusion_foyer_metadata_disk_mb
-            .map_or(self.timefusion_foyer_metadata_disk_gb * 1024 * 1024 * 1024, |mb| mb * 1024 * 1024)
+        self.timefusion_foyer_metadata_disk_mb.map_or(self.timefusion_foyer_metadata_disk_gb * GIB, |mb| mb * MIB)
     }
 }
 
@@ -553,6 +616,32 @@ pub struct MaintenanceConfig {
     pub timefusion_vacuum_schedule:            String,
     #[serde(default = "d_recompress_schedule")]
     pub timefusion_recompress_schedule:        String,
+    /// Proactively warm the Foyer cache for files written by a flush/optimize
+    /// commit, so recent partitions dashboards read don't cold-start after
+    /// every compaction. Footers are always warmed when enabled.
+    #[serde(default = "d_true")]
+    pub timefusion_warm_after_compaction:      bool,
+    /// In addition to footers, warm the full file contents into the main
+    /// (full-file) cache. Off by default — footers carry most of the
+    /// planning-latency win at a fraction of the bytes; enable for data-read
+    /// warmth on the hottest partitions.
+    #[serde(default)]
+    pub timefusion_warm_full_files:            bool,
+    /// Only warm files whose `date=` partition is within this many days of
+    /// today. Bounds warming to the partitions dashboards actually query.
+    /// 0 = no recency limit.
+    #[serde(default = "d_warm_recency_days")]
+    pub timefusion_warm_recency_days:          u64,
+    /// Max concurrent warm fetches per commit. Bounds the S3 GET burst a
+    /// warm job adds right after a compaction.
+    #[serde(default = "d_warm_concurrency")]
+    pub timefusion_warm_concurrency:           usize,
+    /// After a compaction commit, proactively evict the cached full-file bytes
+    /// of the files it tombstoned (no longer in the live set), instead of
+    /// waiting for VACUUM / TTL / LRU to reclaim them. Cheap (in-cache only, no
+    /// S3) and keeps the cache from filling with dead compaction outputs.
+    #[serde(default = "d_true")]
+    pub timefusion_evict_after_compaction:     bool,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.
@@ -632,7 +721,19 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.core.pgwire_port, 5432);
         assert_eq!(config.buffer.timefusion_flush_interval_secs, 600);
-        assert_eq!(config.cache.timefusion_foyer_memory_mb, 512);
+        assert_eq!(config.cache.timefusion_foyer_memory_mb, 1024);
+        assert_eq!(config.cache.timefusion_foyer_disk_gb, 500);
+        assert_eq!(config.cache.disk_size_bytes(), 500 * 1024 * 1024 * 1024);
+        assert_eq!(config.cache.timefusion_warm_inline_max_mb, 0);
+        assert_eq!(config.cache.timefusion_foyer_block_size_mb, 256);
+        assert_eq!(config.cache.block_size_bytes(), 256 * 1024 * 1024);
+        assert_eq!(config.cache.timefusion_foyer_l1_max_entry_mb, 16);
+        assert_eq!(config.cache.timefusion_cache_recent_days, 8);
+        assert!(config.maintenance.timefusion_warm_after_compaction);
+        assert!(config.maintenance.timefusion_evict_after_compaction);
+        assert!(!config.maintenance.timefusion_warm_full_files);
+        assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);
+        assert_eq!(config.maintenance.timefusion_warm_concurrency, 4);
     }
 
     #[test]

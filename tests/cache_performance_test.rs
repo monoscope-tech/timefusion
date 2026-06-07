@@ -45,10 +45,9 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
     // Get baseline stats after writes
     let stats_after_write = shared_cache.get_stats().await;
     assert_eq!(stats_after_write.main.inner_puts, 3, "Should have written to inner store 3 times");
-    assert_eq!(
-        stats_after_write.main.inner_gets, 3,
-        "Should have fetched from inner store 3 times during write"
-    );
+    // Writes warm the cache directly from the put payload (no post-write
+    // re-fetch), so no inner GETs are issued during writes.
+    assert_eq!(stats_after_write.main.inner_gets, 0, "Writes warm from payload — no inner GET during write");
 
     // First read - should hit cache since we cache on write
     let start = Instant::now();
@@ -81,7 +80,7 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
     let stats = shared_cache.get_stats().await;
     assert_eq!(stats.main.hits, 6, "Should have 6 cache hits total (3 per read iteration)");
     assert_eq!(stats.main.misses, 0, "Should have no cache misses since files were cached on write");
-    assert_eq!(stats.main.inner_gets, 3, "Should have fetched from inner store 3 times during write");
+    assert_eq!(stats.main.inner_gets, 0, "Writes warm from payload and reads hit cache — no inner GETs at all");
     assert_eq!(stats.main.inner_puts, 3, "Should have written to inner store 3 times");
 
     // Test cache invalidation on write
@@ -186,17 +185,18 @@ async fn test_parquet_metadata_cache_performance() -> Result<()> {
 
     // Configure cache with metadata optimization
     let config = FoyerCacheConfig {
-        memory_size_bytes:          50 * 1024 * 1024,  // 50MB
-        disk_size_bytes:            100 * 1024 * 1024, // 100MB
-        ttl:                        std::time::Duration::from_secs(300),
-        cache_dir:                  std::path::PathBuf::from("/tmp/test_parquet_metadata_perf"),
-        shards:                     4,
-        file_size_bytes:            4 * 1024 * 1024, // 4MB
-        enable_stats:               true,
+        memory_size_bytes: 50 * 1024 * 1024, // 50MB
+        disk_size_bytes: 100 * 1024 * 1024,  // 100MB
+        ttl: std::time::Duration::from_secs(300),
+        cache_dir: std::path::PathBuf::from("/tmp/test_parquet_metadata_perf"),
+        shards: 4,
+        file_size_bytes: 4 * 1024 * 1024, // 4MB
+        enable_stats: true,
         parquet_metadata_size_hint: 1_048_576,        // 1MB
         metadata_memory_size_bytes: 20 * 1024 * 1024, // 20MB
-        metadata_disk_size_bytes:   50 * 1024 * 1024, // 50MB
-        metadata_shards:            2,
+        metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB
+        metadata_shards: 2,
+        ..Default::default()
     };
 
     // Clean up cache directory
