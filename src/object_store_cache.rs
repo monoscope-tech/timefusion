@@ -258,6 +258,16 @@ type StatsRef = Arc<RwLock<CacheStats>>;
 /// budget yields several regions.
 const MIN_DISK_BLOCK_BYTES: usize = 4 * 1024 * 1024;
 
+/// Cap a desired foyer disk block (region) size to the device. Foyer carves the
+/// device into block-sized regions, so a block >= the device leaves zero usable
+/// regions and every disk insert stalls (a 256MB block on a 50MB device wedged
+/// CI). Keep several regions by capping at a quarter of the device, floored at
+/// the legacy 4MB granularity and never above the device itself. Shared by both
+/// cache builders so neither can silently wedge on a small disk.
+fn capped_block_size(desired: usize, disk_size: usize) -> usize {
+    desired.min(disk_size / 4).max(MIN_DISK_BLOCK_BYTES).min(disk_size)
+}
+
 /// Shared Foyer cache that can be used across multiple object stores
 #[derive(Debug)]
 pub struct SharedFoyerCache {
@@ -291,15 +301,9 @@ impl SharedFoyerCache {
         let metadata_cache_dir = config.cache_dir.join("metadata");
         std::fs::create_dir_all(&metadata_cache_dir)?;
 
-        // Block size caps the largest entry that can land on disk, so the main
-        // data cache wants a block big enough to hold full compaction outputs
-        // (128MB) — otherwise they'd silently never persist. But foyer carves the
-        // device into block-sized regions: a block >= the device leaves zero
-        // usable regions and every disk insert stalls (a 256MB block on a 50MB
-        // dev wedged CI). Cap the block at a quarter of the device so there are
-        // always several regions, never below the legacy 4MB granularity, and
-        // never above the device itself.
-        let data_block_size = config.block_size_bytes.min(config.disk_size_bytes / 4).max(MIN_DISK_BLOCK_BYTES).min(config.disk_size_bytes);
+        // The main data cache wants a block big enough to hold full compaction
+        // outputs (128MB) so they persist, capped to the device so it can't wedge.
+        let data_block_size = capped_block_size(config.block_size_bytes, config.disk_size_bytes);
 
         let cache = HybridCacheBuilder::new()
             .with_policy(HybridCachePolicy::WriteOnInsertion)
@@ -323,7 +327,7 @@ impl SharedFoyerCache {
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
                 BlockEngineConfig::new(FsDeviceBuilder::new(&metadata_cache_dir).with_capacity(config.metadata_disk_size_bytes).build()?)
-                    .with_block_size(config.file_size_bytes),
+                    .with_block_size(capped_block_size(config.file_size_bytes, config.metadata_disk_size_bytes)),
             )
             .build()
             .await?;
@@ -1145,7 +1149,8 @@ impl FoyerObjectStoreCache {
         let age = current_millis().saturating_sub(entry.value().timestamp_millis);
         // `as_millis()` is u128; clamp before the u64 cast so an absurdly large
         // configured TTL can't silently truncate into a tiny value.
-        if age.saturating_mul(2) <= self.config.ttl.as_millis().min(u64::MAX as u128) as u64 {
+        let ttl_millis = self.config.ttl.as_millis().min(u64::MAX as u128) as u64;
+        if age.saturating_mul(2) <= ttl_millis {
             return; // still fresh enough — don't churn the cache
         }
         if !self.refreshing.insert(key.to_string()) {

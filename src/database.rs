@@ -86,6 +86,22 @@ fn within_recency(uri: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
     crate::object_store_cache::date_partition_within(uri, cutoff)
 }
 
+/// The cache-key prefix for a table: its URI minus any `?endpoint=...` query
+/// string (`table_url()` may carry one; `get_file_uris()` omits it) and trailing
+/// slash. File URIs are relativized against this to form cache keys.
+fn table_cache_prefix(table_uri: &str) -> &str {
+    table_uri.split('?').next().unwrap_or(table_uri).trim_end_matches('/')
+}
+
+/// Relativize an absolute file URI against a `table_cache_prefix`, yielding the
+/// bucket-relative path the cached object store keys full files by. `None` on
+/// prefix mismatch (trailing-slash or query-string drift between `table_url()`
+/// and `get_file_uris()`). Shared by the warm and evict paths so a single-char
+/// difference can't desync which key was warmed vs. evicted.
+fn relativize_to_prefix(prefix: &str, uri: &str) -> Option<object_store::path::Path> {
+    uri.strip_prefix(prefix).map(|rel| object_store::path::Path::from(rel.trim_start_matches('/')))
+}
+
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     use datafusion::arrow::array::{StringArray, StringViewArray};
@@ -1636,11 +1652,9 @@ impl Database {
         let metadata_size_hint = self.config.cache.timefusion_parquet_metadata_size_hint as u64;
         let stats_cache = self.object_store_cache.clone();
 
-        // Relativize absolute s3:// URIs against the table root (mirrors
-        // recompress_partition): the cached object store consumes
-        // bucket-relative paths. `table_url()` may carry a `?endpoint=...`
-        // query string that `get_file_uris()` omits — strip it before matching.
-        let prefix = table_uri.split('?').next().unwrap_or(&table_uri).trim_end_matches('/').to_string();
+        // Relativize absolute s3:// URIs against the table root: the cached
+        // object store consumes bucket-relative paths.
+        let prefix = table_cache_prefix(&table_uri);
         // Cap the day count before the i64 cast — recency_days is a config
         // value so overflow can't happen in practice, but a silent wrap would
         // turn a misconfiguration into "warm nothing". 3650d (~10y) is well
@@ -1652,8 +1666,8 @@ impl Database {
             .into_iter()
             .filter(|u| u.ends_with(".parquet"))
             .filter(|u| within_recency(u, cutoff))
-            .filter_map(|u| match u.strip_prefix(&prefix) {
-                Some(rel) => Some(object_store::path::Path::from(rel.trim_start_matches('/'))),
+            .filter_map(|u| match relativize_to_prefix(prefix, &u) {
+                Some(path) => Some(path),
                 None => {
                     // Prefix mismatch (e.g. trailing-slash or query-string
                     // drift between table_url() and get_file_uris()). Warming
@@ -1732,13 +1746,12 @@ impl Database {
         };
         // Same relativization as warm_cache_for_uris: the cache keys full files
         // by their object-store-relative path.
-        let prefix = table_uri.split('?').next().unwrap_or(table_uri).trim_end_matches('/');
+        let prefix = table_cache_prefix(table_uri);
         let mut evicted = 0usize;
         let mut dropped = 0usize;
         for u in removed {
-            if let Some(rel) = u.strip_prefix(prefix) {
-                let key = object_store::path::Path::from(rel.trim_start_matches('/')).to_string();
-                cache.evict_data_entry(&key);
+            if let Some(path) = relativize_to_prefix(prefix, u) {
+                cache.evict_data_entry(path.as_ref());
                 evicted += 1;
             } else {
                 // Prefix mismatch (trailing-slash or query-string drift between
