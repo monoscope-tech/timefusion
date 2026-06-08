@@ -137,16 +137,17 @@ class Stats:
         self.query_errors: list[str] = []
 
 
-def writer(stop: threading.Event, pid: str, rows: list[dict], batch_size: int, stats: Stats):
+def writer(stop: threading.Event, pid: str, rows: list[dict], batch_size: int, stats: Stats, rows_per_sec: float):
     placeholders = "(" + ", ".join(["%s"] * len(COLUMNS)) + ")"
     base_sql = f"INSERT INTO otel_logs_and_spans ({', '.join(COLUMNS)}) VALUES "
+    per_batch_sleep = batch_size / rows_per_sec if rows_per_sec > 0 else 0.0
 
     with psycopg.connect(LOCAL_URL, autocommit=True) as conn, conn.cursor() as cur:
         idx = 0
+        next_send = time.perf_counter()
         while not stop.is_set():
             batch = rows[idx:idx+batch_size]
             if not batch:
-                # loop back to start with re-shifted timestamps (newer "now")
                 idx = 0
                 continue
             idx += batch_size
@@ -162,6 +163,11 @@ def writer(stop: threading.Event, pid: str, rows: list[dict], batch_size: int, s
             except Exception as e:
                 with stats.lock:
                     stats.errors.append(repr(e)[:200])
+            if per_batch_sleep:
+                next_send += per_batch_sleep
+                delay = next_send - time.perf_counter()
+                if delay > 0: time.sleep(delay)
+                else: next_send = time.perf_counter()  # we're behind; reset
 
 
 def reader(stop: threading.Event, project_ids: list[str], stats: Stats):
@@ -209,6 +215,8 @@ def main():
     ap.add_argument("--batch", type=int, default=30, help="rows per INSERT (prod-shape: ~30)")
     ap.add_argument("--row-limit", type=int, default=80000, help="max rows preloaded per project")
     ap.add_argument("--budget-ms", type=float, default=100.0, help="read latency budget for PASS")
+    ap.add_argument("--writer-rate", type=float, default=0,
+                    help="per-writer ingest rate cap in rows/sec (default 0 = unlimited)")
     args = ap.parse_args()
 
     if not DUMP.exists():
@@ -239,7 +247,7 @@ def main():
 
     with ThreadPoolExecutor(max_workers=args.writers + args.readers) as ex:
         for pid in pids:
-            ex.submit(writer, stop, pid, per_project[pid], args.batch, stats)
+            ex.submit(writer, stop, pid, per_project[pid], args.batch, stats, args.writer_rate)
         for _ in range(args.readers):
             ex.submit(reader, stop, pids, stats)
         # Snapshot stats every 15s so it's visible mid-run
