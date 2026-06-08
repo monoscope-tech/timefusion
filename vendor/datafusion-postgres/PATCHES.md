@@ -2,6 +2,17 @@
 
 This directory is a vendored copy of [`datafusion-postgres`](https://github.com/datafusion-contrib/datafusion-postgres) at the version pinned in the top-level `Cargo.toml`. The next `cargo vendor` / manual resync will silently overwrite the local edits below. If you upgrade the dep, re-apply each section by hand or regenerate the patch with `git diff master -- vendor/datafusion-postgres/`.
 
+## CI sentinel
+
+Drop this guard into the `Format` (or any always-running) job so a silent
+resync fails the build instead of regressing the pgwire optimisation:
+
+```bash
+grep -q 'was_pre_optimized' vendor/datafusion-postgres/src/hooks/mod.rs \
+    && grep -q 'was_pre_optimized' vendor/datafusion-postgres/src/handlers.rs \
+    || { echo "vendored datafusion-postgres lost TimeFusion patches — see vendor/datafusion-postgres/PATCHES.md"; exit 1; }
+```
+
 ## 1. `src/hooks/mod.rs` — `QueryHook::was_pre_optimized`
 
 Adds a method to the `QueryHook` trait:

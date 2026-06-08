@@ -79,7 +79,7 @@ fn concurrent_insert_query_bench() {
         let inserts = inserts.clone();
         let pid = format!("proj-{p:04}");
         let per_batch_sleep = if writer_rate > 0.0 {
-            Duration::from_secs_f64(batch_size as f64 / writer_rate as f64)
+            Duration::from_secs_f64(batch_size as f64 / writer_rate)
         } else {
             Duration::ZERO
         };

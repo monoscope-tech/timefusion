@@ -45,6 +45,12 @@ use crate::{
 // All default projects share the same table, with project_id as a partition column
 pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
 
+/// Soft size at which the no-eviction table caches log a warning.
+/// Picked at 10× the documented design target ("thousands of tenants").
+/// Crossings are once-per-threshold-multiple, so a runaway tenant churn
+/// surfaces as growing log frequency rather than a single quiet spike.
+const CACHE_SOFT_LIMIT_WARN: usize = 10_000;
+
 /// Per-key build de-duplicator for the cached Delta `TableProvider`. The inner
 /// `OnceCell` is initialised exactly once per `(project, table, version)`; all
 /// concurrent first-time misses share the same Arc and await the same build.
@@ -1658,7 +1664,23 @@ impl Database {
     /// is the only path to true.
     async fn populate_resolve_caches(&self, project_id: &str, table_name: &str, t: &Arc<RwLock<DeltaTable>>) {
         let key = (project_id.to_string(), table_name.to_string());
-        self.fast_resolve_cache.insert(key.clone(), Arc::clone(t));
+        let was_new = self.fast_resolve_cache.insert(key.clone(), Arc::clone(t)).is_none();
+        // Operator-visible warning so unbounded growth (documented on the
+        // field) doesn't sit unseen in `scan.fast_resolve_cache_entries`.
+        // Fires on first-insert crossings of the soft threshold, then again
+        // every threshold-multiple, so log volume tracks tenant-population
+        // growth rather than per-query traffic.
+        if was_new {
+            let size = self.fast_resolve_cache.len();
+            if size >= CACHE_SOFT_LIMIT_WARN && size.is_multiple_of(CACHE_SOFT_LIMIT_WARN) {
+                tracing::warn!(
+                    target = "table_caches",
+                    fast_resolve_cache_entries = size,
+                    threshold = CACHE_SOFT_LIMIT_WARN,
+                    "fast_resolve_cache crossed soft limit (no eviction by design). If your steady-state tenant count is below the threshold, dropped or transient project_ids are accumulating. Watch scan.fast_resolve_cache_entries in timefusion_stats."
+                );
+            }
+        }
         let has_files = t.read().await.version().map(|v| v > 0).unwrap_or(false);
         let entry = self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         if has_files {
@@ -3445,27 +3467,49 @@ impl ProjectRoutingTable {
         // which doesn't happen in our workload. If that pattern ever
         // emerges, prefer a CAS on an `Arc<AtomicU64>` version cell read
         // outside the DashMap lock.
-        let (cell, was_fresh_cell) = {
-            let mut entry = self
-                .database
-                .delta_provider_cache
-                .entry(cache_key.clone())
-                .or_insert_with(|| (current_version, Arc::new(tokio::sync::OnceCell::new())));
-            let stale = entry.0 != current_version;
+        let (cell, was_fresh_cell, brand_new_entry) = {
+            let entry = self.database.delta_provider_cache.entry(cache_key.clone());
+            let brand_new = matches!(entry, dashmap::Entry::Vacant(_));
+            let mut e = entry.or_insert_with(|| (current_version, Arc::new(tokio::sync::OnceCell::new())));
+            let stale = e.0 != current_version;
             if stale {
-                *entry = (current_version, Arc::new(tokio::sync::OnceCell::new()));
+                *e = (current_version, Arc::new(tokio::sync::OnceCell::new()));
             }
             // "Hit" = the cell was already initialised at this version when
             // we found it. We approximate this by checking initialised state
             // BEFORE we touch get_or_try_init; close enough for an alerting
             // metric. Miss covers both "never seen" and "stale-replaced".
-            (Arc::clone(&entry.1), stale)
+            (Arc::clone(&e.1), stale, brand_new)
         };
         if was_fresh_cell || !cell.initialized() {
             self.database.scan_metrics.provider_cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
             self.database.scan_metrics.provider_cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // Soft-limit warning on the brand-new-entry path — mirrors the
+        // fast_resolve_cache logic. Threshold-multiple cadence keeps log
+        // volume tracking tenant growth, not query rate.
+        if brand_new_entry {
+            let size = self.database.delta_provider_cache.len();
+            if size >= CACHE_SOFT_LIMIT_WARN && size.is_multiple_of(CACHE_SOFT_LIMIT_WARN) {
+                tracing::warn!(
+                    target = "table_caches",
+                    provider_cache_entries = size,
+                    threshold = CACHE_SOFT_LIMIT_WARN,
+                    "delta_provider_cache crossed soft limit (no eviction by design). Watch scan.provider_cache_entries in timefusion_stats."
+                );
+            }
+        }
+        // Bounded staleness: a task that captured the v=N cell before a
+        // concurrent flush bumped the DashMap entry to v=N+1 will still
+        // complete its query against the v=N provider it awaited. That
+        // single query returns pre-flush data. Subsequent queries observe
+        // the new v=N+1 cell. Acceptable for append-only OLAP: the window
+        // is one query, and a few-second-old reading is the expected
+        // semantics of the user-provided MemBuffer/Delta split anyway.
+        // Eagerly checking version after the await would just trade this
+        // for the original per-query rebuild cost (the 30 ms problem this
+        // cache exists to solve).
         let provider = cell
             .get_or_try_init(|| async {
                 let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
