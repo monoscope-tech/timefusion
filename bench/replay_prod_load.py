@@ -33,9 +33,8 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DUMP = DATA / "sample.jsonl.gz"
 
-PROD_URL = os.environ.get(
-    "TF_PROD_URL",
-    "postgresql://postgres:REDACTED-PASSWORD-ROTATED@timefusion.s.past3.tech:5432/postgres",
+PROD_URL = os.environ.get("TF_PROD_URL") or sys.exit(
+    "TF_PROD_URL is required — set it to your TimeFusion connection string"
 )
 LOCAL_HOST = os.environ.get("PGWIRE_HOST", "127.0.0.1")
 LOCAL_PORT = int(os.environ.get("PGWIRE_PORT", "12345"))
