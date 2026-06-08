@@ -567,6 +567,16 @@ pub struct Database {
     /// The safe direction (`true` when actually empty after vacuum) just
     /// runs the scan unnecessarily — no correctness risk.
     delta_has_files:                 dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
+    /// Per-(project,table) cached Delta-side `TableProvider` along with the
+    /// snapshot version it was built against. Steady-state (post-flush)
+    /// queries that have to UNION mem + delta were rebuilding the provider
+    /// on every scan — measured as ~30 ms p95 of pure Delta-side overhead
+    /// in the prior session. The provider is parameter-independent: every
+    /// query for `(project, table)` at the same snapshot version uses the
+    /// same provider, varying only filters/projection/limit on scan().
+    /// Invalidation: compare table.version() against the cached version
+    /// on lookup; mismatch → rebuild + replace.
+    delta_provider_cache:            dashmap::DashMap<(String, String), (u64, Arc<dyn datafusion::datasource::TableProvider>)>,
     /// Per-process scan-path counters. Read by `timefusion_stats` so operators
     /// can see — in prod — whether the in-memory shortcut is being taken,
     /// what the resolve cache hit rate looks like, and how the latency
@@ -880,6 +890,7 @@ impl Database {
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: dashmap::DashMap::new(),
             delta_has_files: dashmap::DashMap::new(),
+            delta_provider_cache: dashmap::DashMap::new(),
             scan_metrics: {
                 let m = Arc::new(ScanMetrics::default());
                 set_scan_metrics_global(m.clone());
@@ -3316,22 +3327,41 @@ impl ProjectRoutingTable {
     async fn scan_delta_table(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Extract project_id from filters for the provider cache key.
+        // Falls back to table_name-only key if absent (multi-project queries).
+        let project_id = self.extract_project_id_from_filters(filters).unwrap_or_else(|| self.default_project.clone());
+        let cache_key = (project_id, self.table_name.clone());
+
         table.update_datafusion_session(state).map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        // Build the delta-rs table provider with our session so its scan
-        // inherits `schema_force_view_types=false` (set in
-        // `create_session_context`). delta-rs's default is `true` (BinaryView),
-        // which mismatches our Binary-typed MemBuffer at the union and
-        // panics in physical planning. The session is a SessionState in
-        // practice; clone the concrete type so we can hand an
-        // `Arc<dyn Session + 'static>` to `with_session`.
-        let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
-        let provider = if let Some(ss) = session_state {
-            table.table_provider().with_session(Arc::new(ss)).await
+        // Per-(project,table) provider cache: only rebuild when the Delta
+        // snapshot version changes. Provider construction is parameter-
+        // independent so the cached value is correct for every query at
+        // the same version. Measured: ~30 ms p95 of pure provider-build
+        // overhead per query under load before this cache. Cache hits
+        // skip the whole `table.table_provider().with_session(...).await`
+        // chain.
+        let current_version = table.version().unwrap_or(0);
+        let provider = if let Some(entry) = self.database.delta_provider_cache.get(&cache_key)
+            && entry.value().0 == current_version
+        {
+            Arc::clone(&entry.value().1)
         } else {
-            table.table_provider().await
-        }
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
+            // Build the delta-rs table provider with our session so its scan
+            // inherits `schema_force_view_types=false` (set in
+            // `create_session_context`). delta-rs's default is `true` (BinaryView),
+            // which mismatches our Binary-typed MemBuffer at the union and
+            // panics in physical planning.
+            let built = if let Some(ss) = session_state {
+                table.table_provider().with_session(Arc::new(ss)).await
+            } else {
+                table.table_provider().await
+            }
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            self.database.delta_provider_cache.insert(cache_key, (current_version, Arc::clone(&built)));
+            built
+        };
 
         // Translate projection indices from our schema to delta table's schema.
         // DataFusion passes indices based on ProjectRoutingTable.schema, but the
