@@ -1389,8 +1389,7 @@ impl MemBuffer {
             })
             .collect::<DFResult<Vec<_>>>()?;
         let sort_fields: Vec<SortField> = src_key_cols.iter().map(|c| SortField::new(c.data_type().clone())).collect();
-        let row_converter =
-            RowConverter::new(sort_fields).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let row_converter = RowConverter::new(sort_fields).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
         let src_rows = row_converter
             .convert_columns(&src_key_cols)
             .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
@@ -1480,8 +1479,8 @@ impl MemBuffer {
                     })
                     .collect::<DFResult<Vec<_>>>()?;
 
-                let new_batch = RecordBatch::try_new(batch.schema(), new_columns)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                let new_batch =
+                    RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
                 bucket_delta += estimate_batch_size(&new_batch) as i64 - old_size as i64;
                 new_batches.push(new_batch);
             }
@@ -1516,8 +1515,8 @@ impl MemBuffer {
     #[instrument(skip(self, assignments, source_batch, registry), fields(project_id, table_name, source_rows = source_batch.num_rows()))]
     #[allow(clippy::too_many_arguments)]
     pub fn update_with_source_by_sql(
-        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)],
-        join_keys: &[(String, String)], source_batch: RecordBatch, registry: Option<&FnRegistry>,
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], join_keys: &[(String, String)],
+        source_batch: RecordBatch, registry: Option<&FnRegistry>,
     ) -> DFResult<u64> {
         let target_df_schema = self.df_schema_for(project_id, table_name)?;
 

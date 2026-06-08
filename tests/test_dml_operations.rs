@@ -452,10 +452,17 @@ mod test_dml_operations {
 
     /// Helper: select `duration` for `name` in `test_project`, ordered by name.
     async fn duration_by_name(ctx: &datafusion::prelude::SessionContext, name: &str) -> Result<i64> {
-        let q = format!("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = '{}'", name);
+        let q = format!(
+            "SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = '{}'",
+            name
+        );
         let df = ctx.sql(&q).await?;
         let results = df.collect().await?;
-        assert!(!results.is_empty() && results[0].num_rows() == 1, "duration_by_name: expected 1 row for {}", name);
+        assert!(
+            !results.is_empty() && results[0].num_rows() == 1,
+            "duration_by_name: expected 1 row for {}",
+            name
+        );
         Ok(results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
     }
 
@@ -680,9 +687,7 @@ mod test_dml_operations {
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(rows_updated, 1);
 
-        let df = ctx
-            .sql("SELECT duration, level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'")
-            .await?;
+        let df = ctx.sql("SELECT duration, level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         let results = df.collect().await?;
         let b = &results[0];
         assert_eq!(b.column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 1234);

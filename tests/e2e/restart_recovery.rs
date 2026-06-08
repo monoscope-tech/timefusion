@@ -83,8 +83,7 @@ async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
     );
 
     let client = env.pg_client().await?;
-    let count: i64 =
-        client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
     assert_eq!(count, 3, "rows lost across restart — WAL replay broken");
     Ok(())
 }
