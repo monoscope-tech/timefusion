@@ -108,23 +108,3 @@ jobs:
       - name: Test
         run: cargo test --all-features --locked
 
-  # E2E suite: dynamic per-test MinIO via testcontainers. Decoupled from the
-  # service-based MinIO above so we can run scenarios in parallel without
-  # bucket collisions. Docker is preinstalled on ubuntu-latest runners.
-  e2e:
-    name: E2E (testcontainers)
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - name: Free disk space
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          shared-key: e2e
-      - name: E2E suite
-        run: cargo test --test e2e --locked -- --nocapture
