@@ -3493,7 +3493,24 @@ impl ProjectRoutingTable {
         // which doesn't happen in our workload. If that pattern ever
         // emerges, prefer a CAS on an `Arc<AtomicU64>` version cell read
         // outside the DashMap lock.
-        let (cell, was_fresh_cell, brand_new_entry) = {
+        // Optimistic read path: under 300+ concurrent readers, the prior
+        // `entry()`-on-every-call took a per-shard WRITE lock and serialised
+        // every cache hit hashing to the same shard. The read-only `get()`
+        // takes a per-shard READ lock, so concurrent hits don't block each
+        // other. We only take the write path on miss or version mismatch —
+        // events that happen seconds apart per project, not per query.
+        let read_hit = self
+            .database
+            .delta_provider_cache
+            .get(&cache_key)
+            .filter(|e| e.value().0 == current_version)
+            .map(|e| Arc::clone(&e.value().1));
+        let (cell, was_fresh_cell, brand_new_entry) = if let Some(c) = read_hit {
+            (c, false, false)
+        } else {
+            // Miss / stale — take the write path. Re-check after acquiring
+            // the entry lock since another thread may have populated it
+            // between our get() and entry() (DashMap doesn't upgrade locks).
             let entry = self.database.delta_provider_cache.entry(cache_key.clone());
             let brand_new = matches!(entry, dashmap::Entry::Vacant(_));
             let mut e = entry.or_insert_with(|| (current_version, Arc::new(tokio::sync::OnceCell::new())));

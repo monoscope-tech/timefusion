@@ -55,6 +55,7 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
 }
 
 #[test]
+#[ignore = "long-running microbench: default BENCH_DURATION=20s × 300 writers / 75 readers — opt-in via `cargo test -- --ignored concurrent_insert_query_bench` or override env (BENCH_DURATION=5)"]
 fn concurrent_insert_query_bench() {
     let projects: usize = std::env::var("BENCH_PROJECTS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let readers: usize = std::env::var("BENCH_READERS").ok().and_then(|s| s.parse().ok()).unwrap_or(75);

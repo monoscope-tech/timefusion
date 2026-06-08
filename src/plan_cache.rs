@@ -187,21 +187,23 @@ impl QueryHook for PlanCacheHook {
         // a full clear would cause when one burst of distinct queries
         // displaces the hot templates.
         //
-        // Concurrency note: this branch is unguarded — under a burst of
-        // novel queries all missing simultaneously (300 connections in an
-        // ad-hoc debug session), N threads could each cross the threshold
-        // and call `retain` in parallel, each one taking shard write locks
-        // and re-counting. That stacks the cost but is self-limiting
-        // (after the first sweep the size drops below `capacity` and
-        // subsequent threads no-op). If this ever shows up as a real
-        // problem, gate the sweep on an `AtomicBool` swap-acquire.
-        //
-        // TODO(perf): track in an issue if this fires in prod. The fix is
-        // a single AtomicBool::swap(true, Acquire) gate around the
-        // `cache.retain` call so only one thread sweeps per overflow
-        // crossing; nothing exotic but not worth the added state when the
-        // OLAP workload never trips this branch.
-        if self.cache.len() >= self.capacity {
+        // Under a burst of novel queries all missing simultaneously (300
+        // connections in an ad-hoc debug session), N threads could each
+        // cross the threshold and try to sweep. Without coordination
+        // they'd each take per-shard write locks in series, stalling
+        // concurrent readers. The static AtomicBool below gates the
+        // sweep so only the first thread per overflow crossing runs
+        // `retain`; the rest skip and re-insert as if the cap hadn't
+        // been crossed yet (their entries will be evicted by the next
+        // sweep). Cheap single-atomic and converges the stampede.
+        // AtomicBool gate so only one sweep runs per overflow crossing.
+        // Cheap (one atomic) and converts the multi-thread retain
+        // stampede into a single sweep + a cohort of fast-path skips.
+        // `cache.retain` with this closure can't panic, so the guard can
+        // be a flat `.store(false)` at the end of the block rather than
+        // a Drop-based scopeguard.
+        static EVICTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if self.cache.len() >= self.capacity && !EVICTING.swap(true, std::sync::atomic::Ordering::AcqRel) {
             let target = self.capacity / 2;
             // Operator-visible signal: this branch firing means the workload
             // is pushing more distinct plan templates than the cache can
@@ -227,6 +229,7 @@ impl QueryHook for PlanCacheHook {
                 // for a try-lock-and-skip pattern.
                 fastrand::usize(..self.capacity) >= target
             });
+            EVICTING.store(false, std::sync::atomic::Ordering::Release);
         }
         self.cache.insert(canonical, plan.clone());
         Some(Ok(plan))

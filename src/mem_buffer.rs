@@ -1407,14 +1407,33 @@ impl TableBuffer {
             // by small batches just sits as a tail of small batches against
             // the big one — readers iterate one extra cheap Vec slot;
             // writers don't pay a stop-the-world memcpy.
+            //
+            // Best-effort: coalesce is an optimisation, not a correctness
+            // requirement. If `concat_batches` fails (e.g. schema-evolution
+            // mismatch between buffered batches), we leave the Vec as-is
+            // and log — the just-pushed batch is durably in the bucket
+            // either way. Propagating the error here used to leak the
+            // pushed batch back to the caller as Err, who'd then retry
+            // and insert a duplicate.
             let bucket_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
             if g.len() > MAX_BATCH_COUNT_PER_BUCKET && bucket_bytes <= MAX_BATCH_BYTES_FOR_COALESCE {
                 let schema = g[0].schema();
-                let combined = arrow::compute::concat_batches(&schema, g.iter())?;
-                let combined_size = estimate_batch_size(&combined);
-                g.clear();
-                g.push(combined);
-                bucket.memory_bytes.store(combined_size, Ordering::Relaxed);
+                match arrow::compute::concat_batches(&schema, g.iter()) {
+                    Ok(combined) => {
+                        let combined_size = estimate_batch_size(&combined);
+                        g.clear();
+                        g.push(combined);
+                        bucket.memory_bytes.store(combined_size, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target = "mem_buffer",
+                            error = %e,
+                            bucket_batch_count = g.len(),
+                            "coalesce concat_batches failed; continuing without coalesce (bucket data intact)"
+                        );
+                    }
+                }
             }
         }
         // `row_count` and the min/max timestamps update OUTSIDE the bucket
