@@ -97,6 +97,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 // Fire-and-forget (spawns internally); clone since `added` is
                 // also returned for the sidecar tantivy indexer.
                 db.warm_cache_for_table(&project_id, &table_name, added.clone());
+                if !added.is_empty() {
+                    db.mark_delta_has_files(&project_id, &table_name);
+                }
                 Ok(added)
             })
         },
@@ -236,9 +239,17 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let pgwire_shutdown = tokio_util::sync::CancellationToken::new();
     let pg_task = tokio::spawn({
         let shutdown = pgwire_shutdown.clone();
+        let scan_metrics = Some(db.scan_metrics.clone());
         async move {
-            if let Err(e) =
-                timefusion::pgwire_handlers::serve_with_listener(listener, Arc::new(session_context), &pg_opts, auth_config, shutdown.cancelled_owned()).await
+            if let Err(e) = timefusion::pgwire_handlers::serve_with_listener(
+                listener,
+                Arc::new(session_context),
+                &pg_opts,
+                auth_config,
+                scan_metrics,
+                shutdown.cancelled_owned(),
+            )
+            .await
             {
                 error!("PGWire server error: {}", e);
             }

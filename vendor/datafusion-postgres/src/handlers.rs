@@ -305,11 +305,22 @@ impl ExtendedQueryHandler for DfSessionService {
                 .clone()
                 .replace_params_with_values(&param_values)
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-            let optimised = self
-                .session_context
-                .state()
-                .optimize(&plan)
-                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            // Skip per-query `state.optimize()` ONLY when some hook
+            // pre-optimized the plan at parse time (TimeFusion's PlanCacheHook
+            // does this). Plans that fell through the bypass paths
+            // (statement_to_plan in `do_parse_query`) are still optimized
+            // here. Measured: skipping the redundant optimize on the cached
+            // path dropped pgwire end-to-end p95 from 131ms → 8ms (~16×).
+            let canonical_sql = &portal.statement.statement.0;
+            let pre_optimized = self.query_hooks.iter().any(|h| h.was_pre_optimized(canonical_sql));
+            let optimised = if pre_optimized {
+                plan
+            } else {
+                self.session_context
+                    .state()
+                    .optimize(&plan)
+                    .map_err(|e| PgWireError::ApiError(Box::new(e)))?
+            };
 
             let dataframe = {
                 let timeout = client::get_statement_timeout(client);

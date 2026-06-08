@@ -58,7 +58,7 @@ mod connection_pressure {
 
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
-                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth_config, std::future::pending::<()>()) => {
+                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth_config, None, std::future::pending::<()>()) => {
                         if let Err(e) = res {
                             eprintln!("Server error: {:?}", e);
                         }

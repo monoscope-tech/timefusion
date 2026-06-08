@@ -32,6 +32,16 @@ jobs:
         with:
           components: rustfmt
       - run: cargo +nightly fmt --all --check
+      # Sentinel: fail the build if a future `cargo vendor` / manual resync
+      # silently reverts the vendored datafusion-postgres patches that
+      # power the per-query optimize skip. See PATCHES.md for the recipe.
+      - name: vendor patches still applied
+        run: |
+          set -euo pipefail
+          grep -q 'was_pre_optimized' vendor/datafusion-postgres/src/hooks/mod.rs \
+            || { echo "vendored hooks/mod.rs lost was_pre_optimized — see vendor/datafusion-postgres/PATCHES.md"; exit 1; }
+          grep -q 'was_pre_optimized' vendor/datafusion-postgres/src/handlers.rs \
+            || { echo "vendored handlers.rs lost the optimize-skip patch — see vendor/datafusion-postgres/PATCHES.md"; exit 1; }
 
   # Combined clippy + test. `cargo clippy` implies `cargo check`, and both
   # share ~all artifacts with `cargo test` — running them in one job lets
@@ -97,3 +107,4 @@ jobs:
 
       - name: Test
         run: cargo test --all-features --locked
+

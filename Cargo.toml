@@ -118,6 +118,13 @@ test-case = "3.3"
 criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# E2E harness: dynamic MinIO per test, snapshot assertions, proptest.
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["minio"] }
+tokio-test = "0.4"
+tracing-test = "0.2"
+insta = { version = "1", features = ["yaml"] }
+proptest = "1"
 
 [[bench]]
 name = "core_benchmarks"
@@ -144,6 +151,17 @@ test = []
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
+
+# Fast-iteration release profile: ~3x faster builds vs `release` (thin-LTO,
+# parallel codegen, no debuginfo, no strip). Marginal runtime cost. Use for
+# perf-iteration cycles, not for shipping binaries.
+#   cargo build --profile release-iter
+[profile.release-iter]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+debug = 0
+strip = "none"
 
 # Local patch: arrow-pg 0.13.0's UUID parameter decoder calls
 # `portal.parameter::<String>`, which pgwire rejects for the UUID OID and
