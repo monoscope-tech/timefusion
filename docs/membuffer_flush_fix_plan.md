@@ -137,6 +137,12 @@ Most prod traffic is batched client-side, so 50 conns is closer to real than 300
 
 **The 300-writer scenario is a stress test, not a production target.** Writer contention dominates above ~150 concurrent INSERT-issuing connections — each INSERT carries a fresh parse + (now cached) plan-build chain that, while individually cheap, multiplies under high writer concurrency and starves readers on shared tokio worker threads. The realistic envelope (≤100 mixed conns at 15 k r/s ingest) clears the < 100 ms p95 goal comfortably.
 
+### Harness-side bottleneck at extreme load
+
+At 100 writers + 75 readers, the harness reports p95 = 1200 ms but `timefusion_stats.pgwire.lat_p95_us_approx` shows the server is at **32 ms**. The 1170 ms gap is in the harness itself: 175 Python threads contending for the GIL plus 175 sockets exchanging messages under psycopg's libpq-based synchronous client. This is a measurement artifact of the test harness, not a production behavior of the database — a real client using a non-GIL runtime (Go, Rust, Java) or a properly multi-process Python deployment would see the server-side numbers, not the harness numbers.
+
+**For accurate prod-projection latency under high concurrency, use `timefusion_stats.pgwire.lat_p95_us_approx` directly** — it measures the server-side end-to-end and is unaffected by client-side bottlenecks.
+
 **How the fast-resolve fix worked:** dev-build instrumentation showed `slow delta scan: total=N resolve=N lock=0ms scan_build=4ms` — `resolve_table` was 99% of per-query Delta-side latency. Three tokio RwLock `.await`s per call (unified_tables map, last_written_versions map, inner table.version()) plus `should_refresh_table` returning true on the common `(Some(_), None)` state and firing `update_state` per query for un-flushed projects. Added a `DashMap` lock-free shortcut on Database, populated on first slow-path success. Hot path becomes `DashMap.get → Arc clone`, zero awaits.
 
 **Failure mode > 200 writers:** ~10 % of reads hit a periodic stall (p99 jumps to 900 ms+ while p50 stays under 30 ms). Diagnosed contributors:
