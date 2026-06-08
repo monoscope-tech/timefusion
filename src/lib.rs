@@ -2,6 +2,7 @@
 
 pub mod autotune;
 pub mod batch_queue;
+pub mod bootstrap;
 pub mod buffered_write_layer;
 pub mod clock;
 pub mod config;

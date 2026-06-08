@@ -1,7 +1,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -124,6 +124,11 @@ pub struct StatsSnapshot {
     /// `now - min(bucket.min_timestamp)`). None when MemBuffer is empty.
     /// Alerting target: alert at > 2× `flush_interval_secs`.
     pub oldest_bucket_age_secs: Option<u64>,
+    /// Cumulative flush successes/failures since process start. Mirrors the
+    /// OTel `timefusion.flush.completed`/`failed` counters so tests can
+    /// assert without configuring OTel.
+    pub flush_completed_total:  u64,
+    pub flush_failed_total:     u64,
 }
 
 #[derive(Debug, Default)]
@@ -180,6 +185,18 @@ pub struct BufferedWriteLayer {
     flush_lock:             Mutex<()>,
     reserved_bytes:         AtomicUsize, // Memory reserved for in-flight writes
     pressure_notify:        Arc<Notify>, // Wakes flush task when pressure threshold crossed
+    /// Notified at the end of every flush task iteration (success or failure).
+    /// Test hook: lets E2E harnesses await actual completion of background work
+    /// instead of racing wall-clock sleeps.
+    flush_tick_notify:      Arc<Notify>,
+    /// Notified at the end of every eviction task iteration.
+    eviction_tick_notify:   Arc<Notify>,
+    /// Cumulative flush counters mirrored alongside OTel `record_flush`.
+    /// OTel global metric state is opt-in (only initialized when telemetry is
+    /// configured), so these atomics give the harness an in-process way to
+    /// assert on what the global counters would be.
+    flush_completed_total:  AtomicU64,
+    flush_failed_total:     AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
     function_registry:      Arc<crate::functions::FnRegistry>,
 }
@@ -220,6 +237,10 @@ impl BufferedWriteLayer {
             flush_lock: Mutex::new(()),
             reserved_bytes: AtomicUsize::new(0),
             pressure_notify: Arc::new(Notify::new()),
+            flush_tick_notify: Arc::new(Notify::new()),
+            eviction_tick_notify: Arc::new(Notify::new()),
+            flush_completed_total: AtomicU64::new(0),
+            flush_failed_total: AtomicU64::new(0),
             function_registry,
         })
     }
@@ -577,6 +598,7 @@ impl BufferedWriteLayer {
 
             if let Err(e) = self.flush_completed_buckets().await {
                 crate::metrics::record_flush(false);
+                self.flush_failed_total.fetch_add(1, Ordering::Relaxed);
                 error!("Flush task error: {}", e);
             }
             // WAL monitoring: check file accumulation
@@ -591,6 +613,10 @@ impl BufferedWriteLayer {
                     error!("Emergency WAL flush failed: {}", e);
                 }
             }
+            // Test-hook signal: every iteration end (success or failure).
+            // `notify_waiters` wakes all currently parked awaiters; if no
+            // test is watching, the call is essentially free.
+            self.flush_tick_notify.notify_waiters();
         }
     }
 
@@ -614,6 +640,7 @@ impl BufferedWriteLayer {
                         error!("Eviction-task flush failed: {}", e);
                     }
                     self.evict_drained_metadata();
+                    self.eviction_tick_notify.notify_waiters();
                 }
                 _ = self.shutdown.cancelled() => {
                     info!("Eviction task shutting down");
@@ -657,6 +684,7 @@ impl BufferedWriteLayer {
                     self.checkpoint_and_drain(&bucket);
                     any_ok = true;
                     crate::metrics::record_flush(true);
+                    self.flush_completed_total.fetch_add(1, Ordering::Relaxed);
                     debug!(
                         "Flushed bucket: project={}, table={}, bucket_id={}, rows={}",
                         bucket.project_id, bucket.table_name, bucket.bucket_id, bucket.row_count
@@ -664,6 +692,7 @@ impl BufferedWriteLayer {
                 }
                 Err(e) => {
                     crate::metrics::record_flush(false);
+                    self.flush_failed_total.fetch_add(1, Ordering::Relaxed);
                     error!(
                         "Failed to flush bucket: project={}, table={}, bucket_id={}: {}",
                         bucket.project_id, bucket.table_name, bucket.bucket_id, e
@@ -890,6 +919,44 @@ impl BufferedWriteLayer {
         self.mem_buffer.get_stats().total_rows == 0
     }
 
+    /// Test hook: synchronously run one eviction-task iteration
+    /// (drain-then-evict-metadata). Production code should not call this —
+    /// the eviction task is already spawned by `start_background_tasks`.
+    pub async fn force_evict_now(&self) -> anyhow::Result<()> {
+        self.flush_completed_buckets().await?;
+        self.evict_drained_metadata();
+        self.eviction_tick_notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Test hook: returns a `Notify` that is pinged at the end of every
+    /// flush-task iteration. Call `notified()` BEFORE the action that should
+    /// trigger a flush (otherwise the notification is missed).
+    pub fn flush_tick_notify(&self) -> Arc<Notify> {
+        self.flush_tick_notify.clone()
+    }
+
+    /// Test hook: returns a `Notify` pinged at end of every eviction-task
+    /// iteration. Same caveat as `flush_tick_notify`.
+    pub fn eviction_tick_notify(&self) -> Arc<Notify> {
+        self.eviction_tick_notify.clone()
+    }
+
+    /// Test hook: simulates a crash by cancelling background tasks WITHOUT
+    /// the final-flush graceful shutdown. Used by the e2e restart harness
+    /// to test WAL replay — `shutdown()` would flush pending rows to Delta
+    /// and checkpoint the WAL, which is not what a real crash does.
+    pub async fn crash_for_test(&self) {
+        self.shutdown.cancel();
+        let handles: Vec<JoinHandle<()>> = {
+            let mut guard = self.background_tasks.lock().await;
+            std::mem::take(&mut *guard)
+        };
+        for handle in handles {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        }
+    }
+
     /// Direct accessor for the underlying `MemBuffer`. Used by the SQL
     /// routing layer to call `search_text_match` (the in-memory tantivy
     /// prefilter for buckets that haven't flushed yet).
@@ -927,6 +994,8 @@ impl BufferedWriteLayer {
             wal_known_topics: self.wal.known_topic_count(),
             bucket_duration_micros: crate::mem_buffer::bucket_duration_micros(),
             oldest_bucket_age_secs,
+            flush_completed_total: self.flush_completed_total.load(Ordering::Relaxed),
+            flush_failed_total: self.flush_failed_total.load(Ordering::Relaxed),
         }
     }
 

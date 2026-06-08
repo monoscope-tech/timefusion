@@ -141,6 +141,15 @@ harness = false
 [features]
 default = []
 test = []
+# Gates the dynamic-MinIO E2E suite. Off by default so the heavy
+# testcontainers path doesn't run in the main `cargo test` job — the
+# dedicated `e2e` CI job opts in via `--features e2e`.
+e2e = []
+
+[[test]]
+name = "e2e"
+path = "tests/e2e/main.rs"
+required-features = ["e2e"]
 
 # Release builds prioritize binary size + runtime speed over compile time.
 # fat LTO + single codegen-unit lets the optimizer inline across crates;

@@ -108,3 +108,30 @@ jobs:
       - name: Test
         run: cargo test --all-features --locked
 
+  # E2E suite: full pgwire → BufferedWriteLayer → WAL → Delta path against a
+  # per-test MinIO via testcontainers. Runs in its own job so failures are
+  # attributable and the suite can be made a required check independently.
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: e2e
+      - name: E2E
+        # --test-threads=1: walrus-rust reads WALRUS_DATA_DIR from process
+        # env, so per-test WAL isolation requires serialization.
+        run: cargo test --test e2e --features e2e --locked -- --test-threads=1 --nocapture
+
