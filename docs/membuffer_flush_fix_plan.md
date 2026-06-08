@@ -124,6 +124,18 @@ The DataFusion plan cache helps for the logical plan template but the *physical*
 | `bf44249` + `fa1dee9` | Scan + pgwire metrics in `timefusion_stats` | observability |
 | `5056454` | DashMap plan cache replaces Mutex<LruCache> | -30 % |
 | `cfadce9` | Pre-optimize at miss-time, skip per-query optimize | -50 % (server pgwire 131 ms → 8 ms) |
+| `e630d9e` | Cache Delta TableProvider per (project, table, version) | not yet validated under heavy mem+delta load — flush-task interference dominates first |
+
+## Realistic-load envelope (50 conns mix)
+
+Most prod traffic is batched client-side, so 50 conns is closer to real than 300:
+
+| writers | readers | writer-rate | ingest | p50 read | p95 read | p99 read |
+|---|---|---|---|---|---|---|
+| 5 | 75 | 1 | 25 r/s | 6–11 ms | 22–47 ms | 77–107 ms |
+| **50** | **75** | **10** | **15 000 r/s** | **8–14 ms** | **49–70 ms** | **141–155 ms** |
+
+**The 300-writer scenario is a stress test, not a production target.** Writer contention dominates above ~150 concurrent INSERT-issuing connections — each INSERT carries a fresh parse + (now cached) plan-build chain that, while individually cheap, multiplies under high writer concurrency and starves readers on shared tokio worker threads. The realistic envelope (≤100 mixed conns at 15 k r/s ingest) clears the < 100 ms p95 goal comfortably.
 
 **How the fast-resolve fix worked:** dev-build instrumentation showed `slow delta scan: total=N resolve=N lock=0ms scan_build=4ms` — `resolve_table` was 99% of per-query Delta-side latency. Three tokio RwLock `.await`s per call (unified_tables map, last_written_versions map, inner table.version()) plus `should_refresh_table` returning true on the common `(Some(_), None)` state and firing `update_state` per query for un-flushed projects. Added a `DashMap` lock-free shortcut on Database, populated on first slow-path success. Hot path becomes `DashMap.get → Arc clone`, zero awaits.
 
