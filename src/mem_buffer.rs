@@ -1362,15 +1362,30 @@ impl MemBuffer {
 
         // Hash the source side once via Arrow's RowConverter so target rows can
         // probe the lookup with byte-identical key encoding.
+        //
+        // RowConverter requires matching data types across both sides. Target
+        // and source key columns can differ (e.g. target stores `Utf8View`
+        // while a VALUES-derived source produces `Utf8`), so cast source key
+        // cols to the target key col types before hashing. Target columns
+        // are used as-is.
         let src_key_cols: Vec<ArrayRef> = source
             .join_keys
             .iter()
-            .map(|(_, src_col_name)| {
-                source
+            .map(|(tgt_col_name, src_col_name)| {
+                let raw = source
                     .batch
                     .column_by_name(src_col_name)
-                    .cloned()
-                    .ok_or_else(|| datafusion::error::DataFusionError::Plan(format!("Source column '{}' not found in source batch", src_col_name)))
+                    .ok_or_else(|| datafusion::error::DataFusionError::Plan(format!("Source column '{}' not found in source batch", src_col_name)))?;
+                let target_ty = target_schema
+                    .field_with_name(tgt_col_name)
+                    .map_err(|_| datafusion::error::DataFusionError::Plan(format!("Target column '{}' not found", tgt_col_name)))?
+                    .data_type()
+                    .clone();
+                if raw.data_type() == &target_ty {
+                    Ok(raw.clone())
+                } else {
+                    arrow::compute::cast(raw.as_ref(), &target_ty).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+                }
             })
             .collect::<DFResult<Vec<_>>>()?;
         let sort_fields: Vec<SortField> = src_key_cols.iter().map(|c| SortField::new(c.data_type().clone())).collect();

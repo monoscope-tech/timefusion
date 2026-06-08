@@ -212,13 +212,23 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                         join.join_type
                     )));
                 }
-                if join.filter.is_some() {
-                    return Err(DataFusionError::NotImplemented(
-                        "UPDATE ... FROM with non-equi join filter is not supported (use equality only)".to_string(),
-                    ));
-                }
-
                 let (target_side, source_side, keys) = identify_target_side(join, table_name)?;
+                // DataFusion stores cross-side conditions (e.g. user wrote
+                // `NOT (o.hashes @> ARRAY[u.tag])`) in `join.filter` rather
+                // than the surrounding `Filter`. Pull it into the predicate
+                // path so the Delta MergeBuilder AND-s it into the join key
+                // expression, and the MemBuffer hash-join evaluates it
+                // against the widened batch.
+                if let Some(jf) = &join.filter {
+                    predicate = Some(match predicate.take() {
+                        None => jf.clone(),
+                        Some(existing) => Expr::BinaryExpr(BinaryExpr {
+                            left:  Box::new(existing),
+                            op:    Operator::And,
+                            right: Box::new(jf.clone()),
+                        }),
+                    });
+                }
                 source_plan = Some(UpdateSourcePlan {
                     plan:      source_side.clone(),
                     join_keys: keys,
@@ -873,28 +883,44 @@ fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
         .map_err(|e| DataFusionError::Execution(format!("Failed to convert expression: {}", e)))
 }
 
-/// Re-qualify bare column references in `expr` under the given alias.
-/// Used to turn the user's predicate (which addresses the target table by its
-/// real name) into a predicate that references the `target` alias used by
-/// [`deltalake::operations::merge::MergeBuilder`].
-fn requalify_columns(expr: &Expr, alias: &str) -> Result<Expr> {
+/// Rewrite column references in `expr` so they address `MergeBuilder`'s
+/// `source` / `target` aliases instead of whatever aliases the user wrote
+/// in the SQL (e.g. `UPDATE otel_logs_and_spans o ... FROM (...) AS u`).
+///
+/// Rule:
+/// - Cols already qualified `source.x` or `target.x` pass through unchanged.
+/// - Cols with any other qualifier (or no qualifier) whose name appears in
+///   the source schema are rewritten to `source.x`.
+/// - All other cols become bare `x`, leaving `MergeBuilder` to resolve them
+///   against the target (target columns are unambiguous since source columns
+///   were already routed above).
+fn requalify_for_merge(expr: Expr, source_cols: &std::collections::HashSet<String>, source_alias: &str, target_alias: &str) -> Result<Expr> {
     use datafusion::common::tree_node::{Transformed, TreeNode};
-    expr.clone()
-        .transform(|e| match &e {
-            Expr::Column(c) => {
-                let new_col = Column::new(Some(alias.to_string()), c.name.clone());
-                Ok(Transformed::yes(Expr::Column(new_col)))
+    expr.transform(|e| match &e {
+        Expr::Column(c) => match c.relation.as_ref() {
+            Some(r) if r.table() == source_alias => Ok(Transformed::no(e)),
+            Some(r) if r.table() == target_alias => Ok(Transformed::no(e)),
+            _ => {
+                if source_cols.contains(&c.name) {
+                    Ok(Transformed::yes(Expr::Column(Column::new(Some(source_alias.to_string()), c.name.clone()))))
+                } else {
+                    Ok(Transformed::yes(Expr::Column(Column::from_name(c.name.clone()))))
+                }
             }
-            _ => Ok(Transformed::no(e)),
-        })
-        .map(|t| t.data)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to requalify columns: {}", e)))
+        },
+        _ => Ok(Transformed::no(e)),
+    })
+    .map(|t| t.data)
+    .map_err(|e| DataFusionError::Execution(format!("Failed to requalify for merge: {}", e)))
 }
 
 /// Build the join predicate that drives the merge: a conjunction of
 /// `target.k_i = source.k_i` clauses for each equi-key pair, AND-ed with the
-/// optional user predicate (which gets re-qualified under `target_alias`).
-fn build_join_predicate(target_alias: &str, source_alias: &str, join_keys: &[(String, String)], extra: Option<&Expr>) -> Result<Expr> {
+/// optional user predicate (which gets routed through [`requalify_for_merge`]
+/// so the user's source/target aliases resolve under `MergeBuilder`'s).
+fn build_join_predicate(
+    target_alias: &str, source_alias: &str, join_keys: &[(String, String)], extra: Option<&Expr>, source_cols: &std::collections::HashSet<String>,
+) -> Result<Expr> {
     use datafusion::prelude::col;
     let mut key_iter = join_keys.iter().map(|(t, s)| {
         Expr::BinaryExpr(BinaryExpr {
@@ -914,7 +940,7 @@ fn build_join_predicate(target_alias: &str, source_alias: &str, join_keys: &[(St
         });
     }
     if let Some(p) = extra {
-        let p = requalify_columns(p, target_alias)?;
+        let p = requalify_for_merge(p.clone(), source_cols, source_alias, target_alias)?;
         acc = Expr::BinaryExpr(BinaryExpr {
             left:  Box::new(acc),
             op:    Operator::And,
@@ -924,50 +950,16 @@ fn build_join_predicate(target_alias: &str, source_alias: &str, join_keys: &[(St
     Ok(acc)
 }
 
-/// Re-qualify assignment value exprs so source-column references address the
-/// `source` alias the merge introduces. Promotes:
-/// - bare columns whose name exists in the source schema → `source.x`
-/// - columns qualified with any non-`target_alias` table reference whose name
-///   exists in source schema (e.g. the user's `u.d` from `FROM (...) AS u`)
-///   → `source.x`
-///
-/// Already-`source`-qualified columns and target-qualified columns pass
-/// through unchanged.
+/// Re-qualify assignment value exprs via [`requalify_for_merge`] so the
+/// user's source/target aliases address `MergeBuilder`'s `source` / `target`.
 fn requalify_assignments_for_merge(
     assignments: Vec<(String, Expr)>, source_schema: &SchemaRef, source_alias: &str, target_alias: &str,
 ) -> Result<Vec<(String, Expr)>> {
-    use datafusion::common::tree_node::{Transformed, TreeNode};
     let source_cols: std::collections::HashSet<String> = source_schema.fields().iter().map(|f| f.name().clone()).collect();
     assignments
         .into_iter()
         .map(|(col_name, expr)| {
-            let new_expr = expr
-                .transform(|e| match &e {
-                    Expr::Column(c) => {
-                        let in_source = source_cols.contains(&c.name);
-                        match c.relation.as_ref() {
-                            // Already addressing the source alias — leave alone.
-                            Some(r) if r.table() == source_alias => Ok(Transformed::no(e)),
-                            // Target-qualified — leave alone; delta-rs resolves it via the target alias.
-                            Some(r) if r.table() == target_alias => Ok(Transformed::no(e)),
-                            // Any other qualifier (the user's `FROM (...) AS u` alias) — if
-                            // the column exists in source, rewrite to `source.<name>`.
-                            Some(_) if in_source => {
-                                let new_col = Column::new(Some(source_alias.to_string()), c.name.clone());
-                                Ok(Transformed::yes(Expr::Column(new_col)))
-                            }
-                            // Bare column matching a source field → also `source.<name>`.
-                            None if in_source => {
-                                let new_col = Column::new(Some(source_alias.to_string()), c.name.clone());
-                                Ok(Transformed::yes(Expr::Column(new_col)))
-                            }
-                            _ => Ok(Transformed::no(e)),
-                        }
-                    }
-                    _ => Ok(Transformed::no(e)),
-                })
-                .map(|t| t.data)
-                .map_err(|e| DataFusionError::Execution(format!("Failed to requalify assignment for merge: {}", e)))?;
+            let new_expr = requalify_for_merge(expr, &source_cols, source_alias, target_alias)?;
             Ok((col_name, new_expr))
         })
         .collect()
@@ -1005,9 +997,11 @@ pub async fn perform_delta_merge_update(
     let source_schema = source.schema.clone();
     let source_batch = source.batch.clone();
     let join_keys = source.join_keys.clone();
+    let source_cols: std::collections::HashSet<String> = source_schema.fields().iter().map(|f| f.name().clone()).collect();
 
-    // Re-qualify assignments before moving into the closure so source-col refs
-    // address the `source` alias that MergeBuilder will introduce.
+    // Re-qualify assignments AND predicate before moving into the closure so
+    // the user's source/target aliases address `MergeBuilder`'s `source` /
+    // `target` aliases.
     let assignments = requalify_assignments_for_merge(assignments, &source_schema, "source", "target")?;
 
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| async move {
@@ -1019,7 +1013,7 @@ pub async fn perform_delta_merge_update(
             .read_batch(source_batch)
             .map_err(|e| DataFusionError::Execution(format!("Failed to wrap UPDATE FROM source as DataFrame: {}", e)))?;
 
-        let join_pred = build_join_predicate("target", "source", &join_keys, predicate.as_ref())?;
+        let join_pred = build_join_predicate("target", "source", &join_keys, predicate.as_ref(), &source_cols)?;
 
         let merge = delta_table
             .merge(source_df, join_pred)

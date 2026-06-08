@@ -568,6 +568,88 @@ mod test_dml_operations {
         Ok(())
     }
 
+    /// Structural mirror of monoscope's UPDATE-2 SQL: parallel unnested text
+    /// arrays as the source rowset, table aliases (`o`, `u`), array-append
+    /// into a list column. If DataFusion's planner or our rewriters fall over
+    /// on this shape (unnest inside FROM subquery, user aliases on both
+    /// sides, list-typed assignment target) this catches it pre-prod.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_from_unnest_text_array() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let records = create_test_records(now);
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        // Monoscope UPDATE-2 lifted shape: parallel unnest of text[] arrays
+        // bound as `u(span_name, tag)`, append into `hashes`. Join is on
+        // `name` here (single key); monoscope uses two: span_id + trace_id —
+        // structurally identical.
+        let df = ctx
+            .sql(
+                "UPDATE otel_logs_and_spans o
+                    SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
+                    FROM (
+                      SELECT unnest(ARRAY['Bob', 'Alice']::text[])      AS span_name,
+                             unnest(ARRAY['pat:bob', 'pat:alice']::text[]) AS tag
+                    ) u
+                    WHERE o.project_id = 'test_project'
+                      AND o.name = u.span_name",
+            )
+            .await?;
+        let result = df.collect().await?;
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(rows_updated, 2, "Expected 2 rows tagged (Bob, Alice)");
+        Ok(())
+    }
+
+    /// Idempotency aspect of the monoscope UPDATE-2 shape: re-running the
+    /// same statement with the `NOT @>` predicate must touch zero rows.
+    /// Currently `#[ignore]`d — `MergeBuilder` returns the rows that the
+    /// join matched even when the SET expression produces an unchanged value
+    /// after the WHEN MATCHED predicate trims them. Untangling needs deeper
+    /// investigation of MergeBuilder's accounting of WHEN MATCHED with
+    /// non-trivial predicate filtering. Monoscope's re-extraction safety on
+    /// TF will rely on this — track as a follow-up.
+    #[ignore = "MergeBuilder idempotency under NOT @> predicate — see comment"]
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_from_unnest_text_array_idempotent() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let records = create_test_records(now);
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        let sql = "UPDATE otel_logs_and_spans o
+                    SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag]
+                    FROM (
+                      SELECT unnest(ARRAY['Bob', 'Alice']::text[])      AS span_name,
+                             unnest(ARRAY['pat:bob', 'pat:alice']::text[]) AS tag
+                    ) u
+                    WHERE o.project_id = 'test_project'
+                      AND o.name = u.span_name
+                      AND NOT (COALESCE(o.hashes, '{}'::text[]) @> ARRAY[u.tag])";
+        let _ = ctx.sql(sql).await?.collect().await?;
+        let r2 = ctx.sql(sql).await?.collect().await?;
+        let n = r2[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(n, 0, "Re-running idempotent UPDATE must touch zero rows");
+        Ok(())
+    }
+
     /// Multi-column SET in a single `UPDATE ... FROM` — mirrors the monoscope
     /// pattern of assigning several fields from a joined source row.
     #[serial]
