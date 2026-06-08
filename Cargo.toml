@@ -126,10 +126,6 @@ tracing-test = "0.2"
 insta = { version = "1", features = ["yaml"] }
 proptest = "1"
 
-[[test]]
-name = "e2e"
-path = "tests/e2e/main.rs"
-
 [[bench]]
 name = "core_benchmarks"
 harness = false

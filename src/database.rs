@@ -556,6 +556,15 @@ pub struct Database {
     /// `.await`s in `resolve_unified_table` / `resolve_custom_table` that
     /// otherwise dominated the per-query latency under load (proven via
     /// `slow delta scan` instrumentation showing `resolve` was 99% of cost).
+    ///
+    /// **Growth**: this map has no eviction — size scales with the unique
+    /// `(project_id, table_name)` pairs seen since process start. For
+    /// unified tables every entry holds an `Arc::clone` of the same
+    /// `DeltaTable` (cheap, ~16 bytes), so 100 k tenants = a few MB. Custom
+    /// tables hold distinct objects so memory tracks the number of distinct
+    /// custom configs. Operators with churn far above expected tenant
+    /// counts should add a periodic sweeper; for the current target
+    /// (thousands of tenants) the leakage is well under noise.
     fast_resolve_cache:              dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
     /// Per-(project,table) sticky bit: "Delta may hold matching files."
     /// Two seed paths so the bit is always at least as conservative as truth
@@ -1523,10 +1532,15 @@ impl Database {
         self.fast_resolve_cache.get(&(project_id.to_string(), table_name.to_string())).map(|r| Arc::clone(r.value()))
     }
 
-    /// Has this Delta table ever held a file (i.e. has any flush completed)?
-    /// `None` means "we've never resolved this table yet" — caller should not
-    /// assume empty in that case; fall back to the full scan path.
-    pub fn delta_known_empty(&self, project_id: &str, table_name: &str) -> bool {
+    /// `true` iff we've previously resolved this Delta table AND it had no
+    /// files at that observation (or has remained empty since — the
+    /// `delta_has_files` bit is sticky-true, never sticky-false). Returns
+    /// `false` for "we don't know yet" (table never resolved), so callers
+    /// fall through to the full scan path — never falsely skip Delta.
+    /// Internally the stored bit is "delta_has_files" (matches the flush
+    /// callback's mental model: we know what we wrote); this method flips
+    /// to the predicate the scan path actually wants ("can we skip Delta?").
+    pub fn delta_is_known_empty(&self, project_id: &str, table_name: &str) -> bool {
         self.delta_has_files
             .get(&(project_id.to_string(), table_name.to_string()))
             .map(|f| !f.load(std::sync::atomic::Ordering::Relaxed))
@@ -3353,9 +3367,21 @@ impl ProjectRoutingTable {
         // chain.
         let current_version = table.version().unwrap_or(0);
         // Resolve or install a OnceCell for this (key, version). DashMap
-        // shard-write lock is held only across the cheap entry-insert; the
+        // shard-write lock is held only across the cheap entry-insert + an
+        // optional in-place tuple replacement on version mismatch; the
         // expensive provider build runs OUTSIDE the lock, while concurrent
         // tasks all clone the same cell Arc and await its single init.
+        //
+        // The `entry.0 != current_version` branch serialises the readers of
+        // the *same* (project, table) when a new snapshot lands: each
+        // thread grabs the per-shard write lock just long enough to replace
+        // the stale cell with a fresh one. At our flush cadence (seconds
+        // apart per project, single-digit-per-second under heavy load) the
+        // serialisation window is microseconds — meaningful only if a
+        // version-change burst races with hundreds of concurrent readers,
+        // which doesn't happen in our workload. If that pattern ever
+        // emerges, prefer a CAS on an `Arc<AtomicU64>` version cell read
+        // outside the DashMap lock.
         let cell = {
             let mut entry = self
                 .database
@@ -3821,7 +3847,7 @@ impl TableProvider for ProjectRoutingTable {
         // scan-plan-build cost. Flipped by the flush callback after a
         // successful commit; never flipped back (compaction reduces files but
         // doesn't go to zero in steady state).
-        let skip_delta = skip_delta || self.database.delta_known_empty(&project_id, &self.table_name);
+        let skip_delta = skip_delta || self.database.delta_is_known_empty(&project_id, &self.table_name);
         tag_shape(&|s| s.skipped_delta = skip_delta);
 
         // MemBuffer query. `query_partitioned_with_text_match` handles its

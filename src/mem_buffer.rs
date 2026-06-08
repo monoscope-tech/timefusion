@@ -1371,6 +1371,17 @@ impl TableBuffer {
                 bucket.memory_bytes.store(combined_size, Ordering::Relaxed);
             }
         }
+        // `row_count` and the min/max timestamps update OUTSIDE the bucket
+        // lock. This is intentional: a concurrent reader that snapshots the
+        // batches Vec between the lock release and these atomic stores will
+        // momentarily see the new batch's rows in the query result while
+        // `row_count` reports the pre-insert total. Stats / observability
+        // counters can briefly lag the actual data, but query correctness is
+        // unaffected — readers always see the authoritative `batches` vec
+        // contents under the lock. Keeping the atomic updates outside the
+        // lock holds the critical section to just the Vec push (and the
+        // amortised coalesce) so writer throughput isn't capped by atomic
+        // ordering on uncontended buckets.
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
         bucket.update_timestamps(timestamp_micros);
 

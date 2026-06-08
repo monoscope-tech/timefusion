@@ -121,6 +121,14 @@ impl PlanCacheHook {
 
 #[async_trait]
 impl QueryHook for PlanCacheHook {
+    /// Deliberately a no-op for simple queries. The cache only fires on the
+    /// extended-query path (parameterised SQL with `$N` placeholders); ad-hoc
+    /// `psql` simple queries get one-shot literals so caching them by
+    /// canonical text would never produce a hit. The vendored
+    /// datafusion-postgres `SimpleQueryHandler::do_query` still runs
+    /// `state.optimize()` per call because `was_pre_optimized` returns false
+    /// for canonical SQL not present in our cache — see
+    /// `vendor/datafusion-postgres/PATCHES.md`.
     async fn handle_simple_query(
         &self, _statement: &Statement, _session_context: &SessionContext, _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
@@ -184,6 +192,13 @@ impl QueryHook for PlanCacheHook {
                 // DashMap iterates per-shard so this is roughly random by
                 // hash distribution. Cheaper than an LRU clock and adequate
                 // when the steady-state working set fits well under capacity.
+                // Caveat: `retain` takes a write-lock on each shard in turn.
+                // Under a pathological burst of distinct queries that
+                // crosses the cap (~256 unique templates) this briefly
+                // stalls every concurrent reader on the same shards. For
+                // the OLAP workload measured here (~5 unique templates)
+                // this branch never fires; if it ever does in prod, swap
+                // for a try-lock-and-skip pattern.
                 fastrand::usize(..self.capacity) >= target
             });
         }
