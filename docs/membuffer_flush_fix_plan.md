@@ -115,6 +115,29 @@ Current breaking points: 300 w + 100 r is right at the boundary (p95 = 100–110
 
 The DataFusion plan cache helps for the logical plan template but the *physical* plan is rebuilt per-call. Caching at the physical layer is a bigger lift but is the next ~10× available on this path.
 
+## Deferred follow-ups
+
+These are known shortcomings of the perf series that the team has decided NOT to land in this PR. Each carries enough context to action when prioritised — track as GitHub issues if you want them to appear on the board.
+
+### TTL / capacity sweep on `fast_resolve_cache` + `delta_has_files` + `delta_provider_cache`
+
+All three maps are documented as having no eviction. Steady-state size scales with the lifetime-unique `(project_id, table_name)` pairs the process has seen, not the live set. The `CACHE_SOFT_LIMIT_WARN = 10_000` is a log alert, not a cap; nothing prevents these from growing without bound under a tenant create/drop churn pattern (common in test infrastructure, less so in prod).
+
+Action when needed:
+
+1. Add a periodic sweep on the maintenance scheduler — say once per `TIMEFUSION_BUFFER_RETENTION_MINS` window — that walks each cache and drops entries whose backing `Arc<RwLock<DeltaTable>>` is gone from `unified_tables` / `custom_project_tables`. The Arc weak-ref pattern keeps the sweep race-free.
+2. Optionally add an LRU-style touched-timestamp on each entry and a max-age TTL so even non-dropped tables that go cold for hours expire.
+
+Soft-limit warnings already surface in logs (`target = "table_caches"`); operators can use those to time the rollout.
+
+### `was_pre_optimized` evicted-plan re-optimize cost
+
+After a TOCTOU eviction of the plan-cache memo, the do_query path will run `state.optimize()` on an already-optimized plan. Optimization is idempotent — the rules detect inapplicability and short-circuit — so this is a few-hundred-microsecond no-op per affected query. Not a correctness issue. If profiling ever shows this as visible tail cost under churn, the fix is to keep a separate `pre_optimized: DashSet<String>` that survives the LRU sweep.
+
+### `try_fast_resolve` String allocations
+
+`self.fast_resolve_cache.get(&(project_id.to_string(), table_name.to_string()))` allocates two Strings per call. ~70 ns/call on the hot path; absorbed by the 12 µs (release-iter) p50 query budget. The proper DashMap-with-borrowed-key fix needs a wrapper key type plus an `Equivalent` impl, disproportionate vs the cost. Land when DashMap upstream stabilises a borrowed-tuple-key story.
+
 ## Per-session optimization log (chronological)
 
 | Commit | Change | Δ p95 vs prior |

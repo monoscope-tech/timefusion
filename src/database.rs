@@ -1594,15 +1594,22 @@ impl Database {
         self.fast_resolve_cache.get(&(project_id.to_string(), table_name.to_string())).map(|r| Arc::clone(r.value()))
     }
 
-    /// `true` iff we've previously resolved this Delta table AND it had no
-    /// files at that observation (or has remained empty since — the
-    /// `delta_has_files` bit is sticky-true, never sticky-false). Returns
-    /// `false` for "we don't know yet" (table never resolved), so callers
-    /// fall through to the full scan path — never falsely skip Delta.
-    /// Internally the stored bit is "delta_has_files" (matches the flush
-    /// callback's mental model: we know what we wrote); this method flips
-    /// to the predicate the scan path actually wants ("can we skip Delta?").
-    pub fn delta_is_known_empty(&self, project_id: &str, table_name: &str) -> bool {
+    /// `true` iff the scan path is allowed to skip the Delta side entirely
+    /// for `(project, table)` — i.e., we've previously resolved this table
+    /// AND have positive evidence it had no files at that observation (or
+    /// has remained empty since — the `delta_has_files` bit is sticky-true,
+    /// never sticky-false). Returns `false` for "we don't know yet" (table
+    /// never resolved), so callers fall through to the full scan path and
+    /// never falsely skip Delta.
+    ///
+    /// Reads as the predicate the scan path actually wants at the call
+    /// site (`if delta_scan_can_be_skipped { ... }`), without the
+    /// double-negative the prior `delta_is_known_empty` name imposed.
+    /// Internally the stored bit is the positive `delta_has_files`
+    /// (matches the flush callback's mental model — "we know what we
+    /// wrote"); this method flips polarity exactly once, here, so call
+    /// sites stay readable.
+    pub fn delta_scan_can_be_skipped(&self, project_id: &str, table_name: &str) -> bool {
         self.delta_has_files
             .get(&(project_id.to_string(), table_name.to_string()))
             // Acquire-load pairs with the Release-store in mark_delta_has_files
@@ -1710,7 +1717,7 @@ impl Database {
         let has_files = t.read().await.version().map(|v| v > 0).unwrap_or(false);
         let entry = self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         if has_files {
-            // Release pairs with the Acquire load in delta_is_known_empty
+            // Release pairs with the Acquire load in delta_scan_can_be_skipped
             // (see comment there). Same rationale.
             entry.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -4017,7 +4024,7 @@ impl TableProvider for ProjectRoutingTable {
         // scan-plan-build cost. Flipped by the flush callback after a
         // successful commit; never flipped back (compaction reduces files but
         // doesn't go to zero in steady state).
-        let skip_delta = skip_delta || self.database.delta_is_known_empty(&project_id, &self.table_name);
+        let skip_delta = skip_delta || self.database.delta_scan_can_be_skipped(&project_id, &self.table_name);
         tag_shape(&|s| s.skipped_delta = skip_delta);
 
         // MemBuffer query. `query_partitioned_with_text_match` handles its
@@ -4490,7 +4497,7 @@ mod tests {
     }
 
     /// Anchors the Delta-empty short-circuit correctness invariant:
-    /// `delta_is_known_empty` must return `false` (the conservative default
+    /// `delta_scan_can_be_skipped` must return `false` (the conservative default
     /// that runs the full scan) until `mark_delta_has_files` is called, and
     /// the flip is monotonic and per-(project,table). This is the load-
     /// bearing predicate for the 45% latency win — a regression that
@@ -4505,24 +4512,27 @@ mod tests {
 
         // Fresh (project, table): unknown → false (must NOT skip Delta).
         assert!(
-            !db.delta_is_known_empty(&p1, t),
+            !db.delta_scan_can_be_skipped(&p1, t),
             "unknown projects must default to false so callers don't skip Delta"
         );
-        assert!(!db.delta_is_known_empty(&p2, t), "second unknown project also defaults to false");
+        assert!(!db.delta_scan_can_be_skipped(&p2, t), "second unknown project also defaults to false");
 
-        // Mark p1 as having files. delta_is_known_empty for p1 stays false
+        // Mark p1 as having files. delta_scan_can_be_skipped for p1 stays false
         // because the table is no longer empty — short-circuit must NOT
         // fire (otherwise we'd hide the just-flushed data).
         db.mark_delta_has_files(&p1, t);
-        assert!(!db.delta_is_known_empty(&p1, t), "after mark_delta_has_files, table has files → can't skip");
+        assert!(
+            !db.delta_scan_can_be_skipped(&p1, t),
+            "after mark_delta_has_files, table has files → can't skip"
+        );
 
         // Unrelated project: bit per-(project, table), so p2 unaffected.
         // Still false (unknown), still must scan.
-        assert!(!db.delta_is_known_empty(&p2, t), "marking p1 must not affect p2's bit");
+        assert!(!db.delta_scan_can_be_skipped(&p2, t), "marking p1 must not affect p2's bit");
 
         // Re-marking is idempotent.
         db.mark_delta_has_files(&p1, t);
-        assert!(!db.delta_is_known_empty(&p1, t), "re-mark is idempotent — still has files");
+        assert!(!db.delta_scan_can_be_skipped(&p1, t), "re-mark is idempotent — still has files");
 
         // Sticky-true invariant: the populate path inside resolve_table
         // (and helpers) must NEVER downgrade an already-set true to false,
@@ -4536,7 +4546,7 @@ mod tests {
         // doesn't yet have a Delta-empty table to test that branch, but the
         // populate_resolve_caches docstring documents the property and the
         // implementation only ever calls store(true).)
-        assert!(!db.delta_is_known_empty(&p1, t), "sticky-true: bit stays set across subsequent resolves");
+        assert!(!db.delta_scan_can_be_skipped(&p1, t), "sticky-true: bit stays set across subsequent resolves");
         Ok(())
     }
 
@@ -4563,7 +4573,7 @@ mod tests {
 
         // Simulate the flush callback marking files-present for this project.
         db.mark_delta_has_files(&project_id, table);
-        assert!(!db.delta_is_known_empty(&project_id, table), "post-mark: bit is true → not known empty");
+        assert!(!db.delta_scan_can_be_skipped(&project_id, table), "post-mark: bit is true → not known empty");
 
         // Force a resolve of the unified table. The fresh handle reports
         // version() == 0 because nothing has been written. Pre-fix this
@@ -4571,7 +4581,7 @@ mod tests {
         // invariant holds.
         let _t = db.resolve_table(&project_id, table).await?;
         assert!(
-            !db.delta_is_known_empty(&project_id, table),
+            !db.delta_scan_can_be_skipped(&project_id, table),
             "STICKY-TRUE: resolve_table observing version==0 must NOT downgrade a previously-marked bit. \
              A regression here means post-flush rows get hidden from queries."
         );
@@ -4580,7 +4590,7 @@ mod tests {
         // → fast_resolve_cache hit) — same invariant must hold.
         let _ = db.try_fast_resolve(&project_id, table);
         assert!(
-            !db.delta_is_known_empty(&project_id, table),
+            !db.delta_scan_can_be_skipped(&project_id, table),
             "STICKY-TRUE preserved across try_fast_resolve too"
         );
 
