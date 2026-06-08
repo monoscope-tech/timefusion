@@ -18,7 +18,10 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::{
     config::AppConfig,
     mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp},
-    wal::{WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_record_batch_public, deserialize_update_payload, deserialize_update_with_source_payload},
+    wal::{
+        WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_record_batch_public, deserialize_update_payload,
+        deserialize_update_with_source_payload,
+    },
 };
 
 // Reservation-side scale factor applied to `estimate_batch_size()` to
@@ -1218,8 +1221,11 @@ mod tests {
     /// full hash-join + widened-batch eval path.
     fn build_update_source_for_id_rewrite(rows: &[(&str, &str)]) -> (crate::dml::UpdateSource, Vec<(String, datafusion::logical_expr::Expr)>) {
         use std::sync::Arc;
-        use arrow::array::{ArrayRef, StringArray};
-        use arrow::datatypes::{DataType, Field, Schema};
+
+        use arrow::{
+            array::{ArrayRef, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
         use datafusion::prelude::col;
 
         let lookup_names: ArrayRef = Arc::new(StringArray::from(rows.iter().map(|(n, _)| *n).collect::<Vec<_>>()));
@@ -1271,10 +1277,7 @@ mod tests {
 
         // create_test_batch produces three rows with names test1/test2/test3
         // and matching ids span1/span2/span3.
-        let (source, assignments) = build_update_source_for_id_rewrite(&[
-            ("test1", "rewritten-1"),
-            ("test3", "rewritten-3"),
-        ]);
+        let (source, assignments) = build_update_source_for_id_rewrite(&[("test1", "rewritten-1"), ("test3", "rewritten-3")]);
         let updated = layer.update_with_source(&project, &table, None, &assignments, &source).unwrap();
         assert_eq!(updated, 2, "expected 2 rows matched by the join");
 
@@ -1355,11 +1358,7 @@ mod tests {
                 .as_any()
                 .downcast_ref::<arrow::array::StringArray>()
                 .unwrap();
-            let id_col = combined
-                .column(combined.schema().index_of("id").unwrap())
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .unwrap();
+            let id_col = combined.column(combined.schema().index_of("id").unwrap()).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
 
             let mut found_rewritten = false;
             for i in 0..combined.num_rows() {

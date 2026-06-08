@@ -61,8 +61,8 @@ fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
 /// expects those refs to resolve against `schema`.
 #[derive(Clone)]
 pub struct UpdateSource {
-    pub batch:      RecordBatch,
-    pub schema:     SchemaRef,
+    pub batch:     RecordBatch,
+    pub schema:    SchemaRef,
     /// `(target_col, source_col)` pairs. Names refer to bare column names;
     /// table qualifiers are stripped during extraction.
     pub join_keys: Vec<(String, String)>,
@@ -314,10 +314,12 @@ fn identify_target_side<'a>(join: &'a Join, target_table_name: &str) -> Result<(
     let target_is_left = match (left_scan.as_deref(), right_scan.as_deref()) {
         (Some(l), _) if l.ends_with(target_table_name) => true,
         (_, Some(r)) if r.ends_with(target_table_name) => false,
-        _ => return Err(DataFusionError::Plan(format!(
-            "UPDATE target table `{}` not found on either side of FROM-join (left={:?}, right={:?})",
-            target_table_name, left_scan, right_scan
-        ))),
+        _ => {
+            return Err(DataFusionError::Plan(format!(
+                "UPDATE target table `{}` not found on either side of FROM-join (left={:?}, right={:?})",
+                target_table_name, left_scan, right_scan
+            )));
+        }
     };
 
     let (target_side, source_side) = if target_is_left {
@@ -332,12 +334,10 @@ fn identify_target_side<'a>(join: &'a Join, target_table_name: &str) -> Result<(
         .iter()
         .map(|(l, r)| {
             let (tgt_expr, src_expr) = if target_is_left { (l, r) } else { (r, l) };
-            let tgt_col = expr_to_bare_col(tgt_expr).ok_or_else(|| DataFusionError::NotImplemented(
-                format!("UPDATE ... FROM join key must be a plain column reference, got: {tgt_expr}")
-            ))?;
-            let src_col = expr_to_bare_col(src_expr).ok_or_else(|| DataFusionError::NotImplemented(
-                format!("UPDATE ... FROM join key must be a plain column reference, got: {src_expr}")
-            ))?;
+            let tgt_col = expr_to_bare_col(tgt_expr)
+                .ok_or_else(|| DataFusionError::NotImplemented(format!("UPDATE ... FROM join key must be a plain column reference, got: {tgt_expr}")))?;
+            let src_col = expr_to_bare_col(src_expr)
+                .ok_or_else(|| DataFusionError::NotImplemented(format!("UPDATE ... FROM join key must be a plain column reference, got: {src_expr}")))?;
             Ok((tgt_col, src_col))
         })
         .collect();
@@ -365,11 +365,7 @@ fn expr_to_bare_col(expr: &Expr) -> Option<String> {
 /// Materialize an [`UpdateSourcePlan`] into a single [`RecordBatch`] by running
 /// the source plan as a regular DataFusion query and concatenating the streamed
 /// batches. Errors if the source exceeds [`MAX_UPDATE_SOURCE_ROWS`].
-async fn materialize_source(
-    planner: &DefaultPhysicalPlanner,
-    session_state: &SessionState,
-    sp: UpdateSourcePlan,
-) -> Result<UpdateSource> {
+async fn materialize_source(planner: &DefaultPhysicalPlanner, session_state: &SessionState, sp: UpdateSourcePlan) -> Result<UpdateSource> {
     let phys = planner.create_physical_plan(&sp.plan, session_state).await?;
     let schema = phys.schema();
     let task_ctx = Arc::new(TaskContext::from(session_state));
@@ -929,9 +925,7 @@ fn build_join_predicate(
             right: Box::new(col(format!("{source_alias}.{s}"))),
         })
     });
-    let mut acc = key_iter
-        .next()
-        .ok_or_else(|| DataFusionError::Plan("UPDATE ... FROM requires at least one join key".to_string()))?;
+    let mut acc = key_iter.next().ok_or_else(|| DataFusionError::Plan("UPDATE ... FROM requires at least one join key".to_string()))?;
     for next in key_iter {
         acc = Expr::BinaryExpr(BinaryExpr {
             left:  Box::new(acc),
@@ -1031,9 +1025,7 @@ pub async fn perform_delta_merge_update(
             })
             .map_err(|e| DataFusionError::Execution(format!("when_matched_update failed: {}", e)))?;
 
-        let (new_table, metrics) = merge
-            .await
-            .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta MERGE UPDATE: {}", e)))?;
+        let (new_table, metrics) = merge.await.map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta MERGE UPDATE: {}", e)))?;
         Ok((new_table, metrics.num_target_rows_updated as u64))
     })
     .await;
