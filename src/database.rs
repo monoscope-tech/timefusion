@@ -1610,6 +1610,10 @@ impl Database {
     /// wrote"); this method flips polarity exactly once, here, so call
     /// sites stay readable.
     pub fn delta_scan_can_be_skipped(&self, project_id: &str, table_name: &str) -> bool {
+        // Two String allocations per call — same caveat as `try_fast_resolve`.
+        // Lumped together as a deferred follow-up in
+        // `docs/membuffer_flush_fix_plan.md` (borrowed-tuple-key wrapper for
+        // all three table-keyed DashMaps at once).
         self.delta_has_files
             .get(&(project_id.to_string(), table_name.to_string()))
             // Acquire-load pairs with the Release-store in mark_delta_has_files

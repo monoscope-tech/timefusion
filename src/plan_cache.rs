@@ -202,6 +202,15 @@ impl QueryHook for PlanCacheHook {
         // `cache.retain` with this closure can't panic, so the guard can
         // be a flat `.store(false)` at the end of the block rather than
         // a Drop-based scopeguard.
+        // `cache.len()` walks every DashMap shard under a read lock — O(shards).
+        // With ~5 templates in the OLAP target the threshold never trips, so
+        // this is a per-miss O(16) atomic chain that mostly returns false
+        // before the second clause even fires. If `DEFAULT_PLAN_CACHE_CAPACITY`
+        // ever grows to a number where `len()` shows up on the profile,
+        // mirror the size with a separate `AtomicUsize` bumped/decremented
+        // alongside `cache.insert`/`retain` and gate on that instead — the
+        // `EVICTING` AtomicBool already prevents double-counting on the
+        // sweep path.
         static EVICTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if self.cache.len() >= self.capacity && !EVICTING.swap(true, std::sync::atomic::Ordering::AcqRel) {
             let target = self.capacity / 2;
