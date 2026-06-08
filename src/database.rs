@@ -447,6 +447,25 @@ pub struct Database {
     /// otherwise dominated the per-query latency under load (proven via
     /// `slow delta scan` instrumentation showing `resolve` was 99% of cost).
     fast_resolve_cache:              dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
+    /// Per-(project,table) sticky bit: "Delta may hold matching files."
+    /// Two seed paths so the bit is always at least as conservative as truth
+    /// — never falsely `false`:
+    ///   1. **Cold start / first resolve**: `resolve_table` reads
+    ///      `DeltaTable.version()` from the snapshot we just loaded. The
+    ///      snapshot itself is hydrated from `_delta_log/*.json` on S3, so
+    ///      a fresh process inherits the S3 truth. `version > 0` ⇒ true.
+    ///   2. **Steady state**: the flush callback (`main.rs`) calls
+    ///      `mark_delta_has_files` after every successful commit that adds
+    ///      files. Sticky-monotonic — once `true`, never flipped back, so
+    ///      compaction churn doesn't mistakenly hide data.
+    /// While `false`, `ProjectRoutingTable::scan` short-circuits the Delta
+    /// scan entirely — MemBuffer is authoritative for all rows. Avoids the
+    /// per-query cost of building a delta-rs TableProvider + scan plan for
+    /// a project that has never committed (common at warm-up and in the
+    /// multi-tenant case where most projects sit below the flush threshold).
+    /// The safe direction (`true` when actually empty after vacuum) just
+    /// runs the scan unnecessarily — no correctness risk.
+    delta_has_files:                 dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
     batch_queue:                     Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown:            Arc<CancellationToken>,
     config_pool:                     Option<PgPool>,
@@ -753,6 +772,7 @@ impl Database {
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: dashmap::DashMap::new(),
+            delta_has_files: dashmap::DashMap::new(),
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
             config_pool,
@@ -1370,6 +1390,27 @@ impl Database {
             .map(|r| Arc::clone(r.value()))
     }
 
+    /// Has this Delta table ever held a file (i.e. has any flush completed)?
+    /// `None` means "we've never resolved this table yet" — caller should not
+    /// assume empty in that case; fall back to the full scan path.
+    pub fn delta_known_empty(&self, project_id: &str, table_name: &str) -> bool {
+        self.delta_has_files
+            .get(&(project_id.to_string(), table_name.to_string()))
+            .map(|f| !f.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    /// Mark a (project, table) as having Delta files. Called by the flush
+    /// callback after a successful commit.
+    pub fn mark_delta_has_files(&self, project_id: &str, table_name: &str) {
+        let key = (project_id.to_string(), table_name.to_string());
+        let flag = self
+            .delta_has_files
+            .entry(key)
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         let span = tracing::Span::current();
 
@@ -1401,15 +1442,20 @@ impl Database {
         if self.has_custom_storage(project_id, table_name).await {
             span.record("is_custom", true);
             let t = self.resolve_custom_table(project_id, table_name).await?;
-            self.fast_resolve_cache.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&t));
+            let key = (project_id.to_string(), table_name.to_string());
+            self.fast_resolve_cache.insert(key.clone(), Arc::clone(&t));
+            let has_files = t.read().await.version().map(|v| v > 0).unwrap_or(false);
+            self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false))).store(has_files, std::sync::atomic::Ordering::Relaxed);
             return Ok(t);
         }
 
         span.record("is_custom", false);
         // Default: use unified table (all projects share the same table, partitioned by project_id)
         let t = self.resolve_unified_table(table_name).await?;
-        // Populate fast cache so subsequent reads skip the await dance.
-        self.fast_resolve_cache.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&t));
+        let key = (project_id.to_string(), table_name.to_string());
+        self.fast_resolve_cache.insert(key.clone(), Arc::clone(&t));
+        let has_files = t.read().await.version().map(|v| v > 0).unwrap_or(false);
+        self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false))).store(has_files, std::sync::atomic::Ordering::Relaxed);
         Ok(t)
     }
 
@@ -3588,6 +3634,12 @@ impl TableProvider for ProjectRoutingTable {
             (Some((mem_oldest, _)), Some((query_min, _))) => query_min >= mem_oldest,
             _ => false,
         };
+        // Sticky-empty short-circuit: if no flush has ever committed for this
+        // (project, table), Delta is guaranteed empty and we can skip the
+        // scan-plan-build cost. Flipped by the flush callback after a
+        // successful commit; never flipped back (compaction reduces files but
+        // doesn't go to zero in steady state).
+        let skip_delta = skip_delta || self.database.delta_known_empty(&project_id, &self.table_name);
 
         // MemBuffer query. `query_partitioned_with_text_match` handles its
         // own atomic per-bucket prefilter inside the bucket lock — we must
