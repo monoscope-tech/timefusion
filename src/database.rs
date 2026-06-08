@@ -3190,6 +3190,12 @@ impl Database {
         self.statistics_extractor.clear_cache().await
     }
 
+    /// Foyer cache handle (None if Foyer disabled). Test hook for harnesses
+    /// that want hit/miss assertions; also used by the warm-cache path.
+    pub fn object_store_cache(&self) -> Option<&Arc<SharedFoyerCache>> {
+        self.object_store_cache.as_ref()
+    }
+
     /// Invalidate statistics for a specific table
     pub async fn invalidate_table_statistics(&self, project_id: &str, table_name: &str) {
         self.statistics_extractor.invalidate(project_id, table_name).await

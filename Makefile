@@ -1,4 +1,4 @@
-.PHONY: test test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
+.PHONY: test test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
 # Default test (fast, excludes slow integration tests)
 test:
@@ -94,6 +94,12 @@ tf-start: minio-start
 			kill -0 $$(cat /tmp/timefusion.pid) 2>/dev/null || { echo "timefusion died; see /tmp/timefusion.log"; tail -50 /tmp/timefusion.log; exit 1; }; \
 			sleep 1; \
 		done; echo "timeout waiting for PGWire on $$port"; tail -50 /tmp/timefusion.log; exit 1
+
+# E2E tests: dynamic MinIO via testcontainers (requires Docker). Each test
+# gets a fresh container + bucket so they parallelize safely.
+test-e2e:
+	@echo "Running E2E suite (Docker required for MinIO)..."
+	cargo test --test e2e --features e2e -- --test-threads=1 --nocapture $${ARGS}
 
 tf-stop:
 	@[ -f /tmp/timefusion.pid ] && kill $$(cat /tmp/timefusion.pid) 2>/dev/null || true

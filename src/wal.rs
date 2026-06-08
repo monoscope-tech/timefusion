@@ -99,6 +99,10 @@ pub enum WalOperation {
     Insert = 0,
     Delete = 1,
     Update = 2,
+    /// `UPDATE ... FROM` with a materialized source RecordBatch serialized
+    /// alongside the predicate/assignments. Added in V2 of the UPDATE shape;
+    /// old binaries will reject these entries with `InvalidOperation(3)`.
+    UpdateWithSource = 3,
 }
 
 impl TryFrom<u8> for WalOperation {
@@ -108,6 +112,7 @@ impl TryFrom<u8> for WalOperation {
             0 => Ok(WalOperation::Insert),
             1 => Ok(WalOperation::Delete),
             2 => Ok(WalOperation::Update),
+            3 => Ok(WalOperation::UpdateWithSource),
             _ => Err(WalError::InvalidOperation(value)),
         }
     }
@@ -144,6 +149,24 @@ pub struct DeletePayload {
 pub struct UpdatePayload {
     pub predicate_sql: Option<String>,
     pub assignments:   Vec<(String, String)>,
+}
+
+/// `UPDATE ... FROM` source side, persisted alongside the predicate +
+/// assignments so WAL replay can reconstruct the join after a restart.
+/// `batch_ipc` is an Arrow IPC stream of the source `RecordBatch`.
+#[derive(Debug, Clone, Encode, Decode)]
+pub struct SerializedSource {
+    /// `(target_col, source_col)` pairs — bare column names.
+    pub join_keys: Vec<(String, String)>,
+    /// Arrow IPC stream bytes of the materialized source batch.
+    pub batch_ipc: Vec<u8>,
+}
+
+#[derive(Debug, Encode, Decode)]
+pub struct UpdateWithSourcePayload {
+    pub predicate_sql: Option<String>,
+    pub assignments:   Vec<(String, String)>,
+    pub source:        SerializedSource,
 }
 
 /// Number of walrus shards per logical (project_id, table_name) topic.
@@ -421,6 +444,41 @@ impl WalManager {
             shard,
             predicate_sql,
             assignments.len()
+        );
+        Ok(shard)
+    }
+
+    /// Append an `UPDATE ... FROM` entry. Stores the source `RecordBatch`
+    /// (already serialized to Arrow IPC bytes by the caller) alongside the
+    /// predicate + assignments so WAL replay can reconstruct the join.
+    #[instrument(skip(self, assignments, source), fields(project_id, table_name, source_ipc_bytes = source.batch_ipc.len()))]
+    pub fn append_update_with_source(
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], source: &SerializedSource,
+    ) -> Result<usize, WalError> {
+        let topic = Self::make_topic(project_id, table_name);
+        let shard = self.pick_shard(&topic);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
+        let payload = UpdateWithSourcePayload {
+            predicate_sql: predicate_sql.map(String::from),
+            assignments:   assignments.to_vec(),
+            source:        source.clone(),
+        };
+        let entry = WalEntry::new(
+            project_id,
+            table_name,
+            WalOperation::UpdateWithSource,
+            bincode::encode_to_vec(&payload, BINCODE_CONFIG)?,
+        );
+        self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
+        self.persist_topic(&topic);
+        debug!(
+            "WAL append UPDATE_WITH_SOURCE: topic={}, shard={}, predicate={:?}, assignments={}, source_keys={}, source_bytes={}",
+            topic,
+            shard,
+            predicate_sql,
+            assignments.len(),
+            source.join_keys.len(),
+            source.batch_ipc.len()
         );
         Ok(shard)
     }
@@ -939,6 +997,25 @@ pub fn deserialize_delete_payload(data: &[u8]) -> Result<DeletePayload, WalError
 pub fn deserialize_update_payload(data: &[u8]) -> Result<UpdatePayload, WalError> {
     let (payload, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
     Ok(payload)
+}
+
+pub fn deserialize_update_with_source_payload(data: &[u8]) -> Result<UpdateWithSourcePayload, WalError> {
+    let (payload, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
+    Ok(payload)
+}
+
+/// Public Arrow IPC `RecordBatch` serializer. Exposed so the
+/// `BufferedWriteLayer` can persist `UPDATE ... FROM` source batches without
+/// reinventing the IPC encoding used elsewhere in this module.
+pub fn serialize_record_batch_public(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
+    serialize_record_batch(batch)
+}
+
+/// Public Arrow IPC `RecordBatch` deserializer; the inverse of
+/// [`serialize_record_batch_public`]. Used by the WAL replay path to
+/// re-materialize `UPDATE ... FROM` source batches.
+pub fn deserialize_record_batch_public(data: &[u8]) -> Result<RecordBatch, WalError> {
+    deserialize_record_batch(data)
 }
 
 #[cfg(test)]
