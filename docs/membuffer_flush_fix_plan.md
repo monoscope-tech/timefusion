@@ -100,7 +100,11 @@ See `bench/replay_prod_load.rs` (and companion `bench/download_prod_sample.sh`).
 | **300** | **75** | **5** | **1500** | **27 ms** | **267 ms** | **920 ms** | **88%** |
 | 500 | 100 | 2 | 1000 | 223 ms | 1400 ms | 1900 ms | 7% |
 
-**Pass envelope:** ≤200 concurrent writers + 50 readers @ 1000 r/s ingest with **p95 < 100 ms**. This is the 8000× improvement vs the prod baseline (p95: 487 s → 60 ms on the 24 h list).
+**Pass envelope:** initially ≤200 concurrent writers + 50 readers @ 1000 r/s ingest with **p95 < 100 ms**. The 8000× improvement vs the prod baseline (p95: 487 s → 60 ms on the 24 h list).
+
+After fast-resolve fix (commit `da85e29`): **≤300 writers + 30 readers @ 1500 r/s ingest, p95 = 93 ms**. Higher reader counts (75+) still saturate the tokio runtime and tail latencies escalate.
+
+**How the fast-resolve fix worked:** dev-build instrumentation showed `slow delta scan: total=N resolve=N lock=0ms scan_build=4ms` — `resolve_table` was 99% of per-query Delta-side latency. Three tokio RwLock `.await`s per call (unified_tables map, last_written_versions map, inner table.version()) plus `should_refresh_table` returning true on the common `(Some(_), None)` state and firing `update_state` per query for un-flushed projects. Added a `DashMap` lock-free shortcut on Database, populated on first slow-path success. Hot path becomes `DashMap.get → Arc clone`, zero awaits.
 
 **Failure mode > 200 writers:** ~10 % of reads hit a periodic stall (p99 jumps to 900 ms+ while p50 stays under 30 ms). Diagnosed contributors:
 
