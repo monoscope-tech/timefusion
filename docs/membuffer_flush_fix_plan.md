@@ -108,6 +108,23 @@ After Delta-empty short-circuit (`800d30d`) + lock-free plan cache (`5056454`) +
 
 Current breaking points: 300 w + 100 r is right at the boundary (p95 = 100–110 ms). 500 writers saturates the tokio runtime entirely (p50 jumps to 375 ms).
 
+**Important caveat — the empty-Delta short-circuit is doing heavy lifting.** On a fresh process where no flushes have committed yet, `skipped_delta_pct ≈ 99.5%` and server scan p95 is 0.5 ms. Once flushes start landing files (steady state in prod after 10 min), `skipped_delta_pct` drops to ~67 % and server scan p95 climbs back to ~32 ms because the queries needing UNION(mem, delta) go through the full Delta-side TableProvider build. The next optimization target — to keep the envelope post-flush — is:
+
+- **Cache the Delta-side TableProvider** per `(project, table, snapshot_version)` rather than rebuilding on every scan. Currently each scan that doesn't short-circuit calls `table.table_provider().await` which traverses delta-rs internals on every query.
+- **Pre-resolve the union plan**: the per-query overhead of stitching `MemorySourceConfig` and the Delta scan into a `UnionExec` includes filter pushdown, schema coercion, and bucket-range exclusion filters. None of these depend on parameter values; they could be cached per `(project, table, mem_buckets_signature)`.
+
+The DataFusion plan cache helps for the logical plan template but the *physical* plan is rebuilt per-call. Caching at the physical layer is a bigger lift but is the next ~10× available on this path.
+
+## Per-session optimization log (chronological)
+
+| Commit | Change | Δ p95 vs prior |
+|---|---|---|
+| `da85e29` | Lock-free fast-resolve via DashMap shortcut | -15 % |
+| `800d30d` | Delta-empty sticky short-circuit (seeded from S3 truth) | -45 % |
+| `bf44249` + `fa1dee9` | Scan + pgwire metrics in `timefusion_stats` | observability |
+| `5056454` | DashMap plan cache replaces Mutex<LruCache> | -30 % |
+| `cfadce9` | Pre-optimize at miss-time, skip per-query optimize | -50 % (server pgwire 131 ms → 8 ms) |
+
 **How the fast-resolve fix worked:** dev-build instrumentation showed `slow delta scan: total=N resolve=N lock=0ms scan_build=4ms` — `resolve_table` was 99% of per-query Delta-side latency. Three tokio RwLock `.await`s per call (unified_tables map, last_written_versions map, inner table.version()) plus `should_refresh_table` returning true on the common `(Some(_), None)` state and firing `update_state` per query for un-flushed projects. Added a `DashMap` lock-free shortcut on Database, populated on first slow-path success. Hot path becomes `DashMap.get → Arc clone`, zero awaits.
 
 **Failure mode > 200 writers:** ~10 % of reads hit a periodic stall (p99 jumps to 900 ms+ while p50 stays under 30 ms). Diagnosed contributors:
