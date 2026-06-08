@@ -15,7 +15,7 @@ Usage:
   python3 bench/concurrent_load.py --writers 5 --readers 4 --duration 90
 """
 from __future__ import annotations
-import argparse, gzip, json, os, random, statistics, sys, threading, time, uuid
+import argparse, gzip, json, math, os, random, statistics, sys, threading, time, uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, timezone, timedelta
@@ -203,7 +203,11 @@ def read_tf_stats() -> dict[str, float]:
 def pct(xs: list[float], p: float) -> float:
     if not xs: return float("nan")
     s = sorted(xs)
-    k = max(0, min(len(s)-1, int(round((p/100) * (len(s)-1)))))
+    # Nearest-rank: NIST / hdrhistogram convention uses ceil((p/100) * n) - 1
+    # rather than round(). Python's round() does banker's rounding on .5 which
+    # under-reports p50 by one sample on even-length lists; ceil() matches the
+    # tail-latency tooling everyone else uses.
+    k = max(0, min(len(s)-1, math.ceil(p/100 * len(s)) - 1))
     return s[k]
 
 

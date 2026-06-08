@@ -85,7 +85,7 @@ After this lands the WAL is much smaller. If we eventually drop the WAL entirely
 
 ## Reproduction harness
 
-See `bench/replay_prod_load.py` (and companion `bench/download_prod_sample.sh`). Pulls a realistic slice of prod `otel_logs_and_spans` rows + their stats fingerprint, ingests them into a local TimeFusion via the same gRPC path used by monoscope, and asserts against `timefusion_stats` so each workstream's claim ("65 → <5000 rows/batch", "9 KB → <2 KB/row") can be re-run after every code change.
+See `bench/replay_prod_load.py` (download / replay / validate subcommands, sample wired through `bench/data/sample.jsonl.gz`). Pulls a realistic slice of prod `otel_logs_and_spans` rows + their stats fingerprint, ingests them into a local TimeFusion via the same gRPC path used by monoscope, and asserts against `timefusion_stats` so each workstream's claim ("65 → <5000 rows/batch", "9 KB → <2 KB/row") can be re-run after every code change.
 
 ## Performance envelope (2026-06-08, after B1 v2 + MAX_BATCH_COUNT_PER_BUCKET=8)
 
