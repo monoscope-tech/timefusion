@@ -183,4 +183,11 @@ arrow-pg = { path = "vendor/arrow-pg" }
 # with >9 placeholders return the wrong type-by-position to the client.
 # Vendored copy sorts by numeric suffix instead.
 datafusion-postgres = { path = "vendor/datafusion-postgres" }
+# Local patch: datafusion-sql 53.1.0's UPDATE planner has a defensive
+# `not_impl_err!("UPDATE ... FROM is not supported")` guard
+# (apache/datafusion#19950) even though `update_to_plan` already handles
+# `from` correctly via `plan_from_tables`. Vendored copy deletes the guard
+# so `UPDATE ... FROM` reaches TimeFusion's `DmlQueryPlanner`, which lowers
+# it to `MergeBuilder` (Delta path) and a hash-join (MemBuffer path).
+datafusion-sql = { path = "vendor/datafusion-sql" }
 

@@ -1281,6 +1281,209 @@ impl MemBuffer {
         Ok(total_updated)
     }
 
+    /// Update rows matching the predicate with values joined from a
+    /// pre-materialized source batch — the `UPDATE ... FROM` execution path.
+    ///
+    /// For each target row, the join keys are hashed against the source's
+    /// matching keys (Arrow `RowConverter` produces canonical comparable
+    /// rows). Matched rows then evaluate assignment exprs against a per-batch
+    /// "widened" `RecordBatch` whose schema is `(target_fields..., source_fields
+    /// renamed to source__<name>...)`, with source columns taken at the
+    /// looked-up row index (NULL where no match).
+    ///
+    /// Multi-match semantics: first source row wins (PG leaves this undefined).
+    #[instrument(skip(self, predicate, assignments, source), fields(project_id, table_name, rows_updated))]
+    pub fn update_with_source(
+        &self, project_id: &str, table_name: &str, predicate: Option<&Expr>, assignments: &[(String, Expr)], source: &crate::dml::UpdateSource,
+    ) -> DFResult<u64> {
+        use std::collections::HashMap;
+
+        if assignments.is_empty() {
+            return Ok(0);
+        }
+        let Some(table) = self.get_table(project_id, table_name) else {
+            return Ok(0);
+        };
+        let target_schema = table.schema();
+
+        // Build widened schema: target fields + source fields prefixed `source__`,
+        // all nullable on the source side (rows without a matching source row
+        // produce NULLs in source columns).
+        let mut widened_fields: Vec<arrow::datatypes::Field> = target_schema.fields().iter().map(|f| (**f).clone()).collect();
+        for f in source.schema.fields() {
+            widened_fields.push(arrow::datatypes::Field::new(format!("source__{}", f.name()), f.data_type().clone(), true));
+        }
+        let widened_schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(widened_fields));
+        let widened_df_schema = DFSchema::try_from(widened_schema.as_ref().clone())?;
+        let props = ExecutionProps::new();
+
+        // Rewriter: turn source-qualified column refs into bare `source__<name>`
+        // refs so they resolve against the widened schema. Bare source-named
+        // columns get the same treatment; everything else passes through.
+        let source_col_names: std::collections::HashSet<String> = source.schema.fields().iter().map(|f| f.name().clone()).collect();
+        let rewrite = |e: Expr| -> DFResult<Expr> {
+            use datafusion::common::tree_node::Transformed;
+            e.transform(|expr| match &expr {
+                Expr::Column(c) => {
+                    let is_source_qual = matches!(c.relation.as_ref(), Some(r) if r.table() == "source");
+                    let is_bare_source = c.relation.is_none() && source_col_names.contains(&c.name);
+                    if is_source_qual || is_bare_source {
+                        Ok(Transformed::yes(Expr::Column(Column::from_name(format!("source__{}", c.name)))))
+                    } else {
+                        Ok(Transformed::no(expr))
+                    }
+                }
+                _ => Ok(Transformed::no(expr)),
+            })
+            .map(|t| t.data)
+            .map_err(|e| datafusion::error::DataFusionError::Execution(format!("update_with_source: rewrite failed: {e}")))
+        };
+
+        let physical_predicate = predicate
+            .map(|p| -> DFResult<_> {
+                let stripped = strip_column_qualifiers(p.clone())?;
+                let rewritten = rewrite(stripped)?;
+                create_physical_expr(&rewritten, &widened_df_schema, &props)
+            })
+            .transpose()?;
+
+        let physical_assignments: Vec<(usize, _)> = assignments
+            .iter()
+            .map(|(col, expr)| -> DFResult<_> {
+                let stripped = strip_column_qualifiers(expr.clone())?;
+                let rewritten = rewrite(stripped)?;
+                let phys_expr = create_physical_expr(&rewritten, &widened_df_schema, &props)?;
+                let col_idx = target_schema
+                    .index_of(col)
+                    .map_err(|_| datafusion::error::DataFusionError::Execution(format!("Column '{}' not found", col)))?;
+                Ok((col_idx, phys_expr))
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+
+        // Hash the source side once via Arrow's RowConverter so target rows can
+        // probe the lookup with byte-identical key encoding.
+        let src_key_cols: Vec<ArrayRef> = source
+            .join_keys
+            .iter()
+            .map(|(_, src_col_name)| {
+                source
+                    .batch
+                    .column_by_name(src_col_name)
+                    .cloned()
+                    .ok_or_else(|| datafusion::error::DataFusionError::Plan(format!("Source column '{}' not found in source batch", src_col_name)))
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+        let sort_fields: Vec<SortField> = src_key_cols.iter().map(|c| SortField::new(c.data_type().clone())).collect();
+        let row_converter =
+            RowConverter::new(sort_fields).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let src_rows = row_converter
+            .convert_columns(&src_key_cols)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let mut src_lookup: HashMap<OwnedRow, u32> = HashMap::with_capacity(source.batch.num_rows());
+        for (i, row) in src_rows.iter().enumerate() {
+            // First-wins on duplicate source keys (PG leaves multi-match
+            // semantics undefined; deterministic first-row-wins is our pick).
+            src_lookup.entry(row.owned()).or_insert(i as u32);
+        }
+
+        let mut total_updated = 0u64;
+        let mut total_delta: i64 = 0;
+
+        for mut bucket_entry in table.buckets.iter_mut() {
+            let bucket = bucket_entry.value_mut();
+            let mut batches = bucket.batches.lock();
+            let mut bucket_delta: i64 = 0;
+            let mut new_batches: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+
+            for batch in batches.drain(..) {
+                let num_rows = batch.num_rows();
+                if num_rows == 0 {
+                    new_batches.push(batch);
+                    continue;
+                }
+
+                // Probe source lookup per target row.
+                let tgt_key_cols: Vec<ArrayRef> = source
+                    .join_keys
+                    .iter()
+                    .map(|(tgt_col, _)| {
+                        batch
+                            .column_by_name(tgt_col)
+                            .cloned()
+                            .ok_or_else(|| datafusion::error::DataFusionError::Plan(format!("Target column '{}' not found", tgt_col)))
+                    })
+                    .collect::<DFResult<Vec<_>>>()?;
+                let tgt_rows = row_converter
+                    .convert_columns(&tgt_key_cols)
+                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+                let src_idxs: UInt32Array = (0..num_rows).map(|i| src_lookup.get(&tgt_rows.row(i).owned()).copied()).collect();
+
+                // Build widened batch by appending source cols taken at probed indices.
+                let mut widened_cols: Vec<ArrayRef> = batch.columns().to_vec();
+                for i in 0..source.schema.fields().len() {
+                    let src_col = source.batch.column(i);
+                    let taken = arrow::compute::take(src_col.as_ref(), &src_idxs, None)
+                        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                    widened_cols.push(taken);
+                }
+                let widened_batch = RecordBatch::try_new(widened_schema.clone(), widened_cols)
+                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+                // has_match: source idx was non-null (a join match existed).
+                let has_match = BooleanArray::from((0..num_rows).map(|i| !src_idxs.is_null(i)).collect::<Vec<_>>());
+
+                let pred_mask = if let Some(ref phys_pred) = physical_predicate {
+                    let result = phys_pred.evaluate(&widened_batch)?;
+                    let arr = result.into_array(num_rows)?;
+                    arr.as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .cloned()
+                        .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?
+                } else {
+                    BooleanArray::from(vec![true; num_rows])
+                };
+
+                let mask = arrow::compute::and(&pred_mask, &has_match).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+                let matching_count = mask.iter().filter(|v| v == &Some(true)).count();
+                if matching_count == 0 {
+                    new_batches.push(batch);
+                    continue;
+                }
+                total_updated += matching_count as u64;
+
+                let old_size = estimate_batch_size(&batch);
+                let new_columns: Vec<ArrayRef> = (0..batch.num_columns())
+                    .map(|col_idx| {
+                        if let Some((_, phys_expr)) = physical_assignments.iter().find(|(idx, _)| *idx == col_idx) {
+                            let new_values = phys_expr.evaluate(&widened_batch)?.into_array(num_rows)?;
+                            merge_arrays(batch.column(col_idx), &new_values, &mask)
+                        } else {
+                            Ok(batch.column(col_idx).clone())
+                        }
+                    })
+                    .collect::<DFResult<Vec<_>>>()?;
+
+                let new_batch = RecordBatch::try_new(batch.schema(), new_columns)
+                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                bucket_delta += estimate_batch_size(&new_batch) as i64 - old_size as i64;
+                new_batches.push(new_batch);
+            }
+
+            *batches = new_batches;
+            apply_signed_delta(&bucket.memory_bytes, bucket_delta);
+            total_delta += bucket_delta;
+        }
+
+        apply_signed_delta(&self.estimated_bytes, total_delta);
+        debug!(
+            "MemBuffer update_with_source: project={}, table={}, rows_updated={}",
+            project_id, table_name, total_updated
+        );
+        Ok(total_updated)
+    }
+
     /// Delete rows using a SQL predicate string (for WAL recovery).
     /// Parses the SQL WHERE clause and delegates to delete().
     #[instrument(skip(self, registry), fields(project_id, table_name))]
@@ -1288,6 +1491,43 @@ impl MemBuffer {
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
         self.delete(project_id, table_name, predicate.as_ref())
+    }
+
+    /// WAL replay path for `UPDATE ... FROM`. Reconstructs an
+    /// [`crate::dml::UpdateSource`] from the WAL-stored join keys + source
+    /// `RecordBatch`, parses the SQL predicate/assignments against the
+    /// widened schema (target + `source__`-prefixed source columns), then
+    /// delegates to [`Self::update_with_source`].
+    #[instrument(skip(self, assignments, source_batch, registry), fields(project_id, table_name, source_rows = source_batch.num_rows()))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_with_source_by_sql(
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)],
+        join_keys: &[(String, String)], source_batch: RecordBatch, registry: Option<&FnRegistry>,
+    ) -> DFResult<u64> {
+        let target_df_schema = self.df_schema_for(project_id, table_name)?;
+
+        // Build the widened DFSchema the assignment SQL was originally parsed
+        // against (target fields + source fields renamed with `source__`
+        // prefix). Same shape as `update_with_source` constructs internally.
+        let mut widened_fields: Vec<arrow::datatypes::Field> = target_df_schema.fields().iter().map(|f| (**f).clone()).collect();
+        for f in source_batch.schema().fields() {
+            widened_fields.push(arrow::datatypes::Field::new(format!("source__{}", f.name()), f.data_type().clone(), true));
+        }
+        let widened_schema = Arc::new(arrow::datatypes::Schema::new(widened_fields));
+        let widened_df_schema = DFSchema::try_from(widened_schema.as_ref().clone())?;
+
+        let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &widened_df_schema, registry)).transpose()?;
+        let parsed_assignments: Vec<(String, Expr)> = assignments
+            .iter()
+            .map(|(col, val_sql)| parse_sql_predicate(val_sql, &widened_df_schema, registry).map(|expr| (col.clone(), expr)))
+            .collect::<DFResult<Vec<_>>>()?;
+
+        let source = crate::dml::UpdateSource {
+            schema:    source_batch.schema(),
+            batch:     source_batch,
+            join_keys: join_keys.to_vec(),
+        };
+        self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source)
     }
 
     /// Update rows using SQL strings (for WAL recovery).

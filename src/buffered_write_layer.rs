@@ -18,7 +18,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::{
     config::AppConfig,
     mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp},
-    wal::{WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_update_payload},
+    wal::{WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_record_batch_public, deserialize_update_payload, deserialize_update_with_source_payload},
 };
 
 // Reservation-side scale factor applied to `estimate_batch_size()` to
@@ -517,6 +517,40 @@ impl BufferedWriteLayer {
                             entry.project_id, entry.table_name, e
                         );
                         quarantine_entry(&quarantine_dir, &entry, "update_corrupt", &e.to_string());
+                    }
+                },
+                WalOperation::UpdateWithSource => match deserialize_update_with_source_payload(&entry.data) {
+                    Ok(payload) => match deserialize_record_batch_public(&payload.source.batch_ipc) {
+                        Ok(source_batch) => {
+                            if let Err(e) = mem_buffer.update_with_source_by_sql(
+                                &entry.project_id,
+                                &entry.table_name,
+                                payload.predicate_sql.as_deref(),
+                                &payload.assignments,
+                                &payload.source.join_keys,
+                                source_batch,
+                                registry_ref,
+                            ) {
+                                error!("WAL REPLAY FAILED: UPDATE_WITH_SOURCE for {}.{}: {}", entry.project_id, entry.table_name, e);
+                                quarantine_entry(&quarantine_dir, &entry, "update_with_source_replay_failed", &e.to_string());
+                            } else {
+                                updates_replayed += 1;
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "WAL CORRUPTION: undeserializable UPDATE_WITH_SOURCE Arrow batch for {}.{}: {}",
+                                entry.project_id, entry.table_name, e
+                            );
+                            quarantine_entry(&quarantine_dir, &entry, "update_with_source_batch_corrupt", &e.to_string());
+                        }
+                    },
+                    Err(e) => {
+                        error!(
+                            "WAL CORRUPTION: undeserializable UPDATE_WITH_SOURCE payload for {}.{}: {}",
+                            entry.project_id, entry.table_name, e
+                        );
+                        quarantine_entry(&quarantine_dir, &entry, "update_with_source_corrupt", &e.to_string());
                     }
                 },
             }
@@ -1069,6 +1103,31 @@ impl BufferedWriteLayer {
             .append_update(project_id, table_name, predicate_sql.as_deref(), &assignments_sql)
             .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_update failed: {e}").into()))?;
         self.mem_buffer.update(project_id, table_name, predicate, assignments)
+    }
+
+    /// Apply `UPDATE ... FROM` to the memory buffer. Serializes the source
+    /// `RecordBatch` to Arrow IPC and writes a `WalOperation::UpdateWithSource`
+    /// entry before mutating in-memory state, so WAL replay can faithfully
+    /// reconstruct the join after a restart.
+    #[instrument(skip(self, predicate, assignments, source), fields(project_id, table_name, source_rows = source.batch.num_rows()))]
+    pub fn update_with_source(
+        &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>,
+        assignments: &[(String, datafusion::logical_expr::Expr)], source: &crate::dml::UpdateSource,
+    ) -> datafusion::error::Result<u64> {
+        let predicate_sql = predicate.map(|p| format!("{}", p));
+        let assignments_sql: Vec<(String, String)> = assignments.iter().map(|(col, expr)| (col.clone(), format!("{}", expr))).collect();
+
+        let batch_ipc = crate::wal::serialize_record_batch_public(&source.batch)
+            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL source serialize failed: {e}").into()))?;
+        let serialized_source = crate::wal::SerializedSource {
+            join_keys: source.join_keys.clone(),
+            batch_ipc,
+        };
+
+        self.wal
+            .append_update_with_source(project_id, table_name, predicate_sql.as_deref(), &assignments_sql, &serialized_source)
+            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_update_with_source failed: {e}").into()))?;
+        self.mem_buffer.update_with_source(project_id, table_name, predicate, assignments, source)
     }
 }
 
