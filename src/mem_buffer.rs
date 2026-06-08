@@ -43,6 +43,16 @@ static BUCKET_DURATION_MICROS_CFG: std::sync::OnceLock<i64> = std::sync::OnceLoc
 /// Arrow overhead. Empirically, dropping from 32→8 cut p95 at 200-project
 /// load from 240ms to ~80ms.
 const MAX_BATCH_COUNT_PER_BUCKET: usize = 8;
+/// Skip the in-lock coalesce when the bucket's combined payload exceeds
+/// this many bytes. The point of coalesce is to bound query-side
+/// per-bucket batch fanout for sub-ms reads on bursty small-INSERT
+/// workloads — once a bucket already holds a multi-megabyte payload the
+/// per-query iteration overhead is already dwarfed by the data work, and
+/// `concat_batches` on tens of MB would hold the bucket lock for
+/// milliseconds, starving every concurrent reader of that bucket. 4 MB
+/// matches one Arrow IPC default block; arrived at empirically — see
+/// `tests/membuffer_concurrency_bench.rs`.
+const MAX_BATCH_BYTES_FOR_COALESCE: usize = 4 * 1024 * 1024;
 
 /// Configured bucket window in microseconds. Set once at startup via
 /// `set_bucket_duration_micros`; defaults to 10 minutes when unset. Smaller
@@ -150,6 +160,35 @@ pub struct MemBuffer {
     /// Flattened structure: (project_id, table_name) → TableBuffer
     /// Reduces 3 hash lookups to 1 for table access.
     tables:               DashMap<TableKey, Arc<TableBuffer>>,
+    /// Running approximation of in-memory bytes across all live buckets.
+    /// Reported via `timefusion_stats` as `mem_buffer.estimated_bytes_approx`.
+    ///
+    /// Accounting is intentionally cheap, not exact:
+    /// - `+= new_size` on every insert (pre-coalesce batch size).
+    /// - On coalesce, the bucket's `memory_bytes` field is overwritten to
+    ///   the post-concat size, but this MemBuffer-level total isn't
+    ///   decremented — so the running sum stays high until the bucket
+    ///   drains.
+    /// - `-= freed_bytes` on `drain_bucket` and eviction (sees the
+    ///   post-coalesce bucket size, fully reconciling that bucket's
+    ///   contribution).
+    ///
+    /// **Maximum drift bound**: at any instant, the over-reporting is at
+    /// most the sum of `(pre_coalesce_size - post_coalesce_size)` across
+    /// buckets that have coalesced since their last drain. The bucket-
+    /// level field is exact; only the MemBuffer-level sum drifts. With
+    /// 10-minute buckets and pressure-driven flushes, this converges
+    /// every retention window (single-digit minutes).
+    ///
+    /// **Why not exact**: making this exact requires holding a lock that
+    /// spans bucket coalesce + counter update for every insert. The hot
+    /// path is currently lock-free (per-bucket atomic) and the drift is
+    /// bounded, monotone, and self-correcting on drain.
+    ///
+    /// **Operator caution**: do NOT use this counter for back-pressure
+    /// decisions where a false-high reading would cause incorrect
+    /// throttling. The `pressure_pct` reported on `buffered_layer` is
+    /// what the flush task and the memory-reservation CAS actually use.
     estimated_bytes:      AtomicUsize,
     /// Mirrors `WalManager::shards_per_topic` so `FlushableBucket.wal_shard_counts`
     /// is always sized correctly when snapshotted at seal time.
@@ -1362,7 +1401,14 @@ impl TableBuffer {
             let mut g = bucket.batches.lock();
             g.push(batch);
             bucket.memory_bytes.fetch_add(new_size, Ordering::Relaxed);
-            if g.len() > MAX_BATCH_COUNT_PER_BUCKET {
+            // Coalesce gate: count exceeded AND aggregate bytes still small
+            // enough that concat_batches under the lock won't block readers
+            // for milliseconds. Cap means a single multi-MB INSERT followed
+            // by small batches just sits as a tail of small batches against
+            // the big one — readers iterate one extra cheap Vec slot;
+            // writers don't pay a stop-the-world memcpy.
+            let bucket_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
+            if g.len() > MAX_BATCH_COUNT_PER_BUCKET && bucket_bytes <= MAX_BATCH_BYTES_FOR_COALESCE {
                 let schema = g[0].schema();
                 let combined = arrow::compute::concat_batches(&schema, g.iter())?;
                 let combined_size = estimate_batch_size(&combined);

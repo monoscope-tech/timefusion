@@ -582,6 +582,11 @@ pub struct Database {
     /// custom configs. Operators with churn far above expected tenant
     /// counts should add a periodic sweeper; for the current target
     /// (thousands of tenants) the leakage is well under noise.
+    ///
+    /// **No drop eviction**: same caveat as `delta_provider_cache` below
+    /// — entries for tables dropped at runtime persist until process
+    /// restart. Watch `scan.fast_resolve_cache_entries` in
+    /// `timefusion_stats` for unbounded growth.
     fast_resolve_cache:              dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
     /// Per-(project,table) sticky bit: "Delta may hold matching files."
     /// Two seed paths so the bit is always at least as conservative as truth
@@ -618,6 +623,16 @@ pub struct Database {
     /// tasks find the cell, await its completion, and share the same Arc.
     /// Without this guard, N concurrent first-time queries would each pay
     /// the full build cost.
+    ///
+    /// **Known limitation — no drop eviction**: entries for tables that
+    /// are dropped at runtime stay in the map. The cached `Arc<dyn
+    /// TableProvider>` keeps the underlying state alive (file lists,
+    /// snapshot metadata), so memory tracks the historical max of
+    /// distinct `(project, table)` pairs, not the live set. For
+    /// workloads with steady tenant counts this is invisible; for a
+    /// churning create/drop pattern, expose `scan.provider_cache_entries`
+    /// in `timefusion_stats` (already wired) for alerting, and add a
+    /// TTL sweep here when it ever becomes a real problem.
     delta_provider_cache:            DeltaProviderCache,
     /// Per-process scan-path counters. Read by `timefusion_stats` so operators
     /// can see — in prod — whether the in-memory shortcut is being taken,
@@ -1570,7 +1585,14 @@ impl Database {
     pub fn delta_is_known_empty(&self, project_id: &str, table_name: &str) -> bool {
         self.delta_has_files
             .get(&(project_id.to_string(), table_name.to_string()))
-            .map(|f| !f.load(std::sync::atomic::Ordering::Relaxed))
+            // Acquire-load pairs with the Release-store in mark_delta_has_files
+            // and populate_resolve_caches. The DashMap shard lock already
+            // provides a happens-before via its own acquire/release of the
+            // shard's internal lock, but defending Relaxed here would break
+            // the moment a future refactor reads the Arc<AtomicBool> outside
+            // the shard guard. Cost on ARM is one `dmb ish` per query;
+            // negligible against the work it protects.
+            .map(|f| !f.load(std::sync::atomic::Ordering::Acquire))
             .unwrap_or(false)
     }
 
@@ -1579,7 +1601,7 @@ impl Database {
     pub fn mark_delta_has_files(&self, project_id: &str, table_name: &str) {
         let key = (project_id.to_string(), table_name.to_string());
         let flag = self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        flag.store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
@@ -1640,7 +1662,9 @@ impl Database {
         let has_files = t.read().await.version().map(|v| v > 0).unwrap_or(false);
         let entry = self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         if has_files {
-            entry.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Release pairs with the Acquire load in delta_is_known_empty
+            // (see comment there). Same rationale.
+            entry.store(true, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -4426,6 +4450,53 @@ mod tests {
         // populate_resolve_caches docstring documents the property and the
         // implementation only ever calls store(true).)
         assert!(!db.delta_is_known_empty(&p1, t), "sticky-true: bit stays set across subsequent resolves");
+        Ok(())
+    }
+
+    /// End-to-end test of the sticky-bit's load-bearing property: after a
+    /// project is marked as having files, NO subsequent code path may
+    /// downgrade the bit and silently hide those files from queries.
+    ///
+    /// The scenario this pins: a flush callback marks `(p, t)` true; a
+    /// concurrent reader's `resolve_table` then races against the same
+    /// (p, t) and would observe `version() == 0` on its just-loaded
+    /// snapshot (delta-rs caches per-handle, update_state is async).
+    /// Pre-fix, `populate_resolve_caches` would unconditionally store the
+    /// false from that observation, downgrade the bit, and every
+    /// subsequent scan would skip Delta — losing the just-flushed rows
+    /// until process restart. The fix only ever stores `true`. The test
+    /// here forces the exact sequence (mark → resolve fresh table at
+    /// version 0 → assert) without needing a real concurrency race.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_delta_has_files_resolve_doesnt_downgrade() -> Result<()> {
+        let (db, _ctx, prefix) = setup_test_database().await?;
+        let project_id = format!("proj-{prefix}");
+        let table = "otel_logs_and_spans";
+
+        // Simulate the flush callback marking files-present for this project.
+        db.mark_delta_has_files(&project_id, table);
+        assert!(!db.delta_is_known_empty(&project_id, table), "post-mark: bit is true → not known empty");
+
+        // Force a resolve of the unified table. The fresh handle reports
+        // version() == 0 because nothing has been written. Pre-fix this
+        // would have downgraded the bit; post-fix the sticky-true
+        // invariant holds.
+        let _t = db.resolve_table(&project_id, table).await?;
+        assert!(
+            !db.delta_is_known_empty(&project_id, table),
+            "STICKY-TRUE: resolve_table observing version==0 must NOT downgrade a previously-marked bit. \
+             A regression here means post-flush rows get hidden from queries."
+        );
+
+        // Resolve via the alternative path used by SELECTs (try_fast_resolve
+        // → fast_resolve_cache hit) — same invariant must hold.
+        let _ = db.try_fast_resolve(&project_id, table);
+        assert!(
+            !db.delta_is_known_empty(&project_id, table),
+            "STICKY-TRUE preserved across try_fast_resolve too"
+        );
+
         Ok(())
     }
 
