@@ -35,14 +35,14 @@ const BUCKET_DURATION_MICROS: i64 = DEFAULT_BUCKET_DURATION_MICROS;
 
 static BUCKET_DURATION_MICROS_CFG: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 
-/// Max row count for the "tail" batch inside a TimeBucket. While the last
-/// batch in the bucket is below this threshold, an incoming insert is
-/// `concat_batches`-ed into it instead of pushed. Tuned for prod-shape OTLP
-/// ingest (~30 rows per INSERT): with TARGET=8192 the bucket holds
-/// ceil(rows / 8192) batches plus one in-progress tail, instead of one
-/// batch per INSERT. Larger value reduces batch count further but increases
-/// the bytes copied per insert; this is the sweet spot empirically.
-const COALESCE_TARGET_ROWS: usize = 8192;
+/// Hard cap on RecordBatch count per TimeBucket. Insert just pushes; when
+/// the bucket crosses this threshold, one insert pays an amortized coalesce
+/// (all batches → one). Without amortization (concat on every insert)
+/// 20-writer harness regresses to p95>1s because the concat holds the
+/// bucket lock and starves the read path snapshot. 32 keeps bucket scan
+/// time bounded (≤32 RecordBatches to iterate) and amortizes coalesce cost
+/// across 32 inserts.
+const MAX_BATCH_COUNT_PER_BUCKET: usize = 32;
 
 /// Configured bucket window in microseconds. Set once at startup via
 /// `set_bucket_duration_micros`; defaults to 10 minutes when unset. Smaller
@@ -1339,49 +1339,42 @@ impl TableBuffer {
 
     /// Insert a batch into this table's appropriate time bucket.
     ///
-    /// Coalesces into the bucket's last batch while combined row count stays
-    /// below `COALESCE_TARGET_ROWS`. Without this, monoscope-style ingest of
-    /// ~30-row OTLP traces produces thousands of tiny RecordBatches per
-    /// bucket (one per INSERT), which dominates scan time and inflates Arrow
-    /// per-batch overhead. With it, the bucket holds O(rows / target)
-    /// batches regardless of insert cadence.
+    /// Fast path: push the batch as-is. When the bucket count crosses
+    /// `MAX_BATCH_COUNT_PER_BUCKET`, that insert pays an amortized coalesce
+    /// (all batches → one), which both bounds bucket scan time (≤32 batches)
+    /// and reclaims per-batch dictionary fragmentation. Concat happens under
+    /// the bucket lock, but only once per N inserts instead of every insert,
+    /// so writer→reader contention on the snapshot path drops by N×.
     ///
-    /// Returns `(net_bytes_added, bucket_id)`. The "net" is important: on a
-    /// coalesce path we replace the prior last batch with a larger combined
-    /// one, so the caller should add `(combined_size - prior_last_size)` to
-    /// the MemBuffer-level byte counter, not the raw incoming batch size.
+    /// Returns `(new_batch_size_bytes, bucket_id)`. The size returned is the
+    /// incoming batch's contribution; coalesce-induced memory shrinkage is
+    /// reflected in `bucket.memory_bytes` directly (authoritative) but not
+    /// in the value returned (the caller's MemBuffer-level counter is
+    /// approximate by design — converges on drain/evict).
     pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<(usize, i64)> {
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
+        let new_size = estimate_batch_size(&batch);
 
         let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
-        let net_added_bytes = {
+        {
             let mut g = bucket.batches.lock();
-            let should_coalesce = g.last().is_some_and(|l| l.num_rows() + row_count <= COALESCE_TARGET_ROWS);
-            if should_coalesce {
-                let last = g.pop().unwrap();
-                let old_last_size = estimate_batch_size(&last);
-                let schema = last.schema();
-                let combined = arrow::compute::concat_batches(&schema, &[last, batch])?;
+            g.push(batch);
+            bucket.memory_bytes.fetch_add(new_size, Ordering::Relaxed);
+            if g.len() > MAX_BATCH_COUNT_PER_BUCKET {
+                let schema = g[0].schema();
+                let combined = arrow::compute::concat_batches(&schema, g.iter())?;
                 let combined_size = estimate_batch_size(&combined);
+                g.clear();
                 g.push(combined);
-                combined_size.saturating_sub(old_last_size)
-            } else {
-                let sz = estimate_batch_size(&batch);
-                g.push(batch);
-                sz
+                bucket.memory_bytes.store(combined_size, Ordering::Relaxed);
             }
-        };
+        }
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
-        bucket.memory_bytes.fetch_add(net_added_bytes, Ordering::Relaxed);
         bucket.update_timestamps(timestamp_micros);
 
-        debug!(
-            "TableBuffer insert: project={}, table={}, bucket={}, rows={}, net_bytes={}",
-            self.project_id, self.table_name, bucket_id, row_count, net_added_bytes
-        );
-        Ok((net_added_bytes, bucket_id))
+        Ok((new_size, bucket_id))
     }
 }
 
@@ -2055,19 +2048,18 @@ mod tests {
     /// Repro for the prod fragmentation incident (docs/membuffer_flush_fix_plan.md):
     /// monoscope ingests OTLP traces as ~30-row INSERTs. Pre-fix, each INSERT
     /// became one RecordBatch in the bucket → 1000 inserts = 1000 batches,
-    /// 30 rows/batch, scan-time bound. With coalescing, the bucket caps at
-    /// ceil(rows / COALESCE_TARGET_ROWS) + 1 batches and rows/batch climbs
-    /// to the COALESCE_TARGET.
+    /// 30 rows/batch, scan-time bound. With amortized coalesce, the bucket
+    /// is bounded at MAX_BATCH_COUNT_PER_BUCKET (32) — when a push crosses
+    /// the threshold the next insert folds the lot into one.
     #[test]
     fn insert_coalesces_small_batches_into_bucket_tail() {
         let buffer = MemBuffer::new();
-        let ts = 1_000_000_000_000i64; // arbitrary, all in one bucket
+        let ts = 1_000_000_000_000i64;
         let row_count_per_insert = 30;
         let inserts = 1000;
         let total_rows = row_count_per_insert * inserts;
 
         for i in 0..inserts {
-            // Make every batch's timestamp unique-ish but same bucket; values don't matter
             let batch = make_batch_with_rows(ts + i as i64, row_count_per_insert);
             buffer.insert("p1", "t1", batch, ts).unwrap();
         }
@@ -2080,15 +2072,14 @@ mod tests {
         let n_batches = snapshot.len();
         let total_in_bucket: usize = snapshot.iter().map(|b| b.num_rows()).sum();
 
-        let expected_max_batches = total_rows.div_ceil(COALESCE_TARGET_ROWS) + 1;
         assert_eq!(total_in_bucket, total_rows, "row preservation");
         assert!(
-            n_batches <= expected_max_batches,
-            "bucket should hold ≤{expected_max_batches} batches after coalesce, got {n_batches}"
+            n_batches <= MAX_BATCH_COUNT_PER_BUCKET + 1,
+            "bucket should hold ≤{} batches after amortized coalesce, got {n_batches}",
+            MAX_BATCH_COUNT_PER_BUCKET + 1
         );
-        // And rows/batch should be near the target on the non-tail batches
         let avg = total_rows / n_batches.max(1);
-        assert!(avg >= 1000, "avg rows/batch should be ≥1000 after coalesce, got {avg}");
+        assert!(avg >= 900, "avg rows/batch should be ≥900 after coalesce, got {avg}");
     }
 
     fn make_batch_with_rows(start_ts: i64, n: usize) -> RecordBatch {
