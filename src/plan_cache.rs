@@ -28,7 +28,6 @@
 //! also gain a schema-version token in the key (e.g. an `Arc<AtomicU64>`
 //! bumped on each reload) or a full flush on reload.
 
-use std::num::NonZeroUsize;
 
 use async_trait::async_trait;
 use datafusion::{
@@ -86,7 +85,6 @@ impl Default for PlanCacheHook {
 
 impl PlanCacheHook {
     pub fn new(capacity: usize) -> Self {
-        let _ = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
             cache:    dashmap::DashMap::new(),
             capacity: capacity.max(1),
@@ -175,12 +173,20 @@ impl QueryHook for PlanCacheHook {
             Ok(p) => p,
             Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
         };
-        // Soft size cap: when exceeded, clear the cache and let it repopulate.
-        // Cheap (rare event) and avoids the cost of an eviction queue. With a
-        // 256-entry cap and OLAP query templates measured in tens, this branch
-        // is effectively dead code in practice.
+        // Soft size cap: when exceeded, evict half the entries (random shard
+        // sweep) rather than clearing the whole cache. With the OLAP workload
+        // we measured (~5 unique templates) this branch never fires; under
+        // pattern-diverse load (ad-hoc debug sessions) it avoids the thrash
+        // a full clear would cause when one burst of distinct queries
+        // displaces the hot templates.
         if self.cache.len() >= self.capacity {
-            self.cache.clear();
+            let target = self.capacity / 2;
+            self.cache.retain(|_, _| {
+                // DashMap iterates per-shard so this is roughly random by
+                // hash distribution. Cheaper than an LRU clock and adequate
+                // when the steady-state working set fits well under capacity.
+                fastrand::usize(..self.capacity) >= target
+            });
         }
         self.cache.insert(canonical, plan.clone());
         Some(Ok(plan))
@@ -191,5 +197,14 @@ impl QueryHook for PlanCacheHook {
         _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         None
+    }
+
+    /// Signal to the do_query path that any plan we returned is already
+    /// optimized — so `state.optimize()` can be skipped. Plans only land
+    /// in `self.cache` after `state.optimize()` ran inside
+    /// `handle_extended_parse_query`, so a cache lookup here is the
+    /// authoritative answer.
+    fn was_pre_optimized(&self, canonical_sql: &str) -> bool {
+        self.cache.contains_key(canonical_sql)
     }
 }

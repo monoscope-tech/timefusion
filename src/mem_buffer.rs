@@ -2049,7 +2049,7 @@ mod tests {
     /// monoscope ingests OTLP traces as ~30-row INSERTs. Pre-fix, each INSERT
     /// became one RecordBatch in the bucket → 1000 inserts = 1000 batches,
     /// 30 rows/batch, scan-time bound. With amortized coalesce, the bucket
-    /// is bounded at MAX_BATCH_COUNT_PER_BUCKET (32) — when a push crosses
+    /// is bounded at MAX_BATCH_COUNT_PER_BUCKET — when a push crosses
     /// the threshold the next insert folds the lot into one.
     #[test]
     fn insert_coalesces_small_batches_into_bucket_tail() {

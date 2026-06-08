@@ -21,7 +21,7 @@ Typical loop:
   # change code, restart TF, re-run replay+validate
 """
 from __future__ import annotations
-import argparse, gzip, json, os, sys, time, uuid
+import argparse, gzip, json, os, re, sys, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
@@ -97,6 +97,9 @@ def download(args):
     # to avoid loading all rows into memory at once. Hours/limit are ints — safe
     # to inline (TF rejects parameterised INTERVAL anyway).
     cols_sql = ", ".join(COLUMNS)
+    # Guard against SQL injection — UUID/hex-only chars.
+    if not re.fullmatch(r"[0-9a-fA-F-]{1,64}", args.project):
+        sys.exit(f"refusing unsafe --project value: {args.project!r}")
     where_base = f"project_id = '{args.project}'"
     if args.hours:
         where_base += f" AND timestamp >= now() - INTERVAL '{int(args.hours)} hours'"

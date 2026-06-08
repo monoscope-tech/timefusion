@@ -386,10 +386,10 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
 /// Start the server with custom handlers
 pub async fn serve_with_logging(
     session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut factory = LoggingHandlerFactory::new(session_context, auth_config);
-    if let Some(m) = crate::database::scan_metrics_global() {
+    if let Some(m) = scan_metrics {
         factory = factory.with_scan_metrics(m);
     }
     let handlers = Arc::new(factory);
@@ -402,10 +402,10 @@ pub async fn serve_with_logging(
 /// TLS config and connection-limit settings.
 pub async fn serve_with_listener(
     listener: tokio::net::TcpListener, session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
-    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut factory = LoggingHandlerFactory::new(session_context, auth_config);
-    if let Some(m) = crate::database::scan_metrics_global() {
+    if let Some(m) = scan_metrics {
         factory = factory.with_scan_metrics(m);
     }
     let handlers = Arc::new(factory);

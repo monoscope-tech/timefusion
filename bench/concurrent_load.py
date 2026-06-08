@@ -289,7 +289,7 @@ def main():
         p50 = pct(xs, 50)*1000; p95 = pct(xs, 95)*1000; p99 = pct(xs, 99)*1000
         max_ms = max(xs)*1000
         under_budget = sum(1 for x in xs if x*1000 <= args.budget_ms) / len(xs)
-        ok = p95*1 <= args.budget_ms
+        ok = p95 <= args.budget_ms
         overall_pass &= ok
         print(f"  [{'PASS' if ok else 'FAIL'}] {name:8s} "
               f"n={len(xs):4d}  p50={p50:6.1f}ms  p95={p95:7.1f}ms  p99={p99:7.1f}ms  "
@@ -308,10 +308,10 @@ def main():
     print(f"  buffered_layer.pressure   {pre.get('buffered_layer.pressure_pct',0):>10.0f}%-> {post.get('buffered_layer.pressure_pct',0):>10.0f}%")
     print(f"  wal.disk_mb               {pre.get('wal.disk_mb',0):>10.0f}  -> {post.get('wal.disk_mb',0):>10.0f}")
     if post.get('mem_buffer.total_batches', 0) > 0:
-        rpb = post['mem_buffer.total_rows'] / post['mem_buffer.total_batches']
+        rpb = post.get('mem_buffer.total_rows', 0) / post['mem_buffer.total_batches']
         print(f"  rows/batch (end)          {rpb:>10.1f}   target >5000")
     if post.get('mem_buffer.total_rows', 0) > 0:
-        bpr = post['mem_buffer.estimated_bytes'] / post['mem_buffer.total_rows']
+        bpr = post.get('mem_buffer.estimated_bytes', 0) / post['mem_buffer.total_rows']
         print(f"  bytes/row (end)           {bpr:>10.0f}   target <2048")
 
     print(f"\n# overall: {'PASS' if overall_pass else 'FAIL'}")

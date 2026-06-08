@@ -45,17 +45,6 @@ use crate::{
 // All default projects share the same table, with project_id as a partition column
 pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
 
-/// Singleton handle so pgwire-side handlers can record end-to-end query
-/// latency into the same ScanMetrics the scan-side counters write to,
-/// without plumbing an Arc through the datafusion_postgres factory.
-static SCAN_METRICS_GLOBAL: std::sync::OnceLock<Arc<ScanMetrics>> = std::sync::OnceLock::new();
-pub fn scan_metrics_global() -> Option<Arc<ScanMetrics>> {
-    SCAN_METRICS_GLOBAL.get().cloned()
-}
-pub fn set_scan_metrics_global(m: Arc<ScanMetrics>) {
-    let _ = SCAN_METRICS_GLOBAL.set(m);
-}
-
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanShape {
@@ -576,7 +565,13 @@ pub struct Database {
     /// same provider, varying only filters/projection/limit on scan().
     /// Invalidation: compare table.version() against the cached version
     /// on lookup; mismatch → rebuild + replace.
-    delta_provider_cache:            dashmap::DashMap<(String, String), (u64, Arc<dyn datafusion::datasource::TableProvider>)>,
+    ///
+    /// Concurrent misses are de-duplicated through a per-key `OnceCell`:
+    /// the first task to miss installs the cell and starts the build; later
+    /// tasks find the cell, await its completion, and share the same Arc.
+    /// Without this guard, N concurrent first-time queries would each pay
+    /// the full build cost.
+    delta_provider_cache:            dashmap::DashMap<(String, String), (u64, Arc<tokio::sync::OnceCell<Arc<dyn datafusion::datasource::TableProvider>>>)>,
     /// Per-process scan-path counters. Read by `timefusion_stats` so operators
     /// can see — in prod — whether the in-memory shortcut is being taken,
     /// what the resolve cache hit rate looks like, and how the latency
@@ -891,11 +886,7 @@ impl Database {
             fast_resolve_cache: dashmap::DashMap::new(),
             delta_has_files: dashmap::DashMap::new(),
             delta_provider_cache: dashmap::DashMap::new(),
-            scan_metrics: {
-                let m = Arc::new(ScanMetrics::default());
-                set_scan_metrics_global(m.clone());
-                m
-            },
+            scan_metrics: Arc::new(ScanMetrics::default()),
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
             config_pool,
@@ -3342,26 +3333,34 @@ impl ProjectRoutingTable {
         // skip the whole `table.table_provider().with_session(...).await`
         // chain.
         let current_version = table.version().unwrap_or(0);
-        let provider = if let Some(entry) = self.database.delta_provider_cache.get(&cache_key)
-            && entry.value().0 == current_version
-        {
-            Arc::clone(&entry.value().1)
-        } else {
-            let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
-            // Build the delta-rs table provider with our session so its scan
-            // inherits `schema_force_view_types=false` (set in
-            // `create_session_context`). delta-rs's default is `true` (BinaryView),
-            // which mismatches our Binary-typed MemBuffer at the union and
-            // panics in physical planning.
-            let built = if let Some(ss) = session_state {
-                table.table_provider().with_session(Arc::new(ss)).await
-            } else {
-                table.table_provider().await
+        // Resolve or install a OnceCell for this (key, version). DashMap
+        // shard-write lock is held only across the cheap entry-insert; the
+        // expensive provider build runs OUTSIDE the lock, while concurrent
+        // tasks all clone the same cell Arc and await its single init.
+        let cell = {
+            let mut entry = self.database.delta_provider_cache.entry(cache_key.clone()).or_insert_with(|| (current_version, Arc::new(tokio::sync::OnceCell::new())));
+            if entry.0 != current_version {
+                *entry = (current_version, Arc::new(tokio::sync::OnceCell::new()));
             }
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-            self.database.delta_provider_cache.insert(cache_key, (current_version, Arc::clone(&built)));
-            built
+            Arc::clone(&entry.1)
         };
+        let provider = cell
+            .get_or_try_init(|| async {
+                let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
+                // Build the delta-rs table provider with our session so its scan
+                // inherits `schema_force_view_types=false` (set in
+                // `create_session_context`). delta-rs's default is `true` (BinaryView),
+                // which mismatches our Binary-typed MemBuffer at the union and
+                // panics in physical planning.
+                if let Some(ss) = session_state {
+                    table.table_provider().with_session(Arc::new(ss)).await
+                } else {
+                    table.table_provider().await
+                }
+                .map_err(|e| DataFusionError::External(Box::new(e)))
+            })
+            .await?
+            .clone();
 
         // Translate projection indices from our schema to delta table's schema.
         // DataFusion passes indices based on ProjectRoutingTable.schema, but the
