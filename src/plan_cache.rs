@@ -163,6 +163,18 @@ impl QueryHook for PlanCacheHook {
         // inference returns the right type per placeholder (otherwise row-1
         // types leak across to row-2+ placeholders by position).
         let plan = crate::insert_coerce::rewrite_plan(plan);
+        // Pre-optimize at cache-miss time, not per-query. With OLAP traffic
+        // (one-time plan build, millions of executions) this turns a per-
+        // query 30ms cost into a one-time amortization. Vendored
+        // datafusion-postgres skips its `state.optimize()` call when the
+        // hook returns Some — see `vendor/datafusion-postgres/src/handlers.rs`.
+        // The plan still goes through `replace_params_with_values` at exec
+        // time, but optimization rules that aren't constant-fold are
+        // parameter-independent and stay valid across all bound values.
+        let plan = match state.optimize(&plan) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
+        };
         // Soft size cap: when exceeded, clear the cache and let it repopulate.
         // Cheap (rare event) and avoids the cost of an eviction queue. With a
         // 256-entry cap and OLAP query templates measured in tens, this branch
