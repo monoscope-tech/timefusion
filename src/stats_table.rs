@@ -27,11 +27,27 @@ use datafusion::{
 
 use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics};
 
-#[derive(Debug)]
+/// Snapshot of the size of the resolve/provider caches at scan time.
+/// Reported as `scan.fast_resolve_cache_entries` and
+/// `scan.provider_cache_entries` so operators can spot the unbounded
+/// growth (documented on each cache's field) before it shows up as
+/// memory pressure in long-running processes.
+pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
+
 pub struct StatsTableProvider {
     layer:        Option<Arc<BufferedWriteLayer>>,
     scan_metrics: Option<Arc<ScanMetrics>>,
+    cache_sizes:  Option<CacheSizeSnapshot>,
     schema:       SchemaRef,
+}
+
+impl std::fmt::Debug for StatsTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatsTableProvider")
+            .field("layer", &self.layer)
+            .field("scan_metrics", &self.scan_metrics)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StatsTableProvider {
@@ -44,12 +60,18 @@ impl StatsTableProvider {
         Self {
             layer,
             scan_metrics: None,
+            cache_sizes: None,
             schema,
         }
     }
 
     pub fn with_scan_metrics(mut self, m: Arc<ScanMetrics>) -> Self {
         self.scan_metrics = Some(m);
+        self
+    }
+
+    pub fn with_cache_sizes(mut self, f: CacheSizeSnapshot) -> Self {
+        self.cache_sizes = Some(f);
         self
     }
 
@@ -130,6 +152,7 @@ impl StatsTableProvider {
             rows.push(("scan", "provider_cache_hits".into(), pc_hits.to_string()));
             rows.push(("scan", "provider_cache_misses".into(), pc_misses.to_string()));
             rows.push(("scan", "provider_cache_hit_pct".into(), format!("{:.1}", pct(pc_hits, pc_hits + pc_misses))));
+            rows.push(("scan", "provider_build_abandoned".into(), m.provider_build_abandoned.load(Relaxed).to_string()));
             rows.push(("scan", "lat_p50_us_approx".into(), m.latency_percentile_us(0.50).to_string()));
             rows.push(("scan", "lat_p95_us_approx".into(), m.latency_percentile_us(0.95).to_string()));
             rows.push(("scan", "lat_p99_us_approx".into(), m.latency_percentile_us(0.99).to_string()));
@@ -140,6 +163,14 @@ impl StatsTableProvider {
             rows.push(("pgwire", "lat_p95_us_approx".into(), m.pgwire_percentile_us(0.95).to_string()));
             rows.push(("pgwire", "lat_p99_us_approx".into(), m.pgwire_percentile_us(0.99).to_string()));
             rows.push(("pgwire", "lat_p999_us_approx".into(), m.pgwire_percentile_us(0.999).to_string()));
+        }
+
+        if let Some(snap) = &self.cache_sizes {
+            // Mirror the field-level doc: these caches don't evict; size
+            // tracks unique (project, table) pairs since process start.
+            let (fast_resolve, provider) = snap();
+            rows.push(("scan", "fast_resolve_cache_entries".into(), fast_resolve.to_string()));
+            rows.push(("scan", "provider_cache_entries".into(), provider.to_string()));
         }
 
         let components: Vec<&str> = rows.iter().map(|r| r.0).collect();

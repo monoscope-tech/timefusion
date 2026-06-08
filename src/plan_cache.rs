@@ -197,6 +197,17 @@ impl QueryHook for PlanCacheHook {
         // problem, gate the sweep on an `AtomicBool` swap-acquire.
         if self.cache.len() >= self.capacity {
             let target = self.capacity / 2;
+            // Operator-visible signal: this branch firing means the workload
+            // is pushing more distinct plan templates than the cache can
+            // hold. With the steady-state OLAP target (~5 templates) this
+            // should never fire in prod. If it does, expect the next ~256
+            // queries to thunder-herd into state.optimize().
+            tracing::warn!(
+                target = "plan_cache",
+                size = self.cache.len(),
+                capacity = self.capacity,
+                "plan_cache exceeded capacity — evicting ~half. Subsequent queries on evicted plans will re-pay the optimize cost. If this fires steadily, the workload's plan-template variety has grown past the cache budget."
+            );
             self.cache.retain(|_, _| {
                 // DashMap iterates per-shard so this is roughly random by
                 // hash distribution. Cheaper than an LRU clock and adequate
