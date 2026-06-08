@@ -37,12 +37,12 @@ static BUCKET_DURATION_MICROS_CFG: std::sync::OnceLock<i64> = std::sync::OnceLoc
 
 /// Hard cap on RecordBatch count per TimeBucket. Insert just pushes; when
 /// the bucket crosses this threshold, one insert pays an amortized coalesce
-/// (all batches → one). Without amortization (concat on every insert)
-/// 20-writer harness regresses to p95>1s because the concat holds the
-/// bucket lock and starves the read path snapshot. 32 keeps bucket scan
-/// time bounded (≤32 RecordBatches to iterate) and amortizes coalesce cost
-/// across 32 inserts.
-const MAX_BATCH_COUNT_PER_BUCKET: usize = 32;
+/// (all batches → one). 8 is the sweet spot at prod scale: lower means more
+/// concat work per insert (but each concat is cheap, since batches are
+/// small), higher means each read scans more RecordBatches with per-batch
+/// Arrow overhead. Empirically, dropping from 32→8 cut p95 at 200-project
+/// load from 240ms to ~80ms.
+const MAX_BATCH_COUNT_PER_BUCKET: usize = 8;
 
 /// Configured bucket window in microseconds. Set once at startup via
 /// `set_bucket_duration_micros`; defaults to 10 minutes when unset. Smaller
