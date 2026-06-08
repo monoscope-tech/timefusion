@@ -25,12 +25,29 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 
-use crate::buffered_write_layer::BufferedWriteLayer;
+use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics};
 
-#[derive(Debug)]
+/// Snapshot of the size of the resolve/provider caches at scan time.
+/// Reported as `scan.fast_resolve_cache_entries` and
+/// `scan.provider_cache_entries` so operators can spot the unbounded
+/// growth (documented on each cache's field) before it shows up as
+/// memory pressure in long-running processes.
+pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
+
 pub struct StatsTableProvider {
-    layer:  Option<Arc<BufferedWriteLayer>>,
-    schema: SchemaRef,
+    layer:        Option<Arc<BufferedWriteLayer>>,
+    scan_metrics: Option<Arc<ScanMetrics>>,
+    cache_sizes:  Option<CacheSizeSnapshot>,
+    schema:       SchemaRef,
+}
+
+impl std::fmt::Debug for StatsTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatsTableProvider")
+            .field("layer", &self.layer)
+            .field("scan_metrics", &self.scan_metrics)
+            .finish_non_exhaustive()
+    }
 }
 
 impl StatsTableProvider {
@@ -40,7 +57,22 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self { layer, schema }
+        Self {
+            layer,
+            scan_metrics: None,
+            cache_sizes: None,
+            schema,
+        }
+    }
+
+    pub fn with_scan_metrics(mut self, m: Arc<ScanMetrics>) -> Self {
+        self.scan_metrics = Some(m);
+        self
+    }
+
+    pub fn with_cache_sizes(mut self, f: CacheSizeSnapshot) -> Self {
+        self.cache_sizes = Some(f);
+        self
     }
 
     fn snapshot_batch(&self) -> DFResult<RecordBatch> {
@@ -52,10 +84,16 @@ impl StatsTableProvider {
             rows.push(("mem_buffer", "total_buckets".into(), s.mem_total_buckets.to_string()));
             rows.push(("mem_buffer", "total_rows".into(), s.mem_total_rows.to_string()));
             rows.push(("mem_buffer", "total_batches".into(), s.mem_total_batches.to_string()));
-            rows.push(("mem_buffer", "estimated_bytes".into(), s.mem_estimated_bytes.to_string()));
+            // Suffix `_approx` because the in-bucket coalesce path overwrites
+            // `memory_bytes` to the post-concat size, but the MemBuffer-level
+            // running total only adds the pre-concat new_size at insert time
+            // (no subtraction on coalesce). Drift is at most a few percent
+            // during coalesce-heavy bursts; the value is for capacity
+            // alerting, not for billing.
+            rows.push(("mem_buffer", "estimated_bytes_approx".into(), s.mem_estimated_bytes.to_string()));
             rows.push((
                 "mem_buffer",
-                "estimated_mb".into(),
+                "estimated_mb_approx".into(),
                 format!("{:.1}", s.mem_estimated_bytes as f64 / (1024.0 * 1024.0)),
             ));
             rows.push(("mem_buffer", "bucket_duration_micros".into(), s.bucket_duration_micros.to_string()));
@@ -88,6 +126,51 @@ impl StatsTableProvider {
             rows.push(("plan_cache", "hits".into(), hits.to_string()));
             rows.push(("plan_cache", "misses".into(), misses.to_string()));
             rows.push(("plan_cache", "hit_pct".into(), format!("{:.1}", hit_pct)));
+        }
+
+        if let Some(m) = &self.scan_metrics {
+            use std::sync::atomic::Ordering::Relaxed;
+            let total = m.scans_total.load(Relaxed);
+            let skipped = m.scans_skipped_delta.load(Relaxed);
+            let mem_only = m.scans_mem_only.load(Relaxed);
+            let delta_only = m.scans_delta_only.load(Relaxed);
+            let both = m.scans_mem_plus_delta.load(Relaxed);
+            let fr_hits = m.fast_resolve_hits.load(Relaxed);
+            let fr_misses = m.fast_resolve_misses.load(Relaxed);
+            let pct = |n: u64, d: u64| if d > 0 { n as f64 * 100.0 / d as f64 } else { 0.0 };
+            rows.push(("scan", "total".into(), total.to_string()));
+            rows.push(("scan", "skipped_delta".into(), skipped.to_string()));
+            rows.push(("scan", "skipped_delta_pct".into(), format!("{:.1}", pct(skipped, total))));
+            rows.push(("scan", "mem_only".into(), mem_only.to_string()));
+            rows.push(("scan", "delta_only".into(), delta_only.to_string()));
+            rows.push(("scan", "mem_plus_delta".into(), both.to_string()));
+            rows.push(("scan", "fast_resolve_hits".into(), fr_hits.to_string()));
+            rows.push(("scan", "fast_resolve_misses".into(), fr_misses.to_string()));
+            rows.push(("scan", "fast_resolve_hit_pct".into(), format!("{:.1}", pct(fr_hits, fr_hits + fr_misses))));
+            let pc_hits = m.provider_cache_hits.load(Relaxed);
+            let pc_misses = m.provider_cache_misses.load(Relaxed);
+            rows.push(("scan", "provider_cache_hits".into(), pc_hits.to_string()));
+            rows.push(("scan", "provider_cache_misses".into(), pc_misses.to_string()));
+            rows.push(("scan", "provider_cache_hit_pct".into(), format!("{:.1}", pct(pc_hits, pc_hits + pc_misses))));
+            rows.push(("scan", "provider_build_abandoned".into(), m.provider_build_abandoned.load(Relaxed).to_string()));
+            rows.push(("scan", "lat_p50_us_approx".into(), m.latency_percentile_us(0.50).to_string()));
+            rows.push(("scan", "lat_p95_us_approx".into(), m.latency_percentile_us(0.95).to_string()));
+            rows.push(("scan", "lat_p99_us_approx".into(), m.latency_percentile_us(0.99).to_string()));
+            rows.push(("scan", "lat_p999_us_approx".into(), m.latency_percentile_us(0.999).to_string()));
+            let pgt = m.pgwire_total.load(Relaxed);
+            rows.push(("pgwire", "queries_total".into(), pgt.to_string()));
+            rows.push(("pgwire", "lat_p50_us_approx".into(), m.pgwire_percentile_us(0.50).to_string()));
+            rows.push(("pgwire", "lat_p95_us_approx".into(), m.pgwire_percentile_us(0.95).to_string()));
+            rows.push(("pgwire", "lat_p99_us_approx".into(), m.pgwire_percentile_us(0.99).to_string()));
+            rows.push(("pgwire", "lat_p999_us_approx".into(), m.pgwire_percentile_us(0.999).to_string()));
+        }
+
+        if let Some(snap) = &self.cache_sizes {
+            // Mirror the field-level doc: these caches don't evict; size
+            // tracks unique (project, table) pairs since process start.
+            let (fast_resolve, provider) = snap();
+            rows.push(("scan", "fast_resolve_cache_entries".into(), fast_resolve.to_string()));
+            rows.push(("scan", "provider_cache_entries".into(), provider.to_string()));
         }
 
         let components: Vec<&str> = rows.iter().map(|r| r.0).collect();

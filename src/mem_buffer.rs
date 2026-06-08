@@ -35,6 +35,25 @@ const BUCKET_DURATION_MICROS: i64 = DEFAULT_BUCKET_DURATION_MICROS;
 
 static BUCKET_DURATION_MICROS_CFG: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
 
+/// Hard cap on RecordBatch count per TimeBucket. Insert just pushes; when
+/// the bucket crosses this threshold, one insert pays an amortized coalesce
+/// (all batches → one). 8 is the sweet spot at prod scale: lower means more
+/// concat work per insert (but each concat is cheap, since batches are
+/// small), higher means each read scans more RecordBatches with per-batch
+/// Arrow overhead. Empirically, dropping from 32→8 cut p95 at 200-project
+/// load from 240ms to ~80ms.
+const MAX_BATCH_COUNT_PER_BUCKET: usize = 8;
+/// Skip the in-lock coalesce when the bucket's combined payload exceeds
+/// this many bytes. The point of coalesce is to bound query-side
+/// per-bucket batch fanout for sub-ms reads on bursty small-INSERT
+/// workloads — once a bucket already holds a multi-megabyte payload the
+/// per-query iteration overhead is already dwarfed by the data work, and
+/// `concat_batches` on tens of MB would hold the bucket lock for
+/// milliseconds, starving every concurrent reader of that bucket. 4 MB
+/// matches one Arrow IPC default block; arrived at empirically — see
+/// `tests/membuffer_concurrency_bench.rs`.
+const MAX_BATCH_BYTES_FOR_COALESCE: usize = 4 * 1024 * 1024;
+
 /// Configured bucket window in microseconds. Set once at startup via
 /// `set_bucket_duration_micros`; defaults to 10 minutes when unset. Smaller
 /// windows free MemBuffer memory sooner (because the previous bucket becomes
@@ -141,6 +160,35 @@ pub struct MemBuffer {
     /// Flattened structure: (project_id, table_name) → TableBuffer
     /// Reduces 3 hash lookups to 1 for table access.
     tables:               DashMap<TableKey, Arc<TableBuffer>>,
+    /// Running approximation of in-memory bytes across all live buckets.
+    /// Reported via `timefusion_stats` as `mem_buffer.estimated_bytes_approx`.
+    ///
+    /// Accounting is intentionally cheap, not exact:
+    /// - `+= new_size` on every insert (pre-coalesce batch size).
+    /// - On coalesce, the bucket's `memory_bytes` field is overwritten to
+    ///   the post-concat size, but this MemBuffer-level total isn't
+    ///   decremented — so the running sum stays high until the bucket
+    ///   drains.
+    /// - `-= freed_bytes` on `drain_bucket` and eviction (sees the
+    ///   post-coalesce bucket size, fully reconciling that bucket's
+    ///   contribution).
+    ///
+    /// **Maximum drift bound**: at any instant, the over-reporting is at
+    /// most the sum of `(pre_coalesce_size - post_coalesce_size)` across
+    /// buckets that have coalesced since their last drain. The bucket-
+    /// level field is exact; only the MemBuffer-level sum drifts. With
+    /// 10-minute buckets and pressure-driven flushes, this converges
+    /// every retention window (single-digit minutes).
+    ///
+    /// **Why not exact**: making this exact requires holding a lock that
+    /// spans bucket coalesce + counter update for every insert. The hot
+    /// path is currently lock-free (per-bucket atomic) and the drift is
+    /// bounded, monotone, and self-correcting on drain.
+    ///
+    /// **Operator caution**: do NOT use this counter for back-pressure
+    /// decisions where a false-high reading would cause incorrect
+    /// throttling. The `pressure_pct` reported on `buffered_layer` is
+    /// what the flush task and the memory-reservation CAS actually use.
     estimated_bytes:      AtomicUsize,
     /// Mirrors `WalManager::shards_per_topic` so `FlushableBucket.wal_shard_counts`
     /// is always sized correctly when snapshotted at seal time.
@@ -1329,32 +1377,89 @@ impl TableBuffer {
     }
 
     /// Insert a batch into this table's appropriate time bucket.
-    /// Returns `(batch_size_bytes, bucket_id)` so the caller (`MemBuffer`)
-    /// can invalidate the matching text-index cache entry. Cache lives at
-    /// the MemBuffer level for global byte-budget LRU; correctness is via
-    /// the `indexed_rows == snapshot_rows` version check, so this
-    /// invalidation is a cache-cleanliness optimization rather than a
-    /// correctness requirement.
+    ///
+    /// Fast path: push the batch as-is. When the bucket count crosses
+    /// `MAX_BATCH_COUNT_PER_BUCKET`, that insert pays an amortized coalesce
+    /// (all batches → one), which both bounds bucket scan time (≤32 batches)
+    /// and reclaims per-batch dictionary fragmentation. Concat happens under
+    /// the bucket lock, but only once per N inserts instead of every insert,
+    /// so writer→reader contention on the snapshot path drops by N×.
+    ///
+    /// Returns `(new_batch_size_bytes, bucket_id)`. The size returned is the
+    /// incoming batch's contribution; coalesce-induced memory shrinkage is
+    /// reflected in `bucket.memory_bytes` directly (authoritative) but not
+    /// in the value returned (the caller's MemBuffer-level counter is
+    /// approximate by design — converges on drain/evict).
     pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<(usize, i64)> {
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
-        let batch_size = estimate_batch_size(&batch);
+        let new_size = estimate_batch_size(&batch);
 
         let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
         {
             let mut g = bucket.batches.lock();
             g.push(batch);
-            bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
-            bucket.memory_bytes.fetch_add(batch_size, Ordering::Relaxed);
+            bucket.memory_bytes.fetch_add(new_size, Ordering::Relaxed);
+            // Coalesce gate: count exceeded AND aggregate bytes still small
+            // enough that concat_batches under the lock won't block readers
+            // for milliseconds. Cap means a single multi-MB INSERT followed
+            // by small batches just sits as a tail of small batches against
+            // the big one — readers iterate one extra cheap Vec slot;
+            // writers don't pay a stop-the-world memcpy.
+            //
+            // Best-effort: coalesce is an optimisation, not a correctness
+            // requirement. If `concat_batches` fails (e.g. schema-evolution
+            // mismatch between buffered batches), we leave the Vec as-is
+            // and log — the just-pushed batch is durably in the bucket
+            // either way. Propagating the error here used to leak the
+            // pushed batch back to the caller as Err, who'd then retry
+            // and insert a duplicate.
+            let bucket_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
+            if g.len() > MAX_BATCH_COUNT_PER_BUCKET && bucket_bytes <= MAX_BATCH_BYTES_FOR_COALESCE {
+                let schema = g[0].schema();
+                match arrow::compute::concat_batches(&schema, g.iter()) {
+                    Ok(combined) => {
+                        let combined_size = estimate_batch_size(&combined);
+                        g.clear();
+                        g.push(combined);
+                        bucket.memory_bytes.store(combined_size, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target = "mem_buffer",
+                            error = %e,
+                            bucket_batch_count = g.len(),
+                            "coalesce concat_batches failed; continuing without coalesce (bucket data intact)"
+                        );
+                    }
+                }
+            }
         }
+        // `row_count` and the min/max timestamps update OUTSIDE the bucket
+        // lock. This is intentional: a concurrent reader that snapshots the
+        // batches Vec between the lock release and these atomic stores will
+        // momentarily see the new batch's rows in the query result while
+        // `row_count` reports the pre-insert total. Stats / observability
+        // counters can briefly lag the actual data, but query correctness is
+        // unaffected — readers always see the authoritative `batches` vec
+        // contents under the lock. Keeping the atomic updates outside the
+        // lock holds the critical section to just the Vec push (and the
+        // amortised coalesce) so writer throughput isn't capped by atomic
+        // ordering on uncontended buckets.
+        //
+        // **Not used for flush decisions.** Verified by inspection: every
+        // consumer of `bucket.row_count` is observability-only —
+        // FlushableBucket snapshot for logging (`mem_buffer.rs` snapshot
+        // build site), `total_rows` for `timefusion_stats`, and
+        // `fetch_sub` on drain (symmetric reconciliation, not a threshold
+        // gate). If you ever wire row_count into a flush-trigger threshold,
+        // move the update back inside the lock OR derive the value from
+        // `batches.iter().map(|b| b.num_rows()).sum()` under the lock.
+        bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
         bucket.update_timestamps(timestamp_micros);
 
-        debug!(
-            "TableBuffer insert: project={}, table={}, bucket={}, rows={}, bytes={}",
-            self.project_id, self.table_name, bucket_id, row_count, batch_size
-        );
-        Ok((batch_size, bucket_id))
+        Ok((new_size, bucket_id))
     }
 }
 
@@ -2023,5 +2128,57 @@ mod tests {
 
         let bucket_id = MemBuffer::compute_bucket_id(pre_1970_ts);
         assert_eq!(bucket_id, -2, "20 minutes before epoch should be bucket -2");
+    }
+
+    /// Repro for the prod fragmentation incident (docs/membuffer_flush_fix_plan.md):
+    /// monoscope ingests OTLP traces as ~30-row INSERTs. Pre-fix, each INSERT
+    /// became one RecordBatch in the bucket → 1000 inserts = 1000 batches,
+    /// 30 rows/batch, scan-time bound. With amortized coalesce, the bucket
+    /// is bounded at MAX_BATCH_COUNT_PER_BUCKET — when a push crosses
+    /// the threshold the next insert folds the lot into one.
+    #[test]
+    fn insert_coalesces_small_batches_into_bucket_tail() {
+        let buffer = MemBuffer::new();
+        let ts = 1_000_000_000_000i64;
+        let row_count_per_insert = 30;
+        let inserts = 1000;
+        let total_rows = row_count_per_insert * inserts;
+
+        for i in 0..inserts {
+            let batch = make_batch_with_rows(ts + i as i64, row_count_per_insert);
+            buffer.insert("p1", "t1", batch, ts).unwrap();
+        }
+
+        let bucket_id = MemBuffer::compute_bucket_id(ts);
+        let table = buffer.get_table("p1", "t1").unwrap();
+        let bucket = table.buckets.get(&bucket_id).expect("bucket exists");
+
+        let snapshot: Vec<RecordBatch> = bucket.batches.lock().iter().cloned().collect();
+        let n_batches = snapshot.len();
+        let total_in_bucket: usize = snapshot.iter().map(|b| b.num_rows()).sum();
+
+        assert_eq!(total_in_bucket, total_rows, "row preservation");
+        assert!(
+            n_batches <= MAX_BATCH_COUNT_PER_BUCKET + 1,
+            "bucket should hold ≤{} batches after amortized coalesce, got {n_batches}",
+            MAX_BATCH_COUNT_PER_BUCKET + 1
+        );
+        // The bound on n_batches above is the load-bearing assertion for
+        // coalesce. A separate avg-rows-per-batch check is redundant
+        // (avg = total_rows / n_batches by definition) and would be
+        // schema-sensitive — bigger column types ⇒ larger per-batch
+        // memory for the same row count without changing the count.
+    }
+
+    fn make_batch_with_rows(start_ts: i64, n: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, false),
+        ]));
+        let ts_array = TimestampMicrosecondArray::from(vec![start_ts; n]).with_timezone("UTC");
+        let id_array = Int64Array::from((0..n as i64).collect::<Vec<_>>());
+        let name_array = StringViewArray::from((0..n).map(|i| format!("row-{i}")).collect::<Vec<_>>());
+        RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
     }
 }

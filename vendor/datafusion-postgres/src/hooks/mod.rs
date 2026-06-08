@@ -49,6 +49,14 @@ pub trait QueryHook: Send + Sync {
         client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>>;
 
+    /// Whether the plan this hook returned (for `canonical_sql`) was already
+    /// optimized. Lets the do_query path skip a redundant `state.optimize()`
+    /// call. Default `false` is conservative — the caller will optimize the
+    /// plan as if it had been freshly parsed.
+    fn was_pre_optimized(&self, _canonical_sql: &str) -> bool {
+        false
+    }
+
     /// called at extended query execute phase, for query execution
     async fn handle_extended_query(
         &self,
