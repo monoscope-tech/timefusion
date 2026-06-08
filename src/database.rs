@@ -45,6 +45,73 @@ use crate::{
 // All default projects share the same table, with project_id as a partition column
 pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
 
+/// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
+#[derive(Debug, Default, Clone, Copy)]
+struct ScanShape {
+    skipped_delta:     bool,
+    has_mem:           bool,
+    has_delta:         bool,
+    fast_resolve_hit:  Option<bool>,
+}
+
+/// Counters surfaced via `timefusion_stats` for production debugging. Cheap to
+/// update on the hot path (Relaxed atomics); read via `snapshot()`. Histogram
+/// is fixed-bucket microsecond bins so percentile estimates are O(buckets) to
+/// compute without sorting.
+#[derive(Debug, Default)]
+pub struct ScanMetrics {
+    pub scans_total:           std::sync::atomic::AtomicU64,
+    pub scans_skipped_delta:   std::sync::atomic::AtomicU64,
+    pub scans_mem_only:        std::sync::atomic::AtomicU64,
+    pub scans_delta_only:      std::sync::atomic::AtomicU64,
+    pub scans_mem_plus_delta:  std::sync::atomic::AtomicU64,
+    pub fast_resolve_hits:     std::sync::atomic::AtomicU64,
+    pub fast_resolve_misses:   std::sync::atomic::AtomicU64,
+    /// Latency histogram of the full `ProjectRoutingTable::scan` call in
+    /// microseconds. Buckets are powers of two so reads at any duration land
+    /// in a single bucket via `usize::leading_zeros` math. Bucket i holds
+    /// scans whose duration_us fits in `[1<<i, 1<<(i+1))`. 32 buckets covers
+    /// 1us through ~1.2 hours.
+    pub scan_latency_buckets:  [std::sync::atomic::AtomicU64; 32],
+}
+
+impl ScanMetrics {
+    pub fn record_scan(&self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.scans_total.fetch_add(1, Relaxed);
+        if skipped_delta { self.scans_skipped_delta.fetch_add(1, Relaxed); }
+        match (has_mem, has_delta) {
+            (true, false) => { self.scans_mem_only.fetch_add(1, Relaxed); }
+            (false, true) => { self.scans_delta_only.fetch_add(1, Relaxed); }
+            (true, true) => { self.scans_mem_plus_delta.fetch_add(1, Relaxed); }
+            _ => {}
+        }
+        if let Some(hit) = fast_resolve_hit {
+            if hit { self.fast_resolve_hits.fetch_add(1, Relaxed); }
+            else { self.fast_resolve_misses.fetch_add(1, Relaxed); }
+        }
+        let bucket = if duration_us <= 1 { 0 } else { (64 - duration_us.leading_zeros() - 1).min(31) as usize };
+        self.scan_latency_buckets[bucket].fetch_add(1, Relaxed);
+    }
+
+    /// Estimate percentile from the power-of-two histogram. Returns the upper
+    /// bound of the bucket containing the p-th percentile, in microseconds.
+    /// Coarse — accurate to a factor of 2 — but adequate for prod alerting.
+    pub fn latency_percentile_us(&self, p: f64) -> u64 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let total: u64 = self.scan_latency_buckets.iter().map(|b| b.load(Relaxed)).sum();
+        if total == 0 { return 0; }
+        let target = (total as f64 * p) as u64;
+        let mut cum = 0u64;
+        for (i, b) in self.scan_latency_buckets.iter().enumerate() {
+            cum += b.load(Relaxed);
+            if cum >= target { return 1u64 << (i + 1); }
+        }
+        1u64 << 32
+    }
+}
+
+
 // Custom project tables: projects with their own S3 bucket get isolated tables
 // Key: (project_id, table_name) -> DeltaTable
 pub type CustomProjectTables = Arc<RwLock<HashMap<(String, String), Arc<RwLock<DeltaTable>>>>>;
@@ -466,6 +533,12 @@ pub struct Database {
     /// The safe direction (`true` when actually empty after vacuum) just
     /// runs the scan unnecessarily — no correctness risk.
     delta_has_files:                 dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
+    /// Per-process scan-path counters. Read by `timefusion_stats` so operators
+    /// can see — in prod — whether the in-memory shortcut is being taken,
+    /// what the resolve cache hit rate looks like, and how the latency
+    /// distribution shifts under real load. Counters are cumulative since
+    /// process start; deltas are useful for rate analysis.
+    pub scan_metrics:                Arc<ScanMetrics>,
     batch_queue:                     Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown:            Arc<CancellationToken>,
     config_pool:                     Option<PgPool>,
@@ -773,6 +846,7 @@ impl Database {
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: dashmap::DashMap::new(),
             delta_has_files: dashmap::DashMap::new(),
+            scan_metrics: Arc::new(ScanMetrics::default()),
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
             config_pool,
@@ -1266,7 +1340,10 @@ impl Database {
         // BufferedWriteLayer counters — see src/stats_table.rs.
         ctx.register_table(
             "timefusion_stats",
-            Arc::new(crate::stats_table::StatsTableProvider::new(self.buffered_layer.clone())),
+            Arc::new(
+                crate::stats_table::StatsTableProvider::new(self.buffered_layer.clone())
+                    .with_scan_metrics(self.scan_metrics.clone()),
+            ),
         )?;
 
         self.register_pg_settings_table(ctx)?;
@@ -3501,6 +3578,8 @@ impl TableProvider for ProjectRoutingTable {
     )]
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
         let span = tracing::Span::current();
+        let scan_start = std::time::Instant::now();
+        let scan_metrics = self.database.scan_metrics.clone();
 
         // Apply our custom optimizations to the filters
         let optimized_filters = self.apply_time_series_optimizations(filters)?;
@@ -3601,7 +3680,18 @@ impl TableProvider for ProjectRoutingTable {
         // Variant binary flows through scans untouched; downstream nodes
         // (variant_get, ->, ->>) consume it directly. JSON serialization
         // happens only at the root projection via VariantSelectRewriter.
-        let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> { Ok(plan) };
+        // Metric tags accumulated during the scan. parking_lot::Mutex is
+        // Send (Cell isn't) so the async future stays multi-thread-safe;
+        // uncontended lock+unlock is sub-100ns so the overhead is dwarfed
+        // by the work being measured.
+        let scan_state = parking_lot::Mutex::new(ScanShape::default());
+        let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> {
+            let shape = *scan_state.lock();
+            let us = scan_start.elapsed().as_micros() as u64;
+            scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
+            Ok(plan)
+        };
+        let tag_shape = |f: &dyn Fn(&mut ScanShape)| { f(&mut *scan_state.lock()); };
 
         // Check if buffered layer is configured
         let has_layer = self.database.buffered_layer().is_some();
@@ -3640,6 +3730,7 @@ impl TableProvider for ProjectRoutingTable {
         // successful commit; never flipped back (compaction reduces files but
         // doesn't go to zero in steady state).
         let skip_delta = skip_delta || self.database.delta_known_empty(&project_id, &self.table_name);
+        tag_shape(&|s| s.skipped_delta = skip_delta);
 
         // MemBuffer query. `query_partitioned_with_text_match` handles its
         // own atomic per-bucket prefilter inside the bucket lock — we must
@@ -3661,12 +3752,14 @@ impl TableProvider for ProjectRoutingTable {
             if let Some(f) = tantivy_id_filter.clone() {
                 delta_only_filters.push(f);
             }
+            tag_shape(&|s| s.has_delta = true);
             let plan = self.scan_delta_only(state, &project_id, projection, &delta_only_filters, limit).await?;
             return wrap_result(plan);
         }
 
         // Create MemorySourceConfig with multiple partitions for parallel execution
         let mem_plan = self.create_memory_exec(&mem_partitions, projection)?;
+        tag_shape(&|s| s.has_mem = true);
 
         // If we can skip Delta, return mem plan directly
         if skip_delta {
@@ -3719,11 +3812,18 @@ impl TableProvider for ProjectRoutingTable {
         // when we've already resolved this (project, table) pair before.
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
         let delta_table = match self.database.try_fast_resolve(&project_id, &self.table_name) {
-            Some(t) => t,
-            None => self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?,
+            Some(t) => {
+                tag_shape(&|s| s.fast_resolve_hit = Some(true));
+                t
+            }
+            None => {
+                tag_shape(&|s| s.fast_resolve_hit = Some(false));
+                self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?
+            }
         };
         let table = delta_table.read().await;
         let delta_plan = self.scan_delta_table(&table, state, projection, &delta_filters, limit).await?;
+        tag_shape(&|s| { s.has_mem = true; s.has_delta = true; });
 
         // Union both plans (mem data first for recency, then Delta for historical)
         wrap_result(UnionExec::try_new(vec![mem_plan, delta_plan])?)

@@ -26,11 +26,13 @@ use datafusion::{
 };
 
 use crate::buffered_write_layer::BufferedWriteLayer;
+use crate::database::ScanMetrics;
 
 #[derive(Debug)]
 pub struct StatsTableProvider {
-    layer:  Option<Arc<BufferedWriteLayer>>,
-    schema: SchemaRef,
+    layer:         Option<Arc<BufferedWriteLayer>>,
+    scan_metrics:  Option<Arc<ScanMetrics>>,
+    schema:        SchemaRef,
 }
 
 impl StatsTableProvider {
@@ -40,7 +42,12 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self { layer, schema }
+        Self { layer, scan_metrics: None, schema }
+    }
+
+    pub fn with_scan_metrics(mut self, m: Arc<ScanMetrics>) -> Self {
+        self.scan_metrics = Some(m);
+        self
     }
 
     fn snapshot_batch(&self) -> DFResult<RecordBatch> {
@@ -88,6 +95,31 @@ impl StatsTableProvider {
             rows.push(("plan_cache", "hits".into(), hits.to_string()));
             rows.push(("plan_cache", "misses".into(), misses.to_string()));
             rows.push(("plan_cache", "hit_pct".into(), format!("{:.1}", hit_pct)));
+        }
+
+        if let Some(m) = &self.scan_metrics {
+            use std::sync::atomic::Ordering::Relaxed;
+            let total = m.scans_total.load(Relaxed);
+            let skipped = m.scans_skipped_delta.load(Relaxed);
+            let mem_only = m.scans_mem_only.load(Relaxed);
+            let delta_only = m.scans_delta_only.load(Relaxed);
+            let both = m.scans_mem_plus_delta.load(Relaxed);
+            let fr_hits = m.fast_resolve_hits.load(Relaxed);
+            let fr_misses = m.fast_resolve_misses.load(Relaxed);
+            let pct = |n: u64, d: u64| if d > 0 { n as f64 * 100.0 / d as f64 } else { 0.0 };
+            rows.push(("scan", "total".into(), total.to_string()));
+            rows.push(("scan", "skipped_delta".into(), skipped.to_string()));
+            rows.push(("scan", "skipped_delta_pct".into(), format!("{:.1}", pct(skipped, total))));
+            rows.push(("scan", "mem_only".into(), mem_only.to_string()));
+            rows.push(("scan", "delta_only".into(), delta_only.to_string()));
+            rows.push(("scan", "mem_plus_delta".into(), both.to_string()));
+            rows.push(("scan", "fast_resolve_hits".into(), fr_hits.to_string()));
+            rows.push(("scan", "fast_resolve_misses".into(), fr_misses.to_string()));
+            rows.push(("scan", "fast_resolve_hit_pct".into(), format!("{:.1}", pct(fr_hits, fr_hits + fr_misses))));
+            rows.push(("scan", "lat_p50_us_approx".into(), m.latency_percentile_us(0.50).to_string()));
+            rows.push(("scan", "lat_p95_us_approx".into(), m.latency_percentile_us(0.95).to_string()));
+            rows.push(("scan", "lat_p99_us_approx".into(), m.latency_percentile_us(0.99).to_string()));
+            rows.push(("scan", "lat_p999_us_approx".into(), m.latency_percentile_us(0.999).to_string()));
         }
 
         let components: Vec<&str> = rows.iter().map(|r| r.0).collect();
