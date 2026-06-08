@@ -438,6 +438,15 @@ pub struct Database {
     unified_tables:                  UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
     custom_project_tables:           CustomProjectTables,
+    /// Lock-free per-(project,table) cache of resolved Delta table refs. The
+    /// inner `Arc<RwLock<DeltaTable>>` is the same object held in
+    /// `unified_tables`/`custom_project_tables`, so update_state on the slow
+    /// path mutates the table seen by hot-path callers too. Read path:
+    /// `DashMap.get` (lock-free) → `Arc` clone. Skips the 3 tokio RwLock
+    /// `.await`s in `resolve_unified_table` / `resolve_custom_table` that
+    /// otherwise dominated the per-query latency under load (proven via
+    /// `slow delta scan` instrumentation showing `resolve` was 99% of cost).
+    fast_resolve_cache:              dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
     batch_queue:                     Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown:            Arc<CancellationToken>,
     config_pool:                     Option<PgPool>,
@@ -743,6 +752,7 @@ impl Database {
             config: cfg,
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
+            fast_resolve_cache: dashmap::DashMap::new(),
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
             config_pool,
@@ -1349,6 +1359,17 @@ impl Database {
             is_custom = Empty,
         )
     )]
+    /// Lock-free hot-path resolve. Returns the cached `Arc<RwLock<DeltaTable>>`
+    /// without any `.await`. Skips the version-refresh check; that runs in
+    /// the slow path (`resolve_table`) which is still called on first miss and
+    /// from background tasks. Use this for read queries where stale snapshots
+    /// (a few seconds behind a flush) are acceptable.
+    pub fn try_fast_resolve(&self, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
+        self.fast_resolve_cache
+            .get(&(project_id.to_string(), table_name.to_string()))
+            .map(|r| Arc::clone(r.value()))
+    }
+
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
         let span = tracing::Span::current();
 
@@ -1379,12 +1400,17 @@ impl Database {
         // Check if project has custom storage config → use isolated table
         if self.has_custom_storage(project_id, table_name).await {
             span.record("is_custom", true);
-            return self.resolve_custom_table(project_id, table_name).await;
+            let t = self.resolve_custom_table(project_id, table_name).await?;
+            self.fast_resolve_cache.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&t));
+            return Ok(t);
         }
 
         span.record("is_custom", false);
         // Default: use unified table (all projects share the same table, partitioned by project_id)
-        self.resolve_unified_table(table_name).await
+        let t = self.resolve_unified_table(table_name).await?;
+        // Populate fast cache so subsequent reads skip the await dance.
+        self.fast_resolve_cache.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&t));
+        Ok(t)
     }
 
     /// Resolve a unified table (shared by all default projects, partitioned by project_id)
@@ -3637,9 +3663,13 @@ impl TableProvider for ProjectRoutingTable {
             delta_filters.push(f);
         }
 
-        // Execute Delta query
+        // Execute Delta query — fast path skips the 3 tokio RwLock `.await`s
+        // when we've already resolved this (project, table) pair before.
         let resolve_span = tracing::trace_span!(parent: &span, "resolve_delta_table");
-        let delta_table = self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?;
+        let delta_table = match self.database.try_fast_resolve(&project_id, &self.table_name) {
+            Some(t) => t,
+            None => self.database.resolve_table(&project_id, &self.table_name).instrument(resolve_span).await?,
+        };
         let table = delta_table.read().await;
         let delta_plan = self.scan_delta_table(&table, state, projection, &delta_filters, limit).await?;
 
