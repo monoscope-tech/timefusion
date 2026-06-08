@@ -120,6 +120,12 @@ impl StatsTableProvider {
             rows.push(("scan", "lat_p95_us_approx".into(), m.latency_percentile_us(0.95).to_string()));
             rows.push(("scan", "lat_p99_us_approx".into(), m.latency_percentile_us(0.99).to_string()));
             rows.push(("scan", "lat_p999_us_approx".into(), m.latency_percentile_us(0.999).to_string()));
+            let pgt = m.pgwire_total.load(Relaxed);
+            rows.push(("pgwire", "queries_total".into(), pgt.to_string()));
+            rows.push(("pgwire", "lat_p50_us_approx".into(), m.pgwire_percentile_us(0.50).to_string()));
+            rows.push(("pgwire", "lat_p95_us_approx".into(), m.pgwire_percentile_us(0.95).to_string()));
+            rows.push(("pgwire", "lat_p99_us_approx".into(), m.pgwire_percentile_us(0.99).to_string()));
+            rows.push(("pgwire", "lat_p999_us_approx".into(), m.pgwire_percentile_us(0.999).to_string()));
         }
 
         let components: Vec<&str> = rows.iter().map(|r| r.0).collect();

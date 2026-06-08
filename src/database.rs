@@ -45,6 +45,17 @@ use crate::{
 // All default projects share the same table, with project_id as a partition column
 pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
 
+/// Singleton handle so pgwire-side handlers can record end-to-end query
+/// latency into the same ScanMetrics the scan-side counters write to,
+/// without plumbing an Arc through the datafusion_postgres factory.
+static SCAN_METRICS_GLOBAL: std::sync::OnceLock<Arc<ScanMetrics>> = std::sync::OnceLock::new();
+pub fn scan_metrics_global() -> Option<Arc<ScanMetrics>> {
+    SCAN_METRICS_GLOBAL.get().cloned()
+}
+pub fn set_scan_metrics_global(m: Arc<ScanMetrics>) {
+    let _ = SCAN_METRICS_GLOBAL.set(m);
+}
+
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanShape {
@@ -73,6 +84,14 @@ pub struct ScanMetrics {
     /// scans whose duration_us fits in `[1<<i, 1<<(i+1))`. 32 buckets covers
     /// 1us through ~1.2 hours.
     pub scan_latency_buckets:  [std::sync::atomic::AtomicU64; 32],
+    /// End-to-end pgwire query latency histogram (same bucket scheme as
+    /// `scan_latency_buckets`). Recorded by `LoggingSimpleHandler` and
+    /// `LoggingExtendedQueryHandler` around the `DfSessionService::do_query`
+    /// call — the FULL server-side path from "harness received our query"
+    /// through "result encoded back to client". Compare to scan p95/p99 to
+    /// see how much of the user-visible tail is outside the scan call.
+    pub pgwire_total:          std::sync::atomic::AtomicU64,
+    pub pgwire_latency_buckets:[std::sync::atomic::AtomicU64; 32],
 }
 
 impl ScanMetrics {
@@ -94,16 +113,31 @@ impl ScanMetrics {
         self.scan_latency_buckets[bucket].fetch_add(1, Relaxed);
     }
 
+    /// Record a pgwire end-to-end query duration. Cheap on hot path —
+    /// just a counter bump and one histogram bin increment.
+    pub fn record_pgwire_query(&self, duration_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.pgwire_total.fetch_add(1, Relaxed);
+        let bucket = if duration_us <= 1 { 0 } else { (64 - duration_us.leading_zeros() - 1).min(31) as usize };
+        self.pgwire_latency_buckets[bucket].fetch_add(1, Relaxed);
+    }
+
     /// Estimate percentile from the power-of-two histogram. Returns the upper
     /// bound of the bucket containing the p-th percentile, in microseconds.
     /// Coarse — accurate to a factor of 2 — but adequate for prod alerting.
     pub fn latency_percentile_us(&self, p: f64) -> u64 {
+        Self::percentile_from_buckets(&self.scan_latency_buckets, p)
+    }
+    pub fn pgwire_percentile_us(&self, p: f64) -> u64 {
+        Self::percentile_from_buckets(&self.pgwire_latency_buckets, p)
+    }
+    fn percentile_from_buckets(buckets: &[std::sync::atomic::AtomicU64; 32], p: f64) -> u64 {
         use std::sync::atomic::Ordering::Relaxed;
-        let total: u64 = self.scan_latency_buckets.iter().map(|b| b.load(Relaxed)).sum();
+        let total: u64 = buckets.iter().map(|b| b.load(Relaxed)).sum();
         if total == 0 { return 0; }
         let target = (total as f64 * p) as u64;
         let mut cum = 0u64;
-        for (i, b) in self.scan_latency_buckets.iter().enumerate() {
+        for (i, b) in buckets.iter().enumerate() {
             cum += b.load(Relaxed);
             if cum >= target { return 1u64 << (i + 1); }
         }
@@ -846,7 +880,11 @@ impl Database {
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: dashmap::DashMap::new(),
             delta_has_files: dashmap::DashMap::new(),
-            scan_metrics: Arc::new(ScanMetrics::default()),
+            scan_metrics: {
+                let m = Arc::new(ScanMetrics::default());
+                set_scan_metrics_global(m.clone());
+                m
+            },
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
             config_pool,

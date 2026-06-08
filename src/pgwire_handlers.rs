@@ -101,6 +101,7 @@ pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
     auth_config:     AuthConfig,
     plan_cache:      Arc<PlanCacheHook>,
+    scan_metrics:    Option<Arc<crate::database::ScanMetrics>>,
 }
 
 impl LoggingHandlerFactory {
@@ -111,7 +112,13 @@ impl LoggingHandlerFactory {
             session_context,
             auth_config,
             plan_cache,
+            scan_metrics: None,
         }
+    }
+
+    pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
+        self.scan_metrics = Some(m);
+        self
     }
 
     /// Hook list passed to every `DfSessionService` instance the factory
@@ -128,11 +135,15 @@ impl LoggingHandlerFactory {
 
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
-        Arc::new(LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()))
+        let mut h = LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
+        if let Some(m) = &self.scan_metrics { h = h.with_scan_metrics(m.clone()); }
+        Arc::new(h)
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
-        Arc::new(LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks()))
+        let mut h = LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
+        if let Some(m) = &self.scan_metrics { h = h.with_scan_metrics(m.clone()); }
+        Arc::new(h)
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
@@ -160,20 +171,28 @@ impl ErrorHandler for LoggingErrorHandler {
 
 /// Simple query handler with tracing
 pub struct LoggingSimpleQueryHandler {
-    inner: DfSessionService,
+    inner:         DfSessionService,
+    scan_metrics:  Option<Arc<crate::database::ScanMetrics>>,
 }
 
 impl LoggingSimpleQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
         Self {
-            inner: DfSessionService::new(session_context),
+            inner:        DfSessionService::new(session_context),
+            scan_metrics: None,
         }
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
         Self {
-            inner: DfSessionService::new_with_hooks(session_context, hooks),
+            inner:        DfSessionService::new_with_hooks(session_context, hooks),
+            scan_metrics: None,
         }
+    }
+
+    pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
+        self.scan_metrics = Some(m);
+        self
     }
 }
 
@@ -269,25 +288,40 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         record_query_span(&span, query);
 
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
-        <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span).await
+        let t0 = std::time::Instant::now();
+        let result = <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span).await;
+        if let Some(m) = &self.scan_metrics {
+            m.record_pgwire_query(t0.elapsed().as_micros() as u64);
+        }
+        result
     }
 }
 
 /// Extended query handler with tracing
 pub struct LoggingExtendedQueryHandler {
-    inner: DfSessionService,
+    inner:        DfSessionService,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
+}
+
+impl LoggingExtendedQueryHandler {
+    pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
+        self.scan_metrics = Some(m);
+        self
+    }
 }
 
 impl LoggingExtendedQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
         Self {
-            inner: DfSessionService::new(session_context),
+            inner:        DfSessionService::new(session_context),
+            scan_metrics: None,
         }
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
         Self {
-            inner: DfSessionService::new_with_hooks(session_context, hooks),
+            inner:        DfSessionService::new_with_hooks(session_context, hooks),
+            scan_metrics: None,
         }
     }
 }
@@ -338,9 +372,14 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         record_query_span(&span, query);
 
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
-        <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows)
+        let t0 = std::time::Instant::now();
+        let result = <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows)
             .instrument(execute_span)
-            .await
+            .await;
+        if let Some(m) = &self.scan_metrics {
+            m.record_pgwire_query(t0.elapsed().as_micros() as u64);
+        }
+        result
     }
 }
 
@@ -349,7 +388,11 @@ pub async fn serve_with_logging(
     session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_config));
+    let mut factory = LoggingHandlerFactory::new(session_context, auth_config);
+    if let Some(m) = crate::database::scan_metrics_global() {
+        factory = factory.with_scan_metrics(m);
+    }
+    let handlers = Arc::new(factory);
     datafusion_postgres::serve_with_handlers(handlers, options, shutdown).await?;
     Ok(())
 }
@@ -361,7 +404,11 @@ pub async fn serve_with_listener(
     listener: tokio::net::TcpListener, session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let handlers = Arc::new(LoggingHandlerFactory::new(session_context, auth_config));
+    let mut factory = LoggingHandlerFactory::new(session_context, auth_config);
+    if let Some(m) = crate::database::scan_metrics_global() {
+        factory = factory.with_scan_metrics(m);
+    }
+    let handlers = Arc::new(factory);
     datafusion_postgres::serve_with_listener(listener, handlers, options, shutdown).await?;
     Ok(())
 }
