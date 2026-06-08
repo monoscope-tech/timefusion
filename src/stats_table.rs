@@ -25,14 +25,13 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 
-use crate::buffered_write_layer::BufferedWriteLayer;
-use crate::database::ScanMetrics;
+use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics};
 
 #[derive(Debug)]
 pub struct StatsTableProvider {
-    layer:         Option<Arc<BufferedWriteLayer>>,
-    scan_metrics:  Option<Arc<ScanMetrics>>,
-    schema:        SchemaRef,
+    layer:        Option<Arc<BufferedWriteLayer>>,
+    scan_metrics: Option<Arc<ScanMetrics>>,
+    schema:       SchemaRef,
 }
 
 impl StatsTableProvider {
@@ -42,7 +41,11 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self { layer, scan_metrics: None, schema }
+        Self {
+            layer,
+            scan_metrics: None,
+            schema,
+        }
     }
 
     pub fn with_scan_metrics(mut self, m: Arc<ScanMetrics>) -> Self {

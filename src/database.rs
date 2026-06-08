@@ -45,13 +45,19 @@ use crate::{
 // All default projects share the same table, with project_id as a partition column
 pub type UnifiedTables = Arc<RwLock<HashMap<String, Arc<RwLock<DeltaTable>>>>>;
 
+/// Per-key build de-duplicator for the cached Delta `TableProvider`. The inner
+/// `OnceCell` is initialised exactly once per `(project, table, version)`; all
+/// concurrent first-time misses share the same Arc and await the same build.
+type DeltaProviderCell = tokio::sync::OnceCell<Arc<dyn datafusion::datasource::TableProvider>>;
+type DeltaProviderCache = dashmap::DashMap<(String, String), (u64, Arc<DeltaProviderCell>)>;
+
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanShape {
-    skipped_delta:     bool,
-    has_mem:           bool,
-    has_delta:         bool,
-    fast_resolve_hit:  Option<bool>,
+    skipped_delta:    bool,
+    has_mem:          bool,
+    has_delta:        bool,
+    fast_resolve_hit: Option<bool>,
 }
 
 /// Counters surfaced via `timefusion_stats` for production debugging. Cheap to
@@ -60,43 +66,54 @@ struct ScanShape {
 /// compute without sorting.
 #[derive(Debug, Default)]
 pub struct ScanMetrics {
-    pub scans_total:           std::sync::atomic::AtomicU64,
-    pub scans_skipped_delta:   std::sync::atomic::AtomicU64,
-    pub scans_mem_only:        std::sync::atomic::AtomicU64,
-    pub scans_delta_only:      std::sync::atomic::AtomicU64,
-    pub scans_mem_plus_delta:  std::sync::atomic::AtomicU64,
-    pub fast_resolve_hits:     std::sync::atomic::AtomicU64,
-    pub fast_resolve_misses:   std::sync::atomic::AtomicU64,
+    pub scans_total:            std::sync::atomic::AtomicU64,
+    pub scans_skipped_delta:    std::sync::atomic::AtomicU64,
+    pub scans_mem_only:         std::sync::atomic::AtomicU64,
+    pub scans_delta_only:       std::sync::atomic::AtomicU64,
+    pub scans_mem_plus_delta:   std::sync::atomic::AtomicU64,
+    pub fast_resolve_hits:      std::sync::atomic::AtomicU64,
+    pub fast_resolve_misses:    std::sync::atomic::AtomicU64,
     /// Latency histogram of the full `ProjectRoutingTable::scan` call in
     /// microseconds. Buckets are powers of two so reads at any duration land
     /// in a single bucket via `usize::leading_zeros` math. Bucket i holds
     /// scans whose duration_us fits in `[1<<i, 1<<(i+1))`. 32 buckets covers
     /// 1us through ~1.2 hours.
-    pub scan_latency_buckets:  [std::sync::atomic::AtomicU64; 32],
+    pub scan_latency_buckets:   [std::sync::atomic::AtomicU64; 32],
     /// End-to-end pgwire query latency histogram (same bucket scheme as
     /// `scan_latency_buckets`). Recorded by `LoggingSimpleHandler` and
     /// `LoggingExtendedQueryHandler` around the `DfSessionService::do_query`
     /// call — the FULL server-side path from "harness received our query"
     /// through "result encoded back to client". Compare to scan p95/p99 to
     /// see how much of the user-visible tail is outside the scan call.
-    pub pgwire_total:          std::sync::atomic::AtomicU64,
-    pub pgwire_latency_buckets:[std::sync::atomic::AtomicU64; 32],
+    pub pgwire_total:           std::sync::atomic::AtomicU64,
+    pub pgwire_latency_buckets: [std::sync::atomic::AtomicU64; 32],
 }
 
 impl ScanMetrics {
     pub fn record_scan(&self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>) {
         use std::sync::atomic::Ordering::Relaxed;
         self.scans_total.fetch_add(1, Relaxed);
-        if skipped_delta { self.scans_skipped_delta.fetch_add(1, Relaxed); }
+        if skipped_delta {
+            self.scans_skipped_delta.fetch_add(1, Relaxed);
+        }
         match (has_mem, has_delta) {
-            (true, false) => { self.scans_mem_only.fetch_add(1, Relaxed); }
-            (false, true) => { self.scans_delta_only.fetch_add(1, Relaxed); }
-            (true, true) => { self.scans_mem_plus_delta.fetch_add(1, Relaxed); }
+            (true, false) => {
+                self.scans_mem_only.fetch_add(1, Relaxed);
+            }
+            (false, true) => {
+                self.scans_delta_only.fetch_add(1, Relaxed);
+            }
+            (true, true) => {
+                self.scans_mem_plus_delta.fetch_add(1, Relaxed);
+            }
             _ => {}
         }
         if let Some(hit) = fast_resolve_hit {
-            if hit { self.fast_resolve_hits.fetch_add(1, Relaxed); }
-            else { self.fast_resolve_misses.fetch_add(1, Relaxed); }
+            if hit {
+                self.fast_resolve_hits.fetch_add(1, Relaxed);
+            } else {
+                self.fast_resolve_misses.fetch_add(1, Relaxed);
+            }
         }
         let bucket = if duration_us <= 1 { 0 } else { (64 - duration_us.leading_zeros() - 1).min(31) as usize };
         self.scan_latency_buckets[bucket].fetch_add(1, Relaxed);
@@ -123,17 +140,20 @@ impl ScanMetrics {
     fn percentile_from_buckets(buckets: &[std::sync::atomic::AtomicU64; 32], p: f64) -> u64 {
         use std::sync::atomic::Ordering::Relaxed;
         let total: u64 = buckets.iter().map(|b| b.load(Relaxed)).sum();
-        if total == 0 { return 0; }
+        if total == 0 {
+            return 0;
+        }
         let target = (total as f64 * p) as u64;
         let mut cum = 0u64;
         for (i, b) in buckets.iter().enumerate() {
             cum += b.load(Relaxed);
-            if cum >= target { return 1u64 << (i + 1); }
+            if cum >= target {
+                return 1u64 << (i + 1);
+            }
         }
         1u64 << 32
     }
 }
-
 
 // Custom project tables: projects with their own S3 bucket get isolated tables
 // Key: (project_id, table_name) -> DeltaTable
@@ -548,6 +568,7 @@ pub struct Database {
     ///      `mark_delta_has_files` after every successful commit that adds
     ///      files. Sticky-monotonic — once `true`, never flipped back, so
     ///      compaction churn doesn't mistakenly hide data.
+    ///
     /// While `false`, `ProjectRoutingTable::scan` short-circuits the Delta
     /// scan entirely — MemBuffer is authoritative for all rows. Avoids the
     /// per-query cost of building a delta-rs TableProvider + scan plan for
@@ -571,7 +592,7 @@ pub struct Database {
     /// tasks find the cell, await its completion, and share the same Arc.
     /// Without this guard, N concurrent first-time queries would each pay
     /// the full build cost.
-    delta_provider_cache:            dashmap::DashMap<(String, String), (u64, Arc<tokio::sync::OnceCell<Arc<dyn datafusion::datasource::TableProvider>>>)>,
+    delta_provider_cache:            DeltaProviderCache,
     /// Per-process scan-path counters. Read by `timefusion_stats` so operators
     /// can see — in prod — whether the in-memory shortcut is being taken,
     /// what the resolve cache hit rate looks like, and how the latency
@@ -1380,10 +1401,7 @@ impl Database {
         // BufferedWriteLayer counters — see src/stats_table.rs.
         ctx.register_table(
             "timefusion_stats",
-            Arc::new(
-                crate::stats_table::StatsTableProvider::new(self.buffered_layer.clone())
-                    .with_scan_metrics(self.scan_metrics.clone()),
-            ),
+            Arc::new(crate::stats_table::StatsTableProvider::new(self.buffered_layer.clone()).with_scan_metrics(self.scan_metrics.clone())),
         )?;
 
         self.register_pg_settings_table(ctx)?;
@@ -1502,9 +1520,7 @@ impl Database {
     /// from background tasks. Use this for read queries where stale snapshots
     /// (a few seconds behind a flush) are acceptable.
     pub fn try_fast_resolve(&self, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
-        self.fast_resolve_cache
-            .get(&(project_id.to_string(), table_name.to_string()))
-            .map(|r| Arc::clone(r.value()))
+        self.fast_resolve_cache.get(&(project_id.to_string(), table_name.to_string())).map(|r| Arc::clone(r.value()))
     }
 
     /// Has this Delta table ever held a file (i.e. has any flush completed)?
@@ -1521,10 +1537,7 @@ impl Database {
     /// callback after a successful commit.
     pub fn mark_delta_has_files(&self, project_id: &str, table_name: &str) {
         let key = (project_id.to_string(), table_name.to_string());
-        let flag = self
-            .delta_has_files
-            .entry(key)
-            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let flag = self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -1562,7 +1575,10 @@ impl Database {
             let key = (project_id.to_string(), table_name.to_string());
             self.fast_resolve_cache.insert(key.clone(), Arc::clone(&t));
             let has_files = t.read().await.version().map(|v| v > 0).unwrap_or(false);
-            self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false))).store(has_files, std::sync::atomic::Ordering::Relaxed);
+            self.delta_has_files
+                .entry(key)
+                .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+                .store(has_files, std::sync::atomic::Ordering::Relaxed);
             return Ok(t);
         }
 
@@ -1572,7 +1588,10 @@ impl Database {
         let key = (project_id.to_string(), table_name.to_string());
         self.fast_resolve_cache.insert(key.clone(), Arc::clone(&t));
         let has_files = t.read().await.version().map(|v| v > 0).unwrap_or(false);
-        self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false))).store(has_files, std::sync::atomic::Ordering::Relaxed);
+        self.delta_has_files
+            .entry(key)
+            .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .store(has_files, std::sync::atomic::Ordering::Relaxed);
         Ok(t)
     }
 
@@ -3338,7 +3357,11 @@ impl ProjectRoutingTable {
         // expensive provider build runs OUTSIDE the lock, while concurrent
         // tasks all clone the same cell Arc and await its single init.
         let cell = {
-            let mut entry = self.database.delta_provider_cache.entry(cache_key.clone()).or_insert_with(|| (current_version, Arc::new(tokio::sync::OnceCell::new())));
+            let mut entry = self
+                .database
+                .delta_provider_cache
+                .entry(cache_key.clone())
+                .or_insert_with(|| (current_version, Arc::new(tokio::sync::OnceCell::new())));
             if entry.0 != current_version {
                 *entry = (current_version, Arc::new(tokio::sync::OnceCell::new()));
             }
@@ -3758,7 +3781,9 @@ impl TableProvider for ProjectRoutingTable {
             scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
             Ok(plan)
         };
-        let tag_shape = |f: &dyn Fn(&mut ScanShape)| { f(&mut *scan_state.lock()); };
+        let tag_shape = |f: &dyn Fn(&mut ScanShape)| {
+            f(&mut scan_state.lock());
+        };
 
         // Check if buffered layer is configured
         let has_layer = self.database.buffered_layer().is_some();
@@ -3890,7 +3915,10 @@ impl TableProvider for ProjectRoutingTable {
         };
         let table = delta_table.read().await;
         let delta_plan = self.scan_delta_table(&table, state, projection, &delta_filters, limit).await?;
-        tag_shape(&|s| { s.has_mem = true; s.has_delta = true; });
+        tag_shape(&|s| {
+            s.has_mem = true;
+            s.has_delta = true;
+        });
 
         // Union both plans (mem data first for recency, then Delta for historical)
         wrap_result(UnionExec::try_new(vec![mem_plan, delta_plan])?)

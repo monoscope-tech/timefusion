@@ -28,7 +28,6 @@
 //! also gain a schema-version token in the key (e.g. an `Arc<AtomicU64>`
 //! bumped on each reload) or a full flush on reload.
 
-
 use async_trait::async_trait;
 use datafusion::{
     logical_expr::LogicalPlan,

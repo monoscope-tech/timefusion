@@ -136,13 +136,17 @@ impl LoggingHandlerFactory {
 impl PgWireServerHandlers for LoggingHandlerFactory {
     fn simple_query_handler(&self) -> Arc<impl SimpleQueryHandler> {
         let mut h = LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
-        if let Some(m) = &self.scan_metrics { h = h.with_scan_metrics(m.clone()); }
+        if let Some(m) = &self.scan_metrics {
+            h = h.with_scan_metrics(m.clone());
+        }
         Arc::new(h)
     }
 
     fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
         let mut h = LoggingExtendedQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
-        if let Some(m) = &self.scan_metrics { h = h.with_scan_metrics(m.clone()); }
+        if let Some(m) = &self.scan_metrics {
+            h = h.with_scan_metrics(m.clone());
+        }
         Arc::new(h)
     }
 
@@ -171,8 +175,8 @@ impl ErrorHandler for LoggingErrorHandler {
 
 /// Simple query handler with tracing
 pub struct LoggingSimpleQueryHandler {
-    inner:         DfSessionService,
-    scan_metrics:  Option<Arc<crate::database::ScanMetrics>>,
+    inner:        DfSessionService,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
 }
 
 impl LoggingSimpleQueryHandler {
