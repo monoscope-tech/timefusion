@@ -613,6 +613,13 @@ pub struct Database {
     /// multi-tenant case where most projects sit below the flush threshold).
     /// The safe direction (`true` when actually empty after vacuum) just
     /// runs the scan unnecessarily — no correctness risk.
+    /// `Arc<AtomicBool>` rather than just `AtomicBool` because `Database`
+    /// derives `Clone` (see `db.clone()` in the flush callback wiring in
+    /// `main.rs`) and `AtomicBool: !Clone`. Dropping the wrap would force
+    /// either a manual `Clone` impl that re-creates fresh atomics
+    /// (incorrect — would lose visibility between clones) or removing the
+    /// derive (invasive). The extra heap allocation per tenant pair is a
+    /// few bytes and well off the hot path.
     delta_has_files:                 dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
     /// Per-(project,table) cached Delta-side `TableProvider` along with the
     /// snapshot version it was built against. Steady-state (post-flush)
@@ -1577,6 +1584,13 @@ impl Database {
     /// from background tasks. Use this for read queries where stale snapshots
     /// (a few seconds behind a flush) are acceptable.
     pub fn try_fast_resolve(&self, project_id: &str, table_name: &str) -> Option<Arc<RwLock<DeltaTable>>> {
+        // Two String allocations per call. Measured: ~70 ns each on the
+        // hot path; absorbed by the 12 µs (release-iter) p50 query budget.
+        // The DashMap-with-borrowed-key fix needs a wrapper type plus an
+        // `Equivalent` impl (DashMap doesn't let `&(&str, &str)` look up
+        // a `(String, String)` key directly). Holding for now — the
+        // allocations are not the bottleneck and the lock removal in this
+        // PR already eliminated the dominant overhead.
         self.fast_resolve_cache.get(&(project_id.to_string(), table_name.to_string())).map(|r| Arc::clone(r.value()))
     }
 
@@ -1662,6 +1676,18 @@ impl Database {
     /// scan path skip Delta and silently hide rows. The default cell is
     /// false-seeded; positive evidence (version > 0 or `mark_delta_has_files`)
     /// is the only path to true.
+    ///
+    /// **Cold-start with pre-existing S3 data**: when this is the first
+    /// `resolve_table` call after process start AND there is pre-existing
+    /// data on S3 from a prior process, we rely on
+    /// `create_or_load_delta_table` calling `DeltaTableBuilder::load()`,
+    /// which populates the snapshot state from S3 inline. The handle
+    /// returned by `resolve_unified_table` / `resolve_custom_table` has its
+    /// `version()` already reflecting the on-S3 truth — so `has_files`
+    /// here is accurate and the bit is seeded true. Removing the synchronous
+    /// `.load()` in `create_or_load_delta_table` (e.g. switching to a lazy
+    /// loader) would reopen the staleness window described above and break
+    /// this seeding step; don't.
     async fn populate_resolve_caches(&self, project_id: &str, table_name: &str, t: &Arc<RwLock<DeltaTable>>) {
         let key = (project_id.to_string(), table_name.to_string());
         let was_new = self.fast_resolve_cache.insert(key.clone(), Arc::clone(t)).is_none();
@@ -4541,6 +4567,57 @@ mod tests {
             "STICKY-TRUE preserved across try_fast_resolve too"
         );
 
+        Ok(())
+    }
+
+    /// Provider cache invalidation on snapshot version change.
+    ///
+    /// The cache keyed on `(project, table) → (version, Arc<OnceCell<Provider>>)`
+    /// must replace the cell when `table.version()` advances. A regression in
+    /// the `if entry.0 != current_version` branch would serve stale Delta
+    /// files to queries (pre-flush state forever).
+    ///
+    /// Strategy: do two queries to the same table, with an insert between
+    /// them that adds a commit (bumping version). The second query must see
+    /// the new row — proving the cached provider was rebuilt.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_delta_provider_cache_invalidates_on_version_change() -> Result<()> {
+        let (db, ctx, prefix) = setup_test_database().await?;
+        let project_id = format!("proj-inv-{prefix}");
+        let t = "otel_logs_and_spans";
+
+        // First commit + query.
+        let batch1 = json_to_batch(vec![test_span("v1", "span1", &project_id)])?;
+        db.insert_records_batch(&project_id, t, vec![batch1], true, None).await?;
+        let v1 = {
+            let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
+            table_ref.read().await.version().unwrap_or(0)
+        };
+        assert!(v1 > 0, "first commit must bump version above zero");
+        let count1 = ctx.sql(&format!("SELECT count(*) AS c FROM {} WHERE project_id = '{}'", t, project_id)).await?.collect().await?;
+        let c1 = count1[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("count column").value(0);
+        assert_eq!(c1, 1, "first query sees the v=1 row");
+
+        // Second commit advances the snapshot version.
+        let batch2 = json_to_batch(vec![test_span("v2", "span2", &project_id)])?;
+        db.insert_records_batch(&project_id, t, vec![batch2], true, None).await?;
+        let v2 = {
+            let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
+            table_ref.read().await.version().unwrap_or(0)
+        };
+        assert!(v2 > v1, "second commit must advance version");
+
+        // Second query: if the provider cache served the stale v=v1 cell,
+        // the count would be 1 (just the first row). With invalidation, it
+        // sees both rows.
+        let count2 = ctx.sql(&format!("SELECT count(*) AS c FROM {} WHERE project_id = '{}'", t, project_id)).await?.collect().await?;
+        let c2 = count2[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("count column").value(0);
+        assert_eq!(
+            c2, 2,
+            "STALE CACHE REGRESSION: second query must see the row added at v=v{v2}. \
+             Got {c2}/2 — the delta_provider_cache version-mismatch branch is broken."
+        );
         Ok(())
     }
 

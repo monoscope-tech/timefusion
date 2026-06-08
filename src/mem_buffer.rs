@@ -1428,6 +1428,15 @@ impl TableBuffer {
         // lock holds the critical section to just the Vec push (and the
         // amortised coalesce) so writer throughput isn't capped by atomic
         // ordering on uncontended buckets.
+        //
+        // **Not used for flush decisions.** Verified by inspection: every
+        // consumer of `bucket.row_count` is observability-only —
+        // FlushableBucket snapshot for logging (`mem_buffer.rs` snapshot
+        // build site), `total_rows` for `timefusion_stats`, and
+        // `fetch_sub` on drain (symmetric reconciliation, not a threshold
+        // gate). If you ever wire row_count into a flush-trigger threshold,
+        // move the update back inside the lock OR derive the value from
+        // `batches.iter().map(|b| b.num_rows()).sum()` under the lock.
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
         bucket.update_timestamps(timestamp_micros);
 

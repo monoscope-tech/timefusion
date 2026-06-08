@@ -195,6 +195,12 @@ impl QueryHook for PlanCacheHook {
         // (after the first sweep the size drops below `capacity` and
         // subsequent threads no-op). If this ever shows up as a real
         // problem, gate the sweep on an `AtomicBool` swap-acquire.
+        //
+        // TODO(perf): track in an issue if this fires in prod. The fix is
+        // a single AtomicBool::swap(true, Acquire) gate around the
+        // `cache.retain` call so only one thread sweeps per overflow
+        // crossing; nothing exotic but not worth the added state when the
+        // OLAP workload never trips this branch.
         if self.cache.len() >= self.capacity {
             let target = self.capacity / 2;
             // Operator-visible signal: this branch firing means the workload
@@ -241,11 +247,15 @@ impl QueryHook for PlanCacheHook {
     ///
     /// TOCTOU note: between this lookup and the handler calling
     /// `replace_params_with_values`, the capacity-limit sweep can evict the
-    /// entry. In that case we falsely return `false` on a subsequent call
-    /// and the handler will re-optimize an already-optimized plan — which
-    /// is semantically a no-op (optimization is idempotent on its own
-    /// output) and only costs the redundant work. Safer direction; no
-    /// correctness risk.
+    /// entry. In that case we falsely return `false` and the handler will
+    /// re-optimize the plan it has in hand — specifically, the
+    /// pre-optimised `LogicalPlan` stored on the `Portal` at parse time
+    /// (which IS the optimised plan our hook installed; the eviction only
+    /// removed our memo of having installed it, not the plan itself).
+    /// Re-running `state.optimize()` on an already-optimized plan is a
+    /// near-no-op (analyzer/optimizer rules detect inapplicability and
+    /// short-circuit) — at most a few hundred microseconds of redundant
+    /// work, well below the per-query budget. No correctness risk.
     fn was_pre_optimized(&self, canonical_sql: &str) -> bool {
         self.cache.contains_key(canonical_sql)
     }
