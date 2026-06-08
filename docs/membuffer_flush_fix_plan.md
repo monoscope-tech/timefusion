@@ -104,6 +104,10 @@ See `bench/replay_prod_load.rs` (and companion `bench/download_prod_sample.sh`).
 
 After fast-resolve fix (commit `da85e29`): **≤300 writers + 30 readers @ 1500 r/s ingest, p95 = 93 ms**. Higher reader counts (75+) still saturate the tokio runtime and tail latencies escalate.
 
+After Delta-empty short-circuit (`800d30d`) + lock-free plan cache (`5056454`) + skip-per-query-optimize (`cfadce9`): **≤300 writers + 75 readers @ 1500 r/s ingest, p95 = 74–84 ms**. The skip-optimize fix was the biggest single jump: vendored `datafusion-postgres` was running `state.optimize()` per query at ~30 ms p95 (subst=5 ms, optimize=27–32 ms), with the same handful of canonical OLAP plan templates repeating millions of times. Caching the OPTIMIZED logical plan + skipping the per-query optimize call dropped server-side pgwire p95 from 131 ms → 8 ms (16×).
+
+Current breaking points: 300 w + 100 r is right at the boundary (p95 = 100–110 ms). 500 writers saturates the tokio runtime entirely (p50 jumps to 375 ms).
+
 **How the fast-resolve fix worked:** dev-build instrumentation showed `slow delta scan: total=N resolve=N lock=0ms scan_build=4ms` — `resolve_table` was 99% of per-query Delta-side latency. Three tokio RwLock `.await`s per call (unified_tables map, last_written_versions map, inner table.version()) plus `should_refresh_table` returning true on the common `(Some(_), None)` state and firing `update_state` per query for un-flushed projects. Added a `DashMap` lock-free shortcut on Database, populated on first slow-path success. Hot path becomes `DashMap.get → Arc clone`, zero awaits.
 
 **Failure mode > 200 writers:** ~10 % of reads hit a periodic stall (p99 jumps to 900 ms+ while p50 stays under 30 ms). Diagnosed contributors:
