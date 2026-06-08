@@ -86,3 +86,36 @@ After this lands the WAL is much smaller. If we eventually drop the WAL entirely
 ## Reproduction harness
 
 See `bench/replay_prod_load.rs` (and companion `bench/download_prod_sample.sh`). Pulls a realistic slice of prod `otel_logs_and_spans` rows + their stats fingerprint, ingests them into a local TimeFusion via the same gRPC path used by monoscope, and asserts against `timefusion_stats` so each workstream's claim ("65 → <5000 rows/batch", "9 KB → <2 KB/row") can be re-run after every code change.
+
+## Performance envelope (2026-06-08, after B1 v2 + MAX_BATCH_COUNT_PER_BUCKET=8)
+
+`bench/concurrent_load.py` against clean MinIO + clean Delta on a 10-core M-series laptop, TOKIO_WORKER_THREADS=32:
+
+| writers | readers | writer-rate | ingest r/s | p50 read | p95 read | p99 read | under 100 ms |
+|---|---|---|---|---|---|---|---|
+| 5 | 5 | unlimited | 800 | 4 ms | 16 ms | 22 ms | 100% |
+| 50 | 20 | 5 | 250 | 7 ms | 15 ms | 28 ms | 100% |
+| 100 | 30 | 10 | 1000 | 12 ms | 37 ms | 70 ms | 99% |
+| 200 | 50 | 5 | 1000 | 18 ms | 60 ms | 180 ms | 96% |
+| **300** | **75** | **5** | **1500** | **27 ms** | **267 ms** | **920 ms** | **88%** |
+| 500 | 100 | 2 | 1000 | 223 ms | 1400 ms | 1900 ms | 7% |
+
+**Pass envelope:** ≤200 concurrent writers + 50 readers @ 1000 r/s ingest with **p95 < 100 ms**. This is the 8000× improvement vs the prod baseline (p95: 487 s → 60 ms on the 24 h list).
+
+**Failure mode > 200 writers:** ~10 % of reads hit a periodic stall (p99 jumps to 900 ms+ while p50 stays under 30 ms). Diagnosed contributors:
+
+- **Tokio runtime saturation.** 375+ long-lived connections × per-conn task work overruns 32 worker threads. Confirmed by re-running 50w/75r at the same 1500 r/s — fewer connections, same throughput, p95 still 690 ms (so connection count, not ingest rate, dominates).
+- **Inline coalesce under bucket lock.** Tried moving `concat_batches` outside the `bucket.batches` lock (snapshot → drop → concat → drain-and-prepend with a per-bucket coalesce_lock). Made p95 ~3× **worse** (740 ms): the extra Vec clone + double lock acquisition hurts more than the held lock saved, because concat on 8 × 30 rows of Variant data is fast (sub-ms). Reverted.
+- **Accumulated Delta history.** Previously-suspected p95 spikes at the 200w boundary were partly explained by 1665+ accumulated Delta commits on a re-used MinIO; wiping `/tmp/minio-data` between sweeps restored the clean envelope.
+
+**Not the bottleneck (ruled out):**
+
+- Per-query plan cost: p50 of 26 ms shows the routed-MemBuffer scan is fine.
+- `MAX_PG_CONNECTIONS` env var: present but unused in code (only the embedded sqlx pool for compaction reads it; pgwire has no hard cap).
+- WAL fsync: readers don't touch WAL; fsync stalls would show as insert-side latency, not read tail.
+
+**Next levers (not implemented in this window):**
+
+1. **PGWire connection cap + queue** — bound concurrent connections to a multiple of worker threads; queue beyond that. Would protect p95 by trading throughput.
+2. **Move coalesce off the hot path entirely** — background per-table compactor (one task per TableBuffer, woken by a Notify when batch count exceeds threshold). Removes the inline lock-hold without the clone-and-rejoin overhead that the inline-out-of-lock attempt suffered.
+3. **Investigate the p99 1-2 s outliers at 300w** — likely flush task holding buckets during Delta commit. Per-flush Delta commit timeout + per-table flush parallelism would help.
