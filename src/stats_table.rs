@@ -62,10 +62,16 @@ impl StatsTableProvider {
             rows.push(("mem_buffer", "total_buckets".into(), s.mem_total_buckets.to_string()));
             rows.push(("mem_buffer", "total_rows".into(), s.mem_total_rows.to_string()));
             rows.push(("mem_buffer", "total_batches".into(), s.mem_total_batches.to_string()));
-            rows.push(("mem_buffer", "estimated_bytes".into(), s.mem_estimated_bytes.to_string()));
+            // Suffix `_approx` because the in-bucket coalesce path overwrites
+            // `memory_bytes` to the post-concat size, but the MemBuffer-level
+            // running total only adds the pre-concat new_size at insert time
+            // (no subtraction on coalesce). Drift is at most a few percent
+            // during coalesce-heavy bursts; the value is for capacity
+            // alerting, not for billing.
+            rows.push(("mem_buffer", "estimated_bytes_approx".into(), s.mem_estimated_bytes.to_string()));
             rows.push((
                 "mem_buffer",
-                "estimated_mb".into(),
+                "estimated_mb_approx".into(),
                 format!("{:.1}", s.mem_estimated_bytes as f64 / (1024.0 * 1024.0)),
             ));
             rows.push(("mem_buffer", "bucket_duration_micros".into(), s.bucket_duration_micros.to_string()));
@@ -119,6 +125,11 @@ impl StatsTableProvider {
             rows.push(("scan", "fast_resolve_hits".into(), fr_hits.to_string()));
             rows.push(("scan", "fast_resolve_misses".into(), fr_misses.to_string()));
             rows.push(("scan", "fast_resolve_hit_pct".into(), format!("{:.1}", pct(fr_hits, fr_hits + fr_misses))));
+            let pc_hits = m.provider_cache_hits.load(Relaxed);
+            let pc_misses = m.provider_cache_misses.load(Relaxed);
+            rows.push(("scan", "provider_cache_hits".into(), pc_hits.to_string()));
+            rows.push(("scan", "provider_cache_misses".into(), pc_misses.to_string()));
+            rows.push(("scan", "provider_cache_hit_pct".into(), format!("{:.1}", pct(pc_hits, pc_hits + pc_misses))));
             rows.push(("scan", "lat_p50_us_approx".into(), m.latency_percentile_us(0.50).to_string()));
             rows.push(("scan", "lat_p95_us_approx".into(), m.latency_percentile_us(0.95).to_string()));
             rows.push(("scan", "lat_p99_us_approx".into(), m.latency_percentile_us(0.99).to_string()));

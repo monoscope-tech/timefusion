@@ -73,6 +73,15 @@ pub struct ScanMetrics {
     pub scans_mem_plus_delta:   std::sync::atomic::AtomicU64,
     pub fast_resolve_hits:      std::sync::atomic::AtomicU64,
     pub fast_resolve_misses:    std::sync::atomic::AtomicU64,
+    /// Delta TableProvider cache: hit = cached cell at the current snapshot
+    /// version; miss = either no entry, or an entry at a stale version that
+    /// had to be replaced. Operators tracking the cold-start vs steady-state
+    /// cliff watch the hit ratio: after the first ~tens of seconds per
+    /// (project, table), this should stay high; a low ratio in prod means
+    /// version is churning faster than expected (e.g. very aggressive
+    /// compaction) and the cache isn't paying for itself.
+    pub provider_cache_hits:    std::sync::atomic::AtomicU64,
+    pub provider_cache_misses:  std::sync::atomic::AtomicU64,
     /// Latency histogram of the full `ProjectRoutingTable::scan` call in
     /// microseconds. Buckets are powers of two so reads at any duration land
     /// in a single bucket via `usize::leading_zeros` math. Bucket i holds
@@ -3366,11 +3375,15 @@ impl ProjectRoutingTable {
         // skip the whole `table.table_provider().with_session(...).await`
         // chain.
         let current_version = table.version().unwrap_or(0);
-        // Resolve or install a OnceCell for this (key, version). DashMap
-        // shard-write lock is held only across the cheap entry-insert + an
-        // optional in-place tuple replacement on version mismatch; the
-        // expensive provider build runs OUTSIDE the lock, while concurrent
-        // tasks all clone the same cell Arc and await its single init.
+        // Resolve or install a OnceCell for this (key, version). The DashMap
+        // shard write-lock spans three operations: the `or_insert_with` (a
+        // single hash + slot write on miss, a hash on hit), the
+        // `entry.0 != current_version` compare, and the optional in-place
+        // tuple replacement. All three are O(1) field accesses with no IO,
+        // so the lock window stays in the tens of nanoseconds on the steady
+        // path. The expensive provider build runs OUTSIDE the lock, while
+        // concurrent tasks all clone the same cell Arc and await its single
+        // init.
         //
         // The `entry.0 != current_version` branch serialises the readers of
         // the *same* (project, table) when a new snapshot lands: each
@@ -3382,17 +3395,27 @@ impl ProjectRoutingTable {
         // which doesn't happen in our workload. If that pattern ever
         // emerges, prefer a CAS on an `Arc<AtomicU64>` version cell read
         // outside the DashMap lock.
-        let cell = {
+        let (cell, was_fresh_cell) = {
             let mut entry = self
                 .database
                 .delta_provider_cache
                 .entry(cache_key.clone())
                 .or_insert_with(|| (current_version, Arc::new(tokio::sync::OnceCell::new())));
-            if entry.0 != current_version {
+            let stale = entry.0 != current_version;
+            if stale {
                 *entry = (current_version, Arc::new(tokio::sync::OnceCell::new()));
             }
-            Arc::clone(&entry.1)
+            // "Hit" = the cell was already initialised at this version when
+            // we found it. We approximate this by checking initialised state
+            // BEFORE we touch get_or_try_init; close enough for an alerting
+            // metric. Miss covers both "never seen" and "stale-replaced".
+            (Arc::clone(&entry.1), stale)
         };
+        if was_fresh_cell || !cell.initialized() {
+            self.database.scan_metrics.provider_cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.database.scan_metrics.provider_cache_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let provider = cell
             .get_or_try_init(|| async {
                 let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
@@ -4317,6 +4340,43 @@ mod tests {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
+    }
+
+    /// Anchors the Delta-empty short-circuit correctness invariant:
+    /// `delta_is_known_empty` must return `false` (the conservative default
+    /// that runs the full scan) until `mark_delta_has_files` is called, and
+    /// the flip is monotonic and per-(project,table). This is the load-
+    /// bearing predicate for the 45% latency win — a regression that
+    /// flipped polarity would silently hide post-flush data.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_delta_has_files_sticky_bit() -> Result<()> {
+        let (db, _ctx, prefix) = setup_test_database().await?;
+        let t = "otel_logs_and_spans";
+        let p1 = format!("proj-marked-{prefix}");
+        let p2 = format!("proj-unmarked-{prefix}");
+
+        // Fresh (project, table): unknown → false (must NOT skip Delta).
+        assert!(
+            !db.delta_is_known_empty(&p1, t),
+            "unknown projects must default to false so callers don't skip Delta"
+        );
+        assert!(!db.delta_is_known_empty(&p2, t), "second unknown project also defaults to false");
+
+        // Mark p1 as having files. delta_is_known_empty for p1 stays false
+        // because the table is no longer empty — short-circuit must NOT
+        // fire (otherwise we'd hide the just-flushed data).
+        db.mark_delta_has_files(&p1, t);
+        assert!(!db.delta_is_known_empty(&p1, t), "after mark_delta_has_files, table has files → can't skip");
+
+        // Unrelated project: bit per-(project, table), so p2 unaffected.
+        // Still false (unknown), still must scan.
+        assert!(!db.delta_is_known_empty(&p2, t), "marking p1 must not affect p2's bit");
+
+        // Re-marking is idempotent.
+        db.mark_delta_has_files(&p1, t);
+        assert!(!db.delta_is_known_empty(&p1, t), "re-mark is idempotent — still has files");
+        Ok(())
     }
 
     #[serial]

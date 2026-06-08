@@ -263,7 +263,7 @@ def main():
                 print(f"  t={time.perf_counter()-t0:5.1f}s ins={ins:,} q={queries_so_far} "
                       f"mb_rows={int(s.get('mem_buffer.total_rows',0)):,} "
                       f"mb_batches={int(s.get('mem_buffer.total_batches',0))} "
-                      f"mb_mb={s.get('mem_buffer.estimated_mb',0):.0f} "
+                      f"mb_mb={s.get('mem_buffer.estimated_mb_approx',0):.0f} "
                       f"buckets={int(s.get('mem_buffer.total_buckets',0))} "
                       f"oldest={int(s.get('mem_buffer.oldest_bucket_age_secs',0))}s "
                       f"press={int(s.get('buffered_layer.pressure_pct',0))}%", flush=True)
@@ -304,14 +304,14 @@ def main():
     print(f"  mem_buffer.total_rows     {int(pre.get('mem_buffer.total_rows',0)):>10,} -> {int(post.get('mem_buffer.total_rows',0)):>10,}")
     print(f"  mem_buffer.total_batches  {int(pre.get('mem_buffer.total_batches',0)):>10,} -> {int(post.get('mem_buffer.total_batches',0)):>10,}")
     print(f"  mem_buffer.total_buckets  {int(pre.get('mem_buffer.total_buckets',0)):>10,} -> {int(post.get('mem_buffer.total_buckets',0)):>10,}")
-    print(f"  mem_buffer.estimated_mb   {pre.get('mem_buffer.estimated_mb',0):>10.1f} -> {post.get('mem_buffer.estimated_mb',0):>10.1f}")
+    print(f"  mem_buffer.estimated_mb   {pre.get('mem_buffer.estimated_mb_approx',0):>10.1f} -> {post.get('mem_buffer.estimated_mb_approx',0):>10.1f}")
     print(f"  buffered_layer.pressure   {pre.get('buffered_layer.pressure_pct',0):>10.0f}%-> {post.get('buffered_layer.pressure_pct',0):>10.0f}%")
     print(f"  wal.disk_mb               {pre.get('wal.disk_mb',0):>10.0f}  -> {post.get('wal.disk_mb',0):>10.0f}")
     if post.get('mem_buffer.total_batches', 0) > 0:
         rpb = post.get('mem_buffer.total_rows', 0) / post['mem_buffer.total_batches']
         print(f"  rows/batch (end)          {rpb:>10.1f}   target >5000")
     if post.get('mem_buffer.total_rows', 0) > 0:
-        bpr = post.get('mem_buffer.estimated_bytes', 0) / post['mem_buffer.total_rows']
+        bpr = post.get('mem_buffer.estimated_bytes_approx', 0) / post['mem_buffer.total_rows']
         print(f"  bytes/row (end)           {bpr:>10.0f}   target <2048")
 
     print(f"\n# overall: {'PASS' if overall_pass else 'FAIL'}")

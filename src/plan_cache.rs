@@ -186,6 +186,15 @@ impl QueryHook for PlanCacheHook {
         // pattern-diverse load (ad-hoc debug sessions) it avoids the thrash
         // a full clear would cause when one burst of distinct queries
         // displaces the hot templates.
+        //
+        // Concurrency note: this branch is unguarded — under a burst of
+        // novel queries all missing simultaneously (300 connections in an
+        // ad-hoc debug session), N threads could each cross the threshold
+        // and call `retain` in parallel, each one taking shard write locks
+        // and re-counting. That stacks the cost but is self-limiting
+        // (after the first sweep the size drops below `capacity` and
+        // subsequent threads no-op). If this ever shows up as a real
+        // problem, gate the sweep on an `AtomicBool` swap-acquire.
         if self.cache.len() >= self.capacity {
             let target = self.capacity / 2;
             self.cache.retain(|_, _| {
@@ -218,6 +227,14 @@ impl QueryHook for PlanCacheHook {
     /// in `self.cache` after `state.optimize()` ran inside
     /// `handle_extended_parse_query`, so a cache lookup here is the
     /// authoritative answer.
+    ///
+    /// TOCTOU note: between this lookup and the handler calling
+    /// `replace_params_with_values`, the capacity-limit sweep can evict the
+    /// entry. In that case we falsely return `false` on a subsequent call
+    /// and the handler will re-optimize an already-optimized plan — which
+    /// is semantically a no-op (optimization is idempotent on its own
+    /// output) and only costs the redundant work. Safer direction; no
+    /// correctness risk.
     fn was_pre_optimized(&self, canonical_sql: &str) -> bool {
         self.cache.contains_key(canonical_sql)
     }

@@ -33,9 +33,14 @@ ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 DUMP = DATA / "sample.jsonl.gz"
 
-PROD_URL = os.environ.get("TF_PROD_URL") or sys.exit(
-    "TF_PROD_URL is required — set it to your TimeFusion connection string"
-)
+def prod_url() -> str:
+    """Read TF_PROD_URL on demand. Lazy so importing this module doesn't
+    exit when the env var is unset — tooling that only invokes the
+    `validate` subcommand doesn't need a prod URL at all."""
+    url = os.environ.get("TF_PROD_URL")
+    if not url:
+        sys.exit("TF_PROD_URL is required — set it to your TimeFusion connection string")
+    return url
 LOCAL_HOST = os.environ.get("PGWIRE_HOST", "127.0.0.1")
 LOCAL_PORT = int(os.environ.get("PGWIRE_PORT", "12345"))
 LOCAL_URL = f"host={LOCAL_HOST} port={LOCAL_PORT} user=postgres password=postgres dbname=postgres"
@@ -103,14 +108,14 @@ def download(args):
     if args.hours:
         where_base += f" AND timestamp >= now() - INTERVAL '{int(args.hours)} hours'"
 
-    print(f"[download] {PROD_URL.split('@')[-1]}  project={args.project}  hours={args.hours}  limit={args.limit}")
+    print(f"[download] {prod_url().split('@')[-1]}  project={args.project}  hours={args.hours}  limit={args.limit}")
     t0 = time.time()
     n = 0
     page = min(args.limit, 25_000)
     cursor_ts: str | None = None
     cursor_id: str | None = None
 
-    with psycopg.connect(PROD_URL) as c, c.cursor() as cur, gzip.open(DUMP, "wt") as out:
+    with psycopg.connect(prod_url()) as c, c.cursor() as cur, gzip.open(DUMP, "wt") as out:
         while n < args.limit:
             where = where_base
             if cursor_ts is not None:
@@ -249,7 +254,7 @@ TARGETS = {
     "rows_per_batch":        (lambda s: s["mem_buffer.total_rows"] / max(s["mem_buffer.total_batches"], 1),
                               lambda v: v > 5000,
                               ">5000 rows/batch (now 65)"),
-    "bytes_per_row":         (lambda s: s["mem_buffer.estimated_bytes"] / max(s["mem_buffer.total_rows"], 1),
+    "bytes_per_row":         (lambda s: s["mem_buffer.estimated_bytes_approx"] / max(s["mem_buffer.total_rows"], 1),
                               lambda v: v < 2048,
                               "<2 KB/row (now 9 KB)"),
     "oldest_bucket_age_secs":(lambda s: s["mem_buffer.oldest_bucket_age_secs"],
@@ -285,7 +290,7 @@ def validate(args):
     with psycopg.connect(LOCAL_URL, autocommit=True) as conn, conn.cursor() as cur:
         stats = _read_stats(cur)
         print(f"\n# timefusion_stats (project filter not applied — these are global)")
-        for k in ("mem_buffer.total_rows","mem_buffer.total_batches","mem_buffer.estimated_mb",
+        for k in ("mem_buffer.total_rows","mem_buffer.total_batches","mem_buffer.estimated_mb_approx",
                   "mem_buffer.oldest_bucket_age_secs","buffered_layer.pressure_pct","wal.disk_mb"):
             print(f"  {k:40s} {stats.get(k)}")
 
