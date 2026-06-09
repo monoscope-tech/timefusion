@@ -7,7 +7,7 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use datafusion::sql::sqlparser::ast::{Expr, Set, Statement};
-use log::{info, warn};
+use log::{debug, info};
 use pgwire::api::auth::DefaultServerParameterProvider;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::ClientInfo;
@@ -179,6 +179,18 @@ async fn try_respond_set_statements(
                     | "application_name"
                     | "extra_float_digits"
                     | "search_path"
+                    // Session-formatting keys every pg client sends at connect.
+                    // We don't honor them functionally (datafusion has its own
+                    // text encoding / message level), but we acknowledge SET
+                    // success instead of warning per connection — the warns
+                    // flooded prod logs at high connection turnover.
+                    | "client_encoding"
+                    | "client_min_messages"
+                    | "standard_conforming_strings"
+                    | "lc_messages"
+                    | "lc_monetary"
+                    | "lc_numeric"
+                    | "lc_time"
             ) && !values.is_empty()
             {
                 // postgres configuration variables
@@ -229,9 +241,12 @@ async fn try_respond_set_statements(
         _ => {}
     }
 
-    // fallback to datafusion and ignore all errors
+    // fallback to datafusion and ignore all errors. debug! not warn! so a
+    // novel `SET` from a client we don't recognise doesn't flood prod logs —
+    // we acknowledge SET success below regardless, matching how the
+    // allowlist branch above treats benign session vars.
     if let Err(e) = execute_set_statement(session_context, statement.clone()).await {
-        warn!(
+        debug!(
             "SET statement {statement} is not supported by datafusion, error {e}, statement ignored",
         );
     }
