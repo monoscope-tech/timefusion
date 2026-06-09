@@ -2315,9 +2315,16 @@ mod tests {
 
     #[test]
     fn test_flushable_buckets_carry_all_batches() {
-        // We no longer pre-compact at flush time — the parquet writer downstream
-        // regroups rows into row groups itself, and pre-compacting forces an
-        // unnecessary deep copy of the entire bucket.
+        // Flush-time pre-compaction is gone (the parquet writer downstream
+        // regroups rows into row groups itself, and pre-compacting forced an
+        // unnecessary deep copy of the entire bucket).
+        //
+        // Insert-time coalesce still applies: when `batches.len()` crosses
+        // `MAX_BATCH_COUNT_PER_BUCKET` we concat under the bucket lock to
+        // amortise per-batch RecordBatch overhead. So after N tiny inserts
+        // the flushable bucket may carry fewer than N RecordBatches —
+        // the invariant the flush path actually cares about is "every row
+        // makes it through", not "one RecordBatch per insert".
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
 
@@ -2329,11 +2336,19 @@ mod tests {
 
         let cutoff = MemBuffer::compute_bucket_id(ts) + 1;
         let flushable = buffer.get_flushable_buckets(cutoff);
-        assert_eq!(flushable.len(), 1);
-        assert_eq!(flushable[0].batches.len(), total_rows);
+        assert_eq!(flushable.len(), 1, "all inserts share one time bucket");
         assert_eq!(flushable[0].row_count, total_rows);
         let summed: usize = flushable[0].batches.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(summed, total_rows);
+        assert_eq!(summed, total_rows, "no rows lost to insert-time coalesce");
+        // Coalesce keeps the in-bucket batch count bounded by MAX_BATCH_COUNT_PER_BUCKET + 1
+        // (concat fires when len > MAX_BATCH_COUNT_PER_BUCKET, then the next push reaches
+        // the cap again before the next concat).
+        assert!(
+            flushable[0].batches.len() <= MAX_BATCH_COUNT_PER_BUCKET + 1,
+            "got {} batches, expected ≤ {}",
+            flushable[0].batches.len(),
+            MAX_BATCH_COUNT_PER_BUCKET + 1
+        );
     }
 
     #[test]
