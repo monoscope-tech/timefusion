@@ -307,6 +307,7 @@ fn find_table_scan_name(plan: &LogicalPlan) -> Option<String> {
 /// Given a `Join` and the target table name, decide which child is the target
 /// (the side that scans the target table) and extract equi-join key pairs in
 /// `(target_col_name, source_col_name)` order.
+#[allow(clippy::type_complexity)] // Tuple shape is the natural result of "(target, source, key_pairs)" and a named type would be one-shot.
 fn identify_target_side<'a>(join: &'a Join, target_table_name: &str) -> Result<(&'a LogicalPlan, &'a LogicalPlan, Vec<(String, String)>)> {
     let left_scan = find_table_scan_name(&join.left);
     let right_scan = find_table_scan_name(&join.right);

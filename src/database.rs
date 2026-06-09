@@ -2442,10 +2442,7 @@ impl Database {
 
                     // Compute added files from the post-write snapshot while we still
                     // hold the write lock — no extra log scan required.
-                    let added: Vec<String> = table
-                        .get_file_uris()
-                        .map(|it| it.filter(|u| !pre_uris.contains(u)).collect())
-                        .unwrap_or_default();
+                    let added: Vec<String> = table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
 
                     // Invalidate statistics cache after successful write
                     drop(table); // Release write lock before async operation
@@ -3369,9 +3366,7 @@ impl ProjectRoutingTable {
         self.database
             .insert_records_batch(&project_id, &self.table_name, vec![converted], false, None)
             .await
-            .map_err(|e| {
-                DataFusionError::Execution(format!("fast_insert_batch for project {} table {}: {}", project_id, self.table_name, e))
-            })?;
+            .map_err(|e| DataFusionError::Execution(format!("fast_insert_batch for project {} table {}: {}", project_id, self.table_name, e)))?;
         Ok(total_rows)
     }
 

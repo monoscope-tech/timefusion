@@ -33,19 +33,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::{
     arrow::{array::UInt64Array, datatypes::Schema, record_batch::RecordBatch},
-    catalog::MemTable,
     common::{
         ParamValues,
         tree_node::{Transformed, TreeNode},
     },
-    logical_expr::{Cast, Expr, LogicalPlan, LogicalPlanBuilder, dml::WriteOp},
+    logical_expr::{Cast, Expr, LogicalPlan, dml::WriteOp},
     prelude::SessionContext,
     scalar::ScalarValue,
-    sql::{
-        TableReference,
-        parser::Statement as DfStatement,
-        sqlparser::ast::Statement,
-    },
+    sql::{parser::Statement as DfStatement, sqlparser::ast::Statement},
 };
 use datafusion_postgres::{
     hooks::{HookClient, QueryHook},
@@ -82,8 +77,13 @@ fn fold_literal_casts(plan: LogicalPlan) -> datafusion::error::Result<LogicalPla
                             Ok(folded) => Ok(Transformed::yes(Expr::Literal(folded, metadata.clone()))),
                             // If a particular literal can't be cast (e.g. lossy
                             // string-→-number), leave it alone — the executor's
-                            // cast will surface a clear error.
-                            Err(_) => Ok(Transformed::no(e)),
+                            // cast will surface a clear error. Trace-level so a
+                            // run-time spike is visible without polluting the
+                            // hot path.
+                            Err(err) => {
+                                tracing::trace!(target: "plan_cache", %err, ?value, ?data_type, "fold_literal_casts: cast_to failed, leaving CAST for executor");
+                                Ok(Transformed::no(e))
+                            }
                         };
                     }
                     Ok(Transformed::no(e))
@@ -109,7 +109,13 @@ fn fold_literal_casts(plan: LogicalPlan) -> datafusion::error::Result<LogicalPla
 async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionContext) -> datafusion::error::Result<Option<u64>> {
     use datafusion::logical_expr::dml::DmlStatement;
 
-    let LogicalPlan::Dml(DmlStatement { table_name, op: WriteOp::Insert(_), input, .. }) = plan else {
+    let LogicalPlan::Dml(DmlStatement {
+        table_name,
+        op: WriteOp::Insert(_),
+        input,
+        ..
+    }) = plan
+    else {
         return Ok(None);
     };
 
@@ -198,12 +204,9 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
             .values
             .iter()
             .map(|row| {
-                cell_as_literal(&row[col_idx]).cloned().ok_or_else(|| {
-                    datafusion::error::DataFusionError::Internal(format!(
-                        "try_fast_path_insert: expected Literal, got {:?}",
-                        row[col_idx]
-                    ))
-                })
+                cell_as_literal(&row[col_idx])
+                    .cloned()
+                    .ok_or_else(|| datafusion::error::DataFusionError::Internal(format!("try_fast_path_insert: expected Literal, got {:?}", row[col_idx])))
             })
             .collect::<datafusion::error::Result<_>>()?;
         let arr = ScalarValue::iter_to_array(scalars)?;
@@ -214,8 +217,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
         let arr = if arr.data_type() == target_ty {
             arr
         } else {
-            datafusion::arrow::compute::cast(&arr, target_ty)
-                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+            datafusion::arrow::compute::cast(&arr, target_ty).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
         };
         values_columns.push(arr);
     }
@@ -245,8 +247,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
     } else {
         (values_schema, values_columns)
     };
-    let batch = RecordBatch::try_new(final_schema, columns)
-        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let batch = RecordBatch::try_new(final_schema, columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
 
     let provider = session_context.table_provider(table_name.clone()).await?;
     let Some(routing) = provider.as_any().downcast_ref::<crate::database::ProjectRoutingTable>() else {
@@ -256,70 +257,16 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
     Ok(Some(rows))
 }
 
-/// Replace every `LogicalPlan::Values` whose rows are entirely literal with a
-/// `TableScan` over an in-memory `MemTable` carrying a precomputed
-/// `RecordBatch`. Currently unused — kept for reference; the `try_fast_path_insert`
-/// bypass is cleaner because it also avoids the `Projection`/`DataSinkExec`
-/// stream overhead.
-#[allow(dead_code)]
-fn values_to_memtable(plan: LogicalPlan) -> datafusion::error::Result<LogicalPlan> {
-    plan.transform_up(|node| {
-        let LogicalPlan::Values(values) = &node else {
-            return Ok(Transformed::no(node));
-        };
-        // Only literal-only Values qualify for the shortcut. Anything else
-        // legitimately needs ValuesExec to evaluate.
-        let all_literal = values.values.iter().all(|row| row.iter().all(|e| matches!(e, Expr::Literal(_, _))));
-        if !all_literal {
-            return Ok(Transformed::no(node));
-        }
-        let arrow_schema: Arc<Schema> = Arc::new(values.schema.as_arrow().clone());
-        let num_cols = arrow_schema.fields().len();
-        let num_rows = values.values.len();
-        // Build column-by-column: collect each column's scalar values, then
-        // `ScalarValue::iter_to_array` packs them into an `ArrayRef` in one go.
-        let mut columns: Vec<datafusion::arrow::array::ArrayRef> = Vec::with_capacity(num_cols);
-        for col_idx in 0..num_cols {
-            let target_ty = arrow_schema.field(col_idx).data_type();
-            if num_rows == 0 {
-                columns.push(datafusion::arrow::array::new_empty_array(target_ty));
-                continue;
-            }
-            let scalars: Vec<ScalarValue> = values
-                .values
-                .iter()
-                .map(|row| match &row[col_idx] {
-                    Expr::Literal(v, _) => Ok(v.clone()),
-                    other => Err(datafusion::error::DataFusionError::Internal(format!(
-                        "values_to_memtable: expected Literal, got {other:?}"
-                    ))),
-                })
-                .collect::<datafusion::error::Result<_>>()?;
-            let arr = ScalarValue::iter_to_array(scalars)?;
-            // ScalarValue::iter_to_array can return an array whose type doesn't
-            // exactly match the Values column type (e.g. all-NULL columns come
-            // back as Null arrays). Cast back to the declared type so the
-            // upstream Projection's column refs type-check.
-            let arr = if arr.data_type() == target_ty {
-                arr
-            } else {
-                datafusion::arrow::compute::cast(&arr, target_ty)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
-            };
-            columns.push(arr);
-        }
-        let batch = RecordBatch::try_new(arrow_schema.clone(), columns)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-        let mem_table = MemTable::try_new(arrow_schema, vec![vec![batch]])?;
-        let scan = LogicalPlanBuilder::scan(TableReference::bare("__pgwire_values"), datafusion::datasource::provider_as_source(Arc::new(mem_table)), None)?.build()?;
-        Ok(Transformed::yes(scan))
-    })
-    .map(|t| t.data)
-}
-
-/// Mirror of the vendored `datafusion_postgres::handlers::dml_completion` which
-/// is private. Drives the Insert/Update/Delete dataframe to completion and
-/// builds a `Tag::new(<verb>).with_rows(N)` Execution response.
+/// Mirror of the vendored `datafusion_postgres::handlers::dml_completion`,
+/// which is `pub(super)` and so unreachable from outside the crate.
+///
+/// **Re-vendor checklist.** When bumping the vendored `datafusion-postgres`,
+/// diff `vendored handlers.rs::dml_completion` against this implementation —
+/// upstream changes to the tag format ("INSERT 0 N" oid + count), the
+/// `count` column name, or the count column's Arrow type are silent
+/// divergence here (no compile error, wrong wire response). Search for the
+/// `RE-VENDOR-DML-COMPLETION` marker below and confirm parity.
+// RE-VENDOR-DML-COMPLETION: keep in sync with vendor/datafusion-postgres/src/handlers.rs.
 async fn dml_completion(df: datafusion::dataframe::DataFrame) -> PgWireResult<Option<Response>> {
     let tag = match df.logical_plan() {
         LogicalPlan::Dml(d) => match d.op {
@@ -541,8 +488,7 @@ impl QueryHook for PlanCacheHook {
     }
 
     async fn handle_extended_query(
-        &self, _statement: &Statement, logical_plan: &LogicalPlan, params: &ParamValues, session_context: &SessionContext,
-        _client: &mut dyn HookClient,
+        &self, _statement: &Statement, logical_plan: &LogicalPlan, params: &ParamValues, session_context: &SessionContext, _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
         // Only intercept DML — for SELECTs the vendored path is fine.
         // The win here is post-substitution constant folding of `CAST(Literal, T)`
@@ -575,9 +521,7 @@ impl QueryHook for PlanCacheHook {
         };
         Some(match dml_completion(df).await {
             Ok(Some(resp)) => Ok(resp),
-            Ok(None) => Err(PgWireError::ApiError(
-                "internal error: DML plan returned non-DML completion".to_string().into(),
-            )),
+            Ok(None) => Err(PgWireError::ApiError("internal error: DML plan returned non-DML completion".to_string().into())),
             Err(e) => Err(e),
         })
     }
