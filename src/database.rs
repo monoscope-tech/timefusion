@@ -2309,9 +2309,14 @@ impl Database {
             use_queue = Empty,
         )
     )]
+    /// Insert batches and return the URIs of files newly added by this commit
+    /// (empty for the buffered-layer / batch-queue paths where the actual
+    /// Delta write happens later). Callers use the returned list to drive
+    /// cache warming and the tantivy sidecar without paying for a second
+    /// `update_state()` log scan.
     pub async fn insert_records_batch(
         &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::buffered_write_layer::DeltaWatermark>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let span = tracing::Span::current();
         // Normalize timezone-as-offset (`+00:00`) timestamp columns to the
         // IANA `"UTC"` form. Delta-rs Arrow→Delta schema conversion only
@@ -2340,10 +2345,12 @@ impl Database {
         // Use provided table_name or default to otel_logs_and_spans
         let table_name = if table_name.is_empty() { "otel_logs_and_spans".to_string() } else { table_name.to_string() };
 
-        // If buffered layer is configured and not skipping, use it (WAL → MemBuffer flow)
+        // If buffered layer is configured and not skipping, use it (WAL → MemBuffer flow).
+        // No files are written synchronously on this path; an empty URI list is correct.
         if !skip_queue && let Some(ref layer) = self.buffered_layer {
             span.record("use_queue", "buffered_layer");
-            return layer.insert(&project_id, &table_name, batches).await;
+            layer.insert(&project_id, &table_name, batches).await?;
+            return Ok(Vec::new());
         }
 
         // Fallback to legacy batch queue if configured
@@ -2358,7 +2365,7 @@ impl Database {
                     return Err(anyhow::anyhow!("Queue error: {}", e));
                 }
             }
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         span.record("use_queue", false);
@@ -2395,6 +2402,12 @@ impl Database {
                 debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
             }
 
+            // Snapshot the pre-write file URIs while the write lock is held and
+            // update_state has just run. Cheap in-memory walk of add_actions; the
+            // post-write diff replaces two redundant `list_file_uris` calls
+            // (each of which would re-acquire the write lock + re-run update_state).
+            let pre_uris: std::collections::HashSet<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
             let write_result = async {
                 // Schema evolution enabled: new columns will be automatically added to the table
@@ -2427,12 +2440,16 @@ impl Database {
 
                     *table = new_table;
 
+                    // Compute added files from the post-write snapshot while we still
+                    // hold the write lock — no extra log scan required.
+                    let added: Vec<String> = table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
+
                     // Invalidate statistics cache after successful write
                     drop(table); // Release write lock before async operation
                     self.statistics_extractor.invalidate(&project_id, &table_name).await;
                     debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
 
-                    return Ok(());
+                    return Ok(added);
                 }
                 Err(e) => {
                     let error_str = e.to_string();
@@ -3329,6 +3346,28 @@ impl ProjectRoutingTable {
 
     fn extract_project_id_from_filters(&self, filters: &[Expr]) -> Option<String> {
         filters.iter().find_map(crate::optimizers::extract_project_id_from_expr)
+    }
+
+    /// pgwire-INSERT fast path. Skips `DataSinkExec` + `ValuesExec` entirely:
+    /// caller (the plan_cache hook) has already materialized the incoming
+    /// VALUES into a RecordBatch from substituted literals, so we just run
+    /// the per-batch fixups (`convert_variant_columns`, project-id routing,
+    /// `normalize_timestamp_tz` is run inside `insert_records_batch`) and
+    /// hand straight to `insert_records_batch` → `BufferedWriteLayer.insert`.
+    /// Returns the inserted row count.
+    pub async fn fast_insert_batch(&self, batch: RecordBatch) -> DFResult<u64> {
+        let total_rows = batch.num_rows() as u64;
+        if total_rows == 0 {
+            return Ok(0);
+        }
+        let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
+        let target_schema = self.real_schema();
+        let converted = convert_variant_columns(batch, &target_schema)?;
+        self.database
+            .insert_records_batch(&project_id, &self.table_name, vec![converted], false, None)
+            .await
+            .map_err(|e| DataFusionError::Execution(format!("fast_insert_batch for project {} table {}: {}", project_id, self.table_name, e)))?;
+        Ok(total_rows)
     }
 
     fn schema(&self) -> SchemaRef {

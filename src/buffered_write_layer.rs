@@ -167,6 +167,91 @@ pub type DeltaWatermark = Vec<Option<walrus_rust::WalPosition>>;
 pub type DeltaWriteCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, DeltaWatermark) -> futures::future::BoxFuture<'static, anyhow::Result<Vec<String>>> + Send + Sync>;
 
+/// Accumulator used by `flush_completed_buckets` to fold every per-bucket
+/// `FlushableBucket` for one (project_id, table_name) into a single combined
+/// commit. Each Delta commit pays a fixed cost (log scan + commit log write +
+/// S3 RTT + tantivy build); coalescing turns N×O(commit) into 1×O(commit).
+#[derive(Default)]
+struct CoalescedGroup {
+    /// `Option` not `String` so the first-bucket sentinel doesn't collide with
+    /// the legitimate empty-project_id path (which falls back to "default" in
+    /// the buffered-layer but reaches this code as `""`). Using `is_empty` as
+    /// the sentinel previously let every subsequent bucket in such a group
+    /// silently re-overwrite project_id/table_name.
+    key:               Option<(String, String)>,
+    batches:           Vec<RecordBatch>,
+    row_count:         usize,
+    /// Sum of per-shard counts across all absorbed buckets — drives walrus
+    /// `advance_by_counts` once for the entire commit.
+    wal_shard_counts:  Vec<u64>,
+    /// Per-shard max position across all absorbed buckets — written into
+    /// Delta commit metadata for crash-mid-flush cursor recovery.
+    wal_positions:     Vec<Option<walrus_rust::WalPosition>>,
+    /// Source bucket_ids; drained from MemBuffer after the combined commit succeeds.
+    source_bucket_ids: Vec<i64>,
+}
+
+struct CombinedBucket {
+    combined:          crate::mem_buffer::FlushableBucket,
+    source_bucket_ids: Vec<i64>,
+}
+
+fn merge_wal_positions(a: Vec<Option<walrus_rust::WalPosition>>, b: Vec<Option<walrus_rust::WalPosition>>) -> Vec<Option<walrus_rust::WalPosition>> {
+    let len = a.len().max(b.len());
+    (0..len)
+        .map(|i| match (a.get(i).cloned().flatten(), b.get(i).cloned().flatten()) {
+            (Some(x), Some(y)) => Some(if (y.block_id, y.offset) > (x.block_id, x.offset) { y } else { x }),
+            (Some(x), None) => Some(x),
+            (None, Some(y)) => Some(y),
+            (None, None) => None,
+        })
+        .collect()
+}
+
+impl CoalescedGroup {
+    fn absorb(&mut self, b: crate::mem_buffer::FlushableBucket) {
+        self.key.get_or_insert_with(|| (b.project_id.clone(), b.table_name.clone()));
+        self.row_count += b.row_count;
+        self.batches.extend(b.batches);
+        // Sum per-shard counts (resizing to the wider length).
+        let len = self.wal_shard_counts.len().max(b.wal_shard_counts.len());
+        self.wal_shard_counts.resize(len, 0);
+        for (i, c) in b.wal_shard_counts.iter().enumerate() {
+            self.wal_shard_counts[i] += *c;
+        }
+        // Merge per-shard positions (max).
+        self.wal_positions = merge_wal_positions(std::mem::take(&mut self.wal_positions), b.wal_positions);
+        self.source_bucket_ids.push(b.bucket_id);
+    }
+
+    fn into_combined_bucket(self) -> CombinedBucket {
+        let CoalescedGroup {
+            key,
+            batches,
+            row_count,
+            wal_shard_counts,
+            wal_positions,
+            source_bucket_ids,
+        } = self;
+        // `absorb` is only called via `groups.entry(..).or_default().absorb(b)`
+        // so `key` is always set by the time we collapse the group.
+        let (project_id, table_name) = key.unwrap_or_default();
+        // Use the max source bucket_id as a stable identifier for tracing only —
+        // drain happens per source_bucket_id, not via this synthetic id.
+        let bucket_id = source_bucket_ids.iter().copied().max().unwrap_or(0);
+        let combined = crate::mem_buffer::FlushableBucket {
+            project_id,
+            table_name,
+            bucket_id,
+            batches,
+            row_count,
+            wal_shard_counts,
+            wal_positions,
+        };
+        CombinedBucket { combined, source_bucket_ids }
+    }
+}
+
 /// Optional callback invoked AFTER a successful Delta commit. Receives the
 /// `(project_id, table_name, batches, added_file_uris)` and is responsible
 /// for building and uploading any sidecar index. The `added_file_uris` are
@@ -202,6 +287,13 @@ pub struct BufferedWriteLayer {
     flush_failed_total:     AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
     function_registry:      Arc<crate::functions::FnRegistry>,
+    /// Caps concurrent detached tantivy sidecar builds so a fast flush cycle
+    /// (post-F4 — one build per (project, table) per cycle) can't fan out
+    /// past S3 connection / memory limits when many tables flush together.
+    /// FOLLOW-UP: handles aren't stored; graceful shutdown does not await
+    /// in-flight tantivy uploads. Acceptable for now because the sidecar is
+    /// best-effort and the index can be rebuilt from Delta on demand.
+    tantivy_spawn_sem:      Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -245,6 +337,11 @@ impl BufferedWriteLayer {
             flush_completed_total: AtomicU64::new(0),
             flush_failed_total: AtomicU64::new(0),
             function_registry,
+            // 16 is well above realistic per-cycle table fan-out for the
+            // monoscope workload (~5 distinct table names) while still
+            // bounding worst-case S3 / tantivy heap usage if more tables
+            // appear.
+            tantivy_spawn_sem: Arc::new(tokio::sync::Semaphore::new(16)),
         })
     }
 
@@ -357,23 +454,22 @@ impl BufferedWriteLayer {
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
-        // Check memory pressure and trigger early flush if needed.
-        // We use `flush_all_now` (not `flush_completed_buckets`) here because
-        // under memory pressure the data consuming the budget is almost
-        // always the *current* bucket — `flush_completed_buckets` only
-        // drains buckets older than `bucket_duration_secs`, which leaves
-        // the current-bucket pressure unrelieved and the next insert
-        // still fails. `flush_all_now` includes the current bucket and
-        // matches what an operator would do manually in this state.
+        // Memory pressure no longer triggers a synchronous flush_all_now in the
+        // insert path — that violated the "inserts return fast, Delta happens on
+        // a routine" invariant by stalling pgwire/gRPC threads on S3 commits
+        // (and worse, holding the global flush_lock so one slow tenant froze
+        // ingest for everyone). The safety nets are: (a) `try_reserve_memory`
+        // rejects inserts past the 120% hard limit, surfacing backpressure to
+        // the client; (b) the post-CAS `pressure_notify.notify_one()` already
+        // wakes the background flush task when reservations cross the
+        // configured pressure threshold.
         if self.is_memory_pressure() {
             warn!(
-                "Memory pressure detected ({}MB >= {}MB), triggering early flush_all_now",
+                "Memory pressure (used={}MB / max={}MB) — notifying background flush; insert path will not block on Delta",
                 self.effective_memory_bytes() / (1024 * 1024),
                 self.config.buffer.max_memory_mb()
             );
-            if let Err(e) = self.flush_all_now().await {
-                error!("Early flush due to memory pressure failed: {}", e);
-            }
+            self.pressure_notify.notify_one();
         }
 
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -739,39 +835,94 @@ impl BufferedWriteLayer {
             return Ok(());
         }
 
-        debug!("Flushing {} buckets to Delta", flushable.len());
+        // Coalesce per (project_id, table_name): one Delta commit per table per
+        // cycle instead of one per bucket. Each commit pays a fixed cost
+        // (log scan + JSON write + S3 RTT + tantivy build), so collapsing
+        // N per-table buckets into a single combined write turns N×O(commit)
+        // into 1×O(commit). Also lets dedup span all flushed time windows.
+        let mut groups: std::collections::HashMap<(String, String), CoalescedGroup> = std::collections::HashMap::new();
+        let bucket_count = flushable.len();
+        for bucket in flushable {
+            let entry = groups.entry((bucket.project_id.clone(), bucket.table_name.clone())).or_default();
+            entry.absorb(bucket);
+        }
 
-        // Flush buckets in parallel with bounded concurrency
+        debug!("Flushing {} bucket(s) → {} per-table commit(s)", bucket_count, groups.len());
+
+        // Flush groups in parallel with bounded concurrency. Per-(project,table)
+        // commits are independent — each Delta table has its own write lock
+        // inside `insert_records_batch`, so parallelism here = cross-table
+        // concurrency.
         let parallelism = self.config.buffer.flush_parallelism();
-        let flush_results: Vec<_> = stream::iter(flushable)
-            .map(|bucket| async move {
-                let result = self.flush_bucket(&bucket).await;
-                (bucket, result)
+        let flush_results: Vec<_> = stream::iter(groups.into_values())
+            .map(|group| async move {
+                let combined = group.into_combined_bucket();
+                let result = self.flush_bucket(&combined.combined).await;
+                (combined, result)
             })
             .buffer_unordered(parallelism)
             .collect()
             .await;
 
-        // Process results: checkpoint WAL and drain MemBuffer for successful flushes
+        // Process results: checkpoint WAL and drain MemBuffer for successful flushes.
+        //
+        // Counter semantics: `flush_completed_total`/`flush_failed_total` continue
+        // to count source bucket IDs (not coalesced groups). Pre-F4 each bucket
+        // was its own commit, so `count = buckets = commits`. Post-F4 it's
+        // `count = buckets ≠ commits`; the per-cycle commit count is
+        // `groups.len()` and is visible only in the `Flushing N → M commits`
+        // debug log. Dashboards thresholding on these counters keep their old
+        // numeric meaning (work units done), but a "commits per minute"
+        // dashboard derived from them now overstates real Delta commit rate.
         let mut any_ok = false;
-        for (bucket, result) in flush_results {
+        for (combined, result) in flush_results {
+            let CombinedBucket { combined, source_bucket_ids } = combined;
             match result {
                 Ok(()) => {
-                    self.checkpoint_and_drain(&bucket);
-                    any_ok = true;
-                    crate::metrics::record_flush(true);
-                    self.flush_completed_total.fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        "Flushed bucket: project={}, table={}, bucket_id={}, rows={}",
-                        bucket.project_id, bucket.table_name, bucket.bucket_id, bucket.row_count
-                    );
+                    // Critical ordering: only drain the buckets from MemBuffer
+                    // AFTER `advance_by_counts` succeeds. If we drained then
+                    // failed to advance, restart would not replay those rows
+                    // (gone from MemBuffer) and the WAL cursor would not
+                    // reflect that they were processed — silent data loss.
+                    // On advance failure we leave the buckets in MemBuffer;
+                    // the next flush cycle re-commits them. Delta's optimistic
+                    // concurrency + dedup_keys handle the duplicate commit
+                    // (last-write-wins on the per-table key set).
+                    match self.wal.advance_by_counts(&combined.project_id, &combined.table_name, &combined.wal_shard_counts) {
+                        Ok(()) => {
+                            for bucket_id in &source_bucket_ids {
+                                self.mem_buffer.drain_bucket(&combined.project_id, &combined.table_name, *bucket_id);
+                            }
+                            any_ok = true;
+                            crate::metrics::record_flush(true);
+                            self.flush_completed_total.fetch_add(source_bucket_ids.len() as u64, Ordering::Relaxed);
+                            debug!(
+                                "Flushed coalesced commit: project={}, table={}, buckets={}, rows={}",
+                                combined.project_id,
+                                combined.table_name,
+                                source_bucket_ids.len(),
+                                combined.row_count
+                            );
+                        }
+                        Err(e) => {
+                            // Treat as a flush failure for metrics purposes —
+                            // the next cycle will retry the commit and the
+                            // advance.
+                            crate::metrics::record_flush(false);
+                            self.flush_failed_total.fetch_add(source_bucket_ids.len() as u64, Ordering::Relaxed);
+                            error!(
+                                "WAL advance_by_counts failed after successful Delta commit (project={}, table={}, buckets={:?}); leaving buckets in MemBuffer for retry — next flush will re-commit (dedup_keys protect downstream): {}",
+                                combined.project_id, combined.table_name, source_bucket_ids, e
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     crate::metrics::record_flush(false);
-                    self.flush_failed_total.fetch_add(1, Ordering::Relaxed);
+                    self.flush_failed_total.fetch_add(source_bucket_ids.len() as u64, Ordering::Relaxed);
                     error!(
-                        "Failed to flush bucket: project={}, table={}, bucket_id={}: {}",
-                        bucket.project_id, bucket.table_name, bucket.bucket_id, e
+                        "Failed to flush coalesced commit: project={}, table={}, buckets={:?}: {}",
+                        combined.project_id, combined.table_name, source_bucket_ids, e
                     );
                 }
             }
@@ -817,16 +968,32 @@ impl BufferedWriteLayer {
             Vec::new()
         };
         // Sidecar tantivy index — best-effort, never fails the flush.
-        // We still count the failure so ops can alert on accumulating index
-        // drift (silent UDF-fallback degradation is otherwise invisible).
-        if let Some(ref idx_cb) = self.tantivy_index_callback
-            && let Err(e) = idx_cb(bucket.project_id.clone(), bucket.table_name.clone(), batches, added_files).await
-        {
-            crate::metrics::record_tantivy_build_failure();
-            warn!(
-                "Tantivy index build failed (non-fatal): project={}, table={}, bucket_id={}: {}",
-                bucket.project_id, bucket.table_name, bucket.bucket_id, e
-            );
+        // Spawned as a detached task so the Delta commit critical path doesn't
+        // wait on tar.zst + S3 upload (a per-bucket cost that was dominating
+        // flush latency at prod scale). F4 already collapses N bucket flushes
+        // into one tantivy build per (project, table) per cycle; the semaphore
+        // bounds the worst-case fan-out (many tables flushing simultaneously)
+        // so concurrent uploads can't saturate S3 connections or grow tantivy
+        // writer heap unbounded.
+        if let Some(ref idx_cb) = self.tantivy_index_callback {
+            let cb = idx_cb.clone();
+            let pid = bucket.project_id.clone();
+            let tname = bucket.table_name.clone();
+            let bid = bucket.bucket_id;
+            let sem = self.tantivy_spawn_sem.clone();
+            tokio::spawn(async move {
+                let _permit = match sem.acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return, // semaphore closed — process is shutting down
+                };
+                if let Err(e) = cb(pid.clone(), tname.clone(), batches, added_files).await {
+                    crate::metrics::record_tantivy_build_failure();
+                    warn!(
+                        "Tantivy index build failed (non-fatal): project={}, table={}, bucket_id={}: {}",
+                        pid, tname, bid, e
+                    );
+                }
+            });
         }
         Ok(())
     }
