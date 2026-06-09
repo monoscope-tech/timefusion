@@ -19,7 +19,7 @@ env:
 jobs:
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
       # rustfmt.toml uses nightly-only options (wrap_comments, imports_granularity,
@@ -48,7 +48,7 @@ jobs:
   # them reuse target/ instead of recompiling the world per-job.
   build-test:
     name: Clippy & Test
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 25
     env:
       AWS_SDK_LOAD_CONFIG: "false"
@@ -113,7 +113,7 @@ jobs:
   # attributable and the suite can be made a required check independently.
   e2e:
     name: E2E
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     env:
       CARGO_TERM_COLOR: always
