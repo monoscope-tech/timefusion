@@ -580,8 +580,22 @@ impl MemBuffer {
         }
     }
 
+    /// Authoritative live MemBuffer size — sums every (table, bucket)'s
+    /// `memory_bytes` atomic directly. The internal `estimated_bytes`
+    /// AtomicUsize cache drifts because the in-bucket coalesce path
+    /// (`TimeBucket::insert_batch`) shrinks `bucket.memory_bytes` via
+    /// `.store(combined_size)` without telling MemBuffer about the savings.
+    /// Each coalesce leaks `(sum_before − combined_size)` upward, and any
+    /// `fetch_sub` underflow on this cache wraps to ~USIZE_MAX. Prod hit
+    /// 948 GB reported with a real budget of 44 GB — every `try_reserve_memory`
+    /// then rejected forever ("Memory limit exceeded"). Recomputing here is
+    /// O(N tables × N buckets), microseconds at prod scale (~30 projects ×
+    /// a handful of buckets each), and correct-by-construction.
     pub fn estimated_memory_bytes(&self) -> usize {
-        self.estimated_bytes.load(Ordering::Relaxed)
+        self.tables
+            .iter()
+            .map(|t| t.value().buckets.iter().map(|b| b.value().memory_bytes.load(Ordering::Relaxed)).sum::<usize>())
+            .sum()
     }
 
     pub fn compute_bucket_id(timestamp_micros: i64) -> i64 {
@@ -1594,7 +1608,9 @@ impl MemBuffer {
             total_buckets,
             total_rows,
             total_batches,
-            estimated_memory_bytes: self.estimated_bytes.load(Ordering::Relaxed),
+            // Authoritative — see `estimated_memory_bytes()` for why we don't
+            // trust the `estimated_bytes` AtomicUsize cache.
+            estimated_memory_bytes: self.estimated_memory_bytes(),
             oldest_bucket_micros: oldest,
         }
     }
