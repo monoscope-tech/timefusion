@@ -88,6 +88,69 @@ async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Cold-start latency benchmark. Builds Delta + WAL history, dirty-crashes,
+/// re-bootstraps, and asserts the second bootstrap completes in seconds — the
+/// prod symptom we're targeting is "FATAL: the database system is starting up"
+/// being returned for minutes after a dirty restart (cursor-snapshot missing
+/// or stale). With `bootstrap()` now mirroring main.rs's cursor reconcile,
+/// this test exercises the same slow path prod hits.
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
+    let mut env = E2eEnv::builder().start().await?;
+    {
+        let client = env.pg_client().await?;
+        // Stress what actually scales in derive_wal_cursors_from_delta:
+        //   - many (project, table) topic pairs → many Delta tables to open + scan
+        //   - several flush rounds per project → real commit history depth
+        //   - a final un-flushed batch per project → WAL replay has actual work
+        const PROJECTS: usize = 10;
+        const FLUSHED_ROUNDS: usize = 3;
+        for round in 0..FLUSHED_ROUNDS {
+            for p in 0..PROJECTS {
+                for i in 0..5 {
+                    insert_for(&client, &format!("p-{p}"), &format!("c-{round}-{i}"), FROZEN_START_MICROS).await?;
+                }
+            }
+            env.force_flush().await?;
+        }
+        // One more batch per project that we deliberately do NOT flush — so
+        // the WAL has un-replayed entries past the Delta watermark on crash.
+        for p in 0..PROJECTS {
+            for i in 0..5 {
+                insert_for(&client, &format!("p-{p}"), &format!("u-{i}"), FROZEN_START_MICROS).await?;
+            }
+        }
+        // Let WAL fsync (200ms schedule) catch up before the dirty crash.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+    }
+
+    let t0 = std::time::Instant::now();
+    env.restart().await?;
+    let restart_elapsed = t0.elapsed();
+
+    // 5s is the loose initial bar — prod is currently >1min so any honest
+    // local reproduction will fail this until we cut the dominant phase.
+    // Per-phase timing is logged from bootstrap.rs; grep for `bootstrap.phase=`.
+    assert!(
+        restart_elapsed < Duration::from_secs(5),
+        "cold-start regression: re-bootstrap took {:?} (target <5s)",
+        restart_elapsed
+    );
+    Ok(())
+}
+
+async fn insert_for(client: &tokio_postgres::Client, project_id: &str, id: &str, ts_micros: i64) -> anyhow::Result<()> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap();
+    let sql = format!(
+        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) \
+         VALUES ($1, '{}', '{}', $2, 'span', 'OK', 'm', 'INFO', ARRAY[]::text[], $3)",
+        dt.date_naive(),
+        dt.format("%Y-%m-%d %H:%M:%S%.f"),
+    );
+    client.execute(&sql, &[&project_id, &id, &vec!["s"]]).await?;
+    Ok(())
+}
+
 async fn insert_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64) -> anyhow::Result<()> {
     let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap();
     let sql = format!(
