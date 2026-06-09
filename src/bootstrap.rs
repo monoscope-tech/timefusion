@@ -40,7 +40,9 @@ pub struct Bootstrapped {
 pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     crate::clock::init_from_env();
 
+    let t_db = std::time::Instant::now();
     let mut db = Database::with_config(Arc::clone(&cfg)).await?;
+    tracing::info!("bootstrap.phase=database_init elapsed_ms={}", t_db.elapsed().as_millis());
 
     let db_for_callback = db.clone();
     let delta_write_callback: DeltaWriteCallback = Arc::new(
@@ -62,7 +64,23 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db.setup_session_udfs(&mut session_context)?;
     let registry: Arc<crate::functions::FnRegistry> = Arc::new(session_context.state());
 
+    // Pre-init WAL GC: delete files older than 2× retention before walrus
+    // enumerates the dir on construction. Without this, accumulated leaks
+    // from prior process lifetimes dominate startup (see memory
+    // `wal_bloat_startup.md` — prod hit 467 GB / 12-min startup).
+    let t_gc = std::time::Instant::now();
+    let max_age = std::time::Duration::from_secs(cfg.buffer.retention_mins() * 60 * 2);
+    match crate::wal::gc_wal_files(&cfg.core.wal_dir(), max_age) {
+        Ok((deleted, bytes_freed)) => tracing::info!(
+            "bootstrap.phase=wal_gc deleted={deleted} bytes_freed={bytes_freed} elapsed_ms={}",
+            t_gc.elapsed().as_millis()
+        ),
+        Err(e) => tracing::warn!("bootstrap.phase=wal_gc error={e} elapsed_ms={}", t_gc.elapsed().as_millis()),
+    }
+
+    let t_layer = std::time::Instant::now();
     let mut layer = BufferedWriteLayer::with_config(Arc::clone(&cfg), registry)?.with_delta_writer(delta_write_callback);
+    tracing::info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
 
     // Optional tantivy sidecar (mirrors main.rs). Disabled when no indexed
     // tables OR the bucket is unset (tests with foyer-only setups).
@@ -85,9 +103,32 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     }
 
     let buffered_layer = Arc::new(layer);
+    // Tantivy init may also dominate on cold start if many indexed tables
+    // exist; bracket it independently from the WAL/Delta phases below.
 
-    // WAL replay before background tasks so we don't race spawned flushes.
+    // Mirror main.rs: clean snapshot → skip the Delta cursor scan; dirty/missing
+    // snapshot → derive cursors from Delta so WAL replay doesn't re-inject
+    // entries Delta already has. Keeping this in the test-shared bootstrap
+    // means e2e startup-time assertions exercise the same path as prod.
+    // Per-phase timing is emitted at INFO so cold-start regressions surface
+    // without needing trace-level enabled.
+    let wal_ref = buffered_layer.wal();
+    let t_snap = std::time::Instant::now();
+    let skip_delta_scan = if let Some(snap) = wal_ref.load_cursor_snapshot() {
+        matches!(wal_ref.restore_cursor_snapshot(&snap), Ok(_)) && snap.clean_shutdown
+    } else {
+        false
+    };
+    tracing::info!("bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}", t_snap.elapsed().as_millis());
+    if !skip_delta_scan {
+        let t_delta = std::time::Instant::now();
+        let advanced = db.derive_wal_cursors_from_delta(wal_ref).await.unwrap_or(0);
+        tracing::info!("bootstrap.phase=delta_cursor_reconcile shards_advanced={advanced} elapsed_ms={}", t_delta.elapsed().as_millis());
+    }
+
+    let t_wal = std::time::Instant::now();
     buffered_layer.recover_from_wal().await?;
+    tracing::info!("bootstrap.phase=wal_replay elapsed_ms={}", t_wal.elapsed().as_millis());
     buffered_layer.start_background_tasks().await;
 
     db = db.with_buffered_layer(Arc::clone(&buffered_layer));

@@ -602,14 +602,53 @@ impl BufferedWriteLayer {
             eviction_this.run_eviction_task().await;
         });
 
+        // Start periodic WAL GC. Without this, walrus' per-process
+        // FileStateTracker leaks files across restarts (see `wal::gc_wal_files`).
+        let gc_this = Arc::clone(&this);
+        let gc_handle = tokio::spawn(async move {
+            gc_this.run_wal_gc_task().await;
+        });
+
         // Store handles
         {
             let mut handles = this.background_tasks.lock().await;
             handles.push(flush_handle);
             handles.push(eviction_handle);
+            handles.push(gc_handle);
         }
 
         info!("BufferedWriteLayer background tasks started");
+    }
+
+    async fn run_wal_gc_task(&self) {
+        // Run at a small multiple of retention so a single missed sweep
+        // doesn't leave files past their useful life on disk for long.
+        let retention_secs = self.config.buffer.retention_mins() * 60;
+        let interval = Duration::from_secs(retention_secs.max(60));
+        let max_age = Duration::from_secs(retention_secs * 2);
+        let wal_dir = self.wal.data_dir().clone();
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = self.shutdown.cancelled() => {
+                    info!("WAL GC task shutting down");
+                    break;
+                }
+            }
+            let dir = wal_dir.clone();
+            // Filesystem walk is sync — push to a blocking thread so we
+            // don't stall the runtime if the dir got huge before this fix
+            // landed.
+            let res = tokio::task::spawn_blocking(move || crate::wal::gc_wal_files(&dir, max_age)).await;
+            match res {
+                Ok(Ok((deleted, bytes_freed))) if deleted > 0 => {
+                    info!("WAL GC: deleted {} stale files, freed {} bytes", deleted, bytes_freed);
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!("WAL GC error: {}", e),
+                Err(e) => warn!("WAL GC task panicked: {}", e),
+            }
+        }
     }
 
     async fn run_flush_task(&self) {

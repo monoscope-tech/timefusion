@@ -64,8 +64,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     });
 
     // Initialize database with explicit config
+    let t_db = std::time::Instant::now();
     let mut db = Database::with_config(Arc::clone(&cfg_arc)).await?;
-    info!("Database initialized successfully");
+    info!("bootstrap.phase=database_init elapsed_ms={}", t_db.elapsed().as_millis());
 
     // Initialize BufferedWriteLayer with explicit config
     info!(
@@ -117,7 +118,24 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // optional `TIMEFUSION_TANTIVY_INDEXED_TABLES` override). The query layer
     // accelerates standard SQL predicates (`=`, `LIKE 'prefix%'`) via the
     // TantivyPredicateRewriter — callers don't need to know tantivy exists.
+    // Pre-init WAL GC: delete files past 2× retention before walrus opens
+    // the dir. Walrus' own GC bookkeeping (FileStateTracker) is per-process
+    // and forgets every file written by prior processes — without this
+    // sweep, accumulated leaks dominate startup (prod hit 467 GB / 12-min
+    // startup on 2026-06-09).
+    let t_gc = std::time::Instant::now();
+    let gc_max_age = Duration::from_secs(cfg.buffer.retention_mins() * 60 * 2);
+    match timefusion::wal::gc_wal_files(&cfg.core.wal_dir(), gc_max_age) {
+        Ok((deleted, bytes_freed)) => info!(
+            "bootstrap.phase=wal_gc deleted={deleted} bytes_freed={bytes_freed} elapsed_ms={}",
+            t_gc.elapsed().as_millis()
+        ),
+        Err(e) => warn!("bootstrap.phase=wal_gc error={e} elapsed_ms={}", t_gc.elapsed().as_millis()),
+    }
+
+    let t_layer = std::time::Instant::now();
     let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?.with_delta_writer(delta_write_callback);
+    info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
     let mut tantivy_svc_for_metrics: Option<Arc<timefusion::tantivy_index::service::TantivyIndexService>> = None;
     let indexed_tables = cfg.tantivy.indexed_tables();
     if !indexed_tables.is_empty() {
@@ -156,6 +174,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // snapshot still seeds positions, then falls through to the (env-tuned,
     // shorter) Delta verifier to catch commits made after the last snapshot.
     let wal_ref = buffered_layer.wal();
+    let t_snap = std::time::Instant::now();
     let skip_delta_scan = if let Some(snap) = wal_ref.load_cursor_snapshot() {
         // Surfaced in the boot log only — not gating the skip. See CursorSnapshot
         // docs for the single-writer assumption and the `rm` escape hatch.
@@ -181,6 +200,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     } else {
         false
     };
+    info!("bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}", t_snap.elapsed().as_millis());
     if skip_delta_scan {
         info!("Skipping Delta-derived cursor reconciliation (cursor snapshot is clean)");
     } else {
@@ -190,19 +210,22 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             cfg.buffer.delta_scan_depth(),
             cfg.buffer.delta_scan_concurrency()
         );
+        let t_delta = std::time::Instant::now();
         match db.derive_wal_cursors_from_delta(wal_ref).await {
             Ok(0) => info!("Delta-derived cursor: no advancement needed"),
             Ok(n) => info!("Delta-derived cursor: advanced {} shard(s) past Delta watermark", n),
             Err(e) => warn!("Delta-derived cursor derivation failed (continuing with local cursor): {}", e),
         }
+        info!("bootstrap.phase=delta_cursor_reconcile elapsed_ms={}", t_delta.elapsed().as_millis());
     }
 
     // Recover from WAL on startup
-    info!("Starting WAL recovery...");
+    let t_wal = std::time::Instant::now();
     let recovery_stats = buffered_layer.recover_from_wal().await?;
     info!(
-        "WAL recovery complete: {} entries replayed in {}ms",
-        recovery_stats.entries_replayed, recovery_stats.recovery_duration_ms
+        "bootstrap.phase=wal_replay entries={} elapsed_ms={}",
+        recovery_stats.entries_replayed,
+        t_wal.elapsed().as_millis()
     );
 
     // Start background tasks (flush and eviction)

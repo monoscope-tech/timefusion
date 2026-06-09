@@ -1018,6 +1018,60 @@ pub fn deserialize_record_batch_public(data: &[u8]) -> Result<RecordBatch, WalEr
     deserialize_record_batch(data)
 }
 
+/// Delete WAL files older than `max_age` by mtime, recursing into subdirs.
+/// Skips dotfiles/dotdirs (`.timefusion_meta/`).
+///
+/// Why this exists: `walrus-rust`'s GC bookkeeping (`FileStateTracker`) is an
+/// in-process `HashMap`. On restart every file walrus wrote previously is
+/// invisible to its delete predicate, so files leak forever. Prod was at
+/// 467 GB of orphaned WAL on 2026-06-09 (12-min startup); see memory
+/// `wal_bloat_startup.md`. This is a TF-side safety net: files whose newest
+/// entry is past `retention_mins` are dead weight because `recover_from_wal`
+/// already skips entries past that cutoff. mtime is a sufficient proxy —
+/// walrus rotates to a new file once one is fully allocated, so an old
+/// file's mtime is bounded by when its last block was written.
+pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration) -> std::io::Result<(u64, u64)> {
+    use std::time::SystemTime;
+    let cutoff = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut deleted = 0u64;
+    let mut bytes_freed = 0u64;
+    let mut stack: Vec<PathBuf> = vec![wal_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            if modified < cutoff {
+                let size = meta.len();
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        deleted += 1;
+                        bytes_freed += size;
+                    }
+                    Err(e) => warn!("wal gc: failed to remove {}: {}", path.display(), e),
+                }
+            }
+        }
+    }
+    Ok((deleted, bytes_freed))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1363,5 +1417,50 @@ mod tests {
         let deserialized = deserialize_update_payload(&serialized).unwrap();
         assert_eq!(payload.predicate_sql, deserialized.predicate_sql);
         assert_eq!(payload.assignments, deserialized.assignments);
+    }
+
+    #[test]
+    fn gc_wal_files_skips_meta_and_respects_cutoff() {
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Layout mirrors prod: data files + a `.timefusion_meta/` sibling
+        // that must survive both passes.
+        std::fs::create_dir_all(root.join(".timefusion_meta")).unwrap();
+        std::fs::write(root.join(".timefusion_meta/cursor_snapshot.json"), b"{}").unwrap();
+        std::fs::write(root.join(".timefusion_meta/topics"), b"").unwrap();
+
+        let f1 = root.join("1779989695814");
+        let f2 = root.join("1780994113609");
+        std::fs::write(&f1, vec![0u8; 1024]).unwrap();
+        std::fs::write(&f2, vec![0u8; 2048]).unwrap();
+
+        // Pass 1: max_age = 1h. Both files were created just now → kept.
+        let (deleted, bytes_freed) = gc_wal_files(root, Duration::from_secs(3600)).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(bytes_freed, 0);
+        assert!(f1.exists() && f2.exists());
+
+        // Pass 2: max_age = 0 → cutoff is "now" → every existing file is
+        // strictly older than the cutoff and gets deleted, but `.timefusion_meta`
+        // is exempt.
+        let (deleted, bytes_freed) = gc_wal_files(root, Duration::ZERO).unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(bytes_freed, 1024 + 2048);
+        assert!(!f1.exists() && !f2.exists());
+        assert!(root.join(".timefusion_meta/cursor_snapshot.json").exists(), "meta dir must be skipped");
+        assert!(root.join(".timefusion_meta/topics").exists());
+    }
+
+    #[test]
+    fn gc_wal_files_handles_missing_dir() {
+        // Pre-init sweep on a fresh deployment hits a not-yet-created dir;
+        // must not error.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let (deleted, bytes_freed) = gc_wal_files(&missing, std::time::Duration::ZERO).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(bytes_freed, 0);
     }
 }
