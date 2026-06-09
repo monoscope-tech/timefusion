@@ -115,15 +115,21 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     let wal_ref = buffered_layer.wal();
     let t_snap = std::time::Instant::now();
     let skip_delta_scan = if let Some(snap) = wal_ref.load_cursor_snapshot() {
-        matches!(wal_ref.restore_cursor_snapshot(&snap), Ok(_)) && snap.clean_shutdown
+        wal_ref.restore_cursor_snapshot(&snap).is_ok() && snap.clean_shutdown
     } else {
         false
     };
-    tracing::info!("bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}", t_snap.elapsed().as_millis());
+    tracing::info!(
+        "bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}",
+        t_snap.elapsed().as_millis()
+    );
     if !skip_delta_scan {
         let t_delta = std::time::Instant::now();
         let advanced = db.derive_wal_cursors_from_delta(wal_ref).await.unwrap_or(0);
-        tracing::info!("bootstrap.phase=delta_cursor_reconcile shards_advanced={advanced} elapsed_ms={}", t_delta.elapsed().as_millis());
+        tracing::info!(
+            "bootstrap.phase=delta_cursor_reconcile shards_advanced={advanced} elapsed_ms={}",
+            t_delta.elapsed().as_millis()
+        );
     }
 
     let t_wal = std::time::Instant::now();

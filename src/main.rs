@@ -200,7 +200,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     } else {
         false
     };
-    info!("bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}", t_snap.elapsed().as_millis());
+    info!(
+        "bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}",
+        t_snap.elapsed().as_millis()
+    );
     if skip_delta_scan {
         info!("Skipping Delta-derived cursor reconciliation (cursor snapshot is clean)");
     } else {
