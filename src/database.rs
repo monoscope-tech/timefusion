@@ -3351,6 +3351,30 @@ impl ProjectRoutingTable {
         filters.iter().find_map(crate::optimizers::extract_project_id_from_expr)
     }
 
+    /// pgwire-INSERT fast path. Skips `DataSinkExec` + `ValuesExec` entirely:
+    /// caller (the plan_cache hook) has already materialized the incoming
+    /// VALUES into a RecordBatch from substituted literals, so we just run
+    /// the per-batch fixups (`convert_variant_columns`, project-id routing,
+    /// `normalize_timestamp_tz` is run inside `insert_records_batch`) and
+    /// hand straight to `insert_records_batch` → `BufferedWriteLayer.insert`.
+    /// Returns the inserted row count.
+    pub async fn fast_insert_batch(&self, batch: RecordBatch) -> DFResult<u64> {
+        let total_rows = batch.num_rows() as u64;
+        if total_rows == 0 {
+            return Ok(0);
+        }
+        let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
+        let target_schema = self.real_schema();
+        let converted = convert_variant_columns(batch, &target_schema)?;
+        self.database
+            .insert_records_batch(&project_id, &self.table_name, vec![converted], false, None)
+            .await
+            .map_err(|e| {
+                DataFusionError::Execution(format!("fast_insert_batch for project {} table {}: {}", project_id, self.table_name, e))
+            })?;
+        Ok(total_rows)
+    }
+
     fn schema(&self) -> SchemaRef {
         // Present Variant cols as Utf8View at the table-provider boundary so the SQL planner's
         // INSERT VALUES type check accepts JSON string literals (arrow has no Utf8→Struct cast).

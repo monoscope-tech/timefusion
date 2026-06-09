@@ -28,16 +28,24 @@
 //! also gain a schema-version token in the key (e.g. an `Arc<AtomicU64>`
 //! bumped on each reload) or a full flush on reload.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use datafusion::{
-    arrow::array::UInt64Array,
+    arrow::{array::UInt64Array, datatypes::Schema, record_batch::RecordBatch},
+    catalog::MemTable,
     common::{
         ParamValues,
         tree_node::{Transformed, TreeNode},
     },
-    logical_expr::{Cast, Expr, LogicalPlan, dml::WriteOp},
+    logical_expr::{Cast, Expr, LogicalPlan, LogicalPlanBuilder, dml::WriteOp},
     prelude::SessionContext,
-    sql::{parser::Statement as DfStatement, sqlparser::ast::Statement},
+    scalar::ScalarValue,
+    sql::{
+        TableReference,
+        parser::Statement as DfStatement,
+        sqlparser::ast::Statement,
+    },
 };
 use datafusion_postgres::{
     hooks::{HookClient, QueryHook},
@@ -85,6 +93,226 @@ fn fold_literal_casts(plan: LogicalPlan) -> datafusion::error::Result<LogicalPla
             .collect::<datafusion::error::Result<_>>()?;
         let rebuilt = node.with_new_exprs(new_exprs, node.inputs().into_iter().cloned().collect())?;
         Ok(Transformed::yes(rebuilt))
+    })
+    .map(|t| t.data)
+}
+
+/// pgwire-INSERT bypass: recognise `Dml(Insert) → [Projection →] Values(literals)`
+/// and short-circuit the whole DataFusion executor by building the RecordBatch
+/// directly from the literals and calling `ProjectRoutingTable.fast_insert_batch`.
+/// Skips `ValuesExec`, `DataSinkExec`, and the per-row `replace_params_with_values`
+/// walk that together account for ~5-6 ms/row of overhead at the 88-col schema.
+///
+/// Returns `Ok(Some(rows))` on success, `Ok(None)` if the plan shape isn't
+/// the supported fast-path INSERT (caller should fall back to the regular
+/// `execute_logical_plan` path).
+async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionContext) -> datafusion::error::Result<Option<u64>> {
+    use datafusion::logical_expr::dml::DmlStatement;
+
+    let LogicalPlan::Dml(DmlStatement { table_name, op: WriteOp::Insert(_), input, .. }) = plan else {
+        return Ok(None);
+    };
+
+    // Input is either `Projection → Values` (the common case for INSERT INTO
+    // t (cols) VALUES …) or `Values` directly. We use the Values schema for
+    // building the RecordBatch (row width must match cell count), and where
+    // there is a Projection above, we require each projection expr to be a
+    // simple column rename: `column1 AS target_col`. After `fold_literal_casts`
+    // this is true for parameterised pgwire INSERTs where `insert_coerce`
+    // already pushed the target type down into each placeholder. Anything
+    // more complex (default expressions, computed columns) falls back to the
+    // executor.
+    // For Projection above Values, each output column is either `Column(..)`
+    // or `Alias(Column(..), name)`. We capture (values_input_idx, output_name)
+    // per projection position so we can reorder Values columns to match the
+    // table's expected layout. Anything more complex (computed cols, casts
+    // we didn't fold, sub-exprs) falls back to the executor.
+    // Each output column maps either to a Values column position (column refs
+    // — the common case) or to a constant the optimizer folded into the
+    // projection (NULL defaults for unspecified columns, etc.). We record
+    // (source, name) per output column so the build step can pull from the
+    // right place.
+    enum ColumnSource {
+        Values(usize),
+        Constant(ScalarValue),
+    }
+    let (column_plan, values): (Option<Vec<(ColumnSource, String)>>, &datafusion::logical_expr::Values) = match input.as_ref() {
+        LogicalPlan::Projection(p) => {
+            let LogicalPlan::Values(v) = p.input.as_ref() else {
+                return Ok(None);
+            };
+            let mut plan: Vec<(ColumnSource, String)> = Vec::with_capacity(p.expr.len());
+            for (i, e) in p.expr.iter().enumerate() {
+                let (inner, name) = match e {
+                    Expr::Alias(a) => (a.expr.as_ref(), a.name.clone()),
+                    other => (other, p.schema.field(i).name().to_string()),
+                };
+                match inner {
+                    Expr::Column(c) => {
+                        let Some(input_idx) = v.schema.fields().iter().position(|f| f.name() == &c.name) else {
+                            return Ok(None);
+                        };
+                        plan.push((ColumnSource::Values(input_idx), name));
+                    }
+                    Expr::Literal(val, _) => {
+                        plan.push((ColumnSource::Constant(val.clone()), name));
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            (Some(plan), v)
+        }
+        LogicalPlan::Values(v) => (None, v),
+        _ => return Ok(None),
+    };
+    let target_schema = values.schema.clone();
+
+    // Every cell must be a literal — possibly wrapped in an Alias from the
+    // pgwire `$N` placeholder name retained after substitution. Anything else
+    // legitimately needs the full executor (subqueries, function calls,
+    // correlated refs, etc.).
+    fn cell_as_literal(e: &Expr) -> Option<&ScalarValue> {
+        match e {
+            Expr::Literal(v, _) => Some(v),
+            Expr::Alias(a) => cell_as_literal(&a.expr),
+            _ => None,
+        }
+    }
+    if !values.values.iter().all(|row| row.iter().all(|e| cell_as_literal(e).is_some())) {
+        return Ok(None);
+    }
+
+    let values_schema: Arc<Schema> = Arc::new(target_schema.as_arrow().clone());
+    let num_values_cols = values_schema.fields().len();
+    let num_rows = values.values.len();
+
+    // Build one array per Values column (in Values' native order).
+    let mut values_columns: Vec<datafusion::arrow::array::ArrayRef> = Vec::with_capacity(num_values_cols);
+    for col_idx in 0..num_values_cols {
+        let target_ty = values_schema.field(col_idx).data_type();
+        if num_rows == 0 {
+            values_columns.push(datafusion::arrow::array::new_empty_array(target_ty));
+            continue;
+        }
+        let scalars: Vec<ScalarValue> = values
+            .values
+            .iter()
+            .map(|row| {
+                cell_as_literal(&row[col_idx]).cloned().ok_or_else(|| {
+                    datafusion::error::DataFusionError::Internal(format!(
+                        "try_fast_path_insert: expected Literal, got {:?}",
+                        row[col_idx]
+                    ))
+                })
+            })
+            .collect::<datafusion::error::Result<_>>()?;
+        let arr = ScalarValue::iter_to_array(scalars)?;
+        // `iter_to_array` may return a different concrete type than the
+        // Values column declares (e.g. all-NULL columns come back as Null).
+        // Cast back to target so the downstream MemBuffer schema check sees
+        // exactly what the table expects.
+        let arr = if arr.data_type() == target_ty {
+            arr
+        } else {
+            datafusion::arrow::compute::cast(&arr, target_ty)
+                .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+        };
+        values_columns.push(arr);
+    }
+
+    // Apply the projection: pull Values columns by index, or materialize a
+    // constant array for projection cells the optimizer folded to a literal
+    // (NULL defaults for columns not in the INSERT, etc.).
+    let (final_schema, columns) = if let Some(plan) = column_plan {
+        let n = num_rows.max(1);
+        let mut fields: Vec<Arc<datafusion::arrow::datatypes::Field>> = Vec::with_capacity(plan.len());
+        let mut cols: Vec<datafusion::arrow::array::ArrayRef> = Vec::with_capacity(plan.len());
+        for (src, name) in &plan {
+            match src {
+                ColumnSource::Values(idx) => {
+                    let f = values_schema.field(*idx);
+                    fields.push(Arc::new(datafusion::arrow::datatypes::Field::new(name, f.data_type().clone(), f.is_nullable())));
+                    cols.push(values_columns[*idx].clone());
+                }
+                ColumnSource::Constant(val) => {
+                    let arr = val.to_array_of_size(n)?;
+                    fields.push(Arc::new(datafusion::arrow::datatypes::Field::new(name, arr.data_type().clone(), true)));
+                    cols.push(arr);
+                }
+            }
+        }
+        (Arc::new(Schema::new(fields)), cols)
+    } else {
+        (values_schema, values_columns)
+    };
+    let batch = RecordBatch::try_new(final_schema, columns)
+        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+
+    let provider = session_context.table_provider(table_name.clone()).await?;
+    let Some(routing) = provider.as_any().downcast_ref::<crate::database::ProjectRoutingTable>() else {
+        return Ok(None);
+    };
+    let rows = routing.fast_insert_batch(batch).await?;
+    Ok(Some(rows))
+}
+
+/// Replace every `LogicalPlan::Values` whose rows are entirely literal with a
+/// `TableScan` over an in-memory `MemTable` carrying a precomputed
+/// `RecordBatch`. Currently unused — kept for reference; the `try_fast_path_insert`
+/// bypass is cleaner because it also avoids the `Projection`/`DataSinkExec`
+/// stream overhead.
+#[allow(dead_code)]
+fn values_to_memtable(plan: LogicalPlan) -> datafusion::error::Result<LogicalPlan> {
+    plan.transform_up(|node| {
+        let LogicalPlan::Values(values) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        // Only literal-only Values qualify for the shortcut. Anything else
+        // legitimately needs ValuesExec to evaluate.
+        let all_literal = values.values.iter().all(|row| row.iter().all(|e| matches!(e, Expr::Literal(_, _))));
+        if !all_literal {
+            return Ok(Transformed::no(node));
+        }
+        let arrow_schema: Arc<Schema> = Arc::new(values.schema.as_arrow().clone());
+        let num_cols = arrow_schema.fields().len();
+        let num_rows = values.values.len();
+        // Build column-by-column: collect each column's scalar values, then
+        // `ScalarValue::iter_to_array` packs them into an `ArrayRef` in one go.
+        let mut columns: Vec<datafusion::arrow::array::ArrayRef> = Vec::with_capacity(num_cols);
+        for col_idx in 0..num_cols {
+            let target_ty = arrow_schema.field(col_idx).data_type();
+            if num_rows == 0 {
+                columns.push(datafusion::arrow::array::new_empty_array(target_ty));
+                continue;
+            }
+            let scalars: Vec<ScalarValue> = values
+                .values
+                .iter()
+                .map(|row| match &row[col_idx] {
+                    Expr::Literal(v, _) => Ok(v.clone()),
+                    other => Err(datafusion::error::DataFusionError::Internal(format!(
+                        "values_to_memtable: expected Literal, got {other:?}"
+                    ))),
+                })
+                .collect::<datafusion::error::Result<_>>()?;
+            let arr = ScalarValue::iter_to_array(scalars)?;
+            // ScalarValue::iter_to_array can return an array whose type doesn't
+            // exactly match the Values column type (e.g. all-NULL columns come
+            // back as Null arrays). Cast back to the declared type so the
+            // upstream Projection's column refs type-check.
+            let arr = if arr.data_type() == target_ty {
+                arr
+            } else {
+                datafusion::arrow::compute::cast(&arr, target_ty)
+                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+            };
+            columns.push(arr);
+        }
+        let batch = RecordBatch::try_new(arrow_schema.clone(), columns)
+            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let mem_table = MemTable::try_new(arrow_schema, vec![vec![batch]])?;
+        let scan = LogicalPlanBuilder::scan(TableReference::bare("__pgwire_values"), datafusion::datasource::provider_as_source(Arc::new(mem_table)), None)?.build()?;
+        Ok(Transformed::yes(scan))
     })
     .map(|t| t.data)
 }
@@ -332,6 +560,15 @@ impl QueryHook for PlanCacheHook {
             Ok(p) => p,
             Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
         };
+        // Fast-path: `Dml(Insert) → [Projection →] Values(literals)` skips the
+        // executor entirely and writes the batch straight into the buffered
+        // layer. Saves the ~5-6 ms/row that `ValuesExec` + `DataSinkExec`
+        // were costing at the 88-col schema.
+        match try_fast_path_insert(&folded, session_context).await {
+            Ok(Some(rows)) => return Some(Ok(Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(rows as usize)))),
+            Ok(None) => {} // fall through to the normal executor
+            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
+        }
         let df = match session_context.execute_logical_plan(folded).await {
             Ok(df) => df,
             Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
