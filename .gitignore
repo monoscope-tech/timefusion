@@ -11,3 +11,5 @@ dis-newstyle
 *.log
 .DS_Store
 wal_files/
+__pycache__/
+*.pyc
