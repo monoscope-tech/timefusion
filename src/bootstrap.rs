@@ -49,11 +49,9 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
         move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
             let db = db_for_callback.clone();
             Box::pin(async move {
-                let pre = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
-                db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await?;
-                let post = db.list_file_uris(&project_id, &table_name).await.unwrap_or_default();
-                let pre_set: std::collections::HashSet<String> = pre.into_iter().collect();
-                let added: Vec<String> = post.into_iter().filter(|u| !pre_set.contains(u)).collect();
+                let added = db
+                    .insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark))
+                    .await?;
                 db.warm_cache_for_table(&project_id, &table_name, added.clone());
                 Ok(added)
             })

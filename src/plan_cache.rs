@@ -30,18 +30,86 @@
 
 use async_trait::async_trait;
 use datafusion::{
-    logical_expr::LogicalPlan,
+    arrow::array::UInt64Array,
+    common::{
+        ParamValues,
+        tree_node::{Transformed, TreeNode},
+    },
+    logical_expr::{Cast, Expr, LogicalPlan, dml::WriteOp},
     prelude::SessionContext,
     sql::{parser::Statement as DfStatement, sqlparser::ast::Statement},
 };
 use datafusion_postgres::{
     hooks::{HookClient, QueryHook},
     pgwire::{
-        api::{ClientInfo, results::Response},
+        api::{
+            ClientInfo,
+            results::{Response, Tag},
+        },
         error::{PgWireError, PgWireResult},
     },
 };
 use tracing::debug;
+
+/// Walk a plan and replace every `CAST(Literal(v), T)` with `Literal(cast(v, T))`.
+///
+/// After `replace_params_with_values` substitutes `$N → literal`, the `CAST`
+/// wrappers `insert_coerce` puts around every placeholder turn into per-cell
+/// `CAST(Literal, T)` exprs inside `ValuesExec`. Executing those casts at
+/// query time, once per (row, column), is responsible for ~9–10 ms/row of
+/// pgwire-INSERT overhead at the 88-col schema (measured). The cast values
+/// are constant so we can fold them once, at substitution time, and let
+/// `ValuesExec` see plain literals.
+fn fold_literal_casts(plan: LogicalPlan) -> datafusion::error::Result<LogicalPlan> {
+    plan.transform_up(|node| {
+        let new_exprs: Vec<Expr> = node
+            .expressions()
+            .into_iter()
+            .map(|expr| {
+                expr.transform_up(|e| {
+                    if let Expr::Cast(Cast { expr, data_type }) = &e
+                        && let Expr::Literal(value, metadata) = expr.as_ref()
+                    {
+                        return match value.cast_to(data_type) {
+                            Ok(folded) => Ok(Transformed::yes(Expr::Literal(folded, metadata.clone()))),
+                            // If a particular literal can't be cast (e.g. lossy
+                            // string-→-number), leave it alone — the executor's
+                            // cast will surface a clear error.
+                            Err(_) => Ok(Transformed::no(e)),
+                        };
+                    }
+                    Ok(Transformed::no(e))
+                })
+                .map(|t| t.data)
+            })
+            .collect::<datafusion::error::Result<_>>()?;
+        let rebuilt = node.with_new_exprs(new_exprs, node.inputs().into_iter().cloned().collect())?;
+        Ok(Transformed::yes(rebuilt))
+    })
+    .map(|t| t.data)
+}
+
+/// Mirror of the vendored `datafusion_postgres::handlers::dml_completion` which
+/// is private. Drives the Insert/Update/Delete dataframe to completion and
+/// builds a `Tag::new(<verb>).with_rows(N)` Execution response.
+async fn dml_completion(df: datafusion::dataframe::DataFrame) -> PgWireResult<Option<Response>> {
+    let tag = match df.logical_plan() {
+        LogicalPlan::Dml(d) => match d.op {
+            WriteOp::Insert(_) => Tag::new("INSERT").with_oid(0),
+            WriteOp::Update => Tag::new("UPDATE"),
+            WriteOp::Delete => Tag::new("DELETE"),
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let batches = df.collect().await.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+    let rows = batches
+        .first()
+        .and_then(|b| b.column_by_name("count"))
+        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .map_or(0, |a| a.value(0) as usize);
+    Ok(Some(Response::Execution(tag.with_rows(rows))))
+}
 
 const DEFAULT_PLAN_CACHE_CAPACITY: usize = 256;
 
@@ -245,10 +313,36 @@ impl QueryHook for PlanCacheHook {
     }
 
     async fn handle_extended_query(
-        &self, _statement: &Statement, _logical_plan: &LogicalPlan, _params: &datafusion::common::ParamValues, _session_context: &SessionContext,
+        &self, _statement: &Statement, logical_plan: &LogicalPlan, params: &ParamValues, session_context: &SessionContext,
         _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
-        None
+        // Only intercept DML — for SELECTs the vendored path is fine.
+        // The win here is post-substitution constant folding of `CAST(Literal, T)`
+        // exprs that `insert_coerce` puts around every placeholder; folding them
+        // before `ValuesExec` evaluates the plan saves ~9–10 ms per inserted
+        // row on the 88-col schema (measured).
+        if !matches!(logical_plan, LogicalPlan::Dml(_)) {
+            return None;
+        }
+        let substituted = match logical_plan.clone().replace_params_with_values(params) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
+        };
+        let folded = match fold_literal_casts(substituted) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
+        };
+        let df = match session_context.execute_logical_plan(folded).await {
+            Ok(df) => df,
+            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
+        };
+        Some(match dml_completion(df).await {
+            Ok(Some(resp)) => Ok(resp),
+            Ok(None) => Err(PgWireError::ApiError(
+                "internal error: DML plan returned non-DML completion".to_string().into(),
+            )),
+            Err(e) => Err(e),
+        })
     }
 
     /// Signal to the do_query path that any plan we returned is already
