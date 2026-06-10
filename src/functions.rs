@@ -756,7 +756,8 @@ fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
         }
         if bytes[i] == b'D' && !bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphabetic()) {
             // Bare `D` only — guarded so `D<letter>` (e.g. a future token starting with D)
-            // doesn't get consumed here. `Day`, `Dy`, `DD` are caught by TOKENS / DY above.
+            // doesn't get consumed here. `Day`, `Dy`, `DD` are caught by TOKENS; `DY` is
+            // caught by its own check above.
             flush(&mut parts, &mut buf);
             parts.push(FmtPart::PgD);
             i += 1;
