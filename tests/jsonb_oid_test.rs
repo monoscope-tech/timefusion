@@ -14,7 +14,7 @@ mod jsonb_oid {
     use serial_test::serial;
     use timefusion::{config::AppConfig, database::Database};
     use tokio::sync::Notify;
-    use tokio_postgres::{types::Type, NoTls};
+    use tokio_postgres::{NoTls, types::Type};
     use uuid::Uuid;
 
     const JSONB_OID: u32 = 3802;
@@ -68,7 +68,9 @@ mod jsonb_oid {
             let conn_str = format!("host=localhost port={port} user=postgres password=postgres");
             for _ in 0..100 {
                 if let Ok((client, conn)) = tokio_postgres::connect(&conn_str, NoTls).await {
-                    tokio::spawn(async move { let _ = conn.await; });
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
                     drop(client);
                     return Ok(Self { port, shutdown });
                 }
@@ -80,7 +82,9 @@ mod jsonb_oid {
         async fn connect(&self) -> Result<tokio_postgres::Client> {
             let conn_str = format!("host=localhost port={} user=postgres password=postgres", self.port);
             let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
-            tokio::spawn(async move { let _ = conn.await; });
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
             Ok(client)
         }
     }
@@ -100,8 +104,11 @@ mod jsonb_oid {
         // tokio-postgres `prepare` round-trips RowDescription; column type OID
         // is what hasql / strict drivers inspect.
         let stmt = client.prepare("SELECT jsonb_build_array(1, 'a', true) AS j").await?;
-        assert_eq!(stmt.columns()[0].type_().oid(), JSONB_OID,
-            "jsonb_build_array must surface PG jsonb OID, not text");
+        assert_eq!(
+            stmt.columns()[0].type_().oid(),
+            JSONB_OID,
+            "jsonb_build_array must surface PG jsonb OID, not text"
+        );
 
         // Binary decode via serde_json::Value (tokio-postgres uses binary by default).
         let row = client.query_one("SELECT jsonb_build_array(1, 'a', true) AS j", &[]).await?;
