@@ -47,7 +47,7 @@ impl AnalyzerRule for WildcardFnArgExpander {
     }
 
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        plan.transform_up(|p| expand_in_plan(p)).map(|t| t.data)
+        plan.transform_up(expand_in_plan).map(|t| t.data)
     }
 }
 
@@ -59,22 +59,7 @@ fn expand_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     if input_schemas.is_empty() {
         return Ok(Transformed::no(plan));
     }
-
-    let mut any_changed = false;
-    let rewritten = plan.map_expressions(|expr| {
-        let t = expr.transform_up(|e| expand_in_expr(e, &input_schemas))?;
-        if t.transformed {
-            any_changed = true;
-        }
-        Ok(t)
-    })?;
-
-    if any_changed {
-        Ok(Transformed::yes(rewritten.data))
-    } else {
-        // Drop the rewritten wrapper to preserve the input plan node identity.
-        Ok(Transformed::no(rewritten.data))
-    }
+    plan.map_expressions(|expr| expr.transform_up(|e| expand_in_expr(e, &input_schemas)))
 }
 
 #[allow(deprecated)] // Expr::Wildcard is the actual variant the SQL planner emits today (#7765 plans to replace it, not gone yet)
@@ -157,8 +142,38 @@ mod tests {
     #[tokio::test]
     async fn unknown_qualifier_errors_clearly() {
         let ctx = ctx_with_rule();
-        let err = ctx.sql("SELECT jsonb_build_array(sub.*) FROM (SELECT 1 AS a) other").await.err().expect("expected error");
+        let err = ctx.sql("SELECT jsonb_build_array(sub.*) FROM (SELECT 1 AS a) other").await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("qualifier") || msg.contains("sub"), "msg: {msg}");
+    }
+
+    /// Two qualifiers in one call — schema lookup must handle each independently
+    /// and concatenate the column lists in argument order.
+    #[tokio::test]
+    async fn multiple_qualifiers_in_one_call() {
+        let ctx = ctx_with_rule();
+        let df = ctx
+            .sql(
+                "SELECT jsonb_build_array(a.*, b.*) \
+                 FROM (SELECT 1 AS x, 2 AS y) a \
+                 CROSS JOIN (SELECT 'p' AS p, 'q' AS q) b",
+            )
+            .await
+            .expect("plan ok");
+        let batches = df.collect().await.expect("exec ok");
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().expect("StringViewArray");
+        assert_eq!(col.value(0), r#"[1,2,"p","q"]"#);
+    }
+
+    /// `outer(inner(sub.*))` — transform_up visits the inner ScalarFunction first,
+    /// so the wildcard expansion has to happen there, and the outer call then sees
+    /// the resolved column args.
+    #[tokio::test]
+    async fn nested_function_calls_expand_inside_out() {
+        let ctx = ctx_with_rule();
+        let df = ctx.sql("SELECT jsonb_build_array(jsonb_build_array(sub.*)) FROM (SELECT 1 AS a, 2 AS b) sub").await.expect("plan ok");
+        let batches = df.collect().await.expect("exec ok");
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().expect("StringViewArray");
+        assert_eq!(col.value(0), r#"[[1,2]]"#);
     }
 }
