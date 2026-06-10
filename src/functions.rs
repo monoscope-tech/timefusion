@@ -387,6 +387,8 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
 
     // Register json_build_array function
     ctx.register_udf(create_json_build_array_udf());
+    ctx.register_udf(ScalarUDF::from(JsonbBuildArrayUDF::new()));
+    ctx.register_udf(ScalarUDF::from(ToJsonbUDF::new()));
 
     // Register to_json function
     ctx.register_udf(create_to_json_udf());
@@ -931,8 +933,7 @@ impl JsonBuildArrayUDF {
     fn new() -> Self {
         Self {
             signature: Signature::variadic_any(Volatility::Immutable),
-            // `jsonb_build_array` is Postgres-only; TimeFusion stores JSON as Utf8View either way.
-            aliases:   vec!["jsonb_build_array".to_string()],
+            aliases:   vec![],
         }
     }
 }
@@ -1006,8 +1007,7 @@ impl ToJsonUDF {
     fn new() -> Self {
         Self {
             signature: Signature::any(1, Volatility::Immutable),
-            // `to_jsonb` is Postgres-only; TimeFusion stores JSON as Utf8View either way.
-            aliases:   vec!["to_jsonb".to_string()],
+            aliases:   vec![],
         }
     }
 }
@@ -1044,6 +1044,34 @@ impl ScalarUDFImpl for ToJsonUDF {
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
     }
 }
+
+// JSONB-tagged wrappers around the JSON UDFs. Output stays Utf8View, but the
+// returned Field carries `tf.pg_type = jsonb` so the patched vendor/arrow-pg
+// surfaces PG OID 3802 and prepends the 0x01 binary jsonb version byte.
+fn jsonb_tagged_field(data_type: DataType) -> Arc<datafusion::arrow::datatypes::Field> {
+    let meta = [("tf.pg_type".to_string(), "jsonb".to_string())].into_iter().collect();
+    Arc::new(datafusion::arrow::datatypes::Field::new("", data_type, true).with_metadata(meta))
+}
+
+macro_rules! jsonb_wrapper {
+    ($wrap:ident, $inner:ident, $pg_name:expr) => {
+        #[derive(Debug, Hash, Eq, PartialEq)]
+        struct $wrap { inner: $inner }
+        impl $wrap { fn new() -> Self { Self { inner: $inner::new() } } }
+        impl ScalarUDFImpl for $wrap {
+            fn as_any(&self) -> &dyn Any { self }
+            fn name(&self) -> &str { $pg_name }
+            fn signature(&self) -> &Signature { self.inner.signature() }
+            fn return_type(&self, a: &[DataType]) -> datafusion::error::Result<DataType> { self.inner.return_type(a) }
+            fn return_field_from_args(&self, _: datafusion::logical_expr::ReturnFieldArgs)
+                -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef>
+            { Ok(jsonb_tagged_field(DataType::Utf8View)) }
+            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> { self.inner.invoke_with_args(args) }
+        }
+    };
+}
+jsonb_wrapper!(JsonbBuildArrayUDF, JsonBuildArrayUDF, "jsonb_build_array");
+jsonb_wrapper!(ToJsonbUDF, ToJsonUDF, "to_jsonb");
 
 /// Create the extract_epoch UDF for extracting epoch time with fractional seconds
 fn create_extract_epoch_udf() -> ScalarUDF {

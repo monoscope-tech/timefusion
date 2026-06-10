@@ -206,6 +206,10 @@ mod sqllogictest_tests {
                                 .map(|v| v.unwrap_or_else(|| "NULL".to_string()))
                                 .unwrap_or_else(|_| "[timestamp]".to_string())
                         }),
+                    "json" | "jsonb" => row
+                        .try_get::<_, Option<serde_json::Value>>(i)
+                        .map(|v| v.map(|j| j.to_string()).unwrap_or_else(|| "NULL".to_string()))
+                        .unwrap_or_else(|_| format!("error:{type_name}")),
                     _ => row
                         .try_get::<_, Option<String>>(i)
                         .map(|v| v.unwrap_or_else(|| "NULL".to_string()))

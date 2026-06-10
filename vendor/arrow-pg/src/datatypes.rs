@@ -123,6 +123,14 @@ pub fn into_pg_type(arrow_type: &DataType) -> PgWireResult<Type> {
 pub fn field_into_pg_type(field: &Arc<Field>) -> PgWireResult<Type> {
     let arrow_type = field.data_type();
 
+    // TF patch: DataFusion has no native jsonb type, so UDFs tag their output
+    // Field with `tf.pg_type` to surface PG JSON/JSONB OIDs over pgwire.
+    match field.metadata().get("tf.pg_type").map(String::as_str) {
+        Some("jsonb") => return Ok(Type::JSONB),
+        Some("json") => return Ok(Type::JSON),
+        _ => {}
+    }
+
     match field.extension_type_name() {
         // As of arrow 56, there are additional extension logical type that is
         // defined using field metadata, for instance, json or geo.
