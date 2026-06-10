@@ -104,7 +104,10 @@ jobs:
             docker logs minio
             exit 1
           fi
-          docker run --rm --network host "$MC_IMAGE" sh -c '
+          # mc image's ENTRYPOINT is `mc` itself, so we override to /bin/sh to run a
+          # multi-command script. (Without --entrypoint, `mc sh -c '...'` is what runs
+          # and mc rejects `sh` as an unknown subcommand.)
+          docker run --rm --network host --entrypoint /bin/sh "$MC_IMAGE" -c '
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/timefusion-test local/timefusion-tests'
       - uses: actions/checkout@v4
