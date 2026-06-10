@@ -1,6 +1,7 @@
 mod tantivy_rewriter;
 mod variant_insert_rewriter;
 mod variant_select_rewriter;
+mod wildcard_fn_arg_expander;
 
 use datafusion::{
     logical_expr::{BinaryExpr, Expr, Operator},
@@ -9,6 +10,7 @@ use datafusion::{
 pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;
 pub use variant_select_rewriter::VariantSelectRewriter;
+pub use wildcard_fn_arg_expander::WildcardFnArgExpander;
 
 /// Utilities for converting timestamp filters to date partition filters
 /// for better partition pruning in Delta Lake

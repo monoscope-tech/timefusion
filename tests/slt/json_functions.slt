@@ -207,6 +207,13 @@ SELECT jsonb_build_array(c1, c2, c3) FROM (SELECT id, name, duration FROM otel_l
 ----
 ["00000000-0000-0000-0000-000000000001","test_span",1500]
 
+# Postgres parity: qualified-wildcard in a function call expands to the qualifier's columns.
+# Makes `SELECT jsonb_build_array(sub.*) FROM (...) sub` work without a client-side column count.
+query T
+SELECT jsonb_build_array(sub.*) FROM (SELECT id, name, duration FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1) sub
+----
+["00000000-0000-0000-0000-000000000001","test_span",1500]
+
 # Test to_json function
 query T
 SELECT to_json(summary) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1

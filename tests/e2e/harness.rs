@@ -103,6 +103,13 @@ impl E2eEnvBuilder {
         let test_id = Uuid::new_v4().to_string()[..8].to_string();
         let bucket = format!("e2e-{test_id}");
         let data_dir = std::env::temp_dir().join(format!("timefusion-e2e-{test_id}"));
+        // Defensive: wipe before create. Each test_id is UUID-derived so this can
+        // only target our own dir. CI's /tmp is shared across sequential e2e tests
+        // in the same job, and `gc_wal_files` only deletes files older than
+        // `retention_mins * 2` (~2h20m) — so a fresh leftover from a prior test
+        // survives the gc, and `check_wal_version_stamp` then trips
+        // `Unsupported WAL version: 0 (expected 1)` on what should be a fresh dir.
+        let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(&data_dir).ok();
 
         // walrus-rust reads WALRUS_DATA_DIR from process env. Point it at
