@@ -60,10 +60,11 @@ fn expand_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         return Ok(Transformed::no(plan));
     }
     // No recompute_schema() needed (cf. VariantSelectRewriter which does call it):
-    // `jsonb_build_array(VARIADIC any) -> Utf8View` returns the same type whether we
-    // pass 1 wildcard or N expanded columns, so the projection's output schema
-    // doesn't change. TypeCoercion (the next analyzer pass) re-checks types end-to-end
-    // anyway, so any type drift from another rule would be caught there.
+    // the next analyzer pass (TypeCoercion) re-derives all expression types
+    // end-to-end against the rewritten plan, so any function-arity-sensitive
+    // return-type drift (hypothetical polymorphic UDFs) is corrected before
+    // planning completes. The motivating case — jsonb_build_array(VARIADIC any) →
+    // Utf8View — doesn't drift at all, but the safety net holds either way.
     plan.map_expressions(|expr| expr.transform_up(|e| expand_in_expr(e, &input_schemas)))
 }
 
