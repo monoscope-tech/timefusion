@@ -704,6 +704,9 @@ fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
         ("TZ", "%Z"),
         ("AM", "%p"),
         ("PM", "%p"),
+        // Lowercase forms — Postgres `am`/`pm` emit lowercase output (chrono `%P`).
+        ("am", "%P"),
+        ("pm", "%P"),
     ];
 
     // All token keys are ASCII so byte-prefix matching is sound, but the non-token
@@ -748,9 +751,10 @@ fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
             continue;
         }
         // `DY` must be matched before bare `D` (longest-prefix). Neither is in TOKENS.
-        // Same trailing-alpha guard as `D` below so a future `DYY`-style token doesn't
-        // get greedily consumed as `DY` + leftover `Y`.
-        if bytes[i..].starts_with(b"DY") && !bytes.get(i + 2).is_some_and(|b| b.is_ascii_alphabetic()) {
+        // No trailing-alpha guard here: Postgres consumes `DY` greedily, so `DYY` is
+        // `DY` + leftover `Y`. The bare-`D` guard below is still needed because
+        // `Day`/`Dy`/`DD` are alpha-prefix conflicts; no such conflict exists for `DY`.
+        if bytes[i..].starts_with(b"DY") {
             flush(&mut parts, &mut buf);
             parts.push(FmtPart::PgDY);
             i += 2;
@@ -1870,8 +1874,10 @@ mod tests {
             (r#""YYYY=" YYYY"#, "YYYY= 2026"),
             // Non-ASCII bytes inside a literal must survive intact (UTF-8 boundary walk).
             (r#""· "YYYY"#, "· 2026"),
-            // AM/PM and Dy round-out token coverage.
+            // AM/PM, Dy, bare HH round-out token coverage.
             ("HH12:MI AM", "08:10 AM"),
+            ("HH:MI:SS", "08:10:52"),   // bare HH aliases HH12 (12-hour clock with leading zero).
+            ("HH12:MI am", "08:10 am"), // lowercase am token emits lowercase output.
             ("Dy", "Wed"),
             // Postgres-specific tokens with no exact chrono equivalent.
             // 2026-06-10 is a Wednesday: Postgres D=4 (Sun=1), DY="WED".
