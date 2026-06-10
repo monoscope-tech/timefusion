@@ -74,23 +74,27 @@ jobs:
       TIMEFUSION_FOYER_METADATA_MEMORY_MB: "10"
       TIMEFUSION_FOYER_METADATA_DISK_MB: "50"
       TIMEFUSION_FOYER_SHARDS: "2"
-    services:
-      minio:
-        image: public.ecr.aws/bitnami/minio:latest
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-          MINIO_DEFAULT_BUCKETS: timefusion-test,timefusion-tests
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      # `public.ecr.aws/bitnami/minio` was withdrawn (Bitnami consolidated registries).
+      # GitHub Actions `services:` can't override the entrypoint to pass `server /data`
+      # to the official quay.io/minio/minio image, so start it manually and seed the
+      # buckets that the bitnami image used to auto-create via MINIO_DEFAULT_BUCKETS.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio:latest server /data --console-address ":9001"
+          for _ in {1..30}; do
+            curl -sf http://localhost:9000/minio/health/live && break
+            sleep 1
+          done
+          docker run --rm --network host quay.io/minio/mc:latest sh -c '
+            mc alias set local http://localhost:9000 minioadmin minioadmin &&
+            mc mb -p local/timefusion-test local/timefusion-tests'
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:

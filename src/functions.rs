@@ -622,6 +622,9 @@ fn postgres_to_chrono_format(pg_format: &str) -> String {
     const TOKENS: &[(&str, &str)] = &[
         ("YYYY", "%Y"),
         ("YY", "%y"),
+        // Note: Postgres pads `Month` / `Day` output to 9 chars; chrono's %B / %A do not.
+        // E2E callers rely on the unpadded form, so we keep the divergence — re-add padding
+        // only if a caller asks for it.
         ("Month", "%B"),
         ("Mon", "%b"),
         ("MM", "%m"),
@@ -646,9 +649,21 @@ fn postgres_to_chrono_format(pg_format: &str) -> String {
         ("PM", "%p"),
     ];
 
+    // All token keys are ASCII so byte-prefix matching is sound, but the non-token
+    // pass-through path must walk UTF-8 char boundaries — a multi-byte char in a `"..."`
+    // literal would otherwise be split into separate `char`s and produce mojibake.
     let bytes = pg_format.as_bytes();
     let mut out = String::with_capacity(pg_format.len());
     let mut i = 0;
+    let push_passthrough = |out: &mut String, s: &str, i: &mut usize| {
+        let c = s[*i..].chars().next().expect("loop invariant: i < s.len()");
+        // chrono treats `%` as a format-spec start; double it to emit a literal.
+        if c == '%' {
+            out.push('%');
+        }
+        out.push(c);
+        *i += c.len_utf8();
+    };
     while i < bytes.len() {
         if bytes[i] == b'"' {
             // Literal section: copy until matching `"`. `""` inside is an escaped quote.
@@ -663,25 +678,17 @@ fn postgres_to_chrono_format(pg_format: &str) -> String {
                     i += 1;
                     break;
                 }
-                // chrono treats `%` as a format-spec start; double it to emit a literal.
-                if bytes[i] == b'%' {
-                    out.push('%');
-                }
-                out.push(bytes[i] as char);
-                i += 1;
+                push_passthrough(&mut out, pg_format, &mut i);
             }
             continue;
         }
-        if let Some((pg, chrono)) = TOKENS.iter().find(|(pg, _)| bytes[i..].starts_with(pg.as_bytes())) {
+        let matched = TOKENS.iter().find(|(pg, _)| bytes[i..].starts_with(pg.as_bytes()));
+        if let Some((pg, chrono)) = matched {
             out.push_str(chrono);
             i += pg.len();
             continue;
         }
-        if bytes[i] == b'%' {
-            out.push('%');
-        }
-        out.push(bytes[i] as char);
-        i += 1;
+        push_passthrough(&mut out, pg_format, &mut i);
     }
     out
 }
@@ -1768,6 +1775,11 @@ mod tests {
             ("YY", "26"),
             // Literal containing characters that look like tokens.
             (r#""YYYY=" YYYY"#, "YYYY= 2026"),
+            // Non-ASCII bytes inside a literal must survive intact (UTF-8 boundary walk).
+            (r#""· "YYYY"#, "· 2026"),
+            // AM/PM and Dy round-out token coverage.
+            ("HH12:MI AM", "08:10 AM"),
+            ("Dy", "Wed"),
         ];
         for (fmt, expected) in cases {
             let sql = format!("SELECT to_char({ts}, '{fmt}') AS s");
