@@ -83,16 +83,21 @@ jobs:
       # buckets that the bitnami image used to auto-create via MINIO_DEFAULT_BUCKETS.
       - name: Start MinIO
         run: |
+          # Pinned to a known-good release so a breaking upstream tag doesn't silently break CI.
+          MINIO_IMAGE=quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+          MC_IMAGE=quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
           docker run -d --name minio \
             -p 9000:9000 -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:latest server /data --console-address ":9001"
+            "$MINIO_IMAGE" server /data --console-address ":9001"
           for _ in {1..30}; do
             curl -sf http://localhost:9000/minio/health/live && break
             sleep 1
           done
-          docker run --rm --network host quay.io/minio/mc:latest sh -c '
+          curl -sf http://localhost:9000/minio/health/live \
+            || { echo "MinIO failed to become healthy after 30s"; docker logs minio; exit 1; }
+          docker run --rm --network host "$MC_IMAGE" sh -c '
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/timefusion-test local/timefusion-tests'
       - uses: actions/checkout@v4
