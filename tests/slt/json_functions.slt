@@ -195,6 +195,18 @@ SELECT json_build_array(id, name, duration) FROM otel_logs_and_spans WHERE proje
 ----
 ["00000000-0000-0000-0000-000000000001","test_span",1500]
 
+# Test jsonb_build_array alias (monoscope row-wrap idiom replacement)
+query T
+SELECT jsonb_build_array(id, name, duration) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1
+----
+["00000000-0000-0000-0000-000000000001","test_span",1500]
+
+# Derived-column-alias form used by monoscope's wrapper: SELECT jsonb_build_array(c1, c2, ...) FROM (<inner>) sub(c1, c2, ...)
+query T
+SELECT jsonb_build_array(c1, c2, c3) FROM (SELECT id, name, duration FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1) sub(c1, c2, c3)
+----
+["00000000-0000-0000-0000-000000000001","test_span",1500]
+
 # Test to_json function
 query T
 SELECT to_json(summary) FROM otel_logs_and_spans WHERE project_id='00000000-0000-0000-0000-000000000000' ORDER BY timestamp LIMIT 1

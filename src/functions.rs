@@ -611,24 +611,73 @@ fn format_timestamps(timestamp_array: &ArrayRef, format_str: &str) -> datafusion
     Ok(Arc::new(builder.finish()))
 }
 
-/// Convert PostgreSQL format patterns to chrono format patterns
+/// Convert PostgreSQL `to_char` format patterns to chrono format patterns.
+///
+/// Honors Postgres literal-escape syntax: text inside `"..."` is copied verbatim
+/// (with `""` standing for a literal `"`). Outside literals, the longest matching
+/// token is replaced with its chrono equivalent.
 fn postgres_to_chrono_format(pg_format: &str) -> String {
-    // This is a simplified conversion - a full implementation would handle all PostgreSQL patterns
-    // Order matters! Longer patterns should be replaced first
-    pg_format
-        .replace("YYYY", "%Y")
-        .replace("Month", "%B") // Full month name (must come before MM)
-        .replace("Mon", "%b") // Abbreviated month name (must come before MM)
-        .replace("MM", "%m") // Month number
-        .replace("DD", "%d")
-        .replace("HH24", "%H")
-        .replace("HH", "%I")
-        .replace("MI", "%M")
-        .replace("SS", "%S")
-        .replace("US", "%6f") // Microseconds (6 digits)
-        .replace("MS", "%3f") // Milliseconds (3 digits)
-        .replace("TZ", "%Z")
-        .replace("Day", "%A")
+    // (Postgres token, chrono spec). Longest-prefix wins, so order matters within
+    // groups that share a prefix (HH24 before HH, Month before Mon before MM, etc.).
+    const TOKENS: &[(&str, &str)] = &[
+        ("YYYY", "%Y"),
+        ("YY", "%y"),
+        ("Month", "%B"),
+        ("Mon", "%b"),
+        ("MM", "%m"),
+        ("DD", "%d"),
+        ("Day", "%A"),
+        ("D", "%u"),
+        ("HH24", "%H"),
+        ("HH12", "%I"),
+        ("HH", "%I"),
+        ("MI", "%M"),
+        ("SS", "%S"),
+        ("US", "%6f"),
+        ("MS", "%3f"),
+        ("TZ", "%Z"),
+        ("AM", "%p"),
+        ("PM", "%p"),
+    ];
+
+    let bytes = pg_format.as_bytes();
+    let mut out = String::with_capacity(pg_format.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            // Literal section: copy until matching `"`. `""` inside is an escaped quote.
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        out.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                // chrono treats `%` as a format-spec start; double it to emit a literal.
+                if bytes[i] == b'%' {
+                    out.push('%');
+                }
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        if let Some((pg, chrono)) = TOKENS.iter().find(|(pg, _)| bytes[i..].starts_with(pg.as_bytes())) {
+            out.push_str(chrono);
+            i += pg.len();
+            continue;
+        }
+        if bytes[i] == b'%' {
+            out.push('%');
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Create the AT TIME ZONE UDF for timezone conversion
@@ -770,18 +819,25 @@ fn create_json_build_array_udf() -> ScalarUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonBuildArrayUDF {
     signature: Signature,
+    aliases:   Vec<String>,
 }
 
 impl JsonBuildArrayUDF {
     fn new() -> Self {
         Self {
             signature: Signature::variadic_any(Volatility::Immutable),
+            // `jsonb_build_array` is Postgres-only; TimeFusion stores JSON as Utf8View either way.
+            aliases:   vec!["jsonb_build_array".to_string()],
         }
     }
 }
 
 impl ScalarUDFImpl for JsonBuildArrayUDF {
     scalar_udf_boilerplate!("json_build_array");
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8View)
@@ -1672,6 +1728,38 @@ mod tests {
         assert_eq!(postgres_to_chrono_format("YYYY-MM-DD"), "%Y-%m-%d");
         assert_eq!(postgres_to_chrono_format("YYYY-MM-DD HH24:MI:SS"), "%Y-%m-%d %H:%M:%S");
         assert_eq!(postgres_to_chrono_format("Day, DD Mon YYYY"), "%A, %d %b %Y");
+
+        // Postgres-style "..." literal escapes: ISO-8601 with T separator and Z suffix.
+        assert_eq!(
+            postgres_to_chrono_format(r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""#),
+            "%Y-%m-%dT%H:%M:%S.%6fZ"
+        );
+        // Tokens inside a literal stay literal.
+        assert_eq!(postgres_to_chrono_format(r#""YYYY=" YYYY"#), "YYYY= %Y");
+        // "" inside a literal is an escaped quote.
+        assert_eq!(postgres_to_chrono_format(r#""a""b""#), "a\"b");
+        // A bare % outside tokens is escaped to chrono's literal-%.
+        assert_eq!(postgres_to_chrono_format("100%"), "100%%");
+        // Unterminated literal: copy the remainder verbatim, don't panic.
+        assert_eq!(postgres_to_chrono_format(r#"YYYY "tail"#), "%Y tail");
+    }
+
+    #[tokio::test]
+    async fn test_to_char_udf_iso8601_with_z() {
+        use datafusion::prelude::SessionContext;
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let df = ctx
+            .sql(r#"SELECT to_char(TIMESTAMP '2026-06-10 08:10:52.422355', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS s"#)
+            .await
+            .unwrap();
+        let batches = df.collect().await.unwrap();
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringViewArray>()
+            .unwrap();
+        assert_eq!(col.value(0), "2026-06-10T08:10:52.422355Z");
     }
 
     #[test]
