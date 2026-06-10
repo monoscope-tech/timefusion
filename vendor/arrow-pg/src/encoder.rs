@@ -1,8 +1,10 @@
+use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
 
 #[cfg(not(feature = "datafusion"))]
 use arrow::{array::*, datatypes::*};
+use bytes::BytesMut;
 use chrono::NaiveTime;
 use chrono::{NaiveDate, NaiveDateTime};
 #[cfg(feature = "datafusion")]
@@ -13,9 +15,52 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::CopyData;
 use pgwire::messages::data::DataRow;
 use pgwire::types::ToSqlText;
-use postgres_types::ToSql;
+use postgres_types::{to_sql_checked, IsNull, ToSql, Type};
 use rust_decimal::Decimal;
 use timezone::Tz;
+
+/// Encodes a UTF-8 JSON string as PG JSON/JSONB. Binary JSONB needs a leading
+/// `0x01` version byte; JSON binary and text format are raw bytes.
+#[derive(Debug)]
+struct JsonbStr<'a>(Option<&'a str>);
+
+impl ToSql for JsonbStr<'_> {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        let Some(s) = self.0 else { return Ok(IsNull::Yes) };
+        if matches!(*ty, Type::JSONB) {
+            out.extend_from_slice(&[1u8]);
+        }
+        out.extend_from_slice(s.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::JSON | Type::JSONB)
+    }
+
+    to_sql_checked!();
+}
+
+impl ToSqlText for JsonbStr<'_> {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _opts: &pgwire::types::format::FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        match self.0 {
+            Some(s) => {
+                out.extend_from_slice(s.as_bytes());
+                Ok(IsNull::No)
+            }
+            None => Ok(IsNull::Yes),
+        }
+    }
+}
 
 use crate::error::ToSqlError;
 #[cfg(feature = "postgis")]
@@ -305,8 +350,18 @@ pub fn encode_value<T: Encoder>(
         DataType::Decimal128(_, s) => {
             encoder.encode_field(&get_numeric_128_value(arr, idx, *s as u32)?, pg_field)?
         }
-        DataType::Utf8 => encoder.encode_field(&get_utf8_value(arr, idx), pg_field)?,
-        DataType::Utf8View => encoder.encode_field(&get_utf8_view_value(arr, idx), pg_field)?,
+        DataType::Utf8 | DataType::Utf8View => {
+            let v = if matches!(arrow_type, DataType::Utf8View) {
+                get_utf8_view_value(arr, idx)
+            } else {
+                get_utf8_value(arr, idx)
+            };
+            if matches!(*pg_field.datatype(), Type::JSON | Type::JSONB) {
+                encoder.encode_field(&JsonbStr(v), pg_field)?;
+            } else {
+                encoder.encode_field(&v, pg_field)?;
+            }
+        }
         DataType::BinaryView => encoder.encode_field(&get_binary_view_value(arr, idx), pg_field)?,
         DataType::LargeUtf8 => encoder.encode_field(&get_large_utf8_value(arr, idx), pg_field)?,
         DataType::Binary => encoder.encode_field(&get_binary_value(arr, idx), pg_field)?,
