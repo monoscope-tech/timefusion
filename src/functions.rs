@@ -638,7 +638,11 @@ fn render_pg_format(parts: &[FmtPart], dt: &DateTime<Utc>) -> String {
                 let _ = write!(out, "{}", dt.weekday().num_days_from_sunday() + 1);
             }
             FmtPart::PgDY => {
-                out.push_str(&dt.format("%a").to_string().to_uppercase());
+                // Abbreviated English weekday is ASCII-only, so to_ascii_uppercase suffices
+                // and avoids the locale-aware Unicode case-folding overhead of to_uppercase.
+                let mut s = dt.format("%a").to_string();
+                s.make_ascii_uppercase();
+                out.push_str(&s);
             }
         }
     }
@@ -742,7 +746,9 @@ fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
             continue;
         }
         // `DY` must be matched before bare `D` (longest-prefix). Neither is in TOKENS.
-        if bytes[i..].starts_with(b"DY") {
+        // Same trailing-alpha guard as `D` below so a future `DYY`-style token doesn't
+        // get greedily consumed as `DY` + leftover `Y`.
+        if bytes[i..].starts_with(b"DY") && !bytes.get(i + 2).is_some_and(|b| b.is_ascii_alphabetic()) {
             flush(&mut parts, &mut buf);
             parts.push(FmtPart::PgDY);
             i += 2;
@@ -1877,6 +1883,11 @@ mod tests {
             let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
             assert_eq!(col.value(0), *expected, "format `{fmt}`");
         }
+        // Separate PM-timestamp case to actually exercise the PM output of %p.
+        let pm_sql = "SELECT to_char(TIMESTAMP '2026-06-10 20:10:52', 'HH12:MI PM') AS s";
+        let pm_batches = ctx.sql(pm_sql).await.unwrap().collect().await.unwrap();
+        let pm_col = pm_batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+        assert_eq!(pm_col.value(0), "08:10 PM");
     }
 
     #[test]
