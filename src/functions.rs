@@ -673,9 +673,11 @@ fn render_pg_format(parts: &[FmtPart], dt: &DateTime<Utc>) -> String {
 /// rare numeric tokens, locale-affected text tokens. Add to `TOKENS` (or as new
 /// `FmtPart` variants for cases with no chrono equivalent) when a caller needs them.
 fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
-    // (Postgres token, chrono spec). Longest-prefix wins, so order matters within
-    // groups that share a prefix (HH24 before HH, Month before Mon before MM, etc.).
-    // Note: `D` and `DY` are handled below as PgD / PgDY (no chrono equivalent), not here.
+    // ORDER IS LOAD-BEARING: every entry must come before any entry that is one of its
+    // prefixes. E.g. YYYY before YY, HH24/HH12 before HH, Month before Mon before MM.
+    // The loop below uses linear `find` so a misordering would silently match the
+    // shorter token first. Note: `D` and `DY` are handled below as PgD / PgDY (no
+    // chrono equivalent), not here.
     const TOKENS: &[(&str, &str)] = &[
         ("YYYY", "%Y"),
         ("YY", "%y"),
@@ -760,7 +762,9 @@ fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
             i += 2;
             continue;
         }
-        if bytes[i] == b'D' && !bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphabetic()) {
+        // Alphanumeric guard (vs just alpha) so a future `D1`-style token can't be
+        // greedily consumed as bare `D` + leftover `1` before getting added to TOKENS.
+        if bytes[i] == b'D' && !bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphanumeric()) {
             // Bare `D` only — guarded so `D<letter>` (e.g. a future token starting with D)
             // doesn't get consumed here. `Day`, `Dy`, `DD` are caught by TOKENS; `DY` is
             // caught by its own check above.
