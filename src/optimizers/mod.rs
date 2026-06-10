@@ -1,3 +1,4 @@
+pub mod pg_array_literal_rewriter;
 mod tantivy_rewriter;
 mod variant_insert_rewriter;
 mod variant_select_rewriter;
@@ -7,6 +8,7 @@ use datafusion::{
     logical_expr::{BinaryExpr, Expr, Operator},
     scalar::ScalarValue,
 };
+pub use pg_array_literal_rewriter::PgArrayLiteralRewriter;
 pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;
 pub use variant_select_rewriter::VariantSelectRewriter;

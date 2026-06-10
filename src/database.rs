@@ -1399,6 +1399,9 @@ impl Database {
             // Expands `f(qualifier.*)` into `f(qualifier.c1, …, qualifier.cN)`
             // before TypeCoercion rejects the typeless wildcard. Postgres parity.
             Arc::new(crate::optimizers::WildcardFnArgExpander),
+            // PG parity: `COALESCE(list_col, '{}')` — re-type PG array string
+            // literals as list literals before TypeCoercion fails the call.
+            Arc::new(crate::optimizers::PgArrayLiteralRewriter),
             Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
             Arc::new(crate::optimizers::VariantSelectRewriter),
         ];

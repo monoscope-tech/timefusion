@@ -27,7 +27,7 @@ regex = "1.11.1"
 # Rebase the branch onto upstream main when picking up newer revs.
 # Pinned to a SHA, not the branch tip, so `cargo update` can't silently pull
 # breaking changes from the fork. Bump explicitly when rebasing on upstream.
-deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "005b9ebf6262cd192501c29be3bb9df62acfa2f7", features = [
+deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "2f473fe4c196401f7e8bc8eecae6bad365a45489", features = [
   "datafusion",
   "s3",
 ] }
@@ -192,4 +192,3 @@ datafusion-postgres = { path = "vendor/datafusion-postgres" }
 # logical layer. Tracking apache/datafusion#19950; drop this patch once
 # upstream merges and we bump past it.
 datafusion-sql = { git = "https://github.com/tonyalaribe/datafusion.git", branch = "timefusion-update-from-53.1.0" }
-

@@ -376,6 +376,10 @@ pub fn register_custom_functions(ctx: &mut datafusion::execution::context::Sessi
     // Register Variant-aware expr planner (must be before JSON planner for priority)
     datafusion::execution::FunctionRegistry::register_expr_planner(ctx, Arc::new(VariantAwareExprPlanner))?;
 
+    // PG parity: coalesce that type-checks `coalesce(list_col, '{}')`.
+    // Replaces the built-in under the same name; see PgArrayLiteralRewriter.
+    ctx.register_udf(ScalarUDF::from(crate::optimizers::pg_array_literal_rewriter::PgCoalesceUdf::default()));
+
     // Register to_char function
     ctx.register_udf(create_to_char_udf());
 
