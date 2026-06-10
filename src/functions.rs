@@ -675,6 +675,7 @@ fn render_pg_format(parts: &[FmtPart], dt: &DateTime<Utc>) -> String {
 fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
     // (Postgres token, chrono spec). Longest-prefix wins, so order matters within
     // groups that share a prefix (HH24 before HH, Month before Mon before MM, etc.).
+    // Note: `D` and `DY` are handled below as PgD / PgDY (no chrono equivalent), not here.
     const TOKENS: &[(&str, &str)] = &[
         ("YYYY", "%Y"),
         ("YY", "%y"),
@@ -699,6 +700,7 @@ fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
         ("SS", "%S"),
         ("US", "%6f"),
         ("MS", "%3f"),
+        // Our timestamps are stored UTC, so `TZ` always renders as "UTC".
         ("TZ", "%Z"),
         ("AM", "%p"),
         ("PM", "%p"),
