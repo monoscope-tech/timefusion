@@ -59,6 +59,11 @@ fn expand_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     if input_schemas.is_empty() {
         return Ok(Transformed::no(plan));
     }
+    // No recompute_schema() needed (cf. VariantSelectRewriter which does call it):
+    // `jsonb_build_array(VARIADIC any) -> Utf8View` returns the same type whether we
+    // pass 1 wildcard or N expanded columns, so the projection's output schema
+    // doesn't change. TypeCoercion (the next analyzer pass) re-checks types end-to-end
+    // anyway, so any type drift from another rule would be caught there.
     plan.map_expressions(|expr| expr.transform_up(|e| expand_in_expr(e, &input_schemas)))
 }
 
@@ -85,7 +90,9 @@ fn expand_in_expr(expr: Expr, input_schemas: &[Arc<datafusion::common::DFSchema>
         };
 
         // Find the input schema that owns this qualifier and emit one column
-        // expression per field, in declared order.
+        // expression per field, in declared order. SQL forbids duplicate qualifier
+        // names in the same scope, so first-match-wins is unambiguous — DataFusion
+        // would already have rejected the plan earlier if two schemas shared a name.
         let mut expanded = false;
         for schema in input_schemas {
             let indices = schema.fields_indices_with_qualified(qualifier);
@@ -104,6 +111,9 @@ fn expand_in_expr(expr: Expr, input_schemas: &[Arc<datafusion::common::DFSchema>
         }
     }
 
+    // `has_qualified_wildcard` was true above, and any qualifier we couldn't expand
+    // returned via plan_err! — so reaching here means at least one wildcard arg was
+    // replaced. Transformed::yes is the right signal unconditionally.
     Ok(Transformed::yes(Expr::ScalarFunction(ScalarFunction { func, args: new_args })))
 }
 
