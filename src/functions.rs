@@ -627,6 +627,8 @@ fn postgres_to_chrono_format(pg_format: &str) -> String {
         ("MM", "%m"),
         ("DD", "%d"),
         ("Day", "%A"),
+        ("Dy", "%a"),
+        ("DY", "%a"),
         ("D", "%u"),
         ("HH24", "%H"),
         ("HH12", "%I"),
@@ -1730,10 +1732,7 @@ mod tests {
         assert_eq!(postgres_to_chrono_format("Day, DD Mon YYYY"), "%A, %d %b %Y");
 
         // Postgres-style "..." literal escapes: ISO-8601 with T separator and Z suffix.
-        assert_eq!(
-            postgres_to_chrono_format(r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""#),
-            "%Y-%m-%dT%H:%M:%S.%6fZ"
-        );
+        assert_eq!(postgres_to_chrono_format(r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""#), "%Y-%m-%dT%H:%M:%S.%6fZ");
         // Tokens inside a literal stay literal.
         assert_eq!(postgres_to_chrono_format(r#""YYYY=" YYYY"#), "YYYY= %Y");
         // "" inside a literal is an escaped quote.
@@ -1742,6 +1741,36 @@ mod tests {
         assert_eq!(postgres_to_chrono_format("100%"), "100%%");
         // Unterminated literal: copy the remainder verbatim, don't panic.
         assert_eq!(postgres_to_chrono_format(r#"YYYY "tail"#), "%Y tail");
+    }
+
+    /// End-to-end UDF parity with Postgres/TimescaleDB `to_char`. Expected outputs
+    /// captured from real Postgres 16 with `SELECT to_char(TIMESTAMP '2026-06-10 08:10:52.422355', fmt)`.
+    #[tokio::test]
+    async fn test_to_char_postgres_parity() {
+        use datafusion::prelude::SessionContext;
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let ts = "TIMESTAMP '2026-06-10 08:10:52.422355'";
+        let cases: &[(&str, &str)] = &[
+            ("YYYY-MM-DD", "2026-06-10"),
+            ("YYYY-MM-DD HH24:MI:SS", "2026-06-10 08:10:52"),
+            // Monoscope's ISO-8601 target — the bug this fix addresses.
+            (r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""#, "2026-06-10T08:10:52.422355Z"),
+            (r#"YYYY-MM-DD"T"HH24:MI:SS.MS"Z""#, "2026-06-10T08:10:52.422Z"),
+            ("DD/MM/YYYY", "10/06/2026"),
+            ("Mon DD, YYYY", "Jun 10, 2026"),
+            ("Day, Mon DD YYYY", "Wednesday, Jun 10 2026"),
+            ("HH12:MI", "08:10"),
+            ("YY", "26"),
+            // Literal containing characters that look like tokens.
+            (r#""YYYY=" YYYY"#, "YYYY= 2026"),
+        ];
+        for (fmt, expected) in cases {
+            let sql = format!("SELECT to_char({ts}, '{fmt}') AS s");
+            let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+            let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+            assert_eq!(col.value(0), *expected, "format `{fmt}`");
+        }
     }
 
     #[tokio::test]
@@ -1754,11 +1783,7 @@ mod tests {
             .await
             .unwrap();
         let batches = df.collect().await.unwrap();
-        let col = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<datafusion::arrow::array::StringViewArray>()
-            .unwrap();
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
         assert_eq!(col.value(0), "2026-06-10T08:10:52.422355Z");
     }
 
