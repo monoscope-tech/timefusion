@@ -650,6 +650,24 @@ fn render_pg_format(parts: &[FmtPart], dt: &DateTime<Utc>) -> String {
 /// Honors Postgres literal-escape syntax: text inside `"..."` is copied verbatim
 /// (with `""` standing for a literal `"`). Outside literals, the longest matching
 /// token is replaced with its chrono equivalent.
+///
+/// **Known divergences from real Postgres** (intentional):
+/// - `Month` / `Day` output is unpadded; real Postgres pads to 9 chars. E2E
+///   callers rely on the unpadded form. Re-add padding behind a custom
+///   formatter only if a caller asks.
+/// - Token matching is case-sensitive. Real Postgres `to_char` is case-insensitive
+///   (e.g. `yyyy == YYYY`). Has been true since the original chained-replace
+///   implementation; not a regression.
+/// - Unterminated `"..."` literals are accepted (the remainder is copied
+///   verbatim). Real Postgres errors. Lenient behaviour matches the
+///   chained-replace predecessor.
+/// - `HH` aliases `HH12` (12-hour clock with leading zero), matching Postgres.
+///   Do not "fix" it to `%H` — Postgres `HH` is *not* `HH24`.
+///
+/// **Not yet implemented** (silently pass through as literal text — same as the
+/// chained-replace predecessor): `Q`, `WW`, `IW`, `CC`, `J`, `OF`, `TZH`, `TZM`,
+/// rare numeric tokens, locale-affected text tokens. Add to `TOKENS` (or as new
+/// `FmtPart` variants for cases with no chrono equivalent) when a caller needs them.
 fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
     // (Postgres token, chrono spec). Longest-prefix wins, so order matters within
     // groups that share a prefix (HH24 before HH, Month before Mon before MM, etc.).
