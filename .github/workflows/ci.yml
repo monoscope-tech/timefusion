@@ -91,12 +91,19 @@ jobs:
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
             "$MINIO_IMAGE" server /data --console-address ":9001"
-          for _ in {1..30}; do
-            curl -sf http://localhost:9000/minio/health/live && break
+          # `set -e` (GH Actions default) makes `curl && break` abort the script on the
+          # first failed curl, so we wrap the polling in an `if` instead.
+          for _ in {1..60}; do
+            if curl -sf http://localhost:9000/minio/health/live; then
+              break
+            fi
             sleep 1
           done
-          curl -sf http://localhost:9000/minio/health/live \
-            || { echo "MinIO failed to become healthy after 30s"; docker logs minio; exit 1; }
+          if ! curl -sf http://localhost:9000/minio/health/live; then
+            echo "MinIO failed to become healthy after 60s"
+            docker logs minio
+            exit 1
+          fi
           docker run --rm --network host "$MC_IMAGE" sh -c '
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/timefusion-test local/timefusion-tests'
