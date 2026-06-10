@@ -1396,6 +1396,9 @@ impl Database {
             // injected `text_match(col, lit)` calls get coerced like any
             // other UDF args (Utf8 vs Utf8View etc).
             Arc::new(crate::optimizers::TantivyPredicateRewriter),
+            // Expands `f(qualifier.*)` into `f(qualifier.c1, …, qualifier.cN)`
+            // before TypeCoercion rejects the typeless wildcard. Postgres parity.
+            Arc::new(crate::optimizers::WildcardFnArgExpander),
             Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
             Arc::new(crate::optimizers::VariantSelectRewriter),
         ];
