@@ -5021,7 +5021,7 @@ mod tests {
             // Test timestamp formatting - need to include project_id
             let result = ctx
                 .sql(&format!(
-                    "SELECT id, to_char(timestamp, '%Y-%m-%d %H:%M') as ts FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY timestamp",
+                    "SELECT id, to_char(timestamp, 'YYYY-MM-DD HH24:MI') as ts FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY timestamp",
                     project_id
                 ))
                 .await?

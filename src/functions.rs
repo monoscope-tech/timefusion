@@ -1,7 +1,7 @@
 use std::{any::Any, sync::Arc};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use chrono_tz::Tz;
 use datafusion::{
     arrow::{
@@ -574,13 +574,13 @@ impl ScalarUDFImpl for ToCharUDF {
 
 /// Format timestamps according to PostgreSQL format patterns
 fn format_timestamps(timestamp_array: &ArrayRef, format_str: &str) -> datafusion::error::Result<ArrayRef> {
-    let chrono_format = postgres_to_chrono_format(format_str);
+    let parts = parse_pg_format(format_str);
     let mut builder = StringViewBuilder::new();
 
     let format_fn = |timestamp_us: i64| -> datafusion::error::Result<String> {
         DateTime::<Utc>::from_timestamp_micros(timestamp_us)
             .ok_or_else(|| DataFusionError::Execution("Invalid timestamp".to_string()))
-            .map(|dt| dt.format(&chrono_format).to_string())
+            .map(|dt| render_pg_format(&parts, &dt))
     };
 
     match timestamp_array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
@@ -611,24 +611,178 @@ fn format_timestamps(timestamp_array: &ArrayRef, format_str: &str) -> datafusion
     Ok(Arc::new(builder.finish()))
 }
 
-/// Convert PostgreSQL format patterns to chrono format patterns
-fn postgres_to_chrono_format(pg_format: &str) -> String {
-    // This is a simplified conversion - a full implementation would handle all PostgreSQL patterns
-    // Order matters! Longer patterns should be replaced first
-    pg_format
-        .replace("YYYY", "%Y")
-        .replace("Month", "%B") // Full month name (must come before MM)
-        .replace("Mon", "%b") // Abbreviated month name (must come before MM)
-        .replace("MM", "%m") // Month number
-        .replace("DD", "%d")
-        .replace("HH24", "%H")
-        .replace("HH", "%I")
-        .replace("MI", "%M")
-        .replace("SS", "%S")
-        .replace("US", "%6f") // Microseconds (6 digits)
-        .replace("MS", "%3f") // Milliseconds (3 digits)
-        .replace("TZ", "%Z")
-        .replace("Day", "%A")
+/// One segment of a parsed Postgres format string. Most tokens collapse to a
+/// `Chrono` spec; `PgD` / `PgDY` exist because chrono has no exact equivalent
+/// for the Postgres day-of-week semantics (Sun=1..Sat=7 / uppercase abbrev).
+#[derive(Debug, PartialEq)]
+enum FmtPart {
+    /// A chrono strftime spec (e.g. `"%Y"`) or escaped-literal slice.
+    Chrono(String),
+    /// Postgres `D`: day of week, Sunday=1..Saturday=7.
+    PgD,
+    /// Postgres `DY`: uppercase abbreviated weekday name (e.g. `"WED"`).
+    PgDY,
+}
+
+/// Render a parsed Postgres format against a `DateTime<Utc>`.
+fn render_pg_format(parts: &[FmtPart], dt: &DateTime<Utc>) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            FmtPart::Chrono(spec) => {
+                let _ = write!(out, "{}", dt.format(spec));
+            }
+            FmtPart::PgD => {
+                // chrono `num_days_from_sunday` is 0=Sun..6=Sat; Postgres `D` is 1..7.
+                let _ = write!(out, "{}", dt.weekday().num_days_from_sunday() + 1);
+            }
+            FmtPart::PgDY => {
+                // Abbreviated English weekday is ASCII-only, so to_ascii_uppercase suffices
+                // and avoids the locale-aware Unicode case-folding overhead of to_uppercase.
+                let mut s = dt.format("%a").to_string();
+                s.make_ascii_uppercase();
+                out.push_str(&s);
+            }
+        }
+    }
+    out
+}
+
+/// Parse a PostgreSQL `to_char` format string into a sequence of render parts.
+///
+/// Honors Postgres literal-escape syntax: text inside `"..."` is copied verbatim
+/// (with `""` standing for a literal `"`). Outside literals, the longest matching
+/// token is replaced with its chrono equivalent.
+///
+/// **Known divergences from real Postgres** (intentional):
+/// - `Month` / `Day` output is unpadded; real Postgres pads to 9 chars. E2E
+///   callers rely on the unpadded form. Re-add padding behind a custom
+///   formatter only if a caller asks.
+/// - Token matching is case-sensitive. Real Postgres `to_char` is case-insensitive
+///   (e.g. `yyyy == YYYY`). Has been true since the original chained-replace
+///   implementation; not a regression.
+/// - Unterminated `"..."` literals are accepted (the remainder is copied
+///   verbatim). Real Postgres errors. Lenient behaviour matches the
+///   chained-replace predecessor.
+/// - `HH` aliases `HH12` (12-hour clock with leading zero), matching Postgres.
+///   Do not "fix" it to `%H` — Postgres `HH` is *not* `HH24`.
+///
+/// **Not yet implemented** (silently pass through as literal text — same as the
+/// chained-replace predecessor): `Q`, `WW`, `IW`, `CC`, `J`, `OF`, `TZH`, `TZM`,
+/// rare numeric tokens, locale-affected text tokens. Add to `TOKENS` (or as new
+/// `FmtPart` variants for cases with no chrono equivalent) when a caller needs them.
+fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
+    // ORDER IS LOAD-BEARING: every entry must come before any entry that is one of its
+    // prefixes. E.g. YYYY before YY, HH24/HH12 before HH, Month before Mon before MM.
+    // The loop below uses linear `find` so a misordering would silently match the
+    // shorter token first. Note: `D` and `DY` are handled below as PgD / PgDY (no
+    // chrono equivalent), not here.
+    const TOKENS: &[(&str, &str)] = &[
+        ("YYYY", "%Y"),
+        ("YY", "%y"),
+        // Note: Postgres pads `Month` / `Day` output to 9 chars; chrono's %B / %A do not.
+        // E2E callers rely on the unpadded form, so we keep the divergence — re-add padding
+        // only if a caller asks for it.
+        ("Month", "%B"),
+        ("Mon", "%b"),
+        ("MM", "%m"),
+        ("DD", "%d"),
+        ("Day", "%A"),
+        ("Dy", "%a"),
+        // `D` and `DY` are handled below as PgD / PgDY because chrono has no
+        // exact equivalent for Postgres's Sun=1..Sat=7 numbering or its
+        // uppercase abbreviated weekday name. They must be matched before the
+        // single-char fallback below; they aren't in this table so we test for
+        // them explicitly in the loop.
+        ("HH24", "%H"),
+        ("HH12", "%I"),
+        ("HH", "%I"),
+        ("MI", "%M"),
+        ("SS", "%S"),
+        ("US", "%6f"),
+        ("MS", "%3f"),
+        // Our timestamps are stored UTC, so `TZ` always renders as "UTC".
+        ("TZ", "%Z"),
+        ("AM", "%p"),
+        ("PM", "%p"),
+        // Lowercase forms — Postgres `am`/`pm` emit lowercase output (chrono `%P`).
+        ("am", "%P"),
+        ("pm", "%P"),
+    ];
+
+    // All token keys are ASCII so byte-prefix matching is sound, but the non-token
+    // pass-through path must walk UTF-8 char boundaries — a multi-byte char in a `"..."`
+    // literal would otherwise be split into separate `char`s and produce mojibake.
+    let bytes = pg_format.as_bytes();
+    let mut parts: Vec<FmtPart> = Vec::new();
+    // Accumulate chrono spec / literal text into a buffer; flush on a non-chrono
+    // boundary (PgD / PgDY) or at the end so the resulting Vec stays compact.
+    let mut buf = String::with_capacity(pg_format.len());
+    let flush = |parts: &mut Vec<FmtPart>, buf: &mut String| {
+        if !buf.is_empty() {
+            parts.push(FmtPart::Chrono(std::mem::take(buf)));
+        }
+    };
+    let push_passthrough = |buf: &mut String, s: &str, i: &mut usize| {
+        let c = s[*i..].chars().next().expect("loop invariant: i < s.len()");
+        // chrono treats `%` as a format-spec start; double it to emit a literal.
+        if c == '%' {
+            buf.push('%');
+        }
+        buf.push(c);
+        *i += c.len_utf8();
+    };
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            // Literal section: copy until matching `"`. `""` inside is an escaped quote.
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        buf.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                push_passthrough(&mut buf, pg_format, &mut i);
+            }
+            continue;
+        }
+        // `DY` must be matched before bare `D` (longest-prefix). Neither is in TOKENS.
+        // No trailing-alpha guard here: Postgres consumes `DY` greedily, so `DYY` is
+        // `DY` + leftover `Y`. The bare-`D` guard below is still needed because
+        // `Day`/`Dy`/`DD` are alpha-prefix conflicts; no such conflict exists for `DY`.
+        if bytes[i..].starts_with(b"DY") {
+            flush(&mut parts, &mut buf);
+            parts.push(FmtPart::PgDY);
+            i += 2;
+            continue;
+        }
+        // Alphanumeric guard (vs just alpha) so a future `D1`-style token can't be
+        // greedily consumed as bare `D` + leftover `1` before getting added to TOKENS.
+        if bytes[i] == b'D' && !bytes.get(i + 1).is_some_and(|b| b.is_ascii_alphanumeric()) {
+            // Bare `D` only — guarded so `D<letter>` (e.g. a future token starting with D)
+            // doesn't get consumed here. `Day`, `Dy`, `DD` are caught by TOKENS; `DY` is
+            // caught by its own check above.
+            flush(&mut parts, &mut buf);
+            parts.push(FmtPart::PgD);
+            i += 1;
+            continue;
+        }
+        let matched = TOKENS.iter().find(|(pg, _)| bytes[i..].starts_with(pg.as_bytes()));
+        if let Some((pg, chrono)) = matched {
+            buf.push_str(chrono);
+            i += pg.len();
+            continue;
+        }
+        push_passthrough(&mut buf, pg_format, &mut i);
+    }
+    flush(&mut parts, &mut buf);
+    parts
 }
 
 /// Create the AT TIME ZONE UDF for timezone conversion
@@ -770,18 +924,25 @@ fn create_json_build_array_udf() -> ScalarUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonBuildArrayUDF {
     signature: Signature,
+    aliases:   Vec<String>,
 }
 
 impl JsonBuildArrayUDF {
     fn new() -> Self {
         Self {
             signature: Signature::variadic_any(Volatility::Immutable),
+            // `jsonb_build_array` is Postgres-only; TimeFusion stores JSON as Utf8View either way.
+            aliases:   vec!["jsonb_build_array".to_string()],
         }
     }
 }
 
 impl ScalarUDFImpl for JsonBuildArrayUDF {
     scalar_udf_boilerplate!("json_build_array");
+
+    fn aliases(&self) -> &[String] {
+        &self.aliases
+    }
 
     fn return_type(&self, _arg_types: &[DataType]) -> datafusion::error::Result<DataType> {
         Ok(DataType::Utf8View)
@@ -1668,10 +1829,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_postgres_to_chrono_format() {
-        assert_eq!(postgres_to_chrono_format("YYYY-MM-DD"), "%Y-%m-%d");
-        assert_eq!(postgres_to_chrono_format("YYYY-MM-DD HH24:MI:SS"), "%Y-%m-%d %H:%M:%S");
-        assert_eq!(postgres_to_chrono_format("Day, DD Mon YYYY"), "%A, %d %b %Y");
+    fn test_parse_pg_format() {
+        // Helper: assert the parse collapses to a single Chrono part with the given spec.
+        let chrono_only = |fmt: &str, expected: &str| {
+            assert_eq!(parse_pg_format(fmt), vec![FmtPart::Chrono(expected.to_string())], "fmt: {fmt}");
+        };
+        chrono_only("YYYY-MM-DD", "%Y-%m-%d");
+        chrono_only("YYYY-MM-DD HH24:MI:SS", "%Y-%m-%d %H:%M:%S");
+        chrono_only("Day, DD Mon YYYY", "%A, %d %b %Y");
+        // Postgres-style "..." literal escapes: ISO-8601 with T separator and Z suffix.
+        chrono_only(r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""#, "%Y-%m-%dT%H:%M:%S.%6fZ");
+        // Tokens inside a literal stay literal.
+        chrono_only(r#""YYYY=" YYYY"#, "YYYY= %Y");
+        // "" inside a literal is an escaped quote.
+        chrono_only(r#""a""b""#, "a\"b");
+        // A bare % outside tokens is escaped to chrono's literal-%.
+        chrono_only("100%", "100%%");
+        // Unterminated literal: copy the remainder verbatim, don't panic.
+        chrono_only(r#"YYYY "tail"#, "%Y tail");
+
+        // D / DY split the buffer (no chrono equivalent).
+        assert_eq!(parse_pg_format("D"), vec![FmtPart::PgD]);
+        assert_eq!(parse_pg_format("DY"), vec![FmtPart::PgDY]);
+        assert_eq!(parse_pg_format("YYYY-D"), vec![FmtPart::Chrono("%Y-".to_string()), FmtPart::PgD]);
+        assert_eq!(parse_pg_format("DY YYYY"), vec![FmtPart::PgDY, FmtPart::Chrono(" %Y".to_string())]);
+    }
+
+    /// End-to-end UDF parity with Postgres/TimescaleDB `to_char`. Expected outputs
+    /// captured from real Postgres 16 with `SELECT to_char(TIMESTAMP '2026-06-10 08:10:52.422355', fmt)`.
+    #[tokio::test]
+    async fn test_to_char_postgres_parity() {
+        use datafusion::prelude::SessionContext;
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let ts = "TIMESTAMP '2026-06-10 08:10:52.422355'";
+        let cases: &[(&str, &str)] = &[
+            ("YYYY-MM-DD", "2026-06-10"),
+            ("YYYY-MM-DD HH24:MI:SS", "2026-06-10 08:10:52"),
+            // Monoscope's ISO-8601 target — the bug this fix addresses.
+            (r#"YYYY-MM-DD"T"HH24:MI:SS.US"Z""#, "2026-06-10T08:10:52.422355Z"),
+            (r#"YYYY-MM-DD"T"HH24:MI:SS.MS"Z""#, "2026-06-10T08:10:52.422Z"),
+            ("DD/MM/YYYY", "10/06/2026"),
+            ("Mon DD, YYYY", "Jun 10, 2026"),
+            ("Day, Mon DD YYYY", "Wednesday, Jun 10 2026"),
+            ("HH12:MI", "08:10"),
+            ("YY", "26"),
+            // Literal containing characters that look like tokens.
+            (r#""YYYY=" YYYY"#, "YYYY= 2026"),
+            // Non-ASCII bytes inside a literal must survive intact (UTF-8 boundary walk).
+            (r#""· "YYYY"#, "· 2026"),
+            // AM/PM, Dy, bare HH round-out token coverage.
+            ("HH12:MI AM", "08:10 AM"),
+            ("HH:MI:SS", "08:10:52"),   // bare HH aliases HH12 (12-hour clock with leading zero).
+            ("HH12:MI am", "08:10 am"), // lowercase am token emits lowercase output.
+            ("Dy", "Wed"),
+            // Postgres-specific tokens with no exact chrono equivalent.
+            // 2026-06-10 is a Wednesday: Postgres D=4 (Sun=1), DY="WED".
+            ("D", "4"),
+            ("DY", "WED"),
+            // Order-of-parsing check: DY must beat bare D.
+            ("DY-D", "WED-4"),
+        ];
+        for (fmt, expected) in cases {
+            let sql = format!("SELECT to_char({ts}, '{fmt}') AS s");
+            let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+            let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+            assert_eq!(col.value(0), *expected, "format `{fmt}`");
+        }
+        // Separate PM-timestamp case to actually exercise the PM output of %p.
+        let pm_sql = "SELECT to_char(TIMESTAMP '2026-06-10 20:10:52', 'HH12:MI PM') AS s";
+        let pm_batches = ctx.sql(pm_sql).await.unwrap().collect().await.unwrap();
+        let pm_col = pm_batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+        assert_eq!(pm_col.value(0), "08:10 PM");
     }
 
     #[test]

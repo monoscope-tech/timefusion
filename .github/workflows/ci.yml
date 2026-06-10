@@ -74,23 +74,42 @@ jobs:
       TIMEFUSION_FOYER_METADATA_MEMORY_MB: "10"
       TIMEFUSION_FOYER_METADATA_DISK_MB: "50"
       TIMEFUSION_FOYER_SHARDS: "2"
-    services:
-      minio:
-        image: public.ecr.aws/bitnami/minio:latest
-        ports:
-          - 9000:9000
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-          MINIO_DEFAULT_BUCKETS: timefusion-test,timefusion-tests
-        options: >-
-          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - name: Free disk space
         run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      # `public.ecr.aws/bitnami/minio` was withdrawn (Bitnami consolidated registries).
+      # GitHub Actions `services:` can't override the entrypoint to pass `server /data`
+      # to the official quay.io/minio/minio image, so start it manually and seed the
+      # buckets that the bitnami image used to auto-create via MINIO_DEFAULT_BUCKETS.
+      - name: Start MinIO
+        run: |
+          # Pinned to a known-good release so a breaking upstream tag doesn't silently break CI.
+          MINIO_IMAGE=quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+          MC_IMAGE=quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+          docker run -d --name minio \
+            -p 9000:9000 -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            "$MINIO_IMAGE" server /data --console-address ":9001"
+          # `set -e` (GH Actions default) makes `curl && break` abort the script on the
+          # first failed curl, so we wrap the polling in an `if` instead.
+          for _ in {1..60}; do
+            if curl -sf http://localhost:9000/minio/health/live; then
+              break
+            fi
+            sleep 1
+          done
+          if ! curl -sf http://localhost:9000/minio/health/live; then
+            echo "MinIO failed to become healthy after 60s"
+            docker logs minio
+            exit 1
+          fi
+          # mc image's ENTRYPOINT is `mc` itself, so we override to /bin/sh to run a
+          # multi-command script. (Without --entrypoint, `mc sh -c '...'` is what runs
+          # and mc rejects `sh` as an unknown subcommand.)
+          docker run --rm --network host --entrypoint /bin/sh "$MC_IMAGE" -c '
+            mc alias set local http://localhost:9000 minioadmin minioadmin &&
+            mc mb -p local/timefusion-test local/timefusion-tests'
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
