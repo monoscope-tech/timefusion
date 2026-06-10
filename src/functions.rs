@@ -1056,17 +1056,35 @@ fn jsonb_tagged_field(data_type: DataType) -> Arc<datafusion::arrow::datatypes::
 macro_rules! jsonb_wrapper {
     ($wrap:ident, $inner:ident, $pg_name:expr) => {
         #[derive(Debug, Hash, Eq, PartialEq)]
-        struct $wrap { inner: $inner }
-        impl $wrap { fn new() -> Self { Self { inner: $inner::new() } } }
+        struct $wrap {
+            inner: $inner,
+        }
+        impl $wrap {
+            fn new() -> Self {
+                Self { inner: $inner::new() }
+            }
+        }
         impl ScalarUDFImpl for $wrap {
-            fn as_any(&self) -> &dyn Any { self }
-            fn name(&self) -> &str { $pg_name }
-            fn signature(&self) -> &Signature { self.inner.signature() }
-            fn return_type(&self, a: &[DataType]) -> datafusion::error::Result<DataType> { self.inner.return_type(a) }
-            fn return_field_from_args(&self, _: datafusion::logical_expr::ReturnFieldArgs)
-                -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef>
-            { Ok(jsonb_tagged_field(DataType::Utf8View)) }
-            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> { self.inner.invoke_with_args(args) }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                $pg_name
+            }
+            fn signature(&self) -> &Signature {
+                self.inner.signature()
+            }
+            fn return_type(&self, a: &[DataType]) -> datafusion::error::Result<DataType> {
+                self.inner.return_type(a)
+            }
+            fn return_field_from_args(
+                &self, _: datafusion::logical_expr::ReturnFieldArgs,
+            ) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
+                Ok(jsonb_tagged_field(DataType::Utf8View))
+            }
+            fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+                self.inner.invoke_with_args(args)
+            }
         }
     };
 }
