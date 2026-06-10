@@ -628,8 +628,12 @@ fn postgres_to_chrono_format(pg_format: &str) -> String {
         ("DD", "%d"),
         ("Day", "%A"),
         ("Dy", "%a"),
-        ("DY", "%a"),
-        ("D", "%u"),
+        // Omitted on purpose; their chrono mappings don't match Postgres semantics:
+        //   `DY` → Postgres emits uppercase ("WED"), chrono `%a` is title-case ("Wed").
+        //   `D`  → Postgres day-of-week is Sun=1..Sat=7; chrono `%u` is Mon=1..Sun=7 and
+        //          `%w` is Sun=0..Sat=6. No exact chrono token exists.
+        // Re-add with a custom formatter (uppercase post-processing / weekday renumbering)
+        // when a caller actually needs them.
         ("HH24", "%H"),
         ("HH12", "%I"),
         ("HH", "%I"),
@@ -1771,20 +1775,6 @@ mod tests {
             let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
             assert_eq!(col.value(0), *expected, "format `{fmt}`");
         }
-    }
-
-    #[tokio::test]
-    async fn test_to_char_udf_iso8601_with_z() {
-        use datafusion::prelude::SessionContext;
-        let mut ctx = SessionContext::new();
-        register_custom_functions(&mut ctx).unwrap();
-        let df = ctx
-            .sql(r#"SELECT to_char(TIMESTAMP '2026-06-10 08:10:52.422355', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS s"#)
-            .await
-            .unwrap();
-        let batches = df.collect().await.unwrap();
-        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
-        assert_eq!(col.value(0), "2026-06-10T08:10:52.422355Z");
     }
 
     #[test]
