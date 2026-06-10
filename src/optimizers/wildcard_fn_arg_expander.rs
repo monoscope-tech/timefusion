@@ -1,5 +1,5 @@
-//! Expand `qualifier.*` inside scalar / aggregate function arguments into the
-//! explicit column list.
+//! Expand `qualifier.*` inside scalar function arguments into the explicit
+//! column list.
 //!
 //! Postgres special-cases `t.*` in function calls: it's syntactically expanded
 //! into the columns of `t`, in declared order, before the function is resolved.
@@ -137,14 +137,16 @@ mod tests {
         assert_eq!(col.value(0), r#"[1,"x",true]"#);
     }
 
-    /// `sub` doesn't exist at this scope — should fail with a clear
-    /// qualifier-not-found error, not TypeCoercion's typeless-wildcard message.
+    /// `sub` doesn't exist at this scope — DataFusion's SQL planner catches this
+    /// before our analyzer runs (`Invalid qualifier sub`). Our rule's own
+    /// "Unknown qualifier" plan_err is defensive — it would fire if the planner's
+    /// scope check ever changed shape — but the user-visible error stays clear.
     #[tokio::test]
     async fn unknown_qualifier_errors_clearly() {
         let ctx = ctx_with_rule();
         let err = ctx.sql("SELECT jsonb_build_array(sub.*) FROM (SELECT 1 AS a) other").await.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("qualifier") || msg.contains("sub"), "msg: {msg}");
+        assert!(msg.contains("Invalid qualifier sub"), "msg: {msg}");
     }
 
     /// Two qualifiers in one call — schema lookup must handle each independently
@@ -163,6 +165,17 @@ mod tests {
         let batches = df.collect().await.expect("exec ok");
         let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().expect("StringViewArray");
         assert_eq!(col.value(0), r#"[1,2,"p","q"]"#);
+    }
+
+    /// Mixed wildcard and literal args — non-wildcard args must be preserved in
+    /// their original position; the expansion only replaces the wildcard slot.
+    #[tokio::test]
+    async fn mixes_wildcard_with_other_args() {
+        let ctx = ctx_with_rule();
+        let df = ctx.sql("SELECT jsonb_build_array(0, sub.*, 99) FROM (SELECT 1 AS a, 2 AS b) sub").await.expect("plan ok");
+        let batches = df.collect().await.expect("exec ok");
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().expect("StringViewArray");
+        assert_eq!(col.value(0), r#"[0,1,2,99]"#);
     }
 
     /// `outer(inner(sub.*))` — transform_up visits the inner ScalarFunction first,
