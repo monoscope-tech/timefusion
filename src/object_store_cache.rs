@@ -1513,6 +1513,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn containment_probe_serves_data_reads_on_small_fully_warmed_files() -> anyhow::Result<()> {
+        // Files smaller than the size hint are cached WHOLE under (0..size) by
+        // warm_footer — the candidate=0 probe then deliberately serves even
+        // data-page reads near the file START from the metadata cache. This is
+        // the other probe branch (candidate 0), distinct from the suffix-key
+        // case covered above.
+        let inner = Arc::new(InMemory::new());
+        let hint = 1024u64;
+        let cfg = FoyerCacheConfig::test_config_with("containment_probe_small", |c| c.parquet_metadata_size_hint = hint as usize);
+        let cache = FoyerObjectStoreCache::new(inner.clone(), cfg).await?;
+        let path = Path::from("tbl/date=2026-01-01/part-small.parquet");
+        let data = Bytes::from((0..512u32).map(|i| (i % 13) as u8).collect::<Vec<u8>>());
+        inner.put(&path, PutPayload::from(data.clone())).await?;
+
+        // file (512B) <= hint → warm key is the whole file (0..512)
+        assert!(warm_footer(&cache, &path, hint).await, "footer warm must succeed");
+
+        let before = cache.get_stats().await;
+        let r = 16u64..96u64; // nowhere near the footer
+        let got = cache.get_range(&path, r.clone()).await?;
+        assert_eq!(got, data.slice(r.start as usize..r.end as usize), "candidate-0 slice math");
+
+        let after = cache.get_stats().await;
+        assert_eq!(after.metadata.hits, before.metadata.hits + 1, "served by the candidate-0 probe");
+        assert_eq!(after.metadata.inner_gets, before.metadata.inner_gets, "no inner fetch after warm");
+
+        cache.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_basic_operations() -> anyhow::Result<()> {
         let inner = Arc::new(InMemory::new());
         let cache = FoyerObjectStoreCache::new(inner, FoyerCacheConfig::test_config("basic_ops")).await?;
