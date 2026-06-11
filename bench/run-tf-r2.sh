@@ -12,15 +12,25 @@ sleep 1
 mkdir -p "$data_dir"
 
 set -a; source .env; set +a
-# Remote object store for network-latency-inclusive benches. The monoscope
-# R2 token is dead (401 on list/put), so we use the OVH S3 creds from
-# monoscope/.env.prod — same provider as prod TF's storage. Dedicated
-# tf-qlat-bench/ prefix inside the existing rrweb bucket.
-export AWS_S3_ENDPOINT="https://s3.de.io.cloud.ovh.net/"
-export AWS_S3_BUCKET="rrweb"
-export AWS_ACCESS_KEY_ID="$(grep '^S3_ACCESS_KEY' ../monoscope/.env.prod | cut -d= -f2)"
-export AWS_SECRET_ACCESS_KEY="$(grep '^S3_SECRET_KEY' ../monoscope/.env.prod | cut -d= -f2)"
-export AWS_REGION="de"
+# Remote object store for network-latency-inclusive benches.
+# Default: OVH S3 (monoscope/.env.prod creds) — same provider as prod TF.
+# R2=1: Cloudflare R2 via .env.cloudlfare (bucket timefusion-eu).
+# Both use a dedicated tf-qlat-bench/ prefix inside the existing bucket.
+if [ "${R2:-0}" = "1" ]; then
+  # Everything (endpoint incl. account hash, bucket, creds) comes from the
+  # gitignored .env.cloudlfare — never inline R2 account URLs in this public repo.
+  export AWS_S3_ENDPOINT="$(grep '^AWS_S3_ENDPOINT=' .env.cloudlfare | head -1 | cut -d= -f2)"
+  export AWS_S3_BUCKET="$(grep '^AWS_S3_BUCKET=' .env.cloudlfare | head -1 | cut -d= -f2)"
+  export AWS_ACCESS_KEY_ID="$(grep '^AWS_ACCESS_KEY_ID=' .env.cloudlfare | head -1 | cut -d= -f2)"
+  export AWS_SECRET_ACCESS_KEY="$(grep '^AWS_SECRET_ACCESS_KEY=' .env.cloudlfare | head -1 | cut -d= -f2)"
+  export AWS_REGION="$(grep '^AWS_REGION=' .env.cloudlfare | head -1 | cut -d= -f2)"
+else
+  export AWS_S3_ENDPOINT="https://s3.de.io.cloud.ovh.net/"
+  export AWS_S3_BUCKET="rrweb"
+  export AWS_ACCESS_KEY_ID="$(grep '^S3_ACCESS_KEY' ../monoscope/.env.prod | cut -d= -f2)"
+  export AWS_SECRET_ACCESS_KEY="$(grep '^S3_SECRET_KEY' ../monoscope/.env.prod | cut -d= -f2)"
+  export AWS_REGION="de"
+fi
 export AWS_ALLOW_HTTP="false"
 export TIMEFUSION_TABLE_PREFIX="tf-qlat-bench"
 export TIMEFUSION_DATA_DIR="$data_dir"

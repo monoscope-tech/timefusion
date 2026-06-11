@@ -2493,6 +2493,10 @@ impl Database {
 
                     // Invalidate statistics cache after successful write
                     drop(table); // Release write lock before async operation
+                    // Freshly-flushed files are the ones dashboards query next;
+                    // without this they're read cold from S3 until something else
+                    // warms them (repeat queries measured ~300 ms vs 8 ms warm on R2).
+                    self.warm_cache_for_table(&project_id, &table_name, added.clone());
                     self.statistics_extractor.invalidate(&project_id, &table_name).await;
                     debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
 
