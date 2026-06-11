@@ -46,7 +46,11 @@ const MAX_FOYER_META_DISK_GB: usize = 5;
 pub fn apply(config: &mut AppConfig) {
     let mut sys = System::new();
     sys.refresh_memory();
-    let total_ram_bytes = sys.total_memory() as usize;
+    // Inside a container the budget is the cgroup limit, not host RAM —
+    // sizing 72% of a 148GB host into a 66.6GiB cgroup guarantees memcg OOM
+    // kills (prod 2026-06-11: 16 kills/24h, every-10-min crash loop).
+    let host_ram = sys.total_memory() as usize;
+    let total_ram_bytes = sys.cgroup_limits().map_or(host_ram, |c| (c.total_memory as usize).min(host_ram));
     let total_ram_gb = total_ram_bytes / (1024 * 1024 * 1024);
     let total_ram_mb = total_ram_bytes / (1024 * 1024);
 
