@@ -3014,14 +3014,11 @@ impl Database {
                 .await;
             match result {
                 Ok(new_table) => {
-                    // Warm the rewritten files like the optimize paths do
-                    // (swap_and_refresh_cache); without this the replace_where
-                    // outputs are stone-cold and the next query on the
-                    // partition pays full S3 metadata+data reads (1.5 s
-                    // observed against OVH).
-                    let added: Vec<String> = new_table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
-                    *table_ref.write().await = new_table;
-                    self.warm_cache_for_table(project_id, table_name, added);
+                    // Swap + warm-added/evict-removed exactly like the optimize
+                    // paths; a bare swap left the replace_where outputs stone-cold
+                    // (1.5 s first read observed against OVH) and the tombstoned
+                    // files' cache entries alive until TTL.
+                    self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                     crate::metrics::record_compaction_dedup_dropped(dropped);
                     info!(
                         "dedup compaction: table={} project={} date={} dropped={} (before={} after={})",

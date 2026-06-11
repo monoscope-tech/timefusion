@@ -231,9 +231,10 @@ mod tests {
     #[tokio::test]
     async fn coalesce_empty_pg_array_literal() {
         let ctx = ctx_with_rule();
-        let out = one_string(&ctx, "SELECT array_length(COALESCE(CAST(NULL AS VARCHAR[]), '{}'), 1) FROM (SELECT 1)").await;
-        // empty list → array_length over dim 1 is NULL in DF, so just assert it planned & ran
-        assert!(out.contains("---"), "{out}");
+        // cardinality(empty list) = 0 — asserts the actual coalesced value,
+        // not merely that planning succeeded.
+        let out = one_string(&ctx, "SELECT cardinality(COALESCE(CAST(NULL AS VARCHAR[]), '{}')) AS n FROM (SELECT 1)").await;
+        assert!(out.contains("| 0 "), "{out}");
     }
 
     #[tokio::test]

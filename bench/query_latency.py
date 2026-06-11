@@ -102,6 +102,8 @@ def seed_scale():
             pid = f"qlat-scale-p{p}"
             for d in range(n_days):
                 day_end = now - timedelta(days=d, minutes=3)
+                # shift_for_project copies each row dict (dict(r)), so the
+                # in-place re-stamping below can't bleed into base_rows.
                 rows = shift_for_project(base_rows, pid, timedelta(0))
                 step = timedelta(hours=20) / len(rows)
                 for i, r in enumerate(rows):
@@ -135,8 +137,8 @@ def run_ages(n_iter=8):
                 cur.execute(Q_RANDOM, (lo, hi, pid, tgt["id"]))
                 rows = cur.fetchall()
                 times.append((time.perf_counter() - t) * 1000)
-            ts_str = " ".join(f"{x:.0f}" for x in times)
-            print(f"random_access[{age:>7}] rows={len(rows)} ms: {ts_str}")
+            ts_str = " ".join(f"{x:.0f}" for x in times[1:])
+            print(f"random_access[{age:>7}] rows={len(rows)} first={times[0]:.0f}ms warm: {ts_str}")
 
 
 def queries():

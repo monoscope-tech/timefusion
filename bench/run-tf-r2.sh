@@ -14,17 +14,17 @@ mkdir -p "$data_dir"
 set -a; source .env; set +a
 # Remote object store for network-latency-inclusive benches.
 # Default: OVH S3 (monoscope/.env.prod creds) — same provider as prod TF.
-# R2=1: Cloudflare R2 via .env.cloudlfare (bucket timefusion-eu).
+# R2=1: Cloudflare R2 via .env.cloudflare (bucket timefusion-eu).
 # Both use a dedicated tf-qlat-bench/ prefix inside the existing bucket.
 if [ "${R2:-0}" = "1" ]; then
   # Everything (endpoint incl. account hash, bucket, creds) comes from the
-  # gitignored .env.cloudlfare — never inline R2 account URLs in this public repo.
-  [ -f .env.cloudlfare ] || { echo "R2=1 requires ./.env.cloudlfare (gitignored R2 config)"; exit 1; }
-  export AWS_S3_ENDPOINT="$(grep '^AWS_S3_ENDPOINT=' .env.cloudlfare | head -1 | cut -d= -f2)"
-  export AWS_S3_BUCKET="$(grep '^AWS_S3_BUCKET=' .env.cloudlfare | head -1 | cut -d= -f2)"
-  export AWS_ACCESS_KEY_ID="$(grep '^AWS_ACCESS_KEY_ID=' .env.cloudlfare | head -1 | cut -d= -f2)"
-  export AWS_SECRET_ACCESS_KEY="$(grep '^AWS_SECRET_ACCESS_KEY=' .env.cloudlfare | head -1 | cut -d= -f2)"
-  export AWS_REGION="$(grep '^AWS_REGION=' .env.cloudlfare | head -1 | cut -d= -f2)"
+  # gitignored .env.cloudflare — never inline R2 account URLs in this public repo.
+  [ -f .env.cloudflare ] || { echo "R2=1 requires ./.env.cloudflare (gitignored R2 config)"; exit 1; }
+  export AWS_S3_ENDPOINT="$(grep '^AWS_S3_ENDPOINT=' .env.cloudflare | head -1 | cut -d= -f2)"
+  export AWS_S3_BUCKET="$(grep '^AWS_S3_BUCKET=' .env.cloudflare | head -1 | cut -d= -f2)"
+  export AWS_ACCESS_KEY_ID="$(grep '^AWS_ACCESS_KEY_ID=' .env.cloudflare | head -1 | cut -d= -f2)"
+  export AWS_SECRET_ACCESS_KEY="$(grep '^AWS_SECRET_ACCESS_KEY=' .env.cloudflare | head -1 | cut -d= -f2)"
+  export AWS_REGION="$(grep '^AWS_REGION=' .env.cloudflare | head -1 | cut -d= -f2)"
 else
   [ -f ../monoscope/.env.prod ] || { echo "OVH mode requires ../monoscope/.env.prod for S3 creds (or use R2=1)"; exit 1; }
   export AWS_S3_ENDPOINT="https://s3.de.io.cloud.ovh.net/"
