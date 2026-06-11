@@ -1746,12 +1746,16 @@ impl TableBuffer {
             let mut g = bucket.batches.lock();
             g.push(batch);
             bucket.memory_bytes.fetch_add(new_size, Ordering::Relaxed);
-            // Coalesce gate: count exceeded AND aggregate bytes still small
-            // enough that concat_batches under the lock won't block readers
-            // for milliseconds. Cap means a single multi-MB INSERT followed
-            // by small batches just sits as a tail of small batches against
-            // the big one — readers iterate one extra cheap Vec slot;
-            // writers don't pay a stop-the-world memcpy.
+            // Coalesce gate: fold only the trailing run of batches that are
+            // each ≤ MAX_BATCH_BYTES_FOR_COALESCE. Segments past that size
+            // graduate and are never re-copied, so the under-lock memcpy is
+            // bounded (~the cap) regardless of bucket size, and the tail-run
+            // scan touches ≤ tail+1 batches per insert. The previous gate
+            // compared *total bucket bytes* against the cap: a busy 10-min
+            // bucket crossed 4MB within seconds and then accumulated
+            // thousands of uncoalesced single-row batches forever (~30KB
+            // allocated+charged per ~2KB row — prod 2026-06-11 tracked 117GB
+            // inside a 66.6GiB cgroup).
             //
             // Best-effort: coalesce is an optimisation, not a correctness
             // requirement. If `concat_batches` fails (e.g. schema-evolution
@@ -1760,23 +1764,30 @@ impl TableBuffer {
             // either way. Propagating the error here used to leak the
             // pushed batch back to the caller as Err, who'd then retry
             // and insert a duplicate.
-            let bucket_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
-            if g.len() > MAX_BATCH_COUNT_PER_BUCKET && bucket_bytes <= MAX_BATCH_BYTES_FOR_COALESCE {
-                let schema = g[0].schema();
-                match arrow::compute::concat_batches(&schema, g.iter()) {
-                    Ok(combined) => {
-                        let combined_size = estimate_batch_size(&combined);
-                        g.clear();
-                        g.push(combined);
-                        bucket.memory_bytes.store(combined_size, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target = "mem_buffer",
-                            error = %e,
-                            bucket_batch_count = g.len(),
-                            "coalesce concat_batches failed; continuing without coalesce (bucket data intact)"
-                        );
+            if g.len() > MAX_BATCH_COUNT_PER_BUCKET {
+                let mut tail_start = g.len();
+                while tail_start > 0 && estimate_batch_size(&g[tail_start - 1]) <= MAX_BATCH_BYTES_FOR_COALESCE {
+                    tail_start -= 1;
+                }
+                if g.len() - tail_start > MAX_BATCH_COUNT_PER_BUCKET {
+                    let schema = g[tail_start].schema();
+                    match arrow::compute::concat_batches(&schema, g[tail_start..].iter()) {
+                        Ok(combined) => {
+                            let folded_size: usize = g[tail_start..].iter().map(estimate_batch_size).sum();
+                            let combined_size = estimate_batch_size(&combined);
+                            g.truncate(tail_start);
+                            g.push(combined);
+                            let bucket_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
+                            bucket.memory_bytes.store(bucket_bytes.saturating_sub(folded_size) + combined_size, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target = "mem_buffer",
+                                error = %e,
+                                bucket_batch_count = g.len(),
+                                "coalesce concat_batches failed; continuing without coalesce (bucket data intact)"
+                            );
+                        }
                     }
                 }
             }
@@ -1965,6 +1976,44 @@ mod tests {
         assert!(
             charged < 64 * 1024,
             "single ~3KB-logical row charged {charged} bytes — view block capacity is leaking into memory accounting"
+        );
+    }
+
+    // Prod 2026-06-11 follow-up to the view-block fix: the coalesce gate
+    // compared *total bucket bytes* against MAX_BATCH_BYTES_FOR_COALESCE, so
+    // a busy 10-min bucket crossed the 4MB cap within seconds and then
+    // accumulated thousands of uncoalesced single-row batches forever
+    // (~30KB allocated+charged per ~2KB row; tracked memory hit 117GB in a
+    // 66.6GiB cgroup). Coalescing must keep working on the small tail no
+    // matter how large the bucket grows.
+    #[test]
+    fn bucket_keeps_coalescing_past_4mb() {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let payload = "x".repeat(64 * 1024);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("body", DataType::Utf8View, false),
+        ]));
+        for _ in 0..200 {
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC")),
+                    Arc::new(StringViewArray::from(vec![payload.as_str()])),
+                ],
+            )
+            .unwrap();
+            buffer.insert("p1", "t1", batch, ts).unwrap();
+        }
+        let table = buffer.tables.get(&MemBuffer::make_key("p1", "t1")).unwrap();
+        let bucket = table.buckets.get(&MemBuffer::compute_bucket_id(ts)).unwrap();
+        let g = bucket.batches.lock();
+        let (n_batches, total_rows) = (g.len(), g.iter().map(|b| b.num_rows()).sum::<usize>());
+        assert_eq!(total_rows, 200, "coalesce must not lose rows");
+        assert!(
+            n_batches <= 2 * (MAX_BATCH_COUNT_PER_BUCKET + 1),
+            "bucket holds {n_batches} batches — coalesce stopped once the bucket crossed MAX_BATCH_BYTES_FOR_COALESCE"
         );
     }
 
