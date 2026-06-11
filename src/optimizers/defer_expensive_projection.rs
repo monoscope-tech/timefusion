@@ -98,7 +98,7 @@ impl OptimizerRule for DeferExpensiveProjection {
 
         let min_proj = Projection::try_new(needed.into_iter().map(Expr::Column).collect(), Arc::clone(&proj.input))?;
         let new_sort = LogicalPlan::Sort(Sort {
-            expr: new_sort_exprs,
+            expr:  new_sort_exprs,
             input: Arc::new(LogicalPlan::Projection(min_proj)),
             fetch: sort.fetch,
         });
@@ -118,13 +118,14 @@ impl OptimizerRule for DeferExpensiveProjection {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema, TimeUnit},
         datasource::MemTable,
         execution::session_state::SessionStateBuilder,
         prelude::SessionContext,
     };
+
+    use super::*;
 
     async fn plans(sql: &str, with_rule: bool) -> (String, String) {
         let mut builder = SessionStateBuilder::new().with_default_features();
@@ -140,7 +141,10 @@ mod tests {
         ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap())).unwrap();
         let df = ctx.sql(sql).await.unwrap();
         let logical = format!("{}", df.clone().into_optimized_plan().unwrap().display_indent());
-        let physical = format!("{}", datafusion::physical_plan::displayable(df.create_physical_plan().await.unwrap().as_ref()).indent(false));
+        let physical = format!(
+            "{}",
+            datafusion::physical_plan::displayable(df.create_physical_plan().await.unwrap().as_ref()).indent(false)
+        );
         (logical, physical)
     }
 
@@ -167,7 +171,10 @@ mod tests {
         // projection back below SortExec (it can only do so when the sort key
         // survives the projection as a raw column, which it doesn't here).
         let p_sort = phys.find("SortExec").expect(&phys);
-        assert!(phys.find("concat").expect(&phys) < p_sort, "physical plan must keep concat above SortExec:\n{phys}");
+        assert!(
+            phys.find("concat").expect(&phys) < p_sort,
+            "physical plan must keep concat above SortExec:\n{phys}"
+        );
         assert!(phys.contains("TopK"), "SortExec must run as TopK:\n{phys}");
     }
 
