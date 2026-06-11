@@ -193,6 +193,7 @@ const_default!(d_vacuum_retention: u64 = 24);
 const_default!(d_optimize_window_hours: u64 = 48);
 const_default!(d_compact_min_files: usize = 5);
 const_default!(d_light_optimize_target: i64 = 16 * 1024 * 1024);
+const_default!(d_optimize_concurrency: usize = 4);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Every 6h (not daily): tombstones leave checkpoints once older than the
@@ -636,6 +637,12 @@ pub struct MaintenanceConfig {
     pub timefusion_compact_min_files:          usize,
     #[serde(default = "d_light_optimize_target")]
     pub timefusion_light_optimize_target_size: i64,
+    /// Concurrent merge tasks per optimize run. delta-rs defaults to
+    /// num_cpus (48 on prod), where each task holds decompressed batches
+    /// plus a zstd writer buffer — 2026-06-11 this OOM-killed the process
+    /// every optimize tick once small files accumulated.
+    #[serde(default = "d_optimize_concurrency")]
+    pub timefusion_optimize_max_concurrent_tasks: usize,
     #[serde(default = "d_light_schedule")]
     pub timefusion_light_optimize_schedule:    String,
     #[serde(default = "d_optimize_schedule")]
