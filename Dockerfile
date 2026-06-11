@@ -87,7 +87,12 @@ ENV OTEL_EXPORTER_OTLP_ENDPOINT=http://srv-captain--otelcol:4317 \
 # path's inflate→compact churn fragments them so freed memory never returns
 # to the OS. Measured 2026-06-11 on prod at identical 2.5-min uptime:
 # 20.7GB anon RSS without this, 5.0GB with — the difference was driving the
-# 66.6GiB-cgroup OOM crashloop. Revisit if we switch to jemalloc.
-ENV MALLOC_ARENA_MAX=2
+# 66.6GiB-cgroup OOM crashloop. MMAP_THRESHOLD pins large allocations
+# (Arrow batches, parquet buffers) to mmap so frees return to the OS —
+# glibc's adaptive threshold (up to 32MB) otherwise strands them on the
+# heap: measured steady-state anon creep ~1GB/min without, ~460MB/min
+# with. Revisit both if we switch to jemalloc.
+ENV MALLOC_ARENA_MAX=2 \
+    MALLOC_MMAP_THRESHOLD_=131072
 
 ENTRYPOINT ["/usr/local/bin/timefusion"]
