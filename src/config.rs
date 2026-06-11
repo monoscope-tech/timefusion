@@ -630,13 +630,13 @@ pub struct ParquetConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MaintenanceConfig {
     #[serde(default = "d_vacuum_retention")]
-    pub timefusion_vacuum_retention_hours:     u64,
+    pub timefusion_vacuum_retention_hours:        u64,
     #[serde(default = "d_optimize_window_hours")]
-    pub timefusion_optimize_window_hours:      u64,
+    pub timefusion_optimize_window_hours:         u64,
     #[serde(default = "d_compact_min_files")]
-    pub timefusion_compact_min_files:          usize,
+    pub timefusion_compact_min_files:             usize,
     #[serde(default = "d_light_optimize_target")]
-    pub timefusion_light_optimize_target_size: i64,
+    pub timefusion_light_optimize_target_size:    i64,
     /// Concurrent merge tasks per optimize run. delta-rs defaults to
     /// num_cpus (48 on prod), where each task holds decompressed batches
     /// plus a zstd writer buffer — 2026-06-11 this OOM-killed the process
@@ -644,45 +644,45 @@ pub struct MaintenanceConfig {
     #[serde(default = "d_optimize_concurrency")]
     pub timefusion_optimize_max_concurrent_tasks: usize,
     #[serde(default = "d_light_schedule")]
-    pub timefusion_light_optimize_schedule:    String,
+    pub timefusion_light_optimize_schedule:       String,
     #[serde(default = "d_optimize_schedule")]
-    pub timefusion_optimize_schedule:          String,
+    pub timefusion_optimize_schedule:             String,
     #[serde(default = "d_vacuum_schedule")]
-    pub timefusion_vacuum_schedule:            String,
+    pub timefusion_vacuum_schedule:               String,
     #[serde(default = "d_recompress_schedule")]
-    pub timefusion_recompress_schedule:        String,
+    pub timefusion_recompress_schedule:           String,
     /// Proactively warm the Foyer cache for files written by a flush/optimize
     /// commit, so recent partitions dashboards read don't cold-start after
     /// every compaction. Footers are always warmed when enabled.
     #[serde(default = "d_true")]
-    pub timefusion_warm_after_compaction:      bool,
+    pub timefusion_warm_after_compaction:         bool,
     /// In addition to footers, warm the full file contents into the main
     /// (full-file) cache. Off by default — footers carry most of the
     /// planning-latency win at a fraction of the bytes; enable for data-read
     /// warmth on the hottest partitions.
     #[serde(default)]
-    pub timefusion_warm_full_files:            bool,
+    pub timefusion_warm_full_files:               bool,
     /// Only warm files whose `date=` partition is within this many days of
     /// today. Bounds warming to the partitions dashboards actually query.
     /// 0 = no recency limit.
     #[serde(default = "d_warm_recency_days")]
-    pub timefusion_warm_recency_days:          u64,
+    pub timefusion_warm_recency_days:             u64,
     /// Warm parquet footers for EVERY live file (not just recency-window
     /// ones). Footers are tens of KB each, but on tables with thousands of
     /// files the boot-time GET burst may matter on small instances — disable
     /// to fall back to recency-bounded footer warming.
     #[serde(default = "d_true")]
-    pub timefusion_warm_all_footers:           bool,
+    pub timefusion_warm_all_footers:              bool,
     /// Max concurrent warm fetches per commit. Bounds the S3 GET burst a
     /// warm job adds right after a compaction.
     #[serde(default = "d_warm_concurrency")]
-    pub timefusion_warm_concurrency:           usize,
+    pub timefusion_warm_concurrency:              usize,
     /// After a compaction commit, proactively evict the cached full-file bytes
     /// of the files it tombstoned (no longer in the live set), instead of
     /// waiting for VACUUM / TTL / LRU to reclaim them. Cheap (in-cache only, no
     /// S3) and keeps the cache from filling with dead compaction outputs.
     #[serde(default = "d_true")]
-    pub timefusion_evict_after_compaction:     bool,
+    pub timefusion_evict_after_compaction:        bool,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.

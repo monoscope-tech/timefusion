@@ -3426,7 +3426,7 @@ impl Database {
                 .with_filters(partition_filters)
                 .with_type(deltalake::operations::optimize::OptimizeType::Compact)
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
-            .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
+                .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
                 .with_writer_properties(writer_properties.clone())
                 .with_min_commit_interval(tokio::time::Duration::from_secs(30))
                 // Variant columns are stored as Struct{Binary, Binary} on disk; if
