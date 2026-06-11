@@ -61,13 +61,12 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db.setup_session_udfs(&mut session_context)?;
     let registry: Arc<crate::functions::FnRegistry> = Arc::new(session_context.state());
 
-    // Pre-init WAL GC: delete files older than 2× retention before walrus
-    // enumerates the dir on construction. Without this, accumulated leaks
-    // from prior process lifetimes dominate startup (see memory
-    // `wal_bloat_startup.md` — prod hit 467 GB / 12-min startup).
+    // Pre-init WAL GC: delete dead files before walrus enumerates the dir on
+    // construction. Without this, accumulated leaks from prior process
+    // lifetimes dominate startup (see memory `wal_bloat_startup.md` — prod
+    // hit 467 GB / 12-min startup).
     let t_gc = std::time::Instant::now();
-    let max_age = std::time::Duration::from_secs(cfg.buffer.retention_mins() * 60 * 2);
-    match crate::wal::gc_wal_files(&cfg.core.wal_dir(), max_age) {
+    match crate::wal::gc_wal_files(&cfg.core.wal_dir(), cfg.buffer.wal_gc_max_age()) {
         Ok((deleted, bytes_freed)) => tracing::info!(
             "bootstrap.phase=wal_gc deleted={deleted} bytes_freed={bytes_freed} elapsed_ms={}",
             t_gc.elapsed().as_millis()
