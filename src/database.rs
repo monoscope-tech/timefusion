@@ -249,11 +249,7 @@ pub(crate) async fn ensure_deleted_file_retention(table: DeltaTable, retention_h
     if current.as_deref() == Some(desired.as_str()) {
         return table;
     }
-    match deltalake::DeltaOps(table.clone())
-        .set_tbl_properties()
-        .with_properties(HashMap::from([(KEY.to_string(), desired.clone())]))
-        .await
-    {
+    match table.clone().set_tbl_properties().with_properties(HashMap::from([(KEY.to_string(), desired.clone())])).await {
         Ok(updated) => {
             info!("Set {KEY}={desired} (was {current:?}) — bounds Remove tombstones kept in checkpoints");
             updated
@@ -4810,7 +4806,7 @@ mod tests {
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///convoy_tbl")?;
         let fast = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
-        let table = deltalake::DeltaOps(fast).create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        let table = fast.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
         assert_eq!(table.version(), Some(0));
 
         // Same store, but every list/get pays a delay — makes update_state
@@ -4864,7 +4860,7 @@ mod tests {
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///retention_tbl")?;
         let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem, url).build()?;
-        let table = deltalake::DeltaOps(t).create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        let table = t.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
         assert!(
             !table.snapshot()?.metadata().configuration().contains_key(KEY),
             "fresh table has no retention property"
