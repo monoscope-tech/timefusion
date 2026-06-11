@@ -77,4 +77,10 @@ COPY --from=builder --chown=nonroot:nonroot /data     /app/data
 
 EXPOSE 80 5432
 
+# Default telemetry destination: the swarm-internal collector. Image ENV
+# loses to service-level env, so operators can still override per deploy.
+# Spans default off (per-query volume); logs + metrics flow.
+ENV OTEL_EXPORTER_OTLP_ENDPOINT=http://srv-captain--otelcol:4317 \
+    OTEL_TRACES_EXPORTER=none
+
 ENTRYPOINT ["/usr/local/bin/timefusion"]

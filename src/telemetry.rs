@@ -1,17 +1,21 @@
-use std::time::Duration;
+use std::{sync::OnceLock, time::Duration};
 
 use opentelemetry::{KeyValue, trace::TracerProvider};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     Resource,
+    logs::SdkLoggerProvider,
     propagation::TraceContextPropagator,
     trace::{RandomIdGenerator, Sampler},
 };
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::config::TelemetryConfig;
+
+/// Kept for `shutdown_telemetry` to flush buffered log batches at exit.
+static LOGGER_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 
 pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     // Set global propagator for trace context
@@ -28,37 +32,48 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         .with_attributes([KeyValue::new("service.name", service_name.clone()), KeyValue::new("service.version", service_version.clone())])
         .build();
 
-    // Create OTLP span exporter
+    // Span export honors the standard OTEL_TRACES_EXPORTER=none switch —
+    // prod runs with spans off (per-query span volume) but logs/metrics on.
     // Note: In opentelemetry-otlp 0.31, message size limits cannot be directly configured
     // through the public API. The default limit is 4MB for incoming messages.
-    let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+    // Batch configuration is handled automatically (batch size 512, delay 5s,
+    // queue 2048).
+    let telemetry_layer = if config.otel_traces_exporter.as_deref() == Some("none") {
+        None
+    } else {
+        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(otlp_endpoint)
+            .with_timeout(Duration::from_secs(10))
+            .build()?;
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(span_exporter)
+            .with_sampler(Sampler::AlwaysOn)
+            .with_id_generator(RandomIdGenerator::default())
+            .with_resource(resource.clone())
+            .build();
+        opentelemetry::global::set_tracer_provider(tracer_provider.clone());
+        Some(OpenTelemetryLayer::new(tracer_provider.tracer("timefusion")))
+    };
+
+    // OTLP logs: bridge tracing events to the collector so TF shows up as a
+    // service in monoscope (the 2026-06-11 OOM loop was diagnosed entirely
+    // from client-side error strings because TF only logged to stdout).
+    // The bridge must not observe the exporter's own tracing output —
+    // tonic/hyper events inside an export would recurse into another export.
+    let log_exporter = opentelemetry_otlp::LogExporter::builder()
         .with_tonic()
         .with_endpoint(otlp_endpoint)
         .with_timeout(Duration::from_secs(10))
         .build()?;
-
-    // Build the tracer provider
-    // Note: In opentelemetry-sdk 0.31, batch configuration is handled automatically
-    // by the batch exporter. The default settings include:
-    // - Max export batch size: 512
-    // - Scheduled delay: 5 seconds
-    // - Max queue size: 2048
-    // These defaults work well for most use cases and help prevent hitting the 4MB limit
-    let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-        .with_batch_exporter(span_exporter)
-        .with_sampler(Sampler::AlwaysOn)
-        .with_id_generator(RandomIdGenerator::default())
-        .with_resource(resource)
-        .build();
-
-    // Set global tracer provider
-    opentelemetry::global::set_tracer_provider(tracer_provider.clone());
-
-    // Create tracer
-    let tracer = tracer_provider.tracer("timefusion");
-
-    // Create telemetry layer
-    let telemetry_layer = OpenTelemetryLayer::new(tracer);
+    let logger_provider = SdkLoggerProvider::builder().with_batch_exporter(log_exporter).with_resource(resource).build();
+    let log_bridge = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(
+        tracing_subscriber::filter::filter_fn(|meta| {
+            let t = meta.target();
+            !(t.starts_with("opentelemetry") || t.starts_with("tonic") || t.starts_with("h2") || t.starts_with("hyper"))
+        }),
+    );
+    let _ = LOGGER_PROVIDER.set(logger_provider);
 
     // Get log filter from environment
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -66,7 +81,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     // Initialize tracing subscriber with telemetry and formatting layers
     let is_json = config.is_json_logging();
 
-    let subscriber = Registry::default().with(env_filter).with(telemetry_layer);
+    let subscriber = Registry::default().with(env_filter).with(telemetry_layer).with(log_bridge);
 
     if is_json {
         subscriber
@@ -86,6 +101,9 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
 
 pub fn shutdown_telemetry() {
     info!("Shutting down OpenTelemetry");
-    // Note: In OpenTelemetry 0.31, there's no global shutdown function
-    // The tracer provider will be shut down when dropped
+    // Tracer/meter providers shut down when dropped; flush buffered logs
+    // explicitly so the final shutdown lines reach the collector.
+    if let Some(p) = LOGGER_PROVIDER.get() {
+        let _ = p.shutdown();
+    }
 }
