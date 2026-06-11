@@ -2000,8 +2000,7 @@ mod tests {
         let big: Vec<String> = (0..1000).map(|i| format!("{i:0>100}")).collect();
         let full = StringViewArray::from(big.iter().map(|s| s.as_str()).collect::<Vec<_>>());
         let ts = chrono::Utc::now().timestamp_micros();
-        let mut fields: Vec<Field> =
-            vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)];
+        let mut fields: Vec<Field> = vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)];
         fields.extend((0..8).map(|i| Field::new(format!("c{i}"), DataType::Utf8View, true)));
         let schema = Arc::new(Schema::new(fields));
         let mut cols: Vec<ArrayRef> = vec![Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC"))];
