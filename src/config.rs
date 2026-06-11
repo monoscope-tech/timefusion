@@ -184,17 +184,28 @@ const_default!(d_stats_cache_size: usize = 50);
 // Observability data is high-churn and rarely time-traveled; the only hard
 // floor is that retention must outlive any in-flight query (which holds a Delta
 // snapshot referencing files vacuum would delete). With no query running beyond
-// ~1h, 48h is a 48x safety margin while reclaiming tombstoned bytes far sooner
-// than the old 72h default.
-const_default!(d_vacuum_retention: u64 = 48);
+// ~1h, 24h is still a 24x safety margin. This value also drives
+// `delta.deletedFileRetentionDuration` (set at create + reconciled at load):
+// Remove tombstones stay in every checkpoint for this long, and prod's 5-min
+// compaction churn at the 7-day delta default accumulated 38.5k tombstones
+// (93% of checkpoint actions) replayed on every snapshot refresh.
+const_default!(d_vacuum_retention: u64 = 24);
 const_default!(d_optimize_window_hours: u64 = 48);
 const_default!(d_compact_min_files: usize = 5);
 const_default!(d_light_optimize_target: i64 = 16 * 1024 * 1024);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
-const_default!(d_vacuum_schedule: String = "0 0 2 * * *");
+// Every 6h (not daily): tombstones leave checkpoints once older than the
+// retention property, so vacuum must visit often enough to delete the files
+// before their tombstones are pruned — a daily cadence against a 24h
+// retention orphans most of a day's churn (VacuumMode::Full backstops any
+// that slip through).
+const_default!(d_vacuum_schedule: String = "0 15 */6 * * *");
 const_default!(d_warm_recency_days: u64 = 2);
-const_default!(d_warm_concurrency: usize = 4);
+// 16: at concurrency 4 prod's 3.1k-file boot warm ran >55 min and was cut
+// short by a restart every time; 16 finishes it in ~1-3 min. Footer GETs are
+// ~64KB suffix ranges, well within R2/S3 burst limits.
+const_default!(d_warm_concurrency: usize = 16);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
@@ -756,7 +767,7 @@ mod tests {
         assert!(config.maintenance.timefusion_evict_after_compaction);
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);
-        assert_eq!(config.maintenance.timefusion_warm_concurrency, 4);
+        assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
     }
 
     #[test]
