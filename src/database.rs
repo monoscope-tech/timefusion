@@ -1527,6 +1527,9 @@ impl Database {
             .with_runtime_env(runtime_env)
             .with_default_features()
             .with_analyzer_rules(analyzer_rules)
+            // Appended after DataFusion's defaults so push_down_limit has
+            // already folded LIMIT into Sort.fetch — see the rule's docs.
+            .with_optimizer_rule(Arc::new(crate::optimizers::DeferExpensiveProjection))
             .with_physical_optimizer_rule(instrument_rule)
             .with_query_planner(Arc::new({
                 let planner = DmlQueryPlanner::new(self.clone());

@@ -1,3 +1,4 @@
+mod defer_expensive_projection;
 pub mod pg_array_literal_rewriter;
 mod tantivy_rewriter;
 mod variant_insert_rewriter;
@@ -8,6 +9,7 @@ use datafusion::{
     logical_expr::{BinaryExpr, Expr, Operator},
     scalar::ScalarValue,
 };
+pub use defer_expensive_projection::DeferExpensiveProjection;
 pub use pg_array_literal_rewriter::PgArrayLiteralRewriter;
 pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;
