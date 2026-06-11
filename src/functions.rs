@@ -6,8 +6,8 @@ use chrono_tz::Tz;
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringViewArray, StringViewBuilder,
-            TimestampMicrosecondArray, TimestampNanosecondArray,
+            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray, StringViewArray, StringViewBuilder, TimestampMicrosecondArray,
+            TimestampNanosecondArray,
         },
         datatypes::{DataType, TimeUnit},
     },
@@ -1183,6 +1183,14 @@ macro_rules! push_json_primitive {
 
 /// Convert Arrow array to JSON values
 fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonValue>> {
+    array_to_json_values_inner(array, true)
+}
+
+/// `sniff_json` parses Utf8 values that look like JSON into real JSON. PG parity
+/// requires it only at the top level — Variant/Utf8 columns holding JSON
+/// (attributes, events, links) need it — while list elements must stay JSON
+/// strings (`to_jsonb(text[])`), so list recursion always passes `false`.
+fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion::error::Result<Vec<JsonValue>> {
     let mut values = Vec::with_capacity(array.len());
 
     match array.data_type() {
@@ -1196,8 +1204,10 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
                     values.push(JsonValue::Null);
                 } else {
                     let s = string_array.value(i);
-                    // Try to parse as JSON if it looks like JSON
-                    let val = if (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']')) {
+                    // Sniff JSON only at the top level: Variant/Utf8 columns holding JSON
+                    // (attributes, events) must surface as real JSON. Inside List(Utf8)
+                    // (e.g. summary text[]) PG keeps elements as JSON *strings*.
+                    let val = if sniff_json && ((s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'))) {
                         serde_json::from_str(s).unwrap_or_else(|_| JsonValue::String(s.to_string()))
                     } else {
                         JsonValue::String(s.to_string())
@@ -1225,30 +1235,36 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
                 }
             }
         }
-        DataType::List(_) => {
-            let list_array = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to ListArray".to_string()))?;
-
-            for i in 0..list_array.len() {
-                if list_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    let array_ref = list_array.value(i);
-                    let inner_values = array_to_json_values(&array_ref)?;
-                    values.push(JsonValue::Array(inner_values));
-                }
-            }
+        DataType::List(_) => push_list_json::<i32>(array, &mut values)?,
+        DataType::LargeList(_) => push_list_json::<i64>(array, &mut values)?,
+        DataType::FixedSizeList(field, _) => {
+            let as_list = datafusion::arrow::compute::cast(array, &DataType::List(field.clone()))?;
+            push_list_json::<i32>(&as_list, &mut values)?
         }
         _ => {
             // For other types, try to convert to string
             let string_array = datafusion::arrow::compute::cast(array, &DataType::Utf8View)?;
-            return array_to_json_values(&string_array);
+            return array_to_json_values_inner(&string_array, sniff_json);
         }
     }
 
     Ok(values)
+}
+
+fn push_list_json<O: datafusion::arrow::array::OffsetSizeTrait>(array: &ArrayRef, values: &mut Vec<JsonValue>) -> datafusion::error::Result<()> {
+    let list_array = array
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::GenericListArray<O>>()
+        .ok_or_else(|| DataFusionError::Execution("Failed to downcast to list array".to_string()))?;
+    for i in 0..list_array.len() {
+        if list_array.is_null(i) {
+            values.push(JsonValue::Null);
+        } else {
+            // Always sniff_json=false: PG's to_jsonb(text[]) keeps elements as JSON strings.
+            values.push(JsonValue::Array(array_to_json_values_inner(&list_array.value(i), false)?));
+        }
+    }
+    Ok(())
 }
 
 /// Create the time_bucket UDF for time-series bucketing (similar to TimescaleDB)
@@ -1951,6 +1967,60 @@ mod tests {
         let pm_batches = ctx.sql(pm_sql).await.unwrap().collect().await.unwrap();
         let pm_col = pm_batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
         assert_eq!(pm_col.value(0), "08:10 PM");
+    }
+
+    /// PG parity: `to_jsonb(text[])` produces an array of JSON *strings*. Elements
+    /// that happen to look like JSON (log bodies, attributes payloads in monoscope's
+    /// `summary` column) must NOT be re-parsed into objects/arrays — that broke the
+    /// log explorer's row renderer ("e.indexOf is not a function").
+    #[tokio::test]
+    async fn test_to_jsonb_text_array_elements_stay_strings() {
+        use datafusion::prelude::SessionContext;
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let sql = r#"SELECT to_jsonb(make_array('{"a":1}', '[1,2]', 'plain', '123')) AS s"#;
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+        assert_eq!(col.value(0), r#"["{\"a\":1}","[1,2]","plain","123"]"#);
+        // Independent of serialisation format: every element must be a JSON *string*.
+        let parsed: serde_json::Value = serde_json::from_str(col.value(0)).unwrap();
+        assert!(
+            parsed.as_array().unwrap().iter().all(serde_json::Value::is_string),
+            "elements must stay strings: {parsed}"
+        );
+        // Top-level Utf8 scalars keep the JSON sniff: Variant/Utf8 columns holding
+        // JSON (attributes, events, links) rely on it to surface as real JSON.
+        let sql = r#"SELECT to_jsonb('{"a":1}') AS s"#;
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+        assert_eq!(col.value(0), r#"{"a":1}"#);
+        // to_json shares array_to_json_values, so the same rule applies — monoscope's
+        // selectChildSpansAndLogs emits to_json(summary).
+        let sql = r#"SELECT to_json(make_array('{"a":1}')) AS s"#;
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+        assert_eq!(col.value(0), r#"["{\"a\":1}"]"#);
+    }
+
+    /// LargeList and FixedSizeList must keep list structure (they used to fall
+    /// through to the cast-to-string arm) and follow the same no-sniff rule.
+    #[test]
+    fn test_large_and_fixed_size_list_to_json_values() {
+        use datafusion::arrow::array::{FixedSizeListBuilder, GenericListBuilder, StringViewBuilder};
+        let expected = vec![serde_json::json!([r#"{"a":1}"#, "plain"])];
+        let mut b = GenericListBuilder::<i64, _>::new(StringViewBuilder::new());
+        b.values().append_value(r#"{"a":1}"#);
+        b.values().append_value("plain");
+        b.append(true);
+        let arr: ArrayRef = Arc::new(b.finish());
+        assert_eq!(array_to_json_values(&arr).unwrap(), expected);
+
+        let mut b = FixedSizeListBuilder::new(StringViewBuilder::new(), 2);
+        b.values().append_value(r#"{"a":1}"#);
+        b.values().append_value("plain");
+        b.append(true);
+        let arr: ArrayRef = Arc::new(b.finish());
+        assert_eq!(array_to_json_values(&arr).unwrap(), expected);
     }
 
     #[test]
