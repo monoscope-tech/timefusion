@@ -83,4 +83,11 @@ EXPOSE 80 5432
 ENV OTEL_EXPORTER_OTLP_ENDPOINT=http://srv-captain--otelcol:4317 \
     OTEL_TRACES_EXPORTER=none
 
+# glibc malloc defaults to 8 arenas/core (384 on a 48-core host); the write
+# path's inflate→compact churn fragments them so freed memory never returns
+# to the OS. Measured 2026-06-11 on prod at identical 2.5-min uptime:
+# 20.7GB anon RSS without this, 5.0GB with — the difference was driving the
+# 66.6GiB-cgroup OOM crashloop. Revisit if we switch to jemalloc.
+ENV MALLOC_ARENA_MAX=2
+
 ENTRYPOINT ["/usr/local/bin/timefusion"]
