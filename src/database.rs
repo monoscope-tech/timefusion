@@ -269,6 +269,9 @@ fn select_warm_paths(
             }
         })
         .collect();
+    // Assumes 10-char ISO dates (date=YYYY-MM-DD, lexically sortable). A
+    // missing or differently-shaped date= segment keys as "" — sorts first
+    // (slightly suboptimal LRU order), never a crash.
     let date_key = |p: &object_store::path::Path| {
         let s = p.as_ref();
         s.find("date=").and_then(|i| s.get(i + 5..i + 15)).unwrap_or("").to_string()
@@ -2103,9 +2106,11 @@ impl Database {
         // old partitions instead of whichever files happened to warm late.
         let (paths, dropped) = select_warm_paths(uris, prefix, warm_all_footers, cutoff);
         if dropped > 0 {
-            // Log so a systematic prefix mismatch is diagnosable instead of a
-            // silent no-op (warming the wrong key would never be hit).
-            debug!("warm: skipped {} file(s) that did not relativize against prefix {}", dropped, prefix);
+            // warn: a systematic prefix mismatch silently no-ops the whole
+            // warm pass (the wrong key would never be hit), and prod runs at
+            // warn level — debug would make it invisible exactly where it
+            // matters (boot-time preload).
+            warn!("warm: skipped {} file(s) that did not relativize against prefix {}", dropped, prefix);
         }
         if paths.is_empty() {
             return;

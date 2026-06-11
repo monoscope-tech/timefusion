@@ -48,6 +48,7 @@ use datafusion::{
 /// trait method delegates to the inner built-in. On a DataFusion upgrade,
 /// re-check `ScalarUDFImpl` for new methods whose defaults would diverge
 /// from the built-in coalesce and forward them here too.
+/// Last audited against DataFusion 53.1.0 — bump this with each audit.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PgCoalesceUdf {
     inner: Arc<datafusion::logical_expr::ScalarUDF>,
@@ -393,6 +394,10 @@ mod tests {
         // The mirror case — non-whitespace BEFORE an opening quote — is also
         // PG-invalid; we leniently concatenate. Pinned for the same reason.
         assert_eq!(parse_pg_string_array("{a\"b\"}"), Some(vec![Some("ab".into())]));
+        // Lone backslash at end of input (inside quotes, escaping nothing):
+        // chars.next()? propagates None → arg left unrewritten → the
+        // string-arg guard errors (never a panic or a half-parsed list).
+        assert_eq!(parse_pg_string_array("{\"a\\}"), None);
         // Multi-dimensional literals are rejected, not silently flattened;
         // braces inside quotes are ordinary element text.
         assert_eq!(parse_pg_string_array("{{a},{b}}"), None);
