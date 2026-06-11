@@ -474,6 +474,13 @@ impl BufferedWriteLayer {
 
         let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
 
+        // Compact before reservation AND WAL serialization: scan-backed DML
+        // batches and IPC-decoded inputs otherwise reserve at phantom size
+        // and serialize entire inherited buffers into the WAL (2026-06-11:
+        // fat UPDATE entries re-inflated the buffer to 772GB on every
+        // replay). MemBuffer's insert re-runs this as a cheap no-op.
+        let batches: Vec<RecordBatch> = batches.into_iter().map(crate::mem_buffer::compact_batch).collect();
+
         // Reserve memory atomically before writing - prevents race condition
         let reserved_size = self.try_reserve_memory(&batches).await?;
 
