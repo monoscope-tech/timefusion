@@ -237,6 +237,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     db = db.start_maintenance_schedulers().await?;
     let db = Arc::new(db);
     db.setup_session_tables(&mut session_context)?;
+    // Non-blocking: snapshot load + footer warm-up off the first query's path.
+    db.preload_tables();
 
     // Start PGWire server on the listener we pre-bound at the top of
     // async_main. First, hand control of that listener back from the

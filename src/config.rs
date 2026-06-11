@@ -327,6 +327,12 @@ impl AwsConfig {
         insert_opt!(opts, "AWS_REGION", self.aws_default_region);
         insert_opt!(opts, "AWS_ALLOW_HTTP", self.aws_allow_http);
         opts.insert("AWS_ENDPOINT_URL".into(), endpoint_override.unwrap_or(&self.aws_s3_endpoint).to_string());
+        // Bound TCP/TLS connection establishment. The object_store default
+        // (5 s connect) plus retries let a black-holed connection stall a
+        // first-touch read for 20 s+ (observed 23 s on a cold partition).
+        // Total request timeout stays at the default 30 s so large flush
+        // PUTs aren't cut off.
+        opts.insert("connect_timeout".into(), "3s".into());
         opts
     }
 }

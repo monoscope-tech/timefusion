@@ -1316,6 +1316,16 @@ impl Database {
         let _ = options.set("datafusion.execution.parquet.enable_page_index", "true");
         let _ = options.set("datafusion.execution.parquet.pruning", "true");
         let _ = options.set("datafusion.execution.parquet.skip_metadata", "false");
+        // One-shot footer read sized to match `warm_footer`'s suffix range: the
+        // Foyer metadata cache keys on (path, exact range), so the reader's
+        // first fetch (size-hint..size) hits the entry the warm task populated.
+        // Without this the reader does 8-byte-tail + metadata-range reads —
+        // two sequential S3 RTTs on different keys that can never be pre-warmed
+        // (measured 1.6 s of metadata_load_time on a cold OVH partition).
+        let _ = options.set(
+            "datafusion.execution.parquet.metadata_size_hint",
+            &self.config.cache.timefusion_parquet_metadata_size_hint.to_string(),
+        );
         let _ = options.set("datafusion.explain.show_schema", "true");
         let _ = options.set("datafusion.runtime.metadata_cache_limit", "500M");
 
@@ -2037,12 +2047,18 @@ impl Database {
         let cutoff = (recency_days > 0).then(|| Utc::now().date_naive() - chrono::Duration::days(recency_days.min(3650) as i64));
 
         let mut dropped = 0usize;
-        let paths: Vec<object_store::path::Path> = uris
+        // Footers are warmed for EVERY live file (tens of KB each — they're
+        // what turns a deep-partition first touch from footer+data RTTs into
+        // a single data fetch). Full-file warming stays recency-bounded.
+        let paths: Vec<(object_store::path::Path, bool)> = uris
             .into_iter()
             .filter(|u| u.ends_with(".parquet"))
-            .filter(|u| within_recency(u, cutoff))
-            .filter_map(|u| match relativize_to_prefix(prefix, &u) {
-                Some(path) => Some(path),
+            .map(|u| {
+                let recent = within_recency(&u, cutoff);
+                (u, recent)
+            })
+            .filter_map(|(u, recent)| match relativize_to_prefix(prefix, &u) {
+                Some(path) => Some((path, recent)),
                 None => {
                     // Prefix mismatch (e.g. trailing-slash or query-string
                     // drift between table_url() and get_file_uris()). Warming
@@ -2084,11 +2100,11 @@ impl Database {
         // filter (e.g. in Loki) by what was actually primed.
         let scope = if warm_full_files { "full" } else { "footer-only" };
         futures::stream::iter(paths)
-            .for_each_concurrent(concurrency, |path| {
+            .for_each_concurrent(concurrency, |(path, recent)| {
                 let store = object_store.clone();
                 async move {
                     let _ = crate::object_store_cache::warm_footer(store.as_ref(), &path, metadata_size_hint).await;
-                    if warm_full_files {
+                    if warm_full_files && recent {
                         let _ = crate::object_store_cache::warm_full(store.as_ref(), &path).await;
                     }
                 }
@@ -2169,6 +2185,31 @@ impl Database {
                 // Already inside a detached task — await the warm directly
                 // instead of spawning a second nested task.
                 db.warm_cache_for_uris(store, table_uri, uris).await;
+            }
+        });
+    }
+
+    /// Resolve every registry table and warm recent-partition footers in the
+    /// background, so the first query after a deploy doesn't pay Delta log
+    /// replay + parquet footer reads inline (measured 1.4 s cold vs 13 ms
+    /// warm against OVH S3 for a single-partition random-access lookup).
+    pub fn preload_tables(self: &Arc<Self>) {
+        let db = Arc::clone(self);
+        tokio::spawn(async move {
+            for table_name in crate::schema_loader::registry().list_tables() {
+                let t = std::time::Instant::now();
+                match db.resolve_table("default", &table_name).await {
+                    Ok(table_ref) => {
+                        let uris: Vec<String> = table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                        info!(
+                            "bootstrap.phase=table_preload table={table_name} files={} elapsed_ms={}",
+                            uris.len(),
+                            t.elapsed().as_millis()
+                        );
+                        db.warm_cache_for_table("default", &table_name, uris);
+                    }
+                    Err(e) => info!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
+                }
             }
         });
     }

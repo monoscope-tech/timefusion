@@ -84,11 +84,65 @@ UNION ALL
 SELECT 'p95', approx_percentile_cont(duration, 0.95) FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s"""
 
 
+def seed_scale():
+    """Prod-shaped dataset: N_PROJECTS x N_DAYS, rows spread per day.
+    Saves random-access targets at several ages (recent / day-old / deep)."""
+    n_projects = int(os.environ.get("QLAT_PROJECTS", "5"))
+    n_days = int(os.environ.get("QLAT_DAYS", "30"))
+    rows_per_day = int(os.environ.get("QLAT_ROWS_PER_DAY", "700"))
+    base_rows = load_rows(rows_per_day)
+    now = datetime.now(timezone.utc)
+    placeholders = "(" + ", ".join(["%s"] * len(COLUMNS)) + ")"
+    base_sql = f"INSERT INTO otel_logs_and_spans ({', '.join(COLUMNS)}) VALUES "
+    targets = {}
+    t0 = time.perf_counter()
+    with psycopg.connect(URL, autocommit=True) as c, c.cursor() as cur:
+        for p in range(n_projects):
+            pid = f"qlat-scale-p{p}"
+            for d in range(n_days):
+                day_end = now - timedelta(days=d, minutes=3)
+                rows = shift_for_project(base_rows, pid, timedelta(0))
+                step = timedelta(hours=20) / len(rows)
+                for i, r in enumerate(rows):
+                    ts = day_end - step * i
+                    r["timestamp"] = ts.isoformat()
+                    r["date"] = ts.date().isoformat()
+                B = 700
+                for i in range(0, len(rows), B):
+                    batch = rows[i : i + B]
+                    flat = [_to_pg(col, r.get(col)) for r in batch for col in COLUMNS]
+                    cur.execute(base_sql + ", ".join([placeholders] * len(batch)), flat)
+                if p == 0 and d in (0, 1, 20):
+                    k = {0: "recent", 1: "day_old", 20: "deep"}[d]
+                    targets[k] = {"id": rows[10]["id"], "timestamp": rows[10]["timestamp"]}
+            print(f"  project {pid}: {n_days}d x {len(base_rows)} rows done ({time.perf_counter()-t0:.0f}s)")
+    STATE.write_text(json.dumps({"project_id": "qlat-scale-p0", "targets": [targets.get("day_old", targets["recent"])], "targets_by_age": targets}))
+    print(f"seed_scale done in {time.perf_counter()-t0:.0f}s → {STATE}")
+
+
+def run_ages(n_iter=8):
+    """Random access at several partition ages — exposes cold/stale costs."""
+    st = json.loads(STATE.read_text())
+    pid = st["project_id"]
+    with psycopg.connect(URL, autocommit=True) as c, c.cursor() as cur:
+        for age, tgt in st.get("targets_by_age", {}).items():
+            ts = datetime.fromisoformat(tgt["timestamp"])
+            lo, hi = ts - timedelta(seconds=1), ts + timedelta(seconds=1)
+            times = []
+            for _ in range(n_iter):
+                t = time.perf_counter()
+                cur.execute(Q_RANDOM, (lo, hi, pid, tgt["id"]))
+                rows = cur.fetchall()
+                times.append((time.perf_counter() - t) * 1000)
+            ts_str = " ".join(f"{x:.0f}" for x in times)
+            print(f"random_access[{age:>7}] rows={len(rows)} ms: {ts_str}")
+
+
 def queries():
     st = json.loads(STATE.read_text())
     pid = st["project_id"]
     since = datetime.now(timezone.utc) - timedelta(hours=WINDOW_H + 1)
-    tgt = st["targets"][1]
+    tgt = st["targets"][-1]
     ts = datetime.fromisoformat(tgt["timestamp"])
     lo, hi = ts - timedelta(seconds=1), ts + timedelta(seconds=1)
     return [
@@ -116,19 +170,28 @@ def run(n_iter=15):
         p95 = times_w[int(len(times_w) * 0.95) - 1]
         print(f"{name:<24} {p50:8.1f} {p95:8.1f} {times_w[0]:8.1f} {times_w[-1]:8.1f}")
 
-    # Same but on a single reused connection (separates conn setup from query cost)
+    # Same but on a single reused connection (separates conn setup from query cost).
+    # plan-only = `EXPLAIN <sql>` wall time: parse + logical plan + analyzers +
+    # optimizers + physical plan, no execution. exec ≈ full − plan-only.
     print("\n-- reused connection --")
+    print(f"{'query':<24} {'p50':>8} {'max':>8} {'plan-only p50':>14}")
     with psycopg.connect(URL, autocommit=True) as c, c.cursor() as cur:
         for name, sql, params in qs:
-            times = []
+            times, plan_times = [], []
             for i in range(n_iter):
                 t = time.perf_counter()
                 cur.execute(sql, params or None)
                 cur.fetchall()
                 times.append((time.perf_counter() - t) * 1000)
+                if name != "simple_select_1":
+                    t = time.perf_counter()
+                    cur.execute("EXPLAIN " + sql, params or None)
+                    cur.fetchall()
+                    plan_times.append((time.perf_counter() - t) * 1000)
             times_w = sorted(times[2:])
             p50 = statistics.median(times_w)
-            print(f"{name:<24} {p50:8.1f} {times_w[-1]:8.1f}(max)")
+            plan_p50 = statistics.median(sorted(plan_times[2:])) if len(plan_times) > 4 else 0.0
+            print(f"{name:<24} {p50:8.1f} {times_w[-1]:8.1f} {plan_p50:14.1f}")
 
 
 def explain():
@@ -149,4 +212,4 @@ def explain():
 
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
-    {"seed": seed, "run": run, "explain": explain}[cmd]()
+    {"seed": seed, "seed_scale": seed_scale, "run": run, "run_ages": run_ages, "explain": explain}[cmd]()

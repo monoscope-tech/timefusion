@@ -137,6 +137,8 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db = db.start_maintenance_schedulers().await?;
     let db = Arc::new(db);
     db.setup_session_tables(&mut session_context)?;
+    // Non-blocking: snapshot load + footer warm-up off the first query's path.
+    db.preload_tables();
 
     Ok(Bootstrapped {
         db,
