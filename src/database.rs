@@ -3204,6 +3204,16 @@ impl Database {
                     let (s, e) = (start.format("%Y-%m-%d %H:%M:%S"), end.format("%Y-%m-%d %H:%M:%S"));
                     Some((
                         format!("{filter} AND \"timestamp\" >= TIMESTAMP '{s}' AND \"timestamp\" < TIMESTAMP '{e}'"),
+                        // Bare-string timestamp bounds: delta-rs can't stringify
+                        // typed TIMESTAMP/CAST literals into the commit's predicate
+                        // ("Unable to convert expression to string"), so this is the
+                        // only commit-able form. Trade-off: when a concurrent commit
+                        // lands mid-write, the OCC checker re-evaluates this with
+                        // delta-kernel's engine and errors on the string→timestamp
+                        // coercion ("arrow_cast should have been simplified") — the
+                        // widened is_conflict below turns that into a rebase+retry,
+                        // and a rebased attempt with no newer commits skips the
+                        // checker entirely.
                         format!("project_id = '{safe_pid}' AND date = '{date_str}' AND timestamp >= '{s}' AND timestamp < '{e}'"),
                     ))
                 })
@@ -3290,7 +3300,12 @@ impl Database {
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        let is_conflict = msg.contains("concurrent transaction") || msg.contains("Commit failed");
+                        // "Transaction failed" covers the conflict checker erroring
+                        // while evaluating our predicate against a concurrent commit
+                        // (seen in prod as "Failed to commit transaction: Error
+                        // evaluating predicate") — rebasing on retry resolves it.
+                        let is_conflict =
+                            msg.contains("concurrent transaction") || msg.contains("Commit failed") || msg.contains("Transaction failed");
                         if !is_conflict || attempt + 1 == MAX_RETRIES {
                             return Err(anyhow::anyhow!("dedup_partition write failed: {}", e));
                         }
