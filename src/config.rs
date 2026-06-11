@@ -732,6 +732,9 @@ pub struct TelemetryConfig {
     pub otel_service_version:        String,
     #[serde(default)]
     pub log_format:                  Option<String>,
+    /// Standard OTel var; `none` disables span export (logs/metrics unaffected).
+    #[serde(default)]
+    pub otel_traces_exporter:        Option<String>,
 }
 
 impl TelemetryConfig {

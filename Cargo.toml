@@ -60,8 +60,9 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing = "0.1.44"
 tracing-opentelemetry = "0.32"
 opentelemetry = "0.31"
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics"] }
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics", "logs"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics", "logs"] }
+opentelemetry-appender-tracing = "0.31"
 datafusion-tracing = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git", rev = "8c28322f" }
 instrumented-object-store = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git", rev = "8c28322f" }
 dotenv = "0.15.0"
