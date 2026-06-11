@@ -310,15 +310,12 @@ pub struct AwsConfig {
     #[serde(default)]
     pub aws_allow_http:                Option<String>,
     /// TCP/TLS connection-establishment bound passed to the object_store S3
-    /// client (humantime format, e.g. "3s", "10s"). See
-    /// `build_storage_options` for why the default is tighter than
+    /// client (humantime format, e.g. "3s", "10s"). `Option` so the derived
+    /// `AwsConfig::default()` stays valid (an empty string wouldn't parse);
+    /// see `build_storage_options` for why the default is tighter than
     /// object_store's 5 s.
-    #[serde(default = "d_s3_connect_timeout")]
-    pub timefusion_s3_connect_timeout: String,
-}
-
-fn d_s3_connect_timeout() -> String {
-    "3s".to_string()
+    #[serde(default)]
+    pub timefusion_s3_connect_timeout: Option<String>,
 }
 
 impl AwsConfig {
@@ -343,7 +340,10 @@ impl AwsConfig {
         // Total request timeout stays at the default 30 s so large flush
         // PUTs aren't cut off. Tunable via TIMEFUSION_S3_CONNECT_TIMEOUT for
         // environments where 3 s is too tight (slow proxies, cross-region).
-        opts.insert("connect_timeout".into(), self.timefusion_s3_connect_timeout.clone());
+        opts.insert(
+            "connect_timeout".into(),
+            self.timefusion_s3_connect_timeout.clone().unwrap_or_else(|| "3s".into()),
+        );
         opts
     }
 }

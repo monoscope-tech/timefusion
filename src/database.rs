@@ -2211,12 +2211,12 @@ impl Database {
         });
     }
 
-    /// Resolve every registry table and warm parquet footers (every live
-    /// file by default; recency-bounded when `timefusion_warm_all_footers`
-    /// is off) in the
-    /// background, so the first query after a deploy doesn't pay Delta log
-    /// replay + parquet footer reads inline (measured 1.4 s cold vs 13 ms
-    /// warm against OVH S3 for a single-partition random-access lookup).
+    /// Resolve every registry table and warm parquet footers in the
+    /// background (ALL live files by default; recency-bounded when
+    /// `TIMEFUSION_WARM_ALL_FOOTERS=false` — see warm_cache_for_uris), so the
+    /// first query after a deploy doesn't pay Delta log replay + parquet
+    /// footer reads inline (measured 1.4 s cold vs 13 ms warm against OVH S3
+    /// for a single-partition random-access lookup).
     pub fn preload_tables(self: &Arc<Self>) {
         // Idempotent: main.rs and bootstrap.rs are disjoint entry points, but
         // a second call must not double the boot-time S3 warm burst.
@@ -2226,16 +2226,17 @@ impl Database {
             return;
         }
         // Tables preload concurrently — a slow object-store round-trip on one
-        // must not delay the others' first-query readiness. Per-file warm
-        // concurrency inside warm_cache_for_uris is already bounded, so the
-        // fan-out here is one in-flight snapshot load per registered table —
-        // fine while the registry stays small (a handful of YAML schemas);
-        // bound this with a semaphore if it ever grows to dozens.
-        for table_name in crate::schema_loader::registry().list_tables() {
-            let db = Arc::clone(self);
-            let shutdown = self.maintenance_shutdown.clone();
-            tokio::spawn(async move {
-                let preload = async {
+        // must not delay the others' first-query readiness — but the fan-out
+        // is capped at the same bound as per-file warming: each table preload
+        // is a Delta log replay (object-store round-trips), so an unbounded
+        // spawn-per-table would spike S3 at boot as the registry grows.
+        let db = Arc::clone(self);
+        let shutdown = self.maintenance_shutdown.clone();
+        let concurrency = self.config.maintenance.timefusion_warm_concurrency.max(1);
+        tokio::spawn(async move {
+            let preload_all = futures::stream::iter(crate::schema_loader::registry().list_tables()).for_each_concurrent(concurrency, |table_name| {
+                let db = Arc::clone(&db);
+                async move {
                     let t = std::time::Instant::now();
                     match db.resolve_table("default", &table_name).await {
                         Ok(table_ref) => {
@@ -2255,15 +2256,15 @@ impl Database {
                         }
                         Err(e) => warn!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                     }
-                };
-                // Abandon warming on shutdown so in-flight S3 calls can't slow
-                // a fast restart during initial boot.
-                tokio::select! {
-                    _ = shutdown.cancelled() => {}
-                    _ = preload => {}
                 }
             });
-        }
+            // Abandon warming on shutdown so in-flight S3 calls can't slow
+            // a fast restart during initial boot.
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = preload_all => {}
+            }
+        });
     }
 
     /// Atomically swap a freshly-optimized `new_table` in under the write lock,

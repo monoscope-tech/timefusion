@@ -324,7 +324,11 @@ mod tests {
     #[tokio::test]
     async fn coalesce_string_column_with_list_errors() {
         let ctx = ctx_with_rule();
-        let err = expect_plan_error(&ctx, "SELECT COALESCE(v, l) FROM (SELECT CAST('x' AS VARCHAR) AS v, CAST(NULL AS VARCHAR[]) AS l)").await;
+        let err = expect_plan_error(
+            &ctx,
+            "SELECT COALESCE(v, l) FROM (SELECT CAST('x' AS VARCHAR) AS v, CAST(NULL AS VARCHAR[]) AS l)",
+        )
+        .await;
         assert!(err.contains("cannot be matched"), "{err}");
     }
 
@@ -347,7 +351,11 @@ mod tests {
                 logical_plan::builder::{LogicalPlanBuilder, LogicalTableSource},
             },
         };
-        let schema = Schema::new(vec![Field::new("hashes", DataType::List(Field::new("item", DataType::Utf8, true).into()), true)]);
+        let schema = Schema::new(vec![Field::new(
+            "hashes",
+            DataType::List(Field::new("item", DataType::Utf8, true).into()),
+            true,
+        )]);
         let coalesce = Expr::ScalarFunction(ScalarFunction::new_udf(datafusion::functions::core::coalesce(), vec![col("hashes"), lit("{}")]));
         let scan = LogicalPlanBuilder::scan_with_filters("t", Arc::new(LogicalTableSource::new(schema.into())), None, vec![coalesce.eq(col("hashes"))])
             .unwrap()
@@ -356,7 +364,9 @@ mod tests {
         let analyzed = PgArrayLiteralRewriter.analyze(scan, &ConfigOptions::default()).unwrap();
         let LogicalPlan::TableScan(ts) = analyzed else { panic!("expected TableScan") };
         let Expr::BinaryExpr(be) = &ts.filters[0] else { panic!("expected eq filter") };
-        let Expr::ScalarFunction(f) = be.left.as_ref() else { panic!("expected coalesce") };
+        let Expr::ScalarFunction(f) = be.left.as_ref() else {
+            panic!("expected coalesce")
+        };
         assert!(
             matches!(f.args[1], Expr::Literal(ScalarValue::List(_), _)),
             "array literal in TableScan filter not rewritten: {:?}",

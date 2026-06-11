@@ -10,16 +10,14 @@ use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
 use serial_test::serial;
 use timefusion::{
     database::Database,
-    test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span_ts},
+    test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span_ts, walrus_env_guard},
 };
 
 #[serial]
 #[tokio::test]
 async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     let cfg = TestConfigBuilder::new("dedup_compaction").with_buffer_mode(BufferMode::Enabled).build();
-    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from process env. `#[serial]`
-    // serializes the suite; this set is racy in principle but safe here.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -78,9 +76,7 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
 #[tokio::test]
 async fn optimize_preserves_all_partition_values() -> Result<()> {
     let cfg = TestConfigBuilder::new("optimize_partition_preserve").with_buffer_mode(BufferMode::Enabled).build();
-    // SAFETY: `set_var` is racy if another thread reads the env concurrently;
-    // `#[serial]` serialises this suite so no other test races the variable.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 

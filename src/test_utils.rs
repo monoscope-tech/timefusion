@@ -62,6 +62,19 @@ pub mod test_helpers {
         }
     }
 
+    /// Point walrus-rust at the test's data dir, restoring the prior value on
+    /// drop — including on panic, so a failed `#[serial]` test can't leak the
+    /// var into the next one. SAFETY: `set_var` is racy if another thread
+    /// reads the env concurrently; callers must hold `#[serial]`.
+    pub fn walrus_env_guard(dir: &std::path::Path) -> impl Drop {
+        let prev = std::env::var_os("WALRUS_DATA_DIR");
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", dir) };
+        scopeguard::guard(prev, |prev| match prev {
+            Some(v) => unsafe { std::env::set_var("WALRUS_DATA_DIR", v) },
+            None => unsafe { std::env::remove_var("WALRUS_DATA_DIR") },
+        })
+    }
+
     /// Build a BufferedWriteLayer for tests/benches without repeating the registry boilerplate.
     pub fn test_layer(cfg: Arc<AppConfig>) -> anyhow::Result<crate::buffered_write_layer::BufferedWriteLayer> {
         crate::buffered_write_layer::BufferedWriteLayer::with_config(cfg, crate::functions::function_registry()?)

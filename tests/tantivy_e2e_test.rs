@@ -164,9 +164,16 @@ async fn wait_for_manifest_entries(store: &dyn object_store::ObjectStore, projec
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         let m = timefusion::tantivy_index::manifest::load(store, TABLE, project).await?;
-        if m.entries.len() >= want || std::time::Instant::now() > deadline {
+        if m.entries.len() >= want {
             return Ok(m);
         }
+        // Err (not the short manifest) on expiry — the caller's assert would
+        // otherwise fire with a confusing entry-count mismatch.
+        anyhow::ensure!(
+            std::time::Instant::now() <= deadline,
+            "manifest for {project} stuck at {} entries after 30s, want {want}",
+            m.entries.len()
+        );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
