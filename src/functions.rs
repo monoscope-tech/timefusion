@@ -930,14 +930,14 @@ fn create_json_build_array_udf() -> ScalarUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonBuildArrayUDF {
     signature: Signature,
-    aliases: Vec<String>,
+    aliases:   Vec<String>,
 }
 
 impl JsonBuildArrayUDF {
     fn new() -> Self {
         Self {
             signature: Signature::variadic_any(Volatility::Immutable),
-            aliases: vec![],
+            aliases:   vec![],
         }
     }
 }
@@ -1004,14 +1004,14 @@ fn create_to_json_udf() -> ScalarUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ToJsonUDF {
     signature: Signature,
-    aliases: Vec<String>,
+    aliases:   Vec<String>,
 }
 
 impl ToJsonUDF {
     fn new() -> Self {
         Self {
             signature: Signature::any(1, Volatility::Immutable),
-            aliases: vec![],
+            aliases:   vec![],
         }
     }
 }
