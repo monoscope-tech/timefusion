@@ -89,10 +89,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 // commit, derived from the post-write snapshot under the same write
                 // lock — no second log scan. Watermark goes into Delta commit metadata
                 // for crash-mid-flush recovery.
+                // insert_records_batch warms the just-flushed files itself
+                // (watermark-gated) — no warm here, or every flush would issue
+                // the warm GETs twice.
                 let added = db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await?;
-                // Warm the just-flushed files into the cache so the first
-                // dashboard read of this partition hits Foyer, not S3.
-                db.warm_cache_for_table(&project_id, &table_name, added.clone());
                 if !added.is_empty() {
                     db.mark_delta_has_files(&project_id, &table_name);
                 }
@@ -237,6 +237,8 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     db = db.start_maintenance_schedulers().await?;
     let db = Arc::new(db);
     db.setup_session_tables(&mut session_context)?;
+    // Non-blocking: snapshot load + footer warm-up off the first query's path.
+    db.preload_tables();
 
     // Start PGWire server on the listener we pre-bound at the top of
     // async_main. First, hand control of that listener back from the

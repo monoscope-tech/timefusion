@@ -10,16 +10,14 @@ use datafusion::arrow::{array::AsArray, datatypes::Int64Type};
 use serial_test::serial;
 use timefusion::{
     database::Database,
-    test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span_ts},
+    test_utils::test_helpers::{BufferMode, TestConfigBuilder, json_to_batch, test_span_ts, walrus_env_guard},
 };
 
 #[serial]
 #[tokio::test]
 async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     let cfg = TestConfigBuilder::new("dedup_compaction").with_buffer_mode(BufferMode::Enabled).build();
-    // SAFETY: walrus-rust reads WALRUS_DATA_DIR from process env. `#[serial]`
-    // serializes the suite; this set is racy in principle but safe here.
-    unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
@@ -65,5 +63,54 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     let post_count = post[0].column(0).as_primitive::<Int64Type>().value(0);
     assert_eq!(post_count, 1, "post-dedup: duplicate should be collapsed to a single row");
 
+    Ok(())
+}
+
+/// Regression: light OPTIMIZE (bin-pack compact) must preserve ALL partition
+/// values on rewritten files. The kernel narrows `partitionValues_parsed` to
+/// the predicate-referenced subset (data skipping), and optimize used that
+/// narrowed map for grouping/output — so a `date = today` filter rewrote
+/// files as partitionValues={date}, silently NULLing project_id and hiding
+/// every compacted row from project-scoped queries.
+#[serial]
+#[tokio::test]
+async fn optimize_preserves_all_partition_values() -> Result<()> {
+    let cfg = TestConfigBuilder::new("optimize_partition_preserve").with_buffer_mode(BufferMode::Enabled).build();
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let ts = chrono::Utc::now().timestamp_micros();
+    // Distinct ids → no dedup interplay; 6 separate commits → 6 small files
+    // (>= timefusion_compact_min_files=5 so the optimize commit isn't skipped).
+    for i in 0..6 {
+        let batch = json_to_batch(vec![test_span_ts(&format!("opt_id_{i}"), "row", &project_id, ts + i)])?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+    }
+
+    let count_sql = format!("SELECT COUNT(*) AS cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
+    let pre = db.query_delta_only(&count_sql).await?;
+    assert_eq!(pre[0].column(0).as_primitive::<Int64Type>().value(0), 6, "pre-optimize row count");
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    db.optimize_table_light(&table_ref, "otel_logs_and_spans").await?;
+
+    // Compacted files must keep the full (project_id, date) partition path…
+    let date_str = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
+    let bad: Vec<String> = table_ref
+        .read()
+        .await
+        .get_file_uris()?
+        .filter(|u| u.contains(&format!("/date={date_str}")) && !u.contains("project_id="))
+        .collect();
+    assert!(bad.is_empty(), "optimize dropped project_id partition from: {bad:?}");
+
+    // …and project-scoped queries must still see every row.
+    let post = db.query_delta_only(&count_sql).await?;
+    assert_eq!(
+        post[0].column(0).as_primitive::<Int64Type>().value(0),
+        6,
+        "post-optimize: project-scoped count must be unchanged"
+    );
     Ok(())
 }

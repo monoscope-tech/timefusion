@@ -1,14 +1,22 @@
 name: Auto-format & Auto-fix
 
-# On every push to master, run `cargo fmt` and `cargo clippy --fix`, then
-# commit any changes back to master. Skips itself on bot-authored commits to
-# avoid infinite loops, and on PR merges that are already CI-clean.
+# On every push (master AND PR branches), run `cargo fmt` and
+# `cargo clippy --fix`, then commit any changes back to the same branch.
+# Skips itself on bot-authored commits to avoid infinite loops, and on
+# commits that are already CI-clean. Forked-repo PRs aren't covered — the
+# default token can't push to forks.
 on:
   push:
-    branches: [master]
+    branches: ['**']
 
 permissions:
   contents: write
+
+# One run per branch at a time; a fix-commit superseding the triggering push
+# cancels the now-stale run instead of racing it.
+concurrency:
+  group: autofix-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   autofix:
@@ -69,4 +77,4 @@ jobs:
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add -A
           git commit -m "chore(autofmt): apply cargo fmt + clippy --fix [skip autofmt]"
-          git push origin HEAD:master
+          git push origin "HEAD:${{ github.ref_name }}"

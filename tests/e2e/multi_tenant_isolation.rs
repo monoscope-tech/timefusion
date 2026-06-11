@@ -3,6 +3,7 @@
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn project_id_filter_isolates_tenants() -> anyhow::Result<()> {
     let env = E2eEnv::builder().start().await?;

@@ -147,3 +147,40 @@ FROM otel_logs_and_spans
 WHERE project_id = 'error_test' AND id = 'duration_test2'
 ----
 -1 true
+
+# PG array-literal compat: monoscope's lookupOtelRecord sends
+# COALESCE(hashes, '{}') / COALESCE(summary, '{}') where '{}' is a Postgres
+# array literal. DataFusion's stock coercion can't unify List(Utf8View) with
+# Utf8, so this errored at planning and broke random-access lookups.
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, level, summary
+) VALUES (
+    'error_test', TIMESTAMP '2023-01-01T10:00:00Z', 'pg_array_lit_test', ARRAY['h1']::VARCHAR[], DATE '2023-01-01',
+    'test_pg_array_literal', 'INFO', ARRAY['row with hashes - INFO level']
+)
+
+query I
+SELECT ARRAY_LENGTH(COALESCE(hashes, '{}'))
+FROM otel_logs_and_spans
+WHERE project_id = 'error_test' AND id = 'pg_array_lit_test'
+----
+1
+
+# NULL list column coalesces to the empty array parsed from '{}'
+query I
+SELECT ARRAY_LENGTH(COALESCE(parent_id_list_does_not_exist, '{}')) FROM (
+    SELECT CAST(NULL AS VARCHAR[]) AS parent_id_list_does_not_exist
+    FROM otel_logs_and_spans
+    WHERE project_id = 'error_test' AND id = 'pg_array_lit_test'
+)
+----
+0
+
+# Non-empty PG array literal parses element-wise
+query T
+SELECT COALESCE(CAST(NULL AS VARCHAR[]), '{a,b}')[1] FROM otel_logs_and_spans
+WHERE project_id = 'error_test' AND id = 'pg_array_lit_test'
+----
+a

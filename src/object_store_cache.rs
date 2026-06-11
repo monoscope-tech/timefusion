@@ -22,7 +22,7 @@ use tokio::{
     sync::{Mutex, RwLock},
     task::JoinSet,
 };
-use tracing::{Instrument, debug, field::Empty, info, instrument};
+use tracing::{Instrument, debug, field::Empty, info, instrument, warn};
 
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +296,15 @@ impl SharedFoyerCache {
             config.metadata_disk_size_bytes / 1024 / 1024 / 1024,
             config.ttl.as_secs()
         );
+        // A sub-5-minute TTL is almost certainly a debug leftover (a real one
+        // shipped in .env once): every idle partition re-cold-starts after
+        // expiry, silently erasing the entire warm-path win.
+        if config.ttl < std::time::Duration::from_secs(300) {
+            warn!(
+                "Foyer TTL is only {}s — cached footers expire between queries; set TIMEFUSION_FOYER_TTL_SECONDS higher unless debugging",
+                config.ttl.as_secs()
+            );
+        }
 
         std::fs::create_dir_all(&config.cache_dir)?;
         let metadata_cache_dir = config.cache_dir.join("metadata");
@@ -913,6 +922,46 @@ impl FoyerObjectStoreCache {
             let file_size = file_meta.size;
             let metadata_size_hint = self.config.parquet_metadata_size_hint as u64;
 
+            // Containment probe against the two ranges `warm_footer` can have
+            // populated: the suffix tail (size-hint..size) and — for files
+            // smaller than the hint — the whole file (0..size). The reader's
+            // own footer reads (8-byte tail, then the parsed metadata range)
+            // never equal those keys exactly, so the exact-key probe above
+            // misses and a pre-warmed cold partition still paid 1-2 S3 RTTs
+            // of metadata latency (300 ms+ observed against OVH).
+            let warm_start = file_size.saturating_sub(metadata_size_hint);
+            // When warm_start == 0 the two candidate ranges coincide; probe once.
+            // candidate=0 also means files smaller than the hint are fully
+            // cached here by warm_footer — any in-bounds read (including data
+            // pages) is intentionally served from the metadata cache.
+            // Probe the suffix key first: for files larger than the hint only
+            // (warm_start..size) exists, so leading with it saves an always-miss
+            // (0..size) lookup on the common footer-read path.
+            let candidates: &[u64] = if warm_start == 0 { &[0] } else { &[warm_start, 0] };
+            for &candidate in candidates {
+                if candidate <= range.start && range.end <= file_size {
+                    let key = Self::make_range_cache_key(location, &(candidate..file_size));
+                    if let Ok(Some(entry)) = self.metadata_cache.get(&key).await {
+                        let value = entry.value();
+                        let (s, e) = ((range.start - candidate) as usize, (range.end - candidate) as usize);
+                        if !value.is_expired(self.config.ttl) && e <= value.data.len() {
+                            self.update_metadata_stats(|st| st.hits += 1).await;
+                            span.record("cache_hit", true);
+                            span.record("is_metadata", true);
+                            // Distinct from the exact-key HIT log above so cache-key
+                            // alignment is diagnosable on a new deployment.
+                            debug!(
+                                "Metadata cache HIT (containment {}..{}) for: {} (range: {}..{})",
+                                candidate, file_size, location, range.start, range.end
+                            );
+                            let sliced = Bytes::copy_from_slice(&value.data[s..e]);
+                            self.maybe_touch(&self.metadata_cache, &key, entry.clone(), 0);
+                            return Ok(sliced);
+                        }
+                    }
+                }
+            }
+
             // Check if this is likely a metadata request (reading from near the end of the file)
             let is_metadata_request = range.start >= file_size.saturating_sub(metadata_size_hint);
             span.record("is_metadata", is_metadata_request);
@@ -1429,6 +1478,39 @@ mod tests {
     use object_store::{ObjectStoreExt, memory::InMemory};
 
     use super::*;
+
+    // Locks in the containment-probe slice math in get_range_cached: a strict
+    // sub-range of the warmed (size-hint..size) footer never equals the warm
+    // key, so only the containment probe can serve it without an inner fetch.
+    #[tokio::test]
+    async fn containment_probe_serves_subrange_of_warmed_footer() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        // The probe computes its candidate key from the CONFIG's size hint, so
+        // the warm call below must use the same value (as prod does — both
+        // read config.cache.timefusion_parquet_metadata_size_hint).
+        let hint = 1024u64;
+        let cfg = FoyerCacheConfig::test_config_with("containment_probe", |c| c.parquet_metadata_size_hint = hint as usize);
+        let cache = FoyerObjectStoreCache::new(inner.clone(), cfg).await?;
+        let path = Path::from("tbl/date=2026-01-01/part.parquet");
+        let data = Bytes::from((0..4096u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        // Put via the inner store so nothing is cached from a write payload.
+        inner.put(&path, PutPayload::from(data.clone())).await?;
+
+        // file (4096B) > hint → warm key is (3072..4096)
+        assert!(warm_footer(&cache, &path, hint).await, "footer warm must succeed");
+
+        let before = cache.get_stats().await;
+        let r = 3100u64..3500u64;
+        let got = cache.get_range(&path, r.clone()).await?;
+        assert_eq!(got, data.slice(r.start as usize..r.end as usize), "containment slice math");
+
+        let after = cache.get_stats().await;
+        assert_eq!(after.metadata.hits, before.metadata.hits + 1, "served by the containment probe");
+        assert_eq!(after.metadata.inner_gets, before.metadata.inner_gets, "no inner fetch after warm");
+
+        cache.shutdown().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_basic_operations() -> anyhow::Result<()> {
