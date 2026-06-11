@@ -249,11 +249,7 @@ pub(crate) async fn ensure_deleted_file_retention(table: DeltaTable, retention_h
     if current.as_deref() == Some(desired.as_str()) {
         return table;
     }
-    match deltalake::DeltaOps(table.clone())
-        .set_tbl_properties()
-        .with_properties(HashMap::from([(KEY.to_string(), desired.clone())]))
-        .await
-    {
+    match table.clone().set_tbl_properties().with_properties(HashMap::from([(KEY.to_string(), desired.clone())])).await {
         Ok(updated) => {
             info!("Set {KEY}={desired} (was {current:?}) — bounds Remove tombstones kept in checkpoints");
             updated
@@ -2195,6 +2191,14 @@ impl Database {
         // is about to issue against S3 (the completion log alone can't —
         // a large warm set takes minutes to get there).
         info!("Cache warm start: {count} files (scope={scope}, concurrency={concurrency})");
+        let t0 = std::time::Instant::now();
+        // Progress heartbeat: a 10k-file boot warm runs minutes; without one
+        // operators can't tell warming from a hang. The {count} denominator
+        // is the selected warm set (footer warms); full-file warming covers
+        // only the `recent` subset of it.
+        const WARM_PROGRESS_INTERVAL: usize = 500;
+        let done = std::sync::atomic::AtomicUsize::new(0);
+        let done = &done;
         futures::stream::iter(paths)
             .for_each_concurrent(concurrency, |(path, recent)| {
                 let store = object_store.clone();
@@ -2203,16 +2207,23 @@ impl Database {
                     if warm_full_files && recent {
                         let _ = crate::object_store_cache::warm_full(store.as_ref(), &path).await;
                     }
+                    let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n.is_multiple_of(WARM_PROGRESS_INTERVAL) {
+                        // Elapsed on the heartbeat lets operators extrapolate
+                        // time-remaining without waiting for completion.
+                        info!("Cache warm progress: {n}/{count} files ({:.1}s elapsed)", t0.elapsed().as_secs_f64());
+                    }
                 }
             })
             .await;
 
+        let elapsed_s = t0.elapsed().as_secs_f64();
         match baseline {
             Some(rate) => info!(
-                "Cache warm complete: {} files warmed (scope={}); foyer main hit rate before warm was {:.2}% (next query benefits)",
-                count, scope, rate
+                "Cache warm complete: {} files warmed (scope={}) in {:.1}s; foyer main hit rate before warm was {:.2}% (next query benefits)",
+                count, scope, elapsed_s, rate
             ),
-            None => info!("Cache warm complete: {} files warmed (scope={})", count, scope),
+            None => info!("Cache warm complete: {} files warmed (scope={}) in {:.1}s", count, scope, elapsed_s),
         }
     }
 
@@ -4868,7 +4879,7 @@ mod tests {
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///convoy_tbl")?;
         let fast = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
-        let table = deltalake::DeltaOps(fast).create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        let table = fast.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
         assert_eq!(table.version(), Some(0));
 
         // Same store, but every list/get pays a delay — makes update_state
@@ -4922,7 +4933,7 @@ mod tests {
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///retention_tbl")?;
         let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem, url).build()?;
-        let table = deltalake::DeltaOps(t).create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        let table = t.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
         assert!(
             !table.snapshot()?.metadata().configuration().contains_key(KEY),
             "fresh table has no retention property"
