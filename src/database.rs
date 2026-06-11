@@ -3133,93 +3133,161 @@ impl Database {
         // not row width. It also stops the every-5-min whole-partition
         // replace_where rewrite, the main Remove-tombstone factory.
         let keys_csv = schema.dedup_keys.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(", ");
-        let probe =
-            format!("SELECT coalesce(sum(c - 1), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS dup_groups WHERE c > 1");
-        let probe_batches = ctx.sql(&probe).await?.collect().await?;
-        let dup_rows = probe_batches
-            .first()
-            .filter(|b| b.num_rows() > 0)
-            .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0)))
-            .unwrap_or(0);
-        if dup_rows <= 0 {
-            return Ok(0);
-        }
 
-        let select = format!("SELECT * FROM {scan_name} WHERE {filter}");
-        let batches = ctx.sql(&select).await?.collect().await?;
-        let before: usize = batches.iter().map(|b| b.num_rows()).sum();
-        if before == 0 {
-            return Ok(0);
-        }
-        let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys)?;
-        let after: usize = deduped.iter().map(|b| b.num_rows()).sum();
-        if before == after {
-            return Ok(0);
-        }
-        let dropped = (before - after) as u64;
-
-        // Variant struct columns may still be BinaryView if the partition mixes
-        // tiers — cast to Binary so the delta-kernel write accepts the schema.
-        let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
-        let predicate = format!("project_id = '{}' AND date = '{}'", safe_pid, date_str);
-
-        // OCC retry — same shape as optimize_table_light_inner. Best-effort;
-        // exhaustion bubbles up as Err (the caller in `dedup_today_partitions`
-        // logs and continues), so the partition only retries when the next
-        // scheduler tick sees a file-count change.
-        const MAX_RETRIES: usize = 4;
-        let mut last_err: Option<deltalake::DeltaTableError> = None;
-        for attempt in 0..MAX_RETRIES {
-            let table_clone = {
-                let table = table_ref.read().await;
-                table.clone()
-            };
-            let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-            let result = table_clone
-                .write(deduped.clone())
-                .with_partition_columns(schema.partitions.clone())
-                .with_writer_properties(writer_properties.clone())
-                .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
-                .with_replace_where(predicate.clone())
-                .await;
-            match result {
-                Ok(new_table) => {
-                    // Swap + warm-added/evict-removed exactly like the optimize
-                    // paths; a bare swap left the replace_where outputs stone-cold
-                    // (1.5 s first read observed against OVH) and the tombstoned
-                    // files' cache entries alive until TTL.
-                    self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
-                    crate::metrics::record_compaction_dedup_dropped(dropped);
-                    info!(
-                        "dedup compaction: table={} project={} date={} dropped={} (before={} after={})",
-                        table_name, project_id, date_str, dropped, before, after
-                    );
-                    return Ok(dropped);
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    let is_conflict = msg.contains("concurrent transaction") || msg.contains("Commit failed");
-                    if !is_conflict || attempt + 1 == MAX_RETRIES {
-                        return Err(anyhow::anyhow!("dedup_partition write failed: {}", e));
+        // Identify the hour buckets that actually contain duplicates. A dup
+        // group shares one exact `timestamp` (it's a dedup key), so chunking
+        // the rewrite by hour can never split a group — and it bounds the
+        // materialization below to one hour of one project instead of the
+        // whole day (the crash-loop backlog made EVERY project probe-positive,
+        // so the probe alone still ballooned tens of GB per sweep).
+        let chunks: Vec<(String, String)> = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
+            let probe = format!(
+                "SELECT CAST(date_trunc('hour', \"timestamp\") AS VARCHAR) FROM \
+                 (SELECT \"timestamp\", count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS g \
+                 WHERE c > 1 GROUP BY 1 ORDER BY 1"
+            );
+            let mut hours = Vec::new();
+            for batch in ctx.sql(&probe).await?.collect().await? {
+                let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
+                let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
+                for i in 0..col.len() {
+                    if !col.is_null(i) {
+                        hours.push(col.value(i).to_string());
                     }
-                    debug!(
-                        "dedup_partition OCC conflict (attempt {}/{}): table={} project={} date={}",
-                        attempt + 1,
-                        MAX_RETRIES,
-                        table_name,
-                        project_id,
-                        date_str
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_millis(150u64 << attempt)).await;
-                    last_err = Some(e);
                 }
             }
+            // Rewriting an hour that late data may still flush into races
+            // replace_where against the append (the stale materialized chunk
+            // would win and drop the fresh rows — same race the old
+            // whole-partition rewrite had for the entire day). The buffer
+            // holds up to ~70 min of data, so only hours sealed for 2h+ are
+            // rewritten; newer dupes clear on a later sweep.
+            let sealed_before = Utc::now().naive_utc() - chrono::Duration::hours(2);
+            hours
+                .into_iter()
+                .filter_map(|h| {
+                    // CAST .. AS VARCHAR may append fractional seconds or a
+                    // timezone suffix; the leading 19 chars are the datetime.
+                    let h19 = h.get(..19)?;
+                    let start = chrono::NaiveDateTime::parse_from_str(h19, "%Y-%m-%dT%H:%M:%S")
+                        .or_else(|_| chrono::NaiveDateTime::parse_from_str(h19, "%Y-%m-%d %H:%M:%S"))
+                        .ok()?;
+                    let end = start + chrono::Duration::hours(1);
+                    if end > sealed_before {
+                        debug!("dedup: skipping unsealed chunk starting {start} (cleared on a later sweep)");
+                        return None;
+                    }
+                    let (s, e) = (start.format("%Y-%m-%d %H:%M:%S"), end.format("%Y-%m-%d %H:%M:%S"));
+                    Some((
+                        format!("{filter} AND \"timestamp\" >= TIMESTAMP '{s}' AND \"timestamp\" < TIMESTAMP '{e}'"),
+                        format!("project_id = '{safe_pid}' AND date = '{date_str}' AND timestamp >= '{s}' AND timestamp < '{e}'"),
+                    ))
+                })
+                .collect()
+        } else {
+            // No timestamp dedup key → can't chunk safely; whole-partition
+            // rewrite, gated on the same any-dupes probe.
+            let probe = format!(
+                "SELECT coalesce(sum(c - 1), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS g WHERE c > 1"
+            );
+            let dup_rows = ctx
+                .sql(&probe)
+                .await?
+                .collect()
+                .await?
+                .first()
+                .filter(|b| b.num_rows() > 0)
+                .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0)))
+                .unwrap_or(0);
+            if dup_rows <= 0 { Vec::new() } else { vec![(filter.clone(), format!("project_id = '{safe_pid}' AND date = '{date_str}'"))] }
+        };
+        if chunks.is_empty() {
+            return Ok(0);
         }
-        Err(anyhow::anyhow!(
-            "dedup_partition exhausted retries: {}",
-            last_err.map(|e| e.to_string()).unwrap_or_default()
-        ))
+
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
+        let mut total_dropped = 0u64;
+        for (chunk_filter, predicate) in chunks {
+            let select = format!("SELECT * FROM {scan_name} WHERE {chunk_filter}");
+            let batches = ctx.sql(&select).await?.collect().await?;
+            let before: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if before == 0 {
+                continue;
+            }
+            let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys)?;
+            let after: usize = deduped.iter().map(|b| b.num_rows()).sum();
+            if before == after {
+                continue;
+            }
+            let dropped = (before - after) as u64;
+
+            // Variant struct columns may still be BinaryView if the partition mixes
+            // tiers — cast to Binary so the delta-kernel write accepts the schema.
+            let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
+
+            // OCC retry — same shape as optimize_table_light_inner. Best-effort;
+            // exhaustion bubbles up as Err (the caller in `dedup_today_partitions`
+            // logs and continues), so the partition only retries when the next
+            // scheduler tick sees a file-count change.
+            const MAX_RETRIES: usize = 4;
+            let mut last_err: Option<deltalake::DeltaTableError> = None;
+            let mut committed = false;
+            for attempt in 0..MAX_RETRIES {
+                let table_clone = {
+                    let table = table_ref.read().await;
+                    table.clone()
+                };
+                let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                let result = table_clone
+                    .write(deduped.clone())
+                    .with_partition_columns(schema.partitions.clone())
+                    .with_writer_properties(writer_properties.clone())
+                    .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
+                    .with_replace_where(predicate.clone())
+                    .await;
+                match result {
+                    Ok(new_table) => {
+                        // Swap + warm-added/evict-removed exactly like the optimize
+                        // paths; a bare swap left the replace_where outputs stone-cold
+                        // (1.5 s first read observed against OVH) and the tombstoned
+                        // files' cache entries alive until TTL.
+                        self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                        crate::metrics::record_compaction_dedup_dropped(dropped);
+                        info!(
+                            "dedup compaction: table={} project={} date={} chunk=[{}] dropped={} (before={} after={})",
+                            table_name, project_id, date_str, predicate, dropped, before, after
+                        );
+                        total_dropped += dropped;
+                        committed = true;
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        let is_conflict = msg.contains("concurrent transaction") || msg.contains("Commit failed");
+                        if !is_conflict || attempt + 1 == MAX_RETRIES {
+                            return Err(anyhow::anyhow!("dedup_partition write failed: {}", e));
+                        }
+                        debug!(
+                            "dedup_partition OCC conflict (attempt {}/{}): table={} project={} date={}",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            table_name,
+                            project_id,
+                            date_str
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(150u64 << attempt)).await;
+                        last_err = Some(e);
+                    }
+                }
+            }
+            if !committed {
+                return Err(anyhow::anyhow!(
+                    "dedup_partition exhausted retries: {}",
+                    last_err.map(|e| e.to_string()).unwrap_or_default()
+                ));
+            }
+        }
+        Ok(total_dropped)
     }
 
     /// Sweep every `(project_id, today)` partition in this table via
