@@ -4,6 +4,14 @@ on:
   push:
     branches: [ master ]
 
+# Serialize deploys and drop superseded runs: without this, concurrent master
+# pushes deploy in build-completion order, and a slower older build can
+# overwrite a newer one (2026-06-11: 037e1b9 overwrote e11ed65, re-deploying
+# the OOM-crashloop image mid-incident).
+concurrency:
+  group: deploy-master
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: blacksmith-4vcpu-ubuntu-2404
