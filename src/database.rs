@@ -213,6 +213,58 @@ fn should_refresh_table(current_version: Option<u64>, last_written_version: Opti
     }
 }
 
+/// Refresh `table`'s snapshot WITHOUT holding the write lock across
+/// `update_state()` — that's a full Delta log replay plus object-store IO
+/// (1s+ per refresh on prod's 40k-action log), and every query refreshes
+/// after a flush commit, so holding the write lock here convoyed all
+/// concurrent planning behind it (observed 50-110s stalls, 2026-06-11).
+/// Clone-update-swap instead: readers keep planning against the old snapshot
+/// while a clone refreshes; the write lock is held only for the swap. The
+/// swap is version-guarded because a concurrent committer (flush, optimize)
+/// may have advanced the shared handle past our clone — never regress it.
+/// Returns the shared handle's version after the refresh. Single choke-point
+/// for snapshot refreshes so the lock discipline can't drift between sites.
+pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>) -> std::result::Result<Option<u64>, deltalake::DeltaTableError> {
+    let mut fresh = table.read().await.clone();
+    fresh.update_state().await?;
+    let fresh_version = fresh.version();
+    let mut guard = table.write().await;
+    // Option<u64> ordering: None < Some(_), so an unloaded handle always swaps.
+    if fresh_version > guard.version() {
+        *guard = fresh;
+    }
+    Ok(guard.version())
+}
+
+/// Ensure `delta.deletedFileRetentionDuration` matches the configured vacuum
+/// retention. Existing tables predate this property and sat at delta's 7-day
+/// default: prod's unified checkpoint carried 38.5k Remove tombstones (93% of
+/// its 41.8k actions, 23.6MB) that every snapshot load and refresh replayed.
+/// Idempotent (no commit when already set) and best-effort — a failed
+/// property commit must never block table load.
+pub(crate) async fn ensure_deleted_file_retention(table: DeltaTable, retention_hours: u64) -> DeltaTable {
+    const KEY: &str = "delta.deletedFileRetentionDuration";
+    let desired = format!("interval {retention_hours} hours");
+    let current = table.snapshot().ok().and_then(|s| s.metadata().configuration().get(KEY).cloned());
+    if current.as_deref() == Some(desired.as_str()) {
+        return table;
+    }
+    match deltalake::DeltaOps(table.clone())
+        .set_tbl_properties()
+        .with_properties(HashMap::from([(KEY.to_string(), desired.clone())]))
+        .await
+    {
+        Ok(updated) => {
+            info!("Set {KEY}={desired} (was {current:?}) — bounds Remove tombstones kept in checkpoints");
+            updated
+        }
+        Err(e) => {
+            warn!("Failed to set {KEY}={desired}: {e}; checkpoints keep tombstones at the current setting ({current:?})");
+            table
+        }
+    }
+}
+
 /// Whether `uri` belongs to a partition no older than `cutoff` (inclusive).
 /// Parses the `date=YYYY-MM-DD` Hive partition segment; if absent or
 /// unparseable, returns `true` (warm rather than silently skip a file we can't
@@ -243,9 +295,13 @@ fn relativize_to_prefix(prefix: &str, uri: &str) -> Option<object_store::path::P
 /// `(path, recent)` pairs: footers warm for every returned file; full-file
 /// warming additionally requires `recent`. With `warm_all_footers` (default)
 /// non-recent files are kept (recent=false → footer-only); without it they
-/// are dropped entirely. Ordered oldest date-partition first so the newest
-/// land last in LRU order (ISO dates sort lexically; undated files first).
-/// Returns the count of URIs that failed to relativize for the caller to log.
+/// are dropped entirely. Ordered NEWEST date-partition first: dashboards
+/// query recent partitions, and prod showed a boot-time warm can be cut
+/// short (slow object store, restart) — oldest-first left exactly those
+/// partitions cold. The old LRU argument for oldest-first only matters when
+/// the warm set exceeds the metadata cache (3k footers ≈ 200MB vs 5GB disk —
+/// nowhere close). Undated files sort last. Returns the count of URIs that
+/// failed to relativize for the caller to log.
 fn select_warm_paths(
     uris: Vec<String>, prefix: &str, warm_all_footers: bool, cutoff: Option<chrono::NaiveDate>,
 ) -> (Vec<(object_store::path::Path, bool)>, usize) {
@@ -270,14 +326,14 @@ fn select_warm_paths(
         })
         .collect();
     // Assumes 10-char ISO dates (date=YYYY-MM-DD, lexically sortable). A
-    // missing or differently-shaped date= segment keys as "" — sorts first
-    // (slightly suboptimal LRU order), never a crash.
+    // missing or differently-shaped date= segment keys as "" — sorts last
+    // under Reverse (treated as oldest), never a crash.
     let date_key = |p: &object_store::path::Path| {
         let s = p.as_ref();
         s.find("date=").and_then(|i| s.get(i + 5..i + 15)).unwrap_or("").to_string()
     };
     // cached_key: one allocation per path, not one per comparison.
-    paths.sort_by_cached_key(|(p, _)| date_key(p));
+    paths.sort_by_cached_key(|(p, _)| std::cmp::Reverse(date_key(p)));
     (paths, dropped)
 }
 
@@ -802,10 +858,9 @@ impl Database {
         const MAX_RETRIES: u32 = 5;
 
         loop {
-            let mut table_write = table.write().await;
-            match table_write.update_state().await {
-                Ok(()) => {
-                    if let Some(version) = table_write.version() {
+            match refresh_table_snapshot(table).await {
+                Ok(version) => {
+                    if let Some(version) = version {
                         debug!("Updated table for {}/{} to version {}", project_id, table_name, version);
                         // Update our version tracking to reflect what we just loaded
                         let mut versions = self.last_written_versions.write().await;
@@ -814,9 +869,6 @@ impl Database {
                     return Ok(());
                 }
                 Err(e) => {
-                    // Release the lock before retrying
-                    drop(table_write);
-
                     retries += 1;
                     if retries >= MAX_RETRIES {
                         error!("Failed to update table for {}/{} after {} retries: {}", project_id, table_name, MAX_RETRIES, e);
@@ -1985,7 +2037,7 @@ impl Database {
         match self.create_or_load_delta_table(storage_uri, storage_options.clone(), cached_store.clone()).await {
             Ok(table) => {
                 info!("Loaded existing table '{}'", table_name);
-                Ok(table)
+                Ok(ensure_deleted_file_retention(table, self.config.maintenance.timefusion_vacuum_retention_hours).await)
             }
             Err(load_err) => {
                 info!("Table '{}' doesn't exist, creating new table. err: {:?}", table_name, load_err);
@@ -2000,6 +2052,12 @@ impl Database {
 
                     let mut config = HashMap::new();
                     config.insert("delta.checkpointInterval".to_string(), Some(checkpoint_interval));
+                    // Aligned with vacuum retention so checkpoints prune Remove
+                    // tombstones as soon as vacuum has had its shot at the files.
+                    config.insert(
+                        "delta.deletedFileRetentionDuration".to_string(),
+                        Some(format!("interval {} hours", self.config.maintenance.timefusion_vacuum_retention_hours)),
+                    );
                     // Default of 32 leaf columns isn't enough for our wide schema (90+ fields);
                     // -1 = index all columns. Needed so kernel data-skipping can evaluate
                     // predicates on columns beyond the first 32 without "No such field" errors.
@@ -2056,9 +2114,8 @@ impl Database {
             Ok(r) => r,
             Err(_) => return Ok(Vec::new()),
         };
-        let mut table = table_ref.write().await;
-        let _ = table.update_state().await;
-        let uris: Vec<String> = table.get_file_uris()?.collect();
+        let _ = refresh_table_snapshot(&table_ref).await;
+        let uris: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
         Ok(uris)
     }
 
@@ -2511,19 +2568,26 @@ impl Database {
         let mut last_error = None;
 
         while retry_count < max_retries {
-            // Hold the write lock for the entire operation to prevent concurrent conflicts
-            let mut table = table_ref.write().await;
-
-            // Update the table state to get the latest version before writing
-            if let Err(e) = table.update_state().await {
+            // Refresh without holding the write lock across IO (see
+            // refresh_table_snapshot) — queries keep planning against the old
+            // snapshot. Staleness just surfaces as an OCC conflict below.
+            if let Err(e) = refresh_table_snapshot(&table_ref).await {
                 debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
             }
 
-            // Snapshot the pre-write file URIs while the write lock is held and
-            // update_state has just run. Cheap in-memory walk of add_actions; the
-            // post-write diff replaces two redundant `list_file_uris` calls
-            // (each of which would re-acquire the write lock + re-run update_state).
-            let pre_uris: std::collections::HashSet<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+            // Snapshot the handle + pre-write file URIs under a read lock; the
+            // S3 write below runs on the clone. Cheap in-memory walk of
+            // add_actions; the post-write diff replaces two redundant
+            // `list_file_uris` calls. Writer-writer races (flush vs optimize/
+            // dedup) are resolved by Delta OCC + this retry loop, exactly like
+            // every other commit path — the write lock is NOT held across the
+            // write anymore (it serialized all query planning behind each
+            // project's parquet upload during flush passes; 50-110s prod stalls).
+            let (table, pre_uris) = {
+                let guard = table_ref.read().await;
+                let pre: std::collections::HashSet<String> = guard.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                (guard.clone(), pre)
+            };
 
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
             let write_result = async {
@@ -2555,19 +2619,24 @@ impl Database {
                         debug!("WARNING: No version available after write for {}/{}", project_id, table_name);
                     }
 
-                    *table = new_table;
-
-                    // Compute added files from the post-write snapshot while we still
-                    // hold the write lock — no extra log scan required.
-                    let added: Vec<String> = table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
+                    // Compute added files from the post-write snapshot — no
+                    // extra log scan required.
+                    let added: Vec<String> = new_table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
 
                     // Capture the store off the handle we just committed with —
                     // the warm task below must never re-resolve the table (a
                     // possible PG roundtrip + a redundant Delta state reload).
-                    let (warm_store, warm_table_uri) = (table.log_store().object_store(None), table.table_url().to_string());
+                    let (warm_store, warm_table_uri) = (new_table.log_store().object_store(None), new_table.table_url().to_string());
 
-                    // Invalidate statistics cache after successful write
-                    drop(table); // Release write lock before async operation
+                    // Brief write lock for the swap only. Version-guarded: a
+                    // concurrent maintenance commit may have advanced the
+                    // shared handle past our post-write snapshot.
+                    {
+                        let mut shared = table_ref.write().await;
+                        if new_table.version() > shared.version() {
+                            *shared = new_table;
+                        }
+                    }
                     // Freshly-flushed files are the ones dashboards query next;
                     // without this they're read cold from S3 until something else
                     // warms them (repeat queries measured ~300 ms vs 8 ms warm on R2).
@@ -2611,11 +2680,10 @@ impl Database {
                         let backoff_ms = 100 * (2_u64.pow(retry_count.min(5)));
                         tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
 
-                        // Drop the lock and try to reload the table
-                        drop(table);
+                        drop(table); // stale clone — the retry re-clones after the reload
 
                         // Force a table state reload on conflict
-                        if let Err(reload_err) = table_ref.write().await.update_state().await {
+                        if let Err(reload_err) = refresh_table_snapshot(&table_ref).await {
                             debug!("Failed to reload table state after conflict: {}", reload_err);
                         }
                     } else {
@@ -3054,7 +3122,30 @@ impl Database {
         // so a future caller can't inject SQL through the partition predicate. date_str comes from NaiveDate::to_string
         // and is already safe.
         let safe_pid = project_id.replace('\'', "''");
-        let select = format!("SELECT * FROM {} WHERE project_id = '{}' AND date = DATE '{}'", scan_name, safe_pid, date_str);
+        let filter = format!("project_id = '{}' AND date = DATE '{}'", safe_pid, date_str);
+        // Probe for duplicates BEFORE materializing anything: the common case
+        // is zero dupes, and `SELECT *` + collect() of a whole day partition
+        // (1.4M wide OTel rows observed) transiently allocated tens of GB
+        // outside any memory pool, every 5-minute sweep, for every project —
+        // the direct cause of prod's 2026-06-11 OOM crash loop (each kill
+        // replayed the WAL, minting the dupes that fattened the next sweep).
+        // The probe aggregates group keys only: bounded by key cardinality,
+        // not row width. It also stops the every-5-min whole-partition
+        // replace_where rewrite, the main Remove-tombstone factory.
+        let keys_csv = schema.dedup_keys.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(", ");
+        let probe =
+            format!("SELECT coalesce(sum(c - 1), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS dup_groups WHERE c > 1");
+        let probe_batches = ctx.sql(&probe).await?.collect().await?;
+        let dup_rows = probe_batches
+            .first()
+            .filter(|b| b.num_rows() > 0)
+            .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0)))
+            .unwrap_or(0);
+        if dup_rows <= 0 {
+            return Ok(0);
+        }
+
+        let select = format!("SELECT * FROM {scan_name} WHERE {filter}");
         let batches = ctx.sql(&select).await?.collect().await?;
         let before: usize = batches.iter().map(|b| b.num_rows()).sum();
         if before == 0 {
@@ -3316,6 +3407,10 @@ impl Database {
             .vacuum()
             .with_retention_period(chrono::Duration::hours(retention_hours as i64))
             .with_enforce_retention_duration(false) // Allow deletion of files newer than default retention
+            // Full: also sweep files whose tombstones already left the
+            // checkpoint (pruned at deletedFileRetentionDuration) — Lite can
+            // no longer see those and they'd leak storage forever.
+            .with_mode(deltalake::operations::vacuum::VacuumMode::Full)
             .await
         {
             Ok((_, metrics)) => {
@@ -3338,8 +3433,7 @@ impl Database {
                 }
 
                 // Update the table state after vacuum
-                let mut table = table_ref.write().await;
-                if table.update_state().await.is_ok() {
+                if refresh_table_snapshot(table_ref).await.is_ok() {
                     info!("Table state updated after vacuum");
                 } else {
                     error!("Failed to update table state after vacuum");
@@ -4419,8 +4513,10 @@ mod writer_properties_tests {
     }
 
     // Pins the warm_all_footers default: non-recent files stay in the warm
-    // set as footer-only (recent=false), oldest partition first; with the
-    // flag off they are dropped entirely.
+    // set as footer-only (recent=false), NEWEST partition first (the
+    // partitions dashboards query must be warm within seconds of boot, even
+    // if the process dies mid-warm); with the flag off they are dropped
+    // entirely.
     #[test]
     fn select_warm_paths_pins_warm_all_footers_default() {
         let prefix = "s3://bucket/timefusion/default/otel";
@@ -4438,8 +4534,8 @@ mod writer_properties_tests {
         assert_eq!(
             got,
             vec![
-                ("project_id=p/date=2020-01-01/old.parquet", false), // footer-only, warms first
-                ("project_id=p/date=2099-01-01/new.parquet", true),
+                ("project_id=p/date=2099-01-01/new.parquet", true),  // newest warms first
+                ("project_id=p/date=2020-01-01/old.parquet", false), // footer-only, backfills last
             ]
         );
 
@@ -4685,6 +4781,100 @@ mod tests {
         datafusion_functions_json::register_all(&mut ctx)?;
         db.setup_session_context(&mut ctx)?;
         Ok((db, ctx, test_prefix))
+    }
+
+    /// Regression guard for the 2026-06-11 prod planning-stall convoy: every
+    /// query refreshes the unified table via `refresh_table_snapshot`, and the
+    /// old implementation held the table WRITE lock across `update_state()`
+    /// (full log replay + object-store IO — 1s+ per post-flush refresh on
+    /// prod's 40k-action log), so all concurrent reads convoyed behind it for
+    /// 50-110s during flush passes. Pin the fix: while a refresh runs against
+    /// a deliberately slow object store, read-lock acquisition must stay fast.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_table_snapshot_does_not_block_readers() -> Result<()> {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let url = Url::parse("memory:///convoy_tbl")?;
+        let fast = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
+        let table = deltalake::DeltaOps(fast).create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        assert_eq!(table.version(), Some(0));
+
+        // Same store, but every list/get pays a delay — makes update_state
+        // slow the way prod's R2-backed log replay is.
+        let wait = std::time::Duration::from_millis(100);
+        let throttled = ThrottledStore::new(
+            mem,
+            ThrottleConfig {
+                wait_get_per_call: wait,
+                wait_list_per_call: wait,
+                wait_list_with_delimiter_per_call: wait,
+                ..Default::default()
+            },
+        );
+        let slow = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(Arc::new(throttled), url).build()?;
+        let shared = Arc::new(RwLock::new(slow));
+
+        let refresher = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move { refresh_table_snapshot(&shared).await })
+        };
+
+        // Sample read-lock acquisition latency while the refresh is in flight.
+        let mut max_wait = std::time::Duration::ZERO;
+        let started = std::time::Instant::now();
+        while !refresher.is_finished() && started.elapsed() < std::time::Duration::from_secs(30) {
+            let t0 = std::time::Instant::now();
+            drop(shared.read().await);
+            max_wait = max_wait.max(t0.elapsed());
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let refresh_took = started.elapsed();
+        let version = refresher.await?.map_err(|e| anyhow::anyhow!(e))?;
+
+        assert_eq!(version, Some(0), "refresh resolved the table snapshot");
+        assert!(refresh_took >= wait, "throttle must make the refresh measurably slow (took {refresh_took:?})");
+        assert!(
+            max_wait < wait / 2,
+            "readers stalled {max_wait:?} behind an in-flight refresh (refresh took {refresh_took:?}) — write lock is being held across update_state"
+        );
+        Ok(())
+    }
+
+    /// Pins the checkpoint-tombstone fix: tables that predate the
+    /// `delta.deletedFileRetentionDuration` property (prod sat at delta's
+    /// 7-day default and accumulated 38.5k Remove tombstones per checkpoint)
+    /// get the property set once at load, idempotently.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ensure_deleted_file_retention_sets_property_once() -> Result<()> {
+        const KEY: &str = "delta.deletedFileRetentionDuration";
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let url = Url::parse("memory:///retention_tbl")?;
+        let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem, url).build()?;
+        let table = deltalake::DeltaOps(t).create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        assert!(
+            !table.snapshot()?.metadata().configuration().contains_key(KEY),
+            "fresh table has no retention property"
+        );
+
+        let table = ensure_deleted_file_retention(table, 24).await;
+        assert_eq!(
+            table.snapshot()?.metadata().configuration().get(KEY).map(String::as_str),
+            Some("interval 24 hours")
+        );
+        assert_eq!(table.version(), Some(1), "property set in one commit");
+
+        let table = ensure_deleted_file_retention(table, 24).await;
+        assert_eq!(table.version(), Some(1), "matching property must not commit again");
+
+        // Retention reconfiguration (e.g. env change) re-reconciles.
+        let table = ensure_deleted_file_retention(table, 48).await;
+        assert_eq!(
+            table.snapshot()?.metadata().configuration().get(KEY).map(String::as_str),
+            Some("interval 48 hours")
+        );
+        assert_eq!(table.version(), Some(2));
+        Ok(())
     }
 
     /// End-to-end test of `recompress_partition`. Skip behavior is the
