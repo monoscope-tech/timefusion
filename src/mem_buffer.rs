@@ -1935,8 +1935,7 @@ mod tests {
     fn single_row_utf8view_insert_charged_logical_size_not_block_capacity() {
         use datafusion::common::ScalarValue;
         let n_str_cols = 64;
-        let mut fields: Vec<Field> =
-            vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)];
+        let mut fields: Vec<Field> = vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)];
         fields.extend((0..n_str_cols).map(|i| Field::new(format!("c{i}"), DataType::Utf8View, true)));
         let item = Arc::new(Field::new("item", DataType::Utf8View, true));
         fields.push(Field::new("l", DataType::List(item.clone()), true));
