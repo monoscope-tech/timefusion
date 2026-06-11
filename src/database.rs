@@ -4885,7 +4885,10 @@ mod tests {
         let db = Database::with_config(cfg).await?;
         let ctx1 = Arc::new(db.clone()).create_session_context();
         let ctx2 = Arc::new(db.clone()).create_session_context();
-        assert!(Arc::ptr_eq(&ctx1.runtime_env(), &ctx2.runtime_env()), "contexts must share one RuntimeEnv/memory pool");
+        assert!(
+            Arc::ptr_eq(&ctx1.runtime_env(), &ctx2.runtime_env()),
+            "contexts must share one RuntimeEnv/memory pool"
+        );
         Ok(())
     }
 
