@@ -2211,7 +2211,9 @@ impl Database {
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     if n.is_multiple_of(WARM_PROGRESS_INTERVAL) {
-                        info!("Cache warm progress: {n}/{count} files");
+                        // Elapsed on the heartbeat lets operators extrapolate
+                        // time-remaining without waiting for completion.
+                        info!("Cache warm progress: {n}/{count} files ({:.1}s elapsed)", t0.elapsed().as_secs_f64());
                     }
                 }
             })
