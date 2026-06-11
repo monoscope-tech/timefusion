@@ -2193,7 +2193,9 @@ impl Database {
         info!("Cache warm start: {count} files (scope={scope}, concurrency={concurrency})");
         let t0 = std::time::Instant::now();
         // Progress heartbeat: a 10k-file boot warm runs minutes; without one
-        // operators can't tell warming from a hang.
+        // operators can't tell warming from a hang. The {count} denominator
+        // is the selected warm set (footer warms); full-file warming covers
+        // only the `recent` subset of it.
         const WARM_PROGRESS_INTERVAL: usize = 500;
         let done = std::sync::atomic::AtomicUsize::new(0);
         let done = &done;
