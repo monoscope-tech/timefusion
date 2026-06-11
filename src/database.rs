@@ -661,6 +661,11 @@ fn redact_str<S: serde::Serializer>(_: &str, ser: S) -> std::result::Result<S::O
 #[derive(Debug, Clone)]
 pub struct Database {
     config:                          Arc<AppConfig>,
+    /// One RuntimeEnv (and thus one memory pool) shared by every session
+    /// context, across `Database` clones. Per-context pools each granted the
+    /// full `memory_limit × fraction` budget, so N contexts oversubscribed
+    /// the cgroup N×; the pool only enforces a global cap if it's global.
+    runtime_env:                     Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
     unified_tables:                  UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
@@ -1050,6 +1055,7 @@ impl Database {
 
         let db = Self {
             config: cfg,
+            runtime_env: Arc::new(std::sync::OnceLock::new()),
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: dashmap::DashMap::new(),
@@ -1472,14 +1478,19 @@ impl Database {
         // Memory pool: defaults to Greedy (single global cap, no per-consumer slicing)
         // for ingest-heavy workloads. Opt into FairSpill for ad-hoc multi-tenant
         // query workloads via TIMEFUSION_MEMORY_POOL=fair_spill.
-        let pool_size = (memory_limit_bytes as f64 * memory_fraction) as usize;
-        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
-            crate::config::MemoryPoolKind::Greedy => Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
-            crate::config::MemoryPoolKind::FairSpill => Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
-        };
-        let runtime_env = RuntimeEnvBuilder::new().with_memory_pool(pool).build().expect("Failed to create runtime environment");
-
-        let runtime_env = Arc::new(runtime_env);
+        // Built once and shared by every session context (pgwire, internal SQL,
+        // maintenance) so the cap is a real process-wide budget.
+        let runtime_env = self
+            .runtime_env
+            .get_or_init(|| {
+                let pool_size = (memory_limit_bytes as f64 * memory_fraction) as usize;
+                let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
+                    crate::config::MemoryPoolKind::Greedy => Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
+                    crate::config::MemoryPoolKind::FairSpill => Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
+                };
+                Arc::new(RuntimeEnvBuilder::new().with_memory_pool(pool).build().expect("Failed to create runtime environment"))
+            })
+            .clone();
 
         // Set up tracing options with configurable sampling
         let record_metrics = self.config.memory.timefusion_tracing_record_metrics;
@@ -4863,6 +4874,19 @@ mod tests {
         datafusion_functions_json::register_all(&mut ctx)?;
         db.setup_session_context(&mut ctx)?;
         Ok((db, ctx, test_prefix))
+    }
+
+    /// Per-context RuntimeEnvs each granted the full memory budget, so N
+    /// contexts oversubscribed the cgroup N× — the pool must be process-wide,
+    /// including across `Database` clones (bootstrap clones the db).
+    #[tokio::test]
+    async fn session_contexts_share_one_memory_pool() -> Result<()> {
+        let cfg = create_test_config("pool-share");
+        let db = Database::with_config(cfg).await?;
+        let ctx1 = Arc::new(db.clone()).create_session_context();
+        let ctx2 = Arc::new(db.clone()).create_session_context();
+        assert!(Arc::ptr_eq(&ctx1.runtime_env(), &ctx2.runtime_env()), "contexts must share one RuntimeEnv/memory pool");
+        Ok(())
     }
 
     /// Regression guard for the 2026-06-11 prod planning-stall convoy: every
