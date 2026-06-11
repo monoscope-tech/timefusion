@@ -2869,6 +2869,7 @@ impl Database {
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
         let table_clone = table_ref.read().await.clone();
+        let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
         let optimize_result = table_clone
             .optimize()
             .with_filters(&partition_filters)
@@ -2892,7 +2893,12 @@ impl Database {
                     "recompress: date={} table={} removed={} added={} considered={}",
                     date_str, table_name, metrics.num_files_removed, metrics.num_files_added, metrics.total_considered_files
                 );
-                *table_ref.write().await = new_table;
+                // Swap + warm-added/evict-removed like the other optimize
+                // paths. A bare swap left the rewritten cold-tier files
+                // un-warmed and the tombstoned ones cached — the next query
+                // on a recompressed partition paid full S3 reads (1.5 s
+                // observed against OVH).
+                let _ = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                 Ok(())
             }
             Err(e) => {
@@ -2981,6 +2987,7 @@ impl Database {
                 let table = table_ref.read().await;
                 table.clone()
             };
+            let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
             let result = table_clone
                 .write(deduped.clone())
                 .with_partition_columns(schema.partitions.clone())
@@ -2990,7 +2997,15 @@ impl Database {
                 .await;
             match result {
                 Ok(new_table) => {
+                    // Warm the rewritten files like the optimize paths do
+                    // (swap_and_refresh_cache); without this the replace_where
+                    // outputs are stone-cold and the next query on the
+                    // partition pays full S3 metadata+data reads (1.5 s
+                    // observed against OVH).
+                    let added: Vec<String> =
+                        new_table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
                     *table_ref.write().await = new_table;
+                    self.warm_cache_for_table(project_id, table_name, added);
                     crate::metrics::record_compaction_dedup_dropped(dropped);
                     info!(
                         "dedup compaction: table={} project={} date={} dropped={} (before={} after={})",
