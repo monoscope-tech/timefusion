@@ -356,8 +356,37 @@ fn compact_view_arrays(arr: &ArrayRef) -> ArrayRef {
     }
 }
 
-fn compact_view_batch(batch: RecordBatch) -> RecordBatch {
-    let cols: Vec<ArrayRef> = batch.columns().iter().map(compact_view_arrays).collect();
+/// Copy an array into freshly-allocated exact-size buffers when its current
+/// buffers are mostly someone else's bytes. Arrow IPC decode (WAL replay,
+/// gRPC ingest) reads the whole message body into one allocation and hands
+/// every column a slice of it — `Buffer::capacity()` reports the full body,
+/// so a replayed batch is charged ~n_cols × message size (prod 2026-06-11
+/// night: 6,546 replayed entries charged 772.5GB inside a 66.6GiB cgroup).
+/// The cap-vs-len gate sees exactly that: a slice's `len` is its own region,
+/// `capacity` is the underlying allocation. `MutableArrayData` rebases
+/// offsets and copies only the referenced region, recursing into children.
+fn privatize_sliced(arr: &ArrayRef) -> ArrayRef {
+    use arrow::array::{ArrayData, MutableArrayData, make_array};
+    fn waste(data: &ArrayData) -> (usize, usize) {
+        let (cap, len) = data.buffers().iter().fold((0usize, 0usize), |(c, l), b| (c + b.capacity(), l + b.len()));
+        data.child_data().iter().map(waste).fold((cap, len), |(c, l), (cc, cl)| (c + cc, l + cl))
+    }
+    let data = arr.to_data();
+    let (cap, len) = waste(&data);
+    if cap <= len * 2 + 1024 {
+        return arr.clone();
+    }
+    let mut m = MutableArrayData::new(vec![&data], false, data.len());
+    m.extend(0, 0, data.len());
+    make_array(m.freeze())
+}
+
+/// Full charge-honesty pass: view gc first (block slack / scan-block
+/// inheritance), then buffer privatization (IPC message-body slices). Runs
+/// at every bucket insert and before WAL serialization so neither memory
+/// accounting nor WAL entries carry other allocations' bytes.
+pub(crate) fn compact_batch(batch: RecordBatch) -> RecordBatch {
+    let cols: Vec<ArrayRef> = batch.columns().iter().map(|c| privatize_sliced(&compact_view_arrays(c))).collect();
     if cols.iter().zip(batch.columns()).all(|(a, b)| Arc::ptr_eq(a, b)) {
         batch
     } else {
@@ -1740,7 +1769,7 @@ impl TableBuffer {
     /// in the value returned (the caller's MemBuffer-level counter is
     /// approximate by design — converges on drain/evict).
     pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<(usize, i64)> {
-        let batch = compact_view_batch(batch);
+        let batch = compact_batch(batch);
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
         let new_size = estimate_batch_size(&batch);
