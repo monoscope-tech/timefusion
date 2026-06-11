@@ -67,12 +67,11 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         .with_timeout(Duration::from_secs(10))
         .build()?;
     let logger_provider = SdkLoggerProvider::builder().with_batch_exporter(log_exporter).with_resource(resource).build();
-    let log_bridge = opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(
-        tracing_subscriber::filter::filter_fn(|meta| {
+    let log_bridge =
+        opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(tracing_subscriber::filter::filter_fn(|meta| {
             let t = meta.target();
             !(t.starts_with("opentelemetry") || t.starts_with("tonic") || t.starts_with("h2") || t.starts_with("hyper"))
-        }),
-    );
+        }));
     let _ = LOGGER_PROVIDER.set(logger_provider);
 
     // Get log filter from environment
