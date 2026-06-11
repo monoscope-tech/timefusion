@@ -3133,9 +3133,8 @@ impl Database {
         // not row width. It also stops the every-5-min whole-partition
         // replace_where rewrite, the main Remove-tombstone factory.
         let keys_csv = schema.dedup_keys.iter().map(|k| format!("\"{k}\"")).collect::<Vec<_>>().join(", ");
-        let probe = format!(
-            "SELECT coalesce(sum(c - 1), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS dup_groups WHERE c > 1"
-        );
+        let probe =
+            format!("SELECT coalesce(sum(c - 1), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS dup_groups WHERE c > 1");
         let probe_batches = ctx.sql(&probe).await?.collect().await?;
         let dup_rows = probe_batches
             .first()
@@ -4535,7 +4534,7 @@ mod writer_properties_tests {
         assert_eq!(
             got,
             vec![
-                ("project_id=p/date=2099-01-01/new.parquet", true), // newest warms first
+                ("project_id=p/date=2099-01-01/new.parquet", true),  // newest warms first
                 ("project_id=p/date=2020-01-01/old.parquet", false), // footer-only, backfills last
             ]
         );
@@ -4798,10 +4797,7 @@ mod tests {
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///convoy_tbl")?;
         let fast = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
-        let table = deltalake::DeltaOps(fast)
-            .create()
-            .with_columns(get_default_schema().columns().unwrap_or_default())
-            .await?;
+        let table = deltalake::DeltaOps(fast).create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
         assert_eq!(table.version(), Some(0));
 
         // Same store, but every list/get pays a delay — makes update_state
@@ -4816,9 +4812,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let slow = DeltaTableBuilder::from_url(url.clone())?
-            .with_storage_backend(Arc::new(throttled), url)
-            .build()?;
+        let slow = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(Arc::new(throttled), url).build()?;
         let shared = Arc::new(RwLock::new(slow));
 
         let refresher = {
@@ -4857,14 +4851,17 @@ mod tests {
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///retention_tbl")?;
         let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem, url).build()?;
-        let table = deltalake::DeltaOps(t)
-            .create()
-            .with_columns(get_default_schema().columns().unwrap_or_default())
-            .await?;
-        assert!(!table.snapshot()?.metadata().configuration().contains_key(KEY), "fresh table has no retention property");
+        let table = deltalake::DeltaOps(t).create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        assert!(
+            !table.snapshot()?.metadata().configuration().contains_key(KEY),
+            "fresh table has no retention property"
+        );
 
         let table = ensure_deleted_file_retention(table, 24).await;
-        assert_eq!(table.snapshot()?.metadata().configuration().get(KEY).map(String::as_str), Some("interval 24 hours"));
+        assert_eq!(
+            table.snapshot()?.metadata().configuration().get(KEY).map(String::as_str),
+            Some("interval 24 hours")
+        );
         assert_eq!(table.version(), Some(1), "property set in one commit");
 
         let table = ensure_deleted_file_retention(table, 24).await;
@@ -4872,7 +4869,10 @@ mod tests {
 
         // Retention reconfiguration (e.g. env change) re-reconciles.
         let table = ensure_deleted_file_retention(table, 48).await;
-        assert_eq!(table.snapshot()?.metadata().configuration().get(KEY).map(String::as_str), Some("interval 48 hours"));
+        assert_eq!(
+            table.snapshot()?.metadata().configuration().get(KEY).map(String::as_str),
+            Some("interval 48 hours")
+        );
         assert_eq!(table.version(), Some(2));
         Ok(())
     }

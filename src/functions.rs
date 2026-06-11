@@ -6,8 +6,8 @@ use chrono_tz::Tz;
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray, StringViewArray, StringViewBuilder,
-            TimestampMicrosecondArray, TimestampNanosecondArray,
+            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray, StringViewArray, StringViewBuilder, TimestampMicrosecondArray,
+            TimestampNanosecondArray,
         },
         datatypes::{DataType, TimeUnit},
     },
@@ -1984,7 +1984,10 @@ mod tests {
         assert_eq!(col.value(0), r#"["{\"a\":1}","[1,2]","plain","123"]"#);
         // Independent of serialisation format: every element must be a JSON *string*.
         let parsed: serde_json::Value = serde_json::from_str(col.value(0)).unwrap();
-        assert!(parsed.as_array().unwrap().iter().all(serde_json::Value::is_string), "elements must stay strings: {parsed}");
+        assert!(
+            parsed.as_array().unwrap().iter().all(serde_json::Value::is_string),
+            "elements must stay strings: {parsed}"
+        );
         // Top-level Utf8 scalars keep the JSON sniff: Variant/Utf8 columns holding
         // JSON (attributes, events, links) rely on it to surface as real JSON.
         let sql = r#"SELECT to_jsonb('{"a":1}') AS s"#;
