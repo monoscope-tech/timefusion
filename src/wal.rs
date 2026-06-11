@@ -1077,7 +1077,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::{
-        array::{Int64Array, StringViewArray},
+        array::{ArrayRef, Int64Array, StringViewArray},
         datatypes::{DataType, Field, Schema},
     };
 
@@ -1102,6 +1102,45 @@ mod tests {
         let deserialized = deserialize_record_batch(&serialized).unwrap();
         assert_eq!(batch.num_rows(), deserialized.num_rows());
         assert_eq!(batch.num_columns(), deserialized.num_columns());
+    }
+
+    // Prod 2026-06-11 night: WAL replay of 6,546 entries charged 772.5GB
+    // (~118MB each ≈ 89 cols × ~1.3MB message). Arrow IPC decode reads the
+    // whole message body into one allocation and hands every column a slice
+    // of it, so each column's `Buffer::capacity()` reports the full body —
+    // a replayed batch is charged ~n_cols × message size unless the buffers
+    // are privatized before entering a bucket.
+    #[test]
+    fn replayed_batch_charged_logical_not_message_body() {
+        let n_cols = 30;
+        let n_rows = 50;
+        let payload: Vec<String> = (0..n_rows).map(|i| format!("{i:0>100}")).collect();
+        let mut fields = vec![Field::new("ts", DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())), false)];
+        fields.extend((0..n_cols).map(|i| Field::new(format!("c{i}"), if i % 2 == 0 { DataType::Utf8View } else { DataType::Utf8 }, true)));
+        let ts = chrono::Utc::now().timestamp_micros();
+        let mut cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![ts; n_rows]).with_timezone("UTC"))];
+        let strs: Vec<&str> = payload.iter().map(|s| s.as_str()).collect();
+        cols.extend((0..n_cols).map(|i| -> ArrayRef {
+            if i % 2 == 0 {
+                Arc::new(StringViewArray::from(strs.clone()))
+            } else {
+                Arc::new(arrow::array::StringArray::from(strs.clone()))
+            }
+        }));
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols).unwrap();
+
+        let bytes = serialize_record_batch(&batch).unwrap();
+        let replayed = deserialize_record_batch(&bytes).unwrap();
+
+        let buffer = crate::mem_buffer::MemBuffer::new();
+        buffer.insert("p1", "t1", replayed, ts).unwrap();
+        let charged = buffer.estimated_memory_bytes();
+        // logical ≈ 30 cols × 50 rows × 100B ≈ 150KB; without privatization
+        // each column charges the ~190KB message body (~5.7MB total).
+        assert!(
+            charged < 1024 * 1024,
+            "replayed ~150KB-logical batch charged {charged} bytes — IPC message-body slices are leaking into accounting"
+        );
     }
 
     #[test]
