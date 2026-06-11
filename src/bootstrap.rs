@@ -49,8 +49,9 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
         move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
             let db = db_for_callback.clone();
             Box::pin(async move {
+                // insert_records_batch warms the just-flushed files itself
+                // (watermark-gated) — warming here too would double the GETs.
                 let added = db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await?;
-                db.warm_cache_for_table(&project_id, &table_name, added.clone());
                 Ok(added)
             })
         },

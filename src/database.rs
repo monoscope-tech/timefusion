@@ -2090,6 +2090,18 @@ impl Database {
         if paths.is_empty() {
             return;
         }
+        // Warm oldest date-partitions FIRST so the newest land last in LRU
+        // order: if the warm set exceeds the metadata cache (size it as
+        // metadata_disk ≥ live_files × parquet_metadata_size_hint), eviction
+        // then drops the least-queried old partitions instead of whichever
+        // files happened to warm late. ISO dates sort lexically; files
+        // without a date= segment warm first.
+        let date_key = |p: &object_store::path::Path| {
+            let s = p.as_ref();
+            s.find("date=").and_then(|i| s.get(i + 5..i + 15)).unwrap_or("").to_string()
+        };
+        let mut paths = paths;
+        paths.sort_by_key(|(p, _)| date_key(p));
 
         let count = paths.len();
         // Baseline the cache stats *before* warming: the warm GETs are all
