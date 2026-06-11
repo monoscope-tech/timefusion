@@ -76,14 +76,18 @@ pub mod test_helpers {
             "walrus_env_guard already held by another test — add #[serial] to the caller"
         );
         let prev = std::env::var_os("WALRUS_DATA_DIR");
-        unsafe { std::env::set_var("WALRUS_DATA_DIR", dir) };
-        scopeguard::guard(prev, |prev| {
+        // Guard constructed BEFORE set_var: if set_var ever panicked, drop
+        // would still clear HELD (and restore prev), instead of poisoning
+        // every later caller with a misleading "already held" assert.
+        let guard = scopeguard::guard(prev, |prev| {
             match prev {
                 Some(v) => unsafe { std::env::set_var("WALRUS_DATA_DIR", v) },
                 None => unsafe { std::env::remove_var("WALRUS_DATA_DIR") },
             }
             HELD.store(false, Ordering::SeqCst);
-        })
+        });
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", dir) };
+        guard
     }
 
     /// Build a BufferedWriteLayer for tests/benches without repeating the registry boilerplate.

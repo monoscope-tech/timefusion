@@ -2196,8 +2196,9 @@ impl Database {
         // a large warm set takes minutes to get there).
         info!("Cache warm start: {count} files (scope={scope}, concurrency={concurrency})");
         let t0 = std::time::Instant::now();
-        // Progress every 500 files: a 10k-file boot warm runs minutes; without
-        // a heartbeat operators can't tell warming from a hang.
+        // Progress heartbeat: a 10k-file boot warm runs minutes; without one
+        // operators can't tell warming from a hang.
+        const WARM_PROGRESS_INTERVAL: usize = 500;
         let done = std::sync::atomic::AtomicUsize::new(0);
         let done = &done;
         futures::stream::iter(paths)
@@ -2209,20 +2210,20 @@ impl Database {
                         let _ = crate::object_store_cache::warm_full(store.as_ref(), &path).await;
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n.is_multiple_of(500) {
+                    if n.is_multiple_of(WARM_PROGRESS_INTERVAL) {
                         info!("Cache warm progress: {n}/{count} files");
                     }
                 }
             })
             .await;
 
-        let elapsed_ms = t0.elapsed().as_millis();
+        let elapsed_s = t0.elapsed().as_secs_f64();
         match baseline {
             Some(rate) => info!(
-                "Cache warm complete: {} files warmed (scope={}) in {}ms; foyer main hit rate before warm was {:.2}% (next query benefits)",
-                count, scope, elapsed_ms, rate
+                "Cache warm complete: {} files warmed (scope={}) in {:.1}s; foyer main hit rate before warm was {:.2}% (next query benefits)",
+                count, scope, elapsed_s, rate
             ),
-            None => info!("Cache warm complete: {} files warmed (scope={}) in {}ms", count, scope, elapsed_ms),
+            None => info!("Cache warm complete: {} files warmed (scope={}) in {:.1}s", count, scope, elapsed_s),
         }
     }
 
