@@ -303,12 +303,13 @@ TimeFusion combines best-in-class technologies to deliver exceptional performanc
 
 ### Performance Tuning
 
-| Variable                          | Description        | Default |
-| --------------------------------- | ------------------ | ------- |
-| `TIMEFUSION_PAGE_ROW_COUNT_LIMIT` | Rows per page      | `20000` |
-| `TIMEFUSION_MAX_ROW_GROUP_SIZE`   | Max row group size | `128MB` |
-| `TIMEFUSION_OPTIMIZE_TARGET_SIZE` | Target file size   | `512MB` |
-| `TIMEFUSION_BATCH_QUEUE_CAPACITY` | Batch queue size   | `1000`  |
+| Variable                          | Description                                                                                | Default |
+| --------------------------------- | ------------------------------------------------------------------------------------------ | ------- |
+| `TIMEFUSION_PAGE_ROW_COUNT_LIMIT` | Rows per page                                                                              | `20000` |
+| `TIMEFUSION_MAX_ROW_GROUP_SIZE`   | Max row group size                                                                         | `128MB` |
+| `TIMEFUSION_OPTIMIZE_TARGET_SIZE` | Target file size                                                                           | `512MB` |
+| `TIMEFUSION_BATCH_QUEUE_CAPACITY` | Batch queue size                                                                           | `1000`  |
+| `TIMEFUSION_S3_CONNECT_TIMEOUT`   | S3 TCP/TLS connect bound (humantime). Tuned for same-region S3; widen behind slow proxies | `3s`    |
 
 ### Cache Configuration
 

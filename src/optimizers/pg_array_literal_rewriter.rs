@@ -205,6 +205,10 @@ fn rewrite_in_expr(expr: Expr, input_schemas: &[Arc<DFSchema>]) -> Result<Transf
 
 /// Convert parsed PG array elements to a typed list literal. None on any
 /// element that doesn't parse as `elem_type` (caller leaves the arg alone).
+/// Always emits `ScalarValue::List` even when the sibling column is
+/// LargeList/FixedSizeList: coerce_types may claim those, but TypeCoercion
+/// then casts the literal (arrow supports List → Large/FixedSizeList), so no
+/// physical-planning mismatch — the variant only matters for element type.
 fn pg_elems_to_list(elems: Vec<Option<String>>, elem_type: &DataType) -> Option<ScalarValue> {
     let vals: Option<Vec<ScalarValue>> = elems
         .into_iter()
@@ -224,6 +228,8 @@ fn pg_elems_to_list(elems: Vec<Option<String>>, elem_type: &DataType) -> Option<
 /// Malformed quoting parses leniently rather than strictly: bailing would
 /// only swap one error (this rewrite skipped → TypeCoercion's) for another,
 /// while leniency keeps stable-but-sloppy client literals working.
+/// Only the bare `NULL` keyword is a null element; `\N` is COPY text-format
+/// syntax, not array-literal syntax, and stays literal text (as in PG).
 fn parse_pg_string_array(s: &str) -> Option<Vec<Option<String>>> {
     let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
     if inner.trim().is_empty() {

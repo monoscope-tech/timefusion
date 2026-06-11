@@ -239,6 +239,44 @@ fn relativize_to_prefix(prefix: &str, uri: &str) -> Option<object_store::path::P
     uri.strip_prefix(prefix).map(|rel| object_store::path::Path::from(rel.trim_start_matches('/')))
 }
 
+/// Select and order the files `warm_cache_for_uris` will warm. Returns
+/// `(path, recent)` pairs: footers warm for every returned file; full-file
+/// warming additionally requires `recent`. With `warm_all_footers` (default)
+/// non-recent files are kept (recent=false → footer-only); without it they
+/// are dropped entirely. Ordered oldest date-partition first so the newest
+/// land last in LRU order (ISO dates sort lexically; undated files first).
+/// Returns the count of URIs that failed to relativize for the caller to log.
+fn select_warm_paths(
+    uris: Vec<String>, prefix: &str, warm_all_footers: bool, cutoff: Option<chrono::NaiveDate>,
+) -> (Vec<(object_store::path::Path, bool)>, usize) {
+    let mut dropped = 0usize;
+    let mut paths: Vec<(object_store::path::Path, bool)> = uris
+        .into_iter()
+        .filter(|u| u.ends_with(".parquet"))
+        .map(|u| {
+            let recent = within_recency(&u, cutoff);
+            (u, recent)
+        })
+        .filter(|(_, recent)| warm_all_footers || *recent)
+        .filter_map(|(u, recent)| match relativize_to_prefix(prefix, &u) {
+            Some(path) => Some((path, recent)),
+            None => {
+                // Prefix mismatch (e.g. trailing-slash or query-string drift
+                // between table_url() and get_file_uris()). Warming this file
+                // would address the wrong key, so skip it.
+                dropped += 1;
+                None
+            }
+        })
+        .collect();
+    let date_key = |p: &object_store::path::Path| {
+        let s = p.as_ref();
+        s.find("date=").and_then(|i| s.get(i + 5..i + 15)).unwrap_or("").to_string()
+    };
+    paths.sort_by_key(|(p, _)| date_key(p));
+    (paths, dropped)
+}
+
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     use datafusion::arrow::array::{StringArray, StringViewArray};
@@ -2052,56 +2090,25 @@ impl Database {
         // past any partition we'd query.
         let cutoff = (recency_days > 0).then(|| Utc::now().date_naive() - chrono::Duration::days(recency_days.min(3650) as i64));
 
-        let mut dropped = 0usize;
         // With warm_all_footers (default): footers warm for EVERY live file
         // (tens of KB each — they turn a deep-partition first touch from
         // footer+data RTTs into a single data fetch). On tables with
         // thousands of files that's thousands of boot-time GETs (bounded by
         // `concurrency`); disable the flag to recency-bound footers too.
-        // Full-file warming is always recency-bounded.
-        let paths: Vec<(object_store::path::Path, bool)> = uris
-            .into_iter()
-            .filter(|u| u.ends_with(".parquet"))
-            .map(|u| {
-                let recent = within_recency(&u, cutoff);
-                (u, recent)
-            })
-            .filter(|(_, recent)| warm_all_footers || *recent)
-            .filter_map(|(u, recent)| match relativize_to_prefix(prefix, &u) {
-                Some(path) => Some((path, recent)),
-                None => {
-                    // Prefix mismatch (e.g. trailing-slash or query-string
-                    // drift between table_url() and get_file_uris()). Warming
-                    // this file would address the wrong key, so skip it — but
-                    // log so a systematic mismatch is diagnosable instead of a
-                    // silent no-op.
-                    if dropped == 0 {
-                        debug!("warm: URI {} does not start with table prefix {}; skipping (warm only)", u, prefix);
-                    }
-                    dropped += 1;
-                    None
-                }
-            })
-            .collect();
-
+        // Full-file warming is always recency-bounded. Oldest partitions warm
+        // FIRST so the newest land last in LRU order: if the warm set exceeds
+        // the metadata cache (size it as metadata_disk ≥ live_files ×
+        // parquet_metadata_size_hint), eviction then drops the least-queried
+        // old partitions instead of whichever files happened to warm late.
+        let (paths, dropped) = select_warm_paths(uris, prefix, warm_all_footers, cutoff);
         if dropped > 0 {
+            // Log so a systematic prefix mismatch is diagnosable instead of a
+            // silent no-op (warming the wrong key would never be hit).
             debug!("warm: skipped {} file(s) that did not relativize against prefix {}", dropped, prefix);
         }
         if paths.is_empty() {
             return;
         }
-        // Warm oldest date-partitions FIRST so the newest land last in LRU
-        // order: if the warm set exceeds the metadata cache (size it as
-        // metadata_disk ≥ live_files × parquet_metadata_size_hint), eviction
-        // then drops the least-queried old partitions instead of whichever
-        // files happened to warm late. ISO dates sort lexically; files
-        // without a date= segment warm first.
-        let date_key = |p: &object_store::path::Path| {
-            let s = p.as_ref();
-            s.find("date=").and_then(|i| s.get(i + 5..i + 15)).unwrap_or("").to_string()
-        };
-        let mut paths = paths;
-        paths.sort_by_key(|(p, _)| date_key(p));
 
         let count = paths.len();
         // Baseline the cache stats *before* warming: the warm GETs are all
@@ -4392,6 +4399,36 @@ mod writer_properties_tests {
         let kv = p.key_value_metadata().expect("KV metadata present");
         let tier = kv.iter().find(|k| k.key == COMPRESSION_TIER_KEY).expect("tier key present");
         assert_eq!(tier.value.as_deref(), Some("15"));
+    }
+
+    // Pins the warm_all_footers default: non-recent files stay in the warm
+    // set as footer-only (recent=false), oldest partition first; with the
+    // flag off they are dropped entirely.
+    #[test]
+    fn select_warm_paths_pins_warm_all_footers_default() {
+        let prefix = "s3://bucket/timefusion/default/otel";
+        let uris = vec![
+            format!("{prefix}/project_id=p/date=2099-01-01/new.parquet"),
+            format!("{prefix}/project_id=p/date=2020-01-01/old.parquet"),
+            format!("{prefix}/project_id=p/date=2099-01-02/checkpoint.json"),
+            "s3://elsewhere/unrelated.parquet".to_string(),
+        ];
+        let cutoff = Some(chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+
+        let (paths, dropped) = select_warm_paths(uris.clone(), prefix, true, cutoff);
+        assert_eq!(dropped, 1, "prefix-mismatched URI counted as dropped");
+        let got: Vec<(&str, bool)> = paths.iter().map(|(p, r)| (p.as_ref(), *r)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("project_id=p/date=2020-01-01/old.parquet", false), // footer-only, warms first
+                ("project_id=p/date=2099-01-01/new.parquet", true),
+            ]
+        );
+
+        let (paths, _) = select_warm_paths(uris, prefix, false, cutoff);
+        assert_eq!(paths.len(), 1, "warm_all_footers=false drops non-recent files");
+        assert!(paths[0].0.as_ref().contains("date=2099-01-01"));
     }
 
     #[test]
