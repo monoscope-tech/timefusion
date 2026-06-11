@@ -717,20 +717,15 @@ impl BufferedWriteLayer {
     }
 
     async fn run_wal_gc_task(&self) {
-        // Run at a small multiple of retention so a single missed sweep
-        // doesn't leave files past their useful life on disk for long.
-        let retention_secs = self.config.buffer.retention_mins() * 60;
-        let interval = Duration::from_secs(retention_secs.max(60));
-        let max_age = Duration::from_secs(retention_secs * 2);
+        // Sweep immediately, then every 10 minutes. The walk touches at most
+        // a few dozen files, and waiting a full retention period before the
+        // first sweep meant a process that restarted faster than that never
+        // reclaimed anything — the 2026-06-11 crash loop (10-min OOM kills)
+        // re-accumulated 30GB this way despite this task existing.
+        const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+        let max_age = self.config.buffer.wal_gc_max_age();
         let wal_dir = self.wal.data_dir().clone();
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                _ = self.shutdown.cancelled() => {
-                    info!("WAL GC task shutting down");
-                    break;
-                }
-            }
             let dir = wal_dir.clone();
             // Filesystem walk is sync — push to a blocking thread so we
             // don't stall the runtime if the dir got huge before this fix
@@ -739,10 +734,20 @@ impl BufferedWriteLayer {
             match res {
                 Ok(Ok((deleted, bytes_freed))) if deleted > 0 => {
                     info!("WAL GC: deleted {} stale files, freed {} bytes", deleted, bytes_freed);
+                    if let Some(m) = crate::metrics::registry() {
+                        m.wal_gc_deleted_files.add(deleted, &[]);
+                    }
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => warn!("WAL GC error: {}", e),
                 Err(e) => warn!("WAL GC task panicked: {}", e),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(SWEEP_INTERVAL) => {}
+                _ = self.shutdown.cancelled() => {
+                    info!("WAL GC task shutting down");
+                    break;
+                }
             }
         }
     }

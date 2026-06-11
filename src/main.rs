@@ -113,14 +113,13 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // optional `TIMEFUSION_TANTIVY_INDEXED_TABLES` override). The query layer
     // accelerates standard SQL predicates (`=`, `LIKE 'prefix%'`) via the
     // TantivyPredicateRewriter — callers don't need to know tantivy exists.
-    // Pre-init WAL GC: delete files past 2× retention before walrus opens
-    // the dir. Walrus' own GC bookkeeping (FileStateTracker) is per-process
-    // and forgets every file written by prior processes — without this
-    // sweep, accumulated leaks dominate startup (prod hit 467 GB / 12-min
-    // startup on 2026-06-09).
+    // Pre-init WAL GC: delete dead files before walrus opens the dir.
+    // Walrus' own GC bookkeeping (FileStateTracker) is per-process and
+    // forgets every file written by prior processes — without this sweep,
+    // accumulated leaks dominate startup (prod hit 467 GB / 12-min startup
+    // on 2026-06-09).
     let t_gc = std::time::Instant::now();
-    let gc_max_age = Duration::from_secs(cfg.buffer.retention_mins() * 60 * 2);
-    match timefusion::wal::gc_wal_files(&cfg.core.wal_dir(), gc_max_age) {
+    match timefusion::wal::gc_wal_files(&cfg.core.wal_dir(), cfg.buffer.wal_gc_max_age()) {
         Ok((deleted, bytes_freed)) => info!(
             "bootstrap.phase=wal_gc deleted={deleted} bytes_freed={bytes_freed} elapsed_ms={}",
             t_gc.elapsed().as_millis()
