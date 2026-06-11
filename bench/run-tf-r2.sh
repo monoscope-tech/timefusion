@@ -19,12 +19,14 @@ set -a; source .env; set +a
 if [ "${R2:-0}" = "1" ]; then
   # Everything (endpoint incl. account hash, bucket, creds) comes from the
   # gitignored .env.cloudlfare — never inline R2 account URLs in this public repo.
+  [ -f .env.cloudlfare ] || { echo "R2=1 requires ./.env.cloudlfare (gitignored R2 config)"; exit 1; }
   export AWS_S3_ENDPOINT="$(grep '^AWS_S3_ENDPOINT=' .env.cloudlfare | head -1 | cut -d= -f2)"
   export AWS_S3_BUCKET="$(grep '^AWS_S3_BUCKET=' .env.cloudlfare | head -1 | cut -d= -f2)"
   export AWS_ACCESS_KEY_ID="$(grep '^AWS_ACCESS_KEY_ID=' .env.cloudlfare | head -1 | cut -d= -f2)"
   export AWS_SECRET_ACCESS_KEY="$(grep '^AWS_SECRET_ACCESS_KEY=' .env.cloudlfare | head -1 | cut -d= -f2)"
   export AWS_REGION="$(grep '^AWS_REGION=' .env.cloudlfare | head -1 | cut -d= -f2)"
 else
+  [ -f ../monoscope/.env.prod ] || { echo "OVH mode requires ../monoscope/.env.prod for S3 creds (or use R2=1)"; exit 1; }
   export AWS_S3_ENDPOINT="https://s3.de.io.cloud.ovh.net/"
   export AWS_S3_BUCKET="rrweb"
   export AWS_ACCESS_KEY_ID="$(grep '^S3_ACCESS_KEY' ../monoscope/.env.prod | cut -d= -f2)"

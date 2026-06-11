@@ -26,6 +26,7 @@ STATE = ROOT / "data" / "query_latency_state.json"
 PID = "qlat-bench-project"
 N_ROWS = 20000
 WINDOW_H = 12  # spread rows over the last 12 hours
+INSERT_BATCH = 700  # 88 cols x 700 = 61.6k params < 65535 pgwire limit
 
 
 def seed():
@@ -44,7 +45,7 @@ def seed():
     base_sql = f"INSERT INTO otel_logs_and_spans ({', '.join(COLUMNS)}) VALUES "
     t0 = time.perf_counter()
     with psycopg.connect(URL, autocommit=True) as c, c.cursor() as cur:
-        B = 700  # 88 cols × 700 = 61.6k params < 65535 pgwire limit
+        B = INSERT_BATCH
         for i in range(0, len(rows), B):
             batch = rows[i : i + B]
             flat = [_to_pg(col, r.get(col)) for r in batch for col in COLUMNS]
@@ -107,7 +108,7 @@ def seed_scale():
                     ts = day_end - step * i
                     r["timestamp"] = ts.isoformat()
                     r["date"] = ts.date().isoformat()
-                B = 700
+                B = INSERT_BATCH
                 for i in range(0, len(rows), B):
                     batch = rows[i : i + B]
                     flat = [_to_pg(col, r.get(col)) for r in batch for col in COLUMNS]
@@ -167,7 +168,7 @@ def run(n_iter=15):
                 times.append((time.perf_counter() - t) * 1000)
         times_w = sorted(times[2:])  # drop 2 cold
         p50 = statistics.median(times_w)
-        p95 = times_w[int(len(times_w) * 0.95) - 1]
+        p95 = times_w[max(0, int(len(times_w) * 0.95) - 1)]
         print(f"{name:<24} {p50:8.1f} {p95:8.1f} {times_w[0]:8.1f} {times_w[-1]:8.1f}")
 
     # Same but on a single reused connection (separates conn setup from query cost).

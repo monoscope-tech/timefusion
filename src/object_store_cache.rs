@@ -921,7 +921,9 @@ impl FoyerObjectStoreCache {
             // misses and a pre-warmed cold partition still paid 1-2 S3 RTTs
             // of metadata latency (300 ms+ observed against OVH).
             let warm_start = file_size.saturating_sub(metadata_size_hint);
-            for candidate in [0, warm_start] {
+            // When warm_start == 0 the two candidate ranges coincide; probe once.
+            let candidates: &[u64] = if warm_start == 0 { &[0] } else { &[0, warm_start] };
+            for &candidate in candidates {
                 if candidate <= range.start && range.end <= file_size {
                     let key = Self::make_range_cache_key(location, &(candidate..file_size));
                     if let Ok(Some(entry)) = self.metadata_cache.get(&key).await {
@@ -936,9 +938,6 @@ impl FoyerObjectStoreCache {
                             return Ok(sliced);
                         }
                     }
-                }
-                if candidate == warm_start {
-                    break; // both probes identical when warm_start == 0
                 }
             }
 

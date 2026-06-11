@@ -12,3 +12,4 @@ dis-newstyle
 .DS_Store
 wal_files/
 bench/__pycache__/
+bench/data/query_latency_state.json

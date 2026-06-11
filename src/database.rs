@@ -2200,13 +2200,19 @@ impl Database {
                 let t = std::time::Instant::now();
                 match db.resolve_table("default", &table_name).await {
                     Ok(table_ref) => {
-                        let uris: Vec<String> = table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                        // Warm via the already-resolved handle — warm_cache_for_table
+                        // would redundantly resolve_table a second time.
+                        let (uris, store, table_uri) = {
+                            let table = table_ref.read().await;
+                            let uris: Vec<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                            (uris, table.log_store().object_store(None), table.table_url().to_string())
+                        };
                         info!(
                             "bootstrap.phase=table_preload table={table_name} files={} elapsed_ms={}",
                             uris.len(),
                             t.elapsed().as_millis()
                         );
-                        db.warm_cache_for_table("default", &table_name, uris);
+                        db.warm_cache_for_uris(store, table_uri, uris).await;
                     }
                     Err(e) => info!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                 }
@@ -2496,7 +2502,14 @@ impl Database {
                     // Freshly-flushed files are the ones dashboards query next;
                     // without this they're read cold from S3 until something else
                     // warms them (repeat queries measured ~300 ms vs 8 ms warm on R2).
-                    self.warm_cache_for_table(&project_id, &table_name, added.clone());
+                    // Gated on `watermark` (only the BufferedWriteLayer flush path
+                    // sets it): direct inserts — tests, tools — must not spawn
+                    // detached warm tasks, whose in-flight connections outlive a
+                    // short-lived runtime and poison the shared client pool for
+                    // the next test's S3 reads ("error sending request" in µs).
+                    if watermark.is_some() {
+                        self.warm_cache_for_table(&project_id, &table_name, added.clone());
+                    }
                     self.statistics_extractor.invalidate(&project_id, &table_name).await;
                     debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
 
@@ -2902,7 +2915,7 @@ impl Database {
                 // un-warmed and the tombstoned ones cached — the next query
                 // on a recompressed partition paid full S3 reads (1.5 s
                 // observed against OVH).
-                let _ = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                 Ok(())
             }
             Err(e) => {
@@ -3006,8 +3019,7 @@ impl Database {
                     // outputs are stone-cold and the next query on the
                     // partition pays full S3 metadata+data reads (1.5 s
                     // observed against OVH).
-                    let added: Vec<String> =
-                        new_table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
+                    let added: Vec<String> = new_table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
                     *table_ref.write().await = new_table;
                     self.warm_cache_for_table(project_id, table_name, added);
                     crate::metrics::record_compaction_dedup_dropped(dropped);
@@ -3180,7 +3192,7 @@ impl Database {
                     // Swap the optimized table in and refresh the cache (warm
                     // freshly-compacted files, evict the small files just
                     // tombstoned) via the shared helper.
-                    let _ = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                    self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                     return Ok(());
                 }
                 Err(e) => {

@@ -215,10 +215,8 @@ mod tests {
     use super::*;
 
     fn ctx_with_rule() -> SessionContext {
-        let rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> = vec![
-            Arc::new(PgArrayLiteralRewriter),
-            Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
-        ];
+        let rules: Vec<Arc<dyn AnalyzerRule + Send + Sync>> =
+            vec![Arc::new(PgArrayLiteralRewriter), Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new())];
         let state = SessionStateBuilder::new().with_default_features().with_analyzer_rules(rules).build();
         let ctx = SessionContext::new_with_state(state);
         ctx.register_udf(datafusion::logical_expr::ScalarUDF::from(PgCoalesceUdf::default()));
