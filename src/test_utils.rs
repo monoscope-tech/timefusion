@@ -65,13 +65,24 @@ pub mod test_helpers {
     /// Point walrus-rust at the test's data dir, restoring the prior value on
     /// drop — including on panic, so a failed `#[serial]` test can't leak the
     /// var into the next one. SAFETY: `set_var` is racy if another thread
-    /// reads the env concurrently; callers must hold `#[serial]`.
+    /// reads the env concurrently; callers must hold `#[serial]` — enforced
+    /// at runtime by the held-flag assert below, so a forgotten `#[serial]`
+    /// fails loudly instead of racing silently.
     pub fn walrus_env_guard(dir: &std::path::Path) -> impl Drop {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static HELD: AtomicBool = AtomicBool::new(false);
+        assert!(
+            !HELD.swap(true, Ordering::SeqCst),
+            "walrus_env_guard already held by another test — add #[serial] to the caller"
+        );
         let prev = std::env::var_os("WALRUS_DATA_DIR");
         unsafe { std::env::set_var("WALRUS_DATA_DIR", dir) };
-        scopeguard::guard(prev, |prev| match prev {
-            Some(v) => unsafe { std::env::set_var("WALRUS_DATA_DIR", v) },
-            None => unsafe { std::env::remove_var("WALRUS_DATA_DIR") },
+        scopeguard::guard(prev, |prev| {
+            match prev {
+                Some(v) => unsafe { std::env::set_var("WALRUS_DATA_DIR", v) },
+                None => unsafe { std::env::remove_var("WALRUS_DATA_DIR") },
+            }
+            HELD.store(false, Ordering::SeqCst);
         })
     }
 
