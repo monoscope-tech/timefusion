@@ -12,6 +12,14 @@
 //! literal, the literal is re-parsed as a PG array literal of the list's
 //! element type. Only string element types are handled (the schema's arrays
 //! are all `VARCHAR[]`); anything else is left for TypeCoercion to report.
+//!
+//! Known divergences from PG (each pinned by a test):
+//! - a string COLUMN coalesced with a list wraps into a one-element list
+//!   (PG errors) — see `coalesce_string_column_with_list_wraps_…`.
+//! - malformed quoting (`{"a"x,b}`, `{a"b"}`) parses leniently (PG errors)
+//!   — see `pg_array_parse_shapes`.
+//! - multi-dimensional literals are rejected → arg left untouched, original
+//!   TypeCoercion error surfaces (PG supports them; schema is 1-D only).
 
 use std::sync::Arc;
 
@@ -196,6 +204,9 @@ fn pg_elems_to_list(elems: Vec<Option<String>>, elem_type: &DataType) -> Option<
 /// contains unquoted nested braces (multi-dimensional arrays like
 /// `{{a},{b}}` — the schema is 1-D only, and misparsing the inner braces as
 /// element text would be silently wrong; bail so the arg is left untouched).
+/// Malformed quoting parses leniently rather than strictly: bailing would
+/// only swap one error (this rewrite skipped → TypeCoercion's) for another,
+/// while leniency keeps stable-but-sloppy client literals working.
 fn parse_pg_string_array(s: &str) -> Option<Vec<Option<String>>> {
     let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
     if inner.trim().is_empty() {

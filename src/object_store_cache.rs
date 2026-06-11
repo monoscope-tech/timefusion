@@ -939,7 +939,7 @@ impl FoyerObjectStoreCache {
                             self.update_metadata_stats(|st| st.hits += 1).await;
                             span.record("cache_hit", true);
                             span.record("is_metadata", true);
-                            let sliced = Bytes::from(value.data[s..e].to_vec());
+                            let sliced = Bytes::copy_from_slice(&value.data[s..e]);
                             self.maybe_touch(&self.metadata_cache, &key, entry.clone(), 0);
                             return Ok(sliced);
                         }

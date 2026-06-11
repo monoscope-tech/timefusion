@@ -2228,7 +2228,9 @@ impl Database {
         // Tables preload concurrently — a slow object-store round-trip on one
         // must not delay the others' first-query readiness. Per-file warm
         // concurrency inside warm_cache_for_uris is already bounded, so the
-        // fan-out here is one in-flight snapshot load per registered table.
+        // fan-out here is one in-flight snapshot load per registered table —
+        // fine while the registry stays small (a handful of YAML schemas);
+        // bound this with a semaphore if it ever grows to dozens.
         for table_name in crate::schema_loader::registry().list_tables() {
             let db = Arc::clone(self);
             let shutdown = self.maintenance_shutdown.clone();
