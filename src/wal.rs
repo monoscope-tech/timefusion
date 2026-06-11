@@ -1115,14 +1115,10 @@ mod tests {
         let n_cols = 30;
         let n_rows = 50;
         let payload: Vec<String> = (0..n_rows).map(|i| format!("{i:0>100}")).collect();
-        let mut fields =
-            vec![Field::new("ts", DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())), false)];
-        fields.extend(
-            (0..n_cols).map(|i| Field::new(format!("c{i}"), if i % 2 == 0 { DataType::Utf8View } else { DataType::Utf8 }, true)),
-        );
+        let mut fields = vec![Field::new("ts", DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())), false)];
+        fields.extend((0..n_cols).map(|i| Field::new(format!("c{i}"), if i % 2 == 0 { DataType::Utf8View } else { DataType::Utf8 }, true)));
         let ts = chrono::Utc::now().timestamp_micros();
-        let mut cols: Vec<ArrayRef> =
-            vec![Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![ts; n_rows]).with_timezone("UTC"))];
+        let mut cols: Vec<ArrayRef> = vec![Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![ts; n_rows]).with_timezone("UTC"))];
         let strs: Vec<&str> = payload.iter().map(|s| s.as_str()).collect();
         cols.extend((0..n_cols).map(|i| -> ArrayRef {
             if i % 2 == 0 {
