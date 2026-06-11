@@ -3187,9 +3187,8 @@ impl Database {
         } else {
             // No timestamp dedup key → can't chunk safely; whole-partition
             // rewrite, gated on the same any-dupes probe.
-            let probe = format!(
-                "SELECT coalesce(sum(c - 1), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS g WHERE c > 1"
-            );
+            let probe =
+                format!("SELECT coalesce(sum(c - 1), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {filter} GROUP BY {keys_csv}) AS g WHERE c > 1");
             let dup_rows = ctx
                 .sql(&probe)
                 .await?
@@ -3199,7 +3198,11 @@ impl Database {
                 .filter(|b| b.num_rows() > 0)
                 .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0)))
                 .unwrap_or(0);
-            if dup_rows <= 0 { Vec::new() } else { vec![(filter.clone(), format!("project_id = '{safe_pid}' AND date = '{date_str}'"))] }
+            if dup_rows <= 0 {
+                Vec::new()
+            } else {
+                vec![(filter.clone(), format!("project_id = '{safe_pid}' AND date = '{date_str}'"))]
+            }
         };
         if chunks.is_empty() {
             return Ok(0);
