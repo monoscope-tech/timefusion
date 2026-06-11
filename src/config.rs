@@ -451,6 +451,13 @@ impl BufferConfig {
     pub fn retention_mins(&self) -> u64 {
         self.timefusion_buffer_retention_mins.max(1)
     }
+    /// Age past which a WAL file is dead weight: `recover_from_wal` skips
+    /// entries older than `retention_mins`, so anything last written before
+    /// that (plus slack for clock skew / an in-flight flush) can never be
+    /// replayed. Shared by the boot-time and runtime GC passes.
+    pub fn wal_gc_max_age(&self) -> Duration {
+        Duration::from_secs((self.retention_mins() + 20) * 60)
+    }
     pub fn eviction_interval_secs(&self) -> u64 {
         self.timefusion_eviction_interval_secs.max(1)
     }

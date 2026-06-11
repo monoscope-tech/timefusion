@@ -62,6 +62,7 @@ counter_registry! {
     ingest_rows                => "timefusion.ingest.rows": "Rows accepted into MemBuffer",
     ingest_errors              => "timefusion.ingest.errors": "Ingest call failures",
     wal_corruption             => "timefusion.wal.corruption_events": "WAL entries that failed to deserialize or replay",
+    wal_gc_deleted_files       => "timefusion.wal.gc_deleted_files": "Stale WAL files reclaimed by the mtime reaper (walrus leaks files across restarts)",
     flush_completed            => "timefusion.flush.completed": "Flush cycles that committed to Delta",
     flush_failed               => "timefusion.flush.failed": "Flush cycles that errored",
     query_executions           => "timefusion.query.executions": "SQL query plans executed",
