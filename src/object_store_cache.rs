@@ -913,6 +913,35 @@ impl FoyerObjectStoreCache {
             let file_size = file_meta.size;
             let metadata_size_hint = self.config.parquet_metadata_size_hint as u64;
 
+            // Containment probe against the two ranges `warm_footer` can have
+            // populated: the suffix tail (size-hint..size) and — for files
+            // smaller than the hint — the whole file (0..size). The reader's
+            // own footer reads (8-byte tail, then the parsed metadata range)
+            // never equal those keys exactly, so the exact-key probe above
+            // misses and a pre-warmed cold partition still paid 1-2 S3 RTTs
+            // of metadata latency (300 ms+ observed against OVH).
+            let warm_start = file_size.saturating_sub(metadata_size_hint);
+            for candidate in [0, warm_start] {
+                if candidate <= range.start && range.end <= file_size {
+                    let key = Self::make_range_cache_key(location, &(candidate..file_size));
+                    if let Ok(Some(entry)) = self.metadata_cache.get(&key).await {
+                        let value = entry.value();
+                        let (s, e) = ((range.start - candidate) as usize, (range.end - candidate) as usize);
+                        if !value.is_expired(self.config.ttl) && e <= value.data.len() {
+                            self.update_metadata_stats(|st| st.hits += 1).await;
+                            span.record("cache_hit", true);
+                            span.record("is_metadata", true);
+                            let sliced = Bytes::from(value.data[s..e].to_vec());
+                            self.maybe_touch(&self.metadata_cache, &key, entry.clone(), 0);
+                            return Ok(sliced);
+                        }
+                    }
+                }
+                if candidate == warm_start {
+                    break; // both probes identical when warm_start == 0
+                }
+            }
+
             // Check if this is likely a metadata request (reading from near the end of the file)
             let is_metadata_request = range.start >= file_size.saturating_sub(metadata_size_hint);
             span.record("is_metadata", is_metadata_request);

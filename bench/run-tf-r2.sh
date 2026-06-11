@@ -24,7 +24,7 @@ export AWS_REGION="de"
 export AWS_ALLOW_HTTP="false"
 export TIMEFUSION_TABLE_PREFIX="tf-qlat-bench"
 export TIMEFUSION_DATA_DIR="$data_dir"
-export RUST_LOG=warn,timefusion=info
+export RUST_LOG="${RUST_LOG_OVERRIDE:-warn,timefusion=info}"
 export TIMEFUSION_FLUSH_INTERVAL_SECS=60
 export TIMEFUSION_BUFFER_MAX_MEMORY_MB=2048
 export TIMEFUSION_ALLOW_INSECURE_AUTH=true
