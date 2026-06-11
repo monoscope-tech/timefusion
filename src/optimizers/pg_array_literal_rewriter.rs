@@ -110,6 +110,11 @@ impl AnalyzerRule for PgArrayLiteralRewriter {
 
 fn rewrite_in_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let input_schemas: Vec<_> = plan.inputs().iter().map(|i| i.schema().clone()).collect();
+    // Leaf nodes (TableScan etc.) are skipped: COALESCE over a list column
+    // reaches us inside Projection/Filter nodes ABOVE the scan, whose input
+    // schemas type the column. If a future rule ever pushes such an expr into
+    // a TableScan's own filter list, it would skip this rewrite and surface
+    // the original TypeCoercion error — extend this to use plan.schema() then.
     if input_schemas.is_empty() {
         return Ok(Transformed::no(plan));
     }

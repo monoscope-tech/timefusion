@@ -2194,9 +2194,13 @@ impl Database {
     /// replay + parquet footer reads inline (measured 1.4 s cold vs 13 ms
     /// warm against OVH S3 for a single-partition random-access lookup).
     pub fn preload_tables(self: &Arc<Self>) {
-        let db = Arc::clone(self);
-        tokio::spawn(async move {
-            for table_name in crate::schema_loader::registry().list_tables() {
+        // Tables preload concurrently — a slow object-store round-trip on one
+        // must not delay the others' first-query readiness. Per-file warm
+        // concurrency inside warm_cache_for_uris is already bounded, so the
+        // fan-out here is one in-flight snapshot load per registered table.
+        for table_name in crate::schema_loader::registry().list_tables() {
+            let db = Arc::clone(self);
+            tokio::spawn(async move {
                 let t = std::time::Instant::now();
                 match db.resolve_table("default", &table_name).await {
                     Ok(table_ref) => {
@@ -2216,8 +2220,8 @@ impl Database {
                     }
                     Err(e) => info!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                 }
-            }
-        });
+            });
+        }
     }
 
     /// Atomically swap a freshly-optimized `new_table` in under the write lock,

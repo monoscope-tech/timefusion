@@ -170,7 +170,7 @@ def run(n_iter=15):
                 times.append((time.perf_counter() - t) * 1000)
         times_w = sorted(times[2:])  # drop 2 cold
         p50 = statistics.median(times_w)
-        p95 = times_w[max(0, int(len(times_w) * 0.95) - 1)]
+        p95 = times_w[min(len(times_w) - 1, int(len(times_w) * 0.95))]
         print(f"{name:<24} {p50:8.1f} {p95:8.1f} {times_w[0]:8.1f} {times_w[-1]:8.1f}")
 
     # Same but on a single reused connection (separates conn setup from query cost).

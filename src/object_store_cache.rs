@@ -922,6 +922,9 @@ impl FoyerObjectStoreCache {
             // of metadata latency (300 ms+ observed against OVH).
             let warm_start = file_size.saturating_sub(metadata_size_hint);
             // When warm_start == 0 the two candidate ranges coincide; probe once.
+            // candidate=0 also means files smaller than the hint are fully
+            // cached here by warm_footer — any in-bounds read (including data
+            // pages) is intentionally served from the metadata cache.
             let candidates: &[u64] = if warm_start == 0 { &[0] } else { &[0, warm_start] };
             for &candidate in candidates {
                 if candidate <= range.start && range.end <= file_size {
