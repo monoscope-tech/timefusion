@@ -36,6 +36,11 @@ else
   export AWS_SECRET_ACCESS_KEY="$(grep '^S3_SECRET_KEY' "$monoscope_env" | cut -d= -f2-)"
   export AWS_REGION="de"
 fi
+# Fail fast on a key that grep'd to empty (absent/renamed in the env file) —
+# otherwise the bench dies later with a cryptic AWS auth error.
+for v in AWS_S3_ENDPOINT AWS_S3_BUCKET AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION; do
+  [ -n "${!v}" ] || { echo "missing $v in the sourced env file"; exit 1; }
+done
 export AWS_ALLOW_HTTP="false"
 export TIMEFUSION_TABLE_PREFIX="tf-qlat-bench"
 export TIMEFUSION_DATA_DIR="$data_dir"

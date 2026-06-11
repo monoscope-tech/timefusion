@@ -22,7 +22,7 @@ use tokio::{
     sync::{Mutex, RwLock},
     task::JoinSet,
 };
-use tracing::{Instrument, debug, field::Empty, info, instrument};
+use tracing::{Instrument, debug, field::Empty, info, instrument, warn};
 
 /// Cache entry with metadata and TTL
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +296,15 @@ impl SharedFoyerCache {
             config.metadata_disk_size_bytes / 1024 / 1024 / 1024,
             config.ttl.as_secs()
         );
+        // A sub-5-minute TTL is almost certainly a debug leftover (a real one
+        // shipped in .env once): every idle partition re-cold-starts after
+        // expiry, silently erasing the entire warm-path win.
+        if config.ttl < std::time::Duration::from_secs(300) {
+            warn!(
+                "Foyer TTL is only {}s — cached footers expire between queries; set TIMEFUSION_FOYER_TTL_SECONDS higher unless debugging",
+                config.ttl.as_secs()
+            );
+        }
 
         std::fs::create_dir_all(&config.cache_dir)?;
         let metadata_cache_dir = config.cache_dir.join("metadata");
@@ -1469,6 +1478,39 @@ mod tests {
     use object_store::{ObjectStoreExt, memory::InMemory};
 
     use super::*;
+
+    // Locks in the containment-probe slice math in get_range_cached: a strict
+    // sub-range of the warmed (size-hint..size) footer never equals the warm
+    // key, so only the containment probe can serve it without an inner fetch.
+    #[tokio::test]
+    async fn containment_probe_serves_subrange_of_warmed_footer() -> anyhow::Result<()> {
+        let inner = Arc::new(InMemory::new());
+        // The probe computes its candidate key from the CONFIG's size hint, so
+        // the warm call below must use the same value (as prod does — both
+        // read config.cache.timefusion_parquet_metadata_size_hint).
+        let hint = 1024u64;
+        let cfg = FoyerCacheConfig::test_config_with("containment_probe", |c| c.parquet_metadata_size_hint = hint as usize);
+        let cache = FoyerObjectStoreCache::new(inner.clone(), cfg).await?;
+        let path = Path::from("tbl/date=2026-01-01/part.parquet");
+        let data = Bytes::from((0..4096u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+        // Put via the inner store so nothing is cached from a write payload.
+        inner.put(&path, PutPayload::from(data.clone())).await?;
+
+        // file (4096B) > hint → warm key is (3072..4096)
+        assert!(warm_footer(&cache, &path, hint).await, "footer warm must succeed");
+
+        let before = cache.get_stats().await;
+        let r = 3100u64..3500u64;
+        let got = cache.get_range(&path, r.clone()).await?;
+        assert_eq!(got, data.slice(r.start as usize..r.end as usize), "containment slice math");
+
+        let after = cache.get_stats().await;
+        assert_eq!(after.metadata.hits, before.metadata.hits + 1, "served by the containment probe");
+        assert_eq!(after.metadata.inner_gets, before.metadata.inner_gets, "no inner fetch after warm");
+
+        cache.shutdown().await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_basic_operations() -> anyhow::Result<()> {

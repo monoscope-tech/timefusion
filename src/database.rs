@@ -273,7 +273,8 @@ fn select_warm_paths(
         let s = p.as_ref();
         s.find("date=").and_then(|i| s.get(i + 5..i + 15)).unwrap_or("").to_string()
     };
-    paths.sort_by_key(|(p, _)| date_key(p));
+    // cached_key: one allocation per path, not one per comparison.
+    paths.sort_by_cached_key(|(p, _)| date_key(p));
     (paths, dropped)
 }
 
@@ -2128,6 +2129,10 @@ impl Database {
         // Labelled scope rather than `full=true/false` so warm logs are easy to
         // filter (e.g. in Loki) by what was actually primed.
         let scope = if warm_full_files { "full" } else { "footer-only" };
+        // Surface the burst size up front so operators can see what a restart
+        // is about to issue against S3 (the completion log alone can't —
+        // a large warm set takes minutes to get there).
+        info!("Cache warm start: {count} files (scope={scope}, concurrency={concurrency})");
         futures::stream::iter(paths)
             .for_each_concurrent(concurrency, |(path, recent)| {
                 let store = object_store.clone();
@@ -2569,8 +2574,15 @@ impl Database {
                     if watermark.is_some() {
                         let db = self.clone();
                         let warm_added = added.clone();
+                        let shutdown = self.maintenance_shutdown.clone();
                         tokio::spawn(async move {
-                            db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added).await;
+                            // Abandon on shutdown (same as preload_tables): the
+                            // detached warm must not issue S3 GETs against a
+                            // draining client pool during a fast restart.
+                            tokio::select! {
+                                _ = shutdown.cancelled() => {}
+                                _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added) => {}
+                            }
                         });
                     }
                     self.statistics_extractor.invalidate(&project_id, &table_name).await;
