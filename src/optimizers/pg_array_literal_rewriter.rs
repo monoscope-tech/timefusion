@@ -58,6 +58,9 @@ pub struct PgCoalesceUdf {
 /// against, compared at compile time to `datafusion::DATAFUSION_VERSION`.
 /// A `cargo update` of datafusion breaks the build here on purpose:
 /// re-audit `ScalarUDFImpl` for new methods, forward them above, then bump.
+/// Maintenance invariant: DATAFUSION_VERSION resolves through the delta-rs
+/// fork's patched graph — the fork must not bump it independently of the
+/// workspace pin, or this check would pass against the wrong version.
 const AUDITED_DATAFUSION_VERSION: &str = "53.1.0";
 const _: () = {
     let (a, b) = (datafusion::DATAFUSION_VERSION.as_bytes(), AUDITED_DATAFUSION_VERSION.as_bytes());

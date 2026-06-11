@@ -72,7 +72,7 @@ pub mod test_helpers {
         use std::sync::atomic::{AtomicBool, Ordering};
         static HELD: AtomicBool = AtomicBool::new(false);
         assert!(
-            !HELD.swap(true, Ordering::SeqCst),
+            !HELD.swap(true, Ordering::Acquire),
             "walrus_env_guard already held by another test — add #[serial] to the caller"
         );
         let prev = std::env::var_os("WALRUS_DATA_DIR");
@@ -84,7 +84,7 @@ pub mod test_helpers {
                 Some(v) => unsafe { std::env::set_var("WALRUS_DATA_DIR", v) },
                 None => unsafe { std::env::remove_var("WALRUS_DATA_DIR") },
             }
-            HELD.store(false, Ordering::SeqCst);
+            HELD.store(false, Ordering::Release);
         });
         unsafe { std::env::set_var("WALRUS_DATA_DIR", dir) };
         guard
