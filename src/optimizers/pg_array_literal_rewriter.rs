@@ -55,7 +55,8 @@ pub struct PgCoalesceUdf {
 }
 
 /// DataFusion version `PgCoalesceUdf`'s method forwarding was last audited
-/// against. A `cargo update` of datafusion breaks the build here on purpose:
+/// against, compared at compile time to `datafusion::DATAFUSION_VERSION`.
+/// A `cargo update` of datafusion breaks the build here on purpose:
 /// re-audit `ScalarUDFImpl` for new methods, forward them above, then bump.
 const AUDITED_DATAFUSION_VERSION: &str = "53.1.0";
 const _: () = {

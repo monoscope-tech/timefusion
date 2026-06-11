@@ -1496,7 +1496,9 @@ mod tests {
         // Put via the inner store so nothing is cached from a write payload.
         inner.put(&path, PutPayload::from(data.clone())).await?;
 
-        // file (4096B) > hint → warm key is (3072..4096)
+        // file (4096B) > hint → warm key is (3072..4096). Warm through &cache
+        // (not &*inner) deliberately: prod warms through the caching layer, so
+        // this also covers the suffix-GET path that populates the range key.
         assert!(warm_footer(&cache, &path, hint).await, "footer warm must succeed");
 
         let before = cache.get_stats().await;
