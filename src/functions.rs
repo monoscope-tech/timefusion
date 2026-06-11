@@ -930,14 +930,14 @@ fn create_json_build_array_udf() -> ScalarUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonBuildArrayUDF {
     signature: Signature,
-    aliases:   Vec<String>,
+    aliases: Vec<String>,
 }
 
 impl JsonBuildArrayUDF {
     fn new() -> Self {
         Self {
             signature: Signature::variadic_any(Volatility::Immutable),
-            aliases:   vec![],
+            aliases: vec![],
         }
     }
 }
@@ -1004,14 +1004,14 @@ fn create_to_json_udf() -> ScalarUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ToJsonUDF {
     signature: Signature,
-    aliases:   Vec<String>,
+    aliases: Vec<String>,
 }
 
 impl ToJsonUDF {
     fn new() -> Self {
         Self {
             signature: Signature::any(1, Volatility::Immutable),
-            aliases:   vec![],
+            aliases: vec![],
         }
     }
 }
@@ -1183,6 +1183,10 @@ macro_rules! push_json_primitive {
 
 /// Convert Arrow array to JSON values
 fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonValue>> {
+    array_to_json_values_inner(array, true)
+}
+
+fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion::error::Result<Vec<JsonValue>> {
     let mut values = Vec::with_capacity(array.len());
 
     match array.data_type() {
@@ -1196,8 +1200,10 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
                     values.push(JsonValue::Null);
                 } else {
                     let s = string_array.value(i);
-                    // Try to parse as JSON if it looks like JSON
-                    let val = if (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']')) {
+                    // Sniff JSON only at the top level: Variant/Utf8 columns holding JSON
+                    // (attributes, events) must surface as real JSON. Inside List(Utf8)
+                    // (e.g. summary text[]) PG keeps elements as JSON *strings*.
+                    let val = if sniff_json && ((s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'))) {
                         serde_json::from_str(s).unwrap_or_else(|_| JsonValue::String(s.to_string()))
                     } else {
                         JsonValue::String(s.to_string())
@@ -1236,7 +1242,7 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
                     values.push(JsonValue::Null);
                 } else {
                     let array_ref = list_array.value(i);
-                    let inner_values = array_to_json_values(&array_ref)?;
+                    let inner_values = array_to_json_values_inner(&array_ref, false)?;
                     values.push(JsonValue::Array(inner_values));
                 }
             }
@@ -1244,7 +1250,7 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
         _ => {
             // For other types, try to convert to string
             let string_array = datafusion::arrow::compute::cast(array, &DataType::Utf8View)?;
-            return array_to_json_values(&string_array);
+            return array_to_json_values_inner(&string_array, sniff_json);
         }
     }
 
@@ -1951,6 +1957,27 @@ mod tests {
         let pm_batches = ctx.sql(pm_sql).await.unwrap().collect().await.unwrap();
         let pm_col = pm_batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
         assert_eq!(pm_col.value(0), "08:10 PM");
+    }
+
+    /// PG parity: `to_jsonb(text[])` produces an array of JSON *strings*. Elements
+    /// that happen to look like JSON (log bodies, attributes payloads in monoscope's
+    /// `summary` column) must NOT be re-parsed into objects/arrays — that broke the
+    /// log explorer's row renderer ("e.indexOf is not a function").
+    #[tokio::test]
+    async fn test_to_jsonb_text_array_elements_stay_strings() {
+        use datafusion::prelude::SessionContext;
+        let mut ctx = SessionContext::new();
+        register_custom_functions(&mut ctx).unwrap();
+        let sql = r#"SELECT to_jsonb(make_array('{"a":1}', '[1,2]', 'plain', '123')) AS s"#;
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+        assert_eq!(col.value(0), r#"["{\"a\":1}","[1,2]","plain","123"]"#);
+        // Top-level Utf8 scalars keep the JSON sniff: Variant/Utf8 columns holding
+        // JSON (attributes, events, links) rely on it to surface as real JSON.
+        let sql = r#"SELECT to_jsonb('{"a":1}') AS s"#;
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+        assert_eq!(col.value(0), r#"{"a":1}"#);
     }
 
     #[test]
