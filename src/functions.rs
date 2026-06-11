@@ -1237,6 +1237,10 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
         }
         DataType::List(_) => push_list_json::<i32>(array, &mut values)?,
         DataType::LargeList(_) => push_list_json::<i64>(array, &mut values)?,
+        DataType::FixedSizeList(field, _) => {
+            let as_list = datafusion::arrow::compute::cast(array, &DataType::List(field.clone()))?;
+            push_list_json::<i32>(&as_list, &mut values)?
+        }
         _ => {
             // For other types, try to convert to string
             let string_array = datafusion::arrow::compute::cast(array, &DataType::Utf8View)?;
@@ -1256,6 +1260,7 @@ fn push_list_json<O: datafusion::arrow::array::OffsetSizeTrait>(array: &ArrayRef
         if list_array.is_null(i) {
             values.push(JsonValue::Null);
         } else {
+            // Always sniff_json=false: PG's to_jsonb(text[]) keeps elements as JSON strings.
             values.push(JsonValue::Array(array_to_json_values_inner(&list_array.value(i), false)?));
         }
     }
@@ -1986,19 +1991,33 @@ mod tests {
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
         assert_eq!(col.value(0), r#"{"a":1}"#);
+        // to_json shares array_to_json_values, so the same rule applies — monoscope's
+        // selectChildSpansAndLogs emits to_json(summary).
+        let sql = r#"SELECT to_json(make_array('{"a":1}')) AS s"#;
+        let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+        let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+        assert_eq!(col.value(0), r#"["{\"a\":1}"]"#);
     }
 
-    /// LargeList must keep list structure (it used to fall through to the
-    /// cast-to-string arm) and its elements follow the same no-sniff rule.
+    /// LargeList and FixedSizeList must keep list structure (they used to fall
+    /// through to the cast-to-string arm) and follow the same no-sniff rule.
     #[test]
-    fn test_large_list_to_json_values() {
-        use datafusion::arrow::array::{GenericListBuilder, StringViewBuilder};
+    fn test_large_and_fixed_size_list_to_json_values() {
+        use datafusion::arrow::array::{FixedSizeListBuilder, GenericListBuilder, StringViewBuilder};
+        let expected = vec![serde_json::json!([r#"{"a":1}"#, "plain"])];
         let mut b = GenericListBuilder::<i64, _>::new(StringViewBuilder::new());
         b.values().append_value(r#"{"a":1}"#);
         b.values().append_value("plain");
         b.append(true);
         let arr: ArrayRef = Arc::new(b.finish());
-        assert_eq!(array_to_json_values(&arr).unwrap(), vec![serde_json::json!([r#"{"a":1}"#, "plain"])]);
+        assert_eq!(array_to_json_values(&arr).unwrap(), expected);
+
+        let mut b = FixedSizeListBuilder::new(StringViewBuilder::new(), 2);
+        b.values().append_value(r#"{"a":1}"#);
+        b.values().append_value("plain");
+        b.append(true);
+        let arr: ArrayRef = Arc::new(b.finish());
+        assert_eq!(array_to_json_values(&arr).unwrap(), expected);
     }
 
     #[test]
