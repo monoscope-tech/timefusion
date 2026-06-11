@@ -3304,8 +3304,7 @@ impl Database {
                         // while evaluating our predicate against a concurrent commit
                         // (seen in prod as "Failed to commit transaction: Error
                         // evaluating predicate") — rebasing on retry resolves it.
-                        let is_conflict =
-                            msg.contains("concurrent transaction") || msg.contains("Commit failed") || msg.contains("Transaction failed");
+                        let is_conflict = msg.contains("concurrent transaction") || msg.contains("Commit failed") || msg.contains("Transaction failed");
                         if !is_conflict || attempt + 1 == MAX_RETRIES {
                             return Err(anyhow::anyhow!("dedup_partition write failed: {}", e));
                         }
