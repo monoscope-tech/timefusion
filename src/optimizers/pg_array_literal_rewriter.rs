@@ -90,9 +90,10 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
             // fails on the second list and the original error surfaces — no
             // silent mis-typing, just a planner-time error like today.
             // NOTE: a real string COLUMN (not a literal) coalesced with a list
-            // also passes here, but the analyzer rule has no literal to
-            // rewrite, so the failure surfaces at execution (Utf8→List cast)
-            // instead of planning. Acceptable: PG errors on that query too.
+            // also passes here; with no literal to rewrite, TypeCoercion's
+            // Utf8→List cast wraps each value into a one-element list — a
+            // deliberate, pinned divergence from PG (which errors). See
+            // coalesce_string_column_with_list_wraps_into_single_element_list.
             let list_t = arg_types
                 .iter()
                 .find(|t| matches!(t, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)))
@@ -303,6 +304,9 @@ mod tests {
         // rejects these literals outright; we parse leniently and keep the
         // quoted value. Pinned so the behavior is intentional, not accidental.
         assert_eq!(parse_pg_string_array("{\"a\"x,b}"), Some(vec![Some("a".into()), Some("b".into())]));
+        // The mirror case — non-whitespace BEFORE an opening quote — is also
+        // PG-invalid; we leniently concatenate. Pinned for the same reason.
+        assert_eq!(parse_pg_string_array("{a\"b\"}"), Some(vec![Some("ab".into())]));
         // Multi-dimensional literals are rejected, not silently flattened;
         // braces inside quotes are ordinary element text.
         assert_eq!(parse_pg_string_array("{{a},{b}}"), None);

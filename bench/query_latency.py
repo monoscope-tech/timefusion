@@ -5,9 +5,11 @@
      — monoscope's lookupOtelRecord, sent with uuid + timestamptz params.
 
 Usage:
-  python3 bench/query_latency.py seed     # insert rows, spread over 12h, flush to Delta
-  python3 bench/query_latency.py run      # run latency suite against seeded data
-  python3 bench/query_latency.py explain  # EXPLAIN ANALYZE each query, dump to /tmp
+  python3 bench/query_latency.py seed        # insert rows, spread over 12h, flush to Delta
+  python3 bench/query_latency.py seed_scale  # prod-shaped: N projects x N days (QLAT_* env)
+  python3 bench/query_latency.py run         # run latency suite against seeded data
+  python3 bench/query_latency.py run_ages    # random access per partition age (needs seed_scale)
+  python3 bench/query_latency.py explain     # EXPLAIN ANALYZE each query, dump to /tmp
 """
 from __future__ import annotations
 import json, os, statistics, sys, time, uuid

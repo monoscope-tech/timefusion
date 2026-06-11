@@ -2211,7 +2211,9 @@ impl Database {
         });
     }
 
-    /// Resolve every registry table and warm recent-partition footers in the
+    /// Resolve every registry table and warm parquet footers (every live
+    /// file by default; recency-bounded when `timefusion_warm_all_footers`
+    /// is off) in the
     /// background, so the first query after a deploy doesn't pay Delta log
     /// replay + parquet footer reads inline (measured 1.4 s cold vs 13 ms
     /// warm against OVH S3 for a single-partition random-access lookup).

@@ -298,17 +298,27 @@ impl TantivyConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AwsConfig {
     #[serde(default)]
-    pub aws_access_key_id:     Option<String>,
+    pub aws_access_key_id:             Option<String>,
     #[serde(default)]
-    pub aws_secret_access_key: Option<String>,
+    pub aws_secret_access_key:         Option<String>,
     #[serde(default)]
-    pub aws_default_region:    Option<String>,
+    pub aws_default_region:            Option<String>,
     #[serde(default = "d_s3_endpoint")]
-    pub aws_s3_endpoint:       String,
+    pub aws_s3_endpoint:               String,
     #[serde(default)]
-    pub aws_s3_bucket:         Option<String>,
+    pub aws_s3_bucket:                 Option<String>,
     #[serde(default)]
-    pub aws_allow_http:        Option<String>,
+    pub aws_allow_http:                Option<String>,
+    /// TCP/TLS connection-establishment bound passed to the object_store S3
+    /// client (humantime format, e.g. "3s", "10s"). See
+    /// `build_storage_options` for why the default is tighter than
+    /// object_store's 5 s.
+    #[serde(default = "d_s3_connect_timeout")]
+    pub timefusion_s3_connect_timeout: String,
+}
+
+fn d_s3_connect_timeout() -> String {
+    "3s".to_string()
 }
 
 impl AwsConfig {
@@ -331,8 +341,9 @@ impl AwsConfig {
         // (5 s connect) plus retries let a black-holed connection stall a
         // first-touch read for 20 s+ (observed 23 s on a cold partition).
         // Total request timeout stays at the default 30 s so large flush
-        // PUTs aren't cut off.
-        opts.insert("connect_timeout".into(), "3s".into());
+        // PUTs aren't cut off. Tunable via TIMEFUSION_S3_CONNECT_TIMEOUT for
+        // environments where 3 s is too tight (slow proxies, cross-region).
+        opts.insert("connect_timeout".into(), self.timefusion_s3_connect_timeout.clone());
         opts
     }
 }
