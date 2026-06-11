@@ -925,7 +925,10 @@ impl FoyerObjectStoreCache {
             // candidate=0 also means files smaller than the hint are fully
             // cached here by warm_footer — any in-bounds read (including data
             // pages) is intentionally served from the metadata cache.
-            let candidates: &[u64] = if warm_start == 0 { &[0] } else { &[0, warm_start] };
+            // Probe the suffix key first: for files larger than the hint only
+            // (warm_start..size) exists, so leading with it saves an always-miss
+            // (0..size) lookup on the common footer-read path.
+            let candidates: &[u64] = if warm_start == 0 { &[0] } else { &[warm_start, 0] };
             for &candidate in candidates {
                 if candidate <= range.start && range.end <= file_size {
                     let key = Self::make_range_cache_key(location, &(candidate..file_size));

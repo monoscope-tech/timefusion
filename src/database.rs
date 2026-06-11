@@ -2218,7 +2218,9 @@ impl Database {
     pub fn preload_tables(self: &Arc<Self>) {
         // Idempotent: main.rs and bootstrap.rs are disjoint entry points, but
         // a second call must not double the boot-time S3 warm burst.
-        if self.preload_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        // Relaxed: the swap's atomicity alone decides the winner; no other
+        // memory needs to be ordered around it.
+        if self.preload_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         // Tables preload concurrently — a slow object-store round-trip on one

@@ -89,6 +89,10 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
             // (coalesce(utf8_list, int_list, '{}')) the retried coercion below
             // fails on the second list and the original error surfaces — no
             // silent mis-typing, just a planner-time error like today.
+            // NOTE: a real string COLUMN (not a literal) coalesced with a list
+            // also passes here, but the analyzer rule has no literal to
+            // rewrite, so the failure surfaces at execution (Utf8→List cast)
+            // instead of planning. Acceptable: PG errors on that query too.
             let list_t = arg_types
                 .iter()
                 .find(|t| matches!(t, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)))
@@ -265,6 +269,20 @@ mod tests {
         let ctx = ctx_with_rule();
         let out = one_string(&ctx, "SELECT COALESCE(CAST(NULL AS VARCHAR[]), '{a, b, \"c,d\", NULL}') AS v FROM (SELECT 1)").await;
         assert!(out.contains("[a, b, c,d, ]"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn coalesce_string_column_with_list_wraps_into_single_element_list() {
+        // A genuine string COLUMN (not a literal) coalesced with a list passes
+        // the UDF's lenient coerce_types; with no literal for the analyzer
+        // rule to rewrite, TypeCoercion casts the column — and Arrow defines
+        // Utf8 → List(Utf8) as wrapping each value in a one-element list. So
+        // the outcome is a deterministic [value], NOT an error (PG would
+        // error here) and NOT silent garbage. Pinned so a behavior change on
+        // a DataFusion/Arrow upgrade is caught.
+        let ctx = ctx_with_rule();
+        let out = one_string(&ctx, "SELECT COALESCE(s, CAST(NULL AS VARCHAR[])) AS v FROM (SELECT 'x' AS s)").await;
+        assert!(out.contains("[x]"), "{out}");
     }
 
     #[tokio::test]

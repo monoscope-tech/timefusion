@@ -1193,7 +1193,7 @@ mod tests {
         // WALRUS_DATA_DIR (whatever the last test pointed it at), so a fixed
         // "proj:tbl" topic inherits blocks/cursors appended by earlier tests
         // in the same process and the exact-position asserts below flake.
-        let table = format!("tbl_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
 
         // Process A: append, advance cursor, write snapshot with clean flag.
         {
@@ -1255,7 +1255,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         // Unique topic per run — see cursor_snapshot_roundtrip_restores_persisted_positions.
-        let table = format!("tbl_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
         {
             let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
             wal.append("proj", &table, &create_test_batch()).unwrap();
@@ -1283,10 +1283,7 @@ mod tests {
         // Walrus uses a process-global `WALRUS_DATA_DIR` so other tests may
         // have seeded state for shared collection keys. Use a per-test
         // unique topic name so the hashed walrus key is guaranteed fresh.
-        let table = format!(
-            "rescue_{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
-        );
+        let table = format!("rescue_{}", uuid::Uuid::new_v4().simple());
         let project = "p";
 
         let before = wal.persisted_read_positions(project, &table).unwrap();
@@ -1413,7 +1410,7 @@ mod tests {
         let path = dir.path().to_path_buf();
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
         // Unique topic per run — see cursor_snapshot_roundtrip_restores_persisted_positions.
-        let table = format!("tbl_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
         wal.append("proj", &table, &create_test_batch()).unwrap();
         wal.advance_by_counts("proj", &table, &[1, 0, 0, 0]).unwrap();
         wal.write_cursor_snapshot(false).unwrap();

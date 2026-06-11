@@ -156,6 +156,21 @@ fn unique_project() -> String {
 }
 const TABLE: &str = "otel_logs_and_spans";
 
+/// Poll the tantivy manifest until it has at least `want` entries. The index
+/// build is a detached task since the flush-throughput work (ef13450) —
+/// `flush_all_now()` returning only guarantees the Delta commit, so tests
+/// asserting on the manifest must wait for the sidecar to catch up.
+async fn wait_for_manifest_entries(store: &dyn object_store::ObjectStore, project: &str, want: usize) -> Result<timefusion::tantivy_index::manifest::Manifest> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let m = timefusion::tantivy_index::manifest::load(store, TABLE, project).await?;
+        if m.entries.len() >= want || std::time::Instant::now() > deadline {
+            return Ok(m);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 // ───────────────────────── tests ─────────────────────────
 
 #[serial]
@@ -233,7 +248,7 @@ async fn tantivy_indexer_actually_writes_manifest_when_flush_routes_through_buff
     layer.flush_all_now().await?;
 
     let store = svc.object_store.clone();
-    let m = timefusion::tantivy_index::manifest::load(store.as_ref(), TABLE, &p).await?;
+    let m = wait_for_manifest_entries(store.as_ref(), &p, 1).await?;
     assert!(!m.entries.is_empty(), "manifest should have at least one entry after flush");
     let entry = m.entries.values().next().unwrap();
     assert!(entry.index.is_some(), "entry should have an index blob URI: {entry:?}");
@@ -290,7 +305,7 @@ async fn compaction_gc_drops_stale_indexes_keeps_live_ones() -> Result<()> {
     db.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![("g2", "n", "second")])], false, None).await?;
     db.buffered_layer().cloned().unwrap().flush_all_now().await?;
 
-    let m_before = timefusion::tantivy_index::manifest::load(svc.object_store.as_ref(), TABLE, &p).await?;
+    let m_before = wait_for_manifest_entries(svc.object_store.as_ref(), &p, 2).await?;
     assert_eq!(m_before.entries.len(), 2, "two flushes → two manifest entries");
 
     // Collect every URI both entries covered.
@@ -334,7 +349,7 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     db2.buffered_layer().cloned().unwrap().flush_all_now().await?;
 
     // Confirm a manifest entry exists for the ON case.
-    let m = timefusion::tantivy_index::manifest::load(svc.object_store.as_ref(), TABLE, &p).await?;
+    let m = wait_for_manifest_entries(svc.object_store.as_ref(), &p, 1).await?;
     assert!(!m.entries.is_empty(), "manifest should have entries after flush");
 
     // Real-world SQL: `WHERE level = 'ERROR'`. The TantivyPredicateRewriter
