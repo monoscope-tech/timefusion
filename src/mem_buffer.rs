@@ -286,30 +286,35 @@ pub fn estimate_batch_size(batch: &RecordBatch) -> usize {
     batch.get_array_memory_size() + BATCH_FIXED_OVERHEAD + batch.num_columns() * PER_COLUMN_OVERHEAD
 }
 
-/// Compact string/binary-view arrays whose buffers are mostly slack.
+/// Compact string/binary-view arrays whose buffers dwarf the bytes the views
+/// actually reference. Two prod failure modes (both 2026-06-11):
 ///
-/// `ScalarValue::to_array_of_size` (pgwire fast-insert, WAL replay of those
-/// rows) allocates a ~16KB view block per Utf8View column even for a <32B
-/// string — ~1MB of reported capacity per single-row batch on the otel
-/// schema. `get_array_memory_size` counts that capacity, so the buffer
-/// budget exhausts after ~38k rows (prod 2026-06-11: 1.5TB tracked inside a
-/// 66.6GiB cgroup, every insert rejected). `gc()` rewrites the views into
-/// exact-size buffers; compact arrays (e.g. from gRPC IPC) pass through as
-/// Arc clones. Recurses into List/LargeList/FixedSizeList/Struct children.
+/// - Builder slack: `ScalarValue::to_array_of_size` (pgwire fast-insert, WAL
+///   replay of those rows) allocates a ~16KB view block per Utf8View column
+///   even for a <32B string — ~1MB of reported capacity per single-row batch
+///   on the otel schema (1.5TB tracked inside a 66.6GiB cgroup).
+/// - Inherited scan blocks: rows read back by the DML UPDATE path arrive as
+///   view arrays referencing the parquet reader's full column-chunk data
+///   blocks (`capacity == len`, so slack detection can't see it) — ~250-row
+///   UPDATE batches charged ~135MB each (29.9GB for 54k rows).
+///
+/// Hence the gate compares buffer capacity against `total_buffer_bytes_used`
+/// (bytes the views reference), which catches both. `gc()` rewrites the
+/// views into exact-size buffers; compact arrays pass through as Arc clones.
+/// Recurses into List/LargeList/FixedSizeList/Struct children.
 fn compact_view_arrays(arr: &ArrayRef) -> ArrayRef {
     use arrow::array::{Array, BinaryViewArray, FixedSizeListArray, LargeListArray, ListArray, StringViewArray, StructArray};
-    fn wasteful(buffers: &[arrow::buffer::Buffer]) -> bool {
-        let (cap, len) = buffers.iter().fold((0usize, 0usize), |(c, l), b| (c + b.capacity(), l + b.len()));
-        cap > len * 2 + 1024
+    fn wasteful(buffers: &[arrow::buffer::Buffer], used: usize) -> bool {
+        buffers.iter().map(|b| b.capacity()).sum::<usize>() > used * 2 + 1024
     }
     match arr.data_type() {
         DataType::Utf8View => {
             let v = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
-            if wasteful(v.data_buffers()) { Arc::new(v.gc()) } else { arr.clone() }
+            if wasteful(v.data_buffers(), v.total_buffer_bytes_used()) { Arc::new(v.gc()) } else { arr.clone() }
         }
         DataType::BinaryView => {
             let v = arr.as_any().downcast_ref::<BinaryViewArray>().unwrap();
-            if wasteful(v.data_buffers()) { Arc::new(v.gc()) } else { arr.clone() }
+            if wasteful(v.data_buffers(), v.total_buffer_bytes_used()) { Arc::new(v.gc()) } else { arr.clone() }
         }
         DataType::List(f) => {
             let l = arr.as_any().downcast_ref::<ListArray>().unwrap();
@@ -1942,8 +1947,10 @@ mod tests {
     // 1.5TB against a 66.6GiB cgroup and rejected every insert within minutes
     // of boot. Guard: a single-row wide-Utf8View batch must be charged near
     // its logical size, including view columns nested in List and Struct.
-    #[test]
-    fn single_row_utf8view_insert_charged_logical_size_not_block_capacity() {
+    /// One ~3KB-logical row across 64 Utf8View columns plus view columns
+    /// nested in List and Struct — built the way the pgwire fast-insert path
+    /// builds rows (`ScalarValue::to_array_of_size`).
+    fn wide_view_row(ts: i64) -> RecordBatch {
         use datafusion::common::ScalarValue;
         let n_str_cols = 64;
         let mut fields: Vec<Field> = vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)];
@@ -1953,7 +1960,6 @@ mod tests {
         fields.push(Field::new("s", DataType::Struct(vec![Field::new("v", DataType::Utf8View, true)].into()), true));
         let schema = Arc::new(Schema::new(fields));
 
-        let ts = chrono::Utc::now().timestamp_micros();
         let view_col = || ScalarValue::Utf8View(Some("a string too long to inline in the view".into())).to_array_of_size(1).unwrap();
         let mut cols: Vec<ArrayRef> = vec![Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC"))];
         cols.extend((0..n_str_cols).map(|_| view_col()));
@@ -1968,14 +1974,63 @@ mod tests {
             vec![view_col()],
             None,
         )));
+        RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    #[test]
+    fn single_row_utf8view_insert_charged_logical_size_not_block_capacity() {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        buffer.insert("p1", "t1", wide_view_row(ts), ts).unwrap();
+        let charged = buffer.estimated_memory_bytes();
+        assert!(
+            charged < 64 * 1024,
+            "single ~3KB-logical row charged {charged} bytes — view block capacity is leaking into memory accounting"
+        );
+    }
+
+    // Prod 2026-06-11 evening: 54,767 rows / 221 batches charged 29.9GB
+    // (~135MB per batch). monoscope's `UPDATE otel_logs_and_spans` jobs make
+    // the DML path re-insert rows read from parquet: filtered/sliced view
+    // arrays inherit the reader's full column-chunk data blocks, where
+    // capacity == len — invisible to slack-based waste detection. The gate
+    // must compare capacity against bytes the views actually reference.
+    #[test]
+    fn sliced_scan_rows_charged_referenced_bytes_not_block_size() {
+        let big: Vec<String> = (0..1000).map(|i| format!("{i:0>100}")).collect();
+        let full = StringViewArray::from(big.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        let ts = chrono::Utc::now().timestamp_micros();
+        let mut fields: Vec<Field> = vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)];
+        fields.extend((0..8).map(|i| Field::new(format!("c{i}"), DataType::Utf8View, true)));
+        let schema = Arc::new(Schema::new(fields));
+        let mut cols: Vec<ArrayRef> = vec![Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC"))];
+        cols.extend((0..8).map(|_| Arc::new(full.slice(0, 1)) as ArrayRef));
         let batch = RecordBatch::try_new(schema, cols).unwrap();
 
         let buffer = MemBuffer::new();
         buffer.insert("p1", "t1", batch, ts).unwrap();
         let charged = buffer.estimated_memory_bytes();
         assert!(
-            charged < 64 * 1024,
-            "single ~3KB-logical row charged {charged} bytes — view block capacity is leaking into memory accounting"
+            charged < 32 * 1024,
+            "1 sliced row (8 view cols x 100B referenced) charged {charged} bytes — inherited scan blocks are leaking into accounting"
+        );
+    }
+
+    // Companion guard: tail-fold outputs must also stay near logical size
+    // (folds concat view arrays; inherited buffers may carry slack).
+    #[test]
+    fn fold_outputs_charged_near_logical_size() {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        for _ in 0..200 {
+            buffer.insert("p1", "t1", wide_view_row(ts), ts).unwrap();
+        }
+        let charged = buffer.estimated_memory_bytes();
+        // 200 rows × ~3KB logical ≈ 600KB; allow generous overhead but stay
+        // orders of magnitude under the ~megabytes-per-fold failure mode.
+        assert!(
+            charged < 16 * 1024 * 1024,
+            "200 ~3KB-logical rows charged {charged} bytes — fold outputs are carrying view block capacity"
         );
     }
 
