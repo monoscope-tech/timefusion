@@ -6,6 +6,7 @@
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn second_optimize_is_a_noop() -> anyhow::Result<()> {
     let env = E2eEnv::builder().start().await?;

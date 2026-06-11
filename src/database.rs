@@ -239,6 +239,48 @@ fn relativize_to_prefix(prefix: &str, uri: &str) -> Option<object_store::path::P
     uri.strip_prefix(prefix).map(|rel| object_store::path::Path::from(rel.trim_start_matches('/')))
 }
 
+/// Select and order the files `warm_cache_for_uris` will warm. Returns
+/// `(path, recent)` pairs: footers warm for every returned file; full-file
+/// warming additionally requires `recent`. With `warm_all_footers` (default)
+/// non-recent files are kept (recent=false → footer-only); without it they
+/// are dropped entirely. Ordered oldest date-partition first so the newest
+/// land last in LRU order (ISO dates sort lexically; undated files first).
+/// Returns the count of URIs that failed to relativize for the caller to log.
+fn select_warm_paths(
+    uris: Vec<String>, prefix: &str, warm_all_footers: bool, cutoff: Option<chrono::NaiveDate>,
+) -> (Vec<(object_store::path::Path, bool)>, usize) {
+    let mut dropped = 0usize;
+    let mut paths: Vec<(object_store::path::Path, bool)> = uris
+        .into_iter()
+        .filter(|u| u.ends_with(".parquet"))
+        .map(|u| {
+            let recent = within_recency(&u, cutoff);
+            (u, recent)
+        })
+        .filter(|(_, recent)| warm_all_footers || *recent)
+        .filter_map(|(u, recent)| match relativize_to_prefix(prefix, &u) {
+            Some(path) => Some((path, recent)),
+            None => {
+                // Prefix mismatch (e.g. trailing-slash or query-string drift
+                // between table_url() and get_file_uris()). Warming this file
+                // would address the wrong key, so skip it.
+                dropped += 1;
+                None
+            }
+        })
+        .collect();
+    // Assumes 10-char ISO dates (date=YYYY-MM-DD, lexically sortable). A
+    // missing or differently-shaped date= segment keys as "" — sorts first
+    // (slightly suboptimal LRU order), never a crash.
+    let date_key = |p: &object_store::path::Path| {
+        let s = p.as_ref();
+        s.find("date=").and_then(|i| s.get(i + 5..i + 15)).unwrap_or("").to_string()
+    };
+    // cached_key: one allocation per path, not one per comparison.
+    paths.sort_by_cached_key(|(p, _)| date_key(p));
+    (paths, dropped)
+}
+
 // Helper function to extract project_id from a batch
 pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     use datafusion::arrow::array::{StringArray, StringViewArray};
@@ -655,6 +697,10 @@ pub struct Database {
     pub scan_metrics:                Arc<ScanMetrics>,
     batch_queue:                     Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown:            Arc<CancellationToken>,
+    /// One-shot guard for `preload_tables` — main.rs and bootstrap.rs are
+    /// disjoint entry points today, but a second call must not double the
+    /// boot-time S3 warm burst.
+    preload_started:                 Arc<std::sync::atomic::AtomicBool>,
     config_pool:                     Option<PgPool>,
     storage_configs:                 Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
     /// Monotonic deadline (nanos since process start) for when the next
@@ -964,6 +1010,7 @@ impl Database {
             scan_metrics: Arc::new(ScanMetrics::default()),
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
+            preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_pool,
             storage_configs: Arc::new(RwLock::new(storage_configs)),
             storage_configs_next_refresh_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1316,6 +1363,16 @@ impl Database {
         let _ = options.set("datafusion.execution.parquet.enable_page_index", "true");
         let _ = options.set("datafusion.execution.parquet.pruning", "true");
         let _ = options.set("datafusion.execution.parquet.skip_metadata", "false");
+        // One-shot footer read sized to match `warm_footer`'s suffix range: the
+        // Foyer metadata cache keys on (path, exact range), so the reader's
+        // first fetch (size-hint..size) hits the entry the warm task populated.
+        // Without this the reader does 8-byte-tail + metadata-range reads —
+        // two sequential S3 RTTs on different keys that can never be pre-warmed
+        // (measured 1.6 s of metadata_load_time on a cold OVH partition).
+        let _ = options.set(
+            "datafusion.execution.parquet.metadata_size_hint",
+            &self.config.cache.timefusion_parquet_metadata_size_hint.to_string(),
+        );
         let _ = options.set("datafusion.explain.show_schema", "true");
         let _ = options.set("datafusion.runtime.metadata_cache_limit", "500M");
 
@@ -1399,6 +1456,9 @@ impl Database {
             // Expands `f(qualifier.*)` into `f(qualifier.c1, …, qualifier.cN)`
             // before TypeCoercion rejects the typeless wildcard. Postgres parity.
             Arc::new(crate::optimizers::WildcardFnArgExpander),
+            // PG parity: `COALESCE(list_col, '{}')` — re-type PG array string
+            // literals as list literals before TypeCoercion fails the call.
+            Arc::new(crate::optimizers::PgArrayLiteralRewriter),
             Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
             Arc::new(crate::optimizers::VariantSelectRewriter),
         ];
@@ -2019,6 +2079,7 @@ impl Database {
             return;
         }
         let warm_full_files = maint.timefusion_warm_full_files;
+        let warm_all_footers = maint.timefusion_warm_all_footers;
         let recency_days = maint.timefusion_warm_recency_days;
         let concurrency = maint.timefusion_warm_concurrency.max(1);
         let metadata_size_hint = self.config.cache.timefusion_parquet_metadata_size_hint as u64;
@@ -2033,30 +2094,23 @@ impl Database {
         // past any partition we'd query.
         let cutoff = (recency_days > 0).then(|| Utc::now().date_naive() - chrono::Duration::days(recency_days.min(3650) as i64));
 
-        let mut dropped = 0usize;
-        let paths: Vec<object_store::path::Path> = uris
-            .into_iter()
-            .filter(|u| u.ends_with(".parquet"))
-            .filter(|u| within_recency(u, cutoff))
-            .filter_map(|u| match relativize_to_prefix(prefix, &u) {
-                Some(path) => Some(path),
-                None => {
-                    // Prefix mismatch (e.g. trailing-slash or query-string
-                    // drift between table_url() and get_file_uris()). Warming
-                    // this file would address the wrong key, so skip it — but
-                    // log so a systematic mismatch is diagnosable instead of a
-                    // silent no-op.
-                    if dropped == 0 {
-                        debug!("warm: URI {} does not start with table prefix {}; skipping (warm only)", u, prefix);
-                    }
-                    dropped += 1;
-                    None
-                }
-            })
-            .collect();
-
+        // With warm_all_footers (default): footers warm for EVERY live file
+        // (tens of KB each — they turn a deep-partition first touch from
+        // footer+data RTTs into a single data fetch). On tables with
+        // thousands of files that's thousands of boot-time GETs (bounded by
+        // `concurrency`); disable the flag to recency-bound footers too.
+        // Full-file warming is always recency-bounded. Oldest partitions warm
+        // FIRST so the newest land last in LRU order: if the warm set exceeds
+        // the metadata cache (size it as metadata_disk ≥ live_files ×
+        // parquet_metadata_size_hint), eviction then drops the least-queried
+        // old partitions instead of whichever files happened to warm late.
+        let (paths, dropped) = select_warm_paths(uris, prefix, warm_all_footers, cutoff);
         if dropped > 0 {
-            debug!("warm: skipped {} file(s) that did not relativize against prefix {}", dropped, prefix);
+            // warn: a systematic prefix mismatch silently no-ops the whole
+            // warm pass (the wrong key would never be hit), and prod runs at
+            // warn level — debug would make it invisible exactly where it
+            // matters (boot-time preload).
+            warn!("warm: skipped {} file(s) that did not relativize against prefix {}", dropped, prefix);
         }
         if paths.is_empty() {
             return;
@@ -2080,12 +2134,16 @@ impl Database {
         // Labelled scope rather than `full=true/false` so warm logs are easy to
         // filter (e.g. in Loki) by what was actually primed.
         let scope = if warm_full_files { "full" } else { "footer-only" };
+        // Surface the burst size up front so operators can see what a restart
+        // is about to issue against S3 (the completion log alone can't —
+        // a large warm set takes minutes to get there).
+        info!("Cache warm start: {count} files (scope={scope}, concurrency={concurrency})");
         futures::stream::iter(paths)
-            .for_each_concurrent(concurrency, |path| {
+            .for_each_concurrent(concurrency, |(path, recent)| {
                 let store = object_store.clone();
                 async move {
                     let _ = crate::object_store_cache::warm_footer(store.as_ref(), &path, metadata_size_hint).await;
-                    if warm_full_files {
+                    if warm_full_files && recent {
                         let _ = crate::object_store_cache::warm_full(store.as_ref(), &path).await;
                     }
                 }
@@ -2166,6 +2224,62 @@ impl Database {
                 // Already inside a detached task — await the warm directly
                 // instead of spawning a second nested task.
                 db.warm_cache_for_uris(store, table_uri, uris).await;
+            }
+        });
+    }
+
+    /// Resolve every registry table and warm parquet footers in the
+    /// background (ALL live files by default; recency-bounded when
+    /// `TIMEFUSION_WARM_ALL_FOOTERS=false` — see warm_cache_for_uris), so the
+    /// first query after a deploy doesn't pay Delta log replay + parquet
+    /// footer reads inline (measured 1.4 s cold vs 13 ms warm against OVH S3
+    /// for a single-partition random-access lookup).
+    pub fn preload_tables(self: &Arc<Self>) {
+        // Idempotent: main.rs and bootstrap.rs are disjoint entry points, but
+        // a second call must not double the boot-time S3 warm burst.
+        // Relaxed: the swap's atomicity alone decides the winner; no other
+        // memory needs to be ordered around it.
+        if self.preload_started.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        // Tables preload concurrently — a slow object-store round-trip on one
+        // must not delay the others' first-query readiness — but the fan-out
+        // is capped at the same bound as per-file warming: each table preload
+        // is a Delta log replay (object-store round-trips), so an unbounded
+        // spawn-per-table would spike S3 at boot as the registry grows.
+        let db = Arc::clone(self);
+        let shutdown = self.maintenance_shutdown.clone();
+        let concurrency = self.config.maintenance.timefusion_warm_concurrency.max(1);
+        tokio::spawn(async move {
+            let preload_all = futures::stream::iter(crate::schema_loader::registry().list_tables()).for_each_concurrent(concurrency, |table_name| {
+                let db = Arc::clone(&db);
+                async move {
+                    let t = std::time::Instant::now();
+                    match db.resolve_table("default", &table_name).await {
+                        Ok(table_ref) => {
+                            // Warm via the already-resolved handle — warm_cache_for_table
+                            // would redundantly resolve_table a second time.
+                            let (uris, store, table_uri) = {
+                                let table = table_ref.read().await;
+                                let uris: Vec<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                                (uris, table.log_store().object_store(None), table.table_url().to_string())
+                            };
+                            info!(
+                                "bootstrap.phase=table_preload table={table_name} files={} elapsed_ms={}",
+                                uris.len(),
+                                t.elapsed().as_millis()
+                            );
+                            db.warm_cache_for_uris(store, table_uri, uris).await;
+                        }
+                        Err(e) => warn!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
+                    }
+                }
+            });
+            // Abandon warming on shutdown so in-flight S3 calls can't slow
+            // a fast restart during initial boot.
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = preload_all => {}
             }
         });
     }
@@ -2447,8 +2561,35 @@ impl Database {
                     // hold the write lock — no extra log scan required.
                     let added: Vec<String> = table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
 
+                    // Capture the store off the handle we just committed with —
+                    // the warm task below must never re-resolve the table (a
+                    // possible PG roundtrip + a redundant Delta state reload).
+                    let (warm_store, warm_table_uri) = (table.log_store().object_store(None), table.table_url().to_string());
+
                     // Invalidate statistics cache after successful write
                     drop(table); // Release write lock before async operation
+                    // Freshly-flushed files are the ones dashboards query next;
+                    // without this they're read cold from S3 until something else
+                    // warms them (repeat queries measured ~300 ms vs 8 ms warm on R2).
+                    // Gated on `watermark` (only the BufferedWriteLayer flush path
+                    // sets it): direct inserts — tests, tools — must not spawn
+                    // detached warm tasks, whose in-flight connections outlive a
+                    // short-lived runtime and poison the shared client pool for
+                    // the next test's S3 reads ("error sending request" in µs).
+                    if watermark.is_some() {
+                        let db = self.clone();
+                        let warm_added = added.clone();
+                        let shutdown = self.maintenance_shutdown.clone();
+                        tokio::spawn(async move {
+                            // Abandon on shutdown (same as preload_tables): the
+                            // detached warm must not issue S3 GETs against a
+                            // draining client pool during a fast restart.
+                            tokio::select! {
+                                _ = shutdown.cancelled() => {}
+                                _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added) => {}
+                            }
+                        });
+                    }
                     self.statistics_extractor.invalidate(&project_id, &table_name).await;
                     debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
 
@@ -2825,6 +2966,7 @@ impl Database {
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
         let table_clone = table_ref.read().await.clone();
+        let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
         let optimize_result = table_clone
             .optimize()
             .with_filters(&partition_filters)
@@ -2848,7 +2990,12 @@ impl Database {
                     "recompress: date={} table={} removed={} added={} considered={}",
                     date_str, table_name, metrics.num_files_removed, metrics.num_files_added, metrics.total_considered_files
                 );
-                *table_ref.write().await = new_table;
+                // Swap + warm-added/evict-removed like the other optimize
+                // paths. A bare swap left the rewritten cold-tier files
+                // un-warmed and the tombstoned ones cached — the next query
+                // on a recompressed partition paid full S3 reads (1.5 s
+                // observed against OVH).
+                self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                 Ok(())
             }
             Err(e) => {
@@ -2937,6 +3084,7 @@ impl Database {
                 let table = table_ref.read().await;
                 table.clone()
             };
+            let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
             let result = table_clone
                 .write(deduped.clone())
                 .with_partition_columns(schema.partitions.clone())
@@ -2946,7 +3094,11 @@ impl Database {
                 .await;
             match result {
                 Ok(new_table) => {
-                    *table_ref.write().await = new_table;
+                    // Swap + warm-added/evict-removed exactly like the optimize
+                    // paths; a bare swap left the replace_where outputs stone-cold
+                    // (1.5 s first read observed against OVH) and the tombstoned
+                    // files' cache entries alive until TTL.
+                    self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                     crate::metrics::record_compaction_dedup_dropped(dropped);
                     info!(
                         "dedup compaction: table={} project={} date={} dropped={} (before={} after={})",
@@ -3117,7 +3269,7 @@ impl Database {
                     // Swap the optimized table in and refresh the cache (warm
                     // freshly-compacted files, evict the small files just
                     // tombstoned) via the shared helper.
-                    let _ = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                    self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -4264,6 +4416,36 @@ mod writer_properties_tests {
         let kv = p.key_value_metadata().expect("KV metadata present");
         let tier = kv.iter().find(|k| k.key == COMPRESSION_TIER_KEY).expect("tier key present");
         assert_eq!(tier.value.as_deref(), Some("15"));
+    }
+
+    // Pins the warm_all_footers default: non-recent files stay in the warm
+    // set as footer-only (recent=false), oldest partition first; with the
+    // flag off they are dropped entirely.
+    #[test]
+    fn select_warm_paths_pins_warm_all_footers_default() {
+        let prefix = "s3://bucket/timefusion/default/otel";
+        let uris = vec![
+            format!("{prefix}/project_id=p/date=2099-01-01/new.parquet"),
+            format!("{prefix}/project_id=p/date=2020-01-01/old.parquet"),
+            format!("{prefix}/project_id=p/date=2099-01-02/checkpoint.json"),
+            "s3://elsewhere/unrelated.parquet".to_string(),
+        ];
+        let cutoff = Some(chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap());
+
+        let (paths, dropped) = select_warm_paths(uris.clone(), prefix, true, cutoff);
+        assert_eq!(dropped, 1, "prefix-mismatched URI counted as dropped");
+        let got: Vec<(&str, bool)> = paths.iter().map(|(p, r)| (p.as_ref(), *r)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("project_id=p/date=2020-01-01/old.parquet", false), // footer-only, warms first
+                ("project_id=p/date=2099-01-01/new.parquet", true),
+            ]
+        );
+
+        let (paths, _) = select_warm_paths(uris, prefix, false, cutoff);
+        assert_eq!(paths.len(), 1, "warm_all_footers=false drops non-recent files");
+        assert!(paths[0].0.as_ref().contains("date=2099-01-01"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn flushed_rows_survive_restart() -> anyhow::Result<()> {
     let mut env = E2eEnv::builder().start().await?;
@@ -49,6 +50,7 @@ async fn flushed_rows_survive_restart() -> anyhow::Result<()> {
 // `flushed_rows_survive_restart` test still covers the durability path via
 // Delta, so this gap doesn't lower coverage of the production crash class.
 #[ignore = "harness restart path doesn't replay WAL — see comment"]
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
     // Disable Foyer; push flush/eviction far into the future so the
@@ -94,6 +96,7 @@ async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
 /// being returned for minutes after a dirty restart (cursor-snapshot missing
 /// or stale). With `bootstrap()` now mirroring main.rs's cursor reconcile,
 /// this test exercises the same slow path prod hits.
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
     let mut env = E2eEnv::builder().start().await?;

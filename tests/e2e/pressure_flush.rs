@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn many_inserts_under_tight_budget_do_not_deadlock() -> anyhow::Result<()> {
     let env = E2eEnv::builder()

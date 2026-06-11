@@ -11,6 +11,7 @@ use timefusion::clock;
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn flush_completed_bucket_only() -> anyhow::Result<()> {
     let env = E2eEnv::builder()
