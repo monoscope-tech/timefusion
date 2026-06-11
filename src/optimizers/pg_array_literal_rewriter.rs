@@ -64,6 +64,8 @@ pub struct PgCoalesceUdf {
 /// same token, fork upgrades that keep the version string still need the
 /// manual audit — the tripwire only catches plain `cargo update`s.
 const AUDITED_DATAFUSION_VERSION: &str = "53.1.0";
+// Byte loop because `&str` equality (PartialEq) isn't const-callable on
+// stable — assert!(a == b) won't compile in a const block.
 const _: () = {
     let (a, b) = (datafusion::DATAFUSION_VERSION.as_bytes(), AUDITED_DATAFUSION_VERSION.as_bytes());
     assert!(
