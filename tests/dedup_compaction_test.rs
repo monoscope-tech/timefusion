@@ -22,7 +22,10 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
     // Pick a fixed timestamp so both inserts share (id, timestamp) and date.
-    let ts = chrono::Utc::now().timestamp_micros();
+    // 3h back: dedup only rewrites hour chunks sealed for 2h+ (late data may
+    // still flush into newer hours). The partition date is derived from ts
+    // below, so a midnight-UTC crossing stays consistent.
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
     let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)]) };
 
     // Two skip_queue=true inserts → two independent Delta commits, two files
