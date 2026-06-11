@@ -1185,19 +1185,25 @@ mod tests {
     /// own fsynced state) is covered by
     /// [`cursor_snapshot_restore_advances_walrus_past_local_state`].
     #[test]
+    #[serial_test::serial]
     fn cursor_snapshot_roundtrip_restores_persisted_positions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
+        // Unique topic per run: walrus state lives under the process-global
+        // WALRUS_DATA_DIR (whatever the last test pointed it at), so a fixed
+        // "proj:tbl" topic inherits blocks/cursors appended by earlier tests
+        // in the same process and the exact-position asserts below flake.
+        let table = format!("tbl_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
 
         // Process A: append, advance cursor, write snapshot with clean flag.
         {
             let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
             let batch = create_test_batch();
-            wal.append("proj", "tbl", &batch).unwrap();
+            wal.append("proj", &table, &batch).unwrap();
             // Advance by 1 on the only shard we wrote to (round-robin picks
             // shard 0 first for an unseen topic).
-            wal.advance_by_counts("proj", "tbl", &[1, 0, 0, 0]).unwrap();
-            let before = wal.persisted_read_positions("proj", "tbl").unwrap();
+            wal.advance_by_counts("proj", &table, &[1, 0, 0, 0]).unwrap();
+            let before = wal.persisted_read_positions("proj", &table).unwrap();
             assert!(before[0].is_some_and(|p| !p.is_origin()), "advance must move shard 0 off origin");
 
             wal.write_cursor_snapshot(true).unwrap();
@@ -1211,13 +1217,13 @@ mod tests {
             let snap = wal.load_cursor_snapshot().expect("snapshot loadable");
             assert!(snap.clean_shutdown);
             assert_eq!(snap.shards_per_topic, 4);
-            assert!(snap.entries.contains_key("proj:tbl"));
+            assert!(snap.entries.contains_key(&WalManager::make_topic("proj", &table)));
 
             // Restore is idempotent — walrus state already reflects the
             // advance, so `restore` advances 0 shards but seeds known_topics.
             let advanced = wal.restore_cursor_snapshot(&snap).unwrap();
             assert_eq!(advanced, 0, "snapshot positions match walrus's own fsynced state");
-            assert!(wal.list_topic_pairs().unwrap().iter().any(|(p, t)| p == "proj" && t == "tbl"));
+            assert!(wal.list_topic_pairs().unwrap().iter().any(|(p, t)| p == "proj" && *t == table));
         }
     }
 
@@ -1225,6 +1231,7 @@ mod tests {
     /// boot falls through to the Delta scan rather than misinterpreting the
     /// payload.
     #[test]
+    #[serial_test::serial]
     fn cursor_snapshot_rejects_version_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
@@ -1243,13 +1250,16 @@ mod tests {
     /// so the boot falls through to the Delta scan rather than restoring
     /// shard-misaligned positions.
     #[test]
+    #[serial_test::serial]
     fn cursor_snapshot_rejects_shard_count_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
+        // Unique topic per run — see cursor_snapshot_roundtrip_restores_persisted_positions.
+        let table = format!("tbl_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
         {
             let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
-            wal.append("proj", "tbl", &create_test_batch()).unwrap();
-            wal.advance_by_counts("proj", "tbl", &[1, 0, 0, 0]).unwrap();
+            wal.append("proj", &table, &create_test_batch()).unwrap();
+            wal.advance_by_counts("proj", &table, &[1, 0, 0, 0]).unwrap();
             wal.write_cursor_snapshot(true).unwrap();
         }
         // Re-open with a different shard count — load must refuse.
@@ -1264,6 +1274,7 @@ mod tests {
     /// is the scenario the snapshot exists to handle, distinct from the
     /// idempotent path in `..._roundtrip_restores_persisted_positions`.
     #[test]
+    #[serial_test::serial]
     fn cursor_snapshot_restore_advances_walrus_past_local_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
@@ -1302,6 +1313,7 @@ mod tests {
     /// leave `cursor_snapshot.json.tmp` behind. The next WalManager init
     /// must sweep it so it doesn't accumulate over many crash-restart cycles.
     #[test]
+    #[serial_test::serial]
     fn cursor_snapshot_tmp_swept_on_init() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
@@ -1323,6 +1335,7 @@ mod tests {
     /// task can carry on.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn write_and_delete_both_fail_under_readonly_meta_dir() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -1351,6 +1364,7 @@ mod tests {
     /// in the spot the atomic-rename tmp would occupy — `fs::write` to a
     /// directory path errors, so the rename never happens.
     #[test]
+    #[serial_test::serial]
     fn write_cursor_snapshot_failure_requires_caller_to_delete_stale_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
@@ -1374,6 +1388,7 @@ mod tests {
     /// absent. The flush path calls this on write failure to keep boot from
     /// restoring stale state.
     #[test]
+    #[serial_test::serial]
     fn delete_cursor_snapshot_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
@@ -1392,12 +1407,15 @@ mod tests {
     /// fine but must not let the boot path skip the Delta verifier — that
     /// gate is reserved for the graceful-shutdown marker.
     #[test]
+    #[serial_test::serial]
     fn cursor_snapshot_dirty_path_loads_but_signals_unclean() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
-        wal.append("proj", "tbl", &create_test_batch()).unwrap();
-        wal.advance_by_counts("proj", "tbl", &[1, 0, 0, 0]).unwrap();
+        // Unique topic per run — see cursor_snapshot_roundtrip_restores_persisted_positions.
+        let table = format!("tbl_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        wal.append("proj", &table, &create_test_batch()).unwrap();
+        wal.advance_by_counts("proj", &table, &[1, 0, 0, 0]).unwrap();
         wal.write_cursor_snapshot(false).unwrap();
 
         let snap = wal.load_cursor_snapshot().expect("dirty snapshot must still be loadable");

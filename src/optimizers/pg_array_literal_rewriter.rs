@@ -33,6 +33,11 @@ use datafusion::{
 /// `coalesce(List, Utf8)` must type-check up front; the analyzer rule below
 /// then replaces the string literal with a real list literal so TypeCoercion
 /// never has to cast Utf8 → List (unsupported in Arrow).
+///
+/// Registered under the built-in's name, shadowing it session-wide; every
+/// trait method delegates to the inner built-in. On a DataFusion upgrade,
+/// re-check `ScalarUDFImpl` for new methods whose defaults would diverge
+/// from the built-in coalesce and forward them here too.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PgCoalesceUdf {
     inner: Arc<datafusion::logical_expr::ScalarUDF>,
@@ -75,6 +80,11 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
     }
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types).or_else(|e| {
+            // Fallback only runs after the built-in coercion failed. Promote
+            // EVERY string arg (not just literals — arg types carry no
+            // expression info here) to the sibling list type: PG treats any
+            // string in array position as an array literal, and the analyzer
+            // rule rewrites the literals to real lists before execution.
             // First list type wins. If a call ever mixes list element types
             // (coalesce(utf8_list, int_list, '{}')) the retried coercion below
             // fails on the second list and the original error surfaces — no
@@ -177,15 +187,12 @@ fn pg_elems_to_list(elems: Vec<Option<String>>, elem_type: &DataType) -> Option<
 }
 
 /// Parse a PG array literal of strings: `{}`, `{a,b}`, `{"a,b",NULL}`.
-/// Returns None if `s` isn't brace-wrapped (not an array literal).
+/// Returns None if `s` isn't brace-wrapped (not an array literal), or if it
+/// contains unquoted nested braces (multi-dimensional arrays like
+/// `{{a},{b}}` — the schema is 1-D only, and misparsing the inner braces as
+/// element text would be silently wrong; bail so the arg is left untouched).
 fn parse_pg_string_array(s: &str) -> Option<Vec<Option<String>>> {
     let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
-    // Multi-dimensional literals ('{{a},{b}}') would misparse as flat
-    // elements once the outer braces are stripped — bail (arg left alone,
-    // TypeCoercion reports the original error) rather than silently mangle.
-    if inner.contains('{') || inner.contains('}') {
-        return None;
-    }
     if inner.trim().is_empty() {
         return Some(vec![]);
     }
@@ -194,6 +201,7 @@ fn parse_pg_string_array(s: &str) -> Option<Vec<Option<String>>> {
     while let Some(c) = chars.next() {
         match c {
             '\\' if in_quotes => cur.push(chars.next()?),
+            '{' | '}' if !in_quotes => return None, // multi-dimensional literal
             '"' => {
                 if !in_quotes && cur.trim().is_empty() {
                     cur.clear(); // drop whitespace before an opening quote
@@ -273,8 +281,14 @@ mod tests {
         assert_eq!(parse_pg_string_array("{a,b}"), Some(vec![Some("a".into()), Some("b".into())]));
         assert_eq!(parse_pg_string_array(r#"{"a,b", c }"#), Some(vec![Some("a,b".into()), Some("c".into())]));
         assert_eq!(parse_pg_string_array("{NULL,\"NULL\"}"), Some(vec![None, Some("NULL".into())]));
-        assert_eq!(parse_pg_string_array("plain"), None);
-        // Multi-dimensional literals are rejected, not silently flattened.
+        // Chars between a closing quote and the next comma are dropped — PG
+        // rejects these literals outright; we parse leniently and keep the
+        // quoted value. Pinned so the behavior is intentional, not accidental.
+        assert_eq!(parse_pg_string_array("{\"a\"x,b}"), Some(vec![Some("a".into()), Some("b".into())]));
+        // Multi-dimensional literals are rejected, not silently flattened;
+        // braces inside quotes are ordinary element text.
         assert_eq!(parse_pg_string_array("{{a},{b}}"), None);
+        assert_eq!(parse_pg_string_array(r#"{"{x}",y}"#), Some(vec![Some("{x}".into()), Some("y".into())]));
+        assert_eq!(parse_pg_string_array("plain"), None);
     }
 }

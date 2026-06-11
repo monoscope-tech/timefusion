@@ -119,8 +119,13 @@ impl E2eEnvBuilder {
         // test sees only its own WAL after restart.
         let test_wal_dir = data_dir.join("wal");
         std::fs::create_dir_all(&test_wal_dir).ok();
-        // SAFETY: e2e suite runs with --test-threads=1, so no other thread
-        // reads/writes WALRUS_DATA_DIR concurrently.
+        // SAFETY: every e2e test is #[serial_test::serial] (the dedicated E2E
+        // job also passes --test-threads=1), so no other thread reads/writes
+        // WALRUS_DATA_DIR concurrently. The serial attribute is what keeps
+        // this sound when the suite runs under plain `cargo test
+        // --all-features` (the Clippy & Test job), where parallel harness
+        // startups used to race the env var and bootstrap with another
+        // test's WAL dir ("Unsupported WAL version: 0").
         unsafe { std::env::set_var("WALRUS_DATA_DIR", &test_wal_dir) };
 
         // Bucket creation: MinIO default credentials are minioadmin/minioadmin.

@@ -2220,7 +2220,7 @@ impl Database {
                             );
                             db.warm_cache_for_uris(store, table_uri, uris).await;
                         }
-                        Err(e) => info!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
+                        Err(e) => warn!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                     }
                 };
                 // Abandon warming on shutdown so in-flight S3 calls can't slow
@@ -2510,6 +2510,11 @@ impl Database {
                     // hold the write lock — no extra log scan required.
                     let added: Vec<String> = table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
 
+                    // Capture the store off the handle we just committed with —
+                    // the warm task below must never re-resolve the table (a
+                    // possible PG roundtrip + a redundant Delta state reload).
+                    let (warm_store, warm_table_uri) = (table.log_store().object_store(None), table.table_url().to_string());
+
                     // Invalidate statistics cache after successful write
                     drop(table); // Release write lock before async operation
                     // Freshly-flushed files are the ones dashboards query next;
@@ -2521,7 +2526,11 @@ impl Database {
                     // short-lived runtime and poison the shared client pool for
                     // the next test's S3 reads ("error sending request" in µs).
                     if watermark.is_some() {
-                        self.warm_cache_for_table(&project_id, &table_name, added.clone());
+                        let db = self.clone();
+                        let warm_added = added.clone();
+                        tokio::spawn(async move {
+                            db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added).await;
+                        });
                     }
                     self.statistics_extractor.invalidate(&project_id, &table_name).await;
                     debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);

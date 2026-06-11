@@ -9,6 +9,7 @@ use super::harness::E2eEnv;
 
 const QUERY_RESPONSE_BUDGET: Duration = Duration::from_secs(5);
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn pgwire_query_returns_response() -> anyhow::Result<()> {
     let env = E2eEnv::builder().start().await?;
@@ -43,6 +44,7 @@ async fn pgwire_query_returns_response() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn count_star_returns_correct_value() -> anyhow::Result<()> {
     let env = E2eEnv::builder().start().await?;

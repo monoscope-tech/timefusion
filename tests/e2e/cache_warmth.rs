@@ -5,6 +5,7 @@
 
 use super::harness::{E2eEnv, FROZEN_START_MICROS};
 
+#[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn second_read_after_flush_hits_foyer() -> anyhow::Result<()> {
     let env = E2eEnv::builder().with_foyer_enabled().start().await?;

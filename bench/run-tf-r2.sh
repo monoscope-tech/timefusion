@@ -26,11 +26,14 @@ if [ "${R2:-0}" = "1" ]; then
   export AWS_SECRET_ACCESS_KEY="$(grep '^AWS_SECRET_ACCESS_KEY=' .env.cloudflare | head -1 | cut -d= -f2-)"
   export AWS_REGION="$(grep '^AWS_REGION=' .env.cloudflare | head -1 | cut -d= -f2-)"
 else
-  [ -f ../monoscope/.env.prod ] || { echo "OVH mode requires ../monoscope/.env.prod for S3 creds (or use R2=1)"; exit 1; }
+  # OVH creds come from a sibling monoscope checkout by default; point
+  # MONOSCOPE_DIR elsewhere if your repos aren't siblings.
+  monoscope_env="${MONOSCOPE_DIR:-../monoscope}/.env.prod"
+  [ -f "$monoscope_env" ] || { echo "OVH mode requires $monoscope_env for S3 creds (set MONOSCOPE_DIR or use R2=1)"; exit 1; }
   export AWS_S3_ENDPOINT="https://s3.de.io.cloud.ovh.net/"
   export AWS_S3_BUCKET="rrweb"
-  export AWS_ACCESS_KEY_ID="$(grep '^S3_ACCESS_KEY' ../monoscope/.env.prod | cut -d= -f2-)"
-  export AWS_SECRET_ACCESS_KEY="$(grep '^S3_SECRET_KEY' ../monoscope/.env.prod | cut -d= -f2-)"
+  export AWS_ACCESS_KEY_ID="$(grep '^S3_ACCESS_KEY' "$monoscope_env" | cut -d= -f2-)"
+  export AWS_SECRET_ACCESS_KEY="$(grep '^S3_SECRET_KEY' "$monoscope_env" | cut -d= -f2-)"
   export AWS_REGION="de"
 fi
 export AWS_ALLOW_HTTP="false"
@@ -39,6 +42,8 @@ export TIMEFUSION_DATA_DIR="$data_dir"
 export RUST_LOG="${RUST_LOG_OVERRIDE:-warn,timefusion=info}"
 export TIMEFUSION_FLUSH_INTERVAL_SECS=60
 export TIMEFUSION_BUFFER_MAX_MEMORY_MB=2048
+# Bench-only convenience (local pgwire without TLS/password). NEVER copy
+# this into a production config.
 export TIMEFUSION_ALLOW_INSECURE_AUTH=true
 export MAX_PG_CONNECTIONS=64
 export TIMEFUSION_BATCH_QUEUE_CAPACITY=10000

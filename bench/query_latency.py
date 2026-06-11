@@ -124,7 +124,10 @@ def seed_scale():
 
 
 def run_ages(n_iter=8):
-    """Random access at several partition ages — exposes cold/stale costs."""
+    """Random access at several partition ages — exposes cold/stale costs.
+    Requires `seed_scale` to have run first (it writes targets_by_age to the
+    state file; plain `seed` doesn't). Iterations are printed unfiltered —
+    the cold first touch IS the signal here, unlike run()'s warm percentiles."""
     st = json.loads(STATE.read_text())
     pid = st["project_id"]
     with psycopg.connect(URL, autocommit=True) as c, c.cursor() as cur:
