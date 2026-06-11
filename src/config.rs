@@ -638,6 +638,12 @@ pub struct MaintenanceConfig {
     /// 0 = no recency limit.
     #[serde(default = "d_warm_recency_days")]
     pub timefusion_warm_recency_days:          u64,
+    /// Warm parquet footers for EVERY live file (not just recency-window
+    /// ones). Footers are tens of KB each, but on tables with thousands of
+    /// files the boot-time GET burst may matter on small instances — disable
+    /// to fall back to recency-bounded footer warming.
+    #[serde(default = "d_true")]
+    pub timefusion_warm_all_footers:           bool,
     /// Max concurrent warm fetches per commit. Bounds the S3 GET burst a
     /// warm job adds right after a compaction.
     #[serde(default = "d_warm_concurrency")]

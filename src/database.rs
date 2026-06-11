@@ -655,6 +655,10 @@ pub struct Database {
     pub scan_metrics:                Arc<ScanMetrics>,
     batch_queue:                     Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown:            Arc<CancellationToken>,
+    /// One-shot guard for `preload_tables` — main.rs and bootstrap.rs are
+    /// disjoint entry points today, but a second call must not double the
+    /// boot-time S3 warm burst.
+    preload_started:                 Arc<std::sync::atomic::AtomicBool>,
     config_pool:                     Option<PgPool>,
     storage_configs:                 Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
     /// Monotonic deadline (nanos since process start) for when the next
@@ -964,6 +968,7 @@ impl Database {
             scan_metrics: Arc::new(ScanMetrics::default()),
             batch_queue: None,
             maintenance_shutdown: Arc::new(CancellationToken::new()),
+            preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_pool,
             storage_configs: Arc::new(RwLock::new(storage_configs)),
             storage_configs_next_refresh_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2032,6 +2037,7 @@ impl Database {
             return;
         }
         let warm_full_files = maint.timefusion_warm_full_files;
+        let warm_all_footers = maint.timefusion_warm_all_footers;
         let recency_days = maint.timefusion_warm_recency_days;
         let concurrency = maint.timefusion_warm_concurrency.max(1);
         let metadata_size_hint = self.config.cache.timefusion_parquet_metadata_size_hint as u64;
@@ -2047,9 +2053,12 @@ impl Database {
         let cutoff = (recency_days > 0).then(|| Utc::now().date_naive() - chrono::Duration::days(recency_days.min(3650) as i64));
 
         let mut dropped = 0usize;
-        // Footers are warmed for EVERY live file (tens of KB each — they're
-        // what turns a deep-partition first touch from footer+data RTTs into
-        // a single data fetch). Full-file warming stays recency-bounded.
+        // With warm_all_footers (default): footers warm for EVERY live file
+        // (tens of KB each — they turn a deep-partition first touch from
+        // footer+data RTTs into a single data fetch). On tables with
+        // thousands of files that's thousands of boot-time GETs (bounded by
+        // `concurrency`); disable the flag to recency-bound footers too.
+        // Full-file warming is always recency-bounded.
         let paths: Vec<(object_store::path::Path, bool)> = uris
             .into_iter()
             .filter(|u| u.ends_with(".parquet"))
@@ -2057,6 +2066,7 @@ impl Database {
                 let recent = within_recency(&u, cutoff);
                 (u, recent)
             })
+            .filter(|(_, recent)| warm_all_footers || *recent)
             .filter_map(|(u, recent)| match relativize_to_prefix(prefix, &u) {
                 Some(path) => Some((path, recent)),
                 None => {
@@ -2194,6 +2204,11 @@ impl Database {
     /// replay + parquet footer reads inline (measured 1.4 s cold vs 13 ms
     /// warm against OVH S3 for a single-partition random-access lookup).
     pub fn preload_tables(self: &Arc<Self>) {
+        // Idempotent: main.rs and bootstrap.rs are disjoint entry points, but
+        // a second call must not double the boot-time S3 warm burst.
+        if self.preload_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         // Tables preload concurrently — a slow object-store round-trip on one
         // must not delay the others' first-query readiness. Per-file warm
         // concurrency inside warm_cache_for_uris is already bounded, so the
