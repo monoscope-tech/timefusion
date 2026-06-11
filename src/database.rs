@@ -2209,7 +2209,7 @@ impl Database {
                         let _ = crate::object_store_cache::warm_full(store.as_ref(), &path).await;
                     }
                     let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if n % 500 == 0 {
+                    if n.is_multiple_of(500) {
                         info!("Cache warm progress: {n}/{count} files");
                     }
                 }
