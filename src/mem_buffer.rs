@@ -286,6 +286,80 @@ pub fn estimate_batch_size(batch: &RecordBatch) -> usize {
     batch.get_array_memory_size() + BATCH_FIXED_OVERHEAD + batch.num_columns() * PER_COLUMN_OVERHEAD
 }
 
+/// Compact string/binary-view arrays whose buffers are mostly slack.
+///
+/// `ScalarValue::to_array_of_size` (pgwire fast-insert, WAL replay of those
+/// rows) allocates a ~16KB view block per Utf8View column even for a <32B
+/// string — ~1MB of reported capacity per single-row batch on the otel
+/// schema. `get_array_memory_size` counts that capacity, so the buffer
+/// budget exhausts after ~38k rows (prod 2026-06-11: 1.5TB tracked inside a
+/// 66.6GiB cgroup, every insert rejected). `gc()` rewrites the views into
+/// exact-size buffers; compact arrays (e.g. from gRPC IPC) pass through as
+/// Arc clones. Recurses into List/LargeList/FixedSizeList/Struct children.
+fn compact_view_arrays(arr: &ArrayRef) -> ArrayRef {
+    use arrow::array::{Array, BinaryViewArray, FixedSizeListArray, LargeListArray, ListArray, StringViewArray, StructArray};
+    fn wasteful(buffers: &[arrow::buffer::Buffer]) -> bool {
+        let (cap, len) = buffers.iter().fold((0usize, 0usize), |(c, l), b| (c + b.capacity(), l + b.len()));
+        cap > len * 2 + 1024
+    }
+    match arr.data_type() {
+        DataType::Utf8View => {
+            let v = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
+            if wasteful(v.data_buffers()) { Arc::new(v.gc()) } else { arr.clone() }
+        }
+        DataType::BinaryView => {
+            let v = arr.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+            if wasteful(v.data_buffers()) { Arc::new(v.gc()) } else { arr.clone() }
+        }
+        DataType::List(f) => {
+            let l = arr.as_any().downcast_ref::<ListArray>().unwrap();
+            let vals = compact_view_arrays(l.values());
+            if Arc::ptr_eq(&vals, l.values()) {
+                arr.clone()
+            } else {
+                Arc::new(ListArray::new(f.clone(), l.offsets().clone(), vals, l.nulls().cloned()))
+            }
+        }
+        DataType::LargeList(f) => {
+            let l = arr.as_any().downcast_ref::<LargeListArray>().unwrap();
+            let vals = compact_view_arrays(l.values());
+            if Arc::ptr_eq(&vals, l.values()) {
+                arr.clone()
+            } else {
+                Arc::new(LargeListArray::new(f.clone(), l.offsets().clone(), vals, l.nulls().cloned()))
+            }
+        }
+        DataType::FixedSizeList(f, size) => {
+            let l = arr.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+            let vals = compact_view_arrays(l.values());
+            if Arc::ptr_eq(&vals, l.values()) {
+                arr.clone()
+            } else {
+                Arc::new(FixedSizeListArray::new(f.clone(), *size, vals, l.nulls().cloned()))
+            }
+        }
+        DataType::Struct(fields) => {
+            let s = arr.as_any().downcast_ref::<StructArray>().unwrap();
+            let cols: Vec<ArrayRef> = s.columns().iter().map(compact_view_arrays).collect();
+            if cols.iter().zip(s.columns()).all(|(a, b)| Arc::ptr_eq(a, b)) {
+                arr.clone()
+            } else {
+                Arc::new(StructArray::new(fields.clone(), cols, s.nulls().cloned()))
+            }
+        }
+        _ => arr.clone(),
+    }
+}
+
+fn compact_view_batch(batch: RecordBatch) -> RecordBatch {
+    let cols: Vec<ArrayRef> = batch.columns().iter().map(compact_view_arrays).collect();
+    if cols.iter().zip(batch.columns()).all(|(a, b)| Arc::ptr_eq(a, b)) {
+        batch
+    } else {
+        RecordBatch::try_new(batch.schema(), cols).unwrap_or(batch)
+    }
+}
+
 /// Collapse rows in `batches` to one row per unique value of `keys`, keep-last.
 /// Empty `keys` or empty input → no-op. Surviving row order is preserved.
 /// Tiebreaker on identical key tuples: last occurrence in insertion order wins.
@@ -1661,6 +1735,7 @@ impl TableBuffer {
     /// in the value returned (the caller's MemBuffer-level counter is
     /// approximate by design — converges on drain/evict).
     pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<(usize, i64)> {
+        let batch = compact_view_batch(batch);
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
         let new_size = estimate_batch_size(&batch);
@@ -1848,6 +1923,50 @@ mod tests {
         let id_array = Int64Array::from(vec![1]);
         let name_array = StringViewArray::from(vec!["test"]);
         RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
+    }
+
+    // Prod 2026-06-11: pgwire fast-insert / WAL-replay batches materialize a
+    // ~16KB view block per Utf8View column via `ScalarValue::to_array_of_size`
+    // (~1MB charged per row on the 89-col otel schema). MemBuffer tracked
+    // 1.5TB against a 66.6GiB cgroup and rejected every insert within minutes
+    // of boot. Guard: a single-row wide-Utf8View batch must be charged near
+    // its logical size, including view columns nested in List and Struct.
+    #[test]
+    fn single_row_utf8view_insert_charged_logical_size_not_block_capacity() {
+        use datafusion::common::ScalarValue;
+        let n_str_cols = 64;
+        let mut fields: Vec<Field> =
+            vec![Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false)];
+        fields.extend((0..n_str_cols).map(|i| Field::new(format!("c{i}"), DataType::Utf8View, true)));
+        let item = Arc::new(Field::new("item", DataType::Utf8View, true));
+        fields.push(Field::new("l", DataType::List(item.clone()), true));
+        fields.push(Field::new("s", DataType::Struct(vec![Field::new("v", DataType::Utf8View, true)].into()), true));
+        let schema = Arc::new(Schema::new(fields));
+
+        let ts = chrono::Utc::now().timestamp_micros();
+        let view_col = || ScalarValue::Utf8View(Some("a string too long to inline in the view".into())).to_array_of_size(1).unwrap();
+        let mut cols: Vec<ArrayRef> = vec![Arc::new(TimestampMicrosecondArray::from(vec![ts]).with_timezone("UTC"))];
+        cols.extend((0..n_str_cols).map(|_| view_col()));
+        cols.push(Arc::new(arrow::array::ListArray::new(
+            item,
+            arrow::buffer::OffsetBuffer::from_lengths([1]),
+            view_col(),
+            None,
+        )));
+        cols.push(Arc::new(arrow::array::StructArray::new(
+            vec![Field::new("v", DataType::Utf8View, true)].into(),
+            vec![view_col()],
+            None,
+        )));
+        let batch = RecordBatch::try_new(schema, cols).unwrap();
+
+        let buffer = MemBuffer::new();
+        buffer.insert("p1", "t1", batch, ts).unwrap();
+        let charged = buffer.estimated_memory_bytes();
+        assert!(
+            charged < 64 * 1024,
+            "single ~3KB-logical row charged {charged} bytes — view block capacity is leaking into memory accounting"
+        );
     }
 
     #[test]
