@@ -78,7 +78,8 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
 #[tokio::test]
 async fn optimize_preserves_all_partition_values() -> Result<()> {
     let cfg = TestConfigBuilder::new("optimize_partition_preserve").with_buffer_mode(BufferMode::Enabled).build();
-    // SAFETY: see dedup_compaction_collapses_cross_flush_duplicates.
+    // SAFETY: `set_var` is racy if another thread reads the env concurrently;
+    // `#[serial]` serialises this suite so no other test races the variable.
     unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);

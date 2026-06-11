@@ -2200,25 +2200,34 @@ impl Database {
         // fan-out here is one in-flight snapshot load per registered table.
         for table_name in crate::schema_loader::registry().list_tables() {
             let db = Arc::clone(self);
+            let shutdown = self.maintenance_shutdown.clone();
             tokio::spawn(async move {
-                let t = std::time::Instant::now();
-                match db.resolve_table("default", &table_name).await {
-                    Ok(table_ref) => {
-                        // Warm via the already-resolved handle — warm_cache_for_table
-                        // would redundantly resolve_table a second time.
-                        let (uris, store, table_uri) = {
-                            let table = table_ref.read().await;
-                            let uris: Vec<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                            (uris, table.log_store().object_store(None), table.table_url().to_string())
-                        };
-                        info!(
-                            "bootstrap.phase=table_preload table={table_name} files={} elapsed_ms={}",
-                            uris.len(),
-                            t.elapsed().as_millis()
-                        );
-                        db.warm_cache_for_uris(store, table_uri, uris).await;
+                let preload = async {
+                    let t = std::time::Instant::now();
+                    match db.resolve_table("default", &table_name).await {
+                        Ok(table_ref) => {
+                            // Warm via the already-resolved handle — warm_cache_for_table
+                            // would redundantly resolve_table a second time.
+                            let (uris, store, table_uri) = {
+                                let table = table_ref.read().await;
+                                let uris: Vec<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                                (uris, table.log_store().object_store(None), table.table_url().to_string())
+                            };
+                            info!(
+                                "bootstrap.phase=table_preload table={table_name} files={} elapsed_ms={}",
+                                uris.len(),
+                                t.elapsed().as_millis()
+                            );
+                            db.warm_cache_for_uris(store, table_uri, uris).await;
+                        }
+                        Err(e) => info!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
                     }
-                    Err(e) => info!("bootstrap.phase=table_preload table={table_name} skipped: {e}"),
+                };
+                // Abandon warming on shutdown so in-flight S3 calls can't slow
+                // a fast restart during initial boot.
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                    _ = preload => {}
                 }
             });
         }

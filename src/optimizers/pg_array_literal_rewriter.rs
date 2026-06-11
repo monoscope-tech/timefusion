@@ -75,6 +75,10 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
     }
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types).or_else(|e| {
+            // First list type wins. If a call ever mixes list element types
+            // (coalesce(utf8_list, int_list, '{}')) the retried coercion below
+            // fails on the second list and the original error surfaces — no
+            // silent mis-typing, just a planner-time error like today.
             let list_t = arg_types
                 .iter()
                 .find(|t| matches!(t, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)))
@@ -176,6 +180,12 @@ fn pg_elems_to_list(elems: Vec<Option<String>>, elem_type: &DataType) -> Option<
 /// Returns None if `s` isn't brace-wrapped (not an array literal).
 fn parse_pg_string_array(s: &str) -> Option<Vec<Option<String>>> {
     let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
+    // Multi-dimensional literals ('{{a},{b}}') would misparse as flat
+    // elements once the outer braces are stripped — bail (arg left alone,
+    // TypeCoercion reports the original error) rather than silently mangle.
+    if inner.contains('{') || inner.contains('}') {
+        return None;
+    }
     if inner.trim().is_empty() {
         return Some(vec![]);
     }
@@ -264,5 +274,7 @@ mod tests {
         assert_eq!(parse_pg_string_array(r#"{"a,b", c }"#), Some(vec![Some("a,b".into()), Some("c".into())]));
         assert_eq!(parse_pg_string_array("{NULL,\"NULL\"}"), Some(vec![None, Some("NULL".into())]));
         assert_eq!(parse_pg_string_array("plain"), None);
+        // Multi-dimensional literals are rejected, not silently flattened.
+        assert_eq!(parse_pg_string_array("{{a},{b}}"), None);
     }
 }
