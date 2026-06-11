@@ -6,7 +6,7 @@ use chrono_tz::Tz;
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, ListArray, StringArray, StringViewArray, StringViewBuilder,
+            Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray, StringViewArray, StringViewBuilder,
             TimestampMicrosecondArray, TimestampNanosecondArray,
         },
         datatypes::{DataType, TimeUnit},
@@ -1186,6 +1186,10 @@ fn array_to_json_values(array: &ArrayRef) -> datafusion::error::Result<Vec<JsonV
     array_to_json_values_inner(array, true)
 }
 
+/// `sniff_json` parses Utf8 values that look like JSON into real JSON. PG parity
+/// requires it only at the top level — Variant/Utf8 columns holding JSON
+/// (attributes, events, links) need it — while list elements must stay JSON
+/// strings (`to_jsonb(text[])`), so list recursion always passes `false`.
 fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion::error::Result<Vec<JsonValue>> {
     let mut values = Vec::with_capacity(array.len());
 
@@ -1231,22 +1235,8 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
                 }
             }
         }
-        DataType::List(_) => {
-            let list_array = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| DataFusionError::Execution("Failed to downcast to ListArray".to_string()))?;
-
-            for i in 0..list_array.len() {
-                if list_array.is_null(i) {
-                    values.push(JsonValue::Null);
-                } else {
-                    let array_ref = list_array.value(i);
-                    let inner_values = array_to_json_values_inner(&array_ref, false)?;
-                    values.push(JsonValue::Array(inner_values));
-                }
-            }
-        }
+        DataType::List(_) => push_list_json::<i32>(array, &mut values)?,
+        DataType::LargeList(_) => push_list_json::<i64>(array, &mut values)?,
         _ => {
             // For other types, try to convert to string
             let string_array = datafusion::arrow::compute::cast(array, &DataType::Utf8View)?;
@@ -1255,6 +1245,21 @@ fn array_to_json_values_inner(array: &ArrayRef, sniff_json: bool) -> datafusion:
     }
 
     Ok(values)
+}
+
+fn push_list_json<O: datafusion::arrow::array::OffsetSizeTrait>(array: &ArrayRef, values: &mut Vec<JsonValue>) -> datafusion::error::Result<()> {
+    let list_array = array
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::GenericListArray<O>>()
+        .ok_or_else(|| DataFusionError::Execution("Failed to downcast to list array".to_string()))?;
+    for i in 0..list_array.len() {
+        if list_array.is_null(i) {
+            values.push(JsonValue::Null);
+        } else {
+            values.push(JsonValue::Array(array_to_json_values_inner(&list_array.value(i), false)?));
+        }
+    }
+    Ok(())
 }
 
 /// Create the time_bucket UDF for time-series bucketing (similar to TimescaleDB)
@@ -1972,12 +1977,28 @@ mod tests {
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
         assert_eq!(col.value(0), r#"["{\"a\":1}","[1,2]","plain","123"]"#);
+        // Independent of serialisation format: every element must be a JSON *string*.
+        let parsed: serde_json::Value = serde_json::from_str(col.value(0)).unwrap();
+        assert!(parsed.as_array().unwrap().iter().all(serde_json::Value::is_string), "elements must stay strings: {parsed}");
         // Top-level Utf8 scalars keep the JSON sniff: Variant/Utf8 columns holding
         // JSON (attributes, events, links) rely on it to surface as real JSON.
         let sql = r#"SELECT to_jsonb('{"a":1}') AS s"#;
         let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
         let col = batches[0].column(0).as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
         assert_eq!(col.value(0), r#"{"a":1}"#);
+    }
+
+    /// LargeList must keep list structure (it used to fall through to the
+    /// cast-to-string arm) and its elements follow the same no-sniff rule.
+    #[test]
+    fn test_large_list_to_json_values() {
+        use datafusion::arrow::array::{GenericListBuilder, StringViewBuilder};
+        let mut b = GenericListBuilder::<i64, _>::new(StringViewBuilder::new());
+        b.values().append_value(r#"{"a":1}"#);
+        b.values().append_value("plain");
+        b.append(true);
+        let arr: ArrayRef = Arc::new(b.finish());
+        assert_eq!(array_to_json_values(&arr).unwrap(), vec![serde_json::json!([r#"{"a":1}"#, "plain"])]);
     }
 
     #[test]
