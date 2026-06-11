@@ -47,12 +47,40 @@ use datafusion::{
 /// Registered under the built-in's name, shadowing it session-wide; every
 /// trait method delegates to the inner built-in. On a DataFusion upgrade,
 /// re-check `ScalarUDFImpl` for new methods whose defaults would diverge
-/// from the built-in coalesce and forward them here too.
-/// Last audited against DataFusion 53.1.0 — bump this with each audit.
+/// from the built-in coalesce and forward them here too — the const assert
+/// below fails the build on a version bump until that audit happens.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PgCoalesceUdf {
     inner: Arc<datafusion::logical_expr::ScalarUDF>,
 }
+
+/// DataFusion version `PgCoalesceUdf`'s method forwarding was last audited
+/// against, compared at compile time to `datafusion::DATAFUSION_VERSION`.
+/// A `cargo update` of datafusion breaks the build here on purpose:
+/// re-audit `ScalarUDFImpl` for new methods, forward them above, then bump.
+/// Maintenance invariant: DATAFUSION_VERSION resolves through the delta-rs
+/// fork's patched graph — the fork must not bump it independently of the
+/// workspace pin, or this check would pass against the wrong version. By the
+/// same token, fork upgrades that keep the version string still need the
+/// manual audit — the tripwire only catches plain `cargo update`s.
+const AUDITED_DATAFUSION_VERSION: &str = "53.1.0";
+// Byte loop because `&str` equality (PartialEq) isn't const-callable on
+// stable — assert!(a == b) won't compile in a const block.
+const _: () = {
+    let (a, b) = (datafusion::DATAFUSION_VERSION.as_bytes(), AUDITED_DATAFUSION_VERSION.as_bytes());
+    assert!(
+        a.len() == b.len(),
+        "DataFusion bumped: re-audit PgCoalesceUdf's ScalarUDFImpl forwarding, then update AUDITED_DATAFUSION_VERSION"
+    );
+    let mut i = 0;
+    while i < a.len() {
+        assert!(
+            a[i] == b[i],
+            "DataFusion bumped: re-audit PgCoalesceUdf's ScalarUDFImpl forwarding, then update AUDITED_DATAFUSION_VERSION"
+        );
+        i += 1;
+    }
+};
 
 impl Default for PgCoalesceUdf {
     fn default() -> Self {
