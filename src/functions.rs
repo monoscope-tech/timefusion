@@ -955,43 +955,31 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let args = args.args;
-        if args.is_empty() {
-            // Empty array case
-            let mut builder = StringViewBuilder::with_capacity(1);
-            builder.append_value("[]");
-            return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
-        }
+        let num_rows = args
+            .iter()
+            .find_map(|a| match a {
+                ColumnarValue::Array(array) => Some(array.len()),
+                ColumnarValue::Scalar(_) => None,
+            })
+            .unwrap_or(1);
 
-        // Determine the number of rows
-        let num_rows = match &args[0] {
-            ColumnarValue::Array(array) => array.len(),
-            ColumnarValue::Scalar(_) => 1,
-        };
+        // Convert each argument column ONCE up front. Converting inside the
+        // row loop is O(rows² × args) — observed as ~0.6ms/row × millions of
+        // rows, enough to OOM prod on a wide-window span-list query.
+        let cols = args
+            .iter()
+            .map(|arg| match arg {
+                ColumnarValue::Array(array) => array_to_json_values(array),
+                ColumnarValue::Scalar(scalar) => array_to_json_values(&scalar.to_array()?),
+            })
+            .collect::<datafusion::error::Result<Vec<_>>>()?;
 
         let mut builder = StringViewBuilder::with_capacity(num_rows);
-
         for row_idx in 0..num_rows {
-            let mut row_values = Vec::new();
-
-            for arg in &args {
-                let value = match arg {
-                    ColumnarValue::Array(array) => {
-                        let json_values = array_to_json_values(array)?;
-                        json_values[row_idx].clone()
-                    }
-                    ColumnarValue::Scalar(scalar) => {
-                        let array = scalar.to_array()?;
-                        let json_values = array_to_json_values(&array)?;
-                        json_values[0].clone()
-                    }
-                };
-                row_values.push(value);
-            }
-
-            let json_array = JsonValue::Array(row_values);
-            builder.append_value(json_array.to_string());
+            // len-1 columns are broadcast scalars
+            let row = cols.iter().map(|c| c[if c.len() == 1 { 0 } else { row_idx }].clone()).collect();
+            builder.append_value(JsonValue::Array(row).to_string());
         }
-
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
     }
 }
@@ -2021,6 +2009,41 @@ mod tests {
         b.append(true);
         let arr: ArrayRef = Arc::new(b.finish());
         assert_eq!(array_to_json_values(&arr).unwrap(), expected);
+    }
+
+    /// Regression guard: json_build_array used to call array_to_json_values
+    /// per row per arg — O(rows² × args). At one 8192-row batch that's ~10s;
+    /// linear is <100ms. Also pins mixed scalar+array broadcast (a scalar
+    /// first arg used to clamp num_rows to 1).
+    #[test]
+    fn test_json_build_array_linear_and_broadcast() {
+        use datafusion::{
+            arrow::array::{Int64Array, StringViewArray},
+            logical_expr::ScalarFunctionArgs,
+        };
+        let n = 8192;
+        let ids: ArrayRef = Arc::new(StringViewArray::from_iter_values((0..n).map(|i| format!("id-{i}"))));
+        let nums: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n as i64));
+        let scalar = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some("tag".into())));
+        let args = ScalarFunctionArgs {
+            args:           vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
+            arg_fields:     vec![],
+            number_rows:    n,
+            return_field:   Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
+            config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+        };
+        let start = std::time::Instant::now();
+        let ColumnarValue::Array(out) = JsonBuildArrayUDF::new().invoke_with_args(args).unwrap() else {
+            panic!("expected array output")
+        };
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "quadratic regression: took {:?}",
+            start.elapsed()
+        );
+        let out = out.as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
+        assert_eq!(out.len(), n);
+        assert_eq!(out.value(7), r#"["tag","id-7",7]"#);
     }
 
     #[test]
