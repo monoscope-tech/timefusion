@@ -2017,24 +2017,30 @@ mod tests {
     /// first arg used to clamp num_rows to 1).
     #[test]
     fn test_json_build_array_linear_and_broadcast() {
-        use datafusion::arrow::array::{Int64Array, StringViewArray};
-        use datafusion::logical_expr::ScalarFunctionArgs;
+        use datafusion::{
+            arrow::array::{Int64Array, StringViewArray},
+            logical_expr::ScalarFunctionArgs,
+        };
         let n = 8192;
         let ids: ArrayRef = Arc::new(StringViewArray::from_iter_values((0..n).map(|i| format!("id-{i}"))));
         let nums: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n as i64));
         let scalar = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some("tag".into())));
         let args = ScalarFunctionArgs {
-            args: vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
-            arg_fields: vec![],
-            number_rows: n,
-            return_field: Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
+            args:           vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
+            arg_fields:     vec![],
+            number_rows:    n,
+            return_field:   Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
         let start = std::time::Instant::now();
         let ColumnarValue::Array(out) = JsonBuildArrayUDF::new().invoke_with_args(args).unwrap() else {
             panic!("expected array output")
         };
-        assert!(start.elapsed() < std::time::Duration::from_secs(2), "quadratic regression: took {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "quadratic regression: took {:?}",
+            start.elapsed()
+        );
         let out = out.as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
         assert_eq!(out.len(), n);
         assert_eq!(out.value(7), r#"["tag","id-7",7]"#);
