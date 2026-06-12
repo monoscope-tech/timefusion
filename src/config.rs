@@ -117,12 +117,15 @@ const_default!(d_retention_mins: u64 = 70);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
 const_default!(d_wal_shards_per_topic: usize = 4);
-// Per-phase ceiling for each serial shutdown step (PGWire drain → gRPC drain →
-// BufferedWriteLayer flush). 5s — the previous default — was below realistic
-// flush time for any non-trivial MemBuffer and caused the post-deploy WAL
-// replay we saw 2026-06-03. The Docker `StopGracePeriod` external cap should
-// be set ≥ `3 × this` to give all three phases room.
-const_default!(d_shutdown_timeout: u64 = 180);
+// Total graceful-shutdown budget shared by ALL serial shutdown phases
+// (PGWire drain → gRPC drain → buffered-layer flush + cursor snapshot).
+// Set to ~80% of the orchestrator's SIGTERM→SIGKILL grace (Docker/CapRover
+// `StopGracePeriod`; prod is 60s) so the clean cursor snapshot always lands
+// before SIGKILL — the previous per-phase 180s ceilings assumed 540s of
+// grace nobody configured, and PGWire drain alone could eat the real grace
+// before the flush or snapshot ever started (2026-06-11 deploy). Anything
+// unflushed at the deadline is durable in the WAL and replays on next boot.
+const_default!(d_stop_grace: u64 = 50);
 const_default!(d_wal_corruption_threshold: usize = 10);
 const_default!(d_flush_parallelism: usize = 4);
 // Cold-boot Delta cursor reconciliation. R2 happily takes 64+ concurrent
@@ -414,8 +417,8 @@ pub struct BufferConfig {
     pub timefusion_eviction_interval_secs:   u64,
     #[serde(default = "d_buffer_max_memory")]
     pub timefusion_buffer_max_memory_mb:     usize,
-    #[serde(default = "d_shutdown_timeout")]
-    pub timefusion_shutdown_timeout_secs:    u64,
+    #[serde(default = "d_stop_grace")]
+    pub timefusion_stop_grace_secs:          u64,
     #[serde(default = "d_wal_corruption_threshold")]
     pub timefusion_wal_corruption_threshold: usize,
     #[serde(default = "d_flush_parallelism")]
@@ -518,9 +521,9 @@ impl BufferConfig {
         Duration::from_secs(self.timefusion_write_backpressure_secs)
     }
 
-    /// Per-phase shutdown ceiling, in seconds.
-    pub fn compute_shutdown_timeout(&self) -> Duration {
-        Duration::from_secs(self.timefusion_shutdown_timeout_secs.max(1))
+    /// Total graceful-shutdown budget — see `d_stop_grace`.
+    pub fn stop_grace(&self) -> Duration {
+        Duration::from_secs(self.timefusion_stop_grace_secs.max(1))
     }
 }
 

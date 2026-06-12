@@ -1366,23 +1366,31 @@ impl BufferedWriteLayer {
         .await;
     }
 
-    #[instrument(skip(self))]
+    /// Shutdown with the full configured stop grace as the budget. Callers
+    /// that already spent part of the grace on earlier drain phases (main.rs)
+    /// use `shutdown_by` with the shared absolute deadline instead.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.shutdown_by(tokio::time::Instant::now() + self.config.buffer.stop_grace()).await
+    }
+
+    #[instrument(skip(self))]
+    pub async fn shutdown_by(&self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
         info!("BufferedWriteLayer shutdown initiated");
 
-        // Signal background tasks to stop, then run the rest of shutdown under a
-        // deadline that must fit inside the orchestrator's SIGTERM→SIGKILL grace
-        // so the clean cursor snapshot below ALWAYS gets written. Anything not
-        // flushed in time is durable in the WAL and simply replays (and
-        // background-drains) on next boot. Prod 2026-06-12: an unbounded
-        // force-flush of a 38GB buffer blew past the grace, was SIGKILLed
-        // mid-flush, and left clean_shutdown=false → next boot paid
-        // delta_cursor_reconcile + a full blocking replay. Keep
-        // TIMEFUSION_SHUTDOWN_TIMEOUT_SECS below the orchestrator grace.
+        // Signal background tasks to stop, then run the rest of shutdown by
+        // `deadline` — the remainder of the process-wide stop grace, which must
+        // fit inside the orchestrator's SIGTERM→SIGKILL window so the clean
+        // cursor snapshot below ALWAYS gets written. Anything not flushed in
+        // time is durable in the WAL and simply replays (and background-drains)
+        // on next boot. Prod 2026-06-12: an unbounded force-flush of a 38GB
+        // buffer blew past the grace, was SIGKILLed mid-flush, and left
+        // clean_shutdown=false → next boot paid delta_cursor_reconcile + a full
+        // blocking replay. Keep TIMEFUSION_STOP_GRACE_SECS below the
+        // orchestrator grace (Docker `StopGracePeriod`).
         self.shutdown.cancel();
-        let budget = self.config.buffer.compute_shutdown_timeout();
-        let flush_deadline = tokio::time::Instant::now() + budget.mul_f32(0.8);
-        let hard_deadline = tokio::time::Instant::now() + budget;
+        let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let flush_deadline = deadline - budget.mul_f32(0.2); // reserve 20% for the snapshot
+        let hard_deadline = deadline;
         debug!("Shutdown budget: {:?}", budget);
 
         // Wait for background tasks to stop, bounded by the flush deadline.
@@ -1769,7 +1777,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut base = AppConfig::default();
         base.core.timefusion_data_dir = dir.path().to_path_buf();
-        base.buffer.timefusion_shutdown_timeout_secs = 1; // budget=1s, flush_deadline=0.8s
+        base.buffer.timefusion_stop_grace_secs = 1; // budget=1s, flush_deadline=0.8s
         let cfg = Arc::new(base);
         // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
         unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
