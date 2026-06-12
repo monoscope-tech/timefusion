@@ -327,18 +327,21 @@ fn stamp_variant_field(f: &Arc<datafusion::arrow::datatypes::Field>) -> Arc<data
 /// Wrap a `datafusion-variant` UDF so its arg fields get the Variant
 /// extension marker re-stamped before delegation. Generic over the inner
 /// UDF type so `VariantToJsonUdf` and `VariantGetUdf` share one impl.
+/// `JSONB_OUT` tags the output Field with `tf.pg_type = jsonb` so bare
+/// Variant columns (wrapped by VariantPgwireRootWrap) surface PG OID 3802
+/// over the wire instead of text — strict drivers (hasql) reject text.
 #[derive(Debug, Hash, PartialEq, Eq)]
-pub struct VariantExtWrapper<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> {
+pub struct VariantExtWrapper<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_OUT: bool = false> {
     inner: U,
 }
 
-impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> Default for VariantExtWrapper<U> {
+impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_OUT: bool> Default for VariantExtWrapper<U, JSONB_OUT> {
     fn default() -> Self {
         Self { inner: U::default() }
     }
 }
 
-impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> ScalarUDFImpl for VariantExtWrapper<U> {
+impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_OUT: bool> ScalarUDFImpl for VariantExtWrapper<U, JSONB_OUT> {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -356,7 +359,13 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> ScalarUDFImpl
     // we must forward it rather than rely on the default that calls
     // return_type.
     fn return_field_from_args(&self, args: datafusion::logical_expr::ReturnFieldArgs) -> datafusion::error::Result<datafusion::arrow::datatypes::FieldRef> {
-        self.inner.return_field_from_args(args)
+        let f = self.inner.return_field_from_args(args)?;
+        if !JSONB_OUT {
+            return Ok(f);
+        }
+        let mut md = f.metadata().clone();
+        md.insert("tf.pg_type".into(), "jsonb".into());
+        Ok(Arc::new(f.as_ref().clone().with_metadata(md)))
     }
     fn coerce_types(&self, arg_types: &[DataType]) -> datafusion::error::Result<Vec<DataType>> {
         self.inner.coerce_types(arg_types)
@@ -368,7 +377,7 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static> ScalarUDFImpl
 }
 
 use std::hash::Hash;
-pub type VariantToJsonExtUdf = VariantExtWrapper<datafusion_variant::VariantToJsonUdf>;
+pub type VariantToJsonExtUdf = VariantExtWrapper<datafusion_variant::VariantToJsonUdf, true>;
 pub type VariantGetExtUdf = VariantExtWrapper<datafusion_variant::VariantGetUdf>;
 
 /// Register all custom PostgreSQL-compatible functions

@@ -129,4 +129,41 @@ mod jsonb_oid {
 
         Ok(())
     }
+
+    /// Regression: bare Variant columns (e.g. `context` in otel_logs_and_spans)
+    /// get wrapped with `variant_to_json()` by VariantPgwireRootWrap, but the
+    /// wrap surfaced text OID 25 — monoscope's hasql decoder expects jsonb 3802
+    /// (UnexpectedColumnTypeStatementError 3802 25 on logItemDetails).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn bare_variant_column_returns_jsonb_oid() -> Result<()> {
+        let server = Server::start().await?;
+        let client = server.connect().await?;
+
+        client
+            .execute(
+                &format!(
+                    "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, hashes, summary, context) \
+                     VALUES ('test_project', {}, '{}', 'jsonb-oid-row', ARRAY[]::text[], ARRAY['s'], '{{\"trace_id\":\"abc\"}}')",
+                    chrono::Utc::now().date_naive(),
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+                ),
+                &[],
+            )
+            .await?;
+
+        // Mirrors monoscope's logItemDetails query shape: bare Variant column in projection.
+        let stmt = client
+            .prepare("SELECT context FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'jsonb-oid-row' LIMIT 1")
+            .await?;
+        assert_eq!(stmt.columns()[0].type_().oid(), JSONB_OID, "bare Variant column must surface jsonb OID, not text");
+
+        // Binary decode (tokio-postgres uses binary format, same as hasql) —
+        // exercises the 0x01 jsonb version-byte path with real row data.
+        let row = client.query_one(&stmt, &[]).await?;
+        let v: serde_json::Value = row.get(0);
+        assert_eq!(v["trace_id"], "abc");
+
+        Ok(())
+    }
 }
