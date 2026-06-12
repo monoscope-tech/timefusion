@@ -110,28 +110,28 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
 /// `snapshot_stats()` and rendered as rows by `timefusion.stats()`.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
-    pub mem_project_count:      usize,
-    pub mem_total_buckets:      usize,
-    pub mem_total_rows:         usize,
-    pub mem_total_batches:      usize,
-    pub mem_estimated_bytes:    usize,
-    pub reserved_bytes:         usize,
-    pub max_memory_bytes:       usize,
-    pub pressure_pct:           u32,
-    pub wal_files:              usize,
-    pub wal_disk_bytes:         u64,
-    pub wal_shards_per_topic:   usize,
-    pub wal_known_topics:       usize,
-    pub bucket_duration_micros: i64,
+    pub mem_project_count:          usize,
+    pub mem_total_buckets:          usize,
+    pub mem_total_rows:             usize,
+    pub mem_total_batches:          usize,
+    pub mem_estimated_bytes:        usize,
+    pub reserved_bytes:             usize,
+    pub max_memory_bytes:           usize,
+    pub pressure_pct:               u32,
+    pub wal_files:                  usize,
+    pub wal_disk_bytes:             u64,
+    pub wal_shards_per_topic:       usize,
+    pub wal_known_topics:           usize,
+    pub bucket_duration_micros:     i64,
     /// Age of the oldest bucket in MemBuffer (seconds, computed from
     /// `now - min(bucket.min_timestamp)`). None when MemBuffer is empty.
     /// Alerting target: alert at > 2× `flush_interval_secs`.
-    pub oldest_bucket_age_secs: Option<u64>,
+    pub oldest_bucket_age_secs:     Option<u64>,
     /// Cumulative flush successes/failures since process start. Mirrors the
     /// OTel `timefusion.flush.completed`/`failed` counters so tests can
     /// assert without configuring OTel.
-    pub flush_completed_total:  u64,
-    pub flush_failed_total:     u64,
+    pub flush_completed_total:      u64,
+    pub flush_failed_total:         u64,
     /// Times an insert hit the memory hard limit and applied backpressure
     /// (synchronous flush-to-Delta) instead of rejecting. Sustained growth =
     /// ingest outpacing flush; the matching OTel counter is the alert target.
@@ -267,38 +267,38 @@ pub type TantivyIndexCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, Vec<String>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 pub struct BufferedWriteLayer {
-    config:                 Arc<AppConfig>,
-    wal:                    Arc<WalManager>,
-    mem_buffer:             Arc<MemBuffer>,
-    shutdown:               CancellationToken,
-    delta_write_callback:   Option<DeltaWriteCallback>,
-    tantivy_index_callback: Option<TantivyIndexCallback>,
-    background_tasks:       Mutex<Vec<JoinHandle<()>>>,
-    flush_lock:             Mutex<()>,
-    reserved_bytes:         AtomicUsize, // Memory reserved for in-flight writes
-    pressure_notify:        Arc<Notify>, // Wakes flush task when pressure threshold crossed
+    config:                     Arc<AppConfig>,
+    wal:                        Arc<WalManager>,
+    mem_buffer:                 Arc<MemBuffer>,
+    shutdown:                   CancellationToken,
+    delta_write_callback:       Option<DeltaWriteCallback>,
+    tantivy_index_callback:     Option<TantivyIndexCallback>,
+    background_tasks:           Mutex<Vec<JoinHandle<()>>>,
+    flush_lock:                 Mutex<()>,
+    reserved_bytes:             AtomicUsize, // Memory reserved for in-flight writes
+    pressure_notify:            Arc<Notify>, // Wakes flush task when pressure threshold crossed
     /// Notified at the end of every flush task iteration (success or failure).
     /// Test hook: lets E2E harnesses await actual completion of background work
     /// instead of racing wall-clock sleeps.
-    flush_tick_notify:      Arc<Notify>,
+    flush_tick_notify:          Arc<Notify>,
     /// Notified at the end of every eviction task iteration.
-    eviction_tick_notify:   Arc<Notify>,
+    eviction_tick_notify:       Arc<Notify>,
     /// Cumulative flush counters mirrored alongside OTel `record_flush`.
     /// OTel global metric state is opt-in (only initialized when telemetry is
     /// configured), so these atomics give the harness an in-process way to
     /// assert on what the global counters would be.
-    flush_completed_total:  AtomicU64,
-    flush_failed_total:     AtomicU64,
+    flush_completed_total:      AtomicU64,
+    flush_failed_total:         AtomicU64,
     backpressure_engaged_total: AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
-    function_registry:      Arc<crate::functions::FnRegistry>,
+    function_registry:          Arc<crate::functions::FnRegistry>,
     /// Caps concurrent detached tantivy sidecar builds so a fast flush cycle
     /// (post-F4 — one build per (project, table) per cycle) can't fan out
     /// past S3 connection / memory limits when many tables flush together.
     /// FOLLOW-UP: handles aren't stored; graceful shutdown does not await
     /// in-flight tantivy uploads. Acceptable for now because the sidecar is
     /// best-effort and the index can be rebuilt from Delta on demand.
-    tantivy_spawn_sem:      Arc<tokio::sync::Semaphore>,
+    tantivy_spawn_sem:          Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -532,7 +532,10 @@ impl BufferedWriteLayer {
         }
         // `force_flush_current_buckets` self-gates on the WAL-ordering invariant
         // (see its body), so calling it whenever pressure persists is safe.
-        if force_current && self.is_memory_pressure() && let Err(e) = self.force_flush_current_buckets().await {
+        if force_current
+            && self.is_memory_pressure()
+            && let Err(e) = self.force_flush_current_buckets().await
+        {
             warn!("backpressure: force_flush_current_buckets failed: {}", e);
         }
     }
@@ -567,7 +570,10 @@ impl BufferedWriteLayer {
             match self.flush_bucket(&bucket).await {
                 Ok(()) => {
                     if let Err(e) = self.wal.advance_by_counts(&bucket.project_id, &bucket.table_name, &bucket.wal_shard_counts) {
-                        warn!("force-flush: advance_by_counts failed (rows committed to Delta; WAL will re-replay, dedup protects): {}", e);
+                        warn!(
+                            "force-flush: advance_by_counts failed (rows committed to Delta; WAL will re-replay, dedup protects): {}",
+                            e
+                        );
                     } else {
                         self.flush_completed_total.fetch_add(1, Ordering::Relaxed);
                     }
