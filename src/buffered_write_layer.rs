@@ -719,19 +719,32 @@ impl BufferedWriteLayer {
         let mut updates_replayed = 0u64;
         let mut oldest_ts: Option<i64> = None;
         let mut newest_ts: Option<i64> = None;
+        // Per-op-type cost accounting to attribute the replay wall-clock. INSERT
+        // is split into Arrow-IPC decode vs MemBuffer apply; DML arms are timed
+        // whole (they run a DataFusion parse+plan+predicate-eval per entry).
+        let (mut insert_decode_nanos, mut insert_apply_nanos, mut insert_bytes) = (0u128, 0u128, 0u64);
+        let (mut delete_nanos, mut update_nanos) = (0u128, 0u128);
         let mem_buffer = &self.mem_buffer;
 
         let quarantine_dir = self.wal.data_dir().join("quarantine");
         let registry_ref: Option<&crate::functions::FnRegistry> = Some(self.function_registry.as_ref());
         let (_total, error_count) = self.wal.for_each_entry(Some(cutoff), true, |entry| {
+            let entry_start = std::time::Instant::now();
             match entry.operation {
-                WalOperation::Insert => match WalManager::deserialize_batch(&entry.data, &entry.table_name) {
+                WalOperation::Insert => {
+                    insert_bytes += entry.data.len() as u64;
+                    let decoded = WalManager::deserialize_batch(&entry.data, &entry.table_name);
+                    insert_decode_nanos += entry_start.elapsed().as_nanos();
+                    match decoded {
                     Ok(batch) => {
                         if batch.num_rows() == 0 {
                             warn!("Skipping empty batch during WAL recovery for {}.{}", entry.project_id, entry.table_name);
                             return;
                         }
-                        match mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros) {
+                        let apply_start = std::time::Instant::now();
+                        let insert_res = mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros);
+                        insert_apply_nanos += apply_start.elapsed().as_nanos();
+                        match insert_res {
                             Ok(()) => entries_replayed += 1,
                             Err(e) => {
                                 error!("WAL REPLAY FAILED: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
@@ -746,7 +759,8 @@ impl BufferedWriteLayer {
                         );
                         quarantine_entry(&quarantine_dir, &entry, "insert_corrupt", &e.to_string());
                     }
-                },
+                    }
+                }
                 WalOperation::Delete => match deserialize_delete_payload(&entry.data) {
                     Ok(payload) => {
                         if let Err(e) = mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), registry_ref) {
@@ -822,6 +836,13 @@ impl BufferedWriteLayer {
                     }
                 },
             }
+            // INSERT timing is split above; attribute the DML arms here (full
+            // arm = bincode/Arrow decode + DataFusion predicate eval).
+            match entry.operation {
+                WalOperation::Delete => delete_nanos += entry_start.elapsed().as_nanos(),
+                WalOperation::Update | WalOperation::UpdateWithSource => update_nanos += entry_start.elapsed().as_nanos(),
+                WalOperation::Insert => {}
+            }
             let ts = entry.timestamp_micros;
             oldest_ts = Some(oldest_ts.map_or(ts, |o| o.min(ts)));
             newest_ts = Some(newest_ts.map_or(ts, |n| n.max(ts)));
@@ -886,6 +907,23 @@ impl BufferedWriteLayer {
         info!(
             "WAL recovery complete: inserts={}, deletes={}, updates={}, corrupted={}, duration={}ms",
             entries_replayed, deletes_replayed, updates_replayed, error_count, stats.recovery_duration_ms
+        );
+        // Attribution of the replay wall-clock by op type, so we know whether the
+        // long pole is Arrow decode, MemBuffer apply, or per-entry DML SQL eval.
+        let avg_ms = |nanos: u128, n: u64| if n > 0 { nanos as f64 / n as f64 / 1_000_000.0 } else { 0.0 };
+        info!(
+            "WAL recovery cost breakdown: insert_decode={}ms ({:.3}ms/ea), insert_apply={}ms ({:.3}ms/ea), \
+             delete={}ms ({:.3}ms/ea), update={}ms ({:.3}ms/ea), insert_payload={}MB (avg {}B/ea)",
+            insert_decode_nanos / 1_000_000,
+            avg_ms(insert_decode_nanos, entries_replayed),
+            insert_apply_nanos / 1_000_000,
+            avg_ms(insert_apply_nanos, entries_replayed),
+            delete_nanos / 1_000_000,
+            avg_ms(delete_nanos, deletes_replayed),
+            update_nanos / 1_000_000,
+            avg_ms(update_nanos, updates_replayed),
+            insert_bytes / (1024 * 1024),
+            if entries_replayed > 0 { insert_bytes / entries_replayed } else { 0 },
         );
         Ok(stats)
     }
