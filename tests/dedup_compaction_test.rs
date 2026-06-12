@@ -129,7 +129,11 @@ async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
 
     let count_sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'dup_id'", project_id);
     let post = db.query_delta_only(&count_sql).await?;
-    assert_eq!(post[0].column(0).as_primitive::<Int64Type>().value(0), 1, "post-dedup: dup_id row should be collapsed to 1");
+    assert_eq!(
+        post[0].column(0).as_primitive::<Int64Type>().value(0),
+        1,
+        "post-dedup: dup_id row should be collapsed to 1"
+    );
     Ok(())
 }
 
