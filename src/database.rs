@@ -774,6 +774,14 @@ pub struct Database {
     /// the sweep when the version hasn't moved (no commits → no new dupes).
     /// Same unbounded-growth caveat as `last_written_versions`.
     last_dedup_versions:             Arc<RwLock<HashMap<String, u64>>>,
+    /// Serializes in-process Delta commits (flush appends vs dedup
+    /// replace_where). delta-kernel's OCC checker cannot evaluate the
+    /// bare-string timestamp predicate replace_where commits carry (errors
+    /// "arrow_cast should have been simplified"), so a dedup commit racing
+    /// any concurrent append aborts — every attempt, forever, on a busy
+    /// table. With commits serialized the rebase sees no newer versions and
+    /// skips the checker entirely.
+    delta_commit_lock:               Arc<tokio::sync::Mutex<()>>,
     buffered_layer:                  Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
     tantivy_search:                  Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
     tantivy_indexer:                 Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
@@ -1075,6 +1083,7 @@ impl Database {
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
+            delta_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             buffered_layer: None,
             tantivy_search: None,
             tantivy_indexer: None,
@@ -2608,6 +2617,11 @@ impl Database {
             // every other commit path — the write lock is NOT held across the
             // write anymore (it serialized all query planning behind each
             // project's parquet upload during flush passes; 50-110s prod stalls).
+            // Hold the in-process commit lock from snapshot to swap so this
+            // append can never land mid-flight of a dedup replace_where (see
+            // `delta_commit_lock`). Appends-vs-appends pay a short queue wait;
+            // commits are sub-second next to the 10-min flush cadence.
+            let commit_guard = self.delta_commit_lock.lock().await;
             let (table, pre_uris) = {
                 let guard = table_ref.read().await;
                 let pre: std::collections::HashSet<String> = guard.get_file_uris().map(|it| it.collect()).unwrap_or_default();
@@ -2701,6 +2715,9 @@ impl Database {
                         last_error = Some(e);
                         debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, max_retries);
 
+                        // Release the commit lock before backing off — peers
+                        // shouldn't queue behind this writer's sleep.
+                        drop(commit_guard);
                         // Exponential backoff for better handling of concurrent writes
                         let backoff_ms = 100 * (2_u64.pow(retry_count.min(5)));
                         tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
@@ -3277,6 +3294,11 @@ impl Database {
             let mut last_err: Option<deltalake::DeltaTableError> = None;
             let mut committed = false;
             for attempt in 0..MAX_RETRIES {
+                // Clone under the commit lock and hold it through the commit:
+                // with no append able to land in between, the rebase sees no
+                // newer commits and the OCC checker (which errors on our
+                // bare-string timestamp predicate) never runs.
+                let commit_guard = self.delta_commit_lock.lock().await;
                 let table_clone = {
                     let table = table_ref.read().await;
                     table.clone()
@@ -3306,6 +3328,7 @@ impl Database {
                         break;
                     }
                     Err(e) => {
+                        drop(commit_guard);
                         let msg = e.to_string();
                         // "Transaction failed" covers the conflict checker erroring
                         // while evaluating our predicate against a concurrent commit

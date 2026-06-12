@@ -112,7 +112,7 @@ const_default!(d_grpc_port: u16 = 50051);
 const_default!(d_table_prefix: String = "timefusion");
 const_default!(d_batch_queue_capacity: usize = 100_000_000);
 const_default!(d_pgwire_user: String = "postgres");
-const_default!(d_flush_interval: u64 = 600);
+const_default!(d_flush_interval: u64 = 300);
 const_default!(d_retention_mins: u64 = 70);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
@@ -136,14 +136,25 @@ const_default!(d_delta_scan_depth: usize = 8);
 const_default!(d_wal_fsync_ms: u64 = 200);
 // MemBuffer bucket window (seconds). Smaller windows free RAM sooner because
 // the previous bucket becomes flushable sooner; larger windows amortize into
-// fewer/larger Delta commits. Default 600s (10 min) matches the historical
-// hardcoded value; high-throughput tenants benefit from 60–120s.
-const_default!(d_bucket_duration_secs: u64 = 600);
+// fewer/larger Delta commits. Default 300s (5 min) — halved from the historical
+// 600s to cut peak MemBuffer footprint (the current bucket is excluded from
+// flushing, so this is the floor on how long a row accumulates in RAM). The
+// trade-off is ~2× Delta commits / small files; high-throughput tenants can go
+// lower still (60–120s), memory-relaxed deployments can raise it back.
+const_default!(d_bucket_duration_secs: u64 = 300);
 // Memory pressure threshold (0–100) at which the flush task is woken
 // independently of the periodic flush timer. Triggers an early
 // `flush_completed_buckets` so MemBuffer drains before reservation reaches
 // the hard limit. 0 disables pressure-triggered flushes.
 const_default!(d_pressure_flush_pct: u32 = 75);
+// Max seconds an insert applies backpressure (synchronously flushing
+// MemBuffer → Delta to free RAM) before failing, when the memory hard limit
+// is hit. The rows are already durable in the WAL, so this trades a slow
+// write for a rejected one — the right call for a TS DB whose producers DLQ
+// on rejection. 0 restores the old fail-fast behavior. 60s is long enough to
+// ride out a flush cycle / drain a replayed backlog, finite so a genuinely
+// down Delta can't pile blocked writers up without bound.
+const_default!(d_write_backpressure_secs: u64 = 60);
 // Durability mode for the WAL. One of:
 //   "ms"        — async fsync every `wal_fsync_ms` (default; ~200ms loss window)
 //   "sync_each" — fsync after every entry (zero data-loss window, ~1ms per write)
@@ -421,6 +432,8 @@ pub struct BufferConfig {
     pub timefusion_bucket_duration_secs:     u64,
     #[serde(default = "d_pressure_flush_pct")]
     pub timefusion_pressure_flush_pct:       u32,
+    #[serde(default = "d_write_backpressure_secs")]
+    pub timefusion_write_backpressure_secs:  u64,
     /// WAL shards per (project, table) topic. Higher = more append parallelism
     /// at the cost of O(shards) recovery memory and more file handles.
     #[serde(default = "d_wal_shards_per_topic")]
@@ -500,6 +513,9 @@ impl BufferConfig {
     }
     pub fn pressure_flush_pct(&self) -> u32 {
         self.timefusion_pressure_flush_pct.min(100)
+    }
+    pub fn write_backpressure_timeout(&self) -> Duration {
+        Duration::from_secs(self.timefusion_write_backpressure_secs)
     }
 
     /// Per-phase shutdown ceiling, in seconds.
@@ -771,7 +787,8 @@ mod tests {
     fn test_default_config() {
         let config = AppConfig::default();
         assert_eq!(config.core.pgwire_port, 5432);
-        assert_eq!(config.buffer.timefusion_flush_interval_secs, 600);
+        assert_eq!(config.buffer.timefusion_flush_interval_secs, 300);
+        assert_eq!(config.buffer.timefusion_bucket_duration_secs, 300);
         assert_eq!(config.cache.timefusion_foyer_memory_mb, 1024);
         assert_eq!(config.cache.timefusion_foyer_disk_gb, 500);
         assert_eq!(config.cache.disk_size_bytes(), 500 * 1024 * 1024 * 1024);

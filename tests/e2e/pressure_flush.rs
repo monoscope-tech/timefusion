@@ -40,3 +40,56 @@ async fn many_inserts_under_tight_budget_do_not_deadlock() -> anyhow::Result<()>
 
     Ok(())
 }
+
+/// Backpressure-not-rejection through the full prod path. Unlike the liveness
+/// test above (whose ~25MB never crosses the limit), this pushes ~150MB into a
+/// single open bucket — well past the ~76.8MB hard limit on a 64MB budget — so
+/// the open bucket itself is the pressure and only the force-flush escalation
+/// can drain it. With the flush-to-make-room fix every insert must still
+/// succeed (no "Memory limit exceeded"), backpressure must register, and all
+/// rows must be durable + queryable (some in Delta via force-flush, the rest in
+/// MemBuffer). Pre-fix this returned a Postgres error once the buffer crossed
+/// the limit (prod 2026-06-11: 15.8GB > 8GB, every insert rejected).
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn inserts_over_hard_limit_apply_backpressure_not_rejection() -> anyhow::Result<()> {
+    let env = E2eEnv::builder().with_max_memory_mb(64).start().await?;
+    let client = env.pg_client().await?;
+
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
+    let sql = format!(
+        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) \
+         VALUES ($1, '{}', '{}', $2, 'span', 'OK', $3, 'INFO', ARRAY[]::text[], $4)",
+        dt.date_naive(),
+        dt.format("%Y-%m-%d %H:%M:%S%.f"),
+    );
+
+    // ~1MB/row × 150 = ~150MB into one (current) bucket — only the current-bucket
+    // force-flush escalation can relieve this.
+    let big_msg = "x".repeat(64 * 1024);
+    let big_summary: Vec<String> = (0..16).map(|_| big_msg.clone()).collect();
+
+    let run = async {
+        for i in 0..150 {
+            client
+                .execute(&sql, &[&"e2e_bp", &format!("p-{i}"), &big_msg, &big_summary])
+                .await
+                .map_err(|e| anyhow::anyhow!("insert {i} rejected instead of applying backpressure: {e}"))?;
+        }
+        anyhow::Result::<()>::Ok(())
+    };
+    tokio::time::timeout(Duration::from_secs(90), run)
+        .await
+        .map_err(|_| anyhow::anyhow!("inserts under backpressure deadlocked"))??;
+
+    assert!(
+        env.snapshot_stats().backpressure_engaged_total >= 1,
+        "backpressure must engage when the open bucket exceeds the hard limit"
+    );
+
+    let rows = client.query("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_bp"]).await?;
+    let n: i64 = rows[0].get(0);
+    assert_eq!(n, 150, "all backpressured inserts must be durable + queryable");
+
+    Ok(())
+}

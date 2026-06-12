@@ -75,6 +75,9 @@ counter_registry! {
     optimize_partitions_rewritten => "timefusion.optimize.partitions_rewritten": "Date partitions rewritten by full (z-order) optimize",
     optimize_partitions_skipped   => "timefusion.optimize.partitions_skipped": "Date partitions skipped by full optimize because their file set was unchanged since the last run (cache churn avoided)",
     compaction_dedup_dropped_rows => "timefusion.compaction.dedup_dropped_rows": "Rows collapsed by Delta-vs-Delta dedup compaction (cross-flush duplicates)",
+    backpressure_engaged       => "timefusion.ingest.backpressure_engaged": "Inserts that hit the memory hard limit and triggered synchronous flush-to-Delta instead of rejecting (alert if sustained > 0)",
+    backpressure_rejected      => "timefusion.ingest.backpressure_rejected": "Inserts rejected after the backpressure window expired without freeing memory — means Delta flush is not keeping up (page: data still in WAL but ingest is dropping)",
+    backpressure_force_flush   => "timefusion.ingest.backpressure_force_flush": "Current open-bucket force-flushes triggered by sustained backpressure (escalation tier)",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -272,6 +275,9 @@ simple_recorders! {
     record_tantivy_prefilter_skipped => tantivy_prefilter_skipped,
     record_tantivy_prefilter_error => tantivy_prefilter_errors,
     record_tantivy_build_failure => tantivy_build_failures,
+    record_backpressure_engaged => backpressure_engaged,
+    record_backpressure_rejected => backpressure_rejected,
+    record_backpressure_force_flush => backpressure_force_flush,
 }
 
 pub fn record_dedup_dropped(rows: u64) {
