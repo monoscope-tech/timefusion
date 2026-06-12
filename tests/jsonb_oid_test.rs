@@ -156,7 +156,11 @@ mod jsonb_oid {
         let stmt = client
             .prepare("SELECT context FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'jsonb-oid-row' LIMIT 1")
             .await?;
-        assert_eq!(stmt.columns()[0].type_().oid(), JSONB_OID, "bare Variant column must surface jsonb OID, not text");
+        assert_eq!(
+            stmt.columns()[0].type_().oid(),
+            JSONB_OID,
+            "bare Variant column must surface jsonb OID, not text"
+        );
 
         // Binary decode (tokio-postgres uses binary format, same as hasql) —
         // exercises the 0x01 jsonb version-byte path with real row data.
