@@ -330,7 +330,13 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
         .iter()
         .map(|f| {
             if is_variant_type(f.data_type()) {
-                Arc::new(Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable()))
+                // `tf.pg_type = jsonb`: pgwire Describe derives RowDescription from the
+                // *unanalyzed* plan, where Variant cols carry this Utf8View view. Without
+                // the tag, bare Variant columns surface text OID 25 and strict drivers
+                // (hasql) reject the row (expected jsonb 3802). vendor/arrow-pg maps the
+                // tag to OID 3802 + the 0x01 binary jsonb version byte.
+                let md = [("tf.pg_type".to_string(), "jsonb".to_string())].into_iter().collect();
+                Arc::new(Field::new(f.name(), ArrowDataType::Utf8View, f.is_nullable()).with_metadata(md))
             } else {
                 f.clone()
             }
