@@ -115,9 +115,15 @@ async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
     // Gate dedup on the appender's first committed row so the race is guaranteed,
     // not a scheduling artifact: on a loaded CI runner dedup could otherwise finish
     // before the spawned task is scheduled, failing the `appended > 0` assertion.
-    while committed.load(Acquire) == 0 {
-        tokio::task::yield_now().await;
-    }
+    // Timeout so an appender that panics before committing fails loudly instead
+    // of hanging the spin-wait forever (the panic surfaces via appender.await? below).
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while committed.load(Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("appender did not commit a row within 30s");
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
