@@ -319,6 +319,22 @@ pub struct BufferedWriteLayer {
     /// in-flight tantivy uploads. Acceptable for now because the sidecar is
     /// best-effort and the index can be rebuilt from Delta on demand.
     tantivy_spawn_sem:              Arc<tokio::sync::Semaphore>,
+    /// Per-(project, table) max row timestamp ever handed to a Delta commit
+    /// this process lifetime, floored at `boot_micros`. Delta cannot hold
+    /// rows newer than this, so a query whose lower time bound is above it
+    /// can skip the Delta scan — the steady-state recent-window fast path.
+    /// Unlike the old `query_min >= mem_buffer_oldest` heuristic this stays
+    /// sound when Delta holds rows *inside* MemBuffer's range: force-flushed
+    /// open buckets and out-of-order drains after a failed flush (2026-06-11
+    /// visibility gap). Raised before the commit so a query can't race in
+    /// between commit-visible and watermark-raise; a failed commit leaves it
+    /// conservatively high.
+    delta_flushed_watermark:        dashmap::DashMap<crate::mem_buffer::TableKey, i64>,
+    /// Recovery-time floor for the watermark: anything committed by earlier
+    /// process lifetimes has row timestamps at/below roughly this (event
+    /// timestamps drive bucketing; far-future-skewed pre-boot rows are the
+    /// accepted residual exposure, same as the old heuristic).
+    boot_micros:                    i64,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -370,6 +386,8 @@ impl BufferedWriteLayer {
             // bounding worst-case S3 / tantivy heap usage if more tables
             // appear.
             tantivy_spawn_sem: Arc::new(tokio::sync::Semaphore::new(16)),
+            delta_flushed_watermark: dashmap::DashMap::new(),
+            boot_micros: crate::clock::now_micros(),
         })
     }
 
@@ -591,6 +609,11 @@ impl BufferedWriteLayer {
             let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&project_id, &table_name, bucket_id) else {
                 continue;
             };
+            // Exempt this bucket from the Delta-scan exclusion for its whole
+            // lifetime — its window now legitimately holds rows in both
+            // stores. Marked before the commit so no query can race into a
+            // masked window (see MemBuffer::force_flushed docs).
+            self.mem_buffer.mark_force_flushed(&project_id, &table_name, bucket_id);
             match self.flush_bucket(&bucket).await {
                 Ok(()) => {
                     if let Err(e) = self.wal.advance_by_counts(&bucket.project_id, &bucket.table_name, &bucket.wal_shard_counts) {
@@ -1209,6 +1232,14 @@ impl BufferedWriteLayer {
     /// The callback MUST complete the Delta commit before returning Ok - this is critical
     /// for durability. We only checkpoint WAL after this returns successfully.
     async fn flush_bucket(&self, bucket: &FlushableBucket) -> anyhow::Result<()> {
+        // Raise the Delta watermark before the commit (see field docs).
+        if bucket.max_timestamp != i64::MIN {
+            let key = (Arc::<str>::from(bucket.project_id.as_str()), Arc::<str>::from(bucket.table_name.as_str()));
+            self.delta_flushed_watermark
+                .entry(key)
+                .and_modify(|w| *w = (*w).max(bucket.max_timestamp))
+                .or_insert(bucket.max_timestamp);
+        }
         // Last-write-wins dedup on the per-table key set from schema YAML.
         // Empty key list = pass-through. Runs before both Delta write and the
         // tantivy sidecar so both see the same row set.
@@ -1545,17 +1576,16 @@ impl BufferedWriteLayer {
         }
     }
 
-    pub fn get_oldest_timestamp(&self, project_id: &str, table_name: &str) -> Option<i64> {
-        self.mem_buffer.get_oldest_timestamp(project_id, table_name)
-    }
-
-    /// Get the time range (oldest, newest) for a project/table in microseconds.
     pub fn get_bucket_ranges(&self, project_id: &str, table_name: &str) -> Vec<(i64, i64)> {
         self.mem_buffer.get_bucket_ranges(project_id, table_name)
     }
 
-    pub fn get_time_range(&self, project_id: &str, table_name: &str) -> Option<(i64, i64)> {
-        self.mem_buffer.get_time_range(project_id, table_name)
+    /// Upper bound on row timestamps Delta can hold for this table — see
+    /// `delta_flushed_watermark`. Queries bounded strictly above this can
+    /// skip the Delta scan.
+    pub fn delta_flushed_watermark(&self, project_id: &str, table_name: &str) -> i64 {
+        let key = (Arc::<str>::from(project_id), Arc::<str>::from(table_name));
+        self.delta_flushed_watermark.get(&key).map_or(self.boot_micros, |w| (*w).max(self.boot_micros))
     }
 
     pub fn query(&self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr]) -> anyhow::Result<Vec<RecordBatch>> {

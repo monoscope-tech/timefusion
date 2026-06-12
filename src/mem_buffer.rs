@@ -213,6 +213,17 @@ pub struct MemBuffer {
     /// evictions drop oldest cached buckets until under. Auto-tuned from
     /// `buffer_max_memory_mb` at MemBuffer construction.
     text_index_max_bytes: usize,
+    /// (project_id, table_name) → bucket_ids whose rows were force-flushed
+    /// to Delta while the bucket was open. Such a bucket's window holds rows
+    /// legitimately in *both* stores (disjoint sets — force-flush removes
+    /// rows from MemBuffer before committing), so it must stay exempt from
+    /// the Delta-scan exclusion for its whole lifetime, not just while
+    /// current (2026-06-11: the sealed exclusion + a 2h flush backlog masked
+    /// force-flushed Delta rows for 2h). Kept at MemBuffer level — not on
+    /// TableBuffer/TimeBucket — so the mark survives empty-bucket reclaim in
+    /// `take_bucket_for_flush` and bucket/table re-creation by later inserts.
+    /// Pruned on drain and eviction.
+    force_flushed:        DashMap<TableKey, std::collections::HashSet<i64>>,
 }
 
 /// Cache key: (project_id, table_name, bucket_id). All three are cheap to
@@ -638,7 +649,17 @@ impl MemBuffer {
             text_index_cache: parking_lot::Mutex::new(lru::LruCache::unbounded()),
             text_index_bytes: AtomicUsize::new(0),
             text_index_max_bytes,
+            force_flushed: DashMap::new(),
         }
+    }
+
+    /// Record that `bucket_id`'s rows were committed to Delta while the
+    /// bucket was still open — see the `force_flushed` field docs. Called
+    /// before the commit so no query can race into the masked window; a
+    /// failed commit leaves a stale mark, which only costs that bucket the
+    /// brief commit-then-drain exclusion at its eventual sealed flush.
+    pub fn mark_force_flushed(&self, project_id: &str, table_name: &str, bucket_id: i64) {
+        self.force_flushed.entry(Self::make_key(project_id, table_name)).or_default().insert(bucket_id);
     }
 
     pub fn shards_per_topic(&self) -> usize {
@@ -1047,58 +1068,35 @@ impl MemBuffer {
         Ok(partitions)
     }
 
-    /// Get the time range (oldest, newest) for a project/table.
-    /// Returns None if no data exists.
-    /// Time ranges (start, end_exclusive) of every bucket currently held in
-    /// MemBuffer for this project/table, sorted ascending by start. Used by
-    /// the query path to exclude exactly those ranges from the Delta scan,
-    /// so a stuck/un-flushed old bucket no longer hides Delta data above it.
+    /// Time ranges (start, end_exclusive) the Delta scan must exclude
+    /// because MemBuffer is authoritative for them, sorted ascending. The
+    /// range is each bucket's *actual* row range `[min_ts, max_ts]` — not
+    /// its 10-min window — so a bucket holding partial data (WAL-replay
+    /// cutoff, late arrivals) can't mask unrelated Delta rows in the rest
+    /// of its window. Skipped entirely:
+    /// - the current (open) bucket and any force-flushed bucket: their
+    ///   windows legitimately hold rows in both stores (disjoint sets, see
+    ///   `force_flushed`), so excluding them hides the Delta share;
+    /// - empty shells (sentinel min/max), which hold nothing to dedup.
+    ///
     /// Returns an empty Vec if the table is absent.
     pub fn get_bucket_ranges(&self, project_id: &str, table_name: &str) -> Vec<(i64, i64)> {
         let Some(table) = self.get_table(project_id, table_name) else {
             return Vec::new();
         };
-        let dur = bucket_duration_micros();
+        let current = Self::current_bucket_id();
+        let force_flushed = self.force_flushed.get(&Self::make_key(project_id, table_name));
         let mut ranges: Vec<(i64, i64)> = table
             .buckets
             .iter()
-            .map(|b| {
-                let id = *b.key();
-                (id * dur, (id + 1) * dur)
+            .filter(|b| *b.key() != current && !force_flushed.as_ref().is_some_and(|s| s.contains(b.key())))
+            .filter_map(|b| {
+                let (min, max) = (b.min_timestamp.load(Ordering::Relaxed), b.max_timestamp.load(Ordering::Relaxed));
+                (min <= max).then_some((min, max + 1))
             })
             .collect();
         ranges.sort_by_key(|(s, _)| *s);
         ranges
-    }
-
-    pub fn get_time_range(&self, project_id: &str, table_name: &str) -> Option<(i64, i64)> {
-        let oldest = self.get_oldest_timestamp(project_id, table_name)?;
-        let newest = self.get_newest_timestamp(project_id, table_name)?;
-        if oldest == i64::MAX || newest == i64::MIN { None } else { Some((oldest, newest)) }
-    }
-
-    pub fn get_oldest_timestamp(&self, project_id: &str, table_name: &str) -> Option<i64> {
-        self.get_table(project_id, table_name).map(|table| {
-            table
-                .buckets
-                .iter()
-                .map(|b| b.min_timestamp.load(Ordering::Relaxed))
-                .filter(|&ts| ts != i64::MAX)
-                .min()
-                .unwrap_or(i64::MAX)
-        })
-    }
-
-    pub fn get_newest_timestamp(&self, project_id: &str, table_name: &str) -> Option<i64> {
-        self.get_table(project_id, table_name).map(|table| {
-            table
-                .buckets
-                .iter()
-                .map(|b| b.max_timestamp.load(Ordering::Relaxed))
-                .filter(|&ts| ts != i64::MIN)
-                .max()
-                .unwrap_or(i64::MIN)
-        })
     }
 
     #[instrument(skip(self), fields(project_id, table_name, bucket_id))]
@@ -1113,6 +1111,10 @@ impl MemBuffer {
             // Bucket is gone — drop its text-index cache entry so the LRU
             // doesn't hold ~MB of dead postings until natural eviction.
             self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
+            if let Some(mut s) = self.force_flushed.get_mut(&key) {
+                s.remove(&bucket_id);
+            }
+            self.force_flushed.remove_if(&key, |_, s| s.is_empty());
             debug!(
                 "MemBuffer drain: project={}, table={}, bucket={}, batches={}, freed_bytes={}",
                 project_id,
@@ -1363,6 +1365,12 @@ impl MemBuffer {
         if freed_bytes > 0 {
             self.estimated_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
         }
+
+        // Evicted buckets can't mask Delta anymore — drop their marks too.
+        self.force_flushed.retain(|_, s| {
+            s.retain(|id| *id >= cutoff_bucket_id);
+            !s.is_empty()
+        });
 
         if evicted_count > 0 || tables_dropped > 0 {
             debug!(

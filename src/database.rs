@@ -4448,20 +4448,21 @@ impl TableProvider for ProjectRoutingTable {
 
         span.record("scan.uses_mem_buffer", true);
 
-        // Get MemBuffer's time range for this project/table
-        let mem_time_range = layer.get_time_range(&project_id, &self.table_name);
-
         // Extract query time range from filters
         let query_time_range = self.extract_time_range_from_filters(&optimized_filters);
 
-        // Skip Delta when the query's lower bound is at/after MemBuffer's
-        // oldest row. Delta is excluded from MemBuffer's range by the
-        // per-bucket logic below, so no Delta row can satisfy
-        // `timestamp >= query_min` in that case — upper bound doesn't matter
-        // (covers open-ended `WHERE timestamp >= now() - 5m` dashboards).
-        let skip_delta = match (mem_time_range, query_time_range) {
-            (Some((mem_oldest, _)), Some((query_min, _))) => query_min >= mem_oldest,
-            _ => false,
+        // Skip Delta when the query's lower bound is strictly above the
+        // per-table flushed watermark (max row ts ever handed to a Delta
+        // commit, floored at boot) — Delta provably holds nothing newer, so
+        // MemBuffer alone serves open-ended `WHERE timestamp >= now() - 5m`
+        // dashboards. The previous `query_min >= mem_oldest` heuristic was
+        // unsound whenever Delta held rows inside MemBuffer's range —
+        // force-flushed open buckets, or a newer bucket drained while an
+        // older one was stuck after a failed flush — and silently hid those
+        // rows (2026-06-11 visibility gap).
+        let skip_delta = match query_time_range {
+            Some((query_min, _)) => query_min > layer.delta_flushed_watermark(&project_id, &self.table_name),
+            None => false,
         };
         // Sticky-empty short-circuit: if no flush has ever committed for this
         // (project, table), Delta is guaranteed empty and we can skip the
@@ -4512,36 +4513,21 @@ impl TableProvider for ProjectRoutingTable {
 
         // Build Delta filters with per-bucket exclusion.
         //
-        // The MemBuffer / Delta union must not double-count rows: any time
-        // range currently held by a MemBuffer bucket is served *by*
-        // MemBuffer (it's authoritative for those rows) so Delta must
-        // exclude them. The old logic used a single `timestamp < oldest_mem_ts`
-        // cutoff, which broke catastrophically when a bucket got stuck in
-        // MemBuffer (e.g. failed flush) — it dragged `oldest_mem_ts`
-        // backwards and wrongly hid all the Delta rows *above* it. Fixed
-        // by listing the actual ranges MemBuffer currently holds and
-        // excluding only those.
-        //
-        // Exception: the current (open) bucket's range is NOT excluded. Under
-        // memory pressure `force_flush_current_buckets` commits the open
-        // bucket's rows to Delta while inserts keep repopulating the same
-        // bucket_id in MemBuffer — so Delta legitimately holds rows inside the
-        // current range. Excluding it would hide those force-flushed rows
-        // (observed as an 8-of-150 undercount in the pressure_flush e2e test).
-        // It's safe to scan both: force-flush removes rows from MemBuffer
-        // *before* committing, so the current bucket's MemBuffer rows and its
-        // Delta rows are disjoint — the union can't double-count them. (Sealed
-        // buckets keep the exclusion: their normal commit-then-drain flush can
-        // briefly hold the same row in both stores.)
+        // The MemBuffer / Delta union must not double-count rows: a sealed
+        // bucket's rows can briefly sit in both stores during its normal
+        // commit-then-drain flush, so Delta excludes the row ranges
+        // MemBuffer currently holds. `get_bucket_ranges` returns exactly
+        // the ranges where MemBuffer is authoritative — actual per-bucket
+        // [min, max] row ranges, skipping the current (open) bucket and any
+        // force-flushed bucket, whose windows legitimately hold disjoint
+        // row sets in both stores (force-flush removes rows from MemBuffer
+        // *before* committing). Excluding those windows hid the Delta share
+        // for hours when the flush pipeline backed up (2026-06-11).
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
-        let current_bucket_start = crate::mem_buffer::MemBuffer::current_bucket_id() * crate::mem_buffer::bucket_duration_micros();
         let mut delta_filters = optimized_filters.clone();
         let ts_col = || Box::new(col("timestamp"));
         let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
         for (start, end) in &mem_ranges {
-            if *start == current_bucket_start {
-                continue;
-            }
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr {
                 left:  ts_col(),
@@ -5339,6 +5325,98 @@ mod tests {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
+    }
+
+    /// Regression for the 2026-06-11 prod visibility gap: rows force-flushed
+    /// to Delta from an open bucket became invisible once that bucket
+    /// *sealed* — the per-bucket exclusion masked the whole window from the
+    /// Delta scan while the flush backlog kept the bucket in MemBuffer for
+    /// hours. Force-flushed buckets must stay exempt from the exclusion for
+    /// their whole lifetime, not just while current.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn force_flushed_bucket_rows_stay_queryable_after_seal() -> Result<()> {
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&prefix);
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        let res = tokio::time::timeout(std::time::Duration::from_secs(50), async {
+            let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
+            let project_id = format!("ffs_{}", prefix);
+            // Freeze the clock mid-window so all inserts land in one
+            // deterministic bucket we can later seal by advancing time.
+            let dur = crate::mem_buffer::bucket_duration_micros();
+            let t0 = crate::clock::set_micros((crate::clock::now_micros() / dur) * dur + dur / 2);
+
+            for i in 0..3 {
+                let batch = json_to_batch(vec![test_span_ts(&format!("flushed_{i}"), "span", &project_id, t0)])?;
+                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+            }
+            b.buffered_layer.force_flush_current_buckets().await?;
+            for i in 0..2 {
+                let batch = json_to_batch(vec![test_span_ts(&format!("buffered_{i}"), "span", &project_id, t0 + 1_000_000)])?;
+                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+            }
+            // Roll past the bucket boundary: the bucket is now sealed but
+            // unflushed (the periodic flush hasn't run) — exactly the
+            // backed-up state from the incident.
+            crate::clock::advance_micros(dur);
+
+            use datafusion::arrow::array::AsArray;
+            let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
+            let r = b.session_ctx.sql(&sql).await?.collect().await?;
+            let n = r[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+            anyhow::ensure!(n == 5, "force-flushed rows must stay visible after their bucket seals; got {n} of 5");
+            b.shutdown.cancel();
+            Ok(())
+        })
+        .await;
+        crate::clock::unfreeze();
+        res.map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
+    }
+
+    /// Regression for the skip-Delta fast path half of the 2026-06-11 gap:
+    /// a late-arriving row can pull MemBuffer's oldest timestamp to/below
+    /// the query's lower bound while newer rows live only in Delta
+    /// (force-flush, or a newer bucket drained while an older one is stuck).
+    /// The old `query_min >= mem_oldest` heuristic then skipped the Delta
+    /// scan and hid those rows; the flushed-watermark rule must not.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delta_skip_must_not_hide_force_flushed_rows_from_bounded_query() -> Result<()> {
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&prefix);
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        let res = tokio::time::timeout(std::time::Duration::from_secs(50), async {
+            let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
+            let project_id = format!("ffw_{}", prefix);
+            let dur = crate::mem_buffer::bucket_duration_micros();
+            let t0 = crate::clock::set_micros((crate::clock::now_micros() / dur) * dur + dur / 2);
+
+            // Newer row first → force-flushed, lives only in Delta.
+            let batch = json_to_batch(vec![test_span_ts("newer", "span", &project_id, t0 + 2_000_000)])?;
+            b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+            b.buffered_layer.force_flush_current_buckets().await?;
+            // Late arrival with an older timestamp lands in MemBuffer.
+            let batch = json_to_batch(vec![test_span_ts("older", "span", &project_id, t0 + 1_000_000)])?;
+            b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+
+            use datafusion::arrow::array::AsArray;
+            let bound = chrono::DateTime::from_timestamp_micros(t0 + 1_000_000).unwrap().to_rfc3339();
+            let sql = format!(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}' AND timestamp >= TIMESTAMP '{}'",
+                project_id, bound
+            );
+            let r = b.session_ctx.sql(&sql).await?.collect().await?;
+            let n = r[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+            anyhow::ensure!(n == 2, "Delta-only rows inside the bound must not be skipped; got {n} of 2");
+            b.shutdown.cancel();
+            Ok(())
+        })
+        .await;
+        crate::clock::unfreeze();
+        res.map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
     }
 
     #[serial]
