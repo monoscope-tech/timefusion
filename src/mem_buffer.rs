@@ -29,7 +29,12 @@ use crate::functions::FnRegistry;
 // longer = larger Delta files. Matches default flush interval for aligned boundaries.
 // Note: Timestamps before 1970 (negative microseconds) produce negative bucket IDs,
 // which is supported but may result in unexpected ordering if mixed with post-1970 data.
-const DEFAULT_BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000;
+// Fallback when `set_bucket_duration_micros` is never called (i.e. unit tests
+// that build a MemBuffer directly). MUST track `d_bucket_duration_secs` in
+// config.rs — prod always overrides via bootstrap, but keeping the two in sync
+// avoids the test-only `BUCKET_DURATION_MICROS` const diverging from the
+// process-global runtime value once any test pins the OnceLock.
+const DEFAULT_BUCKET_DURATION_MICROS: i64 = 5 * 60 * 1_000_000;
 #[cfg(test)]
 const BUCKET_DURATION_MICROS: i64 = DEFAULT_BUCKET_DURATION_MICROS;
 
@@ -55,7 +60,7 @@ const MAX_BATCH_COUNT_PER_BUCKET: usize = 8;
 const MAX_BATCH_BYTES_FOR_COALESCE: usize = 4 * 1024 * 1024;
 
 /// Configured bucket window in microseconds. Set once at startup via
-/// `set_bucket_duration_micros`; defaults to 10 minutes when unset. Smaller
+/// `set_bucket_duration_micros`; defaults to 5 minutes when unset. Smaller
 /// windows free MemBuffer memory sooner (because the previous bucket becomes
 /// flushable sooner) at the cost of more, smaller Delta commits.
 pub fn bucket_duration_micros() -> i64 {
@@ -253,6 +258,12 @@ pub struct FlushableBucket {
     /// Written into Delta commit metadata so a crash between Delta commit
     /// and `advance_by_counts` can recover the cursor from Delta on restart.
     pub wal_positions:    Vec<Option<walrus_rust::WalPosition>>,
+    /// Actual min/max timestamp of the taken rows, captured before the source
+    /// bucket's atomics were reset. `restore_taken_bucket` replays these so a
+    /// restored bucket keeps its true time range (and stays visible to
+    /// time-range pruning) rather than collapsing to the bucket's start.
+    pub min_timestamp:    i64,
+    pub max_timestamp:    i64,
 }
 
 #[derive(Debug, Default)]
@@ -1161,6 +1172,8 @@ impl MemBuffer {
                     wal_positions,
                     row_count: bucket.row_count.load(Ordering::Relaxed),
                     wal_shard_counts,
+                    min_timestamp: bucket.min_timestamp.load(Ordering::Relaxed),
+                    max_timestamp: bucket.max_timestamp.load(Ordering::Relaxed),
                 });
             }
         }
@@ -1216,8 +1229,10 @@ impl MemBuffer {
         let wal_state = std::mem::take(&mut *wal_g);
         let freed = bucket.memory_bytes.swap(0, Ordering::Relaxed);
         let row_count = bucket.row_count.swap(0, Ordering::Relaxed);
-        bucket.min_timestamp.store(i64::MAX, Ordering::Relaxed);
-        bucket.max_timestamp.store(i64::MIN, Ordering::Relaxed);
+        // Capture the real range as we reset the sentinels so a restore (on
+        // Delta commit failure) can replay it instead of guessing bucket-start.
+        let min_timestamp = bucket.min_timestamp.swap(i64::MAX, Ordering::Relaxed);
+        let max_timestamp = bucket.max_timestamp.swap(i64::MIN, Ordering::Relaxed);
         drop(wal_g);
         drop(batches_g);
         drop(bucket_ref);
@@ -1249,6 +1264,8 @@ impl MemBuffer {
             row_count,
             wal_shard_counts: counts,
             wal_positions: positions,
+            min_timestamp,
+            max_timestamp,
         })
     }
 
@@ -1282,7 +1299,11 @@ impl MemBuffer {
         }
         bucket.memory_bytes.fetch_add(added, Ordering::Relaxed);
         bucket.row_count.fetch_add(b.row_count, Ordering::Relaxed);
-        bucket.update_timestamps(b.bucket_id * bucket_duration_micros());
+        // Replay the true range (monotonic widen) so restored rows stay visible
+        // to time-range pruning; concurrent inserts into the same open bucket
+        // are preserved since fetch_min/max only widens.
+        bucket.update_timestamps(b.min_timestamp);
+        bucket.update_timestamps(b.max_timestamp);
         drop(wal_g);
         drop(batches_g);
         self.estimated_bytes.fetch_add(added, Ordering::Relaxed);
@@ -2397,6 +2418,28 @@ mod tests {
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], &[]).unwrap();
         let total: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2, "no text_match preds → all rows returned");
+    }
+
+    /// Regression: `restore_taken_bucket` (the Delta-commit-failure path of the
+    /// open-bucket force-flush) used to reset the bucket's min/max to the bucket
+    /// *start* (`bucket_id * duration`), hiding restored rows from time-range
+    /// pruning until the next insert. It must replay the rows' real range.
+    #[test]
+    fn restore_taken_bucket_preserves_timestamp_range() {
+        use crate::test_utils::test_helpers::{json_to_batch, test_span};
+        let buffer = MemBuffer::new();
+        let dur = bucket_duration_micros();
+        let ts = 7 * dur + 12_345; // mid-bucket — distinct from the bucket-start sentinel
+        let bucket_id = MemBuffer::compute_bucket_id(ts);
+        buffer.insert("p1", "otel_logs_and_spans", json_to_batch(vec![test_span("a", "svc", "p1")]).unwrap(), ts).unwrap();
+
+        let taken = buffer.take_bucket_for_flush("p1", "otel_logs_and_spans", bucket_id).expect("bucket taken");
+        assert_eq!((taken.min_timestamp, taken.max_timestamp), (ts, ts), "take must capture the real row range");
+
+        buffer.restore_taken_bucket(&taken); // simulate Delta commit failure
+        let again = buffer.take_bucket_for_flush("p1", "otel_logs_and_spans", bucket_id).expect("restored bucket present");
+        assert_eq!((again.min_timestamp, again.max_timestamp), (ts, ts), "restore must preserve the true range");
+        assert_ne!(again.min_timestamp, bucket_id * dur, "must not collapse to bucket start");
     }
 
     #[test]
