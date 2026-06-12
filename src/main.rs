@@ -370,29 +370,29 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // 2. Once gRPC is done, the buffered layer no longer receives new
     //    writes — safe to flush + checkpoint.
     // 3. Shut down database (cache, foyer, log store).
+    // One shutdown budget shared by all serial phases (TIMEFUSION_STOP_GRACE_SECS,
+    // sized to fit the orchestrator's SIGTERM→SIGKILL grace). The drain phases
+    // get small caps so a hung connection can't starve the buffer flush +
+    // cursor snapshot — the phase that determines next-boot cost; their unused
+    // slack flows forward automatically because the buffered layer works off
+    // the same absolute deadline.
+    let grace = cfg.buffer.stop_grace();
+    let deadline = tokio::time::Instant::now() + grace;
     pgwire_shutdown.cancel();
-    let pgwire_drain_deadline = Duration::from_secs(cfg.buffer.timefusion_shutdown_timeout_secs.max(5));
-    match tokio::time::timeout(pgwire_drain_deadline, pg_task).await {
+    match tokio::time::timeout(grace.mul_f32(0.2), pg_task).await {
         Ok(Ok(())) => info!("PGWire drained cleanly"),
         Ok(Err(e)) => error!("PGWire task panicked during drain: {}", e),
-        Err(_) => warn!(
-            "PGWire drain exceeded {}s — proceeding with flush; some in-flight queries may be reset",
-            pgwire_drain_deadline.as_secs()
-        ),
+        Err(_) => warn!("PGWire drain exceeded its slice of the stop grace — proceeding; in-flight queries may be reset"),
     }
 
     grpc_shutdown.cancel();
-    let grpc_drain_deadline = Duration::from_secs(cfg.buffer.timefusion_shutdown_timeout_secs.max(5));
-    match tokio::time::timeout(grpc_drain_deadline, grpc_task).await {
+    match tokio::time::timeout(grace.mul_f32(0.1), grpc_task).await {
         Ok(Ok(())) => info!("gRPC drained cleanly"),
         Ok(Err(e)) => error!("gRPC task panicked during drain: {}", e),
-        Err(_) => error!(
-            "gRPC drain exceeded {}s — forcing shutdown; in-flight requests may be reset",
-            grpc_drain_deadline.as_secs()
-        ),
+        Err(_) => error!("gRPC drain exceeded its slice of the stop grace — proceeding; in-flight requests may be reset"),
     }
 
-    if let Err(e) = buffered_layer_for_shutdown.shutdown().await {
+    if let Err(e) = buffered_layer_for_shutdown.shutdown_by(deadline).await {
         error!("Error during buffered layer shutdown: {}", e);
     }
     sleep(Duration::from_millis(500)).await;
