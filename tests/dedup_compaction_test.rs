@@ -80,6 +80,7 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
 #[serial]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
+    use std::sync::atomic::Ordering::{Acquire, Release};
     let cfg = TestConfigBuilder::new("dedup_occ_race").with_buffer_mode(BufferMode::Enabled).build();
     let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
@@ -94,7 +95,6 @@ async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
 
     // Append fire: fresh-timestamp rows (same partition date space, distinct
     // ids) committing continuously while dedup rewrites the sealed chunk.
-    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let appender = {
@@ -122,7 +122,7 @@ async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
     let dropped = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
-    stop.store(true, Relaxed);
+    stop.store(true, Release);
     let appended = appender.await?;
     assert!(appended > 0, "appender must have raced at least one commit");
     assert_eq!(dropped, 1, "dedup must collapse the duplicate despite concurrent appends");
