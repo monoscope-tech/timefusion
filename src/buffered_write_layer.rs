@@ -110,28 +110,40 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
 /// `snapshot_stats()` and rendered as rows by `timefusion.stats()`.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
-    pub mem_project_count:      usize,
-    pub mem_total_buckets:      usize,
-    pub mem_total_rows:         usize,
-    pub mem_total_batches:      usize,
-    pub mem_estimated_bytes:    usize,
-    pub reserved_bytes:         usize,
-    pub max_memory_bytes:       usize,
-    pub pressure_pct:           u32,
-    pub wal_files:              usize,
-    pub wal_disk_bytes:         u64,
-    pub wal_shards_per_topic:   usize,
-    pub wal_known_topics:       usize,
-    pub bucket_duration_micros: i64,
+    pub mem_project_count:              usize,
+    pub mem_total_buckets:              usize,
+    pub mem_total_rows:                 usize,
+    pub mem_total_batches:              usize,
+    pub mem_estimated_bytes:            usize,
+    pub reserved_bytes:                 usize,
+    pub max_memory_bytes:               usize,
+    pub pressure_pct:                   u32,
+    pub wal_files:                      usize,
+    pub wal_disk_bytes:                 u64,
+    pub wal_shards_per_topic:           usize,
+    pub wal_known_topics:               usize,
+    pub bucket_duration_micros:         i64,
     /// Age of the oldest bucket in MemBuffer (seconds, computed from
     /// `now - min(bucket.min_timestamp)`). None when MemBuffer is empty.
     /// Alerting target: alert at > 2× `flush_interval_secs`.
-    pub oldest_bucket_age_secs: Option<u64>,
+    pub oldest_bucket_age_secs:         Option<u64>,
     /// Cumulative flush successes/failures since process start. Mirrors the
     /// OTel `timefusion.flush.completed`/`failed` counters so tests can
     /// assert without configuring OTel.
-    pub flush_completed_total:  u64,
-    pub flush_failed_total:     u64,
+    pub flush_completed_total:          u64,
+    pub flush_failed_total:             u64,
+    /// Times an insert hit the memory hard limit and applied backpressure
+    /// (synchronous flush-to-Delta) instead of rejecting. Sustained growth =
+    /// ingest outpacing flush; the matching OTel counter is the alert target.
+    pub backpressure_engaged_total:     u64,
+    /// Inserts rejected after the backpressure window expired without freeing
+    /// memory — Delta flush isn't keeping up. PAGE on any growth (data is still
+    /// in the WAL but ingest is now dropping). Mirrored from OTel so operators
+    /// can watch it via the stats table when telemetry isn't wired.
+    pub backpressure_rejected_total:    u64,
+    /// Open-bucket force-flush escalations (a single busy window was itself the
+    /// pressure). Sustained growth = windows too large for the budget.
+    pub backpressure_force_flush_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -189,6 +201,10 @@ struct CoalescedGroup {
     wal_positions:     Vec<Option<walrus_rust::WalPosition>>,
     /// Source bucket_ids; drained from MemBuffer after the combined commit succeeds.
     source_bucket_ids: Vec<i64>,
+    /// Min/max timestamp across absorbed buckets (Option so the derived Default's
+    /// 0 can't corrupt the min). Carried onto the combined FlushableBucket.
+    min_timestamp:     Option<i64>,
+    max_timestamp:     Option<i64>,
 }
 
 struct CombinedBucket {
@@ -221,6 +237,8 @@ impl CoalescedGroup {
         }
         // Merge per-shard positions (max).
         self.wal_positions = merge_wal_positions(std::mem::take(&mut self.wal_positions), b.wal_positions);
+        self.min_timestamp = Some(self.min_timestamp.map_or(b.min_timestamp, |m| m.min(b.min_timestamp)));
+        self.max_timestamp = Some(self.max_timestamp.map_or(b.max_timestamp, |m| m.max(b.max_timestamp)));
         self.source_bucket_ids.push(b.bucket_id);
     }
 
@@ -232,6 +250,8 @@ impl CoalescedGroup {
             wal_shard_counts,
             wal_positions,
             source_bucket_ids,
+            min_timestamp,
+            max_timestamp,
         } = self;
         // `absorb` is only called via `groups.entry(..).or_default().absorb(b)`
         // so `key` is always set by the time we collapse the group.
@@ -247,6 +267,8 @@ impl CoalescedGroup {
             row_count,
             wal_shard_counts,
             wal_positions,
+            min_timestamp: min_timestamp.unwrap_or(i64::MAX),
+            max_timestamp: max_timestamp.unwrap_or(i64::MIN),
         };
         CombinedBucket { combined, source_bucket_ids }
     }
@@ -263,37 +285,40 @@ pub type TantivyIndexCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, Vec<String>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 pub struct BufferedWriteLayer {
-    config:                 Arc<AppConfig>,
-    wal:                    Arc<WalManager>,
-    mem_buffer:             Arc<MemBuffer>,
-    shutdown:               CancellationToken,
-    delta_write_callback:   Option<DeltaWriteCallback>,
-    tantivy_index_callback: Option<TantivyIndexCallback>,
-    background_tasks:       Mutex<Vec<JoinHandle<()>>>,
-    flush_lock:             Mutex<()>,
-    reserved_bytes:         AtomicUsize, // Memory reserved for in-flight writes
-    pressure_notify:        Arc<Notify>, // Wakes flush task when pressure threshold crossed
+    config:                         Arc<AppConfig>,
+    wal:                            Arc<WalManager>,
+    mem_buffer:                     Arc<MemBuffer>,
+    shutdown:                       CancellationToken,
+    delta_write_callback:           Option<DeltaWriteCallback>,
+    tantivy_index_callback:         Option<TantivyIndexCallback>,
+    background_tasks:               Mutex<Vec<JoinHandle<()>>>,
+    flush_lock:                     Mutex<()>,
+    reserved_bytes:                 AtomicUsize, // Memory reserved for in-flight writes
+    pressure_notify:                Arc<Notify>, // Wakes flush task when pressure threshold crossed
     /// Notified at the end of every flush task iteration (success or failure).
     /// Test hook: lets E2E harnesses await actual completion of background work
     /// instead of racing wall-clock sleeps.
-    flush_tick_notify:      Arc<Notify>,
+    flush_tick_notify:              Arc<Notify>,
     /// Notified at the end of every eviction task iteration.
-    eviction_tick_notify:   Arc<Notify>,
+    eviction_tick_notify:           Arc<Notify>,
     /// Cumulative flush counters mirrored alongside OTel `record_flush`.
     /// OTel global metric state is opt-in (only initialized when telemetry is
     /// configured), so these atomics give the harness an in-process way to
     /// assert on what the global counters would be.
-    flush_completed_total:  AtomicU64,
-    flush_failed_total:     AtomicU64,
+    flush_completed_total:          AtomicU64,
+    flush_failed_total:             AtomicU64,
+    backpressure_engaged_total:     AtomicU64,
+    backpressure_rejected_total:    AtomicU64,
+    backpressure_force_flush_total: AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
-    function_registry:      Arc<crate::functions::FnRegistry>,
+    function_registry:              Arc<crate::functions::FnRegistry>,
     /// Caps concurrent detached tantivy sidecar builds so a fast flush cycle
     /// (post-F4 — one build per (project, table) per cycle) can't fan out
     /// past S3 connection / memory limits when many tables flush together.
     /// FOLLOW-UP: handles aren't stored; graceful shutdown does not await
     /// in-flight tantivy uploads. Acceptable for now because the sidecar is
     /// best-effort and the index can be rebuilt from Delta on demand.
-    tantivy_spawn_sem:      Arc<tokio::sync::Semaphore>,
+    tantivy_spawn_sem:              Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -336,6 +361,9 @@ impl BufferedWriteLayer {
             eviction_tick_notify: Arc::new(Notify::new()),
             flush_completed_total: AtomicU64::new(0),
             flush_failed_total: AtomicU64::new(0),
+            backpressure_engaged_total: AtomicU64::new(0),
+            backpressure_rejected_total: AtomicU64::new(0),
+            backpressure_force_flush_total: AtomicU64::new(0),
             function_registry,
             // 16 is well above realistic per-cycle table fan-out for the
             // monoscope workload (~5 distinct table names) while still
@@ -452,6 +480,138 @@ impl BufferedWriteLayer {
         self.reserved_bytes.fetch_sub(size, Ordering::Release);
     }
 
+    /// Reserve memory for a write, applying *backpressure* instead of dropping
+    /// the write when the hard limit is hit. The rows are already destined for
+    /// the durable WAL, and Delta/S3 is effectively unbounded "disk" — so when
+    /// RAM is full the correct move is to flush MemBuffer → Delta to make room
+    /// (the spill), not to reject. We retry the reservation after each drain
+    /// and only fail after `write_backpressure_timeout` with no progress, which
+    /// means Delta itself is unavailable.
+    ///
+    /// This deliberately reintroduces synchronous flushing into the insert path
+    /// (previously removed to keep inserts non-blocking). The trade-off is
+    /// intentional and now load-bearing: for a time-series DB a slow write is
+    /// far better than a rejected one the producer must DLQ. Normal sub-limit
+    /// inserts take the fast path and never block here.
+    async fn reserve_with_backpressure(&self, batches: &[RecordBatch]) -> anyhow::Result<usize> {
+        let first = self.try_reserve_memory(batches).await;
+        let timeout = self.config.buffer.write_backpressure_timeout();
+        if first.is_ok() || timeout.is_zero() {
+            return first;
+        }
+
+        let deadline = std::time::Instant::now() + timeout;
+        let mut last_mem = self.effective_memory_bytes();
+        let mut stalls = 0u32;
+        crate::metrics::record_backpressure_engaged();
+        self.backpressure_engaged_total.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            "Write backpressure engaged: used={}MB ≥ hard limit; flushing to Delta to free RAM (not rejecting)",
+            last_mem / (1024 * 1024)
+        );
+        loop {
+            // Relieve via completed buckets first (always race-free). Escalate
+            // to force-flushing the current open bucket only after consecutive
+            // stalls — i.e. when a single in-flight window is itself the
+            // pressure and completed-bucket flushes can't help.
+            self.relieve_memory_pressure(stalls >= 2).await;
+
+            match self.try_reserve_memory(batches).await {
+                Ok(sz) => return Ok(sz),
+                Err(e) => {
+                    let now_mem = self.effective_memory_bytes();
+                    // Count a stall when this round freed <1% of memory.
+                    if now_mem + now_mem / 100 >= last_mem {
+                        stalls += 1;
+                    } else {
+                        stalls = 0;
+                    }
+                    last_mem = now_mem;
+                    if std::time::Instant::now() >= deadline {
+                        crate::metrics::record_backpressure_rejected();
+                        self.backpressure_rejected_total.fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            "Write backpressure exhausted after {:?}: used={}MB still over hard limit — Delta flush is not freeing memory; rejecting (data remains in WAL)",
+                            timeout,
+                            now_mem / (1024 * 1024)
+                        );
+                        return Err(e);
+                    }
+                    // Brief yield so the background flush task and other writers
+                    // can make progress between our synchronous drain attempts.
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+    }
+
+    /// Synchronously drain MemBuffer → Delta to relieve insert-path memory
+    /// pressure. Flushes completed buckets first (always safe); when
+    /// `force_current` is set also force-flushes the current open bucket(s) via
+    /// the atomic `take_bucket_for_flush` path.
+    async fn relieve_memory_pressure(&self, force_current: bool) {
+        if let Err(e) = self.flush_completed_buckets().await {
+            warn!("backpressure: flush_completed_buckets failed: {}", e);
+        }
+        // `force_flush_current_buckets` self-gates on the WAL-ordering invariant
+        // (see its body), so calling it whenever pressure persists is safe.
+        if force_current
+            && self.is_memory_pressure()
+            && let Err(e) = self.force_flush_current_buckets().await
+        {
+            warn!("backpressure: force_flush_current_buckets failed: {}", e);
+        }
+    }
+
+    /// Force-flush the current (still-open) bucket(s) to Delta. Normal flushing
+    /// excludes the current bucket so a full window accumulates in RAM; under
+    /// sustained single-window pressure that window alone can exceed the budget,
+    /// so this is the escalation tier. `take_bucket_for_flush` removes a
+    /// bucket's rows atomically under the insert lock (no lost-write race) and
+    /// leaves the bucket in place for ongoing inserts. On commit failure the
+    /// rows are restored — durability never depended on this (WAL holds them).
+    pub(crate) async fn force_flush_current_buckets(&self) -> anyhow::Result<()> {
+        let _flush_guard = self.flush_lock.lock().await;
+        let current = MemBuffer::current_bucket_id();
+        // WAL-ordering safety: `advance_by_counts` consumes entries sequentially
+        // from the cursor, so advancing by the current bucket's count is correct
+        // ONLY when every older bucket on the shard has already been flushed +
+        // advanced. If a completed bucket remains (its flush failed), the cursor
+        // is still behind it and advancing now would consume the failed bucket's
+        // entries instead — losing them on a crash. Skip; the next round retries
+        // the completed flush first. (Holds the flush_lock so no concurrent
+        // completed-flush can drain them out from under this check.)
+        if self.mem_buffer.has_buckets_before(current) {
+            debug!("force-flush skipped: completed buckets still present — avoiding WAL over-advance");
+            return Ok(());
+        }
+        crate::metrics::record_backpressure_force_flush();
+        self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
+        for (project_id, table_name, bucket_id) in self.mem_buffer.current_bucket_keys(current) {
+            let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&project_id, &table_name, bucket_id) else {
+                continue;
+            };
+            match self.flush_bucket(&bucket).await {
+                Ok(()) => {
+                    if let Err(e) = self.wal.advance_by_counts(&bucket.project_id, &bucket.table_name, &bucket.wal_shard_counts) {
+                        warn!(
+                            "force-flush: advance_by_counts failed (rows committed to Delta; WAL will re-replay, dedup protects): {}",
+                            e
+                        );
+                    } else {
+                        self.flush_completed_total.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    self.flush_failed_total.fetch_add(1, Ordering::Relaxed);
+                    warn!("force-flush: Delta commit failed; restoring {} rows to MemBuffer: {}", bucket.row_count, e);
+                    self.mem_buffer.restore_taken_bucket(&bucket);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
         // Memory pressure no longer triggers a synchronous flush_all_now in the
@@ -481,8 +641,10 @@ impl BufferedWriteLayer {
         // replay). MemBuffer's insert re-runs this as a cheap no-op.
         let batches: Vec<RecordBatch> = batches.into_iter().map(crate::mem_buffer::compact_batch).collect();
 
-        // Reserve memory atomically before writing - prevents race condition
-        let reserved_size = self.try_reserve_memory(&batches).await?;
+        // Reserve memory atomically before writing - prevents race condition.
+        // Applies backpressure (synchronous flush-to-Delta + retry) instead of
+        // rejecting when at the hard limit — see `reserve_with_backpressure`.
+        let reserved_size = self.reserve_with_backpressure(&batches).await?;
 
         // No per-topic mutex needed: WAL now shards each (project, table)
         // across N walrus collections via `WalManager::pick_shard`, so
@@ -672,6 +834,44 @@ impl BufferedWriteLayer {
                 error_count,
                 corruption_threshold
             );
+        }
+
+        // Boot guard: replay loads entries straight into MemBuffer, bypassing
+        // the insert-path reservation. A large replayed backlog can therefore
+        // start the process already over the memory budget, where every
+        // subsequent insert rejects (prod 2026-06-11: 15.8GB in an 8GB-limit
+        // buffer, wedged + restart-looping). Drain completed buckets to Delta
+        // now so we begin serving with headroom. Replayed buckets carry empty
+        // wal_shard_counts (replay didn't call record_wal_append) so the
+        // post-flush advance_by_counts is a safe no-op — entries were already
+        // consumed by the checkpoint=true pass above. Bounded + progress-gated
+        // so a missing/failing Delta callback can't spin forever.
+        if self.delta_write_callback.is_some() {
+            let max_bytes = self.max_memory_bytes();
+            let mut prev = usize::MAX;
+            for _ in 0..64 {
+                let used = self.effective_memory_bytes();
+                if used <= max_bytes {
+                    break;
+                }
+                info!(
+                    "Post-replay drain: {}MB > {}MB budget — flushing completed buckets to Delta before serving",
+                    used / (1024 * 1024),
+                    max_bytes / (1024 * 1024)
+                );
+                if let Err(e) = self.flush_completed_buckets().await {
+                    warn!("Post-replay drain flush failed: {}", e);
+                    break;
+                }
+                let now = self.effective_memory_bytes();
+                if now + now / 100 >= prev {
+                    // <1% progress: no completed buckets left to drain (or flush
+                    // is stuck). Remaining pressure, if any, is handled by
+                    // insert-path backpressure once we start serving.
+                    break;
+                }
+                prev = now;
+            }
         }
 
         let stats = RecoveryStats {
@@ -1251,6 +1451,9 @@ impl BufferedWriteLayer {
             oldest_bucket_age_secs,
             flush_completed_total: self.flush_completed_total.load(Ordering::Relaxed),
             flush_failed_total: self.flush_failed_total.load(Ordering::Relaxed),
+            backpressure_engaged_total: self.backpressure_engaged_total.load(Ordering::Relaxed),
+            backpressure_rejected_total: self.backpressure_rejected_total.load(Ordering::Relaxed),
+            backpressure_force_flush_total: self.backpressure_force_flush_total.load(Ordering::Relaxed),
         }
     }
 
@@ -1378,10 +1581,13 @@ mod tests {
         .unwrap()
     }
 
+    #[serial]
     #[tokio::test]
     async fn test_insert_and_query() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
@@ -1593,10 +1799,17 @@ mod tests {
         }
     }
 
+    // #[serial] + own WALRUS_DATA_DIR: this test writes WAL via `insert`, and
+    // walrus reads its data dir from the process-global WALRUS_DATA_DIR. Without
+    // pinning it, a concurrent #[serial] test's dropped tempdir leaves the global
+    // pointing at a deleted path → ENOENT on append (flaky in the full suite).
+    #[serial]
     #[tokio::test]
     async fn test_pressure_pct() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("p{}", test_id);
         let table = format!("t{}", test_id);
@@ -1615,10 +1828,13 @@ mod tests {
     /// counts whose total equals the number of WAL entries appended. Before
     /// this regression test the counts didn't exist and `wal.checkpoint`
     /// drained the whole column to its tail.
+    #[serial]
     #[tokio::test]
     async fn wal_shard_counts_recorded_on_insert() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];
         let project = format!("c{}", test_id);
         let table = format!("c{}", test_id);
@@ -1751,10 +1967,165 @@ mod tests {
         );
     }
 
+    /// Regression: prod 2026-06-11 wedged with MemBuffer at 15.8GB > 8GB hard
+    /// limit, every insert rejected with "Memory limit exceeded". The insert
+    /// path must apply *backpressure* — synchronously flush MemBuffer → Delta to
+    /// free RAM and retry — instead of dropping the write. Cap the budget at the
+    /// 64MB floor (hard limit ~76.8MB) and push ~96MB of flushable (old-bucket)
+    /// data through `insert()` with a working Delta callback. Pre-fix, the insert
+    /// crossing the limit returns Err; post-fix every insert succeeds because the
+    /// over-limit reservation drives a flush of the completed bucket first.
+    #[serial]
+    #[tokio::test]
+    async fn backpressure_flushes_instead_of_rejecting() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+
+        use arrow::{
+            array::{StringArray, TimestampMicrosecondArray},
+            datatypes::{DataType, Field, Schema, TimeUnit},
+        };
+
+        let dir = tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.core.timefusion_data_dir = dir.path().to_path_buf();
+        cfg.buffer.timefusion_buffer_max_memory_mb = 64; // floor → hard limit ~76.8MB
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        let cfg = Arc::new(cfg);
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("bp{}", test_id);
+        let table = format!("bp{}", test_id);
+
+        let flush_calls = Arc::new(AtomicUsize::new(0));
+        let fc = flush_calls.clone();
+        let mut layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
+            let c = fc.clone();
+            Box::pin(async move {
+                c.fetch_add(1, O::SeqCst);
+                Ok(Vec::new())
+            })
+        }));
+        let layer = Arc::new(layer);
+
+        // Old timestamp → all rows land in a completed (flushable) bucket.
+        let old_ts = crate::clock::now_micros() - 2 * crate::mem_buffer::bucket_duration_micros();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let rows = 30_000usize;
+        let make_batch = || {
+            let ts = TimestampMicrosecondArray::from(vec![old_ts; rows]);
+            let payload = StringArray::from(vec!["x".repeat(400); rows]); // ~12MB
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ts), Arc::new(payload)]).unwrap()
+        };
+
+        // ~96MB cumulative into a ~76.8MB buffer: at least one insert must cross
+        // the hard limit and rely on backpressure. All must succeed.
+        for i in 0..8 {
+            layer
+                .insert(&project, &table, vec![make_batch()])
+                .await
+                .unwrap_or_else(|e| panic!("insert {i} must succeed under backpressure, got: {e}"));
+        }
+
+        assert!(flush_calls.load(O::SeqCst) >= 1, "backpressure must have forced at least one Delta flush");
+        assert!(
+            layer.snapshot_stats().backpressure_engaged_total >= 1,
+            "backpressure_engaged_total must record the over-limit event"
+        );
+    }
+
+    /// The current (open) bucket is excluded from normal flushing, so a single
+    /// busy 10-min window accumulates in RAM with nothing able to drain it.
+    /// `force_flush_current_buckets` is the escalation tier that can. Prove the
+    /// open bucket survives a completed-bucket flush but is drained by the force
+    /// path.
+    #[serial]
+    #[tokio::test]
+    async fn force_flush_current_bucket_drains_open_window() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("fc{}", test_id);
+        let table = format!("fc{}", test_id);
+
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
+        let layer = Arc::new(layer);
+
+        // create_test_batch uses now() timestamps → the current (open) bucket.
+        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+
+        // Normal completed-bucket flush must NOT touch the open bucket.
+        layer.flush_completed_buckets().await.unwrap();
+        assert!(!layer.is_empty(), "completed-bucket flush must leave the open bucket in MemBuffer");
+
+        // The force path reaches it.
+        layer.force_flush_current_buckets().await.unwrap();
+        assert!(layer.is_empty(), "force_flush_current_buckets must drain the open bucket");
+    }
+
+    /// Durability invariant: the current-bucket force-flush MUST be skipped while
+    /// any completed bucket remains in MemBuffer. `advance_by_counts` consumes WAL
+    /// entries sequentially from the cursor, so advancing by the current bucket's
+    /// count when an older (failed-flush) bucket is still un-advanced would consume
+    /// the older bucket's entries — silent data loss on crash. We seed both an old
+    /// (completed) and a current bucket, then assert force-flush is a no-op (Delta
+    /// callback never fires, nothing drained).
+    #[serial]
+    #[tokio::test]
+    async fn force_flush_skipped_while_completed_bucket_present() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("g{}", test_id);
+        let table = format!("g{}", test_id);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_cb = calls.clone();
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
+            let c = calls_cb.clone();
+            Box::pin(async move {
+                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Vec::new())
+            })
+        }));
+        let layer = Arc::new(layer);
+
+        // Old (completed) bucket + current (open) bucket.
+        let old_ts = crate::clock::now_micros() - 2 * crate::mem_buffer::bucket_duration_micros();
+        let old_batch =
+            crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span_ts("old", "spanA", &project, old_ts)]).unwrap();
+        layer.insert(&project, &table, vec![old_batch]).await.unwrap();
+        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+
+        // Force-flush must short-circuit because the completed bucket is present.
+        layer.force_flush_current_buckets().await.unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "force-flush must NOT touch Delta (or advance the WAL) while a completed bucket remains"
+        );
+        assert!(!layer.is_empty(), "both buckets must remain buffered after the skipped force-flush");
+    }
+
+    #[serial]
     #[tokio::test]
     async fn test_memory_reservation() {
         let dir = tempdir().unwrap();
         let cfg = create_test_config(dir.path().to_path_buf());
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
 
         // Use unique but short project/table names (walrus has metadata size limit)
         let test_id = &uuid::Uuid::new_v4().to_string()[..4];

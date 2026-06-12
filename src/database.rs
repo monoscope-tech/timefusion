@@ -774,6 +774,14 @@ pub struct Database {
     /// the sweep when the version hasn't moved (no commits → no new dupes).
     /// Same unbounded-growth caveat as `last_written_versions`.
     last_dedup_versions:             Arc<RwLock<HashMap<String, u64>>>,
+    /// Serializes in-process Delta commits (flush appends vs dedup
+    /// replace_where). delta-kernel's OCC checker cannot evaluate the
+    /// bare-string timestamp predicate replace_where commits carry (errors
+    /// "arrow_cast should have been simplified"), so a dedup commit racing
+    /// any concurrent append aborts — every attempt, forever, on a busy
+    /// table. With commits serialized the rebase sees no newer versions and
+    /// skips the checker entirely.
+    delta_commit_lock:               Arc<tokio::sync::Mutex<()>>,
     buffered_layer:                  Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
     tantivy_search:                  Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
     tantivy_indexer:                 Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
@@ -1075,6 +1083,7 @@ impl Database {
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
+            delta_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             buffered_layer: None,
             tantivy_search: None,
             tantivy_indexer: None,
@@ -2608,6 +2617,11 @@ impl Database {
             // every other commit path — the write lock is NOT held across the
             // write anymore (it serialized all query planning behind each
             // project's parquet upload during flush passes; 50-110s prod stalls).
+            // Hold the in-process commit lock from snapshot to swap so this
+            // append can never land mid-flight of a dedup replace_where (see
+            // `delta_commit_lock`). Appends-vs-appends pay a short queue wait;
+            // commits are sub-second next to the 10-min flush cadence.
+            let commit_guard = self.delta_commit_lock.lock().await;
             let (table, pre_uris) = {
                 let guard = table_ref.read().await;
                 let pre: std::collections::HashSet<String> = guard.get_file_uris().map(|it| it.collect()).unwrap_or_default();
@@ -2701,6 +2715,12 @@ impl Database {
                         last_error = Some(e);
                         debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, max_retries);
 
+                        // Intentionally release the commit lock BEFORE the
+                        // backoff sleep — do not remove. Holding it across the
+                        // sleep would serialize every other writer behind this
+                        // writer's backoff, converting commit contention into a
+                        // throughput collapse.
+                        drop(commit_guard);
                         // Exponential backoff for better handling of concurrent writes
                         let backoff_ms = 100 * (2_u64.pow(retry_count.min(5)));
                         tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
@@ -3277,6 +3297,11 @@ impl Database {
             let mut last_err: Option<deltalake::DeltaTableError> = None;
             let mut committed = false;
             for attempt in 0..MAX_RETRIES {
+                // Clone under the commit lock and hold it through the commit:
+                // with no append able to land in between, the rebase sees no
+                // newer commits and the OCC checker (which errors on our
+                // bare-string timestamp predicate) never runs.
+                let commit_guard = self.delta_commit_lock.lock().await;
                 let table_clone = {
                     let table = table_ref.read().await;
                     table.clone()
@@ -3306,6 +3331,10 @@ impl Database {
                         break;
                     }
                     Err(e) => {
+                        // Drop BEFORE the backoff sleep below — do not remove.
+                        // Holding the commit lock across the sleep would block
+                        // every concurrent append behind this dedup retry.
+                        drop(commit_guard);
                         let msg = e.to_string();
                         // "Transaction failed" covers the conflict checker erroring
                         // while evaluating our predicate against a concurrent commit
@@ -4492,11 +4521,27 @@ impl TableProvider for ProjectRoutingTable {
         // backwards and wrongly hid all the Delta rows *above* it. Fixed
         // by listing the actual ranges MemBuffer currently holds and
         // excluding only those.
+        //
+        // Exception: the current (open) bucket's range is NOT excluded. Under
+        // memory pressure `force_flush_current_buckets` commits the open
+        // bucket's rows to Delta while inserts keep repopulating the same
+        // bucket_id in MemBuffer — so Delta legitimately holds rows inside the
+        // current range. Excluding it would hide those force-flushed rows
+        // (observed as an 8-of-150 undercount in the pressure_flush e2e test).
+        // It's safe to scan both: force-flush removes rows from MemBuffer
+        // *before* committing, so the current bucket's MemBuffer rows and its
+        // Delta rows are disjoint — the union can't double-count them. (Sealed
+        // buckets keep the exclusion: their normal commit-then-drain flush can
+        // briefly hold the same row in both stores.)
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
+        let current_bucket_start = crate::mem_buffer::MemBuffer::current_bucket_id() * crate::mem_buffer::bucket_duration_micros();
         let mut delta_filters = optimized_filters.clone();
         let ts_col = || Box::new(col("timestamp"));
         let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
         for (start, end) in &mem_ranges {
+            if *start == current_bucket_start {
+                continue;
+            }
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr {
                 left:  ts_col(),
@@ -5243,6 +5288,57 @@ mod tests {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
+    }
+
+    /// Regression for the pressure_flush e2e undercount (8-of-150): when
+    /// `force_flush_current_buckets` commits the open bucket's rows to Delta and
+    /// inserts then repopulate the same bucket_id, the query path must still
+    /// return the force-flushed rows. The old per-bucket exclusion masked the
+    /// current bucket's whole range from the Delta scan, hiding everything that
+    /// had been force-flushed. Drives the force-flush directly so it's
+    /// deterministic (no need to actually exhaust the memory budget).
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn force_flushed_current_bucket_rows_stay_queryable() -> Result<()> {
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&prefix);
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        tokio::time::timeout(std::time::Duration::from_secs(50), async {
+            // Need the real buffered layer (force_flush path), so bootstrap the
+            // full stack rather than the layer-less setup_test_database().
+            let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
+            let project_id = format!("ffq_{}", prefix);
+
+            // 3 rows into the current (open) bucket, then force-flush them to
+            // Delta — leaving the bucket drained but its range still "current".
+            // skip_queue=false so the write flows through the buffered layer
+            // (WAL → MemBuffer), not straight to Delta.
+            for i in 0..3 {
+                let batch = json_to_batch(vec![test_span(&format!("flushed_{i}"), "span", &project_id)])?;
+                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+            }
+            b.buffered_layer.force_flush_current_buckets().await?;
+
+            // 2 more rows repopulate the same current bucket_id in MemBuffer.
+            for i in 0..2 {
+                let batch = json_to_batch(vec![test_span(&format!("buffered_{i}"), "span", &project_id)])?;
+                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+            }
+
+            // All 5 must be visible: 3 from Delta (force-flushed), 2 from MemBuffer.
+            // Pre-fix this returned 2 (the current range was excluded from Delta).
+            use datafusion::arrow::array::AsArray;
+            let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
+            let r = b.session_ctx.sql(&sql).await?.collect().await?;
+            let n = r[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+            assert_eq!(n, 5, "force-flushed rows must remain queryable alongside repopulated MemBuffer rows");
+
+            b.shutdown.cancel();
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
     }
 
     #[serial]
