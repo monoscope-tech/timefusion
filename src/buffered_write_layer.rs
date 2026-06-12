@@ -570,7 +570,7 @@ impl BufferedWriteLayer {
     /// bucket's rows atomically under the insert lock (no lost-write race) and
     /// leaves the bucket in place for ongoing inserts. On commit failure the
     /// rows are restored — durability never depended on this (WAL holds them).
-    async fn force_flush_current_buckets(&self) -> anyhow::Result<()> {
+    pub(crate) async fn force_flush_current_buckets(&self) -> anyhow::Result<()> {
         let _flush_guard = self.flush_lock.lock().await;
         let current = MemBuffer::current_bucket_id();
         // WAL-ordering safety: `advance_by_counts` consumes entries sequentially

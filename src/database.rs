@@ -4521,11 +4521,27 @@ impl TableProvider for ProjectRoutingTable {
         // backwards and wrongly hid all the Delta rows *above* it. Fixed
         // by listing the actual ranges MemBuffer currently holds and
         // excluding only those.
+        //
+        // Exception: the current (open) bucket's range is NOT excluded. Under
+        // memory pressure `force_flush_current_buckets` commits the open
+        // bucket's rows to Delta while inserts keep repopulating the same
+        // bucket_id in MemBuffer — so Delta legitimately holds rows inside the
+        // current range. Excluding it would hide those force-flushed rows
+        // (observed as an 8-of-150 undercount in the pressure_flush e2e test).
+        // It's safe to scan both: force-flush removes rows from MemBuffer
+        // *before* committing, so the current bucket's MemBuffer rows and its
+        // Delta rows are disjoint — the union can't double-count them. (Sealed
+        // buckets keep the exclusion: their normal commit-then-drain flush can
+        // briefly hold the same row in both stores.)
         let mem_ranges = layer.get_bucket_ranges(&project_id, &self.table_name);
+        let current_bucket_start = crate::mem_buffer::MemBuffer::current_bucket_id() * crate::mem_buffer::bucket_duration_micros();
         let mut delta_filters = optimized_filters.clone();
         let ts_col = || Box::new(col("timestamp"));
         let ts_lit = |t: i64| Box::new(lit(ScalarValue::TimestampMicrosecond(Some(t), Some("UTC".into()))));
         for (start, end) in &mem_ranges {
+            if *start == current_bucket_start {
+                continue;
+            }
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr {
                 left:  ts_col(),
@@ -5272,6 +5288,57 @@ mod tests {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
+    }
+
+    /// Regression for the pressure_flush e2e undercount (8-of-150): when
+    /// `force_flush_current_buckets` commits the open bucket's rows to Delta and
+    /// inserts then repopulate the same bucket_id, the query path must still
+    /// return the force-flushed rows. The old per-bucket exclusion masked the
+    /// current bucket's whole range from the Delta scan, hiding everything that
+    /// had been force-flushed. Drives the force-flush directly so it's
+    /// deterministic (no need to actually exhaust the memory budget).
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn force_flushed_current_bucket_rows_stay_queryable() -> Result<()> {
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&prefix);
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        tokio::time::timeout(std::time::Duration::from_secs(50), async {
+            // Need the real buffered layer (force_flush path), so bootstrap the
+            // full stack rather than the layer-less setup_test_database().
+            let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
+            let project_id = format!("ffq_{}", prefix);
+
+            // 3 rows into the current (open) bucket, then force-flush them to
+            // Delta — leaving the bucket drained but its range still "current".
+            // skip_queue=false so the write flows through the buffered layer
+            // (WAL → MemBuffer), not straight to Delta.
+            for i in 0..3 {
+                let batch = json_to_batch(vec![test_span(&format!("flushed_{i}"), "span", &project_id)])?;
+                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+            }
+            b.buffered_layer.force_flush_current_buckets().await?;
+
+            // 2 more rows repopulate the same current bucket_id in MemBuffer.
+            for i in 0..2 {
+                let batch = json_to_batch(vec![test_span(&format!("buffered_{i}"), "span", &project_id)])?;
+                b.db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+            }
+
+            // All 5 must be visible: 3 from Delta (force-flushed), 2 from MemBuffer.
+            // Pre-fix this returned 2 (the current range was excluded from Delta).
+            use datafusion::arrow::array::AsArray;
+            let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}'", project_id);
+            let r = b.session_ctx.sql(&sql).await?.collect().await?;
+            let n = r[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+            assert_eq!(n, 5, "force-flushed rows must remain queryable alongside repopulated MemBuffer rows");
+
+            b.shutdown.cancel();
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
     }
 
     #[serial]
