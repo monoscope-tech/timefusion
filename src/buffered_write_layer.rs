@@ -857,43 +857,14 @@ impl BufferedWriteLayer {
             );
         }
 
-        // Boot guard: replay loads entries straight into MemBuffer, bypassing
-        // the insert-path reservation. A large replayed backlog can therefore
-        // start the process already over the memory budget, where every
-        // subsequent insert rejects (prod 2026-06-11: 15.8GB in an 8GB-limit
-        // buffer, wedged + restart-looping). Drain completed buckets to Delta
-        // now so we begin serving with headroom. Replayed buckets carry empty
-        // wal_shard_counts (replay didn't call record_wal_append) so the
-        // post-flush advance_by_counts is a safe no-op — entries were already
-        // consumed by the checkpoint=true pass above. Bounded + progress-gated
-        // so a missing/failing Delta callback can't spin forever.
-        if self.delta_write_callback.is_some() {
-            let max_bytes = self.max_memory_bytes();
-            let mut prev = usize::MAX;
-            for _ in 0..64 {
-                let used = self.effective_memory_bytes();
-                if used <= max_bytes {
-                    break;
-                }
-                info!(
-                    "Post-replay drain: {}MB > {}MB budget — flushing completed buckets to Delta before serving",
-                    used / (1024 * 1024),
-                    max_bytes / (1024 * 1024)
-                );
-                if let Err(e) = self.flush_completed_buckets().await {
-                    warn!("Post-replay drain flush failed: {}", e);
-                    break;
-                }
-                let now = self.effective_memory_bytes();
-                if now + now / 100 >= prev {
-                    // <1% progress: no completed buckets left to drain (or flush
-                    // is stuck). Remaining pressure, if any, is handled by
-                    // insert-path backpressure once we start serving.
-                    break;
-                }
-                prev = now;
-            }
-        }
+        // NB: replay loads entries straight into MemBuffer (bypassing the
+        // insert-path reservation), so a large backlog can leave the process
+        // over the memory budget. We deliberately do NOT drain here — that
+        // blocked the PGWire listener for the entire flush (prod 2026-06-12:
+        // +215s of 57P03 write-rejection). `drain_to_budget` runs in the
+        // background (spawned by `start_background_tasks`) while we serve; reads
+        // see MemBuffer (unioned with Delta) and new inserts flush-to-make-room
+        // via insert-path backpressure.
 
         let stats = RecoveryStats {
             entries_replayed,
@@ -928,6 +899,47 @@ impl BufferedWriteLayer {
         Ok(stats)
     }
 
+    /// Flush completed buckets to Delta until memory is back under budget, then
+    /// stop. Spawned as a background task after WAL replay: replay can leave the
+    /// process well over the memory budget, but draining no longer blocks the
+    /// PGWire listener — we serve while this runs (reads see MemBuffer unioned
+    /// with Delta; new inserts flush-to-make-room via insert backpressure).
+    /// Bounded + progress-gated so a missing/failing Delta callback can't spin
+    /// forever, and cancel-aware so shutdown returns promptly. Replayed buckets
+    /// carry empty `wal_shard_counts` (replay didn't call `record_wal_append`),
+    /// so the post-flush `advance_by_counts` is a safe no-op — entries were
+    /// already consumed by the checkpoint pass in `recover_from_wal`.
+    async fn drain_to_budget(&self) {
+        if self.delta_write_callback.is_none() {
+            return;
+        }
+        let max_bytes = self.max_memory_bytes();
+        let mut prev = usize::MAX;
+        for _ in 0..64 {
+            if self.shutdown.is_cancelled() {
+                return;
+            }
+            let used = self.effective_memory_bytes();
+            if used <= max_bytes {
+                break;
+            }
+            info!(
+                "Post-replay drain: {}MB > {}MB budget — flushing completed buckets to Delta (background, serving concurrently)",
+                used / (1024 * 1024),
+                max_bytes / (1024 * 1024)
+            );
+            if let Err(e) = self.flush_completed_buckets().await {
+                warn!("Post-replay drain flush failed: {}", e);
+                break;
+            }
+            let now = self.effective_memory_bytes();
+            if now + now / 100 >= prev {
+                break; // <1% progress: nothing left to drain (or flush is stuck).
+            }
+            prev = now;
+        }
+    }
+
     pub async fn start_background_tasks(self: &Arc<Self>) {
         let this = Arc::clone(self);
 
@@ -950,12 +962,21 @@ impl BufferedWriteLayer {
             gc_this.run_wal_gc_task().await;
         });
 
+        // One-shot post-replay drain. WAL replay loads the backlog straight into
+        // MemBuffer; this flushes it down under budget in the background so the
+        // listener serves immediately instead of blocking on the drain.
+        let drain_this = Arc::clone(&this);
+        let drain_handle = tokio::spawn(async move {
+            drain_this.drain_to_budget().await;
+        });
+
         // Store handles
         {
             let mut handles = this.background_tasks.lock().await;
             handles.push(flush_handle);
             handles.push(eviction_handle);
             handles.push(gc_handle);
+            handles.push(drain_handle);
         }
 
         info!("BufferedWriteLayer background tasks started");
@@ -1318,47 +1339,73 @@ impl BufferedWriteLayer {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         info!("BufferedWriteLayer shutdown initiated");
 
-        // Signal background tasks to stop
+        // Signal background tasks to stop, then run the rest of shutdown under a
+        // deadline that must fit inside the orchestrator's SIGTERM→SIGKILL grace
+        // so the clean cursor snapshot below ALWAYS gets written. Anything not
+        // flushed in time is durable in the WAL and simply replays (and
+        // background-drains) on next boot. Prod 2026-06-12: an unbounded
+        // force-flush of a 38GB buffer blew past the grace, was SIGKILLed
+        // mid-flush, and left clean_shutdown=false → next boot paid
+        // delta_cursor_reconcile + a full blocking replay. Keep
+        // TIMEFUSION_SHUTDOWN_TIMEOUT_SECS below the orchestrator grace.
         self.shutdown.cancel();
-        let task_timeout = self.config.buffer.compute_shutdown_timeout();
-        debug!("Shutdown timeout: {:?}", task_timeout);
+        let budget = self.config.buffer.compute_shutdown_timeout();
+        let flush_deadline = tokio::time::Instant::now() + budget.mul_f32(0.8);
+        let hard_deadline = tokio::time::Instant::now() + budget;
+        debug!("Shutdown budget: {:?}", budget);
 
-        // Wait for background tasks to complete (with timeout)
+        // Wait for background tasks to stop, bounded by the flush deadline.
         let handles: Vec<JoinHandle<()>> = {
             let mut guard = self.background_tasks.lock().await;
             std::mem::take(&mut *guard)
         };
-
         for handle in handles {
-            match tokio::time::timeout(task_timeout, handle).await {
+            match tokio::time::timeout_at(flush_deadline, handle).await {
                 Ok(Ok(())) => debug!("Background task completed cleanly"),
                 Ok(Err(e)) => warn!("Background task panicked: {}", e),
-                Err(_) => warn!("Background task did not complete within timeout ({:?})", task_timeout),
+                Err(_) => warn!("Background task did not stop before shutdown flush deadline"),
             }
         }
 
-        // Acquire flush lock - waits for any in-progress flush to complete
-        let _flush_guard = self.flush_lock.lock().await;
-
-        // Force flush all remaining data
-        let all_buckets = self.mem_buffer.get_all_buckets();
-        info!("Flushing {} remaining buckets on shutdown", all_buckets.len());
-
-        for bucket in all_buckets {
-            match self.flush_bucket(&bucket).await {
-                Ok(()) => self.checkpoint_and_drain(&bucket),
-                Err(e) => error!("Shutdown flush failed for bucket {}: {}", bucket.bucket_id, e),
+        // Best-effort flush of remaining buckets, bounded by flush_deadline so a
+        // slice is reserved for the snapshot. The whole loop is deadline-wrapped,
+        // so even a single flush stuck on a slow/unreachable Delta backend can't
+        // blow the grace — the future is dropped and unflushed buckets replay
+        // from the WAL on next boot.
+        match tokio::time::timeout_at(flush_deadline, self.flush_lock.lock()).await {
+            Ok(_flush_guard) => {
+                let all_buckets = self.mem_buffer.get_all_buckets();
+                let total = all_buckets.len();
+                let mut flushed = 0usize;
+                let done = tokio::time::timeout_at(flush_deadline, async {
+                    for bucket in all_buckets {
+                        match self.flush_bucket(&bucket).await {
+                            Ok(()) => {
+                                self.checkpoint_and_drain(&bucket);
+                                flushed += 1;
+                            }
+                            Err(e) => error!("Shutdown flush failed for bucket {}: {}", bucket.bucket_id, e),
+                        }
+                    }
+                })
+                .await;
+                match done {
+                    Ok(()) => info!("Shutdown flush: {}/{} buckets flushed; remainder (if any) replays from WAL", flushed, total),
+                    Err(_) => info!("Shutdown flush deadline reached: {}/{} buckets flushed; remainder replays from WAL", flushed, total),
+                }
             }
+            Err(_) => warn!("Flush lock not acquired before deadline — skipping shutdown flush; WAL holds all data"),
         }
 
-        // Final cursor snapshot with the clean-shutdown marker — boot can
-        // then skip `derive_wal_cursors_from_delta` entirely (~6.5 min saved
-        // on the next start).
+        // ALWAYS write the clean-shutdown snapshot (even after a partial flush):
+        // it records the post-flush cursor positions so the next boot can skip
+        // `derive_wal_cursors_from_delta`. The WAL holds anything unflushed.
         let wal_for_snap = self.wal.clone();
-        match tokio::task::spawn_blocking(move || wal_for_snap.write_cursor_snapshot(true)).await {
-            Ok(Ok(())) => info!("Cursor snapshot written (clean_shutdown=true)"),
-            Ok(Err(e)) => warn!("Cursor snapshot on shutdown failed: {} — next boot will Delta-scan", e),
-            Err(join_err) => warn!("Cursor snapshot blocking task panicked: {} — next boot will Delta-scan", join_err),
+        match tokio::time::timeout_at(hard_deadline, tokio::task::spawn_blocking(move || wal_for_snap.write_cursor_snapshot(true))).await {
+            Ok(Ok(Ok(()))) => info!("Cursor snapshot written (clean_shutdown=true)"),
+            Ok(Ok(Err(e))) => warn!("Cursor snapshot on shutdown failed: {} — next boot will Delta-scan", e),
+            Ok(Err(join_err)) => warn!("Cursor snapshot blocking task panicked: {} — next boot will Delta-scan", join_err),
+            Err(_) => warn!("Cursor snapshot did not finish before shutdown deadline — next boot will Delta-scan"),
         }
 
         info!("BufferedWriteLayer shutdown complete");
@@ -1674,6 +1721,52 @@ mod tests {
             let results = layer.query(&project, &table, &[]).unwrap();
             assert!(!results.is_empty(), "Expected results after WAL recovery");
         }
+    }
+
+    /// Shutdown must finish within its budget AND persist a `clean_shutdown=true`
+    /// snapshot even when the Delta flush can't keep up — otherwise the next boot
+    /// pays `delta_cursor_reconcile` + a full blocking replay (prod 2026-06-12: a
+    /// 38GB shutdown flush blew past CapRover's grace, was SIGKILLed mid-flush,
+    /// and left `clean_shutdown=false`). Models a slow/hung Delta backend with a
+    /// callback that sleeps far longer than the shutdown budget; shutdown must
+    /// bound the flush and still write the clean snapshot.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_writes_clean_snapshot_under_deadline() {
+        let dir = tempdir().unwrap();
+        let mut base = AppConfig::default();
+        base.core.timefusion_data_dir = dir.path().to_path_buf();
+        base.buffer.timefusion_shutdown_timeout_secs = 1; // budget=1s, flush_deadline=0.8s
+        let cfg = Arc::new(base);
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("s{}", test_id);
+        let table = format!("s{}", test_id);
+
+        // Delta callback that blocks far longer than the shutdown budget.
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
+            Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(Vec::new())
+            })
+        }));
+        let layer = Arc::new(layer);
+
+        // Insert into a stale (sealed) bucket so shutdown's flush has work to do.
+        let old_ts = crate::clock::now_micros() - 2 * crate::mem_buffer::bucket_duration_micros();
+        let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span_ts("x", "spanX", &project, old_ts)]).unwrap();
+        layer.insert(&project, &table, vec![batch]).await.unwrap();
+
+        // Shutdown must return promptly (bounded by the budget), not hang on the
+        // 60s flush, and must persist the clean snapshot.
+        let t = std::time::Instant::now();
+        layer.shutdown().await.unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "shutdown must be deadline-bounded, took {:?}", t.elapsed());
+
+        let snap = layer.wal().load_cursor_snapshot().expect("clean snapshot must be written on shutdown");
+        assert!(snap.clean_shutdown, "shutdown must mark clean_shutdown=true even on a partial flush");
     }
 
     /// Build the (`UpdateSource`, assignments) pair used by the `update_with_source`
