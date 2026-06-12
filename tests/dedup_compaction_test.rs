@@ -69,6 +69,60 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     Ok(())
 }
 
+/// Regression for the 2026-06-11 prod OOM/restart loop: dedup's replace_where
+/// commit carries a bare-string timestamp predicate that delta-kernel's OCC
+/// checker cannot evaluate ("arrow_cast should have been simplified"), so any
+/// append landing between dedup's snapshot and commit aborted the sweep —
+/// every attempt, every 5 minutes, materializing and abandoning chunk writes
+/// (observed climbing to the 70GB memcg ceiling). The in-process
+/// `delta_commit_lock` serializes commits so the rebase sees no newer
+/// versions and the checker never runs: dedup must succeed under append fire.
+#[serial]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
+    let cfg = TestConfigBuilder::new("dedup_occ_race").with_buffer_mode(BufferMode::Enabled).build();
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Duplicate pair in a sealed (3h-old) bin — the chunk dedup will rewrite.
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    for name in ["first", "second"] {
+        let batch = json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)])?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+    }
+
+    // Append fire: fresh-timestamp rows (same partition date space, distinct
+    // ids) committing continuously while dedup rewrites the sealed chunk.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let appender = {
+        let (db, project_id, stop) = (Arc::clone(&db), project_id.clone(), Arc::clone(&stop));
+        tokio::spawn(async move {
+            let mut i = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = chrono::Utc::now().timestamp_micros();
+                let batch = json_to_batch(vec![test_span_ts(&format!("live_{i}"), "live", &project_id, now)]).unwrap();
+                db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await.unwrap();
+                i += 1;
+            }
+            i
+        })
+    };
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
+    let dropped = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let appended = appender.await?;
+    assert!(appended > 0, "appender must have raced at least one commit");
+    assert_eq!(dropped, 1, "dedup must collapse the duplicate despite concurrent appends");
+
+    let count_sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'dup_id'", project_id);
+    let post = db.query_delta_only(&count_sql).await?;
+    assert_eq!(post[0].column(0).as_primitive::<Int64Type>().value(0), 1);
+    Ok(())
+}
+
 /// Regression: light OPTIMIZE (bin-pack compact) must preserve ALL partition
 /// values on rewritten files. The kernel narrows `partitionValues_parsed` to
 /// the predicate-referenced subset (data skipping), and optimize used that

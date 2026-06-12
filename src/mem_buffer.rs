@@ -29,7 +29,12 @@ use crate::functions::FnRegistry;
 // longer = larger Delta files. Matches default flush interval for aligned boundaries.
 // Note: Timestamps before 1970 (negative microseconds) produce negative bucket IDs,
 // which is supported but may result in unexpected ordering if mixed with post-1970 data.
-const DEFAULT_BUCKET_DURATION_MICROS: i64 = 10 * 60 * 1_000_000;
+// Fallback when `set_bucket_duration_micros` is never called (i.e. unit tests
+// that build a MemBuffer directly). MUST track `d_bucket_duration_secs` in
+// config.rs — prod always overrides via bootstrap, but keeping the two in sync
+// avoids the test-only `BUCKET_DURATION_MICROS` const diverging from the
+// process-global runtime value once any test pins the OnceLock.
+const DEFAULT_BUCKET_DURATION_MICROS: i64 = 5 * 60 * 1_000_000;
 #[cfg(test)]
 const BUCKET_DURATION_MICROS: i64 = DEFAULT_BUCKET_DURATION_MICROS;
 
@@ -55,7 +60,7 @@ const MAX_BATCH_COUNT_PER_BUCKET: usize = 8;
 const MAX_BATCH_BYTES_FOR_COALESCE: usize = 4 * 1024 * 1024;
 
 /// Configured bucket window in microseconds. Set once at startup via
-/// `set_bucket_duration_micros`; defaults to 10 minutes when unset. Smaller
+/// `set_bucket_duration_micros`; defaults to 5 minutes when unset. Smaller
 /// windows free MemBuffer memory sooner (because the previous bucket becomes
 /// flushable sooner) at the cost of more, smaller Delta commits.
 pub fn bucket_duration_micros() -> i64 {
@@ -253,6 +258,12 @@ pub struct FlushableBucket {
     /// Written into Delta commit metadata so a crash between Delta commit
     /// and `advance_by_counts` can recover the cursor from Delta on restart.
     pub wal_positions:    Vec<Option<walrus_rust::WalPosition>>,
+    /// Actual min/max timestamp of the taken rows, captured before the source
+    /// bucket's atomics were reset. `restore_taken_bucket` replays these so a
+    /// restored bucket keeps its true time range (and stays visible to
+    /// time-range pruning) rather than collapsing to the bucket's start.
+    pub min_timestamp:    i64,
+    pub max_timestamp:    i64,
 }
 
 #[derive(Debug, Default)]
@@ -1161,10 +1172,142 @@ impl MemBuffer {
                     wal_positions,
                     row_count: bucket.row_count.load(Ordering::Relaxed),
                     wal_shard_counts,
+                    min_timestamp: bucket.min_timestamp.load(Ordering::Relaxed),
+                    max_timestamp: bucket.max_timestamp.load(Ordering::Relaxed),
                 });
             }
         }
         result
+    }
+
+    /// (project_id, table_name, bucket_id) for every bucket at or after
+    /// `min_bucket_id` — i.e. the still-open current bucket(s). Used by the
+    /// insert-path backpressure escalation to force-flush the open window when
+    /// flushing completed buckets alone can't relieve memory pressure.
+    pub fn current_bucket_keys(&self, min_bucket_id: i64) -> Vec<(String, String, i64)> {
+        let mut out = Vec::new();
+        for t in self.tables.iter() {
+            let (project_id, table_name) = t.key();
+            for b in t.value().buckets.iter() {
+                if *b.key() >= min_bucket_id {
+                    out.push((project_id.to_string(), table_name.to_string(), *b.key()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Cheap existence check (no batch cloning) for any bucket strictly older
+    /// than `cutoff_bucket_id`. Gates current-bucket force-flush: advancing the
+    /// WAL cursor past the open bucket is only correct once every older bucket
+    /// on the shard has been flushed + advanced (the cursor consumes entries
+    /// sequentially, not by logical bucket). A leftover completed bucket means a
+    /// failed flush left the cursor behind it.
+    pub fn has_buckets_before(&self, cutoff_bucket_id: i64) -> bool {
+        self.tables.iter().any(|t| t.value().buckets.iter().any(|b| *b.key() < cutoff_bucket_id))
+    }
+
+    /// Atomically take a bucket's rows + WAL counts for an out-of-band flush.
+    /// Unlike `collect_buckets` + `drain_bucket` (safe only on sealed buckets),
+    /// this is safe on the *current* still-written bucket: the take happens
+    /// under the same `batches` lock inserts use, so no row can be lost between
+    /// snapshot and removal. The now-empty bucket stays in the map so
+    /// concurrent/subsequent inserts keep writing into it. Returns None when
+    /// the bucket is absent or already empty.
+    pub fn take_bucket_for_flush(&self, project_id: &str, table_name: &str, bucket_id: i64) -> Option<FlushableBucket> {
+        let table = self.get_table(project_id, table_name)?;
+        let bucket_ref = table.buckets.get(&bucket_id)?;
+        let bucket = bucket_ref.value();
+        let mut batches_g = bucket.batches.lock();
+        if batches_g.is_empty() {
+            return None;
+        }
+        // Lock wal_shard_state too so the taken counts match the taken rows
+        // exactly — advance_by_counts must not over- or under-advance.
+        let mut wal_g = bucket.wal_shard_state.lock();
+        let batches: Vec<RecordBatch> = std::mem::take(&mut *batches_g);
+        let wal_state = std::mem::take(&mut *wal_g);
+        let freed = bucket.memory_bytes.swap(0, Ordering::Relaxed);
+        let row_count = bucket.row_count.swap(0, Ordering::Relaxed);
+        // Capture the real range as we reset the sentinels so a restore (on
+        // Delta commit failure) can replay it instead of guessing bucket-start.
+        let min_timestamp = bucket.min_timestamp.swap(i64::MAX, Ordering::Relaxed);
+        let max_timestamp = bucket.max_timestamp.swap(i64::MIN, Ordering::Relaxed);
+        drop(wal_g);
+        drop(batches_g);
+        drop(bucket_ref);
+        self.estimated_bytes.fetch_sub(freed, Ordering::Relaxed);
+        self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
+
+        // Drop the now-empty bucket so a stale empty shell can't — once time rolls
+        // past its window (id < current) — make `has_buckets_before` permanently
+        // gate off future current-bucket force-flushes. `remove_if` re-checks
+        // emptiness under the shard write lock, so a concurrent insert that
+        // repopulated the bucket between the take and here is preserved.
+        table.buckets.remove_if(&bucket_id, |_, b| b.batches.lock().is_empty());
+
+        // Pad to shards_per_topic so advance_by_counts indices line up.
+        let shards = self.shards_per_topic;
+        let mut counts = vec![0u64; shards];
+        let mut positions = vec![None; shards];
+        for (i, &c) in wal_state.counts.iter().take(shards).enumerate() {
+            counts[i] = c;
+        }
+        for (i, p) in wal_state.positions.iter().take(shards).enumerate() {
+            positions[i] = *p;
+        }
+        Some(FlushableBucket {
+            project_id: project_id.to_string(),
+            table_name: table_name.to_string(),
+            bucket_id,
+            batches,
+            row_count,
+            wal_shard_counts: counts,
+            wal_positions: positions,
+            min_timestamp,
+            max_timestamp,
+        })
+    }
+
+    /// Re-insert a bucket previously removed by `take_bucket_for_flush` whose
+    /// Delta commit then failed. Restores rows (query visibility) and merges
+    /// the WAL counts back so the next flush advances the cursor correctly.
+    /// Durability never depended on this — the rows are still in the WAL — but
+    /// it avoids a query-visibility gap until the next restart/replay.
+    pub fn restore_taken_bucket(&self, b: &FlushableBucket) {
+        let Some(table) = self.get_table(&b.project_id, &b.table_name) else { return };
+        let bucket = table.buckets.entry(b.bucket_id).or_insert_with(TimeBucket::new);
+        let mut batches_g = bucket.batches.lock();
+        let mut wal_g = bucket.wal_shard_state.lock();
+        let added: usize = b.batches.iter().map(estimate_batch_size).sum();
+        for batch in &b.batches {
+            batches_g.push(batch.clone());
+        }
+        if wal_g.counts.len() < b.wal_shard_counts.len() {
+            wal_g.counts.resize(b.wal_shard_counts.len(), 0);
+        }
+        for (i, &c) in b.wal_shard_counts.iter().enumerate() {
+            wal_g.counts[i] += c;
+        }
+        if wal_g.positions.len() < b.wal_positions.len() {
+            wal_g.positions.resize(b.wal_positions.len(), None);
+        }
+        for (i, p) in b.wal_positions.iter().enumerate() {
+            if let Some(pos) = p {
+                wal_g.positions[i] = Some(wal_g.positions[i].map_or(*pos, |prev| prev.max(*pos)));
+            }
+        }
+        bucket.memory_bytes.fetch_add(added, Ordering::Relaxed);
+        bucket.row_count.fetch_add(b.row_count, Ordering::Relaxed);
+        // Replay the true range (monotonic widen) so restored rows stay visible
+        // to time-range pruning; concurrent inserts into the same open bucket
+        // are preserved since fetch_min/max only widens.
+        bucket.update_timestamps(b.min_timestamp);
+        bucket.update_timestamps(b.max_timestamp);
+        drop(wal_g);
+        drop(batches_g);
+        self.estimated_bytes.fetch_add(added, Ordering::Relaxed);
+        self.cache_invalidate(&Self::cache_key(&b.project_id, &b.table_name, b.bucket_id));
     }
 
     /// Count buckets whose `max_timestamp` is older than `cutoff_micros`.
@@ -2275,6 +2418,28 @@ mod tests {
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], &[]).unwrap();
         let total: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2, "no text_match preds → all rows returned");
+    }
+
+    /// Regression: `restore_taken_bucket` (the Delta-commit-failure path of the
+    /// open-bucket force-flush) used to reset the bucket's min/max to the bucket
+    /// *start* (`bucket_id * duration`), hiding restored rows from time-range
+    /// pruning until the next insert. It must replay the rows' real range.
+    #[test]
+    fn restore_taken_bucket_preserves_timestamp_range() {
+        use crate::test_utils::test_helpers::{json_to_batch, test_span};
+        let buffer = MemBuffer::new();
+        let dur = bucket_duration_micros();
+        let ts = 7 * dur + 12_345; // mid-bucket — distinct from the bucket-start sentinel
+        let bucket_id = MemBuffer::compute_bucket_id(ts);
+        buffer.insert("p1", "otel_logs_and_spans", json_to_batch(vec![test_span("a", "svc", "p1")]).unwrap(), ts).unwrap();
+
+        let taken = buffer.take_bucket_for_flush("p1", "otel_logs_and_spans", bucket_id).expect("bucket taken");
+        assert_eq!((taken.min_timestamp, taken.max_timestamp), (ts, ts), "take must capture the real row range");
+
+        buffer.restore_taken_bucket(&taken); // simulate Delta commit failure
+        let again = buffer.take_bucket_for_flush("p1", "otel_logs_and_spans", bucket_id).expect("restored bucket present");
+        assert_eq!((again.min_timestamp, again.max_timestamp), (ts, ts), "restore must preserve the true range");
+        assert_ne!(again.min_timestamp, bucket_id * dur, "must not collapse to bucket start");
     }
 
     #[test]
