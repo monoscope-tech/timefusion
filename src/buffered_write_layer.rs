@@ -736,29 +736,29 @@ impl BufferedWriteLayer {
                     let decoded = WalManager::deserialize_batch(&entry.data, &entry.table_name);
                     insert_decode_nanos += entry_start.elapsed().as_nanos();
                     match decoded {
-                    Ok(batch) => {
-                        if batch.num_rows() == 0 {
-                            warn!("Skipping empty batch during WAL recovery for {}.{}", entry.project_id, entry.table_name);
-                            return;
-                        }
-                        let apply_start = std::time::Instant::now();
-                        let insert_res = mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros);
-                        insert_apply_nanos += apply_start.elapsed().as_nanos();
-                        match insert_res {
-                            Ok(()) => entries_replayed += 1,
-                            Err(e) => {
-                                error!("WAL REPLAY FAILED: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
-                                quarantine_entry(&quarantine_dir, &entry, "insert_incompatible", &e.to_string());
+                        Ok(batch) => {
+                            if batch.num_rows() == 0 {
+                                warn!("Skipping empty batch during WAL recovery for {}.{}", entry.project_id, entry.table_name);
+                                return;
+                            }
+                            let apply_start = std::time::Instant::now();
+                            let insert_res = mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros);
+                            insert_apply_nanos += apply_start.elapsed().as_nanos();
+                            match insert_res {
+                                Ok(()) => entries_replayed += 1,
+                                Err(e) => {
+                                    error!("WAL REPLAY FAILED: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
+                                    quarantine_entry(&quarantine_dir, &entry, "insert_incompatible", &e.to_string());
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!(
-                            "WAL CORRUPTION: undeserializable INSERT batch for {}.{}: {}",
-                            entry.project_id, entry.table_name, e
-                        );
-                        quarantine_entry(&quarantine_dir, &entry, "insert_corrupt", &e.to_string());
-                    }
+                        Err(e) => {
+                            error!(
+                                "WAL CORRUPTION: undeserializable INSERT batch for {}.{}: {}",
+                                entry.project_id, entry.table_name, e
+                            );
+                            quarantine_entry(&quarantine_dir, &entry, "insert_corrupt", &e.to_string());
+                        }
                     }
                 }
                 WalOperation::Delete => match deserialize_delete_payload(&entry.data) {
