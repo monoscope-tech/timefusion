@@ -1391,7 +1391,10 @@ impl BufferedWriteLayer {
                 .await;
                 match done {
                     Ok(()) => info!("Shutdown flush: {}/{} buckets flushed; remainder (if any) replays from WAL", flushed, total),
-                    Err(_) => info!("Shutdown flush deadline reached: {}/{} buckets flushed; remainder replays from WAL", flushed, total),
+                    Err(_) => info!(
+                        "Shutdown flush deadline reached: {}/{} buckets flushed; remainder replays from WAL",
+                        flushed, total
+                    ),
                 }
             }
             Err(_) => warn!("Flush lock not acquired before deadline — skipping shutdown flush; WAL holds all data"),
@@ -1756,14 +1759,19 @@ mod tests {
 
         // Insert into a stale (sealed) bucket so shutdown's flush has work to do.
         let old_ts = crate::clock::now_micros() - 2 * crate::mem_buffer::bucket_duration_micros();
-        let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span_ts("x", "spanX", &project, old_ts)]).unwrap();
+        let batch =
+            crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span_ts("x", "spanX", &project, old_ts)]).unwrap();
         layer.insert(&project, &table, vec![batch]).await.unwrap();
 
         // Shutdown must return promptly (bounded by the budget), not hang on the
         // 60s flush, and must persist the clean snapshot.
         let t = std::time::Instant::now();
         layer.shutdown().await.unwrap();
-        assert!(t.elapsed() < std::time::Duration::from_secs(10), "shutdown must be deadline-bounded, took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(10),
+            "shutdown must be deadline-bounded, took {:?}",
+            t.elapsed()
+        );
 
         let snap = layer.wal().load_cursor_snapshot().expect("clean snapshot must be written on shutdown");
         assert!(snap.clean_shutdown, "shutdown must mark clean_shutdown=true even on a partial flush");
