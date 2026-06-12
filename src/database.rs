@@ -2715,8 +2715,11 @@ impl Database {
                         last_error = Some(e);
                         debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, max_retries);
 
-                        // Release the commit lock before backing off — peers
-                        // shouldn't queue behind this writer's sleep.
+                        // Intentionally release the commit lock BEFORE the
+                        // backoff sleep — do not remove. Holding it across the
+                        // sleep would serialize every other writer behind this
+                        // writer's backoff, converting commit contention into a
+                        // throughput collapse.
                         drop(commit_guard);
                         // Exponential backoff for better handling of concurrent writes
                         let backoff_ms = 100 * (2_u64.pow(retry_count.min(5)));
@@ -3328,6 +3331,9 @@ impl Database {
                         break;
                     }
                     Err(e) => {
+                        // Drop BEFORE the backoff sleep below — do not remove.
+                        // Holding the commit lock across the sleep would block
+                        // every concurrent append behind this dedup retry.
                         drop(commit_guard);
                         let msg = e.to_string();
                         // "Transaction failed" covers the conflict checker erroring

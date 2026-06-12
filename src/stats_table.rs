@@ -111,6 +111,16 @@ impl StatsTableProvider {
             ));
             rows.push(("buffered_layer", "pressure_pct".into(), s.pressure_pct.to_string()));
             rows.push(("buffered_layer", "backpressure_engaged_total".into(), s.backpressure_engaged_total.to_string()));
+            rows.push((
+                "buffered_layer",
+                "backpressure_rejected_total".into(),
+                s.backpressure_rejected_total.to_string(),
+            ));
+            rows.push((
+                "buffered_layer",
+                "backpressure_force_flush_total".into(),
+                s.backpressure_force_flush_total.to_string(),
+            ));
             rows.push(("wal", "files".into(), s.wal_files.to_string()));
             rows.push(("wal", "disk_bytes".into(), s.wal_disk_bytes.to_string()));
             rows.push(("wal", "disk_mb".into(), format!("{:.1}", s.wal_disk_bytes as f64 / (1024.0 * 1024.0))));
