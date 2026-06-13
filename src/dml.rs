@@ -862,6 +862,9 @@ where
     guard.update_state().await.map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
     let (new_table, rows_affected) = operation(guard.clone()).await?;
     *guard = new_table;
+    // UPDATE/DELETE advance the version too — persist so boot replays only
+    // post-commit log, same as the insert/maintenance paths.
+    database.persist_snapshot(&guard);
     Ok(rows_affected)
 }
 

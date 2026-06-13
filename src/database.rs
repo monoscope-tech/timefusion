@@ -1,4 +1,4 @@
-use std::{any::Any, collections::HashMap, fmt, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use arrow_schema::SchemaRef;
@@ -23,7 +23,7 @@ use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
 use datafusion_functions_json;
 use deltalake::{
     DeltaTable, DeltaTableBuilder, PartitionFilter, datafusion::parquet::file::properties::WriterProperties, kernel::transaction::CommitProperties,
-    operations::create::CreateBuilder,
+    logstore::LogStore, operations::create::CreateBuilder,
 };
 use futures::StreamExt;
 use instrumented_object_store::instrument_object_store;
@@ -225,6 +225,23 @@ fn should_refresh_table(current_version: Option<u64>, last_written_version: Opti
 /// Returns the shared handle's version after the refresh. Single choke-point
 /// for snapshot refreshes so the lock discipline can't drift between sites.
 pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>) -> std::result::Result<Option<u64>, deltalake::DeltaTableError> {
+    // Staleness probe before the expensive path: commit files are immutable
+    // and versions are contiguous, so the snapshot is current iff
+    // `{version+1}.json` doesn't exist — one GET/404 instead of the
+    // `_delta_log` LIST that `update_state()` always pays (LISTs bypass the
+    // Foyer cache; this was the residual per-query S3 metadata traffic).
+    // A probe hit also warms the cache for the commit read below. On probe
+    // *error* fall through to the full refresh — never skip on uncertainty.
+    {
+        let guard = table.read().await;
+        if let Some(v) = guard.version() {
+            let log_store = guard.log_store();
+            drop(guard);
+            if matches!(log_store.read_commit_entry(v + 1).await, Ok(None)) {
+                return Ok(Some(v));
+            }
+        }
+    }
     let mut fresh = table.read().await.clone();
     fresh.update_state().await?;
     let fresh_version = fresh.version();
@@ -236,26 +253,27 @@ pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>) -> s
     Ok(guard.version())
 }
 
-/// Ensure `delta.deletedFileRetentionDuration` matches the configured vacuum
-/// retention. Existing tables predate this property and sat at delta's 7-day
-/// default: prod's unified checkpoint carried 38.5k Remove tombstones (93% of
-/// its 41.8k actions, 23.6MB) that every snapshot load and refresh replayed.
-/// Idempotent (no commit when already set) and best-effort — a failed
-/// property commit must never block table load.
-pub(crate) async fn ensure_deleted_file_retention(table: DeltaTable, retention_hours: u64) -> DeltaTable {
-    const KEY: &str = "delta.deletedFileRetentionDuration";
-    let desired = format!("interval {retention_hours} hours");
-    let current = table.snapshot().ok().and_then(|s| s.metadata().configuration().get(KEY).cloned());
-    if current.as_deref() == Some(desired.as_str()) {
+/// Reconcile table properties existing tables predate, idempotently (no
+/// commit when already set) and best-effort — a failed property commit must
+/// never block table load. Currently retrofits:
+/// - `delta.deletedFileRetentionDuration`: prod tables sat at delta's 7-day
+///   default; the unified checkpoint carried 38.5k Remove tombstones (93% of
+///   its 41.8k actions, 23.6MB) that every snapshot load and refresh replayed.
+/// - `delta.checkpointInterval`: pre-existing tables sat at delta's default
+///   of 100, so boot replay walked up to 100 commit JSONs past the
+///   checkpoint; new tables get the configured interval at creation.
+pub(crate) async fn ensure_table_properties(table: DeltaTable, desired: HashMap<String, String>) -> DeltaTable {
+    let current = table.snapshot().ok().map(|s| s.metadata().configuration().clone()).unwrap_or_default();
+    if desired.iter().all(|(k, v)| current.get(k) == Some(v)) {
         return table;
     }
-    match table.clone().set_tbl_properties().with_properties(HashMap::from([(KEY.to_string(), desired.clone())])).await {
+    match table.clone().set_tbl_properties().with_properties(desired.clone()).await {
         Ok(updated) => {
-            info!("Set {KEY}={desired} (was {current:?}) — bounds Remove tombstones kept in checkpoints");
+            info!("Reconciled table properties {desired:?}");
             updated
         }
         Err(e) => {
-            warn!("Failed to set {KEY}={desired}: {e}; checkpoints keep tombstones at the current setting ({current:?})");
+            warn!("Failed to set table properties {desired:?}: {e}; table keeps its current settings");
             table
         }
     }
@@ -1021,6 +1039,9 @@ impl Database {
     /// Create a new Database with explicit config.
     /// Prefer this over `new()` for better testability.
     pub async fn with_config(cfg: Arc<AppConfig>) -> Result<Self> {
+        // Active tables rewrite their snapshot every flush; week-stale files
+        // belong to dropped/idle tables and would otherwise accumulate forever.
+        crate::snapshot_cache::prune_stale(&Self::delta_snapshot_dir(&cfg), std::time::Duration::from_secs(7 * 24 * 3600));
         let aws_endpoint = &cfg.aws.aws_s3_endpoint;
         let aws_url = Url::parse(aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
@@ -2056,7 +2077,17 @@ impl Database {
         match self.create_or_load_delta_table(storage_uri, storage_options.clone(), cached_store.clone()).await {
             Ok(table) => {
                 info!("Loaded existing table '{}'", table_name);
-                Ok(ensure_deleted_file_retention(table, self.config.maintenance.timefusion_vacuum_retention_hours).await)
+                let desired = HashMap::from([
+                    (
+                        "delta.deletedFileRetentionDuration".to_string(),
+                        format!("interval {} hours", self.config.maintenance.timefusion_vacuum_retention_hours),
+                    ),
+                    (
+                        "delta.checkpointInterval".to_string(),
+                        self.config.parquet.timefusion_checkpoint_interval.to_string(),
+                    ),
+                ]);
+                Ok(ensure_table_properties(table, desired).await)
             }
             Err(load_err) => {
                 info!("Table '{}' doesn't exist, creating new table. err: {:?}", table_name, load_err);
@@ -2394,6 +2425,7 @@ impl Database {
         let removed: Vec<String> = pre_uris.iter().filter(|u| !live_set.contains(u)).cloned().collect();
         let warm_store = new_table.log_store().object_store(None);
         let warm_table_uri = new_table.table_url().to_string();
+        self.persist_snapshot(&new_table);
         {
             let mut table = table_ref.write().await;
             *table = new_table;
@@ -2493,17 +2525,52 @@ impl Database {
         Ok(Arc::new(store))
     }
 
-    /// Creates or loads a DeltaTable with proper configuration.
+    /// Directory holding locally persisted Delta snapshots (see `snapshot_cache`).
+    fn delta_snapshot_dir(cfg: &AppConfig) -> PathBuf {
+        cfg.core.timefusion_data_dir.join(".timefusion_meta").join("delta_snapshots")
+    }
+
+    /// Persist `table`'s post-commit snapshot locally (detached) so the next
+    /// boot restores it and replays only later commits (see `snapshot_cache`).
+    /// Called from every commit path that swaps a fresh table state in.
+    pub(crate) fn persist_snapshot(&self, table: &DeltaTable) {
+        if let Some(state) = table.state.clone() {
+            let (dir, url) = (Self::delta_snapshot_dir(&self.config), table.table_url().to_string());
+            tokio::task::spawn_blocking(move || crate::snapshot_cache::store(&dir, &url, &state));
+        }
+    }
+
+    /// Creates or loads a DeltaTable with proper configuration. Prefers the
+    /// locally persisted snapshot (restore at version V + incremental replay
+    /// of commits > V) over a full checkpoint + log-tail rebuild from S3;
+    /// falls back to the full load on any restore failure.
     async fn create_or_load_delta_table(
         &self, storage_uri: &str, storage_options: HashMap<String, String>, cached_store: Arc<dyn object_store::ObjectStore>,
     ) -> Result<DeltaTable> {
-        DeltaTableBuilder::from_url(Url::parse(storage_uri)?)?
-            .with_storage_backend(cached_store.clone(), Url::parse(storage_uri)?)
-            .with_storage_options(storage_options.clone())
-            .with_allow_http(true)
-            .load()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))
+        let url = Url::parse(storage_uri)?;
+        let builder = || -> Result<DeltaTableBuilder> {
+            Ok(DeltaTableBuilder::from_url(url.clone())?
+                .with_storage_backend(cached_store.clone(), url.clone())
+                .with_storage_options(storage_options.clone())
+                .with_allow_http(true))
+        };
+        if let Some(state) = crate::snapshot_cache::load(&Self::delta_snapshot_dir(&self.config), storage_uri) {
+            let restored_version = state.version();
+            let mut table = builder()?.build()?;
+            table.state = Some(state);
+            match table.update_state().await {
+                Ok(()) => {
+                    info!(
+                        "Restored '{storage_uri}' from local snapshot at v{restored_version}, caught up to {:?}",
+                        table.version()
+                    );
+                    return Ok(table);
+                }
+                // e.g. the log tail past the snapshot was vacuumed away.
+                Err(e) => warn!("Local snapshot catch-up failed for '{storage_uri}': {e}; falling back to full load"),
+            }
+        }
+        builder()?.load().await.map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))
     }
 
     #[instrument(
@@ -2666,6 +2733,8 @@ impl Database {
                     // the warm task below must never re-resolve the table (a
                     // possible PG roundtrip + a redundant Delta state reload).
                     let (warm_store, warm_table_uri) = (new_table.log_store().object_store(None), new_table.table_url().to_string());
+
+                    self.persist_snapshot(&new_table);
 
                     // Brief write lock for the swap only. Version-guarded: a
                     // concurrent maintenance commit may have advanced the
@@ -5012,6 +5081,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn ensure_deleted_file_retention_sets_property_once() -> Result<()> {
         const KEY: &str = "delta.deletedFileRetentionDuration";
+        const CP_KEY: &str = "delta.checkpointInterval";
+        let props = |hours: u64| HashMap::from([(KEY.to_string(), format!("interval {hours} hours")), (CP_KEY.to_string(), "10".to_string())]);
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///retention_tbl")?;
         let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem, url).build()?;
@@ -5021,23 +5092,61 @@ mod tests {
             "fresh table has no retention property"
         );
 
-        let table = ensure_deleted_file_retention(table, 24).await;
-        assert_eq!(
-            table.snapshot()?.metadata().configuration().get(KEY).map(String::as_str),
-            Some("interval 24 hours")
-        );
-        assert_eq!(table.version(), Some(1), "property set in one commit");
+        let table = ensure_table_properties(table, props(24)).await;
+        let config = table.snapshot()?.metadata().configuration().clone();
+        assert_eq!(config.get(KEY).map(String::as_str), Some("interval 24 hours"));
+        assert_eq!(config.get(CP_KEY).map(String::as_str), Some("10"), "checkpoint interval retrofitted alongside");
+        assert_eq!(table.version(), Some(1), "properties set in one commit");
 
-        let table = ensure_deleted_file_retention(table, 24).await;
-        assert_eq!(table.version(), Some(1), "matching property must not commit again");
+        let table = ensure_table_properties(table, props(24)).await;
+        assert_eq!(table.version(), Some(1), "matching properties must not commit again");
 
         // Retention reconfiguration (e.g. env change) re-reconciles.
-        let table = ensure_deleted_file_retention(table, 48).await;
+        let table = ensure_table_properties(table, props(48)).await;
         assert_eq!(
             table.snapshot()?.metadata().configuration().get(KEY).map(String::as_str),
             Some("interval 48 hours")
         );
         assert_eq!(table.version(), Some(2));
+        Ok(())
+    }
+
+    /// `refresh_table_snapshot` on an already-current table must not pay a
+    /// `_delta_log` LIST (LISTs bypass the Foyer cache, so this was per-query
+    /// S3 metadata traffic): the immutable-commit probe (GET version+1 → 404)
+    /// short-circuits the refresh. Pinned by making LIST prohibitively slow —
+    /// a current-table refresh stays fast, and a genuinely stale one must
+    /// still observe the new commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_table_snapshot_probes_instead_of_listing() -> Result<()> {
+        use object_store::throttle::{ThrottleConfig, ThrottledStore};
+
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let url = Url::parse("memory:///probe_tbl")?;
+        let fast = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
+        let table = fast.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+
+        let list_wait = std::time::Duration::from_secs(2);
+        let throttled = ThrottledStore::new(
+            mem,
+            ThrottleConfig {
+                wait_list_per_call: list_wait,
+                wait_list_with_delimiter_per_call: list_wait,
+                ..Default::default()
+            },
+        );
+        let mut slow = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(Arc::new(throttled), url).build()?;
+        slow.update_state().await?; // initial load pays the LIST
+        let shared = Arc::new(RwLock::new(slow));
+
+        let t0 = std::time::Instant::now();
+        assert_eq!(refresh_table_snapshot(&shared).await.map_err(|e| anyhow::anyhow!(e))?, Some(0));
+        assert!(t0.elapsed() < list_wait, "current-table refresh paid a LIST ({:?})", t0.elapsed());
+
+        // External commit → the probe finds {v+1}.json and the refresh must
+        // run the full update to pick it up.
+        let _ = ensure_table_properties(table, HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())])).await;
+        assert_eq!(refresh_table_snapshot(&shared).await.map_err(|e| anyhow::anyhow!(e))?, Some(1));
         Ok(())
     }
 
