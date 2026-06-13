@@ -20,6 +20,7 @@ pub mod pgwire_handlers;
 pub mod plan_cache;
 pub mod schema_loader;
 pub mod secret_crypto;
+pub mod snapshot_cache;
 pub mod statistics;
 pub mod stats_table;
 pub mod tantivy_index;
