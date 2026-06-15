@@ -12,8 +12,8 @@ mod integration {
     use uuid::Uuid;
 
     struct TestServer {
-        port: u16,
-        test_id: String,
+        port:     u16,
+        test_id:  String,
         shutdown: Arc<Notify>,
     }
 

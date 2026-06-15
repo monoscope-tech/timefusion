@@ -2,8 +2,7 @@
 mod test_custom_functions {
     use anyhow::Result;
     use datafusion::prelude::*;
-    use timefusion::functions::register_custom_functions;
-    use timefusion::test_utils::test_helpers::array_get_str as get_str;
+    use timefusion::{functions::register_custom_functions, test_utils::test_helpers::array_get_str as get_str};
 
     #[tokio::test]
     async fn test_to_char_function() -> Result<()> {

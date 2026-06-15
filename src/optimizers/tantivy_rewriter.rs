@@ -50,10 +50,12 @@ use datafusion::{
     optimizer::AnalyzerRule,
 };
 
-use crate::optimizers::extract_utf8_string;
-use crate::tantivy_index::{
-    schema::{DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER},
-    udf::{TEXT_MATCH_NAME, TextMatchUdf},
+use crate::{
+    optimizers::extract_utf8_string,
+    tantivy_index::{
+        schema::{DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER},
+        udf::{TEXT_MATCH_NAME, TextMatchUdf},
+    },
 };
 
 /// Minimum literal length we'll accelerate on ngram3. Tantivy's 3-gram
@@ -452,10 +454,10 @@ mod tests {
         // miss case variants; skip the rewrite.
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), RAW_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated: false,
-            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern: Box::new(lit("foo")),
-            escape_char: None,
+            negated:          false,
+            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern:          Box::new(lit("foo")),
+            escape_char:      None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols), None);
@@ -465,10 +467,10 @@ mod tests {
     fn match_ilike_substring_works_on_ngram3() {
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated: false,
-            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern: Box::new(lit("%foo%")),
-            escape_char: None,
+            negated:          false,
+            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern:          Box::new(lit("%foo%")),
+            escape_char:      None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols), Some(("c".into(), "foo".into())));
