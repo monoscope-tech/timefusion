@@ -25,7 +25,6 @@ use tdigests::TDigest;
 
 use crate::{errors::arrow_err, optimizers::extract_utf8_string, schema_loader::is_variant_type};
 
-/// Extract a String from any ScalarValue string type (Utf8, Utf8View, LargeUtf8)
 /// Pull a single UTF-8 string out of a scalar-or-length-1-array argument.
 /// Used by UDFs whose Nth argument is a constant string (format, timezone,
 /// etc.). `label` names the argument in error messages.
