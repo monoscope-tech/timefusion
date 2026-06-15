@@ -168,8 +168,10 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let _ = std::fs::remove_dir_all("/tmp/test_foyer_delta_ttl");
 
     let config = FoyerCacheConfig::test_config_with("delta_ttl", |c| {
-        c.ttl = Duration::from_millis(100); // Very short TTL for test
-        // All files now use the same TTL in unified caching approach
+        // 2s TTL (not ~100ms): the "within TTL" puts/gets must complete before
+        // expiry, and a loaded CI runner can stall the put→get window past a
+        // tight TTL, spuriously turning the first hit into a miss. Wide margin.
+        c.ttl = Duration::from_millis(2000);
     });
 
     let inner = Arc::new(InMemory::new());
@@ -190,8 +192,8 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let stats3 = cache.get_stats().await;
     assert_eq!(stats3.main.hits - stats2.main.hits, 1, "Should hit cache within TTL");
 
-    // Wait for TTL to expire
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Wait for TTL to expire (>2s TTL + margin)
+    tokio::time::sleep(Duration::from_millis(2500)).await;
 
     // Should miss cache after TTL
     let _ = cache.get(&metadata_path).await?;
@@ -207,7 +209,7 @@ async fn test_delta_metadata_ttl() -> anyhow::Result<()> {
     let _ = cache.get(&regular_path).await?;
 
     // Wait same time as before
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
 
     // Should also miss cache after TTL (same TTL for all files)
     let stats5 = cache.get_stats().await;
