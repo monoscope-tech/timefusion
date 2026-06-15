@@ -17,11 +17,9 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     config::AppConfig,
+    errors::wal_err,
     mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp},
-    wal::{
-        WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_record_batch_public, deserialize_update_payload,
-        deserialize_update_with_source_payload,
-    },
+    wal::{DeletePayload, UpdatePayload, UpdateWithSourcePayload, WalEntry, WalManager, WalOperation, decode_payload, deserialize_record_batch},
 };
 
 // Reservation-side scale factor applied to `estimate_batch_size()` to
@@ -784,7 +782,7 @@ impl BufferedWriteLayer {
                         }
                     }
                 }
-                WalOperation::Delete => match deserialize_delete_payload(&entry.data) {
+                WalOperation::Delete => match decode_payload::<DeletePayload>(&entry.data) {
                     Ok(payload) => {
                         if let Err(e) = mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), registry_ref) {
                             error!("WAL REPLAY FAILED: DELETE for {}.{}: {}", entry.project_id, entry.table_name, e);
@@ -801,7 +799,7 @@ impl BufferedWriteLayer {
                         quarantine_entry(&quarantine_dir, &entry, "delete_corrupt", &e.to_string());
                     }
                 },
-                WalOperation::Update => match deserialize_update_payload(&entry.data) {
+                WalOperation::Update => match decode_payload::<UpdatePayload>(&entry.data) {
                     Ok(payload) => {
                         if let Err(e) = mem_buffer.update_by_sql(
                             &entry.project_id,
@@ -824,8 +822,8 @@ impl BufferedWriteLayer {
                         quarantine_entry(&quarantine_dir, &entry, "update_corrupt", &e.to_string());
                     }
                 },
-                WalOperation::UpdateWithSource => match deserialize_update_with_source_payload(&entry.data) {
-                    Ok(payload) => match deserialize_record_batch_public(&payload.source.batch_ipc) {
+                WalOperation::UpdateWithSource => match decode_payload::<UpdateWithSourcePayload>(&entry.data) {
+                    Ok(payload) => match deserialize_record_batch(&payload.source.batch_ipc) {
                         Ok(source_batch) => {
                             if let Err(e) = mem_buffer.update_with_source_by_sql(
                                 &entry.project_id,
@@ -1632,9 +1630,7 @@ impl BufferedWriteLayer {
         // not recoverable after a crash — propagate so the client knows the
         // operation didn't commit, rather than apply in-memory and lose it
         // on the next restart's WAL replay.
-        self.wal
-            .append_delete(project_id, table_name, predicate_sql.as_deref())
-            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_delete failed: {e}").into()))?;
+        self.wal.append_delete(project_id, table_name, predicate_sql.as_deref()).map_err(wal_err("append_delete"))?;
         self.mem_buffer.delete(project_id, table_name, predicate)
     }
 
@@ -1651,7 +1647,7 @@ impl BufferedWriteLayer {
         // see a "successful" update that disappears on the next restart.
         self.wal
             .append_update(project_id, table_name, predicate_sql.as_deref(), &assignments_sql)
-            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_update failed: {e}").into()))?;
+            .map_err(wal_err("append_update"))?;
         self.mem_buffer.update(project_id, table_name, predicate, assignments)
     }
 
@@ -1667,8 +1663,7 @@ impl BufferedWriteLayer {
         let predicate_sql = predicate.map(|p| format!("{}", p));
         let assignments_sql: Vec<(String, String)> = assignments.iter().map(|(col, expr)| (col.clone(), format!("{}", expr))).collect();
 
-        let batch_ipc = crate::wal::serialize_record_batch_public(&source.batch)
-            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL source serialize failed: {e}").into()))?;
+        let batch_ipc = crate::wal::serialize_record_batch(&source.batch).map_err(wal_err("source serialize"))?;
         let serialized_source = crate::wal::SerializedSource {
             join_keys: source.join_keys.clone(),
             batch_ipc,
@@ -1676,7 +1671,7 @@ impl BufferedWriteLayer {
 
         self.wal
             .append_update_with_source(project_id, table_name, predicate_sql.as_deref(), &assignments_sql, &serialized_source)
-            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_update_with_source failed: {e}").into()))?;
+            .map_err(wal_err("append_update_with_source"))?;
         self.mem_buffer.update_with_source(project_id, table_name, predicate, assignments, source)
     }
 }

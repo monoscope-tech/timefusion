@@ -751,7 +751,7 @@ pub struct MemoryConfig {
 
 impl MemoryConfig {
     pub fn memory_limit_bytes(&self) -> usize {
-        self.timefusion_memory_limit_gb * 1024 * 1024 * 1024
+        self.timefusion_memory_limit_gb * GIB
     }
 }
 

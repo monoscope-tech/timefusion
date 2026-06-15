@@ -46,20 +46,32 @@ pub mod test_helpers {
         }
 
         pub fn build(self) -> Arc<AppConfig> {
-            let uuid = uuid::Uuid::new_v4().to_string()[..8].to_string();
-            let mut cfg = AppConfig::default();
-            cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
-            cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
-            cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
-            cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
-            cfg.aws.aws_default_region = Some("us-east-1".to_string());
-            cfg.aws.aws_allow_http = Some("true".to_string());
-            cfg.core.timefusion_table_prefix = format!("test-{}-{}", self.test_name, uuid);
-            cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-{}-{}", self.test_name, uuid));
-            cfg.cache.timefusion_foyer_disabled = true;
+            let id = format!("{}-{}", self.test_name, &uuid::Uuid::new_v4().to_string()[..8]);
+            let mut cfg = minio_base_config(&id, &format!("/tmp/timefusion-{id}"));
             cfg.buffer.timefusion_flush_immediately = self.buffer_mode == BufferMode::FlushImmediately;
             Arc::new(cfg)
         }
+    }
+
+    /// Shared MinIO + foyer-disabled config keyed by an explicit table id / data dir.
+    fn minio_base_config(table_id: &str, data_dir: &str) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
+        cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
+        cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
+        cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
+        cfg.aws.aws_default_region = Some("us-east-1".to_string());
+        cfg.aws.aws_allow_http = Some("true".to_string());
+        cfg.core.timefusion_table_prefix = format!("test-{table_id}");
+        cfg.core.timefusion_data_dir = PathBuf::from(data_dir);
+        cfg.cache.timefusion_foyer_disabled = true;
+        cfg
+    }
+
+    /// MinIO-backed config with an explicit table id and data dir. Shared by the
+    /// integration tests that manage their own per-test id/path.
+    pub fn minio_test_config(table_id: &str, data_dir: &str) -> Arc<AppConfig> {
+        Arc::new(minio_base_config(table_id, data_dir))
     }
 
     /// Point walrus-rust at the test's data dir, restoring the prior value on
@@ -170,5 +182,20 @@ pub mod test_helpers {
             "hashes": [],
             "summary": vec![format!("Test span: {}", name)]
         })
+    }
+
+    /// Read a string cell from any String/LargeString/StringView array; panics on other types.
+    pub fn array_get_str(arr: &dyn datafusion::arrow::array::Array, idx: usize) -> String {
+        use datafusion::arrow::array::{LargeStringArray, StringArray, StringViewArray};
+        let any = arr.as_any();
+        if let Some(a) = any.downcast_ref::<StringViewArray>() {
+            a.value(idx).to_string()
+        } else if let Some(a) = any.downcast_ref::<StringArray>() {
+            a.value(idx).to_string()
+        } else if let Some(a) = any.downcast_ref::<LargeStringArray>() {
+            a.value(idx).to_string()
+        } else {
+            panic!("Expected string array but got {:?}", arr.data_type());
+        }
     }
 }

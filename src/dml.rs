@@ -21,7 +21,11 @@ use datafusion::{
 use futures::StreamExt;
 use tracing::{Instrument, error, field::Empty, info, instrument, warn};
 
-use crate::{buffered_write_layer::BufferedWriteLayer, database::Database};
+use crate::{
+    buffered_write_layer::BufferedWriteLayer,
+    database::Database,
+    errors::{arrow_err, exec_err},
+};
 
 /// Hard cap on the number of source rows we'll materialize for an `UPDATE ... FROM`.
 /// Beyond this we error rather than blowing memory; the caller must page or pre-aggregate.
@@ -390,7 +394,7 @@ async fn materialize_source(planner: &DefaultPhysicalPlanner, session_state: &Se
         }
     }
 
-    let combined = concat_batches(&schema, &batches).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+    let combined = concat_batches(&schema, &batches).map_err(arrow_err)?;
 
     Ok(UpdateSource {
         batch: combined,
@@ -456,7 +460,7 @@ fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assign
                 _ => Ok(Transformed::no(e)),
             })
             .map(|t| t.data)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to inline CSE alias: {}", e)))?;
+            .map_err(exec_err("Failed to inline CSE alias"))?;
         *value_expr = new_expr;
     }
     Ok(())
@@ -795,7 +799,7 @@ pub async fn perform_delta_update(
         builder
             .await
             .map(|(table, metrics)| (table, metrics.num_updated_rows as u64))
-            .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta UPDATE: {}", e)))
+            .map_err(exec_err("Failed to execute Delta UPDATE"))
     })
     .await;
 
@@ -831,7 +835,7 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
         builder
             .await
             .map(|(table, metrics)| (table, metrics.num_deleted_rows.unwrap_or(0) as u64))
-            .map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta DELETE: {}", e)))
+            .map_err(exec_err("Failed to execute Delta DELETE"))
     })
     .await;
 
@@ -859,7 +863,7 @@ where
     // where a concurrent DELETE/UPDATE could commit a new version that we'd then
     // overwrite with the stale snapshot from the closure's clone.
     let mut guard = table_lock.write().await;
-    guard.update_state().await.map_err(|e| DataFusionError::Execution(format!("Failed to refresh table state: {}", e)))?;
+    guard.update_state().await.map_err(exec_err("Failed to refresh table state"))?;
     let (new_table, rows_affected) = operation(guard.clone()).await?;
     *guard = new_table;
     // UPDATE/DELETE advance the version too — persist so boot replays only
@@ -880,7 +884,7 @@ fn convert_expr_to_delta(expr: &Expr) -> Result<Expr> {
             _ => Ok(datafusion::common::tree_node::Transformed::no(e)),
         })
         .map(|t| t.data)
-        .map_err(|e| DataFusionError::Execution(format!("Failed to convert expression: {}", e)))
+        .map_err(exec_err("Failed to convert expression"))
 }
 
 /// Rewrite column references in `expr` so they address `MergeBuilder`'s
@@ -911,7 +915,7 @@ fn requalify_for_merge(expr: Expr, source_cols: &std::collections::HashSet<Strin
         _ => Ok(Transformed::no(e)),
     })
     .map(|t| t.data)
-    .map_err(|e| DataFusionError::Execution(format!("Failed to requalify for merge: {}", e)))
+    .map_err(exec_err("Failed to requalify for merge"))
 }
 
 /// Build the join predicate that drives the merge: a conjunction of
@@ -1007,9 +1011,7 @@ pub async fn perform_delta_merge_update(
         // throwaway SessionContext only provides the DataFrame builder; merge
         // execution uses the session passed via `with_session_state`.
         let ctx = datafusion::prelude::SessionContext::new();
-        let source_df = ctx
-            .read_batch(source_batch)
-            .map_err(|e| DataFusionError::Execution(format!("Failed to wrap UPDATE FROM source as DataFrame: {}", e)))?;
+        let source_df = ctx.read_batch(source_batch).map_err(exec_err("Failed to wrap UPDATE FROM source as DataFrame"))?;
 
         let join_pred = build_join_predicate("target", "source", &join_keys, predicate.as_ref(), &source_cols)?;
 
@@ -1027,9 +1029,9 @@ pub async fn perform_delta_merge_update(
                 }
                 u
             })
-            .map_err(|e| DataFusionError::Execution(format!("when_matched_update failed: {}", e)))?;
+            .map_err(exec_err("when_matched_update failed"))?;
 
-        let (new_table, metrics) = merge.await.map_err(|e| DataFusionError::Execution(format!("Failed to execute Delta MERGE UPDATE: {}", e)))?;
+        let (new_table, metrics) = merge.await.map_err(exec_err("Failed to execute Delta MERGE UPDATE"))?;
         Ok((new_table, metrics.num_target_rows_updated as u64))
     })
     .await;

@@ -935,7 +935,7 @@ impl WalManager {
     }
 }
 
-fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
+pub(crate) fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
     let mut buf = Vec::with_capacity(batch.get_array_memory_size() + 1024);
     {
         let mut w = StreamWriter::try_new_with_options(&mut buf, batch.schema_ref(), IpcWriteOptions::default())?;
@@ -945,7 +945,7 @@ fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
     Ok(buf)
 }
 
-fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
+pub(crate) fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
     if data.len() > MAX_BATCH_SIZE {
         return Err(WalError::BatchTooLarge {
             size: data.len(),
@@ -989,33 +989,10 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
     Ok(entry)
 }
 
-pub fn deserialize_delete_payload(data: &[u8]) -> Result<DeletePayload, WalError> {
+/// Decode any bincode DML payload (Delete/Update/UpdateWithSource) from WAL bytes.
+pub fn decode_payload<T: Decode<()>>(data: &[u8]) -> Result<T, WalError> {
     let (payload, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
     Ok(payload)
-}
-
-pub fn deserialize_update_payload(data: &[u8]) -> Result<UpdatePayload, WalError> {
-    let (payload, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
-    Ok(payload)
-}
-
-pub fn deserialize_update_with_source_payload(data: &[u8]) -> Result<UpdateWithSourcePayload, WalError> {
-    let (payload, _) = bincode::decode_from_slice(data, BINCODE_CONFIG)?;
-    Ok(payload)
-}
-
-/// Public Arrow IPC `RecordBatch` serializer. Exposed so the
-/// `BufferedWriteLayer` can persist `UPDATE ... FROM` source batches without
-/// reinventing the IPC encoding used elsewhere in this module.
-pub fn serialize_record_batch_public(batch: &RecordBatch) -> Result<Vec<u8>, WalError> {
-    serialize_record_batch(batch)
-}
-
-/// Public Arrow IPC `RecordBatch` deserializer; the inverse of
-/// [`serialize_record_batch_public`]. Used by the WAL replay path to
-/// re-materialize `UPDATE ... FROM` source batches.
-pub fn deserialize_record_batch_public(data: &[u8]) -> Result<RecordBatch, WalError> {
-    deserialize_record_batch(data)
 }
 
 /// Delete WAL files older than `max_age` by mtime, recursing into subdirs.
@@ -1167,12 +1144,12 @@ mod tests {
             predicate_sql: Some("id = 1".to_string()),
         };
         let serialized = bincode::encode_to_vec(&payload, BINCODE_CONFIG).unwrap();
-        let deserialized = deserialize_delete_payload(&serialized).unwrap();
+        let deserialized = decode_payload::<DeletePayload>(&serialized).unwrap();
         assert_eq!(payload.predicate_sql, deserialized.predicate_sql);
 
         let payload_none = DeletePayload { predicate_sql: None };
         let serialized_none = bincode::encode_to_vec(&payload_none, BINCODE_CONFIG).unwrap();
-        let deserialized_none = deserialize_delete_payload(&serialized_none).unwrap();
+        let deserialized_none = decode_payload::<DeletePayload>(&serialized_none).unwrap();
         assert_eq!(payload_none.predicate_sql, deserialized_none.predicate_sql);
     }
 
@@ -1468,7 +1445,7 @@ mod tests {
             assignments:   vec![("name".to_string(), "'updated'".to_string())],
         };
         let serialized = bincode::encode_to_vec(&payload, BINCODE_CONFIG).unwrap();
-        let deserialized = deserialize_update_payload(&serialized).unwrap();
+        let deserialized = decode_payload::<UpdatePayload>(&serialized).unwrap();
         assert_eq!(payload.predicate_sql, deserialized.predicate_sql);
         assert_eq!(payload.assignments, deserialized.assignments);
     }

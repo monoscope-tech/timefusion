@@ -1,36 +1,15 @@
 #[cfg(test)]
 mod integration {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     use anyhow::Result;
     use datafusion_postgres::ServerOptions;
     use rand::RngExt;
     use serial_test::serial;
-    use timefusion::{config::AppConfig, database::Database};
+    use timefusion::{database::Database, test_utils::test_helpers::minio_test_config};
     use tokio::sync::Notify;
     use tokio_postgres::{Client, NoTls};
     use uuid::Uuid;
-
-    fn create_test_config(test_id: &str) -> Arc<AppConfig> {
-        let mut cfg = AppConfig::default();
-
-        // S3/MinIO settings
-        cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
-        cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
-        cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
-        cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
-        cfg.aws.aws_default_region = Some("us-east-1".to_string());
-        cfg.aws.aws_allow_http = Some("true".to_string());
-
-        // Core settings - unique per test
-        cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
-        cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-{}", test_id));
-
-        // Disable Foyer cache for integration tests
-        cfg.cache.timefusion_foyer_disabled = true;
-
-        Arc::new(cfg)
-    }
 
     struct TestServer {
         port:     u16,
@@ -45,7 +24,7 @@ mod integration {
             let test_id = Uuid::new_v4().to_string();
             let port = 5433 + rand::rng().random_range(1..100) as u16;
 
-            let cfg = create_test_config(&test_id);
+            let cfg = minio_test_config(&test_id, &format!("/tmp/timefusion-{test_id}"));
 
             // Create database with explicit config - no global state
             let db = Database::with_config(cfg).await?;
@@ -396,14 +375,15 @@ mod integration {
             .await?;
 
         // Bare projection: hits wrap_root_projection's Projection arm directly.
+        // Bare Variant columns surface as jsonb (OID 3802), decoded binary as serde_json::Value
+        // (see jsonb_oid_test::bare_variant_column_returns_jsonb_oid for the wire contract).
         let row = client
             .query_one(
                 "SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
                 &[&"test_project", &span_id],
             )
             .await?;
-        let got: String = row.get(0);
-        let parsed: serde_json::Value = serde_json::from_str(&got).unwrap_or_else(|e| panic!("attributes was not valid JSON: {e}; raw={got:?}"));
+        let parsed: serde_json::Value = row.get(0);
         assert_eq!(parsed["http"]["method"], "GET");
         assert_eq!(parsed["user"], "alice");
 
@@ -415,8 +395,8 @@ mod integration {
                 &[&"test_project", &span_id],
             )
             .await?;
-        let got: String = row.get(0);
-        serde_json::from_str::<serde_json::Value>(&got).unwrap_or_else(|e| panic!("Sort+Limit path: attributes was not valid JSON: {e}; raw={got:?}"));
+        let parsed: serde_json::Value = row.get(0);
+        assert_eq!(parsed["http"]["status"], 200, "Sort+Limit path must round-trip variant as jsonb");
 
         Ok(())
     }

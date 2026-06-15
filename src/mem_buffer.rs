@@ -23,7 +23,7 @@ use datafusion::{
 use parking_lot::Mutex;
 use tracing::{debug, info, instrument, warn};
 
-use crate::functions::FnRegistry;
+use crate::{errors::arrow_err, functions::FnRegistry};
 
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
 // longer = larger Delta files. Matches default flush interval for aligned boundaries.
@@ -453,11 +453,11 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String]) -> anyhow::Resu
 fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray) -> DFResult<ArrayRef> {
     // Cast new_values to match original's type if they differ (e.g., Utf8 -> Utf8View)
     let new_values = if original.data_type() != new_values.data_type() {
-        arrow::compute::cast(new_values, original.data_type()).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+        arrow::compute::cast(new_values, original.data_type()).map_err(arrow_err)?
     } else {
         new_values.clone()
     };
-    arrow::compute::kernels::zip::zip(mask, &new_values, original).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::kernels::zip::zip(mask, &new_values, original).map_err(arrow_err)
 }
 
 /// Parse a SQL fragment into a DataFusion Expr. `schema` resolves column refs
@@ -1536,8 +1536,7 @@ impl MemBuffer {
                         })
                         .collect::<DFResult<Vec<_>>>()?;
 
-                    let new_batch =
-                        RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                    let new_batch = RecordBatch::try_new(batch.schema(), new_columns).map_err(arrow_err)?;
                     bucket_delta += estimate_batch_size(&new_batch) as i64 - old_size as i64;
                     Ok(new_batch)
                 })
@@ -1657,15 +1656,13 @@ impl MemBuffer {
                 if raw.data_type() == &target_ty {
                     Ok(raw.clone())
                 } else {
-                    arrow::compute::cast(raw.as_ref(), &target_ty).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+                    arrow::compute::cast(raw.as_ref(), &target_ty).map_err(arrow_err)
                 }
             })
             .collect::<DFResult<Vec<_>>>()?;
         let sort_fields: Vec<SortField> = src_key_cols.iter().map(|c| SortField::new(c.data_type().clone())).collect();
-        let row_converter = RowConverter::new(sort_fields).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-        let src_rows = row_converter
-            .convert_columns(&src_key_cols)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let row_converter = RowConverter::new(sort_fields).map_err(arrow_err)?;
+        let src_rows = row_converter.convert_columns(&src_key_cols).map_err(arrow_err)?;
         let mut src_lookup: HashMap<OwnedRow, u32> = HashMap::with_capacity(source.batch.num_rows());
         for (i, row) in src_rows.iter().enumerate() {
             // First-wins on duplicate source keys (PG leaves multi-match
@@ -1700,9 +1697,7 @@ impl MemBuffer {
                             .ok_or_else(|| datafusion::error::DataFusionError::Plan(format!("Target column '{}' not found", tgt_col)))
                     })
                     .collect::<DFResult<Vec<_>>>()?;
-                let tgt_rows = row_converter
-                    .convert_columns(&tgt_key_cols)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                let tgt_rows = row_converter.convert_columns(&tgt_key_cols).map_err(arrow_err)?;
 
                 let src_idxs: UInt32Array = (0..num_rows).map(|i| src_lookup.get(&tgt_rows.row(i).owned()).copied()).collect();
 
@@ -1710,12 +1705,10 @@ impl MemBuffer {
                 let mut widened_cols: Vec<ArrayRef> = batch.columns().to_vec();
                 for i in 0..source.schema.fields().len() {
                     let src_col = source.batch.column(i);
-                    let taken = arrow::compute::take(src_col.as_ref(), &src_idxs, None)
-                        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                    let taken = arrow::compute::take(src_col.as_ref(), &src_idxs, None).map_err(arrow_err)?;
                     widened_cols.push(taken);
                 }
-                let widened_batch = RecordBatch::try_new(widened_schema.clone(), widened_cols)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                let widened_batch = RecordBatch::try_new(widened_schema.clone(), widened_cols).map_err(arrow_err)?;
 
                 // has_match: source idx was non-null (a join match existed).
                 let has_match = BooleanArray::from((0..num_rows).map(|i| !src_idxs.is_null(i)).collect::<Vec<_>>());
@@ -1731,7 +1724,7 @@ impl MemBuffer {
                     BooleanArray::from(vec![true; num_rows])
                 };
 
-                let mask = arrow::compute::and(&pred_mask, &has_match).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                let mask = arrow::compute::and(&pred_mask, &has_match).map_err(arrow_err)?;
 
                 let matching_count = mask.iter().filter(|v| v == &Some(true)).count();
                 if matching_count == 0 {
@@ -1752,8 +1745,7 @@ impl MemBuffer {
                     })
                     .collect::<DFResult<Vec<_>>>()?;
 
-                let new_batch =
-                    RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                let new_batch = RecordBatch::try_new(batch.schema(), new_columns).map_err(arrow_err)?;
                 bucket_delta += estimate_batch_size(&new_batch) as i64 - old_size as i64;
                 new_batches.push(new_batch);
             }

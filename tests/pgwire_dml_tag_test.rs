@@ -9,32 +9,18 @@
 //! Requires MinIO on 127.0.0.1:9000 (`make minio-start`).
 
 mod pgwire_dml_tag {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{sync::Arc, time::Duration};
 
     use anyhow::{Context, Result};
     use datafusion_postgres::ServerOptions;
     use serial_test::serial;
-    use timefusion::{config::AppConfig, database::Database};
+    use timefusion::{database::Database, test_utils::test_helpers::minio_test_config};
     use tokio::{net::TcpListener, sync::Notify};
     use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
     use uuid::Uuid;
 
     const SPAN_INSERT_COLS: &str =
         "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary)";
-
-    fn create_test_config(test_id: &str) -> Arc<AppConfig> {
-        let mut cfg = AppConfig::default();
-        cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
-        cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
-        cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
-        cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
-        cfg.aws.aws_default_region = Some("us-east-1".to_string());
-        cfg.aws.aws_allow_http = Some("true".to_string());
-        cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
-        cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-{}", test_id));
-        cfg.cache.timefusion_foyer_disabled = true;
-        Arc::new(cfg)
-    }
 
     struct TestServer {
         port:     u16,
@@ -48,7 +34,7 @@ mod pgwire_dml_tag {
             // OS-assigned free port: bind, capture, drop. The tiny race window
             // before the server re-binds is harmless in practice.
             let port = TcpListener::bind("127.0.0.1:0").await?.local_addr()?.port();
-            let cfg = create_test_config(&test_id);
+            let cfg = minio_test_config(&test_id, &format!("/tmp/timefusion-{test_id}"));
             let db = Arc::new(Database::with_config(cfg).await?);
             // Pre-create both tables touched by the suite so failures here
             // (e.g. Variant schema misconfig) surface deterministically rather
