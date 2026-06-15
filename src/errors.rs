@@ -4,8 +4,7 @@
 
 use std::fmt::Display;
 
-use datafusion::arrow::error::ArrowError;
-use datafusion::error::DataFusionError;
+use datafusion::{arrow::error::ArrowError, error::DataFusionError};
 
 /// Wrap an Arrow error as `DataFusionError::ArrowError`.
 pub fn arrow_err(e: ArrowError) -> DataFusionError {
