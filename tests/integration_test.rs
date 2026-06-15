@@ -375,14 +375,15 @@ mod integration {
             .await?;
 
         // Bare projection: hits wrap_root_projection's Projection arm directly.
+        // Bare Variant columns surface as jsonb (OID 3802), decoded binary as serde_json::Value
+        // (see jsonb_oid_test::bare_variant_column_returns_jsonb_oid for the wire contract).
         let row = client
             .query_one(
                 "SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
                 &[&"test_project", &span_id],
             )
             .await?;
-        let got: String = row.get(0);
-        let parsed: serde_json::Value = serde_json::from_str(&got).unwrap_or_else(|e| panic!("attributes was not valid JSON: {e}; raw={got:?}"));
+        let parsed: serde_json::Value = row.get(0);
         assert_eq!(parsed["http"]["method"], "GET");
         assert_eq!(parsed["user"], "alice");
 
@@ -394,8 +395,8 @@ mod integration {
                 &[&"test_project", &span_id],
             )
             .await?;
-        let got: String = row.get(0);
-        serde_json::from_str::<serde_json::Value>(&got).unwrap_or_else(|e| panic!("Sort+Limit path: attributes was not valid JSON: {e}; raw={got:?}"));
+        let parsed: serde_json::Value = row.get(0);
+        assert_eq!(parsed["http"]["status"], 200, "Sort+Limit path must round-trip variant as jsonb");
 
         Ok(())
     }
