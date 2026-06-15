@@ -23,6 +23,7 @@ use datafusion::{
 use parking_lot::Mutex;
 use tracing::{debug, info, instrument, warn};
 
+use crate::errors::arrow_err;
 use crate::functions::FnRegistry;
 
 // 10-minute buckets balance flush granularity vs overhead. Shorter = more flushes,
@@ -164,7 +165,7 @@ pub type TableKey = (Arc<str>, Arc<str>);
 pub struct MemBuffer {
     /// Flattened structure: (project_id, table_name) → TableBuffer
     /// Reduces 3 hash lookups to 1 for table access.
-    tables:               DashMap<TableKey, Arc<TableBuffer>>,
+    tables: DashMap<TableKey, Arc<TableBuffer>>,
     /// Running approximation of in-memory bytes across all live buckets.
     /// Reported via `timefusion_stats` as `mem_buffer.estimated_bytes_approx`.
     ///
@@ -194,21 +195,21 @@ pub struct MemBuffer {
     /// decisions where a false-high reading would cause incorrect
     /// throttling. The `pressure_pct` reported on `buffered_layer` is
     /// what the flush task and the memory-reservation CAS actually use.
-    estimated_bytes:      AtomicUsize,
+    estimated_bytes: AtomicUsize,
     /// Mirrors `WalManager::shards_per_topic` so `FlushableBucket.wal_shard_counts`
     /// is always sized correctly when snapshotted at seal time.
-    shards_per_topic:     usize,
+    shards_per_topic: usize,
     /// LRU cache of per-bucket tantivy indexes. Lives at the MemBuffer
     /// level (not on individual TimeBuckets) so the LRU has a global view
     /// for byte-budget eviction. Entries are dropped:
     /// - when `text_index_max_bytes` is exceeded (LRU-evict tail)
     /// - when the bucket receives an insert (cache_invalidate by key)
     /// - when the bucket drains/evicts (cache_invalidate by key)
-    text_index_cache:     parking_lot::Mutex<lru::LruCache<BucketCacheKey, Arc<crate::tantivy_index::mem_index::BucketTextIndex>>>,
+    text_index_cache: parking_lot::Mutex<lru::LruCache<BucketCacheKey, Arc<crate::tantivy_index::mem_index::BucketTextIndex>>>,
     /// Sum of `size_bytes` across cached entries. Kept in an atomic so the
     /// hot insert path can do a single load to check "over budget?" without
     /// taking the LRU mutex.
-    text_index_bytes:     AtomicUsize,
+    text_index_bytes: AtomicUsize,
     /// Soft budget for cached text indexes (bytes). When exceeded, LRU
     /// evictions drop oldest cached buckets until under. Auto-tuned from
     /// `buffer_max_memory_mb` at MemBuffer construction.
@@ -223,7 +224,7 @@ pub struct MemBuffer {
     /// TableBuffer/TimeBucket — so the mark survives empty-bucket reclaim in
     /// `take_bucket_for_flush` and bucket/table re-creation by later inserts.
     /// Pruned on drain and eviction.
-    force_flushed:        DashMap<TableKey, std::collections::HashSet<i64>>,
+    force_flushed: DashMap<TableKey, std::collections::HashSet<i64>>,
 }
 
 /// Cache key: (project_id, table_name, bucket_id). All three are cheap to
@@ -232,18 +233,18 @@ pub struct MemBuffer {
 pub type BucketCacheKey = (Arc<str>, Arc<str>, i64);
 
 pub struct TableBuffer {
-    buckets:    DashMap<i64, TimeBucket>,
-    schema:     SchemaRef, // Immutable after creation - no lock needed
+    buckets: DashMap<i64, TimeBucket>,
+    schema: SchemaRef, // Immutable after creation - no lock needed
     project_id: Arc<str>,
     table_name: Arc<str>,
 }
 
 pub struct TimeBucket {
-    batches:         Mutex<Vec<RecordBatch>>,
-    row_count:       AtomicUsize,
-    memory_bytes:    AtomicUsize,
-    min_timestamp:   AtomicI64,
-    max_timestamp:   AtomicI64,
+    batches: Mutex<Vec<RecordBatch>>,
+    row_count: AtomicUsize,
+    memory_bytes: AtomicUsize,
+    min_timestamp: AtomicI64,
+    max_timestamp: AtomicI64,
     /// Per-shard WAL-entry counts (drive `advance_by_counts` on flush) and
     /// post-append walrus positions (written to Delta commit metadata for
     /// crash-mid-flush recovery). One mutex so a single append updates both
@@ -253,41 +254,41 @@ pub struct TimeBucket {
 
 #[derive(Debug, Default, Clone)]
 struct WalShardState {
-    counts:    Vec<u64>,
+    counts: Vec<u64>,
     positions: Vec<Option<walrus_rust::WalPosition>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FlushableBucket {
-    pub project_id:       String,
-    pub table_name:       String,
-    pub bucket_id:        i64,
-    pub batches:          Vec<RecordBatch>,
-    pub row_count:        usize,
+    pub project_id: String,
+    pub table_name: String,
+    pub bucket_id: i64,
+    pub batches: Vec<RecordBatch>,
+    pub row_count: usize,
     /// Drives `Wal::advance_by_counts` after a successful flush.
     pub wal_shard_counts: Vec<u64>,
     /// Written into Delta commit metadata so a crash between Delta commit
     /// and `advance_by_counts` can recover the cursor from Delta on restart.
-    pub wal_positions:    Vec<Option<walrus_rust::WalPosition>>,
+    pub wal_positions: Vec<Option<walrus_rust::WalPosition>>,
     /// Actual min/max timestamp of the taken rows, captured before the source
     /// bucket's atomics were reset. `restore_taken_bucket` replays these so a
     /// restored bucket keeps its true time range (and stays visible to
     /// time-range pruning) rather than collapsing to the bucket's start.
-    pub min_timestamp:    i64,
-    pub max_timestamp:    i64,
+    pub min_timestamp: i64,
+    pub max_timestamp: i64,
 }
 
 #[derive(Debug, Default)]
 pub struct MemBufferStats {
-    pub project_count:          usize,
-    pub total_buckets:          usize,
-    pub total_rows:             usize,
-    pub total_batches:          usize,
+    pub project_count: usize,
+    pub total_buckets: usize,
+    pub total_rows: usize,
+    pub total_batches: usize,
     pub estimated_memory_bytes: usize,
     /// Min `min_timestamp` across all buckets in microseconds, or None if empty.
     /// Used to derive `mem_buffer_oldest_bucket_age_seconds` for the metrics
     /// exporter — a key staleness signal (alert if > 2× flush interval).
-    pub oldest_bucket_micros:   Option<i64>,
+    pub oldest_bucket_micros: Option<i64>,
 }
 
 /// Per-batch fixed overhead: RecordBatch struct, schema Arc bump, ArrayData
@@ -453,11 +454,11 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String]) -> anyhow::Resu
 fn merge_arrays(original: &ArrayRef, new_values: &ArrayRef, mask: &BooleanArray) -> DFResult<ArrayRef> {
     // Cast new_values to match original's type if they differ (e.g., Utf8 -> Utf8View)
     let new_values = if original.data_type() != new_values.data_type() {
-        arrow::compute::cast(new_values, original.data_type()).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+        arrow::compute::cast(new_values, original.data_type()).map_err(arrow_err)?
     } else {
         new_values.clone()
     };
-    arrow::compute::kernels::zip::zip(mask, &new_values, original).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+    arrow::compute::kernels::zip::zip(mask, &new_values, original).map_err(arrow_err)
 }
 
 /// Parse a SQL fragment into a DataFusion Expr. `schema` resolves column refs
@@ -1536,8 +1537,7 @@ impl MemBuffer {
                         })
                         .collect::<DFResult<Vec<_>>>()?;
 
-                    let new_batch =
-                        RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                    let new_batch = RecordBatch::try_new(batch.schema(), new_columns).map_err(arrow_err)?;
                     bucket_delta += estimate_batch_size(&new_batch) as i64 - old_size as i64;
                     Ok(new_batch)
                 })
@@ -1657,15 +1657,13 @@ impl MemBuffer {
                 if raw.data_type() == &target_ty {
                     Ok(raw.clone())
                 } else {
-                    arrow::compute::cast(raw.as_ref(), &target_ty).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))
+                    arrow::compute::cast(raw.as_ref(), &target_ty).map_err(arrow_err)
                 }
             })
             .collect::<DFResult<Vec<_>>>()?;
         let sort_fields: Vec<SortField> = src_key_cols.iter().map(|c| SortField::new(c.data_type().clone())).collect();
-        let row_converter = RowConverter::new(sort_fields).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
-        let src_rows = row_converter
-            .convert_columns(&src_key_cols)
-            .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+        let row_converter = RowConverter::new(sort_fields).map_err(arrow_err)?;
+        let src_rows = row_converter.convert_columns(&src_key_cols).map_err(arrow_err)?;
         let mut src_lookup: HashMap<OwnedRow, u32> = HashMap::with_capacity(source.batch.num_rows());
         for (i, row) in src_rows.iter().enumerate() {
             // First-wins on duplicate source keys (PG leaves multi-match
@@ -1700,9 +1698,7 @@ impl MemBuffer {
                             .ok_or_else(|| datafusion::error::DataFusionError::Plan(format!("Target column '{}' not found", tgt_col)))
                     })
                     .collect::<DFResult<Vec<_>>>()?;
-                let tgt_rows = row_converter
-                    .convert_columns(&tgt_key_cols)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                let tgt_rows = row_converter.convert_columns(&tgt_key_cols).map_err(arrow_err)?;
 
                 let src_idxs: UInt32Array = (0..num_rows).map(|i| src_lookup.get(&tgt_rows.row(i).owned()).copied()).collect();
 
@@ -1710,12 +1706,10 @@ impl MemBuffer {
                 let mut widened_cols: Vec<ArrayRef> = batch.columns().to_vec();
                 for i in 0..source.schema.fields().len() {
                     let src_col = source.batch.column(i);
-                    let taken = arrow::compute::take(src_col.as_ref(), &src_idxs, None)
-                        .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                    let taken = arrow::compute::take(src_col.as_ref(), &src_idxs, None).map_err(arrow_err)?;
                     widened_cols.push(taken);
                 }
-                let widened_batch = RecordBatch::try_new(widened_schema.clone(), widened_cols)
-                    .map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                let widened_batch = RecordBatch::try_new(widened_schema.clone(), widened_cols).map_err(arrow_err)?;
 
                 // has_match: source idx was non-null (a join match existed).
                 let has_match = BooleanArray::from((0..num_rows).map(|i| !src_idxs.is_null(i)).collect::<Vec<_>>());
@@ -1731,7 +1725,7 @@ impl MemBuffer {
                     BooleanArray::from(vec![true; num_rows])
                 };
 
-                let mask = arrow::compute::and(&pred_mask, &has_match).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                let mask = arrow::compute::and(&pred_mask, &has_match).map_err(arrow_err)?;
 
                 let matching_count = mask.iter().filter(|v| v == &Some(true)).count();
                 if matching_count == 0 {
@@ -1752,8 +1746,7 @@ impl MemBuffer {
                     })
                     .collect::<DFResult<Vec<_>>>()?;
 
-                let new_batch =
-                    RecordBatch::try_new(batch.schema(), new_columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+                let new_batch = RecordBatch::try_new(batch.schema(), new_columns).map_err(arrow_err)?;
                 bucket_delta += estimate_batch_size(&new_batch) as i64 - old_size as i64;
                 new_batches.push(new_batch);
             }
@@ -1810,8 +1803,8 @@ impl MemBuffer {
             .collect::<DFResult<Vec<_>>>()?;
 
         let source = crate::dml::UpdateSource {
-            schema:    source_batch.schema(),
-            batch:     source_batch,
+            schema: source_batch.schema(),
+            batch: source_batch,
             join_keys: join_keys.to_vec(),
         };
         self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source)
@@ -2007,11 +2000,11 @@ impl TableBuffer {
 impl TimeBucket {
     fn new() -> Self {
         Self {
-            batches:         Mutex::new(Vec::new()),
-            row_count:       AtomicUsize::new(0),
-            memory_bytes:    AtomicUsize::new(0),
-            min_timestamp:   AtomicI64::new(i64::MAX),
-            max_timestamp:   AtomicI64::new(i64::MIN),
+            batches: Mutex::new(Vec::new()),
+            row_count: AtomicUsize::new(0),
+            memory_bytes: AtomicUsize::new(0),
+            min_timestamp: AtomicI64::new(i64::MAX),
+            max_timestamp: AtomicI64::new(i64::MIN),
             wal_shard_state: Mutex::new(WalShardState::default()),
         }
     }
@@ -2335,7 +2328,7 @@ mod tests {
 
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query:  "auth".into(),
+            query: "auth".into(),
         }];
         let got = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).expect("search");
         let ids = got.expect("indexed table produces Some");
@@ -2353,7 +2346,7 @@ mod tests {
 
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query:  "test".into(),
+            query: "test".into(),
         }];
         let got = buffer.search_text_match("p1", "table1", &preds).expect("search");
         assert!(got.is_none(), "unindexed table should return None, got {:?}", got);
@@ -2370,7 +2363,7 @@ mod tests {
         buffer.insert("p1", "otel_logs_and_spans", batch1, ts).unwrap();
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query:  "beta".into(),
+            query: "beta".into(),
         }];
         let initial = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).unwrap().unwrap();
         assert!(initial.is_empty(), "no 'beta' row inserted yet");
@@ -2401,7 +2394,7 @@ mod tests {
 
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query:  "alpha".into(),
+            query: "alpha".into(),
         }];
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], &preds).unwrap();
         let total_rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();

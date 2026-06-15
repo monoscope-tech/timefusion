@@ -23,16 +23,11 @@ use datafusion::{
 use serde_json::{Value as JsonValue, json};
 use tdigests::TDigest;
 
+use crate::errors::arrow_err;
+use crate::optimizers::extract_utf8_string;
 use crate::schema_loader::is_variant_type;
 
 /// Extract a String from any ScalarValue string type (Utf8, Utf8View, LargeUtf8)
-fn scalar_to_string(scalar: &ScalarValue) -> Option<String> {
-    match scalar {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
-        _ => None,
-    }
-}
-
 /// Pull a single UTF-8 string out of a scalar-or-length-1-array argument.
 /// Used by UDFs whose Nth argument is a constant string (format, timezone,
 /// etc.). `label` names the argument in error messages.
@@ -40,7 +35,7 @@ fn extract_scalar_string(arg: &ColumnarValue, label: &str) -> datafusion::error:
     let not_utf8 = || DataFusionError::Execution(format!("{label} must be a UTF8 string"));
     let not_scalar = || DataFusionError::Execution(format!("{label} must be a scalar value"));
     match arg {
-        ColumnarValue::Scalar(scalar) => scalar_to_string(scalar).ok_or_else(not_utf8),
+        ColumnarValue::Scalar(scalar) => extract_utf8_string(scalar).ok_or_else(not_utf8),
         ColumnarValue::Array(arr) => {
             // `&&` short-circuits so is_null(0) is never called on an empty array.
             if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
@@ -279,7 +274,7 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
         };
         // Cast once to Utf8 — collapses Utf8/Utf8View/LargeUtf8 to a single
         // concrete shape, single pass over rows.
-        let utf8 = cast(&arr, &DataType::Utf8).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let utf8 = cast(&arr, &DataType::Utf8).map_err(arrow_err)?;
         let strs = utf8
             .as_any()
             .downcast_ref::<StringArray>()
@@ -381,64 +376,52 @@ pub type VariantToJsonExtUdf = VariantExtWrapper<datafusion_variant::VariantToJs
 pub type VariantGetExtUdf = VariantExtWrapper<datafusion_variant::VariantGetUdf>;
 
 /// Register all custom PostgreSQL-compatible functions
+/// Collapse the repetitive `ctx.register_udf(ScalarUDF::from(T))` calls for
+/// UDFs built straight from a unit/default struct.
+macro_rules! reg_from {
+    ($ctx:expr, $($udf:expr),+ $(,)?) => { $( $ctx.register_udf(ScalarUDF::from($udf)); )+ };
+}
+
 pub fn register_custom_functions(ctx: &mut datafusion::execution::context::SessionContext) -> Result<()> {
     // Register Variant-aware expr planner (must be before JSON planner for priority)
     datafusion::execution::FunctionRegistry::register_expr_planner(ctx, Arc::new(VariantAwareExprPlanner))?;
 
-    // PG parity: coalesce that type-checks `coalesce(list_col, '{}')`.
-    // Replaces the built-in under the same name; see PgArrayLiteralRewriter.
-    ctx.register_udf(ScalarUDF::from(crate::optimizers::pg_array_literal_rewriter::PgCoalesceUdf::default()));
+    // PgCoalesceUdf: PG parity coalesce that type-checks `coalesce(list_col, '{}')`,
+    // replacing the built-in under the same name; see PgArrayLiteralRewriter.
+    // JsonToPgTextUdf bridges variant -> Postgres ->> text semantics (numeric/bool/null → text/NULL).
+    reg_from!(
+        ctx,
+        crate::optimizers::pg_array_literal_rewriter::PgCoalesceUdf::default(),
+        ToCharUDF::new(),
+        AtTimeZoneUDF::new(),
+        JsonBuildArrayUDF::new(),
+        JsonbBuildArrayUDF::new(),
+        ToJsonbUDF::new(),
+        ToJsonUDF::new(),
+        ExtractEpochUDF::new(),
+        JsonToPgTextUdf::default(),
+        datafusion_variant::JsonToVariantUdf::default(),
+        VariantToJsonExtUdf::default(),
+        VariantGetExtUdf::default(),
+        datafusion_variant::CastToVariantUdf::default(),
+        datafusion_variant::IsVariantNullUdf::default(),
+        datafusion_variant::VariantPretty::default(),
+        datafusion_variant::VariantListConstruct::default(),
+        datafusion_variant::VariantListInsert::default(),
+        datafusion_variant::VariantObjectConstruct::default(),
+        datafusion_variant::VariantObjectInsert::default(),
+        JsonbPathExistsUDF::new(),
+    );
 
-    // Register to_char function
-    ctx.register_udf(create_to_char_udf());
-
-    // Register AT TIME ZONE function
-    ctx.register_udf(create_at_time_zone_udf());
-
-    // Register jsonb_array_elements function (if not already available)
+    // create_udf-based UDFs that carry construction logic.
     ctx.register_udf(create_jsonb_array_elements_udf());
-
-    // Register json_build_array function
-    ctx.register_udf(create_json_build_array_udf());
-    ctx.register_udf(ScalarUDF::from(JsonbBuildArrayUDF::new()));
-    ctx.register_udf(ScalarUDF::from(ToJsonbUDF::new()));
-
-    // Register to_json function
-    ctx.register_udf(create_to_json_udf());
-
-    // Register extract_epoch function for fractional seconds
-    ctx.register_udf(create_extract_epoch_udf());
-
-    // Register time_bucket function for time-series bucketing
     ctx.register_udf(create_time_bucket_udf());
-
-    // Register percentile_agg aggregate function
     ctx.register_udaf(create_percentile_agg_udaf());
-
-    // Register approx_percentile scalar function
     ctx.register_udf(create_approx_percentile_udf());
 
-    // Bridges variant -> Postgres ->> text semantics (numeric/bool/null → text/NULL).
-    ctx.register_udf(ScalarUDF::from(JsonToPgTextUdf::default()));
-
-    // Register variant functions from datafusion-variant
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::JsonToVariantUdf::default()));
-    ctx.register_udf(ScalarUDF::from(VariantToJsonExtUdf::default()));
-    ctx.register_udf(ScalarUDF::from(VariantGetExtUdf::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::CastToVariantUdf::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::IsVariantNullUdf::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantPretty::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantListConstruct::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantListInsert::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantObjectConstruct::default()));
-    ctx.register_udf(ScalarUDF::from(datafusion_variant::VariantObjectInsert::default()));
-
-    // Register jsonb_path_exists for JSONPath queries on Variant columns
-    ctx.register_udf(create_jsonb_path_exists_udf());
-
-    // Register text_match(col, 'query') for tantivy-accelerated full-text search.
-    // Naive substring fallback ensures correctness when tantivy is disabled or
-    // when post-filtering MemBuffer rows; see [[tantivy_index/udf]].
+    // text_match(col, 'query') for tantivy-accelerated full-text search. Naive
+    // substring fallback keeps correctness when tantivy is disabled or when
+    // post-filtering MemBuffer rows; see [[tantivy_index/udf]].
     ctx.register_udf(crate::tantivy_index::udf::text_match_udf());
 
     // Test-only clock UDFs. Gated behind TIMEFUSION_ENABLE_TEST_UDFS so a
@@ -538,11 +521,6 @@ fn create_now_micros_udf() -> ScalarUDF {
         Ok(ColumnarValue::Array(Arc::new(Int64Array::from(vec![v]))))
     });
     create_udf("timefusion_now_micros", vec![], DataType::Int64, Volatility::Volatile, fun)
-}
-
-/// Create the to_char UDF for PostgreSQL-compatible timestamp formatting
-fn create_to_char_udf() -> ScalarUDF {
-    ScalarUDF::from(ToCharUDF::new())
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
@@ -800,11 +778,6 @@ fn parse_pg_format(pg_format: &str) -> Vec<FmtPart> {
     parts
 }
 
-/// Create the AT TIME ZONE UDF for timezone conversion
-fn create_at_time_zone_udf() -> ScalarUDF {
-    ScalarUDF::from(AtTimeZoneUDF::new())
-}
-
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct AtTimeZoneUDF {
     signature: Signature,
@@ -931,22 +904,17 @@ fn create_jsonb_array_elements_udf() -> ScalarUDF {
     )
 }
 
-/// Create the json_build_array UDF for building JSON arrays
-fn create_json_build_array_udf() -> ScalarUDF {
-    ScalarUDF::from(JsonBuildArrayUDF::new())
-}
-
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonBuildArrayUDF {
     signature: Signature,
-    aliases:   Vec<String>,
+    aliases: Vec<String>,
 }
 
 impl JsonBuildArrayUDF {
     fn new() -> Self {
         Self {
             signature: Signature::variadic_any(Volatility::Immutable),
-            aliases:   vec![],
+            aliases: vec![],
         }
     }
 }
@@ -993,22 +961,17 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
     }
 }
 
-/// Create the to_json UDF for converting values to JSON
-fn create_to_json_udf() -> ScalarUDF {
-    ScalarUDF::from(ToJsonUDF::new())
-}
-
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ToJsonUDF {
     signature: Signature,
-    aliases:   Vec<String>,
+    aliases: Vec<String>,
 }
 
 impl ToJsonUDF {
     fn new() -> Self {
         Self {
             signature: Signature::any(1, Volatility::Immutable),
-            aliases:   vec![],
+            aliases: vec![],
         }
     }
 }
@@ -1091,11 +1054,6 @@ macro_rules! jsonb_wrapper {
 }
 jsonb_wrapper!(JsonbBuildArrayUDF, JsonBuildArrayUDF, "jsonb_build_array");
 jsonb_wrapper!(ToJsonbUDF, ToJsonUDF, "to_jsonb");
-
-/// Create the extract_epoch UDF for extracting epoch time with fractional seconds
-fn create_extract_epoch_udf() -> ScalarUDF {
-    ScalarUDF::from(ExtractEpochUDF::new())
-}
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ExtractEpochUDF {
@@ -1276,7 +1234,7 @@ fn create_time_bucket_udf() -> ScalarUDF {
         // Extract interval string
         let interval_str = match &args[0] {
             ColumnarValue::Scalar(scalar) => {
-                scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("Interval must be a UTF8 string".to_string()))?
+                extract_utf8_string(scalar).ok_or_else(|| DataFusionError::Execution("Interval must be a UTF8 string".to_string()))?
             }
             ColumnarValue::Array(_) => {
                 return Err(DataFusionError::Execution("Interval must be a scalar value".to_string()));
@@ -1607,11 +1565,6 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
 // jsonb_path_exists UDF for JSONPath queries on Variant/JSON columns
 // ============================================================================
 
-/// Create the jsonb_path_exists UDF for PostgreSQL-compatible JSONPath queries
-fn create_jsonb_path_exists_udf() -> ScalarUDF {
-    ScalarUDF::from(JsonbPathExistsUDF::new())
-}
-
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonbPathExistsUDF {
     signature: Signature,
@@ -1646,7 +1599,7 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
         };
 
         let path_str = match &args.args[1] {
-            ColumnarValue::Scalar(scalar) => scalar_to_string(scalar).ok_or_else(|| DataFusionError::Execution("JSONPath must be a string".to_string()))?,
+            ColumnarValue::Scalar(scalar) => extract_utf8_string(scalar).ok_or_else(|| DataFusionError::Execution("JSONPath must be a string".to_string()))?,
             ColumnarValue::Array(_) => {
                 return Err(DataFusionError::Execution("JSONPath must be a scalar string".to_string()));
             }
@@ -2035,10 +1988,10 @@ mod tests {
         let nums: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n as i64));
         let scalar = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some("tag".into())));
         let args = ScalarFunctionArgs {
-            args:           vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
-            arg_fields:     vec![],
-            number_rows:    n,
-            return_field:   Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
+            args: vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
+            arg_fields: vec![],
+            number_rows: n,
+            return_field: Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
         let start = std::time::Instant::now();

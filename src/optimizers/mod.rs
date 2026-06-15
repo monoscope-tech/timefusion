@@ -16,6 +16,14 @@ pub use variant_insert_rewriter::VariantInsertRewriter;
 pub use variant_select_rewriter::VariantSelectRewriter;
 pub use wildcard_fn_arg_expander::WildcardFnArgExpander;
 
+/// Extract the string from a Utf8/Utf8View/LargeUtf8 scalar literal.
+pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
+    match v {
+        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 /// Utilities for converting timestamp filters to date partition filters
 /// for better partition pruning in Delta Lake
 pub mod time_range_partition_pruner {
@@ -76,13 +84,9 @@ pub mod time_range_partition_pruner {
 /// target would route to the wrong tenant. Matching the conservative
 /// `contains_project_id` shape ensures both helpers agree.
 pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
-    use datafusion::common::ScalarValue;
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(col), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(col)) if col.name == "project_id" => match v {
-                ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
-                _ => None,
-            },
+            (Expr::Column(col), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(col)) if col.name == "project_id" => extract_utf8_string(v),
             _ => None,
         },
         Expr::BinaryExpr(BinaryExpr {

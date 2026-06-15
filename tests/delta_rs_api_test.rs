@@ -1,21 +1,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use datafusion::arrow::array::{Array, AsArray, LargeStringArray, StringArray, StringViewArray};
+use datafusion::arrow::array::AsArray;
 use serial_test::serial;
-use timefusion::{database::Database, test_utils::test_helpers::*};
-
-fn get_str(array: &dyn Array, idx: usize) -> String {
-    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-        arr.value(idx).to_string()
-    } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
-        arr.value(idx).to_string()
-    } else if let Some(arr) = array.as_any().downcast_ref::<StringViewArray>() {
-        arr.value(idx).to_string()
-    } else {
-        panic!("Unsupported string array type: {:?}", array.data_type())
-    }
-}
+use timefusion::{
+    database::Database,
+    test_utils::test_helpers::{array_get_str as get_str, *},
+};
 
 async fn setup_test_database() -> Result<(Database, datafusion::prelude::SessionContext)> {
     dotenv::dotenv().ok();

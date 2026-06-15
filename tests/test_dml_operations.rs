@@ -1,39 +1,19 @@
 #[cfg(test)]
 mod test_dml_operations {
-    use std::{path::PathBuf, sync::Arc};
+    use std::sync::Arc;
 
     use anyhow::Result;
-    use datafusion::{
-        arrow,
-        arrow::array::{Array, AsArray, StringArray, StringViewArray},
-    };
+    use datafusion::{arrow, arrow::array::AsArray};
     use serial_test::serial;
-    use timefusion::{config::AppConfig, database::Database};
+    use timefusion::{
+        config::AppConfig,
+        database::Database,
+        test_utils::test_helpers::{array_get_str as get_str, minio_test_config},
+    };
     use tracing::info;
 
-    /// Helper function to get string value from either Utf8View or Utf8 array
-    fn get_str(arr: &dyn Array, idx: usize) -> String {
-        if let Some(sv) = arr.as_any().downcast_ref::<StringViewArray>() {
-            sv.value(idx).to_string()
-        } else if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
-            s.value(idx).to_string()
-        } else {
-            panic!("Expected string array but got {:?}", arr.data_type());
-        }
-    }
-
     fn create_test_config(test_id: &str) -> Arc<AppConfig> {
-        let mut cfg = AppConfig::default();
-        cfg.aws.aws_s3_bucket = Some("timefusion-tests".to_string());
-        cfg.aws.aws_access_key_id = Some("minioadmin".to_string());
-        cfg.aws.aws_secret_access_key = Some("minioadmin".to_string());
-        cfg.aws.aws_s3_endpoint = "http://127.0.0.1:9000".to_string();
-        cfg.aws.aws_default_region = Some("us-east-1".to_string());
-        cfg.aws.aws_allow_http = Some("true".to_string());
-        cfg.core.timefusion_table_prefix = format!("test-{}", test_id);
-        cfg.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-dml-{}", test_id));
-        cfg.cache.timefusion_foyer_disabled = true;
-        Arc::new(cfg)
+        minio_test_config(test_id, &format!("/tmp/timefusion-dml-{test_id}"))
     }
 
     // ==========================================================================
