@@ -36,6 +36,7 @@ use url::Url;
 
 use crate::{
     config::{self, AppConfig},
+    errors::arrow_err,
     object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
     schema_loader::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type},
     statistics::DeltaStatisticsExtractor,
@@ -60,9 +61,9 @@ type DeltaProviderCache = dashmap::DashMap<(String, String), (u64, Arc<DeltaProv
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanShape {
-    skipped_delta:    bool,
-    has_mem:          bool,
-    has_delta:        bool,
+    skipped_delta: bool,
+    has_mem: bool,
+    has_delta: bool,
     fast_resolve_hit: Option<bool>,
 }
 
@@ -72,13 +73,13 @@ struct ScanShape {
 /// compute without sorting.
 #[derive(Debug, Default)]
 pub struct ScanMetrics {
-    pub scans_total:              std::sync::atomic::AtomicU64,
-    pub scans_skipped_delta:      std::sync::atomic::AtomicU64,
-    pub scans_mem_only:           std::sync::atomic::AtomicU64,
-    pub scans_delta_only:         std::sync::atomic::AtomicU64,
-    pub scans_mem_plus_delta:     std::sync::atomic::AtomicU64,
-    pub fast_resolve_hits:        std::sync::atomic::AtomicU64,
-    pub fast_resolve_misses:      std::sync::atomic::AtomicU64,
+    pub scans_total: std::sync::atomic::AtomicU64,
+    pub scans_skipped_delta: std::sync::atomic::AtomicU64,
+    pub scans_mem_only: std::sync::atomic::AtomicU64,
+    pub scans_delta_only: std::sync::atomic::AtomicU64,
+    pub scans_mem_plus_delta: std::sync::atomic::AtomicU64,
+    pub fast_resolve_hits: std::sync::atomic::AtomicU64,
+    pub fast_resolve_misses: std::sync::atomic::AtomicU64,
     /// Delta TableProvider cache: hit = cached cell at the current snapshot
     /// version; miss = either no entry, or an entry at a stale version that
     /// had to be replaced. Operators tracking the cold-start vs steady-state
@@ -86,8 +87,8 @@ pub struct ScanMetrics {
     /// (project, table), this should stay high; a low ratio in prod means
     /// version is churning faster than expected (e.g. very aggressive
     /// compaction) and the cache isn't paying for itself.
-    pub provider_cache_hits:      std::sync::atomic::AtomicU64,
-    pub provider_cache_misses:    std::sync::atomic::AtomicU64,
+    pub provider_cache_hits: std::sync::atomic::AtomicU64,
+    pub provider_cache_misses: std::sync::atomic::AtomicU64,
     /// Provider builds that started against a version that was already
     /// stale by the time the build finished — the DashMap entry got
     /// replaced under us (a flush bumped the version) and the rebuilt
@@ -101,15 +102,15 @@ pub struct ScanMetrics {
     /// in a single bucket via `usize::leading_zeros` math. Bucket i holds
     /// scans whose duration_us fits in `[1<<i, 1<<(i+1))`. 32 buckets covers
     /// 1us through ~1.2 hours.
-    pub scan_latency_buckets:     [std::sync::atomic::AtomicU64; 32],
+    pub scan_latency_buckets: [std::sync::atomic::AtomicU64; 32],
     /// End-to-end pgwire query latency histogram (same bucket scheme as
     /// `scan_latency_buckets`). Recorded by `LoggingSimpleHandler` and
     /// `LoggingExtendedQueryHandler` around the `DfSessionService::do_query`
     /// call — the FULL server-side path from "harness received our query"
     /// through "result encoded back to client". Compare to scan p95/p99 to
     /// see how much of the user-visible tail is outside the scan call.
-    pub pgwire_total:             std::sync::atomic::AtomicU64,
-    pub pgwire_latency_buckets:   [std::sync::atomic::AtomicU64; 32],
+    pub pgwire_total: std::sync::atomic::AtomicU64,
+    pub pgwire_latency_buckets: [std::sync::atomic::AtomicU64; 32],
 }
 
 impl ScanMetrics {
@@ -495,7 +496,7 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
             .zip(struct_fields.iter())
             .map(|(arr, f)| -> DFResult<arrow::array::ArrayRef> {
                 if matches!(f.data_type(), DataType::BinaryView) {
-                    cast(arr, &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                    cast(arr, &DataType::Binary).map_err(arrow_err)
                 } else {
                     Ok(arr.clone())
                 }
@@ -520,7 +521,7 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
         return Ok(batch);
     }
     let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(new_schema, new_cols).map_err(arrow_err)
 }
 
 fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
@@ -572,7 +573,7 @@ fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
         return Ok(batch);
     }
     let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(new_schema, new_cols).map_err(arrow_err)
 }
 
 fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
@@ -604,8 +605,8 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
         // our schema declares). Both Delta reads and MemBuffer end up as
         // Binary → no per-row casts on the read path.
         let arr: StructArray = builder.build().into();
-        let metadata = cast(arr.column(0), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        let value = cast(arr.column(1), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let metadata = cast(arr.column(0), &DataType::Binary).map_err(arrow_err)?;
+        let value = cast(arr.column(1), &DataType::Binary).map_err(arrow_err)?;
         let fields = vec![
             Arc::new(Field::new(crate::schema_loader::VARIANT_METADATA_FIELD, DataType::Binary, false)),
             Arc::new(Field::new(crate::schema_loader::VARIANT_VALUE_FIELD, DataType::Binary, false)),
@@ -642,7 +643,7 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
     }
 
     let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
-    RecordBatch::try_new(new_schema, columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(new_schema, columns).map_err(arrow_err)
 }
 
 // Fallback ZSTD level when a configured/tier level is rejected as out-of-range.
@@ -654,22 +655,22 @@ const COMPRESSION_TIER_KEY: &str = "timefusion.compression_tier";
 
 #[derive(Clone, Serialize, Deserialize, sqlx::FromRow, derive_more::Debug)]
 struct StorageConfig {
-    project_id:           String,
-    table_name:           String,
-    s3_bucket:            String,
-    s3_prefix:            String,
-    s3_region:            String,
+    project_id: String,
+    table_name: String,
+    s3_bucket: String,
+    s3_prefix: String,
+    s3_region: String,
     /// Skipped on serialize so credentials never leak through serde-based dumps
     /// (debug endpoints, metrics serialization, etc.). sqlx::FromRow bypasses
     /// serde so DB-row loading is unaffected. `#[debug("[redacted]")]` keeps
     /// them out of `{:?}` log lines.
     #[serde(serialize_with = "redact_str")]
     #[debug("[redacted]")]
-    s3_access_key_id:     String,
+    s3_access_key_id: String,
     #[serde(serialize_with = "redact_str")]
     #[debug("[redacted]")]
     s3_secret_access_key: String,
-    s3_endpoint:          Option<String>,
+    s3_endpoint: Option<String>,
 }
 
 fn redact_str<S: serde::Serializer>(_: &str, ser: S) -> std::result::Result<S::Ok, S::Error> {
@@ -678,16 +679,16 @@ fn redact_str<S: serde::Serializer>(_: &str, ser: S) -> std::result::Result<S::O
 
 #[derive(Debug, Clone)]
 pub struct Database {
-    config:                          Arc<AppConfig>,
+    config: Arc<AppConfig>,
     /// One RuntimeEnv (and thus one memory pool) shared by every session
     /// context, across `Database` clones. Per-context pools each granted the
     /// full `memory_limit × fraction` budget, so N contexts oversubscribed
     /// the cgroup N×; the pool only enforces a global cap if it's global.
-    runtime_env:                     Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
-    unified_tables:                  UnifiedTables,
+    unified_tables: UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
-    custom_project_tables:           CustomProjectTables,
+    custom_project_tables: CustomProjectTables,
     /// Lock-free per-(project,table) cache of resolved Delta table refs. The
     /// inner `Arc<RwLock<DeltaTable>>` is the same object held in
     /// `unified_tables`/`custom_project_tables`, so update_state on the slow
@@ -710,7 +711,7 @@ pub struct Database {
     /// — entries for tables dropped at runtime persist until process
     /// restart. Watch `scan.fast_resolve_cache_entries` in
     /// `timefusion_stats` for unbounded growth.
-    fast_resolve_cache:              dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
+    fast_resolve_cache: dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
     /// Per-(project,table) sticky bit: "Delta may hold matching files."
     /// Two seed paths so the bit is always at least as conservative as truth
     /// — never falsely `false`:
@@ -737,7 +738,7 @@ pub struct Database {
     /// (incorrect — would lose visibility between clones) or removing the
     /// derive (invasive). The extra heap allocation per tenant pair is a
     /// few bytes and well off the hot path.
-    delta_has_files:                 dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
+    delta_has_files: dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
     /// Per-(project,table) cached Delta-side `TableProvider` along with the
     /// snapshot version it was built against. Steady-state (post-flush)
     /// queries that have to UNION mem + delta were rebuilding the provider
@@ -763,35 +764,35 @@ pub struct Database {
     /// churning create/drop pattern, expose `scan.provider_cache_entries`
     /// in `timefusion_stats` (already wired) for alerting, and add a
     /// TTL sweep here when it ever becomes a real problem.
-    delta_provider_cache:            DeltaProviderCache,
+    delta_provider_cache: DeltaProviderCache,
     /// Per-process scan-path counters. Read by `timefusion_stats` so operators
     /// can see — in prod — whether the in-memory shortcut is being taken,
     /// what the resolve cache hit rate looks like, and how the latency
     /// distribution shifts under real load. Counters are cumulative since
     /// process start; deltas are useful for rate analysis.
-    pub scan_metrics:                Arc<ScanMetrics>,
-    batch_queue:                     Option<Arc<crate::batch_queue::BatchQueue>>,
-    maintenance_shutdown:            Arc<CancellationToken>,
+    pub scan_metrics: Arc<ScanMetrics>,
+    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    maintenance_shutdown: Arc<CancellationToken>,
     /// One-shot guard for `preload_tables` — main.rs and bootstrap.rs are
     /// disjoint entry points today, but a second call must not double the
     /// boot-time S3 warm burst.
-    preload_started:                 Arc<std::sync::atomic::AtomicBool>,
-    config_pool:                     Option<PgPool>,
-    storage_configs:                 Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
+    preload_started: Arc<std::sync::atomic::AtomicBool>,
+    config_pool: Option<PgPool>,
+    storage_configs: Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
     /// Monotonic deadline (nanos since process start) for when the next
     /// storage-configs refresh from the config DB is allowed. Capped at 30s
     /// so a hot SQL path doesn't hit PG on every statement.
     storage_configs_next_refresh_ns: Arc<std::sync::atomic::AtomicU64>,
-    default_s3_bucket:               Option<String>,
-    default_s3_prefix:               Option<String>,
-    default_s3_endpoint:             Option<String>,
-    object_store_cache:              Option<Arc<SharedFoyerCache>>,
-    statistics_extractor:            Arc<DeltaStatisticsExtractor>,
-    last_written_versions:           Arc<RwLock<HashMap<(String, String), u64>>>,
+    default_s3_bucket: Option<String>,
+    default_s3_prefix: Option<String>,
+    default_s3_endpoint: Option<String>,
+    object_store_cache: Option<Arc<SharedFoyerCache>>,
+    statistics_extractor: Arc<DeltaStatisticsExtractor>,
+    last_written_versions: Arc<RwLock<HashMap<(String, String), u64>>>,
     /// Delta snapshot version at last dedup sweep, per scheduler key. Skips
     /// the sweep when the version hasn't moved (no commits → no new dupes).
     /// Same unbounded-growth caveat as `last_written_versions`.
-    last_dedup_versions:             Arc<RwLock<HashMap<String, u64>>>,
+    last_dedup_versions: Arc<RwLock<HashMap<String, u64>>>,
     /// Serializes in-process Delta commits (flush appends vs dedup
     /// replace_where). delta-kernel's OCC checker cannot evaluate the
     /// bare-string timestamp predicate replace_where commits carry (errors
@@ -799,10 +800,10 @@ pub struct Database {
     /// any concurrent append aborts — every attempt, forever, on a busy
     /// table. With commits serialized the rebase sees no newer versions and
     /// skips the checker entirely.
-    delta_commit_lock:               Arc<tokio::sync::Mutex<()>>,
-    buffered_layer:                  Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
-    tantivy_search:                  Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
-    tantivy_indexer:                 Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
+    delta_commit_lock: Arc<tokio::sync::Mutex<()>>,
+    buffered_layer: Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
+    tantivy_search: Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
+    tantivy_indexer: Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
     /// Per-table, per-date set of live file URIs as of the last successful full
     /// (z-order) optimize. delta-rs's ZOrder planner has no idempotence guard —
     /// it rewrites every file in the window on every run, even sealed days that
@@ -811,7 +812,7 @@ pub struct Database {
     /// `optimize_table` skip a sealed partition whose file set is unchanged.
     /// Keyed by table storage URL (unique per physical table). In-memory only:
     /// a restart re-z-orders each partition once, which is harmless.
-    zorder_filesets:                 ZOrderFilesets,
+    zorder_filesets: ZOrderFilesets,
 }
 
 impl Database {
@@ -2462,12 +2463,12 @@ impl Database {
 
         // Configure retry with exponential backoff for transient network errors
         let retry_config = RetryConfig {
-            max_retries:   5,
+            max_retries: 5,
             retry_timeout: Duration::from_secs(180),
-            backoff:       BackoffConfig {
+            backoff: BackoffConfig {
                 init_backoff: Duration::from_millis(100),
-                max_backoff:  Duration::from_secs(15),
-                base:         2.0,
+                max_backoff: Duration::from_secs(15),
+                base: 2.0,
             },
         };
 
@@ -3789,10 +3790,10 @@ fn build_writer_properties(parquet_cfg: &crate::config::ParquetConfig, schema: &
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
-    database:        Arc<Database>,
-    schema:          SchemaRef,
-    _batch_queue:    Option<Arc<crate::batch_queue::BatchQueue>>,
-    table_name:      String,
+    database: Arc<Database>,
+    schema: SchemaRef,
+    _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    table_name: String,
 }
 
 impl ProjectRoutingTable {
@@ -4469,8 +4470,8 @@ impl TableProvider for ProjectRoutingTable {
                     } else {
                         crate::metrics::record_tantivy_prefilter_used();
                         tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
-                            expr:    Box::new(datafusion::logical_expr::col("id")),
-                            list:    ids.into_iter().map(lit).collect(),
+                            expr: Box::new(datafusion::logical_expr::col("id")),
+                            list: ids.into_iter().map(lit).collect(),
                             negated: false,
                         }));
                     }
@@ -4599,18 +4600,18 @@ impl TableProvider for ProjectRoutingTable {
         for (start, end) in &mem_ranges {
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr {
-                left:  ts_col(),
-                op:    Operator::Lt,
+                left: ts_col(),
+                op: Operator::Lt,
                 right: ts_lit(*start),
             });
             let at_or_above = Expr::BinaryExpr(BinaryExpr {
-                left:  ts_col(),
-                op:    Operator::GtEq,
+                left: ts_col(),
+                op: Operator::GtEq,
                 right: ts_lit(*end),
             });
             delta_filters.push(Expr::BinaryExpr(BinaryExpr {
-                left:  Box::new(below),
-                op:    Operator::Or,
+                left: Box::new(below),
+                op: Operator::Or,
                 right: Box::new(at_or_above),
             }));
         }
@@ -4673,11 +4674,11 @@ mod writer_properties_tests {
 
     fn field(name: &str, dt: &str) -> FieldDef {
         FieldDef {
-            name:         name.into(),
-            data_type:    dt.into(),
-            nullable:     true,
-            tantivy:      None,
-            dictionary:   None,
+            name: name.into(),
+            data_type: dt.into(),
+            nullable: true,
+            tantivy: None,
+            dictionary: None,
             bloom_filter: false,
         }
     }
@@ -4689,8 +4690,8 @@ mod writer_properties_tests {
             sorting_columns: sort
                 .into_iter()
                 .map(|n| SortingColumnDef {
-                    name:        n.into(),
-                    descending:  false,
+                    name: n.into(),
+                    descending: false,
                     nulls_first: false,
                 })
                 .collect(),

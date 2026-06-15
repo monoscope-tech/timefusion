@@ -48,9 +48,9 @@ use datafusion::{
         lit,
     },
     optimizer::AnalyzerRule,
-    scalar::ScalarValue,
 };
 
+use crate::optimizers::extract_utf8_string;
 use crate::tantivy_index::{
     schema::{DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER},
     udf::{TEXT_MATCH_NAME, TextMatchUdf},
@@ -124,7 +124,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
                 _ => return None,
             };
             let tok = *indexed_columns.get(&c_name(col))?;
-            let s = extract_utf8_literal(lit)?;
+            let s = extract_utf8_string(lit)?;
             // Raw and default tokenizers want safe-char terms (raw is
             // single-token, default does word split — both struggle with
             // QueryParser metachars). ngram3 sees the literal char-by-char
@@ -155,7 +155,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
                 return None;
             }
             let Expr::Literal(s, _) = r.as_ref() else { return None };
-            let pat = extract_utf8_literal(s)?;
+            let pat = extract_utf8_string(s)?;
             let allow_substring = tok == NGRAM3_TOKENIZER;
             let q = classify_like_pattern(&pat, *escape_char, allow_substring)?;
             // ngram3 tokenizer lowercases on both index and query side, so
@@ -175,13 +175,6 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
 
 fn c_name(c: &datafusion::common::Column) -> String {
     c.name.clone()
-}
-
-fn extract_utf8_literal(s: &ScalarValue) -> Option<String> {
-    match s {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::Utf8View(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
-        _ => None,
-    }
 }
 
 /// Decide which Tantivy query form a SQL LIKE pattern maps to.
@@ -459,10 +452,10 @@ mod tests {
         // miss case variants; skip the rewrite.
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), RAW_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated:          false,
-            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern:          Box::new(lit("foo")),
-            escape_char:      None,
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("foo")),
+            escape_char: None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols), None);
@@ -472,10 +465,10 @@ mod tests {
     fn match_ilike_substring_works_on_ngram3() {
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated:          false,
-            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern:          Box::new(lit("%foo%")),
-            escape_char:      None,
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("%foo%")),
+            escape_char: None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols), Some(("c".into(), "foo".into())));

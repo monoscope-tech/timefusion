@@ -25,28 +25,28 @@ pub const FROZEN_START_MICROS: i64 = 1_900_000_000_000_000; // ~2030-03-15
 
 #[derive(Clone)]
 pub struct E2eEnvBuilder {
-    bucket_duration_secs:   u64,
-    flush_interval_secs:    u64,
+    bucket_duration_secs: u64,
+    flush_interval_secs: u64,
     eviction_interval_secs: u64,
-    retention_mins:         u64,
-    foyer_disabled:         bool,
-    flush_immediately:      bool,
-    max_memory_mb:          usize,
-    frozen_at_micros:       i64,
+    retention_mins: u64,
+    foyer_disabled: bool,
+    flush_immediately: bool,
+    max_memory_mb: usize,
+    frozen_at_micros: i64,
 }
 
 impl Default for E2eEnvBuilder {
     fn default() -> Self {
         Self {
             // Aggressive defaults for fast deterministic tests.
-            bucket_duration_secs:   60,
-            flush_interval_secs:    1,
+            bucket_duration_secs: 60,
+            flush_interval_secs: 1,
             eviction_interval_secs: 1,
-            retention_mins:         5,
-            foyer_disabled:         false,
-            flush_immediately:      false,
-            max_memory_mb:          256,
-            frozen_at_micros:       FROZEN_START_MICROS,
+            retention_mins: 5,
+            foyer_disabled: false,
+            flush_immediately: false,
+            max_memory_mb: 256,
+            frozen_at_micros: FROZEN_START_MICROS,
         }
     }
 }
@@ -173,15 +173,15 @@ impl E2eEnvBuilder {
 }
 
 pub struct E2eEnv {
-    _minio:       ContainerAsync<MinIO>,
+    _minio: ContainerAsync<MinIO>,
     pub data_dir: PathBuf,
-    pub pg_port:  u16,
-    pub bucket:   String,
-    endpoint:     String,
-    test_id:      String,
-    wal_dir:      PathBuf,
-    builder:      E2eEnvBuilder,
-    pg_shutdown:  Arc<Notify>,
+    pub pg_port: u16,
+    pub bucket: String,
+    endpoint: String,
+    test_id: String,
+    wal_dir: PathBuf,
+    builder: E2eEnvBuilder,
+    pg_shutdown: Arc<Notify>,
     bootstrapped: Option<Bootstrapped>,
 }
 
@@ -321,18 +321,18 @@ impl Drop for E2eEnv {
 // ---------------------------------------------------------------------------
 
 struct BuildCfgArgs<'a> {
-    endpoint:               &'a str,
-    bucket:                 &'a str,
-    data_dir:               PathBuf,
-    pg_port:                u16,
-    bucket_duration_secs:   u64,
-    flush_interval_secs:    u64,
+    endpoint: &'a str,
+    bucket: &'a str,
+    data_dir: PathBuf,
+    pg_port: u16,
+    bucket_duration_secs: u64,
+    flush_interval_secs: u64,
     eviction_interval_secs: u64,
-    retention_mins:         u64,
-    foyer_disabled:         bool,
-    flush_immediately:      bool,
-    max_memory_mb:          usize,
-    test_id:                &'a str,
+    retention_mins: u64,
+    foyer_disabled: bool,
+    flush_immediately: bool,
+    max_memory_mb: usize,
+    test_id: &'a str,
 }
 
 fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
@@ -417,4 +417,22 @@ async fn wait_for_pg(port: u16) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     anyhow::bail!("pgwire never became ready on port {port}")
+}
+
+/// Insert one span row at `ts_micros` for an explicit `project_id`.
+pub async fn insert_for(client: &tokio_postgres::Client, project_id: &str, id: &str, ts_micros: i64) -> Result<()> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap();
+    let sql = format!(
+        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) \
+         VALUES ($1, '{}', '{}', $2, 'span', 'OK', 'm', 'INFO', ARRAY[]::text[], $3)",
+        dt.date_naive(),
+        dt.format("%Y-%m-%d %H:%M:%S%.f"),
+    );
+    client.execute(&sql, &[&project_id, &id, &vec!["s"]]).await?;
+    Ok(())
+}
+
+/// Insert one span row at `ts_micros` for the default `e2e_project`.
+pub async fn insert_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64) -> Result<()> {
+    insert_for(client, "e2e_project", id, ts_micros).await
 }

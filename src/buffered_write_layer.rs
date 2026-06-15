@@ -17,11 +17,9 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     config::AppConfig,
+    errors::wal_err,
     mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp},
-    wal::{
-        WalEntry, WalManager, WalOperation, deserialize_delete_payload, deserialize_record_batch_public, deserialize_update_payload,
-        deserialize_update_with_source_payload,
-    },
+    wal::{DeletePayload, UpdatePayload, UpdateWithSourcePayload, WalEntry, WalManager, WalOperation, decode_payload, deserialize_record_batch},
 };
 
 // Reservation-side scale factor applied to `estimate_batch_size()` to
@@ -110,37 +108,37 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
 /// `snapshot_stats()` and rendered as rows by `timefusion.stats()`.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
-    pub mem_project_count:              usize,
-    pub mem_total_buckets:              usize,
-    pub mem_total_rows:                 usize,
-    pub mem_total_batches:              usize,
-    pub mem_estimated_bytes:            usize,
-    pub reserved_bytes:                 usize,
-    pub max_memory_bytes:               usize,
-    pub pressure_pct:                   u32,
-    pub wal_files:                      usize,
-    pub wal_disk_bytes:                 u64,
-    pub wal_shards_per_topic:           usize,
-    pub wal_known_topics:               usize,
-    pub bucket_duration_micros:         i64,
+    pub mem_project_count: usize,
+    pub mem_total_buckets: usize,
+    pub mem_total_rows: usize,
+    pub mem_total_batches: usize,
+    pub mem_estimated_bytes: usize,
+    pub reserved_bytes: usize,
+    pub max_memory_bytes: usize,
+    pub pressure_pct: u32,
+    pub wal_files: usize,
+    pub wal_disk_bytes: u64,
+    pub wal_shards_per_topic: usize,
+    pub wal_known_topics: usize,
+    pub bucket_duration_micros: i64,
     /// Age of the oldest bucket in MemBuffer (seconds, computed from
     /// `now - min(bucket.min_timestamp)`). None when MemBuffer is empty.
     /// Alerting target: alert at > 2× `flush_interval_secs`.
-    pub oldest_bucket_age_secs:         Option<u64>,
+    pub oldest_bucket_age_secs: Option<u64>,
     /// Cumulative flush successes/failures since process start. Mirrors the
     /// OTel `timefusion.flush.completed`/`failed` counters so tests can
     /// assert without configuring OTel.
-    pub flush_completed_total:          u64,
-    pub flush_failed_total:             u64,
+    pub flush_completed_total: u64,
+    pub flush_failed_total: u64,
     /// Times an insert hit the memory hard limit and applied backpressure
     /// (synchronous flush-to-Delta) instead of rejecting. Sustained growth =
     /// ingest outpacing flush; the matching OTel counter is the alert target.
-    pub backpressure_engaged_total:     u64,
+    pub backpressure_engaged_total: u64,
     /// Inserts rejected after the backpressure window expired without freeing
     /// memory — Delta flush isn't keeping up. PAGE on any growth (data is still
     /// in the WAL but ingest is now dropping). Mirrored from OTel so operators
     /// can watch it via the stats table when telemetry isn't wired.
-    pub backpressure_rejected_total:    u64,
+    pub backpressure_rejected_total: u64,
     /// Open-bucket force-flush escalations (a single busy window was itself the
     /// pressure). Sustained growth = windows too large for the budget.
     pub backpressure_force_flush_total: u64,
@@ -148,19 +146,19 @@ pub struct StatsSnapshot {
 
 #[derive(Debug, Default)]
 pub struct RecoveryStats {
-    pub entries_replayed:          u64,
-    pub batches_recovered:         u64,
-    pub oldest_entry_timestamp:    Option<i64>,
-    pub newest_entry_timestamp:    Option<i64>,
-    pub recovery_duration_ms:      u64,
+    pub entries_replayed: u64,
+    pub batches_recovered: u64,
+    pub oldest_entry_timestamp: Option<i64>,
+    pub newest_entry_timestamp: Option<i64>,
+    pub recovery_duration_ms: u64,
     pub corrupted_entries_skipped: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct FlushStats {
     pub buckets_flushed: u64,
-    pub buckets_failed:  u64,
-    pub total_rows:      u64,
+    pub buckets_failed: u64,
+    pub total_rows: u64,
 }
 
 /// Callback for writing batches to Delta Lake. The callback MUST:
@@ -190,25 +188,25 @@ struct CoalescedGroup {
     /// the buffered-layer but reaches this code as `""`). Using `is_empty` as
     /// the sentinel previously let every subsequent bucket in such a group
     /// silently re-overwrite project_id/table_name.
-    key:               Option<(String, String)>,
-    batches:           Vec<RecordBatch>,
-    row_count:         usize,
+    key: Option<(String, String)>,
+    batches: Vec<RecordBatch>,
+    row_count: usize,
     /// Sum of per-shard counts across all absorbed buckets — drives walrus
     /// `advance_by_counts` once for the entire commit.
-    wal_shard_counts:  Vec<u64>,
+    wal_shard_counts: Vec<u64>,
     /// Per-shard max position across all absorbed buckets — written into
     /// Delta commit metadata for crash-mid-flush cursor recovery.
-    wal_positions:     Vec<Option<walrus_rust::WalPosition>>,
+    wal_positions: Vec<Option<walrus_rust::WalPosition>>,
     /// Source bucket_ids; drained from MemBuffer after the combined commit succeeds.
     source_bucket_ids: Vec<i64>,
     /// Min/max timestamp across absorbed buckets (Option so the derived Default's
     /// 0 can't corrupt the min). Carried onto the combined FlushableBucket.
-    min_timestamp:     Option<i64>,
-    max_timestamp:     Option<i64>,
+    min_timestamp: Option<i64>,
+    max_timestamp: Option<i64>,
 }
 
 struct CombinedBucket {
-    combined:          crate::mem_buffer::FlushableBucket,
+    combined: crate::mem_buffer::FlushableBucket,
     source_bucket_ids: Vec<i64>,
 }
 
@@ -285,40 +283,40 @@ pub type TantivyIndexCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, Vec<String>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 pub struct BufferedWriteLayer {
-    config:                         Arc<AppConfig>,
-    wal:                            Arc<WalManager>,
-    mem_buffer:                     Arc<MemBuffer>,
-    shutdown:                       CancellationToken,
-    delta_write_callback:           Option<DeltaWriteCallback>,
-    tantivy_index_callback:         Option<TantivyIndexCallback>,
-    background_tasks:               Mutex<Vec<JoinHandle<()>>>,
-    flush_lock:                     Mutex<()>,
-    reserved_bytes:                 AtomicUsize, // Memory reserved for in-flight writes
-    pressure_notify:                Arc<Notify>, // Wakes flush task when pressure threshold crossed
+    config: Arc<AppConfig>,
+    wal: Arc<WalManager>,
+    mem_buffer: Arc<MemBuffer>,
+    shutdown: CancellationToken,
+    delta_write_callback: Option<DeltaWriteCallback>,
+    tantivy_index_callback: Option<TantivyIndexCallback>,
+    background_tasks: Mutex<Vec<JoinHandle<()>>>,
+    flush_lock: Mutex<()>,
+    reserved_bytes: AtomicUsize,  // Memory reserved for in-flight writes
+    pressure_notify: Arc<Notify>, // Wakes flush task when pressure threshold crossed
     /// Notified at the end of every flush task iteration (success or failure).
     /// Test hook: lets E2E harnesses await actual completion of background work
     /// instead of racing wall-clock sleeps.
-    flush_tick_notify:              Arc<Notify>,
+    flush_tick_notify: Arc<Notify>,
     /// Notified at the end of every eviction task iteration.
-    eviction_tick_notify:           Arc<Notify>,
+    eviction_tick_notify: Arc<Notify>,
     /// Cumulative flush counters mirrored alongside OTel `record_flush`.
     /// OTel global metric state is opt-in (only initialized when telemetry is
     /// configured), so these atomics give the harness an in-process way to
     /// assert on what the global counters would be.
-    flush_completed_total:          AtomicU64,
-    flush_failed_total:             AtomicU64,
-    backpressure_engaged_total:     AtomicU64,
-    backpressure_rejected_total:    AtomicU64,
+    flush_completed_total: AtomicU64,
+    flush_failed_total: AtomicU64,
+    backpressure_engaged_total: AtomicU64,
+    backpressure_rejected_total: AtomicU64,
     backpressure_force_flush_total: AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
-    function_registry:              Arc<crate::functions::FnRegistry>,
+    function_registry: Arc<crate::functions::FnRegistry>,
     /// Caps concurrent detached tantivy sidecar builds so a fast flush cycle
     /// (post-F4 — one build per (project, table) per cycle) can't fan out
     /// past S3 connection / memory limits when many tables flush together.
     /// FOLLOW-UP: handles aren't stored; graceful shutdown does not await
     /// in-flight tantivy uploads. Acceptable for now because the sidecar is
     /// best-effort and the index can be rebuilt from Delta on demand.
-    tantivy_spawn_sem:              Arc<tokio::sync::Semaphore>,
+    tantivy_spawn_sem: Arc<tokio::sync::Semaphore>,
     /// Per-(project, table) max row timestamp ever handed to a Delta commit
     /// this process lifetime, floored at `boot_micros`. Delta cannot hold
     /// rows newer than this, so a query whose lower time bound is above it
@@ -329,12 +327,12 @@ pub struct BufferedWriteLayer {
     /// visibility gap). Raised before the commit so a query can't race in
     /// between commit-visible and watermark-raise; a failed commit leaves it
     /// conservatively high.
-    delta_flushed_watermark:        dashmap::DashMap<crate::mem_buffer::TableKey, i64>,
+    delta_flushed_watermark: dashmap::DashMap<crate::mem_buffer::TableKey, i64>,
     /// Recovery-time floor for the watermark: anything committed by earlier
     /// process lifetimes has row timestamps at/below roughly this (event
     /// timestamps drive bucketing; far-future-skewed pre-boot rows are the
     /// accepted residual exposure, same as the old heuristic).
-    boot_micros:                    i64,
+    boot_micros: i64,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {
@@ -784,7 +782,7 @@ impl BufferedWriteLayer {
                         }
                     }
                 }
-                WalOperation::Delete => match deserialize_delete_payload(&entry.data) {
+                WalOperation::Delete => match decode_payload::<DeletePayload>(&entry.data) {
                     Ok(payload) => {
                         if let Err(e) = mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), registry_ref) {
                             error!("WAL REPLAY FAILED: DELETE for {}.{}: {}", entry.project_id, entry.table_name, e);
@@ -801,7 +799,7 @@ impl BufferedWriteLayer {
                         quarantine_entry(&quarantine_dir, &entry, "delete_corrupt", &e.to_string());
                     }
                 },
-                WalOperation::Update => match deserialize_update_payload(&entry.data) {
+                WalOperation::Update => match decode_payload::<UpdatePayload>(&entry.data) {
                     Ok(payload) => {
                         if let Err(e) = mem_buffer.update_by_sql(
                             &entry.project_id,
@@ -824,8 +822,8 @@ impl BufferedWriteLayer {
                         quarantine_entry(&quarantine_dir, &entry, "update_corrupt", &e.to_string());
                     }
                 },
-                WalOperation::UpdateWithSource => match deserialize_update_with_source_payload(&entry.data) {
-                    Ok(payload) => match deserialize_record_batch_public(&payload.source.batch_ipc) {
+                WalOperation::UpdateWithSource => match decode_payload::<UpdateWithSourcePayload>(&entry.data) {
+                    Ok(payload) => match deserialize_record_batch(&payload.source.batch_ipc) {
                         Ok(source_batch) => {
                             if let Err(e) = mem_buffer.update_with_source_by_sql(
                                 &entry.project_id,
@@ -1632,9 +1630,7 @@ impl BufferedWriteLayer {
         // not recoverable after a crash — propagate so the client knows the
         // operation didn't commit, rather than apply in-memory and lose it
         // on the next restart's WAL replay.
-        self.wal
-            .append_delete(project_id, table_name, predicate_sql.as_deref())
-            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_delete failed: {e}").into()))?;
+        self.wal.append_delete(project_id, table_name, predicate_sql.as_deref()).map_err(wal_err("append_delete"))?;
         self.mem_buffer.delete(project_id, table_name, predicate)
     }
 
@@ -1651,7 +1647,7 @@ impl BufferedWriteLayer {
         // see a "successful" update that disappears on the next restart.
         self.wal
             .append_update(project_id, table_name, predicate_sql.as_deref(), &assignments_sql)
-            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_update failed: {e}").into()))?;
+            .map_err(wal_err("append_update"))?;
         self.mem_buffer.update(project_id, table_name, predicate, assignments)
     }
 
@@ -1667,8 +1663,7 @@ impl BufferedWriteLayer {
         let predicate_sql = predicate.map(|p| format!("{}", p));
         let assignments_sql: Vec<(String, String)> = assignments.iter().map(|(col, expr)| (col.clone(), format!("{}", expr))).collect();
 
-        let batch_ipc = crate::wal::serialize_record_batch_public(&source.batch)
-            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL source serialize failed: {e}").into()))?;
+        let batch_ipc = crate::wal::serialize_record_batch(&source.batch).map_err(wal_err("source serialize"))?;
         let serialized_source = crate::wal::SerializedSource {
             join_keys: source.join_keys.clone(),
             batch_ipc,
@@ -1676,7 +1671,7 @@ impl BufferedWriteLayer {
 
         self.wal
             .append_update_with_source(project_id, table_name, predicate_sql.as_deref(), &assignments_sql, &serialized_source)
-            .map_err(|e| datafusion::error::DataFusionError::External(format!("WAL append_update_with_source failed: {e}").into()))?;
+            .map_err(wal_err("append_update_with_source"))?;
         self.mem_buffer.update_with_source(project_id, table_name, predicate, assignments, source)
     }
 }
