@@ -54,6 +54,8 @@ use datafusion_postgres::{
 };
 use tracing::debug;
 
+use crate::errors::arrow_err;
+
 /// Walk a plan and replace every `CAST(Literal(v), T)` with `Literal(cast(v, T))`.
 ///
 /// After `replace_params_with_values` substitutes `$N → literal`, the `CAST`
@@ -217,7 +219,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
         let arr = if arr.data_type() == target_ty {
             arr
         } else {
-            datafusion::arrow::compute::cast(&arr, target_ty).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?
+            datafusion::arrow::compute::cast(&arr, target_ty).map_err(arrow_err)?
         };
         values_columns.push(arr);
     }
@@ -247,7 +249,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
     } else {
         (values_schema, values_columns)
     };
-    let batch = RecordBatch::try_new(final_schema, columns).map_err(|e| datafusion::error::DataFusionError::ArrowError(Box::new(e), None))?;
+    let batch = RecordBatch::try_new(final_schema, columns).map_err(arrow_err)?;
 
     let provider = session_context.table_provider(table_name.clone()).await?;
     let Some(routing) = provider.as_any().downcast_ref::<crate::database::ProjectRoutingTable>() else {

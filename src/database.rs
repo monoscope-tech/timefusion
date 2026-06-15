@@ -36,6 +36,7 @@ use url::Url;
 
 use crate::{
     config::{self, AppConfig},
+    errors::arrow_err,
     object_store_cache::{FoyerCacheConfig, FoyerObjectStoreCache, SharedFoyerCache},
     schema_loader::{create_insert_compatible_schema, get_default_schema, get_schema, is_variant_type},
     statistics::DeltaStatisticsExtractor,
@@ -495,7 +496,7 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
             .zip(struct_fields.iter())
             .map(|(arr, f)| -> DFResult<arrow::array::ArrayRef> {
                 if matches!(f.data_type(), DataType::BinaryView) {
-                    cast(arr, &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+                    cast(arr, &DataType::Binary).map_err(arrow_err)
                 } else {
                     Ok(arr.clone())
                 }
@@ -520,7 +521,7 @@ fn cast_variant_columns_to_binary(batch: RecordBatch) -> DFResult<RecordBatch> {
         return Ok(batch);
     }
     let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(new_schema, new_cols).map_err(arrow_err)
 }
 
 fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
@@ -572,7 +573,7 @@ fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
         return Ok(batch);
     }
     let new_schema = Arc::new(arrow::datatypes::Schema::new_with_metadata(new_fields, schema.metadata().clone()));
-    RecordBatch::try_new(new_schema, new_cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(new_schema, new_cols).map_err(arrow_err)
 }
 
 fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
@@ -604,8 +605,8 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
         // our schema declares). Both Delta reads and MemBuffer end up as
         // Binary → no per-row casts on the read path.
         let arr: StructArray = builder.build().into();
-        let metadata = cast(arr.column(0), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
-        let value = cast(arr.column(1), &DataType::Binary).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let metadata = cast(arr.column(0), &DataType::Binary).map_err(arrow_err)?;
+        let value = cast(arr.column(1), &DataType::Binary).map_err(arrow_err)?;
         let fields = vec![
             Arc::new(Field::new(crate::schema_loader::VARIANT_METADATA_FIELD, DataType::Binary, false)),
             Arc::new(Field::new(crate::schema_loader::VARIANT_VALUE_FIELD, DataType::Binary, false)),
@@ -642,7 +643,7 @@ fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFR
     }
 
     let new_schema = Arc::new(arrow_schema::Schema::new(new_fields));
-    RecordBatch::try_new(new_schema, columns).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+    RecordBatch::try_new(new_schema, columns).map_err(arrow_err)
 }
 
 // Fallback ZSTD level when a configured/tier level is rejected as out-of-range.

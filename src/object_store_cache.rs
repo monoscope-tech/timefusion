@@ -598,6 +598,23 @@ impl FoyerObjectStoreCache {
         f(&mut *self.metadata_stats.write().await);
     }
 
+    /// Cache miss that triggers an inner-store fetch (data / metadata stats).
+    async fn record_miss_with_fetch(&self) {
+        self.update_stats(|s| {
+            s.misses += 1;
+            s.inner_gets += 1;
+        })
+        .await;
+    }
+
+    async fn record_meta_miss_with_fetch(&self) {
+        self.update_metadata_stats(|s| {
+            s.misses += 1;
+            s.inner_gets += 1;
+        })
+        .await;
+    }
+
     fn make_cache_key(location: &Path) -> String {
         location.to_string()
     }
@@ -791,11 +808,7 @@ impl FoyerObjectStoreCache {
 
         // Cache miss - fetch from inner store
         span.record("cache_hit", false);
-        self.update_stats(|s| {
-            s.misses += 1;
-            s.inner_gets += 1;
-        })
-        .await;
+        self.record_miss_with_fetch().await;
         let is_parquet = is_parquet_file(location);
         let ttl = self.get_ttl_for_path(location);
         debug!(
@@ -969,11 +982,7 @@ impl FoyerObjectStoreCache {
             if is_metadata_request {
                 // Cache miss for metadata range - fetch just the range
                 span.record("cache_hit", false);
-                self.update_metadata_stats(|s| {
-                    s.misses += 1;
-                    s.inner_gets += 1;
-                })
-                .await;
+                self.record_meta_miss_with_fetch().await;
                 debug!(
                     "Metadata cache MISS for Parquet: {} (range: {}..{}, file_size: {})",
                     location, range.start, range.end, file_size
@@ -1049,11 +1058,7 @@ impl FoyerObjectStoreCache {
 
         // Fallback to regular range request for non-parquet files
         span.record("cache_hit", false);
-        self.update_stats(|s| {
-            s.misses += 1;
-            s.inner_gets += 1;
-        })
-        .await;
+        self.record_miss_with_fetch().await;
         debug!(
             "get_range request for: {} (range: {}..{}, parquet={})",
             location, range.start, range.end, is_parquet
@@ -1394,11 +1399,7 @@ impl ObjectStore for FoyerObjectStoreCache {
             let abs_range = result.range.clone();
             let attributes = result.attributes.clone();
             let bytes = result.bytes().await?;
-            self.update_metadata_stats(|s| {
-                s.misses += 1;
-                s.inner_gets += 1;
-            })
-            .await;
+            self.record_meta_miss_with_fetch().await;
             // Populate both the footer-range cache (under the absolute key bounded
             // reads use) and the immutable-meta cache, so the next footer read is
             // a pure cache hit.

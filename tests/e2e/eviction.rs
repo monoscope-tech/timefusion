@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use timefusion::clock;
 
-use super::harness::{E2eEnv, FROZEN_START_MICROS};
+use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
@@ -28,17 +28,5 @@ async fn old_data_evicted_recent_retained() -> anyhow::Result<()> {
     let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
     assert_eq!(count, 2, "both rows must survive eviction (via Delta + MemBuffer)");
 
-    Ok(())
-}
-
-async fn insert_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64) -> anyhow::Result<()> {
-    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap();
-    let sql = format!(
-        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) \
-         VALUES ($1, '{}', '{}', $2, 'span', 'OK', 'm', 'INFO', ARRAY[]::text[], $3)",
-        dt.date_naive(),
-        dt.format("%Y-%m-%d %H:%M:%S%.f"),
-    );
-    client.execute(&sql, &[&"e2e_project", &id, &vec!["s"]]).await?;
     Ok(())
 }

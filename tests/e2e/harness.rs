@@ -418,3 +418,21 @@ async fn wait_for_pg(port: u16) -> Result<()> {
     }
     anyhow::bail!("pgwire never became ready on port {port}")
 }
+
+/// Insert one span row at `ts_micros` for an explicit `project_id`.
+pub async fn insert_for(client: &tokio_postgres::Client, project_id: &str, id: &str, ts_micros: i64) -> Result<()> {
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap();
+    let sql = format!(
+        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary) \
+         VALUES ($1, '{}', '{}', $2, 'span', 'OK', 'm', 'INFO', ARRAY[]::text[], $3)",
+        dt.date_naive(),
+        dt.format("%Y-%m-%d %H:%M:%S%.f"),
+    );
+    client.execute(&sql, &[&project_id, &id, &vec!["s"]]).await?;
+    Ok(())
+}
+
+/// Insert one span row at `ts_micros` for the default `e2e_project`.
+pub async fn insert_at(client: &tokio_postgres::Client, id: &str, ts_micros: i64) -> Result<()> {
+    insert_for(client, "e2e_project", id, ts_micros).await
+}

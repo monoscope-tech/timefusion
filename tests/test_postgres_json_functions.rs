@@ -1,19 +1,7 @@
 #[cfg(test)]
 mod test_json_functions {
     use anyhow::Result;
-    use datafusion::arrow::array::{Array, StringArray, StringViewArray};
-    use timefusion::database::Database;
-
-    /// Helper to extract string value from either Utf8View or Utf8 array
-    fn get_str(arr: &dyn Array, idx: usize) -> String {
-        if let Some(sv) = arr.as_any().downcast_ref::<StringViewArray>() {
-            sv.value(idx).to_string()
-        } else if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
-            s.value(idx).to_string()
-        } else {
-            panic!("Expected string array but got {:?}", arr.data_type());
-        }
-    }
+    use timefusion::{database::Database, test_utils::test_helpers::array_get_str as get_str};
 
     #[tokio::test]
     async fn test_json_build_array() -> Result<()> {
