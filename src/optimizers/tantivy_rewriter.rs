@@ -1,8 +1,11 @@
 //! Transparent Tantivy acceleration for standard SQL predicates.
 //!
-//! Rewrites `col = 'literal'`, `col LIKE 'pattern'`, and `col ILIKE 'pattern'`
-//! on tantivy-indexed columns by **additively** AND-ing a `text_match(col, q)`
-//! call to the predicate. The original comparison is never removed — it
+//! Rewrites `col LIKE 'pattern'` and `col ILIKE 'pattern'` on tantivy-indexed
+//! columns by **additively** AND-ing a `text_match(col, q)` call to the
+//! predicate. Exact `=` / `!=` are deliberately left alone — bloom filters and
+//! column stats prune equality on the Delta side correctly (including under
+//! `OR`/`IN`) and faster than the tantivy id-prefilter. The original comparison
+//! is never removed — it
 //! still applies as a post-filter on MemBuffer rows and Delta files whose
 //! tantivy index hasn't built yet (post-flush lag). The `text_match` call,
 //! once picked up by the existing routing logic in `ProjectRoutingTable`,
@@ -19,7 +22,7 @@
 //!
 //! | SQL form              | raw   | default | ngram3 |
 //! |-----------------------|-------|---------|--------|
-//! | `col = 'lit'`         | ✅ exact | ✅ exact | ✅ exact (case-insens via ngram lowercaser; Delta `=` re-filters case) |
+//! | `col = 'lit'`         | ❌ (bloom/stats) | ❌ (bloom/stats) | ❌ (bloom/stats) |
 //! | `col LIKE 'lit'`      | ✅    | ✅      | ✅      |
 //! | `col LIKE 'pre%'`     | ✅ prefix | ✅ prefix | ✅ prefix |
 //! | `col LIKE '%suf'`     | ❌    | ❌      | ✅ via ngram |
@@ -119,29 +122,11 @@ fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>) -> 
 /// is in between.
 fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'static str>) -> Option<(String, String)> {
     match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => {
-            let (col, lit) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(c), Expr::Literal(s, _)) => (c, s),
-                (Expr::Literal(s, _), Expr::Column(c)) => (c, s),
-                _ => return None,
-            };
-            let tok = *indexed_columns.get(&c_name(col))?;
-            let s = extract_utf8_string(lit)?;
-            // Raw and default tokenizers want safe-char terms (raw is
-            // single-token, default does word split — both struggle with
-            // QueryParser metachars). ngram3 sees the literal char-by-char
-            // and lowercases, so we still gate on safe chars to keep the
-            // injected `text_match` UDF call simple.
-            if !s.chars().all(is_tantivy_safe_term_char) || s.is_empty() {
-                return None;
-            }
-            // Skip ngram3 acceleration for sub-3-char literals (no
-            // valid trigram → tantivy returns everything).
-            if tok == NGRAM3_TOKENIZER && s.chars().count() < NGRAM_MIN_QUERY_LEN {
-                return None;
-            }
-            Some((c_name(col), tantivy_escape_term(&s)))
-        }
+        // Exact `=` / `!=` are intentionally NOT accelerated via tantivy:
+        // bloom filters + column stats prune equality on the Delta side
+        // correctly (including under OR/IN) and faster than the tantivy
+        // id-prefilter, which also intersects id sets and breaks under OR
+        // (2026-06-16 dashboard bug). Tantivy is reserved for substring/LIKE.
         Expr::Like(Like {
             negated: false,
             expr: l,
@@ -274,13 +259,6 @@ fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: bool)
 /// original `=` / `LIKE` re-filters as the correctness backstop.
 fn is_tantivy_safe_term_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '/' | '@')
-}
-
-fn tantivy_escape_term(s: &str) -> String {
-    // For exact-term equality we pass the literal as-is when safe; otherwise
-    // bail (caller already filtered). This keeps the query string simple and
-    // matches the "raw" tokenizer used by indexed keyword columns.
-    s.to_string()
 }
 
 fn text_match_call(column: String, query: String) -> Expr {
@@ -417,35 +395,19 @@ mod tests {
     }
 
     #[test]
-    fn match_indexed_eq_picks_up_known_column() {
+    fn match_exact_eq_is_not_accelerated() {
+        // Exact equality is served by bloom filters / stats, not tantivy —
+        // avoids the OR-intersection prefilter bug (2026-06-16). `!=` was
+        // never rewritten either.
         let cols: HashMap<String, &'static str> = HashMap::from([("service_name".to_string(), RAW_TOKENIZER)]);
-        let e = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::Column(datafusion::common::Column::new_unqualified("service_name"))),
-            Operator::Eq,
-            Box::new(lit("user-api")),
-        ));
-        let got = match_indexed_predicate(&e, &cols);
-        assert_eq!(got, Some(("service_name".into(), "user-api".into())));
-
-        let other = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::Column(datafusion::common::Column::new_unqualified("other_col"))),
-            Operator::Eq,
-            Box::new(lit("x")),
-        ));
-        assert_eq!(match_indexed_predicate(&other, &cols), None);
-    }
-
-    #[test]
-    fn match_eq_skips_short_literals_on_ngram3() {
-        // Sub-3-char literal on an ngram3 column has no full trigram; bail
-        // to avoid a tantivy match-everything degenerate query.
-        let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
-        let e = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            Operator::Eq,
-            Box::new(lit("ab")),
-        ));
-        assert_eq!(match_indexed_predicate(&e, &cols), None);
+        for op in [Operator::Eq, Operator::NotEq] {
+            let e = Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(Expr::Column(datafusion::common::Column::new_unqualified("service_name"))),
+                op,
+                Box::new(lit("user-api")),
+            ));
+            assert_eq!(match_indexed_predicate(&e, &cols), None, "{op:?} must not be accelerated");
+        }
     }
 
     #[test]

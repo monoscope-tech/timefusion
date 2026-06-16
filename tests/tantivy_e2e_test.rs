@@ -210,10 +210,8 @@ async fn delta_flushed_text_match_matches_baseline() -> Result<()> {
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn membuffer_only_level_eq_falls_back_correctly() -> Result<()> {
-    // Rows stay in MemBuffer (no flush). The rewriter still injects
-    // `text_match(level, 'ERROR')` next to the `=` predicate, but the
-    // tantivy search returns `None` (no manifest yet) → no prefilter
-    // applied → original `level = 'ERROR'` filter runs against the
+    // Rows stay in MemBuffer (no flush). Exact `=` is not tantivy-accelerated
+    // (bloom/stats handle it), so `level = 'ERROR'` runs directly against the
     // in-memory batches. Correctness invariant: result identical to the
     // tantivy-off baseline.
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -269,9 +267,10 @@ async fn tantivy_indexer_actually_writes_manifest_when_flush_routes_through_buff
 async fn mixed_membuffer_and_delta_level_eq_returns_union() -> Result<()> {
     // The hard case: some rows are in Delta (and possibly indexed by
     // tantivy), some are still in MemBuffer (definitely not indexed).
-    // The rewriter wraps `level = 'ERROR'` with text_match. Behavior:
-    //   - Delta side may get prefiltered by id IN(...) from tantivy
-    //   - MemBuffer side is queried directly with the original predicate
+    // Exact `=` is not tantivy-accelerated; `level = 'ERROR'` runs as a plain
+    // predicate. Behavior:
+    //   - Delta side pruned by bloom filters / column stats
+    //   - MemBuffer side is queried directly with the predicate
     //   - Result is the union with no duplicates and no missed rows
     let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
     let (db, ctx, _svc) = build_db(&format!("{id}-mix-on"), true).await?;
@@ -359,27 +358,23 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     let m = wait_for_manifest_entries(svc.object_store.as_ref(), &p, 1).await?;
     assert!(!m.entries.is_empty(), "manifest should have entries after flush");
 
-    // Real-world SQL: `WHERE level = 'ERROR'`. The TantivyPredicateRewriter
-    // additively wraps this with `text_match(level, 'ERROR')` so the
-    // ProjectRoutingTable invokes the tantivy prefilter. The original `=`
-    // predicate stays in the plan and re-runs on the Delta scan output —
-    // which is what makes this correct on MemBuffer rows + freshly-flushed
-    // not-yet-indexed files. Test data uses derived levels:
-    //   "login failed: bad password" → ERROR
-    //   "charge declined"             → ERROR
-    //   "login successful"            → INFO
-    //   "charge succeeded"            → INFO
-    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
+    // Real-world SQL using a substring LIKE (the path that still routes
+    // through tantivy — exact `=` is now served by bloom filters/stats). The
+    // TantivyPredicateRewriter wraps `status_message LIKE '%login%'` with
+    // `text_match(status_message, 'login')` so the ProjectRoutingTable invokes
+    // the tantivy prefilter; the original LIKE re-runs on the scan output.
+    //   "login failed: bad password" → k1   "login successful" → k2
+    //   "charge declined"            → k3   "charge succeeded" → k4
+    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND status_message LIKE '%login%'");
     let r_on = collect_ids(&ctx, &q).await?;
     let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(r_on, r_off, "post-flush prefilter must match baseline for `level = 'ERROR'`");
-    assert_eq!(r_on, vec!["k1".to_string(), "k3".to_string()]);
+    assert_eq!(r_on, r_off, "post-flush prefilter must match baseline for `LIKE '%login%'`");
+    assert_eq!(r_on, vec!["k1".to_string(), "k2".to_string()]);
 
-    // Second natural-SQL predicate. INFO is also indexed via the rewriter.
-    let q2 = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'INFO'");
+    let q2 = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND status_message LIKE '%charge%'");
     let r2_on = collect_ids(&ctx, &q2).await?;
     let r2_off = collect_ids(&ctx2, &q2).await?;
     assert_eq!(r2_on, r2_off);
-    assert_eq!(r2_on, vec!["k2".to_string(), "k4".to_string()]);
+    assert_eq!(r2_on, vec!["k3".to_string(), "k4".to_string()]);
     Ok(())
 }

@@ -67,15 +67,14 @@ fn plan_str(plan: &LogicalPlan) -> String {
 }
 
 #[tokio::test]
-async fn rewriter_injects_text_match_for_eq_on_indexed_column() -> Result<()> {
+async fn rewriter_skips_exact_eq_on_indexed_column() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
-    // `level` is indexed (tantivy.indexed: true, tokenizer: raw) in the prod
-    // YAML. The rewriter should produce `level = 'ERROR' AND text_match(level, 'ERROR')`.
+    // Exact `=` is NOT accelerated via tantivy (bloom filters / stats handle
+    // it, and the tantivy id-prefilter breaks under OR — 2026-06-16). `level`
+    // is indexed (raw) yet `level = 'ERROR'` must produce no text_match.
     let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level = 'ERROR'").await?;
     let s = plan_str(&plan);
-    assert!(s.contains("text_match"), "expected text_match in plan, got:\n{}", s);
-    // The original `=` must still appear (additive — correctness invariant).
-    assert!(s.contains("level = "), "expected original = filter retained, got:\n{}", s);
+    assert!(!s.contains("text_match"), "expected NO text_match for exact = on indexed col, got:\n{}", s);
     Ok(())
 }
 
@@ -118,8 +117,8 @@ async fn rewriter_skips_non_indexed_columns() -> Result<()> {
 async fn rewriter_skips_special_chars_in_literal() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // `+` is a tantivy QueryParser metachar. Conservative path: skip the
-    // rewrite rather than misparse. Correctness preserved by retained `=`.
-    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level = 'foo+bar'").await?;
+    // rewrite rather than misparse. Correctness preserved by retained LIKE.
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%foo+bar%'").await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match on metachar literal, got:\n{}", s);
     Ok(())
@@ -128,7 +127,7 @@ async fn rewriter_skips_special_chars_in_literal() -> Result<()> {
 #[tokio::test]
 async fn rewriter_is_idempotent_under_replanning() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
-    let sql = "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level = 'INFO'";
+    let sql = "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%failed%'";
     let p1 = plan_str(&analyze(&ctx, sql).await?);
     let p2 = plan_str(&analyze(&ctx, sql).await?);
     // Same SQL twice should produce the same plan (deterministic). The
@@ -216,14 +215,14 @@ async fn rewriter_skips_sub_3_char_eq_on_ngram3() -> Result<()> {
 #[tokio::test]
 async fn rewriter_handles_multiple_indexed_predicates() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
-    // Two indexed columns (level + name) — both should get text_match
-    // injections. The optimizer's filter pushdown duplicates each into the
-    // TableScan's partial_filters, so the printed count is 2N; we assert
-    // both column-specific calls are present rather than picking an exact
-    // count (less fragile across DataFusion versions).
+    // Two indexed columns via LIKE (the accelerated path; exact `=` is not
+    // tantivy-routed) — both should get text_match injections. The optimizer's
+    // filter pushdown duplicates each into the TableScan's partial_filters, so
+    // the printed count is 2N; we assert both column-specific calls are present
+    // rather than picking an exact count (less fragile across DataFusion versions).
     let plan = analyze(
         &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level = 'ERROR' AND name = 'svc'",
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level LIKE 'ERR%' AND name LIKE 'svc%'",
     )
     .await?;
     let s = plan_str(&plan);

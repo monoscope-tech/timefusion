@@ -9,6 +9,7 @@ mod cache_warmth;
 mod eviction;
 mod flush_lifecycle;
 mod multi_tenant_isolation;
+mod or_utf8view_delta;
 mod pressure_flush;
 mod restart_recovery;
 mod smoke;

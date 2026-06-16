@@ -4428,6 +4428,9 @@ impl TableProvider for ProjectRoutingTable {
                         delta_any_usable = true;
                         delta_indexed_rows = delta_indexed_rows.saturating_add(result.indexed_rows);
                         let ids: std::collections::HashSet<String> = result.hits.into_iter().map(|h| h.id).collect();
+                        // Intersect: this is sound only because predicates are AND-ed.
+                        // `collect_text_matches` skips OR subtrees so disjunctive terms
+                        // never reach here (else x_ids ∩ y_ids = ∅ would drop everything).
                         delta_ids = Some(match delta_ids.take() {
                             None => ids,
                             Some(prev) => prev.intersection(&ids).cloned().collect(),
