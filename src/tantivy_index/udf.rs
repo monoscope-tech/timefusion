@@ -133,12 +133,26 @@ pub struct TextMatchPred {
     pub query:  String,
 }
 
-/// Walk filter expressions, pulling out all `text_match` calls.
+/// Collect `text_match(col, q)` predicates eligible to seed the tantivy
+/// id-prefilter. Both the Delta and MemBuffer prefilters **intersect** the
+/// per-predicate id sets, which is sound only for a conjunction. A predicate
+/// under a disjunction (`a=x OR a=y` → `text_match(a,x) OR text_match(a,y)`)
+/// would intersect `x_ids ∩ y_ids = ∅` and silently drop every matching row
+/// (2026-06-16 dashboard bug: `(kind='server' OR name='...')` returned 0 from
+/// Delta). So we skip OR subtrees; only top-level conjuncts remain, and
+/// intersecting them is a sound superset prefilter (the real predicate, which
+/// keeps every `text_match` call, still runs on top via FilterExec).
 pub fn collect_text_matches(filters: &[datafusion::logical_expr::Expr]) -> Vec<TextMatchPred> {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::{
+        common::tree_node::{TreeNode, TreeNodeRecursion},
+        logical_expr::{BinaryExpr, Expr, Operator},
+    };
     let mut out = Vec::new();
     for f in filters {
         let _ = f.apply(|e| {
+            if matches!(e, Expr::BinaryExpr(BinaryExpr { op: Operator::Or, .. })) {
+                return Ok(TreeNodeRecursion::Jump); // don't descend into OR branches
+            }
             if let Some(p) = extract_text_match(e) {
                 out.push(p);
             }

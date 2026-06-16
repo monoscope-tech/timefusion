@@ -2082,7 +2082,9 @@ impl MemBuffer {
         }
         let idx = idx.expect("idx is Some on this path");
 
-        // Run each predicate and intersect (multi-pred queries are AND-ed).
+        // Run each predicate and intersect — sound only because predicates are
+        // AND-ed; `collect_text_matches` skips OR subtrees so disjunctive terms
+        // never reach here (else x_ids ∩ y_ids = ∅ would drop every match).
         let ids_per_pred: anyhow::Result<Vec<std::collections::HashSet<String>>> =
             preds.iter().map(|p| idx.search(p).map(|hits| hits.into_iter().map(|h| h.id).collect())).collect();
         let combined = ids_per_pred?.into_iter().reduce(|a, b| a.intersection(&b).cloned().collect()).unwrap_or_default();
@@ -2881,5 +2883,47 @@ mod tests {
         let id_array = Int64Array::from((0..n as i64).collect::<Vec<_>>());
         let name_array = StringViewArray::from((0..n).map(|i| format!("row-{i}")).collect::<Vec<_>>());
         RecordBatch::try_new(schema, vec![Arc::new(ts_array), Arc::new(id_array), Arc::new(name_array)]).unwrap()
+    }
+
+    /// Single-bucket batch with a `name` Utf8View column for the OR-equality test.
+    fn name_batch(ts: i64, names: Vec<&str>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, false),
+        ]));
+        let n = names.len();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![ts; n]).with_timezone("UTC")),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+                Arc::new(StringViewArray::from(names)),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn membuffer_or_equality_on_utf8view_keeps_all_matches() {
+        use datafusion::{
+            logical_expr::{Expr, col},
+            scalar::ScalarValue,
+        };
+        let buf = MemBuffer::new();
+        let ts = 1_700_000_000_000_000;
+        let mut names = Vec::new();
+        names.extend(std::iter::repeat("client").take(1258));
+        names.extend(std::iter::repeat("internal").take(13346));
+        names.extend(std::iter::repeat("server").take(200));
+        buf.insert("p", "t", name_batch(ts, names), ts).unwrap();
+
+        // Prod literal type: Utf8View (map_string_types_to_utf8view=true).
+        let view = |s: &str| Expr::Literal(ScalarValue::Utf8View(Some(s.to_string())), None);
+        let or = col("name").eq(view("client")).or(col("name").eq(view("internal")));
+
+        let parts = buf.query_partitioned("p", "t", std::slice::from_ref(&or)).unwrap();
+        let rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1258 + 13346, "OR of two Utf8View equalities must keep all matches");
     }
 }

@@ -400,4 +400,10 @@ mod integration {
 
         Ok(())
     }
+    // The 2026-06-16 OR-on-indexed-column correctness bug is covered by the fast
+    // `mem_buffer::tests::membuffer_or_equality_on_utf8view_keeps_all_matches`
+    // unit test (raw MemBuffer) and the `or_utf8view_delta` e2e suite (full
+    // pgwire path, Delta + MemBuffer-tantivy). A pgwire integration repro here
+    // would just re-run the same assertions via 200 sequential single-row
+    // INSERTs (~80s) — redundant.
 }
