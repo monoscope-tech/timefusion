@@ -70,9 +70,24 @@ async fn or_equality_on_utf8view_delta_matches_in_list() -> anyhow::Result<()> {
     let total = count(&client, pid, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1").await;
     let c_client = count(&client, pid, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND kind='client'").await;
     let c_internal = count(&client, pid, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND kind='internal'").await;
-    let c_or = count(&client, pid, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND (kind='client' OR kind='internal')").await;
-    let c_in = count(&client, pid, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND kind IN ('client','internal')").await;
-    let c_or3 = count(&client, pid, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND (kind='server' OR kind='client' OR kind='internal')").await;
+    let c_or = count(
+        &client,
+        pid,
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND (kind='client' OR kind='internal')",
+    )
+    .await;
+    let c_in = count(
+        &client,
+        pid,
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND kind IN ('client','internal')",
+    )
+    .await;
+    let c_or3 = count(
+        &client,
+        pid,
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND (kind='server' OR kind='client' OR kind='internal')",
+    )
+    .await;
 
     eprintln!(
         "total={total} (expected {}) | client={c_client}/{n_client} internal={c_internal}/{n_internal} OR={c_or} IN={c_in} OR3={c_or3}",
@@ -100,17 +115,26 @@ async fn or_like_on_indexed_col_membuffer_matches_union() -> anyhow::Result<()> 
     let pid = "e2e_project";
 
     // 3 "alpha", 5 "bravo", 2 "charlie" — distinct substrings on an ngram3 col.
-    let msgs: Vec<&str> = std::iter::repeat("alpha")
-        .take(3)
-        .chain(std::iter::repeat("bravo").take(5))
-        .chain(std::iter::repeat("charlie").take(2))
+    let msgs: Vec<&str> = std::iter::repeat_n("alpha", 3)
+        .chain(std::iter::repeat_n("bravo", 5))
+        .chain(std::iter::repeat_n("charlie", 2))
         .collect();
     for (i, msg) in msgs.iter().enumerate() {
         insert_row(&client, pid, &format!("m-{i}"), "server", msg, FROZEN_START_MICROS).await?;
     }
 
-    let alpha = count(&client, pid, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND status_message LIKE '%alpha%'").await;
-    let bravo = count(&client, pid, "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND status_message LIKE '%bravo%'").await;
+    let alpha = count(
+        &client,
+        pid,
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND status_message LIKE '%alpha%'",
+    )
+    .await;
+    let bravo = count(
+        &client,
+        pid,
+        "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id=$1 AND status_message LIKE '%bravo%'",
+    )
+    .await;
     let or = count(
         &client,
         pid,
