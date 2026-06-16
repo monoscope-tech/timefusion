@@ -2913,9 +2913,9 @@ mod tests {
         let buf = MemBuffer::new();
         let ts = 1_700_000_000_000_000;
         let mut names = Vec::new();
-        names.extend(std::iter::repeat("client").take(1258));
-        names.extend(std::iter::repeat("internal").take(13346));
-        names.extend(std::iter::repeat("server").take(200));
+        names.extend(std::iter::repeat_n("client", 1258));
+        names.extend(std::iter::repeat_n("internal", 13346));
+        names.extend(std::iter::repeat_n("server", 200));
         buf.insert("p", "t", name_batch(ts, names), ts).unwrap();
 
         // Prod literal type: Utf8View (map_string_types_to_utf8view=true).

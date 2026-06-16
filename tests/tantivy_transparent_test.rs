@@ -118,7 +118,11 @@ async fn rewriter_skips_special_chars_in_literal() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // `+` is a tantivy QueryParser metachar. Conservative path: skip the
     // rewrite rather than misparse. Correctness preserved by retained LIKE.
-    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%foo+bar%'").await?;
+    let plan = analyze(
+        &ctx,
+        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%foo+bar%'",
+    )
+    .await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match on metachar literal, got:\n{}", s);
     Ok(())
