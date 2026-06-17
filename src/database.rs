@@ -390,9 +390,13 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 /// out ("Expected ... Binary, got ... BinaryView"). Passing this session
 /// via `.with_session_state(...)` overrides the default and keeps the
 /// read schema as declared.
-fn build_optimize_session_state() -> datafusion::execution::session_state::SessionState {
+fn build_optimize_session_state(target_partitions: usize) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
-    let cfg = SessionConfig::new().set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+    let mut cfg = SessionConfig::new().set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+    // Same CPU-quota cap as the query session (see autotune::apply); 0 = default.
+    if target_partitions > 0 {
+        cfg = cfg.with_target_partitions(target_partitions);
+    }
     SessionStateBuilder::new().with_config(cfg).with_default_features().build()
 }
 
@@ -875,8 +879,11 @@ impl Database {
     /// - Per-field `dictionary: false` opt-out for high-entropy free-text.
     /// - Per-field `bloom_filter: true` opt-in for point-lookup columns
     ///   (ids/trace_ids/span_ids); NDV scaled to row-group size.
-    fn create_writer_properties(&self, schema: &crate::schema_loader::TableSchema, zstd_level: i32) -> WriterProperties {
-        build_writer_properties(&self.config.parquet, schema, zstd_level)
+    /// `declare_sorted`: pass `true` only from paths that sort rows by the
+    /// schema sort keys before writing (flush, dedup). Optimize/compact pass
+    /// `false`. See `build_writer_properties`.
+    fn create_writer_properties(&self, schema: &crate::schema_loader::TableSchema, zstd_level: i32, declare_sorted: bool) -> WriterProperties {
+        build_writer_properties(&self.config.parquet, schema, zstd_level, declare_sorted)
     }
 
     /// Updates a DeltaTable and handles errors consistently
@@ -1426,7 +1433,7 @@ impl Database {
 
         use datafusion::{
             config::ConfigOptions,
-            execution::{SessionStateBuilder, context::SessionContext, runtime_env::RuntimeEnvBuilder},
+            execution::{SessionStateBuilder, context::SessionContext},
         };
         use datafusion_tracing::{InstrumentationOptions, instrument_with_info_spans};
 
@@ -1459,7 +1466,16 @@ impl Database {
             &self.config.cache.timefusion_parquet_metadata_size_hint.to_string(),
         );
         let _ = options.set("datafusion.explain.show_schema", "true");
-        let _ = options.set("datafusion.runtime.metadata_cache_limit", "500M");
+        // NOTE: the decoded-metadata cache limit is NOT set here — a
+        // `datafusion.runtime.*` SessionConfig string does not reconfigure an
+        // already-built RuntimeEnv. It is applied on the RuntimeEnvBuilder
+        // below via `build_query_runtime_env` instead.
+
+        // Cap query parallelism at the container's CPU quota (derived in
+        // autotune::apply; 0 = leave DataFusion's default). See MemoryConfig.
+        if self.config.memory.timefusion_query_partitions > 0 {
+            let _ = options.set("datafusion.execution.target_partitions", &self.config.memory.timefusion_query_partitions.to_string());
+        }
 
         // Enable general statistics collection for query optimization.
         // (DataFusion default is `true` — set explicitly so a future default flip
@@ -1519,7 +1535,8 @@ impl Database {
                     crate::config::MemoryPoolKind::Greedy => Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
                     crate::config::MemoryPoolKind::FairSpill => Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
                 };
-                Arc::new(RuntimeEnvBuilder::new().with_memory_pool(pool).build().expect("Failed to create runtime environment"))
+                let meta_cache_bytes = self.config.cache.timefusion_df_metadata_cache_mb * 1024 * 1024;
+                Arc::new(build_query_runtime_env(pool, meta_cache_bytes))
             })
             .clone();
 
@@ -2659,7 +2676,12 @@ impl Database {
         // Get the appropriate schema for this table
         let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
 
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
+        // Cluster by the declared sort keys (timestamp-first) so the parquet
+        // SortingColumn footer is honest and the page index localizes the lead
+        // key. `sorted` is false when a schema-evolved bucket can't be combined
+        // (we then write unsorted) — declare the footer only when it's true.
+        let (batches, sorted) = sort_batches_by_schema(schema, batches);
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
 
         // Retry logic for concurrent writes
         // Hoist out of the retry loop — the watermark is the same on every attempt.
@@ -2939,7 +2961,8 @@ impl Database {
         // Full Z-order optimize runs every 30 min over a 48h window — promote
         // these rewrites to the "warm" tier so day-old data lands smaller on
         // disk without slowing the hot flush path.
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm);
+        // declare_sorted=false: Z-order/Compact reorders rows, so the footer must not claim the schema sort order.
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, false);
 
         // Same trade-off as optimize_table_light: best-effort, don't pause
         // flushes (see comment there). Z-order full optimize is daily-ish,
@@ -2959,7 +2982,7 @@ impl Database {
             // Avoid the BinaryView read for Variant columns (same issue as
             // optimize_table_light); delta-rs's internal session defaults to
             // schema_force_view_types=true.
-            .with_session_state(Arc::new(build_optimize_session_state()))
+            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
             .await;
 
         match optimize_result {
@@ -3145,7 +3168,8 @@ impl Database {
         );
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let writer_properties = self.create_writer_properties(schema, target_level);
+        // declare_sorted=false: recompress rewrites via Z-order/Compact.
+        let writer_properties = self.create_writer_properties(schema, target_level, false);
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
@@ -3166,7 +3190,7 @@ impl Database {
             .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
-            .with_session_state(Arc::new(build_optimize_session_state()))
+            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
             .await;
 
         match optimize_result {
@@ -3232,7 +3256,7 @@ impl Database {
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
-        let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state());
+        let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions));
         let scan_name = "__dedup_src";
         ctx.register_table(scan_name, Arc::new(provider))?;
         // project_id is currently always a UUID/controlled identifier, but defend in depth: escape single quotes
@@ -3339,7 +3363,6 @@ impl Database {
             return Ok(0);
         }
 
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
         let mut total_dropped = 0u64;
         for (chunk_filter, predicate) in chunks {
             let select = format!("SELECT * FROM {scan_name} WHERE {chunk_filter}");
@@ -3358,6 +3381,11 @@ impl Database {
             // Variant struct columns may still be BinaryView if the partition mixes
             // tiers — cast to Binary so the delta-kernel write accepts the schema.
             let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
+            // Keep the rewritten chunk sorted (same as the flush path); declare
+            // the footer only when the sort actually succeeded (per chunk, since
+            // a schema-evolved chunk falls back to unsorted).
+            let (deduped, sorted) = sort_batches_by_schema(schema, deduped);
+            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
 
             // OCC retry — same shape as optimize_table_light_inner. Best-effort;
             // exhaustion bubbles up as Err (the caller in `dedup_today_partitions`
@@ -3501,7 +3529,8 @@ impl Database {
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?];
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level);
+        // declare_sorted=false: light optimize Compacts (concatenates) files without re-sorting.
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, false);
 
         // Best-effort optimize: retry on OCC conflict but DO NOT hold the
         // flush lock. Earlier we wrapped this in `with_flush_paused` to
@@ -3553,7 +3582,7 @@ impl Database {
                 // the optimize-internal Parquet read uses `schema_force_view_types=true`
                 // (delta-rs's default), it returns BinaryView and the rewrite blows up
                 // mid-scan with "Expected ... Binary, got ... BinaryView".
-                .with_session_state(Arc::new(build_optimize_session_state()))
+                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
                 .await;
             match optimize_result {
                 Ok((new_table, metrics)) => {
@@ -3713,10 +3742,102 @@ impl Database {
     }
 }
 
+/// Build the shared query `RuntimeEnv`: the global memory pool plus the
+/// decoded-parquet-metadata cache limit. The limit MUST be set on the builder
+/// here — setting `datafusion.runtime.metadata_cache_limit` on the SessionConfig
+/// does NOT reconfigure an already-built RuntimeEnv, so it silently falls back to
+/// DataFusion's 50MB default and every scan re-decodes the parquet footer + page
+/// index (measured ~900ms metadata_load_time per query on prod).
+fn build_query_runtime_env(
+    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>, metadata_cache_bytes: usize,
+) -> datafusion::execution::runtime_env::RuntimeEnv {
+    datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_memory_pool(pool)
+        .with_metadata_cache_limit(metadata_cache_bytes)
+        .build()
+        .expect("Failed to create runtime environment")
+}
+
+/// Sort `batches` by the table's declared `sorting_columns` and report whether
+/// the result is actually in that order, as `(batches, sorted)`:
+/// - `sorted == true`: rows are globally ordered by the sort keys, so the caller
+///   may declare the parquet `SortingColumn` footer (`declare_sorted=true`).
+/// - `sorted == false`: no sort keys present, OR the bucket mixed schemas
+///   (nullable-field evolution within a 10-min window — `schemas_compatible` in
+///   `mem_buffer` admits this) so `concat_batches` couldn't combine it. We then
+///   write the rows unsorted rather than abort the flush (matching the old
+///   `SchemaMode::Merge` write path), and the caller MUST pass
+///   `declare_sorted=false` so the footer never claims an order we didn't write.
+///
+/// Footer honesty is tied to the returned bool — never assumed. A single batch
+/// skips the concat copy; an already-ordered batch skips the `take` copy.
+fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (Vec<RecordBatch>, bool) {
+    use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take_record_batch};
+    if batches.is_empty() || schema.sorting_columns.is_empty() {
+        return (batches, false);
+    }
+    let arrow_schema = batches[0].schema();
+    // Only sort a schema-homogeneous bucket. mem_buffer's `schemas_compatible`
+    // admits batches with extra nullable fields into one bucket; concatenating
+    // those would either abort the flush or silently drop the evolved column.
+    // Write such a bucket unsorted (sorted=false) and let the writer's
+    // SchemaMode::Merge union the columns losslessly, matching the old path.
+    if batches.iter().any(|b| b.schema() != arrow_schema) {
+        return (batches, false);
+    }
+    let sort_idx: Vec<(usize, &crate::schema_loader::SortingColumnDef)> =
+        schema.sorting_columns.iter().filter_map(|sc| arrow_schema.index_of(&sc.name).ok().map(|i| (i, sc))).collect();
+    if sort_idx.is_empty() {
+        return (batches, false);
+    }
+    let combined = if batches.len() == 1 {
+        batches.into_iter().next().unwrap()
+    } else {
+        match concat_batches(&arrow_schema, &batches) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("sort_batches_by_schema: concat failed, writing unsorted: {e}");
+                return (batches, false);
+            }
+        }
+    };
+    let sort_cols: Vec<SortColumn> = sort_idx
+        .iter()
+        .map(|(i, sc)| SortColumn {
+            values:  combined.column(*i).clone(),
+            options: Some(SortOptions { descending: sc.descending, nulls_first: sc.nulls_first }),
+        })
+        .collect();
+    let indices = match lexsort_to_indices(&sort_cols, None) {
+        Ok(i) => i,
+        Err(e) => {
+            warn!("sort_batches_by_schema: lexsort failed, writing unsorted: {e}");
+            return (vec![combined], false);
+        }
+    };
+    // Already ordered (common: append-ordered, ~monotonic timestamp) → skip the take copy.
+    if indices.values().iter().enumerate().all(|(i, &v)| v as usize == i) {
+        return (vec![combined], true);
+    }
+    match take_record_batch(&combined, &indices) {
+        Ok(sorted) => (vec![sorted], true),
+        Err(e) => {
+            warn!("sort_batches_by_schema: take failed, writing unsorted: {e}");
+            (vec![combined], false)
+        }
+    }
+}
+
 /// Pure builder for parquet `WriterProperties` at a given compression tier.
 /// Lives outside `impl Database` so unit tests can exercise tier/encoding/bloom
 /// decisions without instantiating a Database (which needs S3/MinIO).
-fn build_writer_properties(parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema_loader::TableSchema, zstd_level: i32) -> WriterProperties {
+/// `declare_sorted` controls whether the parquet footer advertises the schema's
+/// `sorting_columns`. Only the write paths that actually sort the rows in that
+/// order (flush/append, dedup) may pass `true`. Optimize/compact/recompress
+/// rewrite rows into Z-order or concatenation, so they MUST pass `false` —
+/// declaring an order the data doesn't have is a latent wrong-results bug for
+/// any reader that trusts it (see docs/plans/2026-06-17-parquet-ordering-pushdown.md).
+fn build_writer_properties(parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema_loader::TableSchema, zstd_level: i32, declare_sorted: bool) -> WriterProperties {
     use deltalake::datafusion::parquet::{
         basic::{Compression, Encoding, ZstdLevel},
         file::{metadata::KeyValue, properties::EnabledStatistics},
@@ -3749,16 +3870,30 @@ fn build_writer_properties(parquet_cfg: &crate::config::ParquetConfig, schema: &
         .set_max_row_group_row_count(Some(max_row_group_size))
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(8388608)
-        .set_statistics_enabled(EnabledStatistics::Page)
+        // Page-level stats only where they prune (the declared sort keys, set
+        // per-column below). Page stats on wide JSON/variant columns
+        // (body/attributes/resource) bloat the ColumnIndex with a min/max per
+        // page — tens of MB of decoded metadata per file that re-decodes on
+        // every scan. Chunk = one min/max per row group for those columns.
+        .set_statistics_enabled(EnabledStatistics::Chunk)
         .set_bloom_filter_enabled(false)
         .set_data_page_row_count_limit(page_row_count_limit)
-        .set_sorting_columns(if sorting_columns_pq.is_empty() { None } else { Some(sorting_columns_pq) })
+        .set_sorting_columns(if declare_sorted && !sorting_columns_pq.is_empty() { Some(sorting_columns_pq) } else { None })
         .set_key_value_metadata(Some(vec![KeyValue::new(COMPRESSION_TIER_KEY.to_string(), zstd_level.to_string())]));
 
     for field in &schema.fields {
         let dt = field.data_type.as_str();
         let col = ColumnPath::from(field.name.as_str());
         let is_sort_key = sort_key_names.contains(field.name.as_str());
+
+        // Page-level stats only where they prune AND are cheap: the declared
+        // sort keys, plus any timestamp/date column (8-byte min/max, common
+        // range predicates like observed_timestamp/start_time/end_time). Wide
+        // JSON/variant/string columns stay at the Chunk default so the
+        // ColumnIndex doesn't balloon.
+        if is_sort_key || dt.starts_with("Timestamp") || dt == "Date32" {
+            builder = builder.set_column_statistics_enabled(col.clone(), EnabledStatistics::Page);
+        }
 
         if dt.starts_with("Timestamp") || dt == "Date32" {
             builder = builder
@@ -4708,7 +4843,7 @@ mod writer_properties_tests {
     #[test]
     fn compression_level_drives_zstd() {
         for level in [3, 9, 15, 19] {
-            let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), level);
+            let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), level, true);
             assert_eq!(
                 p.compression(&ColumnPath::from("anything")),
                 Compression::ZSTD(ZstdLevel::try_new(level).unwrap())
@@ -4718,7 +4853,7 @@ mod writer_properties_tests {
 
     #[test]
     fn invalid_zstd_level_falls_back() {
-        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 999);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 999, true);
         assert_eq!(
             p.compression(&ColumnPath::from("x")),
             Compression::ZSTD(ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap())
@@ -4727,7 +4862,7 @@ mod writer_properties_tests {
 
     #[test]
     fn footer_kv_metadata_carries_tier() {
-        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 15);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), 15, true);
         let kv = p.key_value_metadata().expect("KV metadata present");
         let tier = kv.iter().find(|k| k.key == COMPRESSION_TIER_KEY).expect("tier key present");
         assert_eq!(tier.value.as_deref(), Some("15"));
@@ -4769,7 +4904,7 @@ mod writer_properties_tests {
     fn bloom_opt_in_only_for_flagged_columns() {
         let mut f1 = field("id", "Utf8");
         f1.bloom_filter = true;
-        let p = build_writer_properties(&cfg(), &schema_with(vec![f1, field("body", "Utf8")], vec![]), 3);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![f1, field("body", "Utf8")], vec![]), 3, true);
         assert!(p.bloom_filter_properties(&ColumnPath::from("id")).is_some(), "flagged column has bloom");
         assert!(p.bloom_filter_properties(&ColumnPath::from("body")).is_none(), "unflagged column has no bloom");
     }
@@ -4780,7 +4915,7 @@ mod writer_properties_tests {
         f.bloom_filter = true;
         let mut c = cfg();
         c.timefusion_bloom_filter_disabled = true;
-        let p = build_writer_properties(&c, &schema_with(vec![f], vec![]), 3);
+        let p = build_writer_properties(&c, &schema_with(vec![f], vec![]), 3, true);
         assert!(p.bloom_filter_properties(&ColumnPath::from("id")).is_none());
     }
 
@@ -4788,14 +4923,14 @@ mod writer_properties_tests {
     fn dictionary_opt_out_disables_dict() {
         let mut f = field("stacktrace", "Utf8");
         f.dictionary = Some(false);
-        let p = build_writer_properties(&cfg(), &schema_with(vec![f], vec![]), 3);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![f], vec![]), 3, true);
         assert!(!p.dictionary_enabled(&ColumnPath::from("stacktrace")));
     }
 
     #[test]
     fn sort_key_utf8_uses_delta_byte_array_and_no_dict() {
         use deltalake::datafusion::parquet::basic::Encoding;
-        let p = build_writer_properties(&cfg(), &schema_with(vec![field("id", "Utf8")], vec!["id"]), 3);
+        let p = build_writer_properties(&cfg(), &schema_with(vec![field("id", "Utf8")], vec!["id"]), 3, true);
         assert_eq!(p.encoding(&ColumnPath::from("id")), Some(Encoding::DELTA_BYTE_ARRAY));
         assert!(!p.dictionary_enabled(&ColumnPath::from("id")));
     }
@@ -4807,10 +4942,91 @@ mod writer_properties_tests {
             &cfg(),
             &schema_with(vec![field("ts", "Timestamp(Nanosecond, None)"), field("n", "Int64")], vec![]),
             3,
+            true,
         );
         assert_eq!(p.encoding(&ColumnPath::from("ts")), Some(Encoding::DELTA_BINARY_PACKED));
         assert!(!p.dictionary_enabled(&ColumnPath::from("ts")));
         assert_eq!(p.encoding(&ColumnPath::from("n")), Some(Encoding::DELTA_BINARY_PACKED));
+    }
+
+    // Fix #3: page-level stats only on declared sort keys; wide columns get
+    // chunk-level stats to keep the ColumnIndex (decoded-metadata) small.
+    #[test]
+    fn page_stats_only_for_sort_keys() {
+        use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
+        let p = build_writer_properties(
+            &cfg(),
+            &schema_with(vec![field("timestamp", "Timestamp(Microsecond, None)"), field("body", "Utf8")], vec!["timestamp"]),
+            3,
+            true,
+        );
+        assert_eq!(p.statistics_enabled(&ColumnPath::from("timestamp")), EnabledStatistics::Page);
+        assert_eq!(p.statistics_enabled(&ColumnPath::from("body")), EnabledStatistics::Chunk);
+    }
+
+    // Option A: only declare the parquet SortingColumn footer when the writer
+    // actually sorted the rows. Optimize/compact paths (declare_sorted=false)
+    // must NOT claim an order they don't write, or order-trusting readers break.
+    #[test]
+    fn sorting_columns_declared_only_when_sorted() {
+        let s = schema_with(vec![field("timestamp", "Timestamp(Microsecond, None)"), field("id", "Utf8")], vec!["timestamp", "id"]);
+        let sorted = build_writer_properties(&cfg(), &s, 3, true);
+        let unsorted = build_writer_properties(&cfg(), &s, 3, false);
+        assert!(sorted.sorting_columns().is_some(), "flush/dedup path declares the sort order");
+        assert!(unsorted.sorting_columns().is_none(), "optimize/compact path declares no order");
+    }
+
+    // Fix #1: the decoded-metadata cache limit must reach the RuntimeEnv (a
+    // SessionConfig `datafusion.runtime.*` string would not).
+    #[test]
+    fn runtime_env_applies_metadata_cache_limit() {
+        let pool = std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(1024 * 1024));
+        let bytes = 321 * 1024 * 1024;
+        let rt = build_query_runtime_env(pool, bytes);
+        assert_eq!(rt.cache_manager.get_metadata_cache_limit(), bytes);
+    }
+
+    // Fix #4: batches are globally sorted by the declared lead key before write.
+    #[test]
+    fn sort_batches_orders_by_declared_keys() {
+        use arrow::array::{Array, Int64Array};
+        use arrow_schema::{DataType, Field, Schema};
+        let s = std::sync::Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false)]));
+        let b1 = RecordBatch::try_new(s.clone(), vec![std::sync::Arc::new(Int64Array::from(vec![3, 1]))]).unwrap();
+        let b2 = RecordBatch::try_new(s.clone(), vec![std::sync::Arc::new(Int64Array::from(vec![2, 0]))]).unwrap();
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
+        assert!(sorted);
+        assert_eq!(out.len(), 1);
+        let col = out[0].column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(col.values(), &[0, 1, 2, 3]);
+        // No declared sort columns → input returned untouched, sorted=false.
+        let (passthrough, sorted) = sort_batches_by_schema(&schema_with(vec![], vec![]), vec![out[0].clone(), out[0].clone()]);
+        assert!(!sorted);
+        assert_eq!(passthrough.len(), 2);
+    }
+
+    // Regression for the review's headline finding: a bucket whose batches have
+    // evolved schemas (an extra nullable column on the 2nd batch, which
+    // mem_buffer's schemas_compatible admits) must NOT abort — concat fails, so
+    // we write unsorted and report sorted=false (footer stays honest).
+    #[test]
+    fn sort_batches_tolerates_schema_evolution() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        let s1 = std::sync::Arc::new(Schema::new(vec![Field::new("timestamp", DataType::Int64, false)]));
+        let s2 = std::sync::Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Int64, false),
+            Field::new("extra", DataType::Utf8, true),
+        ]));
+        let b1 = RecordBatch::try_new(s1, vec![std::sync::Arc::new(Int64Array::from(vec![2, 1]))]).unwrap();
+        let b2 = RecordBatch::try_new(s2, vec![
+            std::sync::Arc::new(Int64Array::from(vec![3])),
+            std::sync::Arc::new(StringArray::from(vec![Some("x")])),
+        ])
+        .unwrap();
+        let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
+        assert!(!sorted, "mixed-schema bucket must report unsorted, not panic/abort");
+        assert_eq!(out.len(), 2, "original batches returned for the writer to merge");
     }
 }
 

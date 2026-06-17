@@ -134,6 +134,16 @@ pub fn apply(config: &mut AppConfig) {
         }
     }
 
+    // Query/maintenance target_partitions, from the cgroup CPU quota. Default
+    // static = 0 (DataFusion default); applies to query + optimize sessions.
+    if env_unset("TIMEFUSION_QUERY_PARTITIONS") {
+        let derived = detected_query_partitions();
+        if derived != config.memory.timefusion_query_partitions {
+            config.memory.timefusion_query_partitions = derived;
+            applied.push(("TIMEFUSION_QUERY_PARTITIONS", derived.to_string()));
+        }
+    }
+
     if applied.is_empty() {
         info!("Auto-tune: no overrides applied (user has set all knobs explicitly or host signals unavailable)");
     } else {
@@ -144,6 +154,48 @@ pub fn apply(config: &mut AppConfig) {
 
 fn env_unset(name: &str) -> bool {
     std::env::var(name).is_err()
+}
+
+/// Query/maintenance parallelism (DataFusion `target_partitions`).
+///
+/// DataFusion defaults `target_partitions` to `num_cpus::get()`, which on Linux
+/// reads `sched_getaffinity` — that honors cpuset pinning but NOT the CFS quota
+/// (`docker --cpus`). In a CFS-throttled container TF therefore sees the host's
+/// core count, splits even a single small parquet file into that many scan
+/// groups (each re-opening the file's metadata), and oversubscribes the CPU it
+/// actually has. Derive from the cgroup CPU quota instead, capped at the
+/// affinity-derived count. Set onto the config in `apply()`; the env override
+/// `TIMEFUSION_QUERY_PARTITIONS` wins via serde (apply only fills when unset).
+fn detected_query_partitions() -> usize {
+    let fallback = num_cpus::get().max(1);
+    cpu_quota_cores().map_or(fallback, |q| q.clamp(1, fallback))
+}
+
+/// Cores implied by the cgroup CPU quota (v2 `cpu.max`, then v1
+/// `cfs_quota_us`/`cfs_period_us`). `None` when unthrottled or unreadable.
+fn cpu_quota_cores() -> Option<usize> {
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        return parse_cpu_max(&s);
+    }
+    let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").ok()?.trim().parse::<i64>().ok()?;
+    let period = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok()?.trim().parse::<i64>().ok()?;
+    quota_period_to_cores(quota, period)
+}
+
+/// Parse cgroup v2 `cpu.max` contents: `"<quota> <period>"` or `"max <period>"`.
+fn parse_cpu_max(s: &str) -> Option<usize> {
+    let mut it = s.split_whitespace();
+    let quota = it.next()?;
+    if quota == "max" {
+        return None;
+    }
+    let period: i64 = it.next().unwrap_or("100000").parse().ok()?;
+    quota_period_to_cores(quota.parse().ok()?, period)
+}
+
+/// Round a quota/period ratio up to whole cores (a 1.5-core quota → 2).
+fn quota_period_to_cores(quota: i64, period: i64) -> Option<usize> {
+    (quota > 0 && period > 0).then(|| (quota as f64 / period as f64).ceil() as usize)
 }
 
 /// Return free space (GB) on the volume hosting `path`. Returns None if no
@@ -182,5 +234,15 @@ mod tests {
         assert_eq!(cfg.buffer.timefusion_buffer_max_memory_mb, snapshot.buffer.timefusion_buffer_max_memory_mb);
         assert_eq!(cfg.memory.timefusion_memory_limit_gb, snapshot.memory.timefusion_memory_limit_gb);
         let _ = buffer_before;
+    }
+
+    #[test]
+    fn cpu_max_parsing_rounds_up_and_honors_unlimited() {
+        assert_eq!(parse_cpu_max("max 100000"), None); // unthrottled
+        assert_eq!(parse_cpu_max("200000 100000"), Some(2)); // 2 cores
+        assert_eq!(parse_cpu_max("50000 100000"), Some(1)); // 0.5 → 1
+        assert_eq!(parse_cpu_max("150000 100000"), Some(2)); // 1.5 → 2
+        assert_eq!(parse_cpu_max("100000"), Some(1)); // period defaults to 100000
+        assert_eq!(quota_period_to_cores(-1, 100000), None);
     }
 }
