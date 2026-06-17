@@ -1474,7 +1474,10 @@ impl Database {
         // Cap query parallelism at the container's CPU quota (derived in
         // autotune::apply; 0 = leave DataFusion's default). See MemoryConfig.
         if self.config.memory.timefusion_query_partitions > 0 {
-            let _ = options.set("datafusion.execution.target_partitions", &self.config.memory.timefusion_query_partitions.to_string());
+            let _ = options.set(
+                "datafusion.execution.target_partitions",
+                &self.config.memory.timefusion_query_partitions.to_string(),
+            );
         }
 
         // Enable general statistics collection for query optimization.
@@ -3805,7 +3808,10 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
         .iter()
         .map(|(i, sc)| SortColumn {
             values:  combined.column(*i).clone(),
-            options: Some(SortOptions { descending: sc.descending, nulls_first: sc.nulls_first }),
+            options: Some(SortOptions {
+                descending:  sc.descending,
+                nulls_first: sc.nulls_first,
+            }),
         })
         .collect();
     let indices = match lexsort_to_indices(&sort_cols, None) {
@@ -3837,7 +3843,9 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
 /// rewrite rows into Z-order or concatenation, so they MUST pass `false` —
 /// declaring an order the data doesn't have is a latent wrong-results bug for
 /// any reader that trusts it (see docs/plans/2026-06-17-parquet-ordering-pushdown.md).
-fn build_writer_properties(parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema_loader::TableSchema, zstd_level: i32, declare_sorted: bool) -> WriterProperties {
+fn build_writer_properties(
+    parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema_loader::TableSchema, zstd_level: i32, declare_sorted: bool,
+) -> WriterProperties {
     use deltalake::datafusion::parquet::{
         basic::{Compression, Encoding, ZstdLevel},
         file::{metadata::KeyValue, properties::EnabledStatistics},
@@ -4956,7 +4964,10 @@ mod writer_properties_tests {
         use deltalake::datafusion::parquet::file::properties::EnabledStatistics;
         let p = build_writer_properties(
             &cfg(),
-            &schema_with(vec![field("timestamp", "Timestamp(Microsecond, None)"), field("body", "Utf8")], vec!["timestamp"]),
+            &schema_with(
+                vec![field("timestamp", "Timestamp(Microsecond, None)"), field("body", "Utf8")],
+                vec!["timestamp"],
+            ),
             3,
             true,
         );
@@ -4969,7 +4980,10 @@ mod writer_properties_tests {
     // must NOT claim an order they don't write, or order-trusting readers break.
     #[test]
     fn sorting_columns_declared_only_when_sorted() {
-        let s = schema_with(vec![field("timestamp", "Timestamp(Microsecond, None)"), field("id", "Utf8")], vec!["timestamp", "id"]);
+        let s = schema_with(
+            vec![field("timestamp", "Timestamp(Microsecond, None)"), field("id", "Utf8")],
+            vec!["timestamp", "id"],
+        );
         let sorted = build_writer_properties(&cfg(), &s, 3, true);
         let unsorted = build_writer_properties(&cfg(), &s, 3, false);
         assert!(sorted.sorting_columns().is_some(), "flush/dedup path declares the sort order");
@@ -5019,10 +5033,10 @@ mod writer_properties_tests {
             Field::new("extra", DataType::Utf8, true),
         ]));
         let b1 = RecordBatch::try_new(s1, vec![std::sync::Arc::new(Int64Array::from(vec![2, 1]))]).unwrap();
-        let b2 = RecordBatch::try_new(s2, vec![
-            std::sync::Arc::new(Int64Array::from(vec![3])),
-            std::sync::Arc::new(StringArray::from(vec![Some("x")])),
-        ])
+        let b2 = RecordBatch::try_new(
+            s2,
+            vec![std::sync::Arc::new(Int64Array::from(vec![3])), std::sync::Arc::new(StringArray::from(vec![Some("x")]))],
+        )
         .unwrap();
         let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
         assert!(!sorted, "mixed-schema bucket must report unsorted, not panic/abort");
