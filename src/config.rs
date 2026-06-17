@@ -176,6 +176,12 @@ const_default!(d_foyer_shards: usize = 8);
 const_default!(d_foyer_file_size_mb: usize = 32);
 const_default!(d_foyer_stats: String = "true");
 const_default!(d_metadata_size_hint: usize = 1_048_576);
+// DataFusion's in-process decoded-parquet-metadata cache (footer + page index).
+// Distinct from the Foyer footer-BYTES cache: this holds the decoded
+// ParquetMetaData so repeat scans skip re-parsing. Entries larger than the
+// limit are silently dropped, so it must comfortably exceed a single file's
+// metadata; the DataFusion default is only 50MB.
+const_default!(d_df_metadata_cache_mb: usize = 512);
 const_default!(d_metadata_memory_mb: usize = 512);
 const_default!(d_metadata_disk_gb: usize = 5);
 const_default!(d_metadata_shards: usize = 4);
@@ -223,6 +229,7 @@ const_default!(d_warm_recency_days: u64 = 2);
 const_default!(d_warm_concurrency: usize = 16);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
+const_default!(d_query_partitions: usize = 0);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
 fn d_service_version() -> String {
@@ -545,6 +552,10 @@ pub struct CacheConfig {
     pub timefusion_foyer_stats:                String,
     #[serde(default = "d_metadata_size_hint")]
     pub timefusion_parquet_metadata_size_hint: usize,
+    /// Memory limit (MB) for DataFusion's decoded parquet-metadata cache
+    /// (`datafusion.runtime.metadata_cache_limit`). See `d_df_metadata_cache_mb`.
+    #[serde(default = "d_df_metadata_cache_mb")]
+    pub timefusion_df_metadata_cache_mb:       usize,
     #[serde(default = "d_metadata_memory_mb")]
     pub timefusion_foyer_metadata_memory_mb:   usize,
     #[serde(default)]
@@ -747,6 +758,13 @@ pub struct MemoryConfig {
     pub timefusion_memory_pool:                  MemoryPoolKind,
     #[serde(default = "d_true")]
     pub timefusion_tracing_record_metrics:       bool,
+    /// DataFusion `target_partitions` for query + maintenance sessions. 0 =
+    /// auto: `autotune::apply()` derives it from the container's CPU quota
+    /// (num_cpus ignores the CFS quota, oversubscribing throttled containers).
+    /// A non-zero env (`TIMEFUSION_QUERY_PARTITIONS`) wins. 0 also when unset in
+    /// tests → sessions keep DataFusion's default.
+    #[serde(default = "d_query_partitions")]
+    pub timefusion_query_partitions:             usize,
 }
 
 impl MemoryConfig {
