@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1.48", features = ["full"] }
-datafusion = "53.1.0"
-datafusion-datasource = "53.1.0"
+datafusion = "54.0.0"
+datafusion-datasource = "54.0.0"
 arrow = "58"
 arrow-ipc = "58"
 arrow-json = "58"
@@ -21,13 +21,12 @@ log = "0.4.27"
 color-eyre = "0.6.5"
 arrow-schema = "58"
 regex = "1.11.1"
-# delta-rs main + local Variant DML fix. Branch `timefusion-variant-dml` on
-# our fork carries the write_data_plan normalization for issue #40
-# ("Expected Struct(Binary), got Struct(BinaryView)" on DELETE/UPDATE).
-# Rebase the branch onto upstream main when picking up newer revs.
-# Pinned to a SHA, not the branch tip, so `cargo update` can't silently pull
-# breaking changes from the fork. Bump explicitly when rebasing on upstream.
-deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "76fb0c8bf864e221862deb91837e0c6d5681deaf", features = [
+# delta-rs main + local Variant DML fixes + parquet sort-order pushdown. Branch
+# `timefusion-variant-dml` on our fork (rebased onto upstream DataFusion 54).
+# We track the branch tip (not a pinned SHA); Cargo.lock keeps prod/CI builds
+# reproducible. To pick up a fork push: `cargo update -p deltalake`. Avoid a
+# bare `cargo update`, which would also pull the other fork branch tips.
+deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", branch = "timefusion-variant-dml", features = [
   "datafusion",
   "s3",
 ] }
@@ -47,8 +46,8 @@ sqlx = { version = "0.8", features = [
 futures = { version = "0.3.31", features = ["alloc"] }
 bytes = "1.4"
 tokio-rustls = "0.26.1"
-datafusion-postgres = "0.16"
-datafusion-functions-json = "0.53"
+datafusion-postgres = "0.17"
+datafusion-functions-json = "0.54"
 anyhow = "1.0.100"
 subtle = "2"
 sha2 = "0.10"
@@ -63,8 +62,8 @@ opentelemetry = "0.31"
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio", "metrics", "logs"] }
 opentelemetry-appender-tracing = "0.31"
-datafusion-tracing = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git", rev = "8c28322f" }
-instrumented-object-store = { git = "https://github.com/datafusion-contrib/datafusion-tracing.git", rev = "8c28322f" }
+datafusion-tracing = "54.0.0"
+instrumented-object-store = "54.0.0"
 dotenv = "0.15.0"
 include_dir = "0.7"
 aws-config = { version = "1.6.0", features = ["behavior-version-latest"] }
@@ -86,7 +85,9 @@ walrus-rust = { path = "vendor/walrus-rust" }
 thiserror = "2.0"
 strum = { version = "0.27", features = ["derive"] }
 derive_more = { version = "2", features = ["debug", "display"] }
-datafusion-variant = { git = "https://github.com/datafusion-contrib/datafusion-variant.git", branch = "main" }
+# Official datafusion-contrib/datafusion-variant — supports DataFusion 54 / arrow
+# 58.3 as of #62. We carry no local changes, so use upstream directly (pinned).
+datafusion-variant = { git = "https://github.com/datafusion-contrib/datafusion-variant.git", rev = "9e1c84698150eaef7b640f50f907dd8e585174f5" }
 parquet-variant-compute = "58.3"
 parquet-variant-json = "58.3"
 parquet-variant = "58.3"
@@ -111,7 +112,7 @@ tonic-prost-build = "0.14"
 sqllogictest = { git = "https://github.com/risinglightdb/sqllogictest-rs.git" }
 serial_test = "3.2.0"
 tokio = { version = "1.48", features = ["test-util"] }
-datafusion-common = "53.1.0"
+datafusion-common = "54.0.0"
 tokio-postgres = { version = "0.7.10", features = ["with-chrono-0_4", "with-serde_json-1"] }
 rand = "0.10.0"
 tempfile = "3"
@@ -173,23 +174,19 @@ codegen-units = 16
 debug = 0
 strip = "none"
 
-# Local patch: arrow-pg 0.13.0's UUID parameter decoder calls
-# `portal.parameter::<String>`, which pgwire rejects for the UUID OID and
-# breaks any client (Hasql, tokio-postgres binary) sending UUIDs. Vendored
-# copy decodes as `uuid::Uuid` then stringifies into the Utf8 column.
 [patch.crates-io]
-arrow-pg = { path = "vendor/arrow-pg" }
-# Local patch: datafusion-postgres 0.16.0's `ordered_param_types` sorts
-# placeholders lexicographically (`$10` before `$2`), so multi-row INSERTs
-# with >9 placeholders return the wrong type-by-position to the client.
-# Vendored copy sorts by numeric suffix instead.
-datafusion-postgres = { path = "vendor/datafusion-postgres" }
-# Fork patch on 53.1.0: removes the SQL planner's defensive
-# `not_impl_err!("UPDATE ... FROM is not supported")` guard so that
-# `UPDATE ... FROM` reaches TF's `DmlQueryPlanner` (lowers to Delta
-# `MergeBuilder` / MemBuffer hash-join). Mirrors the SQL-layer change in
-# apache/datafusion#21530 (kosiew). DataFusion's own physical-planner
-# work for UPDATE FROM is irrelevant to TF — we intercept DML at the
-# logical layer. Tracking apache/datafusion#19950; drop this patch once
-# upstream merges and we bump past it.
-datafusion-sql = { git = "https://github.com/tonyalaribe/datafusion.git", branch = "timefusion-update-from-53.1.0" }
+# datafusion-postgres ecosystem on our fork's DataFusion 54 branch
+# (apitoolkit/datafusion-postgres @ timefusion-df54, off v0.16.0). Carries two
+# fixes: arrow-pg decodes UUID/JSON/JSONB bind params by raw bytes (pgwire's
+# FromSql<String> rejects those OIDs, breaking any client sending a UUID), and
+# `ordered_param_types` sorts placeholders by numeric suffix (lexicographic put
+# `$10` before `$2`, mistyping params in >9-placeholder statements). Patching
+# datafusion-postgres alone pulls its sibling arrow-pg/datafusion-pg-catalog
+# from the same git workspace, so those need no separate patch.
+datafusion-postgres = { git = "https://github.com/apitoolkit/datafusion-postgres.git", branch = "timefusion-df54" }
+# datafusion-sql on our fork (tonyalaribe/datafusion @ timefusion-update-from-54,
+# off tag 54.0.0): removes the SQL planner's defensive
+# `not_impl_err!("UPDATE ... FROM is not supported")` guard so `UPDATE ... FROM`
+# reaches TF's DmlQueryPlanner (Delta MergeBuilder / MemBuffer hash-join).
+# Mirrors apache/datafusion#21530; drop once upstream merges #19950.
+datafusion-sql = { git = "https://github.com/tonyalaribe/datafusion.git", branch = "timefusion-update-from-54" }

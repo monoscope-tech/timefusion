@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc};
+use std::{sync::Arc};
 
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Utc};
@@ -51,9 +51,6 @@ fn extract_scalar_string(arg: &ColumnarValue, label: &str) -> datafusion::error:
 /// in a `signature` field. `return_type` / `invoke_with_args` stay per-impl.
 macro_rules! scalar_udf_boilerplate {
     ($name:literal) => {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn name(&self) -> &str {
             $name
         }
@@ -334,9 +331,6 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
 }
 
 impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_OUT: bool> ScalarUDFImpl for VariantExtWrapper<U, JSONB_OUT> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -1026,9 +1020,6 @@ macro_rules! jsonb_wrapper {
             }
         }
         impl ScalarUDFImpl for $wrap {
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
             fn name(&self) -> &str {
                 $pg_name
             }

@@ -9,7 +9,7 @@
 //! must remain a *superset* of what tantivy returns so post-filtering with
 //! this UDF preserves correctness.
 
-use std::{any::Any, sync::Arc};
+use std::{sync::Arc};
 
 use arrow::{
     array::{Array, ArrayRef, BooleanBuilder, StringArray, StringViewArray},
@@ -36,9 +36,6 @@ impl Default for TextMatchUdf {
 }
 
 impl ScalarUDFImpl for TextMatchUdf {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn name(&self) -> &str {
         TEXT_MATCH_NAME
     }
