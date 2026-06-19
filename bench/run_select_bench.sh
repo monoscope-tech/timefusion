@@ -16,7 +16,7 @@ rm -rf "$data_dir"; mkdir -p "$data_dir"
 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
   aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://timefusion-bench --recursive >/dev/null 2>&1 || true
 
-set -a; source .env; set +a
+[ -f .env ] && { set -a; source .env; set +a; } || echo "note: no .env found; using ambient environment"
 export AWS_S3_BUCKET=timefusion-bench
 export TIMEFUSION_DATA_DIR="$data_dir"
 export TIMEFUSION_TABLE_PREFIX=bench
