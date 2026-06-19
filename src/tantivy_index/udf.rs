@@ -9,7 +9,7 @@
 //! must remain a *superset* of what tantivy returns so post-filtering with
 //! this UDF preserves correctness.
 
-use std::{sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
     array::{Array, ArrayRef, BooleanBuilder, StringArray, StringViewArray},

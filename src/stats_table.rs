@@ -8,7 +8,7 @@
 //!     SELECT * FROM timefusion_stats;
 //!     SELECT key, value FROM timefusion_stats WHERE component='mem_buffer';
 
-use std::{sync::Arc};
+use std::sync::Arc;
 
 use arrow::{
     array::{ArrayRef, StringArray},

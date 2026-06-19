@@ -4464,7 +4464,6 @@ impl DataSink for ProjectRoutingTable {
         debug!("write_all: completed insertion of {} total rows", total_row_count);
         Ok(total_row_count as u64)
     }
-
 }
 
 #[async_trait]
