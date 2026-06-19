@@ -1096,7 +1096,10 @@ impl BufferedWriteLayer {
                     // metered in flush_completed/force_flush; this flags the
                     // relief loop itself stalling. (`record_flush(false)` would
                     // be wrong here — no commit was attempted this round.)
-                    error!("Pressure relief made no progress: used={}MB still over the limit — Delta flush is not freeing memory", now / (1024 * 1024));
+                    error!(
+                        "Pressure relief made no progress: used={}MB still over the limit — Delta flush is not freeing memory",
+                        now / (1024 * 1024)
+                    );
                     break;
                 }
                 last = now;
