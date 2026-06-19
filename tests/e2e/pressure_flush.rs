@@ -82,9 +82,14 @@ async fn inserts_over_hard_limit_apply_backpressure_not_rejection() -> anyhow::R
         .await
         .map_err(|_| anyhow::anyhow!("inserts under backpressure deadlocked"))??;
 
+    // The ~150MB lands in one open bucket, so only the current-bucket
+    // force-flush escalation can drain it — assert that ran. (We no longer
+    // require `backpressure_engaged_total >= 1`: the background flusher now
+    // escalates proactively at the pressure threshold, often draining the
+    // bucket before any insert reaches the hard-limit backpressure path.)
     assert!(
-        env.snapshot_stats().backpressure_engaged_total >= 1,
-        "backpressure must engage when the open bucket exceeds the hard limit"
+        env.snapshot_stats().backpressure_force_flush_total >= 1,
+        "force-flush must drain the over-budget open bucket"
     );
 
     let rows = client.query("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_bp"]).await?;

@@ -134,6 +134,7 @@ class Stats:
         self.batches = 0
         self.errors: list[str] = []
         self.lat: dict[str, list[float]] = defaultdict(list)
+        self.wlat: list[float] = []  # per-INSERT latency (ms) — the dual-write ack metric
         self.query_errors: list[str] = []
 
 
@@ -156,10 +157,13 @@ def writer(stop: threading.Event, pid: str, rows: list[dict], batch_size: int, s
                 for c in COLUMNS:
                     flat.append(_to_pg(c, r.get(c)))
             try:
+                t = time.perf_counter()
                 cur.execute(base_sql + ", ".join([placeholders]*len(batch)), flat)
+                ins_ms = (time.perf_counter() - t) * 1000
                 with stats.lock:
                     stats.inserted += len(batch)
                     stats.batches += 1
+                    stats.wlat.append(ins_ms)
             except Exception as e:
                 with stats.lock:
                     stats.errors.append(repr(e)[:200])
@@ -283,6 +287,10 @@ def main():
     print(f"  insert errors  : {len(stats.errors)}")
     if stats.errors[:3]:
         for e in stats.errors[:3]: print(f"    - {e}")
+    if stats.wlat:
+        w = stats.wlat
+        print(f"  INSERT ack lat : n={len(w):,}  p50={pct(w,50):6.1f}ms  p90={pct(w,90):7.1f}ms  "
+              f"p99={pct(w,99):7.1f}ms  p99.9={pct(w,99.9):8.1f}ms  max={max(w):8.1f}ms")
 
     print("\n# reads (budget {:.0f} ms)".format(args.budget_ms))
     overall_pass = len(stats.errors) == 0
