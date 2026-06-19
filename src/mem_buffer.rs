@@ -476,9 +476,7 @@ fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&FnRegistr
     // DF54's comparison kernels no longer auto-coerce mismatched string views
     // (e.g. `upper(name)` Utf8View vs a Utf8 literal), so apply the same type
     // coercion the analyzer would before this predicate is lowered to a physical expr.
-    Ok(expr
-        .rewrite(&mut datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter::new(schema))?
-        .data)
+    Ok(expr.rewrite(&mut datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter::new(schema))?.data)
 }
 
 struct RegistryContextProvider<'a> {
