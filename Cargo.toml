@@ -27,7 +27,7 @@ regex = "1.11.1"
 # Rebase the branch onto upstream main when picking up newer revs.
 # Pinned to a SHA, not the branch tip, so `cargo update` can't silently pull
 # breaking changes from the fork. Bump explicitly when rebasing on upstream.
-deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "2f473fe4c196401f7e8bc8eecae6bad365a45489", features = [
+deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "76fb0c8bf864e221862deb91837e0c6d5681deaf", features = [
   "datafusion",
   "s3",
 ] }
