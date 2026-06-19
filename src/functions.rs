@@ -168,8 +168,20 @@ fn extract_path_component(expr: &Expr) -> Option<PathComponent> {
 /// Check if expression evaluates to a Variant type
 fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
     match expr {
-        // Direct column reference
-        Expr::Column(col) => schema.field_from_column(col).map(|f| is_variant_type(f.data_type())).unwrap_or(false),
+        // Direct column reference. The SQL-facing schema un-types Variant columns to
+        // Utf8View (see `create_insert_compatible_schema`) and tags them
+        // `tf.pg_type=jsonb`, so by the time the planner runs `plan_binary_op` the real
+        // Struct type is gone. Detect the marker too, else `->`/`->>` fall through to
+        // datafusion-functions-json (json_get/json_as_text) and blow up once the
+        // analyzer restores the Variant struct. On a base column the tag is only ever
+        // set on Variant columns (UDF-output `tf.pg_type` tags live on expressions).
+        Expr::Column(col) => schema
+            .field_from_column(col)
+            .map(|f| {
+                is_variant_type(f.data_type())
+                    || f.metadata().get("tf.pg_type").map(|v| v == "jsonb").unwrap_or(false)
+            })
+            .unwrap_or(false),
         // Unwrap aliases
         Expr::Alias(alias) => is_variant_column(&alias.expr, schema),
         // Check if it's a call to a variant-producing function
@@ -357,6 +369,39 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
         self.inner.coerce_types(arg_types)
     }
     fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
+        use datafusion::arrow::compute::cast;
+        use datafusion::arrow::datatypes::{DataType, Field};
+        // The official datafusion-variant UDFs declare a BinaryView Variant output but
+        // pass the input `metadata` buffer through unchanged. TF stores Variants as
+        // Struct(Binary, Binary) (delta-kernel / delta-rs fork requirement), so a
+        // Binary-input Variant makes the inner UDF's *declared* (BinaryView) and
+        // *actual* (Binary metadata) output types disagree → the DataFusion
+        // "result_data_type == expected_type" assertion fires. Coerce Variant args to
+        // BinaryView here so the inner UDF is internally consistent; TF's on-disk /
+        // MemBuffer representation stays Binary.
+        for i in 0..args.args.len() {
+            let field = args.arg_fields[i].clone();
+            let DataType::Struct(inner) = field.data_type() else { continue };
+            if !is_variant_type(field.data_type()) || !inner.iter().any(|f| matches!(f.data_type(), DataType::Binary)) {
+                continue;
+            }
+            let bv_fields: datafusion::arrow::datatypes::Fields = inner
+                .iter()
+                .map(|f| {
+                    let dt = if matches!(f.data_type(), DataType::Binary) { DataType::BinaryView } else { f.data_type().clone() };
+                    Arc::new(Field::new(f.name(), dt, f.is_nullable()))
+                })
+                .collect::<Vec<_>>()
+                .into();
+            let bv = DataType::Struct(bv_fields);
+            let arr = match &args.args[i] {
+                ColumnarValue::Array(a) => a.clone(),
+                ColumnarValue::Scalar(s) => s.to_array_of_size(args.number_rows)?,
+            };
+            let casted = cast(&arr, &bv).map_err(|e| datafusion::error::DataFusionError::Execution(format!("variant BinaryView coerce: {e}")))?;
+            args.args[i] = ColumnarValue::Array(casted);
+            args.arg_fields[i] = Arc::new(Field::new(field.name(), bv, field.is_nullable()).with_metadata(field.metadata().clone()));
+        }
         args.arg_fields = args.arg_fields.iter().map(stamp_variant_field).collect();
         self.inner.invoke_with_args(args)
     }
