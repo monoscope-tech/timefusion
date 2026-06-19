@@ -879,6 +879,7 @@ impl Database {
     /// - Per-field `dictionary: false` opt-out for high-entropy free-text.
     /// - Per-field `bloom_filter: true` opt-in for point-lookup columns
     ///   (ids/trace_ids/span_ids); NDV scaled to row-group size.
+    ///
     /// `declare_sorted`: pass `true` only from paths that sort rows by the
     /// schema sort keys before writing (flush, dedup). Optimize/compact pass
     /// `false`. See `build_writer_properties`.

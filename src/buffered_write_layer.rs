@@ -557,9 +557,14 @@ impl BufferedWriteLayer {
                         );
                         return Err(e);
                     }
-                    // Brief yield so the background flush task can free RAM
-                    // before we retry the reservation.
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    // Wait for a flush to free RAM, then retry. Woken early by
+                    // `flush_tick_notify` (the relief winner / background task
+                    // signals it on every flush), capped at 25ms so a missed
+                    // wakeup can't stall the retry.
+                    tokio::select! {
+                        _ = self.flush_tick_notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
                 }
             }
         }
@@ -581,6 +586,10 @@ impl BufferedWriteLayer {
         {
             warn!("pressure: force_flush_current_buckets failed: {}", e);
         }
+        // Memory may now be below the limit — wake any backpressured writers
+        // parked on `flush_tick_notify` so they retry their reservation
+        // immediately instead of waiting out their 25ms poll.
+        self.flush_tick_notify.notify_waiters();
     }
 
     /// Force-flush the current (still-open) bucket(s) to Delta. Normal flushing
@@ -1081,7 +1090,14 @@ impl BufferedWriteLayer {
                 self.relieve_memory_pressure().await;
                 let now = self.effective_memory_bytes();
                 if now + now / 100 >= last {
-                    break; // no progress this round
+                    // Gave up still over the limit: Delta isn't freeing RAM, so
+                    // inserts are about to hit their own backpressure/reject path.
+                    // Surface it at error level — per-flush failures are already
+                    // metered in flush_completed/force_flush; this flags the
+                    // relief loop itself stalling. (`record_flush(false)` would
+                    // be wrong here — no commit was attempted this round.)
+                    error!("Pressure relief made no progress: used={}MB still over the limit — Delta flush is not freeing memory", now / (1024 * 1024));
+                    break;
                 }
                 last = now;
             }

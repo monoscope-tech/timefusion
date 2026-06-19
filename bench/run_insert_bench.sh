@@ -5,6 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 label="${1:-m}"; writers="${2:-24}"; dur="${3:-60}"; mem="${4:-256}"; flush="${5:-15}"
+mkdir -p bench/data
 report="bench/data/${label}.report"
 ROW_LIMIT="${ROW_LIMIT:-6000}" ./bench/insert_tail.sh "$label" "$writers" "$dur" "$mem" "$flush" > "$report" 2>&1 || true
 echo "########## CONFIG: $label  writers=$writers mem=${mem}MB flush=${flush}s ##########"
