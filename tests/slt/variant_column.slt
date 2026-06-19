@@ -1,0 +1,66 @@
+# Variant COLUMN operator/predicate tests.
+#
+# Regression guard for the DF54 migration: `->`, `->>` and predicates on a
+# Variant-typed COLUMN (body/attributes) broke in prod, while the existing
+# json_functions.slt only exercised them on `status_message` (Utf8). The
+# underlying variant_get/variant_to_json UDFs worked; the operator binding and
+# variant-column predicate pushdown did not.
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, kind, resource___service___name,
+    status_code, level, duration, summary, body
+) VALUES
+    ('variant_col_test', TIMESTAMP '2024-01-15T10:00:00Z', 'vc_1', ARRAY['h']::VARCHAR[], DATE '2024-01-15',
+     'test', 'SERVER', 'svc', 'OK', 'INFO', 1000000, ARRAY['s'], '{"message": "hello", "nested": {"k": "v"}}')
+
+# raw read of a Variant column (auto variant_to_json at the wire) — already worked
+query T
+SELECT body FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND id='vc_1'
+----
+{"message":"hello","nested":{"k":"v"}}
+
+# variant_get + variant_to_json directly — already worked
+query T
+SELECT variant_to_json(variant_get(body, 'message')) FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND id='vc_1'
+----
+"hello"
+
+# ->> operator on a Variant column (returns unquoted text) — BROKE on DF54
+query T
+SELECT body->>'message' FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND id='vc_1'
+----
+hello
+
+# -> operator on a Variant column (returns a Variant; round-trip to json) — BROKE on DF54
+query T
+SELECT variant_to_json(body->'nested') FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND id='vc_1'
+----
+{"k":"v"}
+
+# chained -> then ->> on a Variant column
+query T
+SELECT body->'nested'->>'k' FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND id='vc_1'
+----
+v
+
+# predicate on a Variant column — BROKE on DF54 (kernel "unknown column")
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body IS NOT NULL
+----
+vc_1
+
+# extraction used in a predicate, WITHOUT parens. The session uses the PostgreSQL
+# SQL dialect so `->`/`->>` bind tighter than `=` (real Postgres semantics); under
+# the default GenericDialect this mis-parsed as `body ->> ('message'='hello')`.
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body->>'message'='hello'
+----
+vc_1
+
+# explicit parens still work too
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND (body->>'message')='hello'
+----
+vc_1

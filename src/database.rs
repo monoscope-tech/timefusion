@@ -1447,6 +1447,12 @@ impl Database {
         // Forcing view types causes UPDATE/DELETE rewrites to fail schema validation against variant columns.
         let _ = options.set("datafusion.execution.parquet.schema_force_view_types", "false");
         let _ = options.set("datafusion.sql_parser.map_string_types_to_utf8view", "true");
+        // PostgreSQL dialect for ctx.sql() parsing. The default GenericDialect gives
+        // the JSON `->`/`->>` operators precedence *below* `=` (PgOther 16 < Eq 20), so
+        // `body->>'k'='v'` mis-parses as `body->>('k'='v')`. PostgreSQL binds them
+        // *above* comparison (matching real Postgres + the pgwire fork's own parser),
+        // so unparenthesized `col->>'k'='v'` works without the caller adding parens.
+        let _ = options.set("datafusion.sql_parser.dialect", "postgresql");
 
         // Enable Parquet statistics for better query optimization with Delta Lake
         // These settings ensure DataFusion uses file and column statistics for pruning
@@ -4492,11 +4498,28 @@ impl TableProvider for ProjectRoutingTable {
     }
 
     fn supports_filters_pushdown(&self, filter: &[&Expr]) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        // Analyze each filter to determine if it can be pushed down exactly
+        // Variant columns are Struct(Binary, Binary); the delta-kernel scan cannot
+        // evaluate predicates on them ("Predicate references unknown column: <col>").
+        // Mark any filter that references a Variant column `Unsupported` so DataFusion
+        // applies it via a FilterExec above the scan rather than pushing it into the
+        // kernel. (Variant predicates can't prune row groups anyway.)
+        let variant_cols: std::collections::HashSet<String> = crate::schema_loader::registry()
+            .get(&self.table_name)
+            .map(|s| {
+                s.schema_ref()
+                    .fields()
+                    .iter()
+                    .filter(|f| crate::schema_loader::is_variant_type(f.data_type()))
+                    .map(|f| f.name().clone())
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(filter
             .iter()
             .map(|f| {
-                if Self::is_exact_pushdown_filter(f) {
+                if !variant_cols.is_empty() && f.column_refs().iter().any(|c| variant_cols.contains(&c.name)) {
+                    TableProviderFilterPushDown::Unsupported
+                } else if Self::is_exact_pushdown_filter(f) {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Inexact
