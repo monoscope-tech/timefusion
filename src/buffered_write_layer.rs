@@ -291,6 +291,12 @@ pub struct BufferedWriteLayer {
     tantivy_index_callback:         Option<TantivyIndexCallback>,
     background_tasks:               Mutex<Vec<JoinHandle<()>>>,
     flush_lock:                     Mutex<()>,
+    // Single-flights insert-path backpressure relief: only the writer that wins
+    // this try_lock drives a relief flush; the rest wait for it to free RAM.
+    // Without it, every blocked writer ran its own flush cycle (the ~20s p99
+    // herd). Distinct from `flush_lock` so relief never blocks behind a routine
+    // background flush already holding `flush_lock`.
+    relief_lock:                    Mutex<()>,
     reserved_bytes:                 AtomicUsize, // Memory reserved for in-flight writes
     pressure_notify:                Arc<Notify>, // Wakes flush task when pressure threshold crossed
     /// Notified at the end of every flush task iteration (success or failure).
@@ -369,6 +375,7 @@ impl BufferedWriteLayer {
             tantivy_index_callback: None,
             background_tasks: Mutex::new(Vec::new()),
             flush_lock: Mutex::new(()),
+            relief_lock: Mutex::new(()),
             reserved_bytes: AtomicUsize::new(0),
             pressure_notify: Arc::new(Notify::new()),
             flush_tick_notify: Arc::new(Notify::new()),
@@ -517,66 +524,72 @@ impl BufferedWriteLayer {
         }
 
         let deadline = std::time::Instant::now() + timeout;
-        let mut last_mem = self.effective_memory_bytes();
-        let mut stalls = 0u32;
         crate::metrics::record_backpressure_engaged();
         self.backpressure_engaged_total.fetch_add(1, Ordering::Relaxed);
         warn!(
-            "Write backpressure engaged: used={}MB ≥ hard limit; flushing to Delta to free RAM (not rejecting)",
-            last_mem / (1024 * 1024)
+            "Write backpressure engaged: used={}MB ≥ hard limit; waking background flush to free RAM (not rejecting, not flushing on insert thread)",
+            self.effective_memory_bytes() / (1024 * 1024)
         );
         loop {
-            // Relieve via completed buckets first (always race-free). Escalate
-            // to force-flushing the current open bucket only after consecutive
-            // stalls — i.e. when a single in-flight window is itself the
-            // pressure and completed-bucket flushes can't help.
-            self.relieve_memory_pressure(stalls >= 2).await;
+            // Single-flight relief: only the writer that wins `relief_lock`
+            // drives the synchronous flush; everyone else just nudges the
+            // background flusher and waits. Previously every blocked writer ran
+            // its own `flush_completed_buckets` + force-flush cycle, all queued
+            // on `flush_lock` — with N writers the one at the back of the herd
+            // waited O(N × commit), the source of the ~20s p99 tail. Now one
+            // writer flushes (O(commit)) while the rest sleep below.
+            if let Ok(_relief) = self.relief_lock.try_lock() {
+                self.relieve_memory_pressure().await;
+            } else {
+                self.pressure_notify.notify_one();
+            }
 
             match self.try_reserve_memory(batches).await {
                 Ok(sz) => return Ok(sz),
                 Err(e) => {
-                    let now_mem = self.effective_memory_bytes();
-                    // Count a stall when this round freed <1% of memory.
-                    if now_mem + now_mem / 100 >= last_mem {
-                        stalls += 1;
-                    } else {
-                        stalls = 0;
-                    }
-                    last_mem = now_mem;
                     if std::time::Instant::now() >= deadline {
                         crate::metrics::record_backpressure_rejected();
                         self.backpressure_rejected_total.fetch_add(1, Ordering::Relaxed);
                         error!(
                             "Write backpressure exhausted after {:?}: used={}MB still over hard limit — Delta flush is not freeing memory; rejecting (data remains in WAL)",
                             timeout,
-                            now_mem / (1024 * 1024)
+                            self.effective_memory_bytes() / (1024 * 1024)
                         );
                         return Err(e);
                     }
-                    // Brief yield so the background flush task and other writers
-                    // can make progress between our synchronous drain attempts.
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    // Wait for a flush to free RAM, then retry. Woken early by
+                    // `flush_tick_notify` (the relief winner / background task
+                    // signals it on every flush), capped at 25ms so a missed
+                    // wakeup can't stall the retry.
+                    tokio::select! {
+                        _ = self.flush_tick_notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {}
+                    }
                 }
             }
         }
     }
 
-    /// Synchronously drain MemBuffer → Delta to relieve insert-path memory
-    /// pressure. Flushes completed buckets first (always safe); when
-    /// `force_current` is set also force-flushes the current open bucket(s) via
-    /// the atomic `take_bucket_for_flush` path.
-    async fn relieve_memory_pressure(&self, force_current: bool) {
+    /// One pass of pressure relief: drain completed buckets, then — if still
+    /// over the limit — force-flush the current open bucket(s). Order matters:
+    /// `force_flush_current_buckets` self-gates while completed buckets remain
+    /// (WAL-ordering invariant), so completed buckets must drain first. Shared
+    /// by the insert backpressure path (single-flighted via `relief_lock`) and
+    /// the background flush task; both warn-and-continue on flush errors so the
+    /// caller's retry/no-progress logic decides when to give up.
+    async fn relieve_memory_pressure(&self) {
         if let Err(e) = self.flush_completed_buckets().await {
-            warn!("backpressure: flush_completed_buckets failed: {}", e);
+            warn!("pressure: flush_completed_buckets failed: {}", e);
         }
-        // `force_flush_current_buckets` self-gates on the WAL-ordering invariant
-        // (see its body), so calling it whenever pressure persists is safe.
-        if force_current
-            && self.is_memory_pressure()
+        if self.is_memory_pressure()
             && let Err(e) = self.force_flush_current_buckets().await
         {
-            warn!("backpressure: force_flush_current_buckets failed: {}", e);
+            warn!("pressure: force_flush_current_buckets failed: {}", e);
         }
+        // Memory may now be below the limit — wake any backpressured writers
+        // parked on `flush_tick_notify` so they retry their reservation
+        // immediately instead of waiting out their 25ms poll.
+        self.flush_tick_notify.notify_waiters();
     }
 
     /// Force-flush the current (still-open) bucket(s) to Delta. Normal flushing
@@ -1064,6 +1077,32 @@ impl BufferedWriteLayer {
                 crate::metrics::record_flush(false);
                 self.flush_failed_total.fetch_add(1, Ordering::Relaxed);
                 error!("Flush task error: {}", e);
+            }
+
+            // Pressure escalation off the insert path: a single still-open
+            // window can be the whole budget, which completed-bucket flushing
+            // can't relieve. Drive `relieve_memory_pressure` until we drop below
+            // the limit or a round frees nothing (avoids a busy spin when Delta
+            // is the bottleneck). Inserts proactively served here usually never
+            // touch their own backpressure path.
+            let mut last = self.effective_memory_bytes();
+            while self.is_memory_pressure() {
+                self.relieve_memory_pressure().await;
+                let now = self.effective_memory_bytes();
+                if now + now / 100 >= last {
+                    // Gave up still over the limit: Delta isn't freeing RAM, so
+                    // inserts are about to hit their own backpressure/reject path.
+                    // Surface it at error level — per-flush failures are already
+                    // metered in flush_completed/force_flush; this flags the
+                    // relief loop itself stalling. (`record_flush(false)` would
+                    // be wrong here — no commit was attempted this round.)
+                    error!(
+                        "Pressure relief made no progress: used={}MB still over the limit — Delta flush is not freeing memory",
+                        now / (1024 * 1024)
+                    );
+                    break;
+                }
+                last = now;
             }
             // WAL monitoring: check file accumulation
             let (file_count, total_bytes) = self.wal.wal_stats();
