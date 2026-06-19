@@ -177,10 +177,7 @@ fn is_variant_column(expr: &Expr, schema: &DFSchema) -> bool {
         // set on Variant columns (UDF-output `tf.pg_type` tags live on expressions).
         Expr::Column(col) => schema
             .field_from_column(col)
-            .map(|f| {
-                is_variant_type(f.data_type())
-                    || f.metadata().get("tf.pg_type").map(|v| v == "jsonb").unwrap_or(false)
-            })
+            .map(|f| is_variant_type(f.data_type()) || f.metadata().get("tf.pg_type").map(|v| v == "jsonb").unwrap_or(false))
             .unwrap_or(false),
         // Unwrap aliases
         Expr::Alias(alias) => is_variant_column(&alias.expr, schema),
@@ -369,8 +366,10 @@ impl<U: ScalarUDFImpl + Default + Hash + PartialEq + Eq + 'static, const JSONB_O
         self.inner.coerce_types(arg_types)
     }
     fn invoke_with_args(&self, mut args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
-        use datafusion::arrow::compute::cast;
-        use datafusion::arrow::datatypes::{DataType, Field};
+        use datafusion::arrow::{
+            compute::cast,
+            datatypes::{DataType, Field},
+        };
         // The official datafusion-variant UDFs declare a BinaryView Variant output but
         // pass the input `metadata` buffer through unchanged. TF stores Variants as
         // Struct(Binary, Binary) (delta-kernel / delta-rs fork requirement), so a
