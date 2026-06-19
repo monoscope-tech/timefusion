@@ -472,7 +472,13 @@ fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&FnRegistr
         .map_err(|e| datafusion::error::DataFusionError::SQL(e.into(), None))?;
     let context_provider = RegistryContextProvider { registry };
     let planner = SqlToRel::new(&context_provider);
-    planner.sql_to_expr(sql_expr, schema, &mut Default::default())
+    let expr = planner.sql_to_expr(sql_expr, schema, &mut Default::default())?;
+    // DF54's comparison kernels no longer auto-coerce mismatched string views
+    // (e.g. `upper(name)` Utf8View vs a Utf8 literal), so apply the same type
+    // coercion the analyzer would before this predicate is lowered to a physical expr.
+    Ok(expr
+        .rewrite(&mut datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter::new(schema))?
+        .data)
 }
 
 struct RegistryContextProvider<'a> {
@@ -492,6 +498,9 @@ impl<'a> datafusion::sql::planner::ContextProvider for RegistryContextProvider<'
     fn get_window_meta(&self, name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::WindowUDF>> {
         self.registry?.udwf(name).ok()
     }
+    fn get_higher_order_meta(&self, _name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::HigherOrderUDF>> {
+        None
+    }
     fn get_variable_type(&self, _: &[String]) -> Option<DataType> {
         None
     }
@@ -507,6 +516,9 @@ impl<'a> datafusion::sql::planner::ContextProvider for RegistryContextProvider<'
     }
     fn udwf_names(&self) -> Vec<String> {
         self.registry.map(|r| r.udwfs().into_iter().collect()).unwrap_or_default()
+    }
+    fn higher_order_function_names(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 

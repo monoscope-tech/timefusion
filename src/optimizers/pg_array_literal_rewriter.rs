@@ -63,7 +63,7 @@ pub struct PgCoalesceUdf {
 /// workspace pin, or this check would pass against the wrong version. By the
 /// same token, fork upgrades that keep the version string still need the
 /// manual audit — the tripwire only catches plain `cargo update`s.
-const AUDITED_DATAFUSION_VERSION: &str = "53.1.0";
+const AUDITED_DATAFUSION_VERSION: &str = "54.0.0";
 // Byte loop because `&str` equality (PartialEq) isn't const-callable on
 // stable — assert!(a == b) won't compile in a const block.
 const _: () = {
@@ -91,9 +91,6 @@ impl Default for PgCoalesceUdf {
 }
 
 impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
     fn name(&self) -> &str {
         "coalesce"
     }

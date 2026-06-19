@@ -1,4 +1,4 @@
-use std::{any::Any, sync::Arc};
+use std::{sync::Arc};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -578,10 +578,6 @@ impl ExecutionPlan for DmlExec {
             DmlOperation::Update => "DeltaUpdateExec",
             DmlOperation::Delete => "DeltaDeleteExec",
         }
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

@@ -8,7 +8,7 @@
 //!     SELECT * FROM timefusion_stats;
 //!     SELECT key, value FROM timefusion_stats WHERE component='mem_buffer';
 
-use std::{any::Any, sync::Arc};
+use std::{sync::Arc};
 
 use arrow::{
     array::{ArrayRef, StringArray},
@@ -194,9 +194,6 @@ impl StatsTableProvider {
 
 #[async_trait]
 impl TableProvider for StatsTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

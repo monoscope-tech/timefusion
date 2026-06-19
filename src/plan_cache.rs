@@ -72,9 +72,10 @@ fn fold_literal_casts(plan: LogicalPlan) -> datafusion::error::Result<LogicalPla
             .into_iter()
             .map(|expr| {
                 expr.transform_up(|e| {
-                    if let Expr::Cast(Cast { expr, data_type }) = &e
+                    if let Expr::Cast(Cast { expr, field }) = &e
                         && let Expr::Literal(value, metadata) = expr.as_ref()
                     {
+                        let data_type = field.data_type();
                         return match value.cast_to(data_type) {
                             Ok(folded) => Ok(Transformed::yes(Expr::Literal(folded, metadata.clone()))),
                             // If a particular literal can't be cast (e.g. lossy
@@ -252,7 +253,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
     let batch = RecordBatch::try_new(final_schema, columns).map_err(arrow_err)?;
 
     let provider = session_context.table_provider(table_name.clone()).await?;
-    let Some(routing) = provider.as_any().downcast_ref::<crate::database::ProjectRoutingTable>() else {
+    let Some(routing) = provider.downcast_ref::<crate::database::ProjectRoutingTable>() else {
         return Ok(None);
     };
     let rows = routing.fast_insert_batch(batch).await?;

@@ -1,4 +1,4 @@
-use std::{any::Any, collections::HashMap, fmt, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use arrow_schema::SchemaRef;
@@ -4465,17 +4465,10 @@ impl DataSink for ProjectRoutingTable {
         Ok(total_row_count as u64)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 #[async_trait]
 impl TableProvider for ProjectRoutingTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_type(&self) -> TableType {
         TableType::Base
     }

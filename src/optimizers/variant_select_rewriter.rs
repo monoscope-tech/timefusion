@@ -81,10 +81,10 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         return Ok(Transformed::no(plan));
     };
     // Source must be a DefaultTableSource around ProjectRoutingTable.
-    let Some(default_src) = scan.source.as_any().downcast_ref::<DefaultTableSource>() else {
+    let Some(default_src) = scan.source.downcast_ref::<DefaultTableSource>() else {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
     };
-    let Some(routing) = default_src.table_provider.as_any().downcast_ref::<ProjectRoutingTable>() else {
+    let Some(routing) = default_src.table_provider.downcast_ref::<ProjectRoutingTable>() else {
         return Ok(Transformed::no(LogicalPlan::TableScan(scan)));
     };
     // Fast path: if no Utf8View columns are projected, there can be no
@@ -272,7 +272,7 @@ fn is_variant_expr(expr: &Expr, schema: &DFSchema) -> bool {
     // by string name — renaming the UDF or registering another UDF with the
     // same name would otherwise silently break this check.
     if let Expr::ScalarFunction(sf) = expr
-        && sf.func.inner().as_any().is::<VariantToJsonExtUdf>()
+        && sf.func.inner().downcast_ref::<VariantToJsonExtUdf>().is_some()
     {
         return false;
     }
@@ -340,7 +340,7 @@ mod peel_tests {
             Expr::Alias(a) => a.expr.as_ref(),
             other => other,
         };
-        matches!(inner, Expr::ScalarFunction(sf) if sf.func.inner().as_any().is::<VariantToJsonExtUdf>())
+        matches!(inner, Expr::ScalarFunction(sf) if sf.func.inner().downcast_ref::<VariantToJsonExtUdf>().is_some())
     }
 
     fn first_projection_expr(plan: &LogicalPlan) -> &Expr {
