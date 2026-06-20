@@ -20,11 +20,18 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # Provisions a Blacksmith BuildKit builder backed by a persistent sticky
-      # disk — this is what makes the build-push-action's layer cache survive
-      # across runs (replaces the old gha-cache + container-driver buildx setup).
-      - name: Set up Blacksmith Docker Builder
-        uses: useblacksmith/setup-docker-builder@v1
+      # NOTE: the Blacksmith sticky-disk builder (useblacksmith/setup-docker-builder
+      # + build-push-action) was tried in 9082ef1 to keep the cargo-chef cook layer
+      # warm, but it never produced a working build — every run died instantly with
+      # `buildkit .../snapshots/metadata.db: no such file` (the sticky disk wasn't
+      # provisioned). Reverted to the standard buildx + gha cache that deployed
+      # reliably through 19ccb41. Re-attempt Blacksmith only once its sticky-disk
+      # feature is confirmed enabled for this repo.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Use a container-based driver (using BuildKit) to enable cache export.
+          driver-opts: image=moby/buildkit:master
 
       - name: Login to Container Registry
         uses: docker/login-action@v3
@@ -38,17 +45,15 @@ jobs:
           echo "IMAGE_URL=$(echo ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:$(echo ${{ github.sha }} | cut -c1-7) | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
       - name: Build and Push Docker Image
-        # Blacksmith's drop-in build-push action backs the BuildKit cache with a
-        # persistent sticky disk. type=gha caps at 10GB and rate-limits restore,
-        # so this repo's multi-GB Rust dep cache was silently evicting and
-        # forcing full cargo-chef recooks; the sticky disk keeps the cook layer
-        # warm across runs. No cache-from/cache-to needed — it's automatic.
-        uses: useblacksmith/build-push-action@v1
+        uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: true
           tags: ${{ env.IMAGE_URL }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          debug: true
 
       # Pull the published image and verify the binary actually starts.
       # We previously shipped images that exited at the dynamic linker
