@@ -381,8 +381,10 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
 pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> DFResult<Vec<(String, RecordBatch)>> {
     use std::collections::BTreeMap;
 
-    use datafusion::arrow::array::{StringArray, StringViewArray, UInt32Array};
-    use datafusion::arrow::compute::take_record_batch;
+    use datafusion::arrow::{
+        array::{StringArray, StringViewArray, UInt32Array},
+        compute::take_record_batch,
+    };
 
     let num_rows = batch.num_rows();
     if num_rows == 0 {
@@ -418,10 +420,7 @@ pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> 
         return Ok(vec![(pid, batch)]);
     }
 
-    groups
-        .into_iter()
-        .map(|(pid, indices)| Ok((pid, take_record_batch(&batch, &UInt32Array::from(indices))?)))
-        .collect()
+    groups.into_iter().map(|(pid, indices)| Ok((pid, take_record_batch(&batch, &UInt32Array::from(indices))?))).collect()
 }
 
 /// Convert Utf8/Utf8View/LargeUtf8 columns to Variant binary StructArrays where the target
@@ -4526,7 +4525,12 @@ impl DataSink for ProjectRoutingTable {
         // with no cross-project lock contention.
         let writes = project_batches.into_iter().map(|(project_id, batches)| {
             let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-            debug!("write_all: inserting {} batches with {} total rows for project {}", batches.len(), row_count, project_id);
+            debug!(
+                "write_all: inserting {} batches with {} total rows for project {}",
+                batches.len(),
+                row_count,
+                project_id
+            );
             let insert_span = tracing::trace_span!(parent: &span, "delta_table.insert", project_id = %project_id, rows = row_count);
             async move {
                 self.database
@@ -5148,8 +5152,10 @@ mod tests {
     fn test_partition_batch_by_project_row_wise() {
         use std::sync::Arc;
 
-        use datafusion::arrow::array::{ArrayRef, AsArray, Int64Array, StringArray, StringViewArray};
-        use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema};
+        use datafusion::arrow::{
+            array::{ArrayRef, AsArray, Int64Array, StringArray, StringViewArray},
+            datatypes::{DataType, Field, Int64Type, Schema},
+        };
 
         let check = |pid_col: ArrayRef| {
             let schema = Arc::new(Schema::new(vec![
@@ -5161,10 +5167,7 @@ mod tests {
 
             // BTreeMap → deterministic sorted keys: A, B, default
             let parts = partition_batch_by_project(batch, "default").unwrap();
-            let shape: Vec<(String, Vec<i64>)> = parts
-                .iter()
-                .map(|(p, b)| (p.clone(), b.column(1).as_primitive::<Int64Type>().values().to_vec()))
-                .collect();
+            let shape: Vec<(String, Vec<i64>)> = parts.iter().map(|(p, b)| (p.clone(), b.column(1).as_primitive::<Int64Type>().values().to_vec())).collect();
             assert_eq!(
                 shape,
                 vec![("A".into(), vec![1, 3]), ("B".into(), vec![2]), ("default".into(), vec![4])],
@@ -5916,14 +5919,14 @@ mod tests {
             db.storage_configs.write().await.insert(
                 (pb.clone(), table.clone()),
                 StorageConfig {
-                    project_id: pb.clone(),
-                    table_name: table.clone(),
-                    s3_bucket: "timefusion-tests".to_string(),
-                    s3_prefix: format!("custom-{prefix}"),
-                    s3_region: "us-east-1".to_string(),
-                    s3_access_key_id: "minioadmin".to_string(),
+                    project_id:           pb.clone(),
+                    table_name:           table.clone(),
+                    s3_bucket:            "timefusion-tests".to_string(),
+                    s3_prefix:            format!("custom-{prefix}"),
+                    s3_region:            "us-east-1".to_string(),
+                    s3_access_key_id:     "minioadmin".to_string(),
                     s3_secret_access_key: "minioadmin".to_string(),
-                    s3_endpoint: Some("http://127.0.0.1:9000".to_string()),
+                    s3_endpoint:          Some("http://127.0.0.1:9000".to_string()),
                 },
             );
 
@@ -5945,7 +5948,11 @@ mod tests {
                     Result::<i64>::Ok(ctx.sql(&sql).await?.collect().await?[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
                 }
             };
-            assert_eq!(count(pb.clone()).await?, 1, "pb's row must reach pb's BYO bucket, not leak into pa's unified table");
+            assert_eq!(
+                count(pb.clone()).await?,
+                1,
+                "pb's row must reach pb's BYO bucket, not leak into pa's unified table"
+            );
             assert_eq!(count(pa.clone()).await?, 2, "pa keeps exactly its 2 rows");
 
             db.shutdown().await?;
