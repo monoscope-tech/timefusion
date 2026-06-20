@@ -369,6 +369,61 @@ pub fn extract_project_id(batch: &RecordBatch) -> Option<String> {
     })
 }
 
+/// Split a batch row-wise by its `project_id` column into per-project sub-batches.
+///
+/// A single multi-row INSERT (or queued batch) may carry rows for several
+/// projects. TimeFusion stores each project in its own Delta table, so routing
+/// must follow each row's own `project_id` — reading only row 0 (as a plain
+/// [`extract_project_id`] does) silently misroutes every other row into row 0's
+/// table. Rows with a null/absent `project_id` fall back to `default_project`.
+/// A homogeneous batch is returned as-is (no copy); mixed batches are split with
+/// `take`. Groups are keyed in sorted order for deterministic table writes.
+pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> DFResult<Vec<(String, RecordBatch)>> {
+    use std::collections::BTreeMap;
+
+    use datafusion::arrow::array::{StringArray, StringViewArray, UInt32Array};
+    use datafusion::arrow::compute::take_record_batch;
+
+    let num_rows = batch.num_rows();
+    if num_rows == 0 {
+        return Ok(vec![]);
+    }
+    let Some(col_idx) = batch.schema().fields().iter().position(|f| f.name() == "project_id") else {
+        return Ok(vec![(default_project.to_string(), batch)]);
+    };
+    let column = batch.column(col_idx);
+
+    // Group row indices by project. `get_mut`-or-`insert` so the owned key String
+    // is allocated once per distinct project, not once per row.
+    let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    let mut push = |pid: &str, i: usize| match groups.get_mut(pid) {
+        Some(v) => v.push(i as u32),
+        None => drop(groups.insert(pid.to_string(), vec![i as u32])),
+    };
+    if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+        for i in 0..num_rows {
+            push(if arr.is_null(i) { default_project } else { arr.value(i) }, i);
+        }
+    } else if let Some(arr) = column.as_any().downcast_ref::<StringArray>() {
+        for i in 0..num_rows {
+            push(if arr.is_null(i) { default_project } else { arr.value(i) }, i);
+        }
+    } else {
+        return Ok(vec![(default_project.to_string(), batch)]);
+    }
+
+    // Homogeneous batch: route the whole thing, skip the take/copy.
+    if groups.len() == 1 {
+        let pid = groups.into_keys().next().unwrap();
+        return Ok(vec![(pid, batch)]);
+    }
+
+    groups
+        .into_iter()
+        .map(|(pid, indices)| Ok((pid, take_record_batch(&batch, &UInt32Array::from(indices))?)))
+        .collect()
+}
+
 /// Convert Utf8/Utf8View/LargeUtf8 columns to Variant binary StructArrays where the target
 /// schema expects Variant. Called from `DataSink::write_all` so that INSERT statements (where
 /// the table provider presents Variant cols as Utf8View for the SQL planner's type check) can
@@ -2054,13 +2109,20 @@ impl Database {
                 .unwrap_or(&self.default_s3_endpoint.clone().unwrap_or_else(|| "https://s3.amazonaws.com".to_string()))
         );
 
-        let mut storage_options = HashMap::new();
+        // Start from the shared base options so BYO buckets inherit AWS_ALLOW_HTTP +
+        // connect_timeout like the unified table (delta-rs rejects http/on-prem
+        // endpoints without AWS_ALLOW_HTTP), then override with this tenant's
+        // credentials. Endpoint stays tenant-scoped: a BYO bucket with no custom
+        // endpoint must resolve against real AWS S3, so drop the inherited default
+        // rather than point it at ours.
+        let mut storage_options = self.build_storage_options();
         storage_options.insert("AWS_ACCESS_KEY_ID".to_string(), config.s3_access_key_id.clone());
         storage_options.insert("AWS_SECRET_ACCESS_KEY".to_string(), config.s3_secret_access_key.clone());
         storage_options.insert("AWS_REGION".to_string(), config.s3_region.clone());
-        if let Some(ref endpoint) = config.s3_endpoint {
-            storage_options.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone());
-        }
+        match config.s3_endpoint.as_ref() {
+            Some(endpoint) => storage_options.insert("AWS_ENDPOINT_URL".to_string(), endpoint.clone()),
+            None => storage_options.remove("AWS_ENDPOINT_URL"),
+        };
 
         info!(
             "Creating or loading custom table for project '{}' table '{}' at: {}",
@@ -3975,13 +4037,20 @@ impl ProjectRoutingTable {
         if total_rows == 0 {
             return Ok(0);
         }
-        let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
         let target_schema = self.real_schema();
-        let converted = convert_variant_columns(batch, &target_schema)?;
-        self.database
-            .insert_records_batch(&project_id, &self.table_name, vec![converted], false, None)
-            .await
-            .map_err(|e| DataFusionError::Execution(format!("fast_insert_batch for project {} table {}: {}", project_id, self.table_name, e)))?;
+        // Partition row-wise: one INSERT may carry rows for many projects, each
+        // landing in its own Delta table. Distinct projects write concurrently.
+        let mut writes = Vec::new();
+        for (project_id, sub) in partition_batch_by_project(batch, &self.default_project)? {
+            let converted = convert_variant_columns(sub, &target_schema)?;
+            writes.push(async move {
+                self.database
+                    .insert_records_batch(&project_id, &self.table_name, vec![converted], false, None)
+                    .await
+                    .map_err(|e| DataFusionError::Execution(format!("fast_insert_batch for project {} table {}: {}", project_id, self.table_name, e)))
+            });
+        }
+        futures::future::try_join_all(writes).await?;
         Ok(total_rows)
     }
 
@@ -4430,17 +4499,20 @@ impl DataSink for ProjectRoutingTable {
         let mut total_row_count = 0;
         let mut project_batches: HashMap<String, Vec<RecordBatch>> = HashMap::new();
         let target_schema = self.real_schema();
-        // Collect and group batches by project_id, converting Utf8/Utf8View columns into
-        // Variant structs where the target schema expects Variant (INSERT path: schema()
-        // presented Variant cols as Utf8View, so the inbound batches may carry strings).
+        // Collect batches, converting Utf8/Utf8View columns into Variant structs where the
+        // target schema expects Variant (INSERT path: schema() presented Variant cols as
+        // Utf8View, so inbound batches may carry strings), then partition each batch row-wise
+        // by project_id — a single batch may carry rows for many projects, each of which
+        // lands in its own Delta table.
         while let Some(batch) = data.next().await.transpose()? {
             let batch_rows = batch.num_rows();
             debug!("write_all: received batch with {} rows", batch_rows);
             total_row_count += batch_rows;
-            let project_id = extract_project_id(&batch).unwrap_or_else(|| self.default_project.clone());
             let batch = normalize_timestamp_tz(batch)?;
             let converted = convert_variant_columns(batch, &target_schema)?;
-            project_batches.entry(project_id).or_default().push(converted);
+            for (project_id, sub) in partition_batch_by_project(converted, &self.default_project)? {
+                project_batches.entry(project_id).or_default().push(sub);
+            }
         }
 
         span.record("rows.count", total_row_count);
@@ -4450,22 +4522,21 @@ impl DataSink for ProjectRoutingTable {
             return Ok(0);
         }
 
-        // Insert batches for each project
-        for (project_id, batches) in project_batches {
-            let batch_count = batches.len();
+        // Distinct projects → distinct Delta tables/WAL shards: insert them concurrently,
+        // with no cross-project lock contention.
+        let writes = project_batches.into_iter().map(|(project_id, batches)| {
             let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-            debug!(
-                "write_all: inserting {} batches with {} total rows for project {}",
-                batch_count, row_count, project_id
-            );
-
+            debug!("write_all: inserting {} batches with {} total rows for project {}", batches.len(), row_count, project_id);
             let insert_span = tracing::trace_span!(parent: &span, "delta_table.insert", project_id = %project_id, rows = row_count);
-            self.database
-                .insert_records_batch(&project_id, &self.table_name, batches, false, None)
-                .instrument(insert_span)
-                .await
-                .map_err(|e| DataFusionError::Execution(format!("Insert error for project {} table {}: {}", project_id, self.table_name, e)))?;
-        }
+            async move {
+                self.database
+                    .insert_records_batch(&project_id, &self.table_name, batches, false, None)
+                    .instrument(insert_span)
+                    .await
+                    .map_err(|e| DataFusionError::Execution(format!("Insert error for project {} table {}: {}", project_id, self.table_name, e)))
+            }
+        });
+        futures::future::try_join_all(writes).await?;
 
         debug!("write_all: completed insertion of {} total rows", total_row_count);
         Ok(total_row_count as u64)
@@ -5068,6 +5139,49 @@ mod tests {
 
     use super::*;
     use crate::{config::AppConfig, test_utils::test_helpers::*};
+
+    // Regression: a single Arrow batch carrying rows for several projects (as a
+    // genuine multi-row pgwire INSERT produces) must split row-wise — each row to
+    // its own project. The old routing read only row 0 and dumped every row into
+    // the first row's project, silently corrupting the rest.
+    #[test]
+    fn test_partition_batch_by_project_row_wise() {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::{ArrayRef, AsArray, Int64Array, StringArray, StringViewArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Int64Type, Schema};
+
+        let check = |pid_col: ArrayRef| {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("project_id", pid_col.data_type().clone(), true),
+                Field::new("id", DataType::Int64, false),
+            ]));
+            let ids = Int64Array::from(vec![1, 2, 3, 4]); // interleaved A/B/A + null→default
+            let batch = RecordBatch::try_new(schema, vec![pid_col, Arc::new(ids)]).unwrap();
+
+            // BTreeMap → deterministic sorted keys: A, B, default
+            let parts = partition_batch_by_project(batch, "default").unwrap();
+            let shape: Vec<(String, Vec<i64>)> = parts
+                .iter()
+                .map(|(p, b)| (p.clone(), b.column(1).as_primitive::<Int64Type>().values().to_vec()))
+                .collect();
+            assert_eq!(
+                shape,
+                vec![("A".into(), vec![1, 3]), ("B".into(), vec![2]), ("default".into(), vec![4])],
+                "each project keeps exactly its own rows; null falls back to default"
+            );
+        };
+
+        check(Arc::new(StringViewArray::from(vec![Some("A"), Some("B"), Some("A"), None])));
+        check(Arc::new(StringArray::from(vec![Some("A"), Some("B"), Some("A"), None]))); // Utf8 path too
+
+        // Homogeneous batch: single group, whole batch (no split).
+        let schema = Arc::new(Schema::new(vec![Field::new("project_id", DataType::Utf8View, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(StringViewArray::from(vec!["A", "A", "A"]))]).unwrap();
+        let parts = partition_batch_by_project(batch, "default").unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!((parts[0].0.as_str(), parts[0].1.num_rows()), ("A", 3));
+    }
 
     #[test]
     fn test_within_recency() {
@@ -5776,6 +5890,69 @@ mod tests {
         .await;
         crate::clock::unfreeze();
         res.map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
+    }
+
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    // Regression for the row-0 routing bug against BYO-bucket (custom storage)
+    // tenants — the one case where it actually corrupts. A single mixed-project
+    // batch (what a multi-row pgwire INSERT produces) goes through the real
+    // fast_insert_batch path. pb has an isolated custom bucket; pa uses the
+    // default unified table. The old code routed the whole batch to row 0's
+    // project (pa) → all rows landed in the unified table, so pb's row never
+    // reached pb's bucket: silent data loss for pb AND a cross-tenant leak of
+    // pb's row into the shared unified store. (For all-unified projects Delta's
+    // project_id partitioning masks the bug, which is why it needs custom storage
+    // to reproduce.)
+    async fn test_fast_insert_mixed_custom_storage_routing() -> Result<()> {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            use datafusion::arrow::array::AsArray;
+            let (db, ctx, prefix) = setup_test_database().await?;
+            let (pa, pb, table) = (format!("csA_{prefix}"), format!("csB_{prefix}"), "otel_logs_and_spans".to_string());
+
+            // pb is a BYO-bucket tenant: same MinIO, distinct prefix → its own Delta table.
+            // config_pool is None under setup_test_database, so this injected config is
+            // authoritative (no TTL reload overwrites it).
+            db.storage_configs.write().await.insert(
+                (pb.clone(), table.clone()),
+                StorageConfig {
+                    project_id: pb.clone(),
+                    table_name: table.clone(),
+                    s3_bucket: "timefusion-tests".to_string(),
+                    s3_prefix: format!("custom-{prefix}"),
+                    s3_region: "us-east-1".to_string(),
+                    s3_access_key_id: "minioadmin".to_string(),
+                    s3_secret_access_key: "minioadmin".to_string(),
+                    s3_endpoint: Some("http://127.0.0.1:9000".to_string()),
+                },
+            );
+
+            // One batch, interleaved A/B/A so row 0 (pa) is not the only project.
+            let batch = json_to_batch(vec![test_span("a1", "n", &pa), test_span("b1", "n", &pb), test_span("a2", "n", &pa)])?;
+            let provider = ctx.table_provider(table.as_str()).await?;
+            // Upcast to &dyn Any (TableProvider: Any) — `use super::*` pulls arrow's
+            // Array::as_any into scope, which would otherwise shadow the right method.
+            let any: &dyn std::any::Any = provider.as_ref();
+            let rt = any
+                .downcast_ref::<ProjectRoutingTable>()
+                .ok_or_else(|| anyhow::anyhow!("otel_logs_and_spans is not a ProjectRoutingTable"))?;
+            assert_eq!(rt.fast_insert_batch(batch).await?, 3);
+
+            let count = |p: String| {
+                let ctx = ctx.clone();
+                async move {
+                    let sql = format!("SELECT COUNT(*) c FROM otel_logs_and_spans WHERE project_id = '{p}'");
+                    Result::<i64>::Ok(ctx.sql(&sql).await?.collect().await?[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
+                }
+            };
+            assert_eq!(count(pb.clone()).await?, 1, "pb's row must reach pb's BYO bucket, not leak into pa's unified table");
+            assert_eq!(count(pa.clone()).await?, 2, "pa keeps exactly its 2 rows");
+
+            db.shutdown().await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 60 seconds"))?
     }
 
     #[serial]
