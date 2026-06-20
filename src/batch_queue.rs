@@ -29,10 +29,14 @@ impl BatchQueue {
                         if !batches.is_empty() {
                             let mut grouped = std::collections::HashMap::<String, Vec<RecordBatch>>::new();
                             for batch in batches {
-                                if let Some(project_id) = crate::database::extract_project_id(&batch) {
-                                    grouped.entry(project_id).or_default().push(batch);
-                                } else {
-                                    error!("Skipping batch without project_id");
+                                // Partition row-wise: a queued batch may carry rows for many projects.
+                                match crate::database::partition_batch_by_project(batch, "default") {
+                                    Ok(parts) => {
+                                        for (project_id, sub) in parts {
+                                            grouped.entry(project_id).or_default().push(sub);
+                                        }
+                                    }
+                                    Err(e) => error!("Skipping batch: failed to partition by project_id: {}", e),
                                 }
                             }
 
