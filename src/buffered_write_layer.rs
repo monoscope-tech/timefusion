@@ -602,24 +602,31 @@ impl BufferedWriteLayer {
     pub(crate) async fn force_flush_current_buckets(&self) -> anyhow::Result<()> {
         let _flush_guard = self.flush_lock.lock().await;
         let current = MemBuffer::current_bucket_id();
-        // WAL-ordering safety: `advance_by_counts` consumes entries sequentially
-        // from the cursor, so advancing by the current bucket's count is correct
-        // ONLY when every older bucket on the shard has already been flushed +
-        // advanced. If a completed bucket remains (its flush failed), the cursor
-        // is still behind it and advancing now would consume the failed bucket's
-        // entries instead — losing them on a crash. Skip; the next round retries
-        // the completed flush first. (Holds the flush_lock so no concurrent
-        // completed-flush can drain them out from under this check.)
-        if self.mem_buffer.has_buckets_before(current) {
-            debug!("force-flush skipped: completed buckets still present — avoiding WAL over-advance");
-            return Ok(());
-        }
-        crate::metrics::record_backpressure_force_flush();
-        self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
+        let mut attempted = false;
         for (project_id, table_name, bucket_id) in self.mem_buffer.current_bucket_keys(current) {
+            // WAL-ordering safety, scoped per topic: `advance_by_counts` consumes
+            // entries sequentially per topic, so advancing by the open bucket's
+            // count is correct ONLY when every older bucket *of this same
+            // (project, table)* has already been flushed + advanced. A completed
+            // bucket left behind (its flush failed) means the cursor is still
+            // behind it — advancing now would consume its entries, losing them on
+            // a crash. Skip just this topic; the next round retries its completed
+            // flush first. Per-topic (not global) so one tenant's stuck completed
+            // bucket can't freeze every other tenant's relief — the global gate
+            // wedged the whole instance at the hard limit. (Holds the flush_lock
+            // so no concurrent completed-flush drains them out from under us.)
+            if self.mem_buffer.has_buckets_before(&project_id, &table_name, current) {
+                debug!("force-flush skipped for {}.{}: completed bucket still present — avoiding WAL over-advance", project_id, table_name);
+                continue;
+            }
             let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&project_id, &table_name, bucket_id) else {
                 continue;
             };
+            if !attempted {
+                crate::metrics::record_backpressure_force_flush();
+                self.backpressure_force_flush_total.fetch_add(1, Ordering::Relaxed);
+                attempted = true;
+            }
             // Exempt this bucket from the Delta-scan exclusion for its whole
             // lifetime — its window now legitimately holds rows in both
             // stores. Marked before the commit so no query can race into a
@@ -2328,6 +2335,52 @@ mod tests {
             "force-flush must NOT touch Delta (or advance the WAL) while a completed bucket remains"
         );
         assert!(!layer.is_empty(), "both buckets must remain buffered after the skipped force-flush");
+    }
+
+    /// Regression: a stuck completed bucket in ONE tenant must not freeze
+    /// current-bucket force-flush for OTHER tenants. The WAL-ordering gate is
+    /// per-topic (`advance_by_counts` is per-topic), so tenant T1's un-flushed
+    /// completed bucket must not stop T2's open window from draining. Pre-fix the
+    /// *global* `has_buckets_before` short-circuited the whole call, so one poison
+    /// tenant wedged the entire instance at the hard limit (every insert rejected
+    /// with "Memory limit exceeded"). Post-fix T2 drains while T1 stays skipped.
+    #[serial]
+    #[tokio::test]
+    async fn force_flush_isolates_stuck_tenant() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let t1 = format!("a{}", test_id); // stuck tenant: completed bucket, never flushed
+        let t2 = format!("b{}", test_id); // healthy tenant: open bucket only
+
+        let flushed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let flushed_cb = flushed.clone();
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |p, _t, _b, _wm| {
+            let f = flushed_cb.clone();
+            Box::pin(async move {
+                f.lock().unwrap().push(p);
+                Ok(Vec::new())
+            })
+        }));
+        let layer = Arc::new(layer);
+
+        // T1: a sealed (completed) bucket left un-flushed → a bucket-before-current.
+        let old_ts = crate::clock::now_micros() - 2 * crate::mem_buffer::bucket_duration_micros();
+        let old_batch =
+            crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span_ts("old", "spanA", &t1, old_ts)]).unwrap();
+        layer.insert(&t1, &t1, vec![old_batch]).await.unwrap();
+        // T2: only an open (current) bucket.
+        layer.insert(&t2, &t2, vec![create_test_batch(&t2)]).await.unwrap();
+
+        layer.force_flush_current_buckets().await.unwrap();
+
+        let flushed = flushed.lock().unwrap().clone();
+        assert!(flushed.contains(&t2), "healthy tenant's open bucket must force-flush despite a stuck tenant; flushed={:?}", flushed);
+        assert!(!flushed.contains(&t1), "stuck tenant's completed bucket must stay un-advanced (per-topic WAL gate); flushed={:?}", flushed);
     }
 
     #[serial]
