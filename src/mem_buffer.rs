@@ -1245,8 +1245,7 @@ impl MemBuffer {
     /// table — one poison tenant wedged the whole instance at the hard limit,
     /// rejecting all inserts.
     pub fn has_buckets_before(&self, project_id: &str, table_name: &str, cutoff_bucket_id: i64) -> bool {
-        self.get_table(project_id, table_name)
-            .is_some_and(|t| t.buckets.iter().any(|b| *b.key() < cutoff_bucket_id))
+        self.get_table(project_id, table_name).is_some_and(|t| t.buckets.iter().any(|b| *b.key() < cutoff_bucket_id))
     }
 
     /// Atomically take a bucket's rows + WAL counts for an out-of-band flush.
@@ -2351,7 +2350,11 @@ mod tests {
             Field::new("payload", DataType::Utf8View, false),
         ]));
         let mk = |id: i64, p: &str| {
-            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![id])), Arc::new(StringViewArray::from(vec![p]))]).unwrap()
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![id])), Arc::new(StringViewArray::from(vec![p]))],
+            )
+            .unwrap()
         };
         let batches = vec![mk(1, "a"), mk(2, "b"), mk(3, "c")];
         let out = dedup_batches(batches, &["id".to_string()]).expect("dedup ok");
