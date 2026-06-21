@@ -5,7 +5,7 @@ use std::sync::{
 
 use arrow::{
     array::{Array, ArrayRef, BooleanArray, RecordBatch, TimestampMicrosecondArray, UInt32Array},
-    compute::{concat_batches, filter_record_batch, take_record_batch},
+    compute::{concat, filter_record_batch},
     datatypes::{DataType, SchemaRef, TimeUnit},
     row::{OwnedRow, RowConverter, SortField},
 };
@@ -422,30 +422,53 @@ pub(crate) fn compact_batch(batch: RecordBatch) -> RecordBatch {
 /// Only collapses dupes inside this call's input — cross-bucket dupes need
 /// the read-side row_number() rewrite.
 pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String]) -> anyhow::Result<Vec<RecordBatch>> {
-    let Some(schema) = batches.first().map(|b| b.schema()) else {
-        return Ok(batches);
-    };
-    if keys.is_empty() {
+    if keys.is_empty() || batches.is_empty() {
         return Ok(batches);
     }
-    let combined = concat_batches(&schema, &batches)?;
-    let arrs: Vec<ArrayRef> = keys
+    // Dedup across all batches by concatenating ONLY the key columns — never the
+    // full batches. A large coalesced otel flush (fat body/attributes/resource
+    // strings across many buckets) exceeds Arrow's 2GB i32 string-offset limit,
+    // so `concat_batches` on the whole payload returns "Offset overflow" and
+    // fails the entire flush; the buckets then never drain, MemBuffer wedges at
+    // the hard limit, and every insert is rejected (prod 2026-06-20, project
+    // …88a1a8). Key columns (e.g. `id`) are tiny, so concatenating just those is
+    // safe; superseded rows are then dropped by filtering each batch in place,
+    // keeping every output array bounded by its source batch.
+    let key_arrays: Vec<ArrayRef> = keys
         .iter()
-        .map(|k| combined.column_by_name(k).cloned().ok_or_else(|| anyhow::anyhow!("dedup key `{k}` missing from batch schema")))
+        .map(|k| {
+            let cols = batches
+                .iter()
+                .map(|b| b.column_by_name(k).cloned().ok_or_else(|| anyhow::anyhow!("dedup key `{k}` missing from batch schema")))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            Ok(concat(&cols.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?)
+        })
         .collect::<anyhow::Result<_>>()?;
-    let converter = RowConverter::new(arrs.iter().map(|a| SortField::new(a.data_type().clone())).collect())?;
-    let rows = converter.convert_columns(&arrs)?;
+    let converter = RowConverter::new(key_arrays.iter().map(|a| SortField::new(a.data_type().clone())).collect())?;
+    let rows = converter.convert_columns(&key_arrays)?;
+    // Last occurrence of each key wins (keep-last across coalesced time windows).
     let mut last: std::collections::HashMap<OwnedRow, u32> = std::collections::HashMap::with_capacity(rows.num_rows());
     for i in 0..rows.num_rows() {
         last.insert(rows.row(i).owned(), i as u32);
     }
     if last.len() == rows.num_rows() {
-        // No duplicates — skip the take(), which would otherwise rebuild every column.
-        return Ok(vec![combined]);
+        // No duplicates — return the batches untouched (never fused into one array).
+        return Ok(batches);
     }
-    let mut idx: Vec<u32> = last.into_values().collect();
-    idx.sort_unstable();
-    Ok(vec![take_record_batch(&combined, &UInt32Array::from(idx))?])
+    let keep: std::collections::HashSet<u32> = last.into_values().collect();
+    // Filter each batch against its slice of the global row-index space.
+    let mut out = Vec::with_capacity(batches.len());
+    let mut base = 0u32;
+    for b in &batches {
+        let n = b.num_rows() as u32;
+        let mask = BooleanArray::from((0..n).map(|r| keep.contains(&(base + r))).collect::<Vec<bool>>());
+        base += n;
+        let kept = filter_record_batch(b, &mask)?;
+        if kept.num_rows() > 0 {
+            out.push(kept);
+        }
+    }
+    Ok(out)
 }
 
 /// Merge two arrays based on a boolean mask.
@@ -1209,14 +1232,21 @@ impl MemBuffer {
         out
     }
 
-    /// Cheap existence check (no batch cloning) for any bucket strictly older
-    /// than `cutoff_bucket_id`. Gates current-bucket force-flush: advancing the
-    /// WAL cursor past the open bucket is only correct once every older bucket
-    /// on the shard has been flushed + advanced (the cursor consumes entries
-    /// sequentially, not by logical bucket). A leftover completed bucket means a
-    /// failed flush left the cursor behind it.
-    pub fn has_buckets_before(&self, cutoff_bucket_id: i64) -> bool {
-        self.tables.iter().any(|t| t.value().buckets.iter().any(|b| *b.key() < cutoff_bucket_id))
+    /// Cheap existence check (no batch cloning) for any bucket of *this topic*
+    /// strictly older than `cutoff_bucket_id`. Gates current-bucket force-flush:
+    /// advancing the WAL cursor past the open bucket is only correct once every
+    /// older bucket on the shard has been flushed + advanced (the cursor consumes
+    /// entries sequentially, not by logical bucket). A leftover completed bucket
+    /// means a failed flush left the cursor behind it.
+    ///
+    /// Scoped per `(project, table)` because the WAL invariant it protects is
+    /// per-topic (`advance_by_counts` is per-topic). A global check let a stuck
+    /// completed bucket in one table freeze current-bucket force-flush for *every*
+    /// table — one poison tenant wedged the whole instance at the hard limit,
+    /// rejecting all inserts.
+    pub fn has_buckets_before(&self, project_id: &str, table_name: &str, cutoff_bucket_id: i64) -> bool {
+        self.get_table(project_id, table_name)
+            .is_some_and(|t| t.buckets.iter().any(|b| *b.key() < cutoff_bucket_id))
     }
 
     /// Atomically take a bucket's rows + WAL counts for an out-of-band flush.
@@ -2281,15 +2311,20 @@ mod tests {
         ];
         let keys = vec!["id".to_string(), "timestamp".to_string()];
         let out = dedup_batches(batches, &keys).expect("dedup ok");
-        assert_eq!(out.len(), 1);
-        let b = &out[0];
-        assert_eq!(b.num_rows(), 3, "should collapse to 3 unique (id,ts)");
-        let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
-        let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
-        let got: Vec<(i64, &str)> = (0..b.num_rows()).map(|i| (ids.value(i), pl.value(i))).collect();
-        // Concat order = [(1,100,old), (2,200,old), (1,100,new), (3,300,v3), (2,200,new)];
-        // kept = surviving indices [2,3,4] sorted → (1,new), (3,v3), (2,new).
-        assert_eq!(got, vec![(1, "v1-new"), (3, "v3"), (2, "v2-new")]);
+        // Dedup filters each batch in place (no full-payload concat), so the
+        // survivors come back as multiple batches — collect across all of them.
+        let total: usize = out.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 3, "should collapse to 3 unique (id,ts)");
+        let got: Vec<(i64, String)> = out
+            .iter()
+            .flat_map(|b| {
+                let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+                let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
+                (0..b.num_rows()).map(move |i| (ids.value(i), pl.value(i).to_string())).collect::<Vec<_>>()
+            })
+            .collect();
+        // Surviving global indices [2,3,4] → batch1 keeps (1,new),(3,v3); batch2 keeps (2,new).
+        assert_eq!(got, vec![(1, "v1-new".into()), (3, "v3".into()), (2, "v2-new".into())]);
     }
 
     #[test]
@@ -2301,6 +2336,27 @@ mod tests {
         let out = dedup_batches(vec![batch.clone()], &[]).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].num_rows(), batch.num_rows());
+    }
+
+    /// Regression (prod 2026-06-20): a large coalesced otel flush fused every
+    /// batch into one RecordBatch inside `dedup_batches`, overflowing Arrow's 2GB
+    /// i32 string-offset limit ("Offset overflow error"). That failed the flush,
+    /// so the buckets never drained and MemBuffer wedged at the hard limit —
+    /// every insert rejected. Dedup must not build a single fused array: with no
+    /// duplicate keys across N input batches it returns those N batches untouched.
+    #[test]
+    fn dedup_batches_does_not_concatenate_full_payload() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("payload", DataType::Utf8View, false),
+        ]));
+        let mk = |id: i64, p: &str| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![id])), Arc::new(StringViewArray::from(vec![p]))]).unwrap()
+        };
+        let batches = vec![mk(1, "a"), mk(2, "b"), mk(3, "c")];
+        let out = dedup_batches(batches, &["id".to_string()]).expect("dedup ok");
+        assert_eq!(out.len(), 3, "distinct-key batches must be returned un-fused (no 2GB-prone concat)");
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     }
 
     #[test]
