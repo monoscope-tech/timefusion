@@ -616,7 +616,10 @@ impl BufferedWriteLayer {
             // wedged the whole instance at the hard limit. (Holds the flush_lock
             // so no concurrent completed-flush drains them out from under us.)
             if self.mem_buffer.has_buckets_before(&project_id, &table_name, current) {
-                debug!("force-flush skipped for {}.{}: completed bucket still present — avoiding WAL over-advance", project_id, table_name);
+                debug!(
+                    "force-flush skipped for {}.{}: completed bucket still present — avoiding WAL over-advance",
+                    project_id, table_name
+                );
                 continue;
             }
             let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&project_id, &table_name, bucket_id) else {
@@ -2379,8 +2382,16 @@ mod tests {
         layer.force_flush_current_buckets().await.unwrap();
 
         let flushed = flushed.lock().unwrap().clone();
-        assert!(flushed.contains(&t2), "healthy tenant's open bucket must force-flush despite a stuck tenant; flushed={:?}", flushed);
-        assert!(!flushed.contains(&t1), "stuck tenant's completed bucket must stay un-advanced (per-topic WAL gate); flushed={:?}", flushed);
+        assert!(
+            flushed.contains(&t2),
+            "healthy tenant's open bucket must force-flush despite a stuck tenant; flushed={:?}",
+            flushed
+        );
+        assert!(
+            !flushed.contains(&t1),
+            "stuck tenant's completed bucket must stay un-advanced (per-topic WAL gate); flushed={:?}",
+            flushed
+        );
     }
 
     #[serial]
