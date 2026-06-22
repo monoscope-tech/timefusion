@@ -2387,6 +2387,19 @@ impl Database {
                     ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema.schema_ref(), batch_queue.clone(), table_name.clone());
                 ctx.register_table(&table_name, Arc::new(routing_table))?;
                 info!("Registered ProjectRoutingTable for table '{}' with SessionContext", table_name);
+
+                // Bulk-write alias: `INSERT INTO {table}__bulk ...` commits
+                // straight to Delta (skip_queue), bypassing WAL + MemBuffer, so a
+                // backfill / DLQ drain can't pressure the live buffer. The session
+                // context is shared across connections (see pgwire_handlers), so a
+                // per-connection GUC can't isolate the bulk writer — a dedicated
+                // table name is how a client opts into the direct path. Internal
+                // `table_name` stays the real table, so writes and reads both hit
+                // the same Delta table.
+                let bulk_table =
+                    ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema.schema_ref(), batch_queue.clone(), table_name.clone())
+                        .with_skip_queue(true);
+                ctx.register_table(&format!("{table_name}__bulk"), Arc::new(bulk_table))?;
             }
         }
 
@@ -6621,13 +6634,25 @@ pub struct ProjectRoutingTable {
     schema: SchemaRef,
     _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
     table_name: String,
+    /// When true, INSERTs commit straight to Delta (`skip_queue=true`),
+    /// bypassing the BufferedWriteLayer (WAL + MemBuffer). Backs the
+    /// `{table}__bulk` alias for backfills / DLQ drains that must not pressure
+    /// the live MemBuffer. Reads route to the same underlying Delta table.
+    skip_queue: bool,
 }
 
 impl ProjectRoutingTable {
     pub fn new(
         default_project: String, database: Arc<Database>, schema: SchemaRef, batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>, table_name: String,
     ) -> Self {
-        Self { default_project, database, schema, _batch_queue: batch_queue, table_name }
+        Self { default_project, database, schema, _batch_queue: batch_queue, table_name, skip_queue: false }
+    }
+
+    /// Route this provider's INSERTs straight to Delta, bypassing the
+    /// BufferedWriteLayer. Backs the `{table}__bulk` alias.
+    pub fn with_skip_queue(mut self, skip_queue: bool) -> Self {
+        self.skip_queue = skip_queue;
+        self
     }
 
     fn extract_project_id_from_filters(&self, filters: &[Expr]) -> Option<String> {
@@ -6654,7 +6679,7 @@ impl ProjectRoutingTable {
             let converted = convert_variant_columns(sub, &target_schema)?;
             writes.push(async move {
                 self.database
-                    .insert_records_batch(&project_id, &self.table_name, vec![converted], false, None)
+                    .insert_records_batch(&project_id, &self.table_name, vec![converted], self.skip_queue, None)
                     .await
                     .map_err(|e| DataFusionError::Execution(format!("fast_insert_batch for project {} table {}: {}", project_id, self.table_name, e)))
             });
@@ -7299,7 +7324,7 @@ impl DataSink for ProjectRoutingTable {
             let insert_span = tracing::trace_span!(parent: &span, "delta_table.insert", project_id = %project_id, rows = row_count);
             async move {
                 self.database
-                    .insert_records_batch(&project_id, &self.table_name, batches, false, None)
+                    .insert_records_batch(&project_id, &self.table_name, batches, self.skip_queue, None)
                     .instrument(insert_span)
                     .await
                     .map_err(|e| DataFusionError::Execution(format!("Insert error for project {} table {}: {}", project_id, self.table_name, e)))

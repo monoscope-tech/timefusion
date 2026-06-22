@@ -5,6 +5,7 @@
 
 mod harness;
 
+mod bulk_load;
 mod cache_warmth;
 mod deletion_vectors;
 mod dml_compression;
