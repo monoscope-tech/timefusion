@@ -512,7 +512,11 @@ impl WalManager {
             WalOperation::UpdateWithSource,
             bincode::encode_to_vec(&payload, BINCODE_CONFIG)?,
         );
-        self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
+        let entry_bytes = serialize_wal_entry(&entry)?;
+        {
+            let _guard = self.append_lock(&walrus_key);
+            self.wal.append_for_topic(&walrus_key, &entry_bytes)?;
+        }
         self.persist_topic(&topic);
         debug!(
             "WAL append UPDATE_WITH_SOURCE: topic={}, shard={}, predicate={:?}, assignments={}, source_keys={}, source_bytes={}",
@@ -1259,8 +1263,19 @@ mod tests {
                 let (wal, table, errors) = (wal.clone(), table.clone(), errors.clone());
                 s.spawn(move || {
                     let batch = create_test_batch();
-                    for _ in 0..8 {
-                        if wal.append_batch("proj", &table, std::slice::from_ref(&batch)).is_err() {
+                    let source = SerializedSource {
+                        join_keys: vec![("id".into(), "id".into())],
+                        batch_ipc: vec![1, 2, 3],
+                    };
+                    for i in 0..8 {
+                        // Interleave append_batch with append_update_with_source so a
+                        // same-shard collision exercises both append paths' locking.
+                        let res = if i % 2 == 0 {
+                            wal.append_batch("proj", &table, std::slice::from_ref(&batch)).map(|_| ())
+                        } else {
+                            wal.append_update_with_source("proj", &table, Some("id = 1"), &[("v".into(), "1".into())], &source).map(|_| ())
+                        };
+                        if res.is_err() {
                             errors.fetch_add(1, Ordering::Relaxed);
                         }
                     }
