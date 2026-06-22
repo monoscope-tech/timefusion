@@ -55,28 +55,48 @@ async fn staged_flush_persists_to_delta() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Several default projects share ONE unified Delta table, so flushing them
-/// concurrently drives multiple staged commits at the same table version.
-/// Each must land via the OCC retry around the short commit lock — no tenant
-/// may lose rows to a lost-update.
+/// Several default projects share ONE unified Delta table. This drives the
+/// staged path directly (skip_queue=true) from 5 tasks *in parallel*, so their
+/// parquet uploads overlap outside `delta_commit_lock` and their commits queue
+/// on it. Every row must land — no tenant lost to an interleaving.
+///
+/// Note: this exercises concurrent *staging* + the serialized commit queue, NOT
+/// the OCC retry branch — within one process `delta_commit_lock` + the
+/// refresh-under-lock serialize all commits, so they never self-conflict. OCC
+/// retry only fires against an external/maintenance committer, which isn't
+/// reproducible here. The earlier `force_flush` version didn't even overlap the
+/// uploads (flush_all_now loops buckets sequentially).
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_unified_table_commits_lose_nothing() -> anyhow::Result<()> {
+async fn concurrent_unified_table_staging_loses_nothing() -> anyhow::Result<()> {
     let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).start().await?;
-    let client = env.pg_client().await?;
-
-    // All `default_*` projects route to the shared unified table.
     let projects = ["default_a", "default_b", "default_c", "default_d", "default_e"];
-    let per = 40;
+    let per = 20;
     for p in projects {
         env.db().get_or_create_table(p, "otel_logs_and_spans").await?;
-        for i in 0..per {
-            insert_for(&client, p, &format!("{p}-{i}"), FROZEN_START_MICROS + i as i64 * 1_000).await?;
-        }
     }
 
-    flush_then_drain(&env).await?;
+    let mut handles = Vec::new();
+    for p in projects {
+        let db = env.db().clone();
+        handles.push(tokio::spawn(async move {
+            for i in 0..per {
+                let batch = timefusion::test_utils::test_helpers::json_to_batch(vec![timefusion::test_utils::test_helpers::test_span(
+                    &format!("{p}-{i}"),
+                    "span",
+                    p,
+                )])?;
+                // skip_queue=true → straight to the staged commit path, bypassing MemBuffer.
+                db.insert_records_batch(p, "otel_logs_and_spans", vec![batch], true, None).await?;
+            }
+            anyhow::Ok(())
+        }));
+    }
+    for h in handles {
+        h.await??;
+    }
 
+    let client = env.pg_client().await?;
     for p in projects {
         let c: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&p]).await?.get(0);
         assert_eq!(c, per as i64, "tenant {p} lost rows under concurrent staged commits to the unified table");

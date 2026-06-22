@@ -2760,10 +2760,18 @@ impl Database {
         // Exponential backoff between OCC conflict retries (shared by both paths).
         let retry_backoff = |n: u32| tokio::time::Duration::from_millis(100 * 2_u64.pow(n.min(5)));
         // Only Delta OCC conflicts are retryable; auth/S3/IO errors must fail
-        // fast (don't burn 5 backoffs masking the real cause). Shared by both
-        // write paths so their retry semantics can't drift.
-        let is_conflict_err =
-            |msg: &str| msg.contains("already exists") || msg.contains("conflict") || msg.contains("version") || msg.contains("concurrent modification");
+        // fast (don't burn 5 backoffs masking the real cause). Substrings match
+        // the real delta-rs Display strings: VersionAlreadyExists ("Delta
+        // transaction failed, version N already exists."), the conflict_checker
+        // variants ("Commit failed: a concurrent transaction ..."), and
+        // MetadataChanged ("Metadata changed since last commit."). Deliberately
+        // NOT a bare "version" — that also matches the *permanent*
+        // Unsupported{Reader,Writer}Version errors, which must fail fast.
+        // (Two sibling OCC classifiers exist — dedup_partition, light_optimize;
+        // a shared free fn is a worthwhile follow-up but out of this PR's scope.)
+        let is_conflict_err = |msg: &str| {
+            msg.contains("already exists") || msg.contains("Commit failed") || msg.contains("concurrent transaction") || msg.contains("Metadata changed")
+        };
 
         // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the
         // global `delta_commit_lock`, then serialize only the tiny commit-log
@@ -2829,11 +2837,19 @@ impl Database {
                 partition_by,
                 predicate: None,
             };
+            // Store to clean up the staged parquet on a terminal commit failure —
+            // those objects have no Add/Remove in the log, so Delta VACUUM won't
+            // reclaim them; abandoning them leaks files on S3 forever.
+            let stage_store = staging_table.log_store().object_store(None);
 
             let mut retry_count = 0;
             loop {
-                // Short critical section: refresh → commit-log append → swap.
-                // Parquet is already on S3 so an OCC conflict just re-appends.
+                // Refresh UNDER the lock (the merge path refreshes before locking).
+                // delta_commit_lock serializes all in-process commits, so
+                // refreshing here guarantees we build on the previous committer's
+                // version and never self-conflict; refresh is probe-cheap (a single
+                // GET that 404-short-circuits when already current), so the extra
+                // lock-hold is sub-millisecond on the common path.
                 let commit_guard = self.delta_commit_lock.lock().await;
                 if let Err(e) = refresh_table_snapshot(&table_ref).await {
                     debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e);
@@ -2857,10 +2873,12 @@ impl Database {
                     Err(e) => {
                         drop(commit_guard);
                         if !is_conflict_err(&e.to_string()) {
+                            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                             return Err(anyhow::anyhow!("staged commit failed: {}", e));
                         }
                         retry_count += 1;
                         if retry_count >= max_retries {
+                            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                             return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", max_retries, e));
                         }
                         debug!("staged commit conflict, retrying ({}/{}): {}", retry_count, max_retries, e);
@@ -2934,6 +2952,22 @@ impl Database {
             max_retries,
             last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
         ))
+    }
+
+    /// Best-effort delete of staged-but-uncommitted parquet after a terminal
+    /// staged-commit failure. Those objects have no Add/Remove action in the
+    /// Delta log, so VACUUM never reclaims them — abandoning them leaks files on
+    /// S3 forever. Logs any path it couldn't remove so an operator can clean up.
+    async fn cleanup_orphaned_parquet(store: &Arc<dyn object_store::ObjectStore>, adds: &[deltalake::kernel::Action]) {
+        use object_store::ObjectStoreExt; // dyn-safe `delete` wrapper
+        for action in adds {
+            if let deltalake::kernel::Action::Add(add) = action {
+                let path = object_store::path::Path::from(add.path.as_str());
+                if let Err(e) = store.delete(&path).await {
+                    warn!("orphaned staged parquet (manual cleanup needed): {} — delete failed: {}", add.path, e);
+                }
+            }
+        }
     }
 
     /// Shared post-commit bookkeeping for both the staged and merge write
