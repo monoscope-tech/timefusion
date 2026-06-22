@@ -81,11 +81,8 @@ async fn concurrent_unified_table_staging_loses_nothing() -> anyhow::Result<()> 
         let db = env.db().clone();
         handles.push(tokio::spawn(async move {
             for i in 0..per {
-                let batch = timefusion::test_utils::test_helpers::json_to_batch(vec![timefusion::test_utils::test_helpers::test_span(
-                    &format!("{p}-{i}"),
-                    "span",
-                    p,
-                )])?;
+                let batch =
+                    timefusion::test_utils::test_helpers::json_to_batch(vec![timefusion::test_utils::test_helpers::test_span(&format!("{p}-{i}"), "span", p)])?;
                 // skip_queue=true → straight to the staged commit path, bypassing MemBuffer.
                 db.insert_records_batch(p, "otel_logs_and_spans", vec![batch], true, None).await?;
             }
