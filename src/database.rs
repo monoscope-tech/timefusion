@@ -2754,34 +2754,149 @@ impl Database {
         let (batches, sorted) = sort_batches_by_schema(schema, batches);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
 
-        // Retry logic for concurrent writes
         // Hoist out of the retry loop — the watermark is the same on every attempt.
         let commit_properties = watermark.map(build_watermark_commit_properties);
-
         let max_retries = 5;
+        // Exponential backoff between OCC conflict retries (shared by both paths).
+        let retry_backoff = |n: u32| tokio::time::Duration::from_millis(100 * 2_u64.pow(n.min(5)));
+        // Only Delta OCC conflicts are retryable; auth/S3/IO errors must fail
+        // fast (don't burn 5 backoffs masking the real cause). Substrings match
+        // the real delta-rs Display strings: VersionAlreadyExists ("Delta
+        // transaction failed, version N already exists."), the conflict_checker
+        // variants ("Commit failed: a concurrent transaction ..."), and
+        // MetadataChanged ("Metadata changed since last commit."). Deliberately
+        // NOT a bare "version" — that also matches the *permanent*
+        // Unsupported{Reader,Writer}Version errors, which must fail fast.
+        // (Two sibling OCC classifiers exist — dedup_partition, light_optimize;
+        // a shared free fn is a worthwhile follow-up but out of this PR's scope.)
+        let is_conflict_err = |msg: &str| {
+            msg.contains("already exists") || msg.contains("Commit failed") || msg.contains("concurrent transaction") || msg.contains("Metadata changed")
+        };
+
+        // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the
+        // global `delta_commit_lock`, then serialize only the tiny commit-log
+        // append. The old path held the lock across the whole `.write()`
+        // (parquet encode + S3 upload + commit), serializing every tenant's
+        // upload behind one mutex — the ~8-17 rows/s flush ceiling under heavy
+        // backfill. A staged write parallelizes the uploads and pays the lock
+        // only for a sub-second log append; OCC conflicts re-commit the already
+        // uploaded parquet (no re-encode/re-upload).
+        //
+        // delta-rs' Default-mode RecordBatchWriter cannot evolve schema on a
+        // partitioned table, so when a batch carries a column absent from the
+        // table schema we fall back to the locked WriteBuilder merge path below.
+        let staging_table = { table_ref.read().await.clone() };
+        let staged_writer = match deltalake::writer::RecordBatchWriter::for_table(&staging_table) {
+            Ok(w) => {
+                let w = w.with_writer_properties(writer_properties.clone());
+                let arrow_schema = w.arrow_schema();
+                let table_fields: std::collections::HashSet<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+                let evolves = batches.iter().any(|b| b.schema().fields().iter().any(|f| !table_fields.contains(f.name().as_str())));
+                (!evolves).then_some(w)
+            }
+            Err(e) => {
+                debug!("RecordBatchWriter::for_table failed, using merge path: {}", e);
+                None
+            }
+        };
+
+        if let Some(mut writer) = staged_writer {
+            use deltalake::{
+                kernel::{Action, transaction::TableReference},
+                protocol::DeltaOperation,
+                writer::DeltaWriter,
+            };
+
+            // Upload parquet (no commit) on the staging clone — outside the lock.
+            // RecordBatchWriter (unlike WriteBuilder) doesn't cast the batch to
+            // the table schema, so cast each batch to the table's arrow schema
+            // first — Utf8View→Utf8 etc, filling any missing column with nulls
+            // (safe=true, add_missing=true mirrors WriteBuilder's own coercion).
+            let target_schema = writer.arrow_schema();
+            let stage_span = tracing::trace_span!(parent: &span, "delta.stage_parquet");
+            let adds: Vec<Action> = async {
+                for b in &batches {
+                    let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
+                    writer.write(casted).await?;
+                }
+                writer.flush().await
+            }
+            .instrument(stage_span)
+            .await
+            .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e))?
+            .into_iter()
+            .map(Action::Add)
+            .collect();
+            if adds.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let partition_by = (!schema.partitions.is_empty()).then(|| schema.partitions.clone());
+            let op = DeltaOperation::Write {
+                mode: deltalake::protocol::SaveMode::Append,
+                partition_by,
+                predicate: None,
+            };
+            // Store to clean up the staged parquet on a terminal commit failure —
+            // those objects have no Add/Remove in the log, so Delta VACUUM won't
+            // reclaim them; abandoning them leaks files on S3 forever.
+            let stage_store = staging_table.log_store().object_store(None);
+
+            let mut retry_count = 0;
+            loop {
+                // Refresh UNDER the lock (the merge path refreshes before locking).
+                // delta_commit_lock serializes all in-process commits, so
+                // refreshing here guarantees we build on the previous committer's
+                // version and never self-conflict; refresh is probe-cheap (a single
+                // GET that 404-short-circuits when already current), so the extra
+                // lock-hold is sub-millisecond on the common path.
+                let commit_guard = self.delta_commit_lock.lock().await;
+                if let Err(e) = refresh_table_snapshot(&table_ref).await {
+                    debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e);
+                }
+                let mut new_table = { table_ref.read().await.clone() };
+                let commit_res = deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone().unwrap_or_default())
+                    .with_actions(adds.clone())
+                    .build(Some(new_table.snapshot()? as &dyn TableReference), new_table.log_store(), op.clone())
+                    .await;
+                match commit_res {
+                    Ok(finalized) => {
+                        // Diff pre- vs post-commit file URIs for `added`. Capture
+                        // pre-uris here (only on success) — before the state swap
+                        // below makes `new_table` post-commit — so failed attempts
+                        // don't pay the full-table file-URI walk.
+                        let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                        new_table.state = Some(finalized.snapshot());
+                        drop(commit_guard);
+                        return Ok(self.record_committed_write(&table_ref, &project_id, &table_name, new_table, &pre_uris, watermark.is_some()).await);
+                    }
+                    Err(e) => {
+                        drop(commit_guard);
+                        if !is_conflict_err(&e.to_string()) {
+                            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                            return Err(anyhow::anyhow!("staged commit failed: {}", e));
+                        }
+                        retry_count += 1;
+                        if retry_count >= max_retries {
+                            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                            return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", max_retries, e));
+                        }
+                        debug!("staged commit conflict, retrying ({}/{}): {}", retry_count, max_retries, e);
+                        tokio::time::sleep(retry_backoff(retry_count)).await;
+                    }
+                }
+            }
+        }
+
+        // SCHEMA-EVOLUTION FALLBACK: locked WriteBuilder merge path. Holds the
+        // commit lock across the whole write so the schema-metadata merge can't
+        // race a concurrent commit. Rare (only when a batch adds a column).
         let mut retry_count = 0;
         let mut last_error = None;
-
         while retry_count < max_retries {
-            // Refresh without holding the write lock across IO (see
-            // refresh_table_snapshot) — queries keep planning against the old
-            // snapshot. Staleness just surfaces as an OCC conflict below.
             if let Err(e) = refresh_table_snapshot(&table_ref).await {
                 debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
             }
-
-            // Snapshot the handle + pre-write file URIs under a read lock; the
-            // S3 write below runs on the clone. Cheap in-memory walk of
-            // add_actions; the post-write diff replaces two redundant
-            // `list_file_uris` calls. Writer-writer races (flush vs optimize/
-            // dedup) are resolved by Delta OCC + this retry loop, exactly like
-            // every other commit path — the write lock is NOT held across the
-            // write anymore (it serialized all query planning behind each
-            // project's parquet upload during flush passes; 50-110s prod stalls).
-            // Hold the in-process commit lock from snapshot to swap so this
-            // append can never land mid-flight of a dedup replace_where (see
-            // `delta_commit_lock`). Appends-vs-appends pay a short queue wait;
-            // commits are sub-second next to the 10-min flush cadence.
             let commit_guard = self.delta_commit_lock.lock().await;
             let (table, pre_uris) = {
                 let guard = table_ref.read().await;
@@ -2791,7 +2906,6 @@ impl Database {
 
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
             let write_result = async {
-                // Schema evolution enabled: new columns will be automatically added to the table
                 let mut builder = table
                     .clone()
                     .write(batches.clone())
@@ -2809,93 +2923,24 @@ impl Database {
 
             match write_result {
                 Ok(new_table) => {
-                    // Track the version we just wrote
-                    if let Some(version) = new_table.version() {
-                        // Store the last written version for read-after-write consistency
-                        let mut versions = self.last_written_versions.write().await;
-                        versions.insert((project_id.clone(), table_name.clone()), version);
-                        debug!("Stored last written version for {}/{}: {}", project_id, table_name, version);
-                    } else {
-                        debug!("WARNING: No version available after write for {}/{}", project_id, table_name);
-                    }
-
-                    // Compute added files from the post-write snapshot — no
-                    // extra log scan required.
-                    let added: Vec<String> = new_table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
-
-                    // Capture the store off the handle we just committed with —
-                    // the warm task below must never re-resolve the table (a
-                    // possible PG roundtrip + a redundant Delta state reload).
-                    let (warm_store, warm_table_uri) = (new_table.log_store().object_store(None), new_table.table_url().to_string());
-
-                    self.persist_snapshot(&new_table);
-
-                    // Brief write lock for the swap only. Version-guarded: a
-                    // concurrent maintenance commit may have advanced the
-                    // shared handle past our post-write snapshot.
-                    {
-                        let mut shared = table_ref.write().await;
-                        if new_table.version() > shared.version() {
-                            *shared = new_table;
-                        }
-                    }
-                    // Freshly-flushed files are the ones dashboards query next;
-                    // without this they're read cold from S3 until something else
-                    // warms them (repeat queries measured ~300 ms vs 8 ms warm on R2).
-                    // Gated on `watermark` (only the BufferedWriteLayer flush path
-                    // sets it): direct inserts — tests, tools — must not spawn
-                    // detached warm tasks, whose in-flight connections outlive a
-                    // short-lived runtime and poison the shared client pool for
-                    // the next test's S3 reads ("error sending request" in µs).
-                    if watermark.is_some() {
-                        let db = self.clone();
-                        let warm_added = added.clone();
-                        let shutdown = self.maintenance_shutdown.clone();
-                        tokio::spawn(async move {
-                            // Abandon on shutdown (same as preload_tables): the
-                            // detached warm must not issue S3 GETs against a
-                            // draining client pool during a fast restart.
-                            tokio::select! {
-                                _ = shutdown.cancelled() => {}
-                                _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added) => {}
-                            }
-                        });
-                    }
-                    self.statistics_extractor.invalidate(&project_id, &table_name).await;
-                    debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
-
+                    let added = self.record_committed_write(&table_ref, &project_id, &table_name, new_table, &pre_uris, watermark.is_some()).await;
                     return Ok(added);
                 }
                 Err(e) => {
-                    let error_str = e.to_string();
-                    if error_str.contains("already exists")
-                        || error_str.contains("conflict")
-                        || error_str.contains("version")
-                        || error_str.contains("concurrent modification")
-                    {
-                        // Version conflict, retry with backoff.
+                    if is_conflict_err(&e.to_string()) {
                         retry_count += 1;
                         last_error = Some(e);
                         debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, max_retries);
-
-                        // Intentionally release the commit lock BEFORE the
-                        // backoff sleep — do not remove. Holding it across the
-                        // sleep would serialize every other writer behind this
-                        // writer's backoff, converting commit contention into a
-                        // throughput collapse.
+                        // Release the commit lock BEFORE the backoff sleep — do
+                        // not remove. Holding it across the sleep serializes
+                        // every other writer behind this writer's backoff.
                         drop(commit_guard);
-                        // Exponential backoff for better handling of concurrent writes
-                        let backoff_ms = 100 * (2_u64.pow(retry_count.min(5)));
-                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-
+                        tokio::time::sleep(retry_backoff(retry_count)).await;
                         drop(table); // stale clone — the retry re-clones after the reload
-
-                        // Force a table state reload on conflict
                         if let Err(reload_err) = refresh_table_snapshot(&table_ref).await {
                             debug!("Failed to reload table state after conflict: {}", reload_err);
                         }
                     } else {
-                        // Non-retryable error
                         return Err(anyhow::anyhow!("Delta write failed: {}", e));
                     }
                 }
@@ -2907,6 +2952,70 @@ impl Database {
             max_retries,
             last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
         ))
+    }
+
+    /// Best-effort delete of staged-but-uncommitted parquet after a terminal
+    /// staged-commit failure. Those objects have no Add/Remove action in the
+    /// Delta log, so VACUUM never reclaims them — abandoning them leaks files on
+    /// S3 forever. Logs any path it couldn't remove so an operator can clean up.
+    async fn cleanup_orphaned_parquet(store: &Arc<dyn object_store::ObjectStore>, adds: &[deltalake::kernel::Action]) {
+        use object_store::ObjectStoreExt; // dyn-safe `delete` wrapper
+        for action in adds {
+            if let deltalake::kernel::Action::Add(add) = action {
+                let path = object_store::path::Path::from(add.path.as_str());
+                if let Err(e) = store.delete(&path).await {
+                    warn!("orphaned staged parquet (manual cleanup needed): {} — delete failed: {}", add.path, e);
+                }
+            }
+        }
+    }
+
+    /// Shared post-commit bookkeeping for both the staged and merge write
+    /// paths: record the version for read-after-write, swap the shared handle
+    /// (version-guarded), warm the just-written files, invalidate stats, and
+    /// return the newly added file URIs.
+    async fn record_committed_write(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
+        warm: bool,
+    ) -> Vec<String> {
+        if let Some(version) = new_table.version() {
+            self.last_written_versions.write().await.insert((project_id.to_string(), table_name.to_string()), version);
+            debug!("Stored last written version for {}/{}: {}", project_id, table_name, version);
+        } else {
+            debug!("WARNING: No version available after write for {}/{}", project_id, table_name);
+        }
+        let added: Vec<String> = new_table.get_file_uris().map(|it| it.filter(|u| !pre_uris.contains(u)).collect()).unwrap_or_default();
+        // Capture the store off the committed handle so the warm task never
+        // re-resolves the table (a possible PG roundtrip + Delta state reload).
+        let (warm_store, warm_table_uri) = (new_table.log_store().object_store(None), new_table.table_url().to_string());
+        self.persist_snapshot(&new_table);
+        // Brief write lock for the swap only. Version-guarded: a concurrent
+        // maintenance commit may have advanced the shared handle past ours.
+        {
+            let mut shared = table_ref.write().await;
+            if new_table.version() > shared.version() {
+                *shared = new_table;
+            }
+        }
+        // Freshly-flushed files are queried next; warm them now (repeat queries
+        // measured ~300 ms cold vs 8 ms warm on R2). Gated on `warm` (only the
+        // BufferedWriteLayer flush path sets it): direct inserts — tests, tools
+        // — must not spawn detached warm tasks whose in-flight connections
+        // outlive a short-lived runtime and poison the shared client pool.
+        if warm {
+            let db = self.clone();
+            let warm_added = added.clone();
+            let shutdown = self.maintenance_shutdown.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                    _ = db.warm_cache_for_uris(warm_store, warm_table_uri, warm_added) => {}
+                }
+            });
+        }
+        self.statistics_extractor.invalidate(project_id, table_name).await;
+        debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
+        added
     }
 
     /// Read the latest commit metadata for each WAL topic and fast-forward the
