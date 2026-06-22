@@ -2793,7 +2793,11 @@ impl Database {
         };
 
         if let Some(mut writer) = staged_writer {
-            use deltalake::{kernel::Action, kernel::transaction::TableReference, protocol::DeltaOperation, writer::DeltaWriter};
+            use deltalake::{
+                kernel::{Action, transaction::TableReference},
+                protocol::DeltaOperation,
+                writer::DeltaWriter,
+            };
 
             // Upload parquet (no commit) on the staging clone — outside the lock.
             // RecordBatchWriter (unlike WriteBuilder) doesn't cast the batch to
@@ -2820,7 +2824,11 @@ impl Database {
             }
 
             let partition_by = (!schema.partitions.is_empty()).then(|| schema.partitions.clone());
-            let op = DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by, predicate: None };
+            let op = DeltaOperation::Write {
+                mode: deltalake::protocol::SaveMode::Append,
+                partition_by,
+                predicate: None,
+            };
 
             let mut retry_count = 0;
             loop {
