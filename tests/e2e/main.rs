@@ -13,4 +13,5 @@ mod or_utf8view_delta;
 mod pressure_flush;
 mod restart_recovery;
 mod smoke;
+mod staged_commit;
 mod zorder_idempotence;
