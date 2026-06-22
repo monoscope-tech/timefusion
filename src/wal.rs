@@ -402,6 +402,15 @@ impl WalManager {
         self.append_locks[idx].lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Serialize and append one entry under the shard's `append_lock` so
+    /// concurrent same-shard appends queue instead of erroring.
+    fn locked_append(&self, walrus_key: &str, entry: &WalEntry) -> Result<(), WalError> {
+        let entry_bytes = serialize_wal_entry(entry)?;
+        let _guard = self.append_lock(walrus_key);
+        self.wal.append_for_topic(walrus_key, &entry_bytes)?;
+        Ok(())
+    }
+
     /// Returns the shard the entry was appended to. Callers must record this
     /// against their MemBuffer bucket so the WAL cursor can later be advanced
     /// by exactly the right count per shard (see `advance_by_counts`).
@@ -411,11 +420,7 @@ impl WalManager {
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let entry = WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?);
-        let entry_bytes = serialize_wal_entry(&entry)?;
-        {
-            let _guard = self.append_lock(&walrus_key);
-            self.wal.append_for_topic(&walrus_key, &entry_bytes)?;
-        }
+        self.locked_append(&walrus_key, &entry)?;
         self.persist_topic(&topic);
         debug!("WAL append INSERT: topic={}, shard={}, rows={}", topic, shard, batch.num_rows());
         Ok(shard)
@@ -455,11 +460,7 @@ impl WalManager {
             BINCODE_CONFIG,
         )?;
         let entry = WalEntry::new(project_id, table_name, WalOperation::Delete, data);
-        let entry_bytes = serialize_wal_entry(&entry)?;
-        {
-            let _guard = self.append_lock(&walrus_key);
-            self.wal.append_for_topic(&walrus_key, &entry_bytes)?;
-        }
+        self.locked_append(&walrus_key, &entry)?;
         self.persist_topic(&topic);
         debug!("WAL append DELETE: topic={}, shard={}, predicate={:?}", topic, shard, predicate_sql);
         Ok(shard)
@@ -475,11 +476,7 @@ impl WalManager {
             assignments:   assignments.to_vec(),
         };
         let entry = WalEntry::new(project_id, table_name, WalOperation::Update, bincode::encode_to_vec(&payload, BINCODE_CONFIG)?);
-        let entry_bytes = serialize_wal_entry(&entry)?;
-        {
-            let _guard = self.append_lock(&walrus_key);
-            self.wal.append_for_topic(&walrus_key, &entry_bytes)?;
-        }
+        self.locked_append(&walrus_key, &entry)?;
         self.persist_topic(&topic);
         debug!(
             "WAL append UPDATE: topic={}, shard={}, predicate={:?}, assignments={}",
@@ -512,11 +509,7 @@ impl WalManager {
             WalOperation::UpdateWithSource,
             bincode::encode_to_vec(&payload, BINCODE_CONFIG)?,
         );
-        let entry_bytes = serialize_wal_entry(&entry)?;
-        {
-            let _guard = self.append_lock(&walrus_key);
-            self.wal.append_for_topic(&walrus_key, &entry_bytes)?;
-        }
+        self.locked_append(&walrus_key, &entry)?;
         self.persist_topic(&topic);
         debug!(
             "WAL append UPDATE_WITH_SOURCE: topic={}, shard={}, predicate={:?}, assignments={}, source_keys={}, source_bytes={}",
