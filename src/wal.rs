@@ -181,6 +181,12 @@ pub struct UpdateWithSourcePayload {
 /// deployments override via `BufferConfig::timefusion_wal_shards_per_topic`.
 const WAL_SHARDS_PER_TOPIC_DEFAULT: usize = 4;
 
+/// Stripe count for the per-collection append locks (see
+/// `WalManager::append_locks`). Far exceeds the realistic distinct-collection
+/// count (topics × shards) so false sharing between unrelated collections is
+/// negligible.
+const WAL_APPEND_LOCK_STRIPES: usize = 256;
+
 pub struct WalManager {
     wal:              Walrus,
     data_dir:         PathBuf,
@@ -192,6 +198,14 @@ pub struct WalManager {
     /// the cold-cache miss for an idle topic.
     shard_counter:    dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
     shards_per_topic: usize,
+    /// Per-collection append serialization. Walrus rejects *concurrent* appends
+    /// to one collection with "another batch write already in progress".
+    /// `pick_shard` spreads load across `shards_per_topic` collections, but more
+    /// than `shards_per_topic` concurrent appends to one topic still collide on
+    /// a shard. These striped locks make colliders QUEUE (briefly — an append is
+    /// an in-memory write; fsync is decoupled) instead of erroring the insert,
+    /// which would dead-letter the row. Striped by `walrus_key` hash.
+    append_locks:     Vec<std::sync::Mutex<()>>,
 }
 
 impl WalManager {
@@ -248,6 +262,7 @@ impl WalManager {
             known_topics,
             shard_counter: dashmap::DashMap::new(),
             shards_per_topic,
+            append_locks: (0..WAL_APPEND_LOCK_STRIPES).map(|_| std::sync::Mutex::new(())).collect(),
         })
     }
 
@@ -374,6 +389,19 @@ impl WalManager {
         topic.split_once(':').map(|(p, t)| (p.to_string(), t.to_string()))
     }
 
+    /// Acquire the append lock for a walrus collection so concurrent appends to
+    /// it queue instead of hitting walrus's "another batch write already in
+    /// progress". Held only across the (fast, in-memory) walrus write — never an
+    /// `.await` — so blocking a worker is brief. The guard wraps `()`, so a
+    /// poisoned lock carries no invalid state and is safe to recover.
+    fn append_lock(&self, walrus_key: &str) -> std::sync::MutexGuard<'_, ()> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        walrus_key.hash(&mut h);
+        let idx = (h.finish() as usize) % self.append_locks.len();
+        self.append_locks[idx].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Returns the shard the entry was appended to. Callers must record this
     /// against their MemBuffer bucket so the WAL cursor can later be advanced
     /// by exactly the right count per shard (see `advance_by_counts`).
@@ -383,7 +411,11 @@ impl WalManager {
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let entry = WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?);
-        self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
+        let entry_bytes = serialize_wal_entry(&entry)?;
+        {
+            let _guard = self.append_lock(&walrus_key);
+            self.wal.append_for_topic(&walrus_key, &entry_bytes)?;
+        }
         self.persist_topic(&topic);
         debug!("WAL append INSERT: topic={}, shard={}, rows={}", topic, shard, batch.num_rows());
         Ok(shard)
@@ -402,7 +434,10 @@ impl WalManager {
             .collect::<Result<_, _>>()?;
 
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-        self.wal.batch_append_for_topic(&walrus_key, &payload_refs)?;
+        {
+            let _guard = self.append_lock(&walrus_key);
+            self.wal.batch_append_for_topic(&walrus_key, &payload_refs)?;
+        }
         self.persist_topic(&topic);
         debug!("WAL batch append INSERT: topic={}, shard={}, batches={}", topic, shard, batches.len());
         Ok((shard, batches.len()))
@@ -420,7 +455,11 @@ impl WalManager {
             BINCODE_CONFIG,
         )?;
         let entry = WalEntry::new(project_id, table_name, WalOperation::Delete, data);
-        self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
+        let entry_bytes = serialize_wal_entry(&entry)?;
+        {
+            let _guard = self.append_lock(&walrus_key);
+            self.wal.append_for_topic(&walrus_key, &entry_bytes)?;
+        }
         self.persist_topic(&topic);
         debug!("WAL append DELETE: topic={}, shard={}, predicate={:?}", topic, shard, predicate_sql);
         Ok(shard)
@@ -436,7 +475,11 @@ impl WalManager {
             assignments:   assignments.to_vec(),
         };
         let entry = WalEntry::new(project_id, table_name, WalOperation::Update, bincode::encode_to_vec(&payload, BINCODE_CONFIG)?);
-        self.wal.append_for_topic(&walrus_key, &serialize_wal_entry(&entry)?)?;
+        let entry_bytes = serialize_wal_entry(&entry)?;
+        {
+            let _guard = self.append_lock(&walrus_key);
+            self.wal.append_for_topic(&walrus_key, &entry_bytes)?;
+        }
         self.persist_topic(&topic);
         debug!(
             "WAL append UPDATE: topic={}, shard={}, predicate={:?}, assignments={}",
@@ -1187,6 +1230,48 @@ mod tests {
                 "({p1:?},{t1:?}) and ({p2:?},{t2:?}) collide"
             );
         }
+    }
+
+    /// Concurrent appends to a *single* topic must queue, not error. Walrus
+    /// rejects concurrent appends to one collection ("another batch write
+    /// already in progress"); `pick_shard` only spreads across
+    /// `shards_per_topic`, so more concurrent writers than shards collide on a
+    /// shard. The per-collection `append_lock` serializes them. Regression for
+    /// the 2026-06-22 prod DLQ flood, where these errors dead-lettered live
+    /// inserts under backfill concurrency.
+    #[test]
+    #[serial_test::serial]
+    fn concurrent_appends_same_topic_do_not_error() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
+        let wal = Arc::new(WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 4).unwrap());
+
+        // Far more concurrent writers than the 4 shards → guaranteed same-shard
+        // collisions under round-robin. Without `append_lock` walrus errors.
+        let errors = Arc::new(AtomicUsize::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..32 {
+                let (wal, table, errors) = (wal.clone(), table.clone(), errors.clone());
+                s.spawn(move || {
+                    let batch = create_test_batch();
+                    for _ in 0..8 {
+                        if wal.append_batch("proj", &table, std::slice::from_ref(&batch)).is_err() {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "concurrent same-topic appends must queue, not error with 'another batch write already in progress'"
+        );
     }
 
     /// Round-trip cursor snapshot: write, drop the manager, re-open, restore.
