@@ -403,7 +403,9 @@ impl WalManager {
     }
 
     /// Serialize and append one entry under the shard's `append_lock` so
-    /// concurrent same-shard appends queue instead of erroring.
+    /// concurrent same-shard appends queue instead of erroring. The guard
+    /// drops when this returns, so callers' `persist_topic` file I/O runs
+    /// outside the critical section — keep it after the call, not before.
     fn locked_append(&self, walrus_key: &str, entry: &WalEntry) -> Result<(), WalError> {
         let entry_bytes = serialize_wal_entry(entry)?;
         let _guard = self.append_lock(walrus_key);
@@ -440,6 +442,8 @@ impl WalManager {
 
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         {
+            // Guard scoped tightly: dropped before persist_topic so the shard
+            // lock never covers persist_topic's synchronous file I/O.
             let _guard = self.append_lock(&walrus_key);
             self.wal.batch_append_for_topic(&walrus_key, &payload_refs)?;
         }
@@ -1245,6 +1249,10 @@ mod tests {
         };
 
         let dir = tempfile::tempdir().unwrap();
+        // SAFETY: walrus reads its data dir from the process-global
+        // WALRUS_DATA_DIR; #[serial] protects the mutation. Without this the
+        // test inherits a prior test's now-dropped tempdir and walrus I/O fails.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", dir.path()) };
         let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
         let wal = Arc::new(WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 4).unwrap());
 
