@@ -276,9 +276,18 @@ pub(crate) fn parse_optimize(query: &str) -> Result<Option<OptimizeCmd>, String>
     if !cond.to_ascii_lowercase().starts_with("date") {
         return Err("OPTIMIZE only supports a single `date` filter".to_string());
     }
-    let val = cond[4..].trim().strip_prefix('=').ok_or("expected: date = 'YYYY-MM-DD'")?.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+    let val = cond[4..]
+        .trim()
+        .strip_prefix('=')
+        .ok_or("expected: date = 'YYYY-MM-DD'")?
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .trim();
     let date = val.parse::<chrono::NaiveDate>().map_err(|_| format!("invalid date '{val}', expected YYYY-MM-DD"))?;
-    Ok(Some(OptimizeCmd { table: table.to_string(), date }))
+    Ok(Some(OptimizeCmd {
+        table: table.to_string(),
+        date,
+    }))
 }
 
 /// Rewrites Postgres synonyms that DataFusion's SQL parser doesn't accept.
@@ -521,7 +530,10 @@ mod tests {
         assert_eq!(cmd.table, "otel_logs_and_spans");
         assert_eq!(cmd.date, "2026-06-19".parse().unwrap());
         // Case / spacing / quote / trailing-semicolon tolerance.
-        assert_eq!(parse_optimize("optimize t where DATE='2026-01-02';").unwrap().unwrap().date, "2026-01-02".parse().unwrap());
+        assert_eq!(
+            parse_optimize("optimize t where DATE='2026-01-02';").unwrap().unwrap().date,
+            "2026-01-02".parse().unwrap()
+        );
         assert_eq!(parse_optimize("  OPTIMIZE  t  WHERE  date  =  \"2026-01-02\"  ").unwrap().unwrap().table, "t");
     }
 

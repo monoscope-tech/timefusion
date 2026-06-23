@@ -443,7 +443,9 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         match a.as_str() {
             "--table" => table = it.next().context("--table needs a value")?,
             "--date" => only_date = Some(it.next().context("--date needs a value")?.parse().context("--date must be YYYY-MM-DD")?),
-            "--older-than-hours" => older_than_hours = it.next().context("--older-than-hours needs a value")?.parse().context("--older-than-hours must be an integer")?,
+            "--older-than-hours" => {
+                older_than_hours = it.next().context("--older-than-hours needs a value")?.parse().context("--older-than-hours must be an integer")?
+            }
             "--all" => all = true,
             "--dry-run" => dry_run = true,
             other => anyhow::bail!(
