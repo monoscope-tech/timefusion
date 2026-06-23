@@ -569,6 +569,23 @@ fn incremental_commit_properties(enabled: bool) -> CommitProperties {
     CommitProperties::default().with_incremental_advance(enabled)
 }
 
+/// True for the retryable Delta OCC conflicts — a single retry on a refreshed
+/// snapshot resolves them. Shared by the flush, dedup, and light-optimize commit
+/// loops so they classify identically. Substrings match the real delta-rs
+/// Display strings: VersionAlreadyExists ("... version N already exists."), the
+/// conflict_checker variants ("Commit failed: a concurrent transaction ..."),
+/// MetadataChanged ("Metadata changed since last commit."), and the predicate
+/// re-evaluation failure ("Transaction failed ..."). Deliberately NOT a bare
+/// "version" — that also matches the permanent Unsupported{Reader,Writer}Version
+/// errors, which must fail fast.
+fn is_occ_conflict_err(msg: &str) -> bool {
+    msg.contains("already exists")
+        || msg.contains("Commit failed")
+        || msg.contains("concurrent transaction")
+        || msg.contains("Metadata changed")
+        || msg.contains("Transaction failed")
+}
+
 /// write. No-op for any column that's not a Variant struct or already in
 /// Binary form. Called from `insert_records_batch` right before the
 /// Delta write so MemBuffer can keep its natural BinaryView layout
@@ -2561,8 +2578,16 @@ impl Database {
         let warm_table_uri = new_table.table_url().to_string();
         self.persist_snapshot(&new_table);
         {
+            // Version-guarded swap so this is safe to call WITHOUT holding
+            // `delta_commit_lock`: a concurrent committer may have already
+            // advanced `table_ref` past our just-committed version (its refresh
+            // picks our commit up from the log), and a bare `*table = new_table`
+            // would regress the handle. None < Some(_), so an unloaded handle
+            // always swaps. Same guard as `refresh_table_snapshot`.
             let mut table = table_ref.write().await;
-            *table = new_table;
+            if new_table.version() > table.version() {
+                *table = new_table;
+            }
         }
         // Eviction is in-cache only (cheap), so run it inline. Warming issues S3
         // GETs, so detach it — the maintenance loop shouldn't block on priming
@@ -2850,20 +2875,6 @@ impl Database {
         let max_retries = 5;
         // Exponential backoff between OCC conflict retries (shared by both paths).
         let retry_backoff = |n: u32| tokio::time::Duration::from_millis(100 * 2_u64.pow(n.min(5)));
-        // Only Delta OCC conflicts are retryable; auth/S3/IO errors must fail
-        // fast (don't burn 5 backoffs masking the real cause). Substrings match
-        // the real delta-rs Display strings: VersionAlreadyExists ("Delta
-        // transaction failed, version N already exists."), the conflict_checker
-        // variants ("Commit failed: a concurrent transaction ..."), and
-        // MetadataChanged ("Metadata changed since last commit."). Deliberately
-        // NOT a bare "version" — that also matches the *permanent*
-        // Unsupported{Reader,Writer}Version errors, which must fail fast.
-        // (Two sibling OCC classifiers exist — dedup_partition, light_optimize;
-        // a shared free fn is a worthwhile follow-up but out of this PR's scope.)
-        let is_conflict_err = |msg: &str| {
-            msg.contains("already exists") || msg.contains("Commit failed") || msg.contains("concurrent transaction") || msg.contains("Metadata changed")
-        };
-
         // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the
         // global `delta_commit_lock`, then serialize only the tiny commit-log
         // append. The old path held the lock across the whole `.write()`
@@ -2963,7 +2974,7 @@ impl Database {
                     }
                     Err(e) => {
                         drop(commit_guard);
-                        if !is_conflict_err(&e.to_string()) {
+                        if !is_occ_conflict_err(&e.to_string()) {
                             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                             return Err(anyhow::anyhow!("staged commit failed: {}", e));
                         }
@@ -3018,7 +3029,7 @@ impl Database {
                     return Ok(added);
                 }
                 Err(e) => {
-                    if is_conflict_err(&e.to_string()) {
+                    if is_occ_conflict_err(&e.to_string()) {
                         retry_count += 1;
                         last_error = Some(e);
                         debug!("Delta write conflict detected, retrying... (attempt {}/{})", retry_count, max_retries);
@@ -3752,6 +3763,13 @@ impl Database {
                     .await;
                 match result {
                     Ok(new_table) => {
+                        // Release the commit lock BEFORE post-commit work, matching
+                        // the flush staged-commit path. The commit has landed; the
+                        // version-guarded swap + cache refresh no longer need the
+                        // lock, and holding it across get_file_uris (26k paths),
+                        // persist_snapshot, and the table write-lock would serialize
+                        // every concurrent flush append behind this window.
+                        drop(commit_guard);
                         // Swap + warm-added/evict-removed exactly like the optimize
                         // paths; a bare swap left the replace_where outputs stone-cold
                         // (1.5 s first read observed against OVH) and the tombstoned
@@ -3776,7 +3794,7 @@ impl Database {
                         // while evaluating our predicate against a concurrent commit
                         // (seen in prod as "Failed to commit transaction: Error
                         // evaluating predicate") — rebasing on retry resolves it.
-                        let is_conflict = msg.contains("concurrent transaction") || msg.contains("Commit failed") || msg.contains("Transaction failed");
+                        let is_conflict = is_occ_conflict_err(&msg);
                         if !is_conflict || attempt + 1 == MAX_RETRIES {
                             return Err(anyhow::anyhow!("dedup_partition write failed: {}", e));
                         }
@@ -3952,7 +3970,7 @@ impl Database {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    let is_conflict = msg.contains("concurrent transaction") || msg.contains("Commit failed");
+                    let is_conflict = is_occ_conflict_err(&msg);
                     // "Found unmasked nulls for non-nullable StructArray" surfaces
                     // when delta-rs is mid-rewrite and the in-flight Add log lines
                     // for partition struct values aren't fully populated yet.
@@ -5414,6 +5432,33 @@ mod tests {
 
     use super::*;
     use crate::{config::AppConfig, test_utils::test_helpers::*};
+
+    /// The shared OCC classifier must treat every retryable delta-rs conflict as
+    /// retryable — including `VersionAlreadyExists` ("already exists", which can
+    /// hit the dedup path under multi-replica races), `MetadataChanged`, and the
+    /// predicate re-evaluation failure ("Transaction failed") — while permanent
+    /// errors (protocol version, auth/IO) fail fast. Guards the dedup/optimize
+    /// loops, which previously omitted some of these substrings.
+    #[test]
+    fn is_occ_conflict_err_classifies_retryable_vs_permanent() {
+        for retryable in [
+            "Delta transaction failed, version 58420 already exists.",
+            "Commit failed: a concurrent transaction overlapped",
+            "concurrent transaction wrote to the same files",
+            "Metadata changed since last commit.",
+            "Transaction failed: Error evaluating predicate",
+        ] {
+            assert!(is_occ_conflict_err(retryable), "should retry: {retryable}");
+        }
+        for permanent in [
+            "Generic S3 error: Access Denied",
+            "Unsupported reader version: requires 3, have 2",
+            "Unsupported writer version required",
+            "Arrow error: Invalid argument",
+        ] {
+            assert!(!is_occ_conflict_err(permanent), "must fail fast: {permanent}");
+        }
+    }
 
     // Regression: a single Arrow batch carrying rows for several projects (as a
     // genuine multi-row pgwire INSERT produces) must split row-wise — each row to
