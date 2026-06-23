@@ -3023,8 +3023,8 @@ impl Database {
     /// (version-guarded), warm the just-written files, invalidate stats, and
     /// return the newly added file URIs.
     async fn record_committed_write(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, new_table: DeltaTable,
-        pre_uris: &std::collections::HashSet<String>, warm: bool,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
+        warm: bool,
     ) -> Vec<String> {
         let committed_version = new_table.version();
         if let Some(version) = committed_version {
