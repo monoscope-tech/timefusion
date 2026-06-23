@@ -93,6 +93,59 @@ mod tests {
     use super::*;
     use crate::schema_loader::get_default_schema;
 
+    /// Decisive probe: does a delta-rs commit (the `CommitBuilder` post-commit
+    /// hook that produces `finalized.snapshot()` in TF's flush path) preserve
+    /// the materialized file list? If a commit drops it, every subsequent
+    /// post-commit `snapshot.update()` falls back to a full checkpoint replay —
+    /// the 2-8s/flush prod cost — even though load/update preserve it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commit_preserves_materialized_files() -> anyhow::Result<()> {
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let url = Url::parse("memory:///commit_mat")?;
+        let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
+        let mut table = t.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        assert!(table.state.as_ref().unwrap().has_materialized_files(), "freshly created table is materialized");
+
+        // A metadata commit through the high-level ops API exercises the same
+        // CommitBuilder post-commit hook the flush path uses.
+        table = table
+            .set_tbl_properties()
+            .with_properties(std::collections::HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())]))
+            .await?;
+        assert_eq!(table.version(), Some(1));
+        assert!(
+            table.state.as_ref().unwrap().has_materialized_files(),
+            "post-commit state must stay materialized; if false, every flush full-scans"
+        );
+        Ok(())
+    }
+
+    /// Does a full `.load()` (the path TF takes when there's no usable local
+    /// snapshot — e.g. a legacy on-disk snapshot that misses) come back
+    /// materialized? If not, every post-commit update stays on the full-scan
+    /// branch and never self-heals — the suspected prod cause. Also verifies
+    /// `ensure_materialized_files` (Tier A) repairs it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_load_materialization() -> anyhow::Result<()> {
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let url = Url::parse("memory:///full_load")?;
+        let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
+        let created = t.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
+        created
+            .set_tbl_properties()
+            .with_properties(std::collections::HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())]))
+            .await?;
+
+        let mut loaded = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).load().await?;
+        let materialized_on_load = loaded.state.as_ref().unwrap().has_materialized_files();
+        // Tier A must leave the state materialized regardless of how it loaded.
+        let log_store = loaded.log_store();
+        loaded.state.as_mut().unwrap().ensure_materialized_files(log_store.as_ref()).await?;
+        assert!(loaded.state.as_ref().unwrap().has_materialized_files(), "ensure_materialized_files must materialize after a full load");
+        eprintln!("FULL_LOAD_MATERIALIZED_ON_LOAD={materialized_on_load}");
+        Ok(())
+    }
+
     /// Round-trip: persist a snapshot, restore it into a fresh unloaded
     /// handle, and incrementally catch up to a commit made after the persist.
     /// This is exactly the boot path — restore at version V, replay > V.
@@ -119,6 +172,20 @@ mod tests {
         restored.state = Some(state);
         restored.update_state().await?;
         assert_eq!(restored.version(), Some(1), "restored snapshot must incrementally reach the latest commit");
+
+        // The fork persists the materialized file list (MaterializedFilesWire),
+        // so a restored snapshot must come back materialized and STAY that way
+        // across updates — otherwise post-commit updates fall back to a full
+        // checkpoint replay (the 2-8s/flush prod cost). Guard the whole chain:
+        // ensure (idempotent) → update (incremental) → reconcile rebuild.
+        assert!(restored.state.as_ref().unwrap().has_materialized_files(), "restored snapshot must come back materialized");
+        let log_store = restored.log_store();
+        restored.state.as_mut().unwrap().ensure_materialized_files(log_store.as_ref()).await?;
+        restored.update_state().await?;
+        assert!(restored.state.as_ref().unwrap().has_materialized_files(), "materialization must survive update (stays incremental)");
+        let log_store = restored.log_store();
+        restored.state.as_mut().unwrap().rematerialize_files(log_store.as_ref()).await?;
+        assert!(restored.state.as_ref().unwrap().has_materialized_files(), "rematerialize_files keeps the file list materialized");
 
         // Wrong table url (or hash collision) must miss, not mis-restore.
         assert!(load(dir.path(), "memory:///other_tbl").is_none());
