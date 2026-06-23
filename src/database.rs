@@ -2667,7 +2667,10 @@ impl Database {
                     .inspect_err(|e| warn!("Local snapshot catch-up failed for '{storage_uri}': {e}; falling back to full load"))
                     .ok()
                     .map(|()| {
-                        info!("Restored '{storage_uri}' from local snapshot at v{restored_version}, caught up to {:?}", table.version());
+                        info!(
+                            "Restored '{storage_uri}' from local snapshot at v{restored_version}, caught up to {:?}",
+                            table.version()
+                        );
                         table
                     })
             }
@@ -3020,8 +3023,8 @@ impl Database {
     /// (version-guarded), warm the just-written files, invalidate stats, and
     /// return the newly added file URIs.
     async fn record_committed_write(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, mut new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
-        warm: bool,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, new_table: DeltaTable,
+        pre_uris: &std::collections::HashSet<String>, warm: bool,
     ) -> Vec<String> {
         let committed_version = new_table.version();
         if let Some(version) = committed_version {
@@ -3070,7 +3073,7 @@ impl Database {
         let reconcile_n = self.config.maintenance.timefusion_snapshot_reconcile_commits;
         if self.config.maintenance.timefusion_incremental_snapshot
             && reconcile_n > 0
-            && committed_version.is_some_and(|v| (v + Self::reconcile_offset(project_id, table_name, reconcile_n)) % reconcile_n == 0)
+            && committed_version.is_some_and(|v| (v + Self::reconcile_offset(project_id, table_name, reconcile_n)).is_multiple_of(reconcile_n))
         {
             let (table_ref, shutdown) = (table_ref.clone(), self.maintenance_shutdown.clone());
             let (project_id, table_name) = (project_id.to_string(), table_name.to_string());

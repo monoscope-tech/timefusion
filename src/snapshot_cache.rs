@@ -141,7 +141,10 @@ mod tests {
         // Tier A must leave the state materialized regardless of how it loaded.
         let log_store = loaded.log_store();
         loaded.state.as_mut().unwrap().ensure_materialized_files(log_store.as_ref()).await?;
-        assert!(loaded.state.as_ref().unwrap().has_materialized_files(), "ensure_materialized_files must materialize after a full load");
+        assert!(
+            loaded.state.as_ref().unwrap().has_materialized_files(),
+            "ensure_materialized_files must materialize after a full load"
+        );
         eprintln!("FULL_LOAD_MATERIALIZED_ON_LOAD={materialized_on_load}");
         Ok(())
     }
@@ -178,14 +181,23 @@ mod tests {
         // across updates — otherwise post-commit updates fall back to a full
         // checkpoint replay (the 2-8s/flush prod cost). Guard the whole chain:
         // ensure (idempotent) → update (incremental) → reconcile rebuild.
-        assert!(restored.state.as_ref().unwrap().has_materialized_files(), "restored snapshot must come back materialized");
+        assert!(
+            restored.state.as_ref().unwrap().has_materialized_files(),
+            "restored snapshot must come back materialized"
+        );
         let log_store = restored.log_store();
         restored.state.as_mut().unwrap().ensure_materialized_files(log_store.as_ref()).await?;
         restored.update_state().await?;
-        assert!(restored.state.as_ref().unwrap().has_materialized_files(), "materialization must survive update (stays incremental)");
+        assert!(
+            restored.state.as_ref().unwrap().has_materialized_files(),
+            "materialization must survive update (stays incremental)"
+        );
         let log_store = restored.log_store();
         restored.state.as_mut().unwrap().rematerialize_files(log_store.as_ref()).await?;
-        assert!(restored.state.as_ref().unwrap().has_materialized_files(), "rematerialize_files keeps the file list materialized");
+        assert!(
+            restored.state.as_ref().unwrap().has_materialized_files(),
+            "rematerialize_files keeps the file list materialized"
+        );
 
         // Wrong table url (or hash collision) must miss, not mis-restore.
         assert!(load(dir.path(), "memory:///other_tbl").is_none());
