@@ -42,13 +42,6 @@ pub fn config() -> &'static AppConfig {
     CONFIG.get().expect("Config not initialized. Call init_config() first.")
 }
 
-/// Global config if initialized. Unlike [`config`] this never panics, for the
-/// few call sites reachable before/without `init_config` (e.g. the E2E harness,
-/// which wires a `Database` directly without setting the global singleton).
-pub fn try_config() -> Option<&'static AppConfig> {
-    CONFIG.get()
-}
-
 /// Whether the operator has opted into open auth for local dev via
 /// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Both the pgwire and gRPC auth
 /// paths gate their fail-secure defaults on this flag.
