@@ -250,26 +250,27 @@ pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>, incr
     }
     let mut fresh = table.read().await.clone();
     // Fast path (gated by the caller's `incremental` flag, i.e. self.config):
-    // when the catch-up range is append-only, advance by appending the new
-    // files instead of re-collecting the whole active set — the O(active files)
-    // re-materialize `update_state` pays (2-8s on the 26k-file unified table).
-    // Falls back to the full update when not applicable (removes in range, gap
-    // too large, not materialized). The fallback path is slightly *more*
-    // expensive than a bare update_state — it pays advance_appends_only's
-    // probe (one get_latest_version + cached commit GETs) before the full
-    // update_state's uncached `_delta_log` LIST + re-materialize. That recurs
-    // on the first refresh after each compaction (light-optimize removes files
-    // every ~5 min); acceptable since the common append-only case is the win.
+    // carry the materialized file list forward over the catch-up range —
+    // appending the new files and dropping the tombstoned ones (compaction /
+    // replace_where) — instead of re-collecting the whole active set, the
+    // O(active files) re-materialize `update_state` pays (2-8s on the 26k-file
+    // unified table). Falls back to the full update when not applicable (gap
+    // too large, not materialized, unreadable commit). The fallback path is
+    // slightly *more* expensive than a bare update_state — it pays
+    // advance_catchup's probe (one get_latest_version + cached commit GETs)
+    // before the full update_state's uncached `_delta_log` LIST + re-materialize
+    // — but the common case (in-gap, materialized) is always the win now that
+    // removes no longer force the fallback.
     let advanced = if incremental {
         let log_store = fresh.log_store();
         match fresh.state.as_mut() {
-            Some(state) => match state.advance_appends_only(log_store.as_ref(), REFRESH_APPEND_CATCHUP_MAX_GAP).await {
+            Some(state) => match state.advance_catchup(log_store.as_ref(), REFRESH_APPEND_CATCHUP_MAX_GAP).await {
                 Ok(advanced) => advanced,
                 // Non-fatal: the full update_state below re-attempts the same IO
                 // and surfaces any persistent error; log so a table silently
                 // never taking the fast path is at least visible.
                 Err(e) => {
-                    debug!("append-only catch-up failed, falling back to full update_state: {e}");
+                    debug!("incremental catch-up failed, falling back to full update_state: {e}");
                     false
                 }
             },
@@ -558,6 +559,14 @@ fn build_watermark_commit_properties(watermark: &crate::buffered_write_layer::De
     let mut meta = std::collections::HashMap::new();
     meta.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(entries));
     CommitProperties::default().with_metadata(meta)
+}
+
+/// `CommitProperties` for a compaction/dedup commit (Add + Remove): when
+/// `enabled`, the post-commit hook advances the materialized snapshot
+/// incrementally instead of re-materializing every active file. `false` is the
+/// plain full-update behaviour.
+fn incremental_commit_properties(enabled: bool) -> CommitProperties {
+    CommitProperties::default().with_incremental_advance(enabled)
 }
 
 /// write. No-op for any column that's not a Variant struct or already in
@@ -2826,17 +2835,15 @@ impl Database {
 
         // Hoist out of the retry loop — the watermark is the same on every attempt.
         let commit_properties = watermark.map(build_watermark_commit_properties);
-        // Let the post-commit hook advance the snapshot by appending the
-        // committed files instead of re-materializing the whole active set.
-        // Applied to both the staged (pure-append) and schema-evolution merge
-        // paths: the hook takes the fast path only when the commit has no Remove
-        // actions, so it can never drop files. A schema-evolution commit
-        // (MetaData + Add, no Remove) is still safe — the hook rebuilds the
-        // kernel snapshot from the log, so the MetaData/schema change IS applied;
-        // only the file-list re-materialization is skipped. Removes (overwrite/
-        // delete) fall back to the full update.
+        // Let the post-commit hook advance the snapshot incrementally — carry
+        // the materialized file list forward, append the committed files, drop
+        // any removed ones — instead of re-materializing the whole active set.
+        // Safe for the staged (pure-append) and schema-evolution merge paths
+        // alike: the hook rebuilds the kernel snapshot from the log, so a
+        // MetaData/schema change IS applied; only the file-list re-materialize
+        // is skipped.
         let commit_properties = if self.config.maintenance.timefusion_incremental_snapshot {
-            Some(commit_properties.unwrap_or_default().with_fast_append_advance(true))
+            Some(commit_properties.unwrap_or_default().with_incremental_advance(true))
         } else {
             commit_properties
         };
@@ -3292,6 +3299,7 @@ impl Database {
             .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
+            .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
             // Avoid the BinaryView read for Variant columns (same issue as
             // optimize_table_light); delta-rs's internal session defaults to
             // schema_force_view_types=true.
@@ -3503,6 +3511,7 @@ impl Database {
             .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
+            .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
             .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
             .await;
 
@@ -3718,12 +3727,18 @@ impl Database {
                     table.clone()
                 };
                 let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                // Apply this replace_where's Add+Remove to the materialized
+                // snapshot incrementally (drop tombstoned paths, append new)
+                // instead of the post-commit hook re-materializing all active
+                // files — the 2-8s/commit full scan on the 26k-file unified
+                // table that the dedup sweep otherwise pays under the commit lock.
                 let result = table_clone
                     .write(deduped.clone())
                     .with_partition_columns(schema.partitions.clone())
                     .with_writer_properties(writer_properties.clone())
                     .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
                     .with_replace_where(predicate.clone())
+                    .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
                     .await;
                 match result {
                     Ok(new_table) => {
@@ -3891,6 +3906,10 @@ impl Database {
                 .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
                 .with_writer_properties(writer_properties.clone())
                 .with_min_commit_interval(tokio::time::Duration::from_secs(30))
+                // Apply the compaction's Add+Remove to the materialized snapshot
+                // incrementally rather than re-materializing all active files in
+                // the post-commit hook (see the dedup path).
+                .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
                 // Variant columns are stored as Struct{Binary, Binary} on disk; if
                 // the optimize-internal Parquet read uses `schema_force_view_types=true`
                 // (delta-rs's default), it returns BinaryView and the rewrite blows up
@@ -5679,6 +5698,88 @@ mod tests {
         assert!(
             max_wait < wait / 2,
             "readers stalled {max_wait:?} behind an in-flight refresh (refresh took {refresh_took:?}) — write lock is being held across update_state"
+        );
+        Ok(())
+    }
+
+    /// Tier-C correctness guard: advancing a materialized snapshot incrementally
+    /// across a `replace_where` (Add + Remove) must yield exactly the active
+    /// file set a full re-materialize produces. This is the path the
+    /// dedup/compaction sweeps take (`with_incremental_advance`) and that
+    /// `refresh_table_snapshot(.., true)` → `advance_catchup` takes on catch-up.
+    /// Drift here silently corrupts query results — by keeping a tombstoned file
+    /// or dropping a live one — so it must be pinned in this repo, not only in
+    /// the fork's EagerSnapshot tests.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_incremental_matches_full_across_removes() -> Result<()> {
+        use datafusion::arrow::{
+            array::{Int32Array, RecordBatch, StringArray},
+            datatypes::{DataType as ArrowDataType, Field, Schema},
+        };
+        use deltalake::{
+            kernel::{DataType, PrimitiveType, StructField},
+            protocol::SaveMode,
+        };
+
+        let mem = Arc::new(object_store::memory::InMemory::new());
+        let url = Url::parse("memory:///tierc_removes")?;
+        let backend = || DeltaTableBuilder::from_url(url.clone()).unwrap().with_storage_backend(mem.clone(), url.clone());
+
+        // v0: partitioned table.
+        let cols = vec![
+            StructField::new("id", DataType::Primitive(PrimitiveType::Integer), true),
+            StructField::new("p", DataType::Primitive(PrimitiveType::String), true),
+        ];
+        let table = backend().build()?.create().with_columns(cols).with_partition_columns(["p".to_string()]).await?;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, true),
+            Field::new("p", ArrowDataType::Utf8, true),
+        ]));
+        let batch = |ids: Vec<i32>, ps: Vec<&str>| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(ids)) as _, Arc::new(StringArray::from(ps)) as _]).unwrap()
+        };
+
+        // v1: append p=a, v2: append p=b (two partition files). These plain writes
+        // set no incremental flag, so the returned `table` is the authoritative
+        // full re-materialize at every step.
+        let table = table.write(vec![batch(vec![1, 2], vec!["a", "a"])]).with_save_mode(SaveMode::Append).await?;
+        let table = table.write(vec![batch(vec![3], vec!["b"])]).with_save_mode(SaveMode::Append).await?;
+        assert_eq!(table.version(), Some(2));
+
+        // v3: replace_where p=a → tombstones v1's file, adds a new one (Add + Remove).
+        let table = table
+            .write(vec![batch(vec![10, 11], vec!["a", "a"])])
+            .with_save_mode(SaveMode::Overwrite)
+            .with_replace_where("p = 'a'")
+            .await?;
+        assert_eq!(table.version(), Some(3));
+
+        let uris = |t: &DeltaTable| t.get_file_uris().map(|it| it.collect::<std::collections::HashSet<String>>()).unwrap_or_default();
+        let truth = uris(&table); // authoritative v3 set (full re-materialize)
+        assert_eq!(truth.len(), 2, "v3 active set = p=b file + replaced p=a file");
+
+        // Stale handle pinned at v2. Drive the Tier-C catch-up directly (the
+        // path refresh_table_snapshot takes) and assert it RETURNED TRUE — i.e.
+        // actually took the incremental path across the replace_where, rather
+        // than silently falling back to a full update_state (which would also
+        // produce a correct set and so hide a broken incremental path).
+        let mut stale = backend().with_version(2).load().await?;
+        assert!(
+            stale.state.as_ref().is_some_and(|s| s.has_materialized_files()),
+            "stale handle must be materialized to exercise the fast path"
+        );
+        let log_store = stale.log_store();
+        let took_fast_path = stale.state.as_mut().unwrap().advance_catchup(log_store.as_ref(), REFRESH_APPEND_CATCHUP_MAX_GAP).await?;
+        assert!(
+            took_fast_path,
+            "advance_catchup must take the incremental path over the replace_where, not fall back to a full update"
+        );
+        assert_eq!(stale.version(), Some(3), "incremental catch-up reached the latest version");
+        assert_eq!(
+            uris(&stale),
+            truth,
+            "incremental advance across replace_where must equal the full re-materialize"
         );
         Ok(())
     }

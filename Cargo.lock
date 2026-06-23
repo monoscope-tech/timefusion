@@ -2983,7 +2983,7 @@ dependencies = [
 [[package]]
 name = "deltalake"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=0752b7eab70899d833b6fb4b3735953c14a872b1#0752b7eab70899d833b6fb4b3735953c14a872b1"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=dc6d24c3ce8f3f605443f612eb1caddad145b510#dc6d24c3ce8f3f605443f612eb1caddad145b510"
 dependencies = [
  "buoyant_kernel 0.24.0",
  "ctor",
@@ -2994,7 +2994,7 @@ dependencies = [
 [[package]]
 name = "deltalake-aws"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=0752b7eab70899d833b6fb4b3735953c14a872b1#0752b7eab70899d833b6fb4b3735953c14a872b1"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=dc6d24c3ce8f3f605443f612eb1caddad145b510#dc6d24c3ce8f3f605443f612eb1caddad145b510"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3017,7 +3017,7 @@ dependencies = [
 [[package]]
 name = "deltalake-core"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=0752b7eab70899d833b6fb4b3735953c14a872b1#0752b7eab70899d833b6fb4b3735953c14a872b1"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=dc6d24c3ce8f3f605443f612eb1caddad145b510#dc6d24c3ce8f3f605443f612eb1caddad145b510"
 dependencies = [
  "alloc-stdlib",
  "arrow",
@@ -3073,7 +3073,7 @@ dependencies = [
 [[package]]
 name = "deltalake-derive"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=0752b7eab70899d833b6fb4b3735953c14a872b1#0752b7eab70899d833b6fb4b3735953c14a872b1"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=dc6d24c3ce8f3f605443f612eb1caddad145b510#dc6d24c3ce8f3f605443f612eb1caddad145b510"
 dependencies = [
  "convert_case 0.9.0",
  "itertools 0.14.0",
@@ -6037,7 +6037,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -6058,7 +6058,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
