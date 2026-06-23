@@ -32,6 +32,14 @@ jobs:
         with:
           components: rustfmt
       - run: cargo +nightly fmt --all --check
+      # NOTE: a former step here grepped vendor/datafusion-postgres for the
+      # `was_pre_optimized` optimize-skip patch. That crate is now a git dep
+      # ([patch.crates-io] in Cargo.toml → apitoolkit/datafusion-postgres@timefusion-df54),
+      # so the grep targeted a deleted path and failed every run. The
+      # optimize-skip behavioral contract is consequently NOT CI-guarded: if a
+      # branch bump drops the patch, extended queries silently double-optimize.
+      # Verify the patch on every datafusion-postgres rev bump (see plan_cache.rs);
+      # a round-trip "no double state.optimize()" smoke test would re-add a guard.
 
   # Combined clippy + test. `cargo clippy` implies `cargo check`, and both
   # share ~all artifacts with `cargo test` — running them in one job lets

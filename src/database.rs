@@ -254,7 +254,12 @@ pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>, incr
     // files instead of re-collecting the whole active set — the O(active files)
     // re-materialize `update_state` pays (2-8s on the 26k-file unified table).
     // Falls back to the full update when not applicable (removes in range, gap
-    // too large, not materialized).
+    // too large, not materialized). The fallback path is slightly *more*
+    // expensive than a bare update_state — it pays advance_appends_only's
+    // probe (one get_latest_version + cached commit GETs) before the full
+    // update_state's uncached `_delta_log` LIST + re-materialize. That recurs
+    // on the first refresh after each compaction (light-optimize removes files
+    // every ~5 min); acceptable since the common append-only case is the win.
     let advanced = if incremental {
         let log_store = fresh.log_store();
         match fresh.state.as_mut() {
