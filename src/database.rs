@@ -214,6 +214,11 @@ fn should_refresh_table(current_version: Option<u64>, last_written_version: Opti
     }
 }
 
+/// Max commits behind for the append-only fast catch-up in `refresh_table_snapshot`:
+/// each commit in the range costs one log read for the Remove check, so cap it
+/// and let larger gaps take the single full re-materialize instead.
+const REFRESH_APPEND_CATCHUP_MAX_GAP: u64 = 64;
+
 /// Refresh `table`'s snapshot WITHOUT holding the write lock across
 /// `update_state()` — that's a full Delta log replay plus object-store IO
 /// (1s+ per refresh on prod's 40k-action log), and every query refreshes
@@ -244,7 +249,36 @@ pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>) -> s
         }
     }
     let mut fresh = table.read().await.clone();
-    fresh.update_state().await?;
+    // Fast path: when incremental snapshots are on and the catch-up range is
+    // append-only, advance by appending the new files instead of re-collecting
+    // the whole active set — the O(active files) re-materialize `update_state`
+    // pays (2-8s on the 26k-file unified table). Falls back to the full update
+    // when not applicable (removes in range, gap too large, not materialized).
+    // try_config (not config()) — refresh runs in the E2E harness too, which
+    // wires a Database without the global singleton; default to the flag's
+    // default (on) when unset.
+    let incremental = crate::config::try_config().is_none_or(|c| c.maintenance.timefusion_incremental_snapshot);
+    let advanced = if incremental {
+        let log_store = fresh.log_store();
+        match fresh.state.as_mut() {
+            Some(state) => match state.advance_appends_only(log_store.as_ref(), REFRESH_APPEND_CATCHUP_MAX_GAP).await {
+                Ok(advanced) => advanced,
+                // Non-fatal: the full update_state below re-attempts the same IO
+                // and surfaces any persistent error; log so a table silently
+                // never taking the fast path is at least visible.
+                Err(e) => {
+                    debug!("append-only catch-up failed, falling back to full update_state: {e}");
+                    false
+                }
+            },
+            None => false,
+        }
+    } else {
+        false
+    };
+    if !advanced {
+        fresh.update_state().await?;
+    }
     let fresh_version = fresh.version();
     let mut guard = table.write().await;
     // Option<u64> ordering: None < Some(_), so an unloaded handle always swaps.
