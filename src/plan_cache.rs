@@ -260,16 +260,17 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
     Ok(Some(rows))
 }
 
-/// Mirror of the vendored `datafusion_postgres::handlers::dml_completion`,
+/// Mirror of `datafusion_postgres::handlers::dml_completion`,
 /// which is `pub(super)` and so unreachable from outside the crate.
 ///
-/// **Re-vendor checklist.** When bumping the vendored `datafusion-postgres`,
-/// diff `vendored handlers.rs::dml_completion` against this implementation —
-/// upstream changes to the tag format ("INSERT 0 N" oid + count), the
-/// `count` column name, or the count column's Arrow type are silent
+/// **Re-sync checklist.** When bumping the patched `datafusion-postgres` git dep
+/// (apitoolkit/datafusion-postgres @ `timefusion-df54`, see the `[patch.crates-io]`
+/// in Cargo.toml), diff its `handlers.rs::dml_completion` against this
+/// implementation — upstream changes to the tag format ("INSERT 0 N" oid +
+/// count), the `count` column name, or the count column's Arrow type are silent
 /// divergence here (no compile error, wrong wire response). Search for the
-/// `RE-VENDOR-DML-COMPLETION` marker below and confirm parity.
-// RE-VENDOR-DML-COMPLETION: keep in sync with vendor/datafusion-postgres/src/handlers.rs.
+/// `RE-SYNC-DML-COMPLETION` marker below and confirm parity.
+// RE-SYNC-DML-COMPLETION: keep in sync with apitoolkit/datafusion-postgres@timefusion-df54 src/handlers.rs.
 async fn dml_completion(df: datafusion::dataframe::DataFrame) -> PgWireResult<Option<Response>> {
     let tag = match df.logical_plan() {
         LogicalPlan::Dml(d) => match d.op {
@@ -373,8 +374,8 @@ impl QueryHook for PlanCacheHook {
     /// canonical text would never produce a hit. The vendored
     /// datafusion-postgres `SimpleQueryHandler::do_query` still runs
     /// `state.optimize()` per call because `was_pre_optimized` returns false
-    /// for canonical SQL not present in our cache — see
-    /// `vendor/datafusion-postgres/PATCHES.md`.
+    /// for canonical SQL not present in our cache — see the optimize-skip patch
+    /// on apitoolkit/datafusion-postgres@timefusion-df54.
     async fn handle_simple_query(
         &self, _statement: &Statement, _session_context: &SessionContext, _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
@@ -416,9 +417,9 @@ impl QueryHook for PlanCacheHook {
         let plan = crate::insert_coerce::rewrite_plan(plan);
         // Pre-optimize at cache-miss time, not per-query. With OLAP traffic
         // (one-time plan build, millions of executions) this turns a per-
-        // query 30ms cost into a one-time amortization. Vendored
-        // datafusion-postgres skips its `state.optimize()` call when the
-        // hook returns Some — see `vendor/datafusion-postgres/src/handlers.rs`.
+        // query 30ms cost into a one-time amortization. The patched
+        // datafusion-postgres skips its `state.optimize()` call when the hook
+        // returns Some — see apitoolkit/datafusion-postgres@timefusion-df54 src/handlers.rs.
         // The plan still goes through `replace_params_with_values` at exec
         // time, but optimization rules that aren't constant-fold are
         // parameter-independent and stay valid across all bound values.
