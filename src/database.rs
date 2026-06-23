@@ -2629,6 +2629,18 @@ impl Database {
         }
     }
 
+    /// Materialize a table snapshot's active file list in memory. `reconcile`
+    /// rebuilds it from object-store truth; otherwise it materializes once if
+    /// not already done. No-op when the table carries no state.
+    async fn materialize_snapshot_files(table: &mut DeltaTable, reconcile: bool) -> Result<()> {
+        let log_store = table.log_store();
+        match table.state.as_mut() {
+            Some(state) if reconcile => state.rematerialize_files(log_store.as_ref()).await.map_err(Into::into),
+            Some(state) => state.ensure_materialized_files(log_store.as_ref()).await.map_err(Into::into),
+            None => Ok(()),
+        }
+    }
+
     /// Creates or loads a DeltaTable with proper configuration. Prefers the
     /// locally persisted snapshot (restore at version V + incremental replay
     /// of commits > V) over a full checkpoint + log-tail rebuild from S3;
@@ -2643,23 +2655,45 @@ impl Database {
                 .with_storage_options(storage_options.clone())
                 .with_allow_http(true))
         };
-        if let Some(state) = crate::snapshot_cache::load(&Self::delta_snapshot_dir(&self.config), storage_uri) {
-            let restored_version = state.version();
-            let mut table = builder()?.build()?;
-            table.state = Some(state);
-            match table.update_state().await {
-                Ok(()) => {
-                    info!(
-                        "Restored '{storage_uri}' from local snapshot at v{restored_version}, caught up to {:?}",
-                        table.version()
-                    );
-                    return Ok(table);
-                }
-                // e.g. the log tail past the snapshot was vacuumed away.
-                Err(e) => warn!("Local snapshot catch-up failed for '{storage_uri}': {e}; falling back to full load"),
+        let restored = match crate::snapshot_cache::load(&Self::delta_snapshot_dir(&self.config), storage_uri) {
+            Some(state) => {
+                let restored_version = state.version();
+                let mut table = builder()?.build()?;
+                table.state = Some(state);
+                // e.g. the log tail past the snapshot was vacuumed away → full load.
+                table
+                    .update_state()
+                    .await
+                    .inspect_err(|e| warn!("Local snapshot catch-up failed for '{storage_uri}': {e}; falling back to full load"))
+                    .ok()
+                    .map(|()| {
+                        info!(
+                            "Restored '{storage_uri}' from local snapshot at v{restored_version}, caught up to {:?}",
+                            table.version()
+                        );
+                        table
+                    })
             }
+            None => None,
+        };
+        let mut table = match restored {
+            Some(t) => t,
+            None => builder()?.load().await.map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))?,
+        };
+        // Materialize the file list once so every post-commit update stays
+        // incremental. With incremental snapshots on this is a *correctness*
+        // requirement, not just perf: a non-materialized snapshot enumerates an
+        // EMPTY file set, and the fast-advance post-commit hook would build on
+        // it — so fail loud rather than cache a handle that serves empty results
+        // (the caller retries on next access). load()/restore normally arrive
+        // materialized, so this no-ops and can only fail on the rare path that
+        // actually has to materialize.
+        if self.config.maintenance.timefusion_incremental_snapshot {
+            Self::materialize_snapshot_files(&mut table, false)
+                .await
+                .map_err(|e| anyhow::anyhow!("Materializing file list for '{storage_uri}' failed: {e}"))?;
         }
-        builder()?.load().await.map_err(|e| anyhow::anyhow!("Failed to load table: {}", e))
+        Ok(table)
     }
 
     #[instrument(
@@ -2756,6 +2790,20 @@ impl Database {
 
         // Hoist out of the retry loop — the watermark is the same on every attempt.
         let commit_properties = watermark.map(build_watermark_commit_properties);
+        // Let the post-commit hook advance the snapshot by appending the
+        // committed files instead of re-materializing the whole active set.
+        // Applied to both the staged (pure-append) and schema-evolution merge
+        // paths: the hook takes the fast path only when the commit has no Remove
+        // actions, so it can never drop files. A schema-evolution commit
+        // (MetaData + Add, no Remove) is still safe — the hook rebuilds the
+        // kernel snapshot from the log, so the MetaData/schema change IS applied;
+        // only the file-list re-materialization is skipped. Removes (overwrite/
+        // delete) fall back to the full update.
+        let commit_properties = if self.config.maintenance.timefusion_incremental_snapshot {
+            Some(commit_properties.unwrap_or_default().with_fast_append_advance(true))
+        } else {
+            commit_properties
+        };
         let max_retries = 5;
         // Exponential backoff between OCC conflict retries (shared by both paths).
         let retry_backoff = |n: u32| tokio::time::Duration::from_millis(100 * 2_u64.pow(n.min(5)));
@@ -2975,10 +3023,11 @@ impl Database {
     /// (version-guarded), warm the just-written files, invalidate stats, and
     /// return the newly added file URIs.
     async fn record_committed_write(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
-        warm: bool,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, new_table: DeltaTable,
+        pre_uris: &std::collections::HashSet<String>, warm: bool,
     ) -> Vec<String> {
-        if let Some(version) = new_table.version() {
+        let committed_version = new_table.version();
+        if let Some(version) = committed_version {
             self.last_written_versions.write().await.insert((project_id.to_string(), table_name.to_string()), version);
             debug!("Stored last written version for {}/{}: {}", project_id, table_name, version);
         } else {
@@ -3015,7 +3064,55 @@ impl Database {
         }
         self.statistics_extractor.invalidate(project_id, table_name).await;
         debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
+        // Periodic reconcile, OFF the flush path: every Nth commit (offset per
+        // table so tables with uniform write rates don't all rebuild at once)
+        // rebuild the file list from S3 truth in the background. This bounds any
+        // incremental-replay drift without blocking the WAL cursor, and runs on
+        // a detached clone so it never touches `added` (tantivy coverage) or the
+        // persisted snapshot — both already captured from the committed state.
+        let reconcile_n = self.config.maintenance.timefusion_snapshot_reconcile_commits;
+        if self.config.maintenance.timefusion_incremental_snapshot
+            && reconcile_n > 0
+            && committed_version.is_some_and(|v| (v + Self::reconcile_offset(project_id, table_name, reconcile_n)).is_multiple_of(reconcile_n))
+        {
+            let (table_ref, shutdown) = (table_ref.clone(), self.maintenance_shutdown.clone());
+            let (project_id, table_name) = (project_id.to_string(), table_name.to_string());
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {}
+                    _ = Self::reconcile_snapshot(&table_ref, &project_id, &table_name) => {}
+                }
+            });
+        }
         added
+    }
+
+    /// Stable per-table offset into the reconcile cycle so tables committing in
+    /// lockstep don't all hit their `% reconcile_n == 0` boundary together.
+    fn reconcile_offset(project_id: &str, table_name: &str, reconcile_n: u64) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        (project_id, table_name).hash(&mut h);
+        h.finish() % reconcile_n
+    }
+
+    /// Rebuild a table's in-memory file list from object-store truth and swap it
+    /// in — but only if no commit advanced the handle while we rebuilt, since a
+    /// rebuild is pinned to its version and a stale swap would drop newer files.
+    /// Runs detached (off the flush path); never persists (the commit path
+    /// already persisted the correct incremental state).
+    async fn reconcile_snapshot(table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str) {
+        let mut fresh = table_ref.read().await.clone();
+        if let Err(e) = Self::materialize_snapshot_files(&mut fresh, true).await {
+            warn!("Snapshot reconcile failed for {project_id}/{table_name}: {e}");
+            return;
+        }
+        let fresh_version = fresh.version();
+        let mut shared = table_ref.write().await;
+        if fresh_version == shared.version() {
+            *shared = fresh;
+            debug!("Reconciled snapshot for {project_id}/{table_name} at v{fresh_version:?}");
+        }
     }
 
     /// Read the latest commit metadata for each WAL topic and fast-forward the

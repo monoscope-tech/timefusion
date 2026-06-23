@@ -27,7 +27,7 @@ regex = "1.11.1"
 # push, which busts cargo-chef's recipe.json and forces a full dependency
 # recompile in CI. Bump deliberately to pick up fork changes:
 #   cargo update -p deltalake --precise <new-sha>   (then update this rev)
-deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "dc7e18432c1cb40ee023811b1c258433a4c82e27", features = [
+deltalake = { git = "https://github.com/tonyalaribe/delta-rs-timefusion.git", rev = "3b0468b2ff674f821dfaeaf19a2d47af21ada77c", features = [
   "datafusion",
   "s3",
 ] }

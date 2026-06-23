@@ -227,6 +227,7 @@ const_default!(d_warm_recency_days: u64 = 2);
 // short by a restart every time; 16 finishes it in ~1-3 min. Footer GETs are
 // ~64KB suffix ranges, well within R2/S3 burst limits.
 const_default!(d_warm_concurrency: usize = 16);
+const_default!(d_snapshot_reconcile: u64 = 500);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_query_partitions: usize = 0);
@@ -720,6 +721,18 @@ pub struct MaintenanceConfig {
     /// S3) and keeps the cache from filling with dead compaction outputs.
     #[serde(default = "d_true")]
     pub timefusion_evict_after_compaction:        bool,
+    /// Advance the post-commit snapshot by appending only the files the commit
+    /// added, instead of re-materializing the whole active file set (2-8s over
+    /// 26k files every flush in prod). Produces an identical file set — a
+    /// faster, equivalent replay, safe regardless of writer count. Off reverts
+    /// to the full re-materialize per commit.
+    #[serde(default = "d_true")]
+    pub timefusion_incremental_snapshot:          bool,
+    /// Belt-and-suspenders for the above: every Nth commit per table, drop the
+    /// materialized files and re-materialize from S3 truth, bounding any drift
+    /// from an incremental-replay bug. 0 disables reconciliation.
+    #[serde(default = "d_snapshot_reconcile")]
+    pub timefusion_snapshot_reconcile_commits:    u64,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.
