@@ -5710,8 +5710,10 @@ mod tests {
             array::{Int32Array, RecordBatch, StringArray},
             datatypes::{DataType as ArrowDataType, Field, Schema},
         };
-        use deltalake::kernel::{DataType, PrimitiveType, StructField};
-        use deltalake::protocol::SaveMode;
+        use deltalake::{
+            kernel::{DataType, PrimitiveType, StructField},
+            protocol::SaveMode,
+        };
 
         let mem = Arc::new(object_store::memory::InMemory::new());
         let url = Url::parse("memory:///tierc_removes")?;
@@ -5724,7 +5726,10 @@ mod tests {
         ];
         let table = backend().build()?.create().with_columns(cols).with_partition_columns(["p".to_string()]).await?;
 
-        let schema = Arc::new(Schema::new(vec![Field::new("id", ArrowDataType::Int32, true), Field::new("p", ArrowDataType::Utf8, true)]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", ArrowDataType::Int32, true),
+            Field::new("p", ArrowDataType::Utf8, true),
+        ]));
         let batch = |ids: Vec<i32>, ps: Vec<&str>| {
             RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(ids)) as _, Arc::new(StringArray::from(ps)) as _]).unwrap()
         };
@@ -5751,13 +5756,20 @@ mod tests {
         // Stale handle pinned at v2, advanced to v3 via the Tier-C incremental
         // path (refresh_table_snapshot → advance_catchup over the replace_where).
         let stale = backend().with_version(2).load().await?;
-        assert!(stale.state.as_ref().is_some_and(|s| s.has_materialized_files()), "stale handle must be materialized to exercise the fast path");
+        assert!(
+            stale.state.as_ref().is_some_and(|s| s.has_materialized_files()),
+            "stale handle must be materialized to exercise the fast path"
+        );
         let shared = Arc::new(RwLock::new(stale));
         refresh_table_snapshot(&shared, true).await?;
 
         let advanced = shared.read().await;
         assert_eq!(advanced.version(), Some(3), "incremental catch-up reached the latest version");
-        assert_eq!(uris(&advanced), truth, "incremental advance across replace_where must equal the full re-materialize");
+        assert_eq!(
+            uris(&advanced),
+            truth,
+            "incremental advance across replace_where must equal the full re-materialize"
+        );
         Ok(())
     }
 
