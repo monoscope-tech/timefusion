@@ -3717,11 +3717,21 @@ impl Database {
             let mut last_err: Option<deltalake::DeltaTableError> = None;
             let mut committed = false;
             for attempt in 0..MAX_RETRIES {
-                // Clone under the commit lock and hold it through the commit:
-                // with no append able to land in between, the rebase sees no
-                // newer commits and the OCC checker (which errors on our
-                // bare-string timestamp predicate) never runs.
+                // Refresh UNDER the lock before cloning, exactly like the flush
+                // staged-commit path. Holding the lock alone is NOT enough: a
+                // prior committer advances the Delta log but our in-memory
+                // `table_ref` handle lags it, so building the replace_where on
+                // the stale handle commits a base_version behind latest and the
+                // OCC checker rebases — re-running the full file-matching scan
+                // every attempt (the conflicts_checked>0 retry storm seen in
+                // prod). Refreshing here makes base_version == latest, so the
+                // commit lands first-try and the bare-string predicate's OCC
+                // checker never runs. Refresh is probe-cheap (404-short-circuit
+                // when already current).
                 let commit_guard = self.delta_commit_lock.lock().await;
+                if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
+                    debug!("dedup pre-commit refresh failed (attempt {}): {}", attempt + 1, e);
+                }
                 let table_clone = {
                     let table = table_ref.read().await;
                     table.clone()
