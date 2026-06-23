@@ -11,18 +11,18 @@ use datafusion_postgres::{
             auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler, cleartext::CleartextPasswordAuthStartupHandler},
             portal::Portal,
             query::{ExtendedQueryHandler, SimpleQueryHandler},
-            results::{DescribePortalResponse, DescribeStatementResponse, Response},
+            results::{DescribePortalResponse, DescribeStatementResponse, Response, Tag},
             stmt::StoredStatement,
             store::PortalStore,
         },
-        error::{PgWireError, PgWireResult},
+        error::{ErrorInfo, PgWireError, PgWireResult},
         messages::PgWireBackendMessage,
     },
 };
 use futures::Sink;
 use tracing::{Instrument, field::Empty, info, instrument};
 
-use crate::plan_cache::PlanCacheHook;
+use crate::{database::Database, plan_cache::PlanCacheHook};
 
 /// Auth configuration for PgWire server
 #[derive(Debug, Clone)]
@@ -102,6 +102,7 @@ pub struct LoggingHandlerFactory {
     auth_config:     AuthConfig,
     plan_cache:      Arc<PlanCacheHook>,
     scan_metrics:    Option<Arc<crate::database::ScanMetrics>>,
+    db:              Option<Arc<Database>>,
 }
 
 impl LoggingHandlerFactory {
@@ -113,11 +114,20 @@ impl LoggingHandlerFactory {
             auth_config,
             plan_cache,
             scan_metrics: None,
+            db: None,
         }
     }
 
     pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
         self.scan_metrics = Some(m);
+        self
+    }
+
+    /// Enables the on-demand `OPTIMIZE <table> WHERE date = '...'` admin command
+    /// (intercepted in the simple-query path). Unset in test servers, which
+    /// don't need it.
+    pub fn with_database(mut self, db: Arc<Database>) -> Self {
+        self.db = Some(db);
         self
     }
 
@@ -138,6 +148,9 @@ impl PgWireServerHandlers for LoggingHandlerFactory {
         let mut h = LoggingSimpleQueryHandler::new_with_hooks(self.session_context.clone(), self.hooks());
         if let Some(m) = &self.scan_metrics {
             h = h.with_scan_metrics(m.clone());
+        }
+        if let Some(db) = &self.db {
+            h = h.with_database(db.clone());
         }
         Arc::new(h)
     }
@@ -177,6 +190,7 @@ impl ErrorHandler for LoggingErrorHandler {
 pub struct LoggingSimpleQueryHandler {
     inner:        DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
+    db:           Option<Arc<Database>>,
 }
 
 impl LoggingSimpleQueryHandler {
@@ -184,6 +198,7 @@ impl LoggingSimpleQueryHandler {
         Self {
             inner:        DfSessionService::new(session_context),
             scan_metrics: None,
+            db:           None,
         }
     }
 
@@ -191,6 +206,7 @@ impl LoggingSimpleQueryHandler {
         Self {
             inner:        DfSessionService::new_with_hooks(session_context, hooks),
             scan_metrics: None,
+            db:           None,
         }
     }
 
@@ -198,6 +214,71 @@ impl LoggingSimpleQueryHandler {
         self.scan_metrics = Some(m);
         self
     }
+
+    pub fn with_database(mut self, db: Arc<Database>) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// Execute an intercepted `OPTIMIZE <table> WHERE date = '...'`.
+    async fn run_optimize(&self, cmd: OptimizeCmd) -> PgWireResult<Vec<Response>> {
+        let db = match self.db.as_ref() {
+            Some(d) => d,
+            None => return Err(optimize_err("OPTIMIZE is not available on this server")),
+        };
+        let table_ref = db
+            .get_or_create_unified_table(&cmd.table)
+            .await
+            .map_err(|e| optimize_err(&format!("OPTIMIZE: open table '{}': {e}", cmd.table)))?;
+        let (removed, added) = db.compact_date(&table_ref, &cmd.table, cmd.date).await.map_err(|e| optimize_err(&e.to_string()))?;
+        info!("pgwire OPTIMIZE {} date={}: {removed} removed, {added} added", cmd.table, cmd.date);
+        Ok(vec![Response::Execution(Tag::new(&format!("OPTIMIZE {removed} {added}")))])
+    }
+}
+
+/// An intercepted `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'` admin command.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct OptimizeCmd {
+    pub table: String,
+    pub date:  chrono::NaiveDate,
+}
+
+fn optimize_err(msg: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".to_string(), "42601".to_string(), msg.to_string())))
+}
+
+/// Parse `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'`.
+///
+/// - `Ok(None)`: not an OPTIMIZE statement — fall through to DataFusion.
+/// - `Ok(Some(_))`: valid, run it.
+/// - `Err(msg)`: it *is* OPTIMIZE but malformed (no table, missing/non-`date`
+///   filter, bad date). A bare `OPTIMIZE <table>` is rejected on purpose — an
+///   unbounded in-process compaction can OOM the instance — and surfaced as a
+///   clear error rather than a confusing DataFusion parser error.
+pub(crate) fn parse_optimize(query: &str) -> Result<Option<OptimizeCmd>, String> {
+    let q = query.trim().trim_end_matches(';').trim();
+    let lower = q.to_ascii_lowercase();
+    let is_optimize = lower == "optimize" || lower.strip_prefix("optimize").is_some_and(|r| r.starts_with(char::is_whitespace));
+    if !is_optimize {
+        return Ok(None);
+    }
+    let rest = q[8..].trim(); // "optimize" is 8 ASCII bytes
+    let (table, where_part) = rest.split_once(char::is_whitespace).map(|(t, w)| (t.trim(), w.trim())).unwrap_or((rest, ""));
+    if table.is_empty() {
+        return Err("OPTIMIZE requires a table and date: OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'".to_string());
+    }
+    if !where_part.to_ascii_lowercase().starts_with("where") {
+        return Err(format!(
+            "OPTIMIZE {table} needs a date filter: OPTIMIZE {table} WHERE date = 'YYYY-MM-DD' (bare OPTIMIZE is disabled — it would compact all history in-process)"
+        ));
+    }
+    let cond = where_part[5..].trim(); // after WHERE
+    if !cond.to_ascii_lowercase().starts_with("date") {
+        return Err("OPTIMIZE only supports a single `date` filter".to_string());
+    }
+    let val = cond[4..].trim().strip_prefix('=').ok_or("expected: date = 'YYYY-MM-DD'")?.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+    let date = val.parse::<chrono::NaiveDate>().map_err(|_| format!("invalid date '{val}', expected YYYY-MM-DD"))?;
+    Ok(Some(OptimizeCmd { table: table.to_string(), date }))
 }
 
 /// Rewrites Postgres synonyms that DataFusion's SQL parser doesn't accept.
@@ -289,6 +370,15 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
     {
         let rewritten = rewrite_pg_synonyms(query);
         let query = rewritten.as_ref();
+
+        // OPTIMIZE <table> WHERE date = '...' — admin compaction, caught before
+        // DataFusion (whose parser rejects OPTIMIZE).
+        match parse_optimize(query) {
+            Ok(Some(cmd)) => return self.run_optimize(cmd).await,
+            Ok(None) => {}
+            Err(msg) => return Err(optimize_err(&msg)),
+        }
+
         let span = tracing::Span::current();
         record_query_span(&span, query);
 
@@ -407,11 +497,14 @@ pub async fn serve_with_logging(
 /// TLS config and connection-limit settings.
 pub async fn serve_with_listener(
     listener: tokio::net::TcpListener, session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
-    scan_metrics: Option<Arc<crate::database::ScanMetrics>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut factory = LoggingHandlerFactory::new(session_context, auth_config);
     if let Some(m) = scan_metrics {
         factory = factory.with_scan_metrics(m);
+    }
+    if let Some(db) = db {
+        factory = factory.with_database(db);
     }
     let handlers = Arc::new(factory);
     datafusion_postgres::serve_with_listener(listener, handlers, options, shutdown).await?;
@@ -420,7 +513,36 @@ pub async fn serve_with_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::rewrite_pg_synonyms;
+    use super::{parse_optimize, rewrite_pg_synonyms};
+
+    #[test]
+    fn optimize_parses_table_and_date() {
+        let cmd = parse_optimize("OPTIMIZE otel_logs_and_spans WHERE date = '2026-06-19'").unwrap().unwrap();
+        assert_eq!(cmd.table, "otel_logs_and_spans");
+        assert_eq!(cmd.date, "2026-06-19".parse().unwrap());
+        // Case / spacing / quote / trailing-semicolon tolerance.
+        assert_eq!(parse_optimize("optimize t where DATE='2026-01-02';").unwrap().unwrap().date, "2026-01-02".parse().unwrap());
+        assert_eq!(parse_optimize("  OPTIMIZE  t  WHERE  date  =  \"2026-01-02\"  ").unwrap().unwrap().table, "t");
+    }
+
+    #[test]
+    fn optimize_rejects_unbounded_and_malformed() {
+        // Bare OPTIMIZE (no date) is rejected — would compact all history in-process.
+        assert!(parse_optimize("OPTIMIZE otel_logs_and_spans").is_err());
+        assert!(parse_optimize("OPTIMIZE").is_err());
+        // Non-date filter, bad date.
+        assert!(parse_optimize("OPTIMIZE t WHERE project_id = 'x'").is_err());
+        assert!(parse_optimize("OPTIMIZE t WHERE date = 'not-a-date'").is_err());
+    }
+
+    #[test]
+    fn non_optimize_queries_fall_through() {
+        assert_eq!(parse_optimize("SELECT 1"), Ok(None));
+        assert_eq!(parse_optimize("INSERT INTO t VALUES (1)"), Ok(None));
+        // Don't false-match an identifier that merely starts with "optimize".
+        assert_eq!(parse_optimize("SELECT optimizer FROM t"), Ok(None));
+        assert_eq!(parse_optimize("optimizer_stats"), Ok(None));
+    }
 
     #[test]
     fn abort_rewrites_to_rollback() {
