@@ -214,6 +214,11 @@ fn should_refresh_table(current_version: Option<u64>, last_written_version: Opti
     }
 }
 
+/// Max commits behind for the append-only fast catch-up in `refresh_table_snapshot`:
+/// each commit in the range costs one log read for the Remove check, so cap it
+/// and let larger gaps take the single full re-materialize instead.
+const REFRESH_APPEND_CATCHUP_MAX_GAP: u64 = 64;
+
 /// Refresh `table`'s snapshot WITHOUT holding the write lock across
 /// `update_state()` — that's a full Delta log replay plus object-store IO
 /// (1s+ per refresh on prod's 40k-action log), and every query refreshes
@@ -225,7 +230,7 @@ fn should_refresh_table(current_version: Option<u64>, last_written_version: Opti
 /// may have advanced the shared handle past our clone — never regress it.
 /// Returns the shared handle's version after the refresh. Single choke-point
 /// for snapshot refreshes so the lock discipline can't drift between sites.
-pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>) -> std::result::Result<Option<u64>, deltalake::DeltaTableError> {
+pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>, incremental: bool) -> std::result::Result<Option<u64>, deltalake::DeltaTableError> {
     // Staleness probe before the expensive path: commit files are immutable
     // and versions are contiguous, so the snapshot is current iff
     // `{version+1}.json` doesn't exist — one GET/404 instead of the
@@ -244,7 +249,38 @@ pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>) -> s
         }
     }
     let mut fresh = table.read().await.clone();
-    fresh.update_state().await?;
+    // Fast path (gated by the caller's `incremental` flag, i.e. self.config):
+    // when the catch-up range is append-only, advance by appending the new
+    // files instead of re-collecting the whole active set — the O(active files)
+    // re-materialize `update_state` pays (2-8s on the 26k-file unified table).
+    // Falls back to the full update when not applicable (removes in range, gap
+    // too large, not materialized). The fallback path is slightly *more*
+    // expensive than a bare update_state — it pays advance_appends_only's
+    // probe (one get_latest_version + cached commit GETs) before the full
+    // update_state's uncached `_delta_log` LIST + re-materialize. That recurs
+    // on the first refresh after each compaction (light-optimize removes files
+    // every ~5 min); acceptable since the common append-only case is the win.
+    let advanced = if incremental {
+        let log_store = fresh.log_store();
+        match fresh.state.as_mut() {
+            Some(state) => match state.advance_appends_only(log_store.as_ref(), REFRESH_APPEND_CATCHUP_MAX_GAP).await {
+                Ok(advanced) => advanced,
+                // Non-fatal: the full update_state below re-attempts the same IO
+                // and surfaces any persistent error; log so a table silently
+                // never taking the fast path is at least visible.
+                Err(e) => {
+                    debug!("append-only catch-up failed, falling back to full update_state: {e}");
+                    false
+                }
+            },
+            None => false,
+        }
+    } else {
+        false
+    };
+    if !advanced {
+        fresh.update_state().await?;
+    }
     let fresh_version = fresh.version();
     let mut guard = table.write().await;
     // Option<u64> ordering: None < Some(_), so an unloaded handle always swaps.
@@ -948,7 +984,7 @@ impl Database {
         const MAX_RETRIES: u32 = 5;
 
         loop {
-            match refresh_table_snapshot(table).await {
+            match refresh_table_snapshot(table, self.config.maintenance.timefusion_incremental_snapshot).await {
                 Ok(version) => {
                     if let Some(version) = version {
                         debug!("Updated table for {}/{} to version {}", project_id, table_name, version);
@@ -2253,7 +2289,7 @@ impl Database {
             Ok(r) => r,
             Err(_) => return Ok(Vec::new()),
         };
-        let _ = refresh_table_snapshot(&table_ref).await;
+        let _ = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
         let uris: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
         Ok(uris)
     }
@@ -2899,7 +2935,7 @@ impl Database {
                 // GET that 404-short-circuits when already current), so the extra
                 // lock-hold is sub-millisecond on the common path.
                 let commit_guard = self.delta_commit_lock.lock().await;
-                if let Err(e) = refresh_table_snapshot(&table_ref).await {
+                if let Err(e) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
                     debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e);
                 }
                 let mut new_table = { table_ref.read().await.clone() };
@@ -2942,7 +2978,7 @@ impl Database {
         let mut retry_count = 0;
         let mut last_error = None;
         while retry_count < max_retries {
-            if let Err(e) = refresh_table_snapshot(&table_ref).await {
+            if let Err(e) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
                 debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
             }
             let commit_guard = self.delta_commit_lock.lock().await;
@@ -2985,7 +3021,7 @@ impl Database {
                         drop(commit_guard);
                         tokio::time::sleep(retry_backoff(retry_count)).await;
                         drop(table); // stale clone — the retry re-clones after the reload
-                        if let Err(reload_err) = refresh_table_snapshot(&table_ref).await {
+                        if let Err(reload_err) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
                             debug!("Failed to reload table state after conflict: {}", reload_err);
                         }
                     } else {
@@ -3955,7 +3991,7 @@ impl Database {
                 }
 
                 // Update the table state after vacuum
-                if refresh_table_snapshot(table_ref).await.is_ok() {
+                if refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await.is_ok() {
                     info!("Table state updated after vacuum");
                 } else {
                     error!("Failed to update table state after vacuum");
@@ -5623,7 +5659,7 @@ mod tests {
 
         let refresher = {
             let shared = Arc::clone(&shared);
-            tokio::spawn(async move { refresh_table_snapshot(&shared).await })
+            tokio::spawn(async move { refresh_table_snapshot(&shared, true).await })
         };
 
         // Sample read-lock acquisition latency while the refresh is in flight.
@@ -5713,13 +5749,13 @@ mod tests {
         let shared = Arc::new(RwLock::new(slow));
 
         let t0 = std::time::Instant::now();
-        assert_eq!(refresh_table_snapshot(&shared).await.map_err(|e| anyhow::anyhow!(e))?, Some(0));
+        assert_eq!(refresh_table_snapshot(&shared, true).await.map_err(|e| anyhow::anyhow!(e))?, Some(0));
         assert!(t0.elapsed() < list_wait, "current-table refresh paid a LIST ({:?})", t0.elapsed());
 
         // External commit → the probe finds {v+1}.json and the refresh must
         // run the full update to pick it up.
         let _ = ensure_table_properties(table, HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())])).await;
-        assert_eq!(refresh_table_snapshot(&shared).await.map_err(|e| anyhow::anyhow!(e))?, Some(1));
+        assert_eq!(refresh_table_snapshot(&shared, true).await.map_err(|e| anyhow::anyhow!(e))?, Some(1));
         Ok(())
     }
 
