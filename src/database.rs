@@ -270,7 +270,7 @@ pub(crate) async fn refresh_table_snapshot(table: &Arc<RwLock<DeltaTable>>, incr
                 // and surfaces any persistent error; log so a table silently
                 // never taking the fast path is at least visible.
                 Err(e) => {
-                    debug!("append-only catch-up failed, falling back to full update_state: {e}");
+                    debug!("incremental catch-up failed, falling back to full update_state: {e}");
                     false
                 }
             },
@@ -559,6 +559,14 @@ fn build_watermark_commit_properties(watermark: &crate::buffered_write_layer::De
     let mut meta = std::collections::HashMap::new();
     meta.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(entries));
     CommitProperties::default().with_metadata(meta)
+}
+
+/// `CommitProperties` for a compaction/dedup commit (Add + Remove): when
+/// `enabled`, the post-commit hook advances the materialized snapshot
+/// incrementally instead of re-materializing every active file. `false` is the
+/// plain full-update behaviour.
+fn incremental_commit_properties(enabled: bool) -> CommitProperties {
+    CommitProperties::default().with_incremental_advance(enabled)
 }
 
 /// write. No-op for any column that's not a Variant struct or already in
@@ -3291,7 +3299,7 @@ impl Database {
             .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
-            .with_commit_properties(CommitProperties::default().with_incremental_advance(self.config.maintenance.timefusion_incremental_snapshot))
+            .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
             // Avoid the BinaryView read for Variant columns (same issue as
             // optimize_table_light); delta-rs's internal session defaults to
             // schema_force_view_types=true.
@@ -3503,7 +3511,7 @@ impl Database {
             .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
-            .with_commit_properties(CommitProperties::default().with_incremental_advance(self.config.maintenance.timefusion_incremental_snapshot))
+            .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
             .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
             .await;
 
@@ -3724,16 +3732,14 @@ impl Database {
                 // instead of the post-commit hook re-materializing all active
                 // files — the 2-8s/commit full scan on the 26k-file unified
                 // table that the dedup sweep otherwise pays under the commit lock.
-                let mut write = table_clone
+                let result = table_clone
                     .write(deduped.clone())
                     .with_partition_columns(schema.partitions.clone())
                     .with_writer_properties(writer_properties.clone())
                     .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
-                    .with_replace_where(predicate.clone());
-                if self.config.maintenance.timefusion_incremental_snapshot {
-                    write = write.with_commit_properties(CommitProperties::default().with_incremental_advance(true));
-                }
-                let result = write.await;
+                    .with_replace_where(predicate.clone())
+                    .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                    .await;
                 match result {
                     Ok(new_table) => {
                         // Swap + warm-added/evict-removed exactly like the optimize
@@ -3903,7 +3909,7 @@ impl Database {
                 // Apply the compaction's Add+Remove to the materialized snapshot
                 // incrementally rather than re-materializing all active files in
                 // the post-commit hook (see the dedup path).
-                .with_commit_properties(CommitProperties::default().with_incremental_advance(self.config.maintenance.timefusion_incremental_snapshot))
+                .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
                 // Variant columns are stored as Struct{Binary, Binary} on disk; if
                 // the optimize-internal Parquet read uses `schema_force_view_types=true`
                 // (delta-rs's default), it returns BinaryView and the rewrite blows up
@@ -5753,20 +5759,25 @@ mod tests {
         let truth = uris(&table); // authoritative v3 set (full re-materialize)
         assert_eq!(truth.len(), 2, "v3 active set = p=b file + replaced p=a file");
 
-        // Stale handle pinned at v2, advanced to v3 via the Tier-C incremental
-        // path (refresh_table_snapshot → advance_catchup over the replace_where).
-        let stale = backend().with_version(2).load().await?;
+        // Stale handle pinned at v2. Drive the Tier-C catch-up directly (the
+        // path refresh_table_snapshot takes) and assert it RETURNED TRUE — i.e.
+        // actually took the incremental path across the replace_where, rather
+        // than silently falling back to a full update_state (which would also
+        // produce a correct set and so hide a broken incremental path).
+        let mut stale = backend().with_version(2).load().await?;
         assert!(
             stale.state.as_ref().is_some_and(|s| s.has_materialized_files()),
             "stale handle must be materialized to exercise the fast path"
         );
-        let shared = Arc::new(RwLock::new(stale));
-        refresh_table_snapshot(&shared, true).await?;
-
-        let advanced = shared.read().await;
-        assert_eq!(advanced.version(), Some(3), "incremental catch-up reached the latest version");
+        let log_store = stale.log_store();
+        let took_fast_path = stale.state.as_mut().unwrap().advance_catchup(log_store.as_ref(), REFRESH_APPEND_CATCHUP_MAX_GAP).await?;
+        assert!(
+            took_fast_path,
+            "advance_catchup must take the incremental path over the replace_where, not fall back to a full update"
+        );
+        assert_eq!(stale.version(), Some(3), "incremental catch-up reached the latest version");
         assert_eq!(
-            uris(&advanced),
+            uris(&stale),
             truth,
             "incremental advance across replace_where must equal the full re-materialize"
         );
