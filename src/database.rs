@@ -3412,6 +3412,56 @@ impl Database {
         out
     }
 
+    /// Compact a single `date=` partition by bin-packing its small files
+    /// (`Compact`, not Z-order — a pure row-group merge that preserves
+    /// Variant/Binary column bytes). Powers the on-demand `OPTIMIZE <table>
+    /// WHERE date = '...'` pgwire command and the `optimize` CLI subcommand,
+    /// which compact old partitions that fall outside the scheduled 48h Z-order
+    /// window. Commits once for this date; returns (files_removed, files_added).
+    pub async fn compact_date(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate) -> Result<(u64, u64)> {
+        let table_clone = { table_ref.read().await.clone() };
+        let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+        let target_size = self.config.parquet.timefusion_optimize_target_size;
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        // declare_sorted=false: Compact bin-packs across files, output isn't globally sorted.
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, false);
+        let partition_filters = vec![PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?];
+
+        let (new_table, metrics) = table_clone
+            .optimize()
+            .with_filters(&partition_filters)
+            .with_type(deltalake::operations::optimize::OptimizeType::Compact)
+            .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+            .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
+            .with_writer_properties(writer_properties)
+            .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
+            .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+            // Variant columns: same BinaryView-avoidance session as optimize_table.
+            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
+            .await
+            .map_err(|e| anyhow::anyhow!("compact date={date} table={table_name} failed: {e}"))?;
+
+        self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+        info!("compact date={date} table={table_name}: {} files removed, {} files added", metrics.num_files_removed, metrics.num_files_added);
+        Ok((metrics.num_files_removed as u64, metrics.num_files_added as u64))
+    }
+
+    /// Distinct `date=YYYY-MM-DD` partitions present in the live file set,
+    /// ascending. Drives the CLI/pgwire "compact old partitions" loop.
+    pub async fn partition_dates(&self, table_ref: &Arc<RwLock<DeltaTable>>) -> Result<Vec<chrono::NaiveDate>> {
+        let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
+        let mut dates = std::collections::BTreeSet::new();
+        for uri in &uris {
+            if let Some(i) = uri.find("date=") {
+                let tail = &uri[i + 5..];
+                if let Ok(d) = tail.get(..10).unwrap_or(tail).parse::<chrono::NaiveDate>() {
+                    dates.insert(d);
+                }
+            }
+        }
+        Ok(dates.into_iter().collect())
+    }
+
     /// Rewrites a date partition at a higher ZSTD level using Z-order (or
     /// Compact if no z_order_columns). Skips partitions whose probe file
     /// already advertises a tier `>= target_level` via Parquet footer KV

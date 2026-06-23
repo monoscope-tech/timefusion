@@ -25,6 +25,18 @@ fn main() -> anyhow::Result<()> {
         return secret_crypto::run_cli();
     }
 
+    // CLI helper: `timefusion optimize [--table T] [--date D | --older-than-hours N | --all]`
+    // Runs a one-off compaction of old `date=` partitions, then exits. Run it on
+    // a workstation (not the prod box) pointed at prod storage to knock down the
+    // file-count backlog without adding memory pressure to the live server — it
+    // uses the same DynamoDB commit lock, so it coordinates safely with a
+    // running instance.
+    if std::env::args().nth(1).as_deref() == Some("optimize") {
+        let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        return tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run_optimize_cli(cfg));
+    }
+
     // Initialize global config from environment - validates all settings upfront
     let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
 
@@ -262,6 +274,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let pg_task = tokio::spawn({
         let shutdown = pgwire_shutdown.clone();
         let scan_metrics = Some(db.scan_metrics.clone());
+        let db_for_pg = Arc::clone(&db);
         async move {
             if let Err(e) = timefusion::pgwire_handlers::serve_with_listener(
                 listener,
@@ -269,6 +282,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 &pg_opts,
                 auth_config,
                 scan_metrics,
+                Some(db_for_pg),
                 shutdown.cancelled_owned(),
             )
             .await
@@ -406,5 +420,84 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Shutdown telemetry to ensure all spans are flushed
     telemetry::shutdown_telemetry();
 
+    Ok(())
+}
+
+/// One-off compaction CLI (`timefusion optimize [...]`). Compacts old `date=`
+/// partitions — those outside the scheduled 48h Z-order window that the periodic
+/// job never reaches — using `Database::compact_date` per partition. Intended to
+/// run off-box against prod storage so it doesn't load the live server's memory.
+async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .try_init();
+
+    let mut table = "otel_logs_and_spans".to_string();
+    let mut only_date: Option<chrono::NaiveDate> = None;
+    let mut older_than_hours: u64 = 48;
+    let mut all = false;
+    let mut dry_run = false;
+    let mut it = std::env::args().skip(2);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--table" => table = it.next().context("--table needs a value")?,
+            "--date" => only_date = Some(it.next().context("--date needs a value")?.parse().context("--date must be YYYY-MM-DD")?),
+            "--older-than-hours" => older_than_hours = it.next().context("--older-than-hours needs a value")?.parse().context("--older-than-hours must be an integer")?,
+            "--all" => all = true,
+            "--dry-run" => dry_run = true,
+            other => anyhow::bail!(
+                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--dry-run])"
+            ),
+        }
+    }
+
+    let db = Database::with_config(Arc::new(cfg.clone())).await?;
+    let table_ref = db.get_or_create_unified_table(&table).await?;
+    println!("table prefix='{}' → {}", cfg.core.timefusion_table_prefix, table);
+
+    let dates: Vec<chrono::NaiveDate> = if let Some(d) = only_date {
+        vec![d]
+    } else {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(older_than_hours as i64)).date_naive();
+        db.partition_dates(&table_ref).await?.into_iter().filter(|d| all || *d < cutoff).collect()
+    };
+
+    let scope = match (only_date, all) {
+        (Some(d), _) => format!("date={d}"),
+        (None, true) => "all dates".to_string(),
+        (None, false) => format!("older than {older_than_hours}h"),
+    };
+
+    // --dry-run: list candidate partitions + file counts, mutate nothing.
+    if dry_run {
+        let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
+        println!("DRY RUN — {} candidate partition(s) of '{}' ({}):", dates.len(), table, scope);
+        let mut total = 0usize;
+        for d in &dates {
+            let n = uris.iter().filter(|u| u.contains(&format!("date={d}"))).count();
+            total += n;
+            println!("  date={d}: {n} files");
+        }
+        println!("total {total} files across {} candidate partition(s) (no changes made)", dates.len());
+        db.shutdown().await?;
+        return Ok(());
+    }
+
+    println!("compacting {} partition(s) of '{}' ({})", dates.len(), table, scope);
+    let (mut tot_r, mut tot_a) = (0u64, 0u64);
+    for d in &dates {
+        match db.compact_date(&table_ref, &table, *d).await {
+            Ok((r, a)) => {
+                tot_r += r;
+                tot_a += a;
+                println!("  date={d}: removed={r} added={a}");
+            }
+            Err(e) => eprintln!("  date={d}: FAILED: {e}"),
+        }
+    }
+    println!("done: {tot_r} files removed, {tot_a} files added across {} partition(s)", dates.len());
+
+    db.shutdown().await?;
     Ok(())
 }
