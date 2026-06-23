@@ -3442,8 +3442,11 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("compact date={date} table={table_name} failed: {e}"))?;
 
         self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
-        info!("compact date={date} table={table_name}: {} files removed, {} files added", metrics.num_files_removed, metrics.num_files_added);
-        Ok((metrics.num_files_removed as u64, metrics.num_files_added as u64))
+        info!(
+            "compact date={date} table={table_name}: {} files removed, {} files added",
+            metrics.num_files_removed, metrics.num_files_added
+        );
+        Ok((metrics.num_files_removed, metrics.num_files_added))
     }
 
     /// Distinct `date=YYYY-MM-DD` partitions present in the live file set,
