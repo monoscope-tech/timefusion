@@ -127,7 +127,12 @@ const_default!(d_wal_shards_per_topic: usize = 4);
 // unflushed at the deadline is durable in the WAL and replays on next boot.
 const_default!(d_stop_grace: u64 = 50);
 const_default!(d_wal_corruption_threshold: usize = 10);
-const_default!(d_flush_parallelism: usize = 4);
+// Concurrent staged flush commits. Parquet encode + S3 upload happen outside
+// the delta_commit_lock (see insert_records_batch staged path), so this scales
+// upload throughput directly — the dominant steady-state drain lever under
+// backfill. 8 doubles concurrency over the old 4 while bounding in-flight
+// encode memory; raise further (env) if CPU/R2 headroom allows.
+const_default!(d_flush_parallelism: usize = 8);
 // Cold-boot Delta cursor reconciliation. R2 happily takes 64+ concurrent
 // gets per bucket; the original 8 left ~8× headroom. Depth 8 is half the
 // original 16 (the snapshot replaces the bulk of the scan) but keeps a

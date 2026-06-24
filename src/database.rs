@@ -2658,9 +2658,15 @@ impl Database {
         // TIMEFUSION_S3_REQUEST_TIMEOUT). object_store parses the humantime strings;
         // this is the path the unified + custom data tables (and compaction) use, so
         // its timeouts must match build_storage_options rather than being hardcoded.
+        // PoolMaxIdlePerHost keeps connections warm so concurrent uploads
+        // (raised flush_parallelism, multi-part compaction PUTs) reuse sockets
+        // instead of re-establishing TLS and starving R2 — the connection
+        // starvation that failed the 2026-06-24 compaction. R2 tolerates 64+
+        // concurrent ops per bucket.
         let client_options = ClientOptions::new()
             .with_config(ClientConfigKey::ConnectTimeout, self.config.aws.connect_timeout())
-            .with_config(ClientConfigKey::Timeout, self.config.aws.request_timeout());
+            .with_config(ClientConfigKey::Timeout, self.config.aws.request_timeout())
+            .with_config(ClientConfigKey::PoolMaxIdlePerHost, "64".to_string());
 
         // Build S3 configuration
         let mut builder = AmazonS3Builder::new().with_bucket_name(bucket).with_retry(retry_config).with_client_options(client_options);
