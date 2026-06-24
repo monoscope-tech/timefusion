@@ -194,8 +194,16 @@ pub fn init_metrics(
     // outpacing a working drain, not a stuck flush. Counters (not gauges) so
     // rate() handles the restart-to-0 reset. `ingested` includes WAL-recovered
     // rows so the pair stays comparable after a restart (see snapshot_stats).
-    layer_counter!("timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s.rows_ingested_total);
-    layer_counter!("timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
+    layer_counter!(
+        "timefusion.mem_buffer.rows_ingested_total",
+        "Cumulative rows accepted into MemBuffer (incl. WAL recovery)",
+        |s| s.rows_ingested_total
+    );
+    layer_counter!(
+        "timefusion.mem_buffer.rows_flushed_total",
+        "Cumulative rows drained from MemBuffer to Delta",
+        |s| s.rows_flushed_total
+    );
     layer_gauge!("timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
     layer_gauge!("timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
 
