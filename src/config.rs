@@ -344,15 +344,31 @@ pub struct AwsConfig {
     #[serde(default)]
     pub aws_allow_http:                Option<String>,
     /// TCP/TLS connection-establishment bound passed to the object_store S3
-    /// client (humantime format, e.g. "3s", "10s"). `Option` so the derived
+    /// client (humantime format, e.g. "15s"). `Option` so the derived
     /// `AwsConfig::default()` stays valid (an empty string wouldn't parse);
-    /// see `build_storage_options` for why the default is tighter than
-    /// object_store's 5 s.
+    /// see `connect_timeout`/`request_timeout` for the effective defaults.
     #[serde(default)]
     pub timefusion_s3_connect_timeout: Option<String>,
+    /// Total per-request bound (humantime, e.g. "900s"). Must comfortably
+    /// exceed the time to PUT one large multipart part to R2 under load —
+    /// the 2026-06-24 compaction failed when 300s + concurrent big PUTs
+    /// starved R2 connections. Tunable via TIMEFUSION_S3_REQUEST_TIMEOUT.
+    #[serde(default)]
+    pub timefusion_s3_request_timeout: Option<String>,
 }
 
 impl AwsConfig {
+    /// Effective connect timeout. R2 establishes healthy connections in <1s;
+    /// a generous bound only matters when something is wrong, where it trades
+    /// slower failure for surviving transient R2 connection refusals.
+    pub fn connect_timeout(&self) -> String {
+        self.timefusion_s3_connect_timeout.clone().unwrap_or_else(|| "60s".into())
+    }
+
+    pub fn request_timeout(&self) -> String {
+        self.timefusion_s3_request_timeout.clone().unwrap_or_else(|| "900s".into())
+    }
+
     pub fn build_storage_options(&self, endpoint_override: Option<&str>) -> HashMap<String, String> {
         macro_rules! insert_opt {
             ($opts:expr, $key:expr, $val:expr) => {
@@ -368,16 +384,11 @@ impl AwsConfig {
         insert_opt!(opts, "AWS_REGION", self.aws_default_region);
         insert_opt!(opts, "AWS_ALLOW_HTTP", self.aws_allow_http);
         opts.insert("AWS_ENDPOINT_URL".into(), endpoint_override.unwrap_or(&self.aws_s3_endpoint).to_string());
-        // Bound TCP/TLS connection establishment. The object_store default
-        // (5 s connect) plus retries let a black-holed connection stall a
-        // first-touch read for 20 s+ (observed 23 s on a cold partition).
-        // Total request timeout stays at the default 30 s so large flush
-        // PUTs aren't cut off. Tunable via TIMEFUSION_S3_CONNECT_TIMEOUT for
-        // environments where 3 s is too tight (slow proxies, cross-region).
-        opts.insert(
-            "connect_timeout".into(),
-            self.timefusion_s3_connect_timeout.clone().unwrap_or_else(|| "3s".into()),
-        );
+        // Bound connection establishment + total request time. Kept in sync
+        // with create_object_store (which builds its own client) so both the
+        // delta-rs register path and the direct AmazonS3Builder agree.
+        opts.insert("connect_timeout".into(), self.connect_timeout());
+        opts.insert("timeout".into(), self.request_timeout());
         opts
     }
 }
