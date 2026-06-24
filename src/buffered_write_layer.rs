@@ -1141,28 +1141,29 @@ impl BufferedWriteLayer {
 
             // Pressure escalation off the insert path: a single still-open
             // window can be the whole budget, which completed-bucket flushing
-            // can't relieve. Drive `relieve_memory_pressure` until we drop below
-            // the limit or a round frees nothing (avoids a busy spin when Delta
-            // is the bottleneck). Inserts proactively served here usually never
-            // touch their own backpressure path.
-            let mut last = self.effective_memory_bytes();
-            while self.is_memory_pressure() {
+            // Drain until below the limit, a round commits nothing, or a bounded
+            // round cap. Gate on COMMIT PROGRESS, not a byte delta: under
+            // old-event-time backfill each flushed bucket is tiny, so the old
+            // "<1% bytes freed → bail" quit at pressure=100 while hundreds of old
+            // buckets were still draining slowly. As long as rounds keep
+            // committing buckets (and ingest keeps adding flushable ones), keep
+            // draining; only stop when a round commits nothing (completed buckets
+            // gone or every commit failing/blocked — looping won't free RAM) so
+            // we don't busy-spin when Delta is the bottleneck.
+            const MAX_RELIEF_ROUNDS: u32 = 50;
+            for _ in 0..MAX_RELIEF_ROUNDS {
+                if !self.is_memory_pressure() {
+                    break;
+                }
+                let before = self.flush_completed_total.load(Ordering::Relaxed);
                 self.relieve_memory_pressure().await;
-                let now = self.effective_memory_bytes();
-                if now + now / 100 >= last {
-                    // Gave up still over the limit: Delta isn't freeing RAM, so
-                    // inserts are about to hit their own backpressure/reject path.
-                    // Surface it at error level — per-flush failures are already
-                    // metered in flush_completed/force_flush; this flags the
-                    // relief loop itself stalling. (`record_flush(false)` would
-                    // be wrong here — no commit was attempted this round.)
+                if self.flush_completed_total.load(Ordering::Relaxed) == before {
                     error!(
-                        "Pressure relief made no progress: used={}MB still over the limit — Delta flush is not freeing memory",
-                        now / (1024 * 1024)
+                        "Pressure relief made no progress: used={}MB still over the limit — Delta flush committed nothing this round",
+                        self.effective_memory_bytes() / (1024 * 1024)
                     );
                     break;
                 }
-                last = now;
             }
             // WAL monitoring: check file accumulation
             let (file_count, total_bytes) = self.wal.wal_stats();
