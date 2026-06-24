@@ -2285,7 +2285,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn dedup_batches_keep_last_on_composite_key() {
         let schema = Arc::new(Schema::new(vec![
