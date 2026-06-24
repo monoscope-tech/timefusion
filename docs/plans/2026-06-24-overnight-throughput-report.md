@@ -73,8 +73,38 @@ drain rows/commit. TF-only changes (#3) can lift the ~3000/s ceiling but not to 
   fix it in code than CapRover, I can lower the autotune fractions so the pool sum fits under
   host RAM — say the word.
 
+## ⚠️ URGENT — overnight development (03:28 CEST / 01:28 UTC)
+
+**Prod re-entered the OOM/wedge loop and is actively dropping inserts to the DLQ.**
+
+- One OOM restart ~01:30 UTC (task `hmsa4ktqerxy` → `6xae9b0wdy3x`, `queries_total` reset).
+- Now **wedged at 100% pressure**, `backpressure_rejected_total` climbing fast
+  (158 → 560+ and rising). Logs: `Write backpressure exhausted after 60s: used=9254MB still
+  over hard limit — Delta flush is not freeing memory; rejecting (data remains in WAL)`.
+- The drain **is** committing (18 commits/6min) but **can't free memory**: `total_rows` is
+  flat at ~1.217M and inserts are mostly rejected, yet the buffer stays pinned at the
+  9254 MB hard limit. → memory is held by **buckets that never drain** — the lingering
+  ~99h-old event-time buckets (`oldest_bucket_age_secs=356692`). This is the "lingering
+  buckets / stuck drain" bug (2026-06-22 root-cause #3), now causing a hard wedge.
+- **Not data loss / not a full outage:** rejected inserts remain in the WAL and replay
+  later. It's degraded — DLQ growing, insert latency bad.
+
+**Why I did not act autonomously:** the lingering-bucket drain bug needs real investigation
+(unsafe to fix blind at 3am); a forced restart might clear the wedge *or* re-wedge on replay
+(50/50) and the host is restart-locked. Deploying the memory fix wouldn't unstick *this*
+wedge (it's stuck buckets, not pool sizing) and would add another replay cycle.
+
+**Morning actions (in order):**
+1. **Apply the container-limit + caps config** (table row #1) — gives headroom so the wedge
+   is rarer, and bounds the OOM.
+2. **Clear the current wedge:** a controlled restart *after* confirming the lingering buckets
+   are committed to Delta (check WAL cursor vs Delta watermark) — else it re-wedges.
+3. **Fix the lingering-bucket drain** (why a 99h completed bucket never flushes) — this is
+   the real bug behind both the wedge and the OOM. Needs a debug build / the stuck-bucket
+   stat from the 2026-06-22 P2 observability list.
+
 ## What I'm doing until you wake
 
-Loop continues at low frequency: **passive health monitoring only** (no more prod-mutating
-changes). I'll watch for OOM restarts (`queries_total` resets), pressure, and DLQ trend, and
-flag anything that breaks. The report above is the actionable summary.
+Tightened to ~20-min health checks to build a complete timeline of the wedge (OOM restarts,
+pressure, reject rate) for the morning. **No more prod-mutating changes** — the situation
+needs your decisions, not an unattended gamble. Everything above is the action list.
