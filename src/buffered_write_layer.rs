@@ -142,6 +142,12 @@ pub struct StatsSnapshot {
     /// Open-bucket force-flush escalations (a single busy window was itself the
     /// pressure). Sustained growth = windows too large for the budget.
     pub backpressure_force_flush_total: u64,
+    /// Cumulative rows accepted into MemBuffer and rows drained to Delta. The
+    /// rate gap between them (diff across two scrapes) is the ingest-outpaces-
+    /// drain signal: both climbing but ingest faster = throughput wedge, not a
+    /// stuck flush.
+    pub rows_ingested_total:            u64,
+    pub rows_flushed_total:             u64,
 }
 
 #[derive(Debug, Default)]
@@ -314,6 +320,14 @@ pub struct BufferedWriteLayer {
     backpressure_engaged_total:     AtomicU64,
     backpressure_rejected_total:    AtomicU64,
     backpressure_force_flush_total: AtomicU64,
+    /// Cumulative rows accepted into MemBuffer (post-WAL) and rows drained to
+    /// Delta. Diff two `timefusion_stats` scrapes to get ingest-rate vs
+    /// drain-rate: if `rows_ingested_total` climbs faster than
+    /// `rows_flushed_total` while `pressure_pct=100`, the flush is succeeding
+    /// but ingest is outpacing drain (the file-count-throttled-dedup wedge),
+    /// distinct from a stuck flush (`flush_failed_total` climbing).
+    rows_ingested_total:            AtomicU64,
+    rows_flushed_total:             AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
     function_registry:              Arc<crate::functions::FnRegistry>,
     /// Caps concurrent detached tantivy sidecar builds so a fast flush cycle
@@ -385,6 +399,8 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: AtomicU64::new(0),
             backpressure_rejected_total: AtomicU64::new(0),
             backpressure_force_flush_total: AtomicU64::new(0),
+            rows_ingested_total: AtomicU64::new(0),
+            rows_flushed_total: AtomicU64::new(0),
             function_registry,
             // 16 is well above realistic per-cycle table fan-out for the
             // monoscope workload (~5 distinct table names) while still
@@ -643,6 +659,7 @@ impl BufferedWriteLayer {
                             e
                         );
                     } else {
+                        self.rows_flushed_total.fetch_add(bucket.row_count as u64, Ordering::Relaxed);
                         self.flush_completed_total.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -725,7 +742,10 @@ impl BufferedWriteLayer {
         self.release_reservation(reserved_size);
 
         match &result {
-            Ok(()) => crate::metrics::record_insert(project_id, table_name, row_count as u64),
+            Ok(()) => {
+                self.rows_ingested_total.fetch_add(row_count as u64, Ordering::Relaxed);
+                crate::metrics::record_insert(project_id, table_name, row_count as u64);
+            }
             Err(_) => crate::metrics::record_ingest_error(project_id, table_name),
         }
         result?;
@@ -1236,6 +1256,7 @@ impl BufferedWriteLayer {
                             }
                             any_ok = true;
                             crate::metrics::record_flush(true);
+                            self.rows_flushed_total.fetch_add(combined.row_count as u64, Ordering::Relaxed);
                             self.flush_completed_total.fetch_add(source_bucket_ids.len() as u64, Ordering::Relaxed);
                             debug!(
                                 "Flushed coalesced commit: project={}, table={}, buckets={}, rows={}",
@@ -1628,6 +1649,8 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: self.backpressure_engaged_total.load(Ordering::Relaxed),
             backpressure_rejected_total: self.backpressure_rejected_total.load(Ordering::Relaxed),
             backpressure_force_flush_total: self.backpressure_force_flush_total.load(Ordering::Relaxed),
+            rows_ingested_total: self.rows_ingested_total.load(Ordering::Relaxed),
+            rows_flushed_total: self.rows_flushed_total.load(Ordering::Relaxed),
         }
     }
 

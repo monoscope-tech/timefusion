@@ -169,6 +169,11 @@ pub fn init_metrics(
         "Total rows in MemBuffer across all projects/tables",
         |s| s.mem_total_rows as u64
     );
+    // Ingest vs drain: rate() these two and compare. Ingested climbing faster
+    // than flushed (while pressure_pct=100, flush_failed flat) = ingest
+    // outpacing a working drain, not a stuck flush.
+    layer_gauge!("timefusion.buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer", |s| s.rows_ingested_total);
+    layer_gauge!("timefusion.buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
     layer_gauge!("timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
     layer_gauge!("timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
 
