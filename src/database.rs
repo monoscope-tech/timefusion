@@ -3412,6 +3412,10 @@ impl Database {
                 Ok(())
             }
             Err(e) => {
+                if is_occ_conflict_err(&e.to_string()) {
+                    crate::metrics::record_optimize_conflict();
+                }
+                crate::metrics::record_optimize_failed();
                 error!("Optimization operation failed: {}", e);
                 Err(anyhow::anyhow!("Table optimization failed: {}", e))
             }
@@ -3490,6 +3494,7 @@ impl Database {
                     return Ok((metrics.num_files_removed, metrics.num_files_added));
                 }
                 Err(e) if is_occ_conflict_err(&e.to_string()) && attempt + 1 < MAX_ATTEMPTS => {
+                    crate::metrics::record_optimize_conflict();
                     warn!("compact date={date}: OCC conflict (attempt {}), refreshing + retrying: {}", attempt + 1, e);
                     // Exponential backoff before re-submitting — matches dedup_partition
                     // (150ms << attempt). Zero-delay retries under concurrent heavy
@@ -3506,7 +3511,14 @@ impl Database {
                     );
                     tokio::time::sleep(tokio::time::Duration::from_secs(2 * (attempt as u64 + 1))).await;
                 }
-                Err(e) => return Err(anyhow::anyhow!("compact date={date} table={table_name} failed: {e}")),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_occ_conflict_err(&msg) {
+                        crate::metrics::record_optimize_conflict();
+                    }
+                    crate::metrics::record_optimize_failed();
+                    return Err(anyhow::anyhow!("compact date={date} table={table_name} failed: {e}"));
+                }
             }
         }
         unreachable!("compact_date loop returns on success or final error")
@@ -4087,6 +4099,9 @@ impl Database {
                 Err(e) => {
                     let msg = e.to_string();
                     let is_conflict = is_occ_conflict_err(&msg);
+                    if is_conflict {
+                        crate::metrics::record_optimize_conflict();
+                    }
                     // "Found unmasked nulls for non-nullable StructArray" surfaces
                     // when delta-rs is mid-rewrite and the in-flight Add log lines
                     // for partition struct values aren't fully populated yet.
@@ -4100,6 +4115,7 @@ impl Database {
                         last_err = Some(e);
                         continue;
                     }
+                    crate::metrics::record_optimize_failed();
                     error!("Light optimization operation failed (attempt {}): {}", attempt + 1, e);
                     return Err(anyhow::anyhow!("Light table optimization failed: {}", e));
                 }

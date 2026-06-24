@@ -78,6 +78,8 @@ counter_registry! {
     backpressure_engaged       => "timefusion.ingest.backpressure_engaged": "Inserts that hit the memory hard limit and triggered synchronous flush-to-Delta instead of rejecting (alert if sustained > 0)",
     backpressure_rejected      => "timefusion.ingest.backpressure_rejected": "Inserts rejected after the backpressure window expired without freeing memory — means Delta flush is not keeping up (page: data still in WAL but ingest is dropping)",
     backpressure_force_flush   => "timefusion.ingest.backpressure_force_flush": "Current open-bucket force-flushes triggered by sustained backpressure (escalation tier)",
+    optimize_conflict          => "timefusion.optimize.conflict": "Optimize/compaction commits that hit an OCC conflict (a concurrent txn touched a file the merge read). Retried — but a sustained nonzero rate means optimize is losing commit races to dedup/flush. WARN if rate() stays > 0 across several ticks",
+    optimize_failed            => "timefusion.optimize.failed": "Optimize/compaction runs that ultimately errored or gave up after exhausting retries. The partition stays fragmented until a later run succeeds, so small files pile up silently. PAGE if > 0 sustained",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -333,5 +335,21 @@ pub fn record_optimize_partitions(rewritten: u64, skipped: u64) {
     if let Some(m) = METRICS.get() {
         m.optimize_partitions_rewritten.add(rewritten, &[]);
         m.optimize_partitions_skipped.add(skipped, &[]);
+    }
+}
+
+/// One optimize/compaction OCC conflict (retryable). A sustained rate means the
+/// optimizer is repeatedly losing commit races to concurrent dedup/flush.
+pub fn record_optimize_conflict() {
+    if let Some(m) = METRICS.get() {
+        m.optimize_conflict.add(1, &[]);
+    }
+}
+
+/// One optimize/compaction run that errored or gave up after retries — that
+/// partition stays fragmented until a later run succeeds.
+pub fn record_optimize_failed() {
+    if let Some(m) = METRICS.get() {
+        m.optimize_failed.add(1, &[]);
     }
 }
