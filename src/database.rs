@@ -4279,6 +4279,18 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     if batches.is_empty() || schema.sorting_columns.is_empty() {
         return (batches, false);
     }
+    // Skip the in-flight sort for very large coalesced groups (bulk backfill):
+    // concat + lexsort + take materializes the whole group 2-3x on the flush
+    // path — a serial CPU + RSS spike that, multiplied by flush_parallelism,
+    // slows commits and risks OOM. Write unsorted (declare_sorted=false is
+    // correctness-safe — the footer just won't advertise an order) and let
+    // scheduled compaction re-sort/Z-order. Steady-state per-(project,table)
+    // groups stay well under the threshold, keeping their sorted footer +
+    // compression; only giant backfill coalesces trip it.
+    const SORT_SKIP_BYTES: usize = 256 * 1024 * 1024;
+    if batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() > SORT_SKIP_BYTES {
+        return (batches, false);
+    }
     let arrow_schema = batches[0].schema();
     // Only sort a schema-homogeneous bucket. mem_buffer's `schemas_compatible`
     // admits batches with extra nullable fields into one bucket; concatenating
