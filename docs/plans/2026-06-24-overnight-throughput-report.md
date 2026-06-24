@@ -94,6 +94,19 @@ drain rows/commit. TF-only changes (#3) can lift the ~3000/s ceiling but not to 
 (50/50) and the host is restart-locked. Deploying the memory fix wouldn't unstick *this*
 wedge (it's stuck buckets, not pool sizing) and would add another replay cycle.
 
+**Refined root cause (03:51 UTC update):** the wedge is **drain-throttled-by-file-count**.
+Drain commits only ~3/min because each flush commit does a dedup `replace_where` + metadata
+ops over the **52.9k-file** table (slow). Meanwhile the backlog/DLQ-replay has loaded **568
+time-buckets (~94h of old-event-time data)** into the membuffer. 568 buckets ÷ 3 commits/min
+can't keep up → memory pinned at the 9254 MB hard limit → reject. Rejects accelerating
+(560 → 1432 in 23 min). **The architectural fix:** old-event-time backlog should NOT go
+through the membuffer at all — route it via the dormant **`skip_queue` Delta-direct path**
+(throughput plan §B) so it writes parquet straight to Delta date partitions, never filling
+the 10-min time-bucket membuffer. That removes the wedge at the source. Faster commits (lower
+file count) help too, but compaction is blocked by OCC conflicts while those dates are
+actively written — chicken-and-egg, which is exactly why the Delta-direct backlog path is the
+real fix.
+
 **Morning actions (in order):**
 1. **Apply the container-limit + caps config** (table row #1) — gives headroom so the wedge
    is rarer, and bounds the OOM.
