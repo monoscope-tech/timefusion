@@ -120,6 +120,21 @@ impl StatsTableProvider {
                 "backpressure_force_flush_total".into(),
                 s.backpressure_force_flush_total.to_string(),
             ));
+            rows.push(("buffered_layer", "flush_completed_total".into(), s.flush_completed_total.to_string()));
+            rows.push(("buffered_layer", "flush_failed_total".into(), s.flush_failed_total.to_string()));
+            // Ingest-vs-drain: both climb in steady state. If ingested pulls
+            // ahead of flushed while pressure_pct=100 and flush_failed_total is
+            // flat, ingest is outpacing a working drain (throughput wedge) —
+            // not a stuck flush. `rows_in_buffer_lag` ≈ rows currently buffered
+            // (ingested includes WAL-recovered rows, so the pair stays
+            // comparable after a restart).
+            rows.push(("buffered_layer", "rows_ingested_total".into(), s.rows_ingested_total.to_string()));
+            rows.push(("buffered_layer", "rows_flushed_total".into(), s.rows_flushed_total.to_string()));
+            rows.push((
+                "buffered_layer",
+                "rows_in_buffer_lag".into(),
+                s.rows_ingested_total.saturating_sub(s.rows_flushed_total).to_string(),
+            ));
             rows.push(("wal", "files".into(), s.wal_files.to_string()));
             rows.push(("wal", "disk_bytes".into(), s.wal_disk_bytes.to_string()));
             rows.push(("wal", "disk_mb".into(), format!("{:.1}", s.wal_disk_bytes as f64 / (1024.0 * 1024.0))));
