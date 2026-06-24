@@ -586,6 +586,24 @@ fn is_occ_conflict_err(msg: &str) -> bool {
         || msg.contains("Transaction failed")
 }
 
+/// True for transient S3/network transport failures worth retrying the whole
+/// operation on. object_store retries individual requests (max_retries/180s),
+/// but a multipart part whose connection drops mid-body (R2 under concurrent
+/// large PUTs) can bubble up as terminal — aborting a compaction merge that
+/// committed nothing. delta-rs wraps these as "Failed to parse parquet" via the
+/// async parquet writer, so we match the transport phrases, not the wrapper.
+/// Deliberately excludes auth/permanent errors (403, NoSuchBucket) which must
+/// fail fast.
+fn is_transient_s3_err(msg: &str) -> bool {
+    msg.contains("error sending request")
+        || msg.contains("connection")
+        || msg.contains("Connection")
+        || msg.contains("broken pipe")
+        || msg.contains("reset by peer")
+        || msg.contains("timed out")
+        || msg.contains("timeout")
+}
+
 /// write. No-op for any column that's not a Variant struct or already in
 /// Binary form. Called from `insert_records_batch` right before the
 /// Delta write so MemBuffer can keep its natural BinaryView layout
@@ -3459,6 +3477,12 @@ impl Database {
                 }
                 Err(e) if is_occ_conflict_err(&e.to_string()) && attempt + 1 < MAX_ATTEMPTS => {
                     warn!("compact date={date}: OCC conflict (attempt {}), refreshing + retrying: {}", attempt + 1, e);
+                }
+                Err(e) if is_transient_s3_err(&e.to_string()) && attempt + 1 < MAX_ATTEMPTS => {
+                    // A multipart part connection-dropped mid-merge (nothing committed).
+                    // Back off before retrying — R2 flakes under concurrent large PUTs.
+                    warn!("compact date={date}: transient S3 error (attempt {}), backing off + retrying: {}", attempt + 1, e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2 * (attempt as u64 + 1))).await;
                 }
                 Err(e) => return Err(anyhow::anyhow!("compact date={date} table={table_name} failed: {e}")),
             }
