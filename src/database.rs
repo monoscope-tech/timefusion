@@ -3481,7 +3481,11 @@ impl Database {
                 Err(e) if is_transient_s3_err(&e.to_string()) && attempt + 1 < MAX_ATTEMPTS => {
                     // A multipart part connection-dropped mid-merge (nothing committed).
                     // Back off before retrying — R2 flakes under concurrent large PUTs.
-                    warn!("compact date={date}: transient S3 error (attempt {}), backing off + retrying: {}", attempt + 1, e);
+                    warn!(
+                        "compact date={date}: transient S3 error (attempt {}), backing off + retrying: {}",
+                        attempt + 1,
+                        e
+                    );
                     tokio::time::sleep(tokio::time::Duration::from_secs(2 * (attempt as u64 + 1))).await;
                 }
                 Err(e) => return Err(anyhow::anyhow!("compact date={date} table={table_name} failed: {e}")),
