@@ -368,11 +368,7 @@ pub struct AwsConfig {
 /// `TIMEFUSION_S3_CONNECT_TIMEOUT=150` crash-looped TF on 2026-06-24. Treat an
 /// all-digit string as seconds; pass anything with a unit through untouched.
 fn normalize_duration(s: String) -> String {
-    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
-        format!("{s}s")
-    } else {
-        s
-    }
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) { format!("{s}s") } else { s }
 }
 
 impl AwsConfig {
@@ -855,7 +851,10 @@ mod tests {
         assert_eq!(normalize_duration("150s".into()), "150s");
         assert_eq!(normalize_duration("3m".into()), "3m");
         assert_eq!(normalize_duration("".into()), "");
-        let aws = AwsConfig { timefusion_s3_connect_timeout: Some("150".into()), ..Default::default() };
+        let aws = AwsConfig {
+            timefusion_s3_connect_timeout: Some("150".into()),
+            ..Default::default()
+        };
         assert_eq!(aws.connect_timeout(), "150s");
     }
 
