@@ -204,7 +204,12 @@ const_default!(d_cold_cutoff_days: u64 = 14);
 const_default!(d_recompress_schedule: String = "0 0 3 * * *");
 const_default!(d_row_group_size: usize = 134_217_728); // 128MB
 const_default!(d_checkpoint_interval: u64 = 10);
-const_default!(d_optimize_target: i64 = 128 * 1024 * 1024);
+// 256MB compacted-file target: fewer, larger files cut Delta metadata, S3
+// object count, and the per-commit get_file_uris() walk on the flush append
+// path; sorted + page-indexed files still prune time-range queries within a
+// file, so the query downside is minimal for this (project_id,date)-partitioned
+// workload. Light/today optimize keeps its own 16MB target.
+const_default!(d_optimize_target: i64 = 256 * 1024 * 1024);
 const_default!(d_stats_cache_size: usize = 50);
 // Observability data is high-churn and rarely time-traveled; the only hard
 // floor is that retention must outlive any in-flight query (which holds a Delta
