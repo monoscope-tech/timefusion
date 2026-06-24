@@ -593,11 +593,17 @@ fn is_occ_conflict_err(msg: &str) -> bool {
 /// committed nothing. delta-rs wraps these as "Failed to parse parquet" via the
 /// async parquet writer, so we match the transport phrases, not the wrapper.
 /// Deliberately excludes auth/permanent errors (403, NoSuchBucket) which must
-/// fail fast.
+/// fail fast. Phrases are anchored to genuinely-transient transport states —
+/// notably NOT a bare "connection", which matches the permanent "connection
+/// refused" (misconfigured endpoint / firewall) and would burn the whole retry
+/// budget + backoff before failing.
+/// TODO: object_store exposes typed variants (Error::Generic, retryable flags)
+/// under DeltaTableError::ObjectStore; downcasting the error chain would be
+/// version-stable vs. this string match. Revisit on the next object_store bump.
 fn is_transient_s3_err(msg: &str) -> bool {
     msg.contains("error sending request")
-        || msg.contains("connection")
-        || msg.contains("Connection")
+        || msg.contains("connection reset")
+        || msg.contains("connection closed")
         || msg.contains("broken pipe")
         || msg.contains("reset by peer")
         || msg.contains("timed out")
@@ -3447,8 +3453,16 @@ impl Database {
         // partition lands on a later attempt. Mirrors the dedup retry loop.
         const MAX_ATTEMPTS: usize = 4;
         for attempt in 0..MAX_ATTEMPTS {
-            if attempt > 0 {
-                let _ = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
+            // Runs before every retry (attempt > 0), intentionally for BOTH the
+            // OCC and transient-S3 arms: a concurrent writer may have committed
+            // during the OCC conflict or the S3 backoff sleep, so the next merge
+            // must read a fresh snapshot. Log refresh failures — silently
+            // continuing against a stale snapshot would exhaust all attempts and
+            // surface only the final optimize error, hiding the real cause.
+            if attempt > 0
+                && let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await
+            {
+                debug!("compact_date refresh failed (attempt {}): {}", attempt, e);
             }
             let table_clone = { table_ref.read().await.clone() };
             let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
@@ -3477,6 +3491,10 @@ impl Database {
                 }
                 Err(e) if is_occ_conflict_err(&e.to_string()) && attempt + 1 < MAX_ATTEMPTS => {
                     warn!("compact date={date}: OCC conflict (attempt {}), refreshing + retrying: {}", attempt + 1, e);
+                    // Exponential backoff before re-submitting — matches dedup_partition
+                    // (150ms << attempt). Zero-delay retries under concurrent heavy
+                    // ingest amplify commit contention instead of resolving it.
+                    tokio::time::sleep(tokio::time::Duration::from_millis(150u64 << attempt)).await;
                 }
                 Err(e) if is_transient_s3_err(&e.to_string()) && attempt + 1 < MAX_ATTEMPTS => {
                     // A multipart part connection-dropped mid-merge (nothing committed).
