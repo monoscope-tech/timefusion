@@ -654,6 +654,11 @@ impl BufferedWriteLayer {
             match self.flush_bucket(&bucket).await {
                 Ok(()) => {
                     if let Err(e) = self.wal.advance_by_counts(&bucket.project_id, &bucket.table_name, &bucket.wal_shard_counts) {
+                        // Delta commit succeeded but the WAL cursor didn't move:
+                        // count as a flush failure (matches the coalesced-flush
+                        // path) so the incident is visible in flush_failed_total
+                        // instead of silently drifting rows_in_buffer_lag.
+                        self.flush_failed_total.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             "force-flush: advance_by_counts failed (rows committed to Delta; WAL will re-replay, dedup protects): {}",
                             e
@@ -779,6 +784,12 @@ impl BufferedWriteLayer {
         // Bounded recovery memory: O(1) entries in flight rather than
         // O(retention_window × throughput) (potentially GiBs).
         let mut entries_replayed = 0u64;
+        // Recovered rows land straight in MemBuffer, bypassing insert()'s
+        // rows_ingested_total bump. Count them here and fold in after replay so
+        // rows_ingested_total/rows_flushed_total stay comparable post-restart —
+        // otherwise the recovered rows flush and inflate flushed against a 0
+        // ingested, clamping rows_in_buffer_lag and blinding the wedge signal.
+        let mut recovered_rows = 0u64;
         let mut deletes_replayed = 0u64;
         let mut updates_replayed = 0u64;
         let mut oldest_ts: Option<i64> = None;
@@ -806,10 +817,14 @@ impl BufferedWriteLayer {
                                 return;
                             }
                             let apply_start = std::time::Instant::now();
+                            let rows = batch.num_rows() as u64;
                             let insert_res = mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros);
                             insert_apply_nanos += apply_start.elapsed().as_nanos();
                             match insert_res {
-                                Ok(()) => entries_replayed += 1,
+                                Ok(()) => {
+                                    entries_replayed += 1;
+                                    recovered_rows += rows;
+                                }
                                 Err(e) => {
                                     error!("WAL REPLAY FAILED: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
                                     quarantine_entry(&quarantine_dir, &entry, "insert_incompatible", &e.to_string());
@@ -929,6 +944,8 @@ impl BufferedWriteLayer {
         // background (spawned by `start_background_tasks`) while we serve; reads
         // see MemBuffer (unioned with Delta) and new inserts flush-to-make-room
         // via insert-path backpressure.
+
+        self.rows_ingested_total.fetch_add(recovered_rows, Ordering::Relaxed);
 
         let stats = RecoveryStats {
             entries_replayed,

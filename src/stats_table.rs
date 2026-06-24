@@ -125,7 +125,9 @@ impl StatsTableProvider {
             // Ingest-vs-drain: both climb in steady state. If ingested pulls
             // ahead of flushed while pressure_pct=100 and flush_failed_total is
             // flat, ingest is outpacing a working drain (throughput wedge) —
-            // not a stuck flush. `rows_in_buffer_lag` ≈ rows currently buffered.
+            // not a stuck flush. `rows_in_buffer_lag` ≈ rows currently buffered
+            // (ingested includes WAL-recovered rows, so the pair stays
+            // comparable after a restart).
             rows.push(("buffered_layer", "rows_ingested_total".into(), s.rows_ingested_total.to_string()));
             rows.push(("buffered_layer", "rows_flushed_total".into(), s.rows_flushed_total.to_string()));
             rows.push((
