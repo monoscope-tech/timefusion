@@ -22,25 +22,15 @@ use crate::{
     wal::{DeletePayload, UpdatePayload, UpdateWithSourcePayload, WalEntry, WalManager, WalOperation, decode_payload, deserialize_record_batch},
 };
 
-// Reservation-side scale factor applied to `estimate_batch_size()` to
-// account for what that estimator doesn't already cover: per-batch Vec
-// headers, DashMap node overhead, and allocator fragmentation.
-//
-// `estimate_batch_size()` already uses `batch.get_array_memory_size()`,
-// which captures all underlying Arrow buffers including 64-byte alignment
-// padding and validity bitmaps. Empirical measurement (bench/multiplier_bench.py,
-// 2026-05-17, 4.7k inserts, 16 writers, single-project) shows MemBuffer
-// `estimated_bytes` tracks within ~10–15% of the actual marginal heap
-// growth — RSS growth is dominated by fixed costs (walrus mmaps, Foyer,
-// tantivy) which `max_memory_bytes()` already subtracts out separately.
-// 1.15x gives a safety margin for allocator fragmentation; the previous
-// 1.5x value was an unmeasured guess that wasted ~23% of the configured
-// `max_memory_mb` budget.
+// Safety margin over `estimate_batch_size()` for costs it can't see: Vec
+// headers, DashMap node overhead, allocator fragmentation. The estimator's
+// `get_array_memory_size()` already covers Arrow buffers (alignment, validity
+// bitmaps), and fixed costs (walrus mmaps, Foyer, tantivy) are subtracted via
+// `max_memory_bytes()`. Measured within ~10–15% of marginal heap growth
+// (bench/multiplier_bench.py, 2026-05-17).
 const MEMORY_OVERHEAD_MULTIPLIER: f64 = 1.15;
-/// Hard limit = `max_bytes + max_bytes / HARD_LIMIT_HEADROOM_DIVISOR` →
-/// 120% of the configured budget, leaving headroom for in-flight writes
-/// while preventing unbounded growth. Named "divisor" (not "multiplier")
-/// because the math is `/ N`; `5` → +20%.
+/// Hard limit = `max_bytes + max_bytes / N` = 120% of budget (`5` → +20%),
+/// leaving headroom for in-flight writes without unbounded growth.
 const HARD_LIMIT_HEADROOM_DIVISOR: usize = 5;
 /// Maximum CAS retry attempts before failing
 const MAX_CAS_RETRIES: u32 = 100;
@@ -49,13 +39,8 @@ const CAS_BACKOFF_BASE_MICROS: u64 = 1;
 /// Maximum backoff exponent (caps delay at ~1ms)
 const CAS_BACKOFF_MAX_EXPONENT: u32 = 10;
 
-/// Persist a corrupted/unreplayable WAL entry to `{wal_dir}/quarantine/`
-/// so ops can post-mortem without blocking recovery. Best-effort: write
-/// failures are logged but never propagated — quarantine is observability,
-/// not durability.
-/// Write raw bytes to a path with owner-only (0600) permissions on Unix.
-/// On Windows we fall back to plain write — ACL hardening there is out of
-/// scope for this helper.
+/// Write raw bytes with owner-only (0600) permissions on Unix; plain write
+/// elsewhere.
 fn write_owner_only(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -121,33 +106,32 @@ pub struct StatsSnapshot {
     pub wal_shards_per_topic:           usize,
     pub wal_known_topics:               usize,
     pub bucket_duration_micros:         i64,
-    /// Age of the oldest bucket in MemBuffer (seconds, computed from
-    /// `now - min(bucket.min_timestamp)`). None when MemBuffer is empty.
-    /// Alerting target: alert at > 2× `flush_interval_secs`.
+    /// Oldest MemBuffer bucket age in secs (`now - min bucket.min_timestamp`),
+    /// None when empty. Alert at > 2× `flush_interval_secs`.
     pub oldest_bucket_age_secs:         Option<u64>,
-    /// Cumulative flush successes/failures since process start. Mirrors the
-    /// OTel `timefusion.flush.completed`/`failed` counters so tests can
-    /// assert without configuring OTel.
+    /// Cumulative flush successes/failures since start. Mirror the OTel
+    /// `timefusion.flush.completed`/`failed` counters for OTel-free tests.
     pub flush_completed_total:          u64,
     pub flush_failed_total:             u64,
-    /// Times an insert hit the memory hard limit and applied backpressure
-    /// (synchronous flush-to-Delta) instead of rejecting. Sustained growth =
-    /// ingest outpacing flush; the matching OTel counter is the alert target.
+    /// Inserts that hit the hard limit and applied backpressure (sync flush)
+    /// instead of rejecting. Sustained growth = ingest outpacing flush.
     pub backpressure_engaged_total:     u64,
-    /// Inserts rejected after the backpressure window expired without freeing
-    /// memory — Delta flush isn't keeping up. PAGE on any growth (data is still
-    /// in the WAL but ingest is now dropping). Mirrored from OTel so operators
-    /// can watch it via the stats table when telemetry isn't wired.
+    /// Inserts rejected after backpressure failed to free memory. PAGE on any
+    /// growth — data is safe in WAL but ingest is now dropping.
     pub backpressure_rejected_total:    u64,
-    /// Open-bucket force-flush escalations (a single busy window was itself the
+    /// Open-bucket force-flush escalations (one busy window was itself the
     /// pressure). Sustained growth = windows too large for the budget.
     pub backpressure_force_flush_total: u64,
-    /// Cumulative rows accepted into MemBuffer and rows drained to Delta. The
-    /// rate gap between them (diff across two scrapes) is the ingest-outpaces-
-    /// drain signal: both climbing but ingest faster = throughput wedge, not a
-    /// stuck flush.
+    /// Cumulative rows accepted vs drained to Delta. Both climbing with ingest
+    /// faster = throughput wedge, not a stuck flush.
     pub rows_ingested_total:            u64,
     pub rows_flushed_total:             u64,
+    /// MemBuffer bytes reclaimed by flushes. Flat while `pressure_pct=100` and
+    /// flushes commit = memory is in buckets the flush path isn't reaching.
+    pub flush_freed_bytes_total:        u64,
+    /// Real process RSS (Linux `/proc/self/statm`), None off-Linux. Gap vs
+    /// `mem_buffer.estimated_bytes` reveals per-bucket estimate inflation.
+    pub process_rss_bytes:              Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -165,6 +149,26 @@ pub struct FlushStats {
     pub buckets_flushed: u64,
     pub buckets_failed:  u64,
     pub total_rows:      u64,
+}
+
+/// MemBuffer bytes a flush reclaims — uses the same `estimate_batch_size` as
+/// the per-bucket accounting, so `flush_freed_bytes_total` is directly
+/// comparable to `mem_buffer.estimated_bytes`.
+fn flushable_bytes(b: &crate::mem_buffer::FlushableBucket) -> u64 {
+    b.batches.iter().map(crate::mem_buffer::estimate_batch_size).sum::<usize>() as u64
+}
+
+/// Resident set size of this process in bytes from `/proc/self/statm`
+/// (Linux only; None elsewhere). Compare against the MemBuffer's
+/// `estimate_batch_size` charge: a large RSS-below-estimate gap means the
+/// per-bucket estimate (`get_array_memory_size` on wide Utf8View / replayed
+/// batches) is over-counting, so backpressure is tripping on phantom bytes
+/// rather than real memory.
+fn process_rss_bytes() -> Option<usize> {
+    // statm fields are in pages; resident is field 2. 4 KiB pages on every
+    // Linux target TF deploys to (x86_64) — avoids a libc dependency.
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    statm.split_whitespace().nth(1)?.parse::<usize>().ok().map(|pages| pages * 4096)
 }
 
 /// Callback for writing batches to Delta Lake. The callback MUST:
@@ -328,6 +332,13 @@ pub struct BufferedWriteLayer {
     /// distinct from a stuck flush (`flush_failed_total` climbing).
     rows_ingested_total:            AtomicU64,
     rows_flushed_total:             AtomicU64,
+    /// Cumulative MemBuffer bytes (per `estimate_batch_size`) reclaimed by
+    /// successful flushes. Pair with `pressure_pct`: if `pressure_pct=100` and
+    /// this is flat while flushes commit, the drained buckets are near-empty —
+    /// the memory lives in buckets the flush path isn't reaching (e.g. an open
+    /// window needing force-flush). If it climbs in step with ingest, the drain
+    /// is working and ingest is simply outpacing it.
+    flush_freed_bytes_total:        AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
     function_registry:              Arc<crate::functions::FnRegistry>,
     /// Caps concurrent detached tantivy sidecar builds so a fast flush cycle
@@ -401,6 +412,7 @@ impl BufferedWriteLayer {
             backpressure_force_flush_total: AtomicU64::new(0),
             rows_ingested_total: AtomicU64::new(0),
             rows_flushed_total: AtomicU64::new(0),
+            flush_freed_bytes_total: AtomicU64::new(0),
             function_registry,
             // 16 is well above realistic per-cycle table fan-out for the
             // monoscope workload (~5 distinct table names) while still
@@ -665,6 +677,7 @@ impl BufferedWriteLayer {
                         );
                     } else {
                         self.rows_flushed_total.fetch_add(bucket.row_count as u64, Ordering::Relaxed);
+                        self.flush_freed_bytes_total.fetch_add(flushable_bytes(&bucket), Ordering::Relaxed);
                         self.flush_completed_total.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1274,6 +1287,7 @@ impl BufferedWriteLayer {
                             any_ok = true;
                             crate::metrics::record_flush(true);
                             self.rows_flushed_total.fetch_add(combined.row_count as u64, Ordering::Relaxed);
+                            self.flush_freed_bytes_total.fetch_add(flushable_bytes(&combined), Ordering::Relaxed);
                             self.flush_completed_total.fetch_add(source_bucket_ids.len() as u64, Ordering::Relaxed);
                             debug!(
                                 "Flushed coalesced commit: project={}, table={}, buckets={}, rows={}",
@@ -1668,6 +1682,8 @@ impl BufferedWriteLayer {
             backpressure_force_flush_total: self.backpressure_force_flush_total.load(Ordering::Relaxed),
             rows_ingested_total: self.rows_ingested_total.load(Ordering::Relaxed),
             rows_flushed_total: self.rows_flushed_total.load(Ordering::Relaxed),
+            flush_freed_bytes_total: self.flush_freed_bytes_total.load(Ordering::Relaxed),
+            process_rss_bytes: process_rss_bytes(),
         }
     }
 

@@ -2637,7 +2637,7 @@ impl Database {
     pub async fn create_object_store(&self, storage_uri: &str, storage_options: &HashMap<String, String>) -> Result<Arc<dyn object_store::ObjectStore>> {
         use std::time::Duration;
 
-        use object_store::{BackoffConfig, ClientOptions, RetryConfig, aws::AmazonS3Builder};
+        use object_store::{BackoffConfig, ClientConfigKey, ClientOptions, RetryConfig, aws::AmazonS3Builder};
 
         // Parse the S3 URI to extract bucket and prefix
         let url = Url::parse(storage_uri)?;
@@ -2654,8 +2654,13 @@ impl Database {
             },
         };
 
-        // Configure HTTP client with reasonable timeouts
-        let client_options = ClientOptions::new().with_connect_timeout(Duration::from_secs(30)).with_timeout(Duration::from_secs(300));
+        // Configure HTTP client timeouts from config (TIMEFUSION_S3_CONNECT_TIMEOUT /
+        // TIMEFUSION_S3_REQUEST_TIMEOUT). object_store parses the humantime strings;
+        // this is the path the unified + custom data tables (and compaction) use, so
+        // its timeouts must match build_storage_options rather than being hardcoded.
+        let client_options = ClientOptions::new()
+            .with_config(ClientConfigKey::ConnectTimeout, self.config.aws.connect_timeout())
+            .with_config(ClientConfigKey::Timeout, self.config.aws.request_timeout());
 
         // Build S3 configuration
         let mut builder = AmazonS3Builder::new().with_bucket_name(bucket).with_retry(retry_config).with_client_options(client_options);

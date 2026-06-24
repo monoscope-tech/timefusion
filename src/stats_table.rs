@@ -135,6 +135,23 @@ impl StatsTableProvider {
                 "rows_in_buffer_lag".into(),
                 s.rows_ingested_total.saturating_sub(s.rows_flushed_total).to_string(),
             ));
+            // Drain effectiveness: flat while pressure_pct=100 and flushes
+            // commit ⇒ drained buckets are empty (memory is in buckets the
+            // flush path isn't reaching, e.g. an open window needing force-flush).
+            rows.push(("buffered_layer", "flush_freed_bytes_total".into(), s.flush_freed_bytes_total.to_string()));
+            // Real RSS vs the estimate_batch_size charge. RSS far below
+            // estimated_bytes_approx ⇒ per-bucket estimate is over-counting and
+            // backpressure is tripping on phantom bytes, not real memory.
+            rows.push((
+                "buffered_layer",
+                "process_rss_bytes".into(),
+                s.process_rss_bytes.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
+            ));
+            rows.push((
+                "buffered_layer",
+                "process_rss_mb".into(),
+                s.process_rss_bytes.map(|v| format!("{:.1}", v as f64 / (1024.0 * 1024.0))).unwrap_or_else(|| "null".into()),
+            ));
             rows.push(("wal", "files".into(), s.wal_files.to_string()));
             rows.push(("wal", "disk_bytes".into(), s.wal_disk_bytes.to_string()));
             rows.push(("wal", "disk_mb".into(), format!("{:.1}", s.wal_disk_bytes as f64 / (1024.0 * 1024.0))));
