@@ -362,16 +362,29 @@ pub struct AwsConfig {
     pub timefusion_s3_request_timeout: Option<String>,
 }
 
+/// Coerce a bare-number timeout (e.g. `"150"`) to humantime seconds (`"150s"`).
+/// object_store's `ClientConfigKey::{ConnectTimeout,Timeout}` parse strictly via
+/// humantime and PANIC the process at boot on a unitless value — a prod
+/// `TIMEFUSION_S3_CONNECT_TIMEOUT=150` crash-looped TF on 2026-06-24. Treat an
+/// all-digit string as seconds; pass anything with a unit through untouched.
+fn normalize_duration(s: String) -> String {
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        format!("{s}s")
+    } else {
+        s
+    }
+}
+
 impl AwsConfig {
     /// Effective connect timeout. R2 establishes healthy connections in <1s;
     /// a generous bound only matters when something is wrong, where it trades
     /// slower failure for surviving transient R2 connection refusals.
     pub fn connect_timeout(&self) -> String {
-        self.timefusion_s3_connect_timeout.clone().unwrap_or_else(|| "60s".into())
+        normalize_duration(self.timefusion_s3_connect_timeout.clone().unwrap_or_else(|| "60s".into()))
     }
 
     pub fn request_timeout(&self) -> String {
-        self.timefusion_s3_request_timeout.clone().unwrap_or_else(|| "900s".into())
+        normalize_duration(self.timefusion_s3_request_timeout.clone().unwrap_or_else(|| "900s".into()))
     }
 
     pub fn build_storage_options(&self, endpoint_override: Option<&str>) -> HashMap<String, String> {
@@ -832,6 +845,19 @@ impl Default for AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression for the 2026-06-24 crash loop: TIMEFUSION_S3_CONNECT_TIMEOUT=150
+    // (unitless) panicked object_store's Duration parse at boot. Bare numbers must
+    // coerce to seconds; values with a unit pass through untouched.
+    #[test]
+    fn normalize_duration_coerces_bare_numbers_to_seconds() {
+        assert_eq!(normalize_duration("150".into()), "150s");
+        assert_eq!(normalize_duration("150s".into()), "150s");
+        assert_eq!(normalize_duration("3m".into()), "3m");
+        assert_eq!(normalize_duration("".into()), "");
+        let aws = AwsConfig { timefusion_s3_connect_timeout: Some("150".into()), ..Default::default() };
+        assert_eq!(aws.connect_timeout(), "150s");
+    }
 
     #[test]
     fn test_default_config() {
