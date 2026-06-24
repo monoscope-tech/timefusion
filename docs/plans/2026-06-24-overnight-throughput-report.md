@@ -73,7 +73,16 @@ drain rows/commit. TF-only changes (#3) can lift the ~3000/s ceiling but not to 
   fix it in code than CapRover, I can lower the autotune fractions so the pool sum fits under
   host RAM — say the word.
 
-## ⚠️ URGENT — overnight development (03:28 CEST / 01:28 UTC)
+## ✅ RESOLVED overnight (self-healed 05:41 CEST / 03:41 UTC)
+
+The wedge below **cleared on its own** under low night load: pressure 100%→26%, buffer
+drained 1.27M→410k rows, rejects stopped (~3,268 total — all preserved in WAL, replay on
+their own). Prod is healthy as of 05:41, 3h+ uptime, no OOM restart. **But the root cause is
+unfixed — it WILL re-wedge when daytime ingest returns.** The morning actions below still
+stand; treat them as preventing the next (daytime) wedge, not an active fire. The lingering
+~101h bucket is still pinned (harmless now, but it's the latent driver).
+
+## ⚠️ overnight wedge (03:28 CEST / 01:28 UTC) — now resolved, see above
 
 **Prod re-entered the OOM/wedge loop and is actively dropping inserts to the DLQ.**
 
