@@ -154,6 +154,26 @@ pub fn init_metrics(
         }};
     }
 
+    // Same shape as layer_gauge! but registers a monotonic observable counter
+    // (OTel Sum → Prometheus Counter) so PromQL rate() applies reset detection
+    // and survives process restarts (the values snap to 0 on boot). Use for
+    // cumulative totals; layer_gauge! for point-in-time levels.
+    macro_rules! layer_counter {
+        ($id:literal, $desc:literal, |$s:ident| $value:expr) => {{
+            let weak = buffered_layer.clone();
+            meter
+                .u64_observable_counter($id)
+                .with_description($desc)
+                .with_callback(move |obs| {
+                    if let Some(layer) = weak.upgrade() {
+                        let $s = layer.snapshot_stats();
+                        obs.observe($value, &[]);
+                    }
+                })
+                .build();
+        }};
+    }
+
     layer_gauge!(
         "timefusion.mem_buffer.pressure_pct",
         "MemBuffer memory pressure as percentage of max",
@@ -168,6 +188,21 @@ pub fn init_metrics(
         "timefusion.mem_buffer.rows",
         "Total rows in MemBuffer across all projects/tables",
         |s| s.mem_total_rows as u64
+    );
+    // Ingest vs drain: rate() these two and compare. Ingested climbing faster
+    // than flushed (while pressure_pct=100, flush_failed flat) = ingest
+    // outpacing a working drain, not a stuck flush. Counters (not gauges) so
+    // rate() handles the restart-to-0 reset. `ingested` includes WAL-recovered
+    // rows so the pair stays comparable after a restart (see snapshot_stats).
+    layer_counter!(
+        "timefusion.mem_buffer.rows_ingested_total",
+        "Cumulative rows accepted into MemBuffer (incl. WAL recovery)",
+        |s| s.rows_ingested_total
+    );
+    layer_counter!(
+        "timefusion.mem_buffer.rows_flushed_total",
+        "Cumulative rows drained from MemBuffer to Delta",
+        |s| s.rows_flushed_total
     );
     layer_gauge!("timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
     layer_gauge!("timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);

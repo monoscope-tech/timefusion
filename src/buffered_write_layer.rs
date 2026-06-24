@@ -142,6 +142,12 @@ pub struct StatsSnapshot {
     /// Open-bucket force-flush escalations (a single busy window was itself the
     /// pressure). Sustained growth = windows too large for the budget.
     pub backpressure_force_flush_total: u64,
+    /// Cumulative rows accepted into MemBuffer and rows drained to Delta. The
+    /// rate gap between them (diff across two scrapes) is the ingest-outpaces-
+    /// drain signal: both climbing but ingest faster = throughput wedge, not a
+    /// stuck flush.
+    pub rows_ingested_total:            u64,
+    pub rows_flushed_total:             u64,
 }
 
 #[derive(Debug, Default)]
@@ -314,6 +320,14 @@ pub struct BufferedWriteLayer {
     backpressure_engaged_total:     AtomicU64,
     backpressure_rejected_total:    AtomicU64,
     backpressure_force_flush_total: AtomicU64,
+    /// Cumulative rows accepted into MemBuffer (post-WAL) and rows drained to
+    /// Delta. Diff two `timefusion_stats` scrapes to get ingest-rate vs
+    /// drain-rate: if `rows_ingested_total` climbs faster than
+    /// `rows_flushed_total` while `pressure_pct=100`, the flush is succeeding
+    /// but ingest is outpacing drain (the file-count-throttled-dedup wedge),
+    /// distinct from a stuck flush (`flush_failed_total` climbing).
+    rows_ingested_total:            AtomicU64,
+    rows_flushed_total:             AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
     function_registry:              Arc<crate::functions::FnRegistry>,
     /// Caps concurrent detached tantivy sidecar builds so a fast flush cycle
@@ -385,6 +399,8 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: AtomicU64::new(0),
             backpressure_rejected_total: AtomicU64::new(0),
             backpressure_force_flush_total: AtomicU64::new(0),
+            rows_ingested_total: AtomicU64::new(0),
+            rows_flushed_total: AtomicU64::new(0),
             function_registry,
             // 16 is well above realistic per-cycle table fan-out for the
             // monoscope workload (~5 distinct table names) while still
@@ -638,11 +654,17 @@ impl BufferedWriteLayer {
             match self.flush_bucket(&bucket).await {
                 Ok(()) => {
                     if let Err(e) = self.wal.advance_by_counts(&bucket.project_id, &bucket.table_name, &bucket.wal_shard_counts) {
+                        // Delta commit succeeded but the WAL cursor didn't move:
+                        // count as a flush failure (matches the coalesced-flush
+                        // path) so the incident is visible in flush_failed_total
+                        // instead of silently drifting rows_in_buffer_lag.
+                        self.flush_failed_total.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             "force-flush: advance_by_counts failed (rows committed to Delta; WAL will re-replay, dedup protects): {}",
                             e
                         );
                     } else {
+                        self.rows_flushed_total.fetch_add(bucket.row_count as u64, Ordering::Relaxed);
                         self.flush_completed_total.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -725,7 +747,10 @@ impl BufferedWriteLayer {
         self.release_reservation(reserved_size);
 
         match &result {
-            Ok(()) => crate::metrics::record_insert(project_id, table_name, row_count as u64),
+            Ok(()) => {
+                self.rows_ingested_total.fetch_add(row_count as u64, Ordering::Relaxed);
+                crate::metrics::record_insert(project_id, table_name, row_count as u64);
+            }
             Err(_) => crate::metrics::record_ingest_error(project_id, table_name),
         }
         result?;
@@ -759,6 +784,12 @@ impl BufferedWriteLayer {
         // Bounded recovery memory: O(1) entries in flight rather than
         // O(retention_window × throughput) (potentially GiBs).
         let mut entries_replayed = 0u64;
+        // Recovered rows land straight in MemBuffer, bypassing insert()'s
+        // rows_ingested_total bump. Count them here and fold in after replay so
+        // rows_ingested_total/rows_flushed_total stay comparable post-restart —
+        // otherwise the recovered rows flush and inflate flushed against a 0
+        // ingested, clamping rows_in_buffer_lag and blinding the wedge signal.
+        let mut recovered_rows = 0u64;
         let mut deletes_replayed = 0u64;
         let mut updates_replayed = 0u64;
         let mut oldest_ts: Option<i64> = None;
@@ -786,10 +817,14 @@ impl BufferedWriteLayer {
                                 return;
                             }
                             let apply_start = std::time::Instant::now();
+                            let rows = batch.num_rows() as u64;
                             let insert_res = mem_buffer.insert(&entry.project_id, &entry.table_name, batch, entry.timestamp_micros);
                             insert_apply_nanos += apply_start.elapsed().as_nanos();
                             match insert_res {
-                                Ok(()) => entries_replayed += 1,
+                                Ok(()) => {
+                                    entries_replayed += 1;
+                                    recovered_rows += rows;
+                                }
                                 Err(e) => {
                                     error!("WAL REPLAY FAILED: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
                                     quarantine_entry(&quarantine_dir, &entry, "insert_incompatible", &e.to_string());
@@ -909,6 +944,8 @@ impl BufferedWriteLayer {
         // background (spawned by `start_background_tasks`) while we serve; reads
         // see MemBuffer (unioned with Delta) and new inserts flush-to-make-room
         // via insert-path backpressure.
+
+        self.rows_ingested_total.fetch_add(recovered_rows, Ordering::Relaxed);
 
         let stats = RecoveryStats {
             entries_replayed,
@@ -1236,6 +1273,7 @@ impl BufferedWriteLayer {
                             }
                             any_ok = true;
                             crate::metrics::record_flush(true);
+                            self.rows_flushed_total.fetch_add(combined.row_count as u64, Ordering::Relaxed);
                             self.flush_completed_total.fetch_add(source_bucket_ids.len() as u64, Ordering::Relaxed);
                             debug!(
                                 "Flushed coalesced commit: project={}, table={}, buckets={}, rows={}",
@@ -1628,6 +1666,8 @@ impl BufferedWriteLayer {
             backpressure_engaged_total: self.backpressure_engaged_total.load(Ordering::Relaxed),
             backpressure_rejected_total: self.backpressure_rejected_total.load(Ordering::Relaxed),
             backpressure_force_flush_total: self.backpressure_force_flush_total.load(Ordering::Relaxed),
+            rows_ingested_total: self.rows_ingested_total.load(Ordering::Relaxed),
+            rows_flushed_total: self.rows_flushed_total.load(Ordering::Relaxed),
         }
     }
 
