@@ -99,10 +99,10 @@ impl AuthSource for ConfigAuthSource {
 /// Custom handler factory that creates handlers with logging and auth
 pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
-    auth_config:     AuthConfig,
-    plan_cache:      Arc<PlanCacheHook>,
-    scan_metrics:    Option<Arc<crate::database::ScanMetrics>>,
-    db:              Option<Arc<Database>>,
+    auth_config: AuthConfig,
+    plan_cache: Arc<PlanCacheHook>,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
+    db: Option<Arc<Database>>,
 }
 
 impl LoggingHandlerFactory {
@@ -188,25 +188,25 @@ impl ErrorHandler for LoggingErrorHandler {
 
 /// Simple query handler with tracing
 pub struct LoggingSimpleQueryHandler {
-    inner:        DfSessionService,
+    inner: DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
-    db:           Option<Arc<Database>>,
+    db: Option<Arc<Database>>,
 }
 
 impl LoggingSimpleQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
         Self {
-            inner:        DfSessionService::new(session_context),
+            inner: DfSessionService::new(session_context),
             scan_metrics: None,
-            db:           None,
+            db: None,
         }
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
         Self {
-            inner:        DfSessionService::new_with_hooks(session_context, hooks),
+            inner: DfSessionService::new_with_hooks(session_context, hooks),
             scan_metrics: None,
-            db:           None,
+            db: None,
         }
     }
 
@@ -240,7 +240,7 @@ impl LoggingSimpleQueryHandler {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OptimizeCmd {
     pub table: String,
-    pub date:  chrono::NaiveDate,
+    pub date: chrono::NaiveDate,
 }
 
 fn optimize_err(msg: &str) -> PgWireError {
@@ -403,7 +403,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
 
 /// Extended query handler with tracing
 pub struct LoggingExtendedQueryHandler {
-    inner:        DfSessionService,
+    inner: DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
 }
 
@@ -417,14 +417,14 @@ impl LoggingExtendedQueryHandler {
 impl LoggingExtendedQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
         Self {
-            inner:        DfSessionService::new(session_context),
+            inner: DfSessionService::new(session_context),
             scan_metrics: None,
         }
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
         Self {
-            inner:        DfSessionService::new_with_hooks(session_context, hooks),
+            inner: DfSessionService::new_with_hooks(session_context, hooks),
             scan_metrics: None,
         }
     }

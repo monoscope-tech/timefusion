@@ -127,7 +127,7 @@ pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextM
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextMatchPred {
     pub column: String,
-    pub query:  String,
+    pub query: String,
 }
 
 /// Collect `text_match(col, q)` predicates eligible to seed the tantivy

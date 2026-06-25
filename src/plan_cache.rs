@@ -317,10 +317,10 @@ pub fn global() -> Option<std::sync::Arc<PlanCacheHook>> {
 /// that just clears the cache once exceeded — cheap, correct, and never holds
 /// a lock across the await in `handle_simple_query`.
 pub struct PlanCacheHook {
-    cache:    dashmap::DashMap<String, LogicalPlan>,
+    cache: dashmap::DashMap<String, LogicalPlan>,
     capacity: usize,
-    hits:     std::sync::atomic::AtomicU64,
-    misses:   std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
 }
 
 impl Default for PlanCacheHook {
@@ -332,10 +332,10 @@ impl Default for PlanCacheHook {
 impl PlanCacheHook {
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache:    dashmap::DashMap::new(),
+            cache: dashmap::DashMap::new(),
             capacity: capacity.max(1),
-            hits:     std::sync::atomic::AtomicU64::new(0),
-            misses:   std::sync::atomic::AtomicU64::new(0),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

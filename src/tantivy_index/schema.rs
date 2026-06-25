@@ -47,9 +47,9 @@ pub const ID_FIELD: &str = "_id";
 
 /// Result of building a tantivy schema for a table.
 pub struct BuiltSchema {
-    pub schema:      Schema,
-    pub timestamp:   Field,
-    pub id:          Field,
+    pub schema: Schema,
+    pub timestamp: Field,
+    pub id: Field,
     /// Map of source-column-name → tantivy field. Only contains user columns
     /// that were `indexed: true` in YAML. Variants/lists are included here.
     pub user_fields: HashMap<String, UserField>,
@@ -57,7 +57,7 @@ pub struct BuiltSchema {
 
 #[derive(Debug, Clone)]
 pub struct UserField {
-    pub field:  Field,
+    pub field: Field,
     pub source: FieldDef,
 }
 

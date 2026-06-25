@@ -26,7 +26,7 @@ use crate::tantivy_index::{
 
 #[derive(Debug)]
 pub struct SearchResult {
-    pub hits:         Vec<Hit>,
+    pub hits: Vec<Hit>,
     /// Sum of `rows` across all manifest entries that contributed (whether
     /// they hit or not). Lets the caller compute hit_count / indexed_rows
     /// for the selectivity cutoff.
@@ -36,7 +36,7 @@ pub struct SearchResult {
 #[derive(Debug)]
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
-    pub cache_root:   PathBuf,
+    pub cache_root: PathBuf,
 }
 
 impl TantivySearchService {
