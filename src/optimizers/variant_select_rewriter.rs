@@ -325,7 +325,7 @@ mod peel_tests {
         let df = Arc::new(DFSchema::try_from(schema).unwrap());
         let empty = LogicalPlan::EmptyRelation(EmptyRelation {
             produce_one_row: false,
-            schema:          df,
+            schema: df,
         });
         LogicalPlanBuilder::from(empty).project(vec![col("v")]).unwrap().build().unwrap()
     }

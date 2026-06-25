@@ -29,8 +29,8 @@ fn main() -> anyhow::Result<()> {
     // Runs a one-off compaction of old `date=` partitions, then exits. Run it on
     // a workstation (not the prod box) pointed at prod storage to knock down the
     // file-count backlog without adding memory pressure to the live server — it
-    // uses the same DynamoDB commit lock, so it coordinates safely with a
-    // running instance.
+    // commits via the same S3/R2 conditional-put (If-None-Match) coordination as
+    // the live server, so concurrent commits conflict-detect safely (OCC retry).
     if std::env::args().nth(1).as_deref() == Some("optimize") {
         let cfg = config::init_config().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
         unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };

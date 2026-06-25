@@ -23,7 +23,7 @@ mod pgwire_dml_tag {
         "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary)";
 
     struct TestServer {
-        port:     u16,
+        port: u16,
         shutdown: Arc<Notify>,
     }
 

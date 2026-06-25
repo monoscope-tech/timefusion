@@ -21,7 +21,7 @@ mod jsonb_oid {
     const JSON_OID: u32 = 114;
 
     struct Server {
-        port:     u16,
+        port: u16,
         shutdown: Arc<Notify>,
     }
 
