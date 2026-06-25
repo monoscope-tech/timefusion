@@ -27,14 +27,14 @@ pub struct Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     /// Object-store path to the index tar.zst, or `None` if build failed.
-    pub index: Option<String>,
-    pub rows: u64,
-    pub built_at: DateTime<Utc>,
-    pub schema_version: u32,
+    pub index:                Option<String>,
+    pub rows:                 u64,
+    pub built_at:             DateTime<Utc>,
+    pub schema_version:       u32,
     pub min_timestamp_micros: Option<i64>,
     pub max_timestamp_micros: Option<i64>,
     /// Set when build failed; `index` will be None.
-    pub error: Option<String>,
+    pub error:                Option<String>,
     /// Parquet file URIs that this index covers. Populated from the Delta
     /// write commit's add-actions. Used by `gc_after_compaction` to detect
     /// stale entries: when any of these URIs is no longer live (i.e. it was
@@ -42,7 +42,7 @@ pub struct ManifestEntry {
     /// and can be dropped. Older entries built before this field existed
     /// will deserialize to an empty Vec.
     #[serde(default)]
-    pub covered_files: Vec<String>,
+    pub covered_files:        Vec<String>,
 }
 
 impl Default for Manifest {

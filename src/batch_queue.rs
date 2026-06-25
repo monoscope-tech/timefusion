@@ -8,7 +8,7 @@ use tracing::{error, info};
 
 #[derive(Debug)]
 pub struct BatchQueue {
-    tx: mpsc::Sender<RecordBatch>,
+    tx:       mpsc::Sender<RecordBatch>,
     shutdown: tokio_util::sync::CancellationToken,
 }
 

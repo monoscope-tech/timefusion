@@ -28,14 +28,14 @@ pub mod test_helpers {
     }
 
     pub struct TestConfigBuilder {
-        test_name: String,
+        test_name:   String,
         buffer_mode: BufferMode,
     }
 
     impl TestConfigBuilder {
         pub fn new(test_name: &str) -> Self {
             Self {
-                test_name: test_name.to_string(),
+                test_name:   test_name.to_string(),
                 buffer_mode: BufferMode::Enabled,
             }
         }

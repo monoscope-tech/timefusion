@@ -31,8 +31,8 @@ use crate::{
 /// Owns the object store + tantivy config and produces a callback.
 #[derive(Debug)]
 pub struct TantivyIndexService {
-    pub object_store: Arc<dyn ObjectStore>,
-    pub config: Arc<TantivyConfig>,
+    pub object_store:      Arc<dyn ObjectStore>,
+    pub config:            Arc<TantivyConfig>,
     /// Max `max_timestamp_micros` across every index this process has
     /// successfully published. Feeds the `index_lag_seconds` gauge. Loaded
     /// from manifests on first observation (lazy) and updated after each
@@ -101,14 +101,14 @@ impl TantivyIndexService {
             Err(e) => {
                 let key = bucket_key(&bucket_uuid);
                 let entry = ManifestEntry {
-                    index: None,
-                    rows: 0,
-                    built_at: Utc::now(),
-                    schema_version: manifest::SCHEMA_VERSION,
+                    index:                None,
+                    rows:                 0,
+                    built_at:             Utc::now(),
+                    schema_version:       manifest::SCHEMA_VERSION,
                     min_timestamp_micros: None,
                     max_timestamp_micros: None,
-                    error: Some(format!("build failed: {e}")),
-                    covered_files: added_files.clone(),
+                    error:                Some(format!("build failed: {e}")),
+                    covered_files:        added_files.clone(),
                 };
                 let _ = manifest::upsert(self.object_store.as_ref(), table_name, project_id, &key, entry).await;
                 warn!("tantivy build failed for {project_id}/{table_name}: {e}");
@@ -122,14 +122,14 @@ impl TantivyIndexService {
 
         let key = bucket_key(&bucket_uuid);
         let entry = ManifestEntry {
-            index: Some(path.to_string()),
-            rows: stats.rows,
-            built_at: Utc::now(),
-            schema_version: manifest::SCHEMA_VERSION,
+            index:                Some(path.to_string()),
+            rows:                 stats.rows,
+            built_at:             Utc::now(),
+            schema_version:       manifest::SCHEMA_VERSION,
             min_timestamp_micros: stats.min_timestamp_micros,
             max_timestamp_micros: stats.max_timestamp_micros,
-            error: None,
-            covered_files: added_files,
+            error:                None,
+            covered_files:        added_files,
         };
         manifest::upsert(self.object_store.as_ref(), table_name, project_id, &key, entry).await?;
         self.observe_newest(stats.max_timestamp_micros);
@@ -188,8 +188,8 @@ impl TantivyIndexService {
 
 #[derive(Debug, Default, Clone)]
 pub struct GcReport {
-    pub kept: usize,
-    pub entries_removed: usize,
-    pub blobs_deleted: usize,
+    pub kept:               usize,
+    pub entries_removed:    usize,
+    pub blobs_deleted:      usize,
     pub blob_delete_errors: usize,
 }

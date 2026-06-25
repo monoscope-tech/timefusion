@@ -93,62 +93,62 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
 /// `snapshot_stats()` and rendered as rows by `timefusion.stats()`.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
-    pub mem_project_count: usize,
-    pub mem_total_buckets: usize,
-    pub mem_total_rows: usize,
-    pub mem_total_batches: usize,
-    pub mem_estimated_bytes: usize,
-    pub reserved_bytes: usize,
-    pub max_memory_bytes: usize,
-    pub pressure_pct: u32,
-    pub wal_files: usize,
-    pub wal_disk_bytes: u64,
-    pub wal_shards_per_topic: usize,
-    pub wal_known_topics: usize,
-    pub bucket_duration_micros: i64,
+    pub mem_project_count:              usize,
+    pub mem_total_buckets:              usize,
+    pub mem_total_rows:                 usize,
+    pub mem_total_batches:              usize,
+    pub mem_estimated_bytes:            usize,
+    pub reserved_bytes:                 usize,
+    pub max_memory_bytes:               usize,
+    pub pressure_pct:                   u32,
+    pub wal_files:                      usize,
+    pub wal_disk_bytes:                 u64,
+    pub wal_shards_per_topic:           usize,
+    pub wal_known_topics:               usize,
+    pub bucket_duration_micros:         i64,
     /// Oldest MemBuffer bucket age in secs (`now - min bucket.min_timestamp`),
     /// None when empty. Alert at > 2× `flush_interval_secs`.
-    pub oldest_bucket_age_secs: Option<u64>,
+    pub oldest_bucket_age_secs:         Option<u64>,
     /// Cumulative flush successes/failures since start. Mirror the OTel
     /// `timefusion.flush.completed`/`failed` counters for OTel-free tests.
-    pub flush_completed_total: u64,
-    pub flush_failed_total: u64,
+    pub flush_completed_total:          u64,
+    pub flush_failed_total:             u64,
     /// Inserts that hit the hard limit and applied backpressure (sync flush)
     /// instead of rejecting. Sustained growth = ingest outpacing flush.
-    pub backpressure_engaged_total: u64,
+    pub backpressure_engaged_total:     u64,
     /// Inserts rejected after backpressure failed to free memory. PAGE on any
     /// growth — data is safe in WAL but ingest is now dropping.
-    pub backpressure_rejected_total: u64,
+    pub backpressure_rejected_total:    u64,
     /// Open-bucket force-flush escalations (one busy window was itself the
     /// pressure). Sustained growth = windows too large for the budget.
     pub backpressure_force_flush_total: u64,
     /// Cumulative rows accepted vs drained to Delta. Both climbing with ingest
     /// faster = throughput wedge, not a stuck flush.
-    pub rows_ingested_total: u64,
-    pub rows_flushed_total: u64,
+    pub rows_ingested_total:            u64,
+    pub rows_flushed_total:             u64,
     /// MemBuffer bytes reclaimed by flushes. Flat while `pressure_pct=100` and
     /// flushes commit = memory is in buckets the flush path isn't reaching.
-    pub flush_freed_bytes_total: u64,
+    pub flush_freed_bytes_total:        u64,
     /// Real process RSS (Linux `/proc/self/statm`), None off-Linux. Gap vs
     /// `mem_buffer.estimated_bytes` reveals per-bucket estimate inflation.
-    pub process_rss_bytes: Option<usize>,
+    pub process_rss_bytes:              Option<usize>,
 }
 
 #[derive(Debug, Default)]
 pub struct RecoveryStats {
-    pub entries_replayed: u64,
-    pub batches_recovered: u64,
-    pub oldest_entry_timestamp: Option<i64>,
-    pub newest_entry_timestamp: Option<i64>,
-    pub recovery_duration_ms: u64,
+    pub entries_replayed:          u64,
+    pub batches_recovered:         u64,
+    pub oldest_entry_timestamp:    Option<i64>,
+    pub newest_entry_timestamp:    Option<i64>,
+    pub recovery_duration_ms:      u64,
     pub corrupted_entries_skipped: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct FlushStats {
     pub buckets_flushed: u64,
-    pub buckets_failed: u64,
-    pub total_rows: u64,
+    pub buckets_failed:  u64,
+    pub total_rows:      u64,
 }
 
 /// MemBuffer bytes a flush reclaims — uses the same `estimate_batch_size` as
@@ -198,25 +198,25 @@ struct CoalescedGroup {
     /// the buffered-layer but reaches this code as `""`). Using `is_empty` as
     /// the sentinel previously let every subsequent bucket in such a group
     /// silently re-overwrite project_id/table_name.
-    key: Option<(String, String)>,
-    batches: Vec<RecordBatch>,
-    row_count: usize,
+    key:               Option<(String, String)>,
+    batches:           Vec<RecordBatch>,
+    row_count:         usize,
     /// Sum of per-shard counts across all absorbed buckets — drives walrus
     /// `advance_by_counts` once for the entire commit.
-    wal_shard_counts: Vec<u64>,
+    wal_shard_counts:  Vec<u64>,
     /// Per-shard max position across all absorbed buckets — written into
     /// Delta commit metadata for crash-mid-flush cursor recovery.
-    wal_positions: Vec<Option<walrus_rust::WalPosition>>,
+    wal_positions:     Vec<Option<walrus_rust::WalPosition>>,
     /// Source bucket_ids; drained from MemBuffer after the combined commit succeeds.
     source_bucket_ids: Vec<i64>,
     /// Min/max timestamp across absorbed buckets (Option so the derived Default's
     /// 0 can't corrupt the min). Carried onto the combined FlushableBucket.
-    min_timestamp: Option<i64>,
-    max_timestamp: Option<i64>,
+    min_timestamp:     Option<i64>,
+    max_timestamp:     Option<i64>,
 }
 
 struct CombinedBucket {
-    combined: crate::mem_buffer::FlushableBucket,
+    combined:          crate::mem_buffer::FlushableBucket,
     source_bucket_ids: Vec<i64>,
 }
 
@@ -293,36 +293,36 @@ pub type TantivyIndexCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, Vec<String>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 pub struct BufferedWriteLayer {
-    config: Arc<AppConfig>,
-    wal: Arc<WalManager>,
-    mem_buffer: Arc<MemBuffer>,
-    shutdown: CancellationToken,
-    delta_write_callback: Option<DeltaWriteCallback>,
-    tantivy_index_callback: Option<TantivyIndexCallback>,
-    background_tasks: Mutex<Vec<JoinHandle<()>>>,
-    flush_lock: Mutex<()>,
+    config:                         Arc<AppConfig>,
+    wal:                            Arc<WalManager>,
+    mem_buffer:                     Arc<MemBuffer>,
+    shutdown:                       CancellationToken,
+    delta_write_callback:           Option<DeltaWriteCallback>,
+    tantivy_index_callback:         Option<TantivyIndexCallback>,
+    background_tasks:               Mutex<Vec<JoinHandle<()>>>,
+    flush_lock:                     Mutex<()>,
     // Single-flights insert-path backpressure relief: only the writer that wins
     // this try_lock drives a relief flush; the rest wait for it to free RAM.
     // Without it, every blocked writer ran its own flush cycle (the ~20s p99
     // herd). Distinct from `flush_lock` so relief never blocks behind a routine
     // background flush already holding `flush_lock`.
-    relief_lock: Mutex<()>,
-    reserved_bytes: AtomicUsize,  // Memory reserved for in-flight writes
-    pressure_notify: Arc<Notify>, // Wakes flush task when pressure threshold crossed
+    relief_lock:                    Mutex<()>,
+    reserved_bytes:                 AtomicUsize, // Memory reserved for in-flight writes
+    pressure_notify:                Arc<Notify>, // Wakes flush task when pressure threshold crossed
     /// Notified at the end of every flush task iteration (success or failure).
     /// Test hook: lets E2E harnesses await actual completion of background work
     /// instead of racing wall-clock sleeps.
-    flush_tick_notify: Arc<Notify>,
+    flush_tick_notify:              Arc<Notify>,
     /// Notified at the end of every eviction task iteration.
-    eviction_tick_notify: Arc<Notify>,
+    eviction_tick_notify:           Arc<Notify>,
     /// Cumulative flush counters mirrored alongside OTel `record_flush`.
     /// OTel global metric state is opt-in (only initialized when telemetry is
     /// configured), so these atomics give the harness an in-process way to
     /// assert on what the global counters would be.
-    flush_completed_total: AtomicU64,
-    flush_failed_total: AtomicU64,
-    backpressure_engaged_total: AtomicU64,
-    backpressure_rejected_total: AtomicU64,
+    flush_completed_total:          AtomicU64,
+    flush_failed_total:             AtomicU64,
+    backpressure_engaged_total:     AtomicU64,
+    backpressure_rejected_total:    AtomicU64,
     backpressure_force_flush_total: AtomicU64,
     /// Cumulative rows accepted into MemBuffer (post-WAL) and rows drained to
     /// Delta. Diff two `timefusion_stats` scrapes to get ingest-rate vs
@@ -330,24 +330,24 @@ pub struct BufferedWriteLayer {
     /// `rows_flushed_total` while `pressure_pct=100`, the flush is succeeding
     /// but ingest is outpacing drain (the file-count-throttled-dedup wedge),
     /// distinct from a stuck flush (`flush_failed_total` climbing).
-    rows_ingested_total: AtomicU64,
-    rows_flushed_total: AtomicU64,
+    rows_ingested_total:            AtomicU64,
+    rows_flushed_total:             AtomicU64,
     /// Cumulative MemBuffer bytes (per `estimate_batch_size`) reclaimed by
     /// successful flushes. Pair with `pressure_pct`: if `pressure_pct=100` and
     /// this is flat while flushes commit, the drained buckets are near-empty —
     /// the memory lives in buckets the flush path isn't reaching (e.g. an open
     /// window needing force-flush). If it climbs in step with ingest, the drain
     /// is working and ingest is simply outpacing it.
-    flush_freed_bytes_total: AtomicU64,
+    flush_freed_bytes_total:        AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
-    function_registry: Arc<crate::functions::FnRegistry>,
+    function_registry:              Arc<crate::functions::FnRegistry>,
     /// Caps concurrent detached tantivy sidecar builds so a fast flush cycle
     /// (post-F4 — one build per (project, table) per cycle) can't fan out
     /// past S3 connection / memory limits when many tables flush together.
     /// FOLLOW-UP: handles aren't stored; graceful shutdown does not await
     /// in-flight tantivy uploads. Acceptable for now because the sidecar is
     /// best-effort and the index can be rebuilt from Delta on demand.
-    tantivy_spawn_sem: Arc<tokio::sync::Semaphore>,
+    tantivy_spawn_sem:              Arc<tokio::sync::Semaphore>,
     /// Per-(project, table) max row timestamp ever handed to a Delta commit
     /// this process lifetime, floored at `boot_micros`. Delta cannot hold
     /// rows newer than this, so a query whose lower time bound is above it
@@ -358,12 +358,12 @@ pub struct BufferedWriteLayer {
     /// visibility gap). Raised before the commit so a query can't race in
     /// between commit-visible and watermark-raise; a failed commit leaves it
     /// conservatively high.
-    delta_flushed_watermark: dashmap::DashMap<crate::mem_buffer::TableKey, i64>,
+    delta_flushed_watermark:        dashmap::DashMap<crate::mem_buffer::TableKey, i64>,
     /// Recovery-time floor for the watermark: anything committed by earlier
     /// process lifetimes has row timestamps at/below roughly this (event
     /// timestamps drive bucketing; far-future-skewed pre-boot rows are the
     /// accepted residual exposure, same as the old heuristic).
-    boot_micros: i64,
+    boot_micros:                    i64,
 }
 
 impl std::fmt::Debug for BufferedWriteLayer {

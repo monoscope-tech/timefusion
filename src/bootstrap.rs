@@ -21,13 +21,13 @@ use crate::{
 
 /// Everything a serving process needs after bootstrap is done.
 pub struct Bootstrapped {
-    pub db: Arc<Database>,
+    pub db:             Arc<Database>,
     pub buffered_layer: Arc<BufferedWriteLayer>,
     /// The SessionContext used by the pgwire handlers — UDFs and table
     /// providers are already registered.
-    pub session_ctx: Arc<SessionContext>,
+    pub session_ctx:    Arc<SessionContext>,
     /// Cancel to signal shutdown to anything we spawned.
-    pub shutdown: CancellationToken,
+    pub shutdown:       CancellationToken,
 }
 
 /// Build the BufferedWriteLayer + Database wiring exactly as `main.rs` does,
