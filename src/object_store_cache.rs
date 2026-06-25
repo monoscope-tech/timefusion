@@ -1309,11 +1309,11 @@ impl MultipartUpload for CachingMultipartUpload {
 // duration when it finishes, surfacing slow `_delta_log` scans during the ~40s
 // Delta commit. Remove once the commit bottleneck is confirmed/fixed.
 struct TimedListStream {
-    inner: BoxStream<'static, ObjectStoreResult<ObjectMeta>>,
+    inner:   BoxStream<'static, ObjectStoreResult<ObjectMeta>>,
     started: std::time::Instant,
-    count: usize,
-    prefix: String,
-    done: bool,
+    count:   usize,
+    prefix:  String,
+    done:    bool,
 }
 impl futures::Stream for TimedListStream {
     type Item = ObjectStoreResult<ObjectMeta>;
@@ -1487,21 +1487,21 @@ impl ObjectStore for FoyerObjectStoreCache {
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         Box::pin(TimedListStream {
-            inner: self.inner.list(prefix),
+            inner:   self.inner.list(prefix),
             started: std::time::Instant::now(),
-            count: 0,
-            prefix: prefix.map(|p| p.to_string()).unwrap_or_default(),
-            done: false,
+            count:   0,
+            prefix:  prefix.map(|p| p.to_string()).unwrap_or_default(),
+            done:    false,
         })
     }
 
     fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
         Box::pin(TimedListStream {
-            inner: self.inner.list_with_offset(prefix, offset),
+            inner:   self.inner.list_with_offset(prefix, offset),
             started: std::time::Instant::now(),
-            count: 0,
-            prefix: format!("{}@>{}", prefix.map(|p| p.to_string()).unwrap_or_default(), offset),
-            done: false,
+            count:   0,
+            prefix:  format!("{}@>{}", prefix.map(|p| p.to_string()).unwrap_or_default(), offset),
+            done:    false,
         })
     }
 
