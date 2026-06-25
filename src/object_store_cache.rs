@@ -1305,6 +1305,36 @@ impl MultipartUpload for CachingMultipartUpload {
     }
 }
 
+// DIAG (commit-throughput profiling): wraps a list stream to log total items +
+// duration when it finishes, surfacing slow `_delta_log` scans during the ~40s
+// Delta commit. Remove once the commit bottleneck is confirmed/fixed.
+struct TimedListStream {
+    inner: BoxStream<'static, ObjectStoreResult<ObjectMeta>>,
+    started: std::time::Instant,
+    count: usize,
+    prefix: String,
+    done: bool,
+}
+impl futures::Stream for TimedListStream {
+    type Item = ObjectStoreResult<ObjectMeta>;
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let p = this.inner.as_mut().poll_next(cx);
+        match &p {
+            std::task::Poll::Ready(Some(_)) => this.count += 1,
+            std::task::Poll::Ready(None) if !this.done => {
+                this.done = true;
+                let ms = this.started.elapsed().as_millis();
+                if ms > 1500 {
+                    tracing::info!("slow_list prefix={} items={} ms={}", this.prefix, this.count, ms);
+                }
+            }
+            _ => {}
+        }
+        p
+    }
+}
+
 #[async_trait]
 impl ObjectStore for FoyerObjectStoreCache {
     async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> ObjectStoreResult<PutResult> {
@@ -1456,11 +1486,23 @@ impl ObjectStore for FoyerObjectStoreCache {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list(prefix)
+        Box::pin(TimedListStream {
+            inner: self.inner.list(prefix),
+            started: std::time::Instant::now(),
+            count: 0,
+            prefix: prefix.map(|p| p.to_string()).unwrap_or_default(),
+            done: false,
+        })
     }
 
     fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> BoxStream<'static, ObjectStoreResult<ObjectMeta>> {
-        self.inner.list_with_offset(prefix, offset)
+        Box::pin(TimedListStream {
+            inner: self.inner.list_with_offset(prefix, offset),
+            started: std::time::Instant::now(),
+            count: 0,
+            prefix: format!("{}@>{}", prefix.map(|p| p.to_string()).unwrap_or_default(), offset),
+            done: false,
+        })
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> ObjectStoreResult<ListResult> {
