@@ -75,17 +75,17 @@ fn snap_to_pos((block_id, offset): SnapPos) -> WalPosition {
 /// `clean_shutdown` flag alone won't catch out-of-band commits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorSnapshot {
-    pub version: u32,
+    pub version:           u32,
     /// Wall-clock micros (`clock::now_micros`) at write time. Informational
     /// only — surfaced in the boot log so operators can spot a stale
     /// snapshot, but not enforced as a max-age gate.
     pub written_at_micros: i64,
-    pub shards_per_topic: usize,
+    pub shards_per_topic:  usize,
     /// True only when written by the graceful-shutdown path. Boot uses this
     /// flag to decide whether the Delta verifier can be skipped entirely.
-    pub clean_shutdown: bool,
+    pub clean_shutdown:    bool,
     /// `"project_id:table_name"` → per-shard cursor (None = never written).
-    pub entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
+    pub entries:           std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
 }
 
 /// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
@@ -121,11 +121,11 @@ impl TryFrom<u8> for WalOperation {
 #[derive(Debug, Encode, Decode)]
 pub struct WalEntry {
     pub timestamp_micros: i64,
-    pub project_id: String,
-    pub table_name: String,
-    pub operation: WalOperation,
+    pub project_id:       String,
+    pub table_name:       String,
+    pub operation:        WalOperation,
     #[bincode(with_serde)]
-    pub data: Vec<u8>,
+    pub data:             Vec<u8>,
 }
 
 impl WalEntry {
@@ -148,7 +148,7 @@ pub struct DeletePayload {
 #[derive(Debug, Encode, Decode)]
 pub struct UpdatePayload {
     pub predicate_sql: Option<String>,
-    pub assignments: Vec<(String, String)>,
+    pub assignments:   Vec<(String, String)>,
 }
 
 /// `UPDATE ... FROM` source side, persisted alongside the predicate +
@@ -165,8 +165,8 @@ pub struct SerializedSource {
 #[derive(Debug, Encode, Decode)]
 pub struct UpdateWithSourcePayload {
     pub predicate_sql: Option<String>,
-    pub assignments: Vec<(String, String)>,
-    pub source: SerializedSource,
+    pub assignments:   Vec<(String, String)>,
+    pub source:        SerializedSource,
 }
 
 /// Number of walrus shards per logical (project_id, table_name) topic.
@@ -188,15 +188,15 @@ const WAL_SHARDS_PER_TOPIC_DEFAULT: usize = 4;
 const WAL_APPEND_LOCK_STRIPES: usize = 256;
 
 pub struct WalManager {
-    wal: Walrus,
-    data_dir: PathBuf,
+    wal:              Walrus,
+    data_dir:         PathBuf,
     /// Logical topic strings ("{project_id}:{table_name}") — one entry per
     /// (project, table). Each maps to `shards_per_topic` walrus collections.
-    known_topics: DashSet<String>,
+    known_topics:     DashSet<String>,
     /// Per-topic round-robin counter chooses which shard the next batch is
     /// appended to. Topic-scoped (rather than global) so we don't penalize
     /// the cold-cache miss for an idle topic.
-    shard_counter: dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
+    shard_counter:    dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
     shards_per_topic: usize,
     /// Per-collection append serialization. Walrus rejects *concurrent* appends
     /// to one collection with "another batch write already in progress".
@@ -205,7 +205,7 @@ pub struct WalManager {
     /// a shard. These striped locks make colliders QUEUE (briefly — an append is
     /// an in-memory write; fsync is decoupled) instead of erroring the insert,
     /// which would dead-letter the row. Striped by `walrus_key` hash.
-    append_locks: Vec<std::sync::Mutex<()>>,
+    append_locks:     Vec<std::sync::Mutex<()>>,
 }
 
 impl WalManager {
@@ -288,7 +288,7 @@ impl WalManager {
         match std::fs::read_to_string(&stamp_path) {
             Ok(s) => {
                 let on_disk: u8 = s.trim().parse().map_err(|_| WalError::UnsupportedVersion {
-                    version: 0,
+                    version:  0,
                     expected: WAL_VERSION,
                 })?;
                 if on_disk != WAL_VERSION {
@@ -298,7 +298,7 @@ impl WalManager {
                         on_disk, WAL_VERSION, data_dir
                     );
                     return Err(WalError::UnsupportedVersion {
-                        version: on_disk,
+                        version:  on_disk,
                         expected: WAL_VERSION,
                     });
                 }
@@ -311,7 +311,7 @@ impl WalManager {
                     data_dir, WAL_VERSION
                 );
                 Err(WalError::UnsupportedVersion {
-                    version: 0,
+                    version:  0,
                     expected: WAL_VERSION,
                 })
             }
@@ -477,7 +477,7 @@ impl WalManager {
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let payload = UpdatePayload {
             predicate_sql: predicate_sql.map(String::from),
-            assignments: assignments.to_vec(),
+            assignments:   assignments.to_vec(),
         };
         let entry = WalEntry::new(project_id, table_name, WalOperation::Update, bincode::encode_to_vec(&payload, BINCODE_CONFIG)?);
         self.locked_append(&walrus_key, &entry)?;
@@ -504,8 +504,8 @@ impl WalManager {
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let payload = UpdateWithSourcePayload {
             predicate_sql: predicate_sql.map(String::from),
-            assignments: assignments.to_vec(),
-            source: source.clone(),
+            assignments:   assignments.to_vec(),
+            source:        source.clone(),
         };
         let entry = WalEntry::new(
             project_id,
@@ -993,7 +993,7 @@ pub(crate) fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalEr
     if data.len() > MAX_BATCH_SIZE {
         return Err(WalError::BatchTooLarge {
             size: data.len(),
-            max: MAX_BATCH_SIZE,
+            max:  MAX_BATCH_SIZE,
         });
     }
     let mut reader = StreamReader::try_new(std::io::Cursor::new(data), None)?;
@@ -1018,13 +1018,13 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
 
     if data[0..4] != WAL_MAGIC {
         return Err(WalError::UnsupportedVersion {
-            version: data[0],
+            version:  data[0],
             expected: WAL_VERSION,
         });
     }
     if data.len() < 6 || data[4] != WAL_VERSION {
         return Err(WalError::UnsupportedVersion {
-            version: data[4],
+            version:  data[4],
             expected: WAL_VERSION,
         });
     }
@@ -1168,10 +1168,10 @@ mod tests {
     fn test_wal_entry_serialization() {
         let entry = WalEntry {
             timestamp_micros: 1234567890,
-            project_id: "project-123".to_string(),
-            table_name: "test_table".to_string(),
-            operation: WalOperation::Insert,
-            data: vec![1, 2, 3, 4, 5],
+            project_id:       "project-123".to_string(),
+            table_name:       "test_table".to_string(),
+            operation:        WalOperation::Insert,
+            data:             vec![1, 2, 3, 4, 5],
         };
         let serialized = serialize_wal_entry(&entry).unwrap();
         let deserialized = deserialize_wal_entry(&serialized).unwrap();
@@ -1543,7 +1543,7 @@ mod tests {
     fn test_update_payload_serialization() {
         let payload = UpdatePayload {
             predicate_sql: Some("id = 1".to_string()),
-            assignments: vec![("name".to_string(), "'updated'".to_string())],
+            assignments:   vec![("name".to_string(), "'updated'".to_string())],
         };
         let serialized = bincode::encode_to_vec(&payload, BINCODE_CONFIG).unwrap();
         let deserialized = decode_payload::<UpdatePayload>(&serialized).unwrap();

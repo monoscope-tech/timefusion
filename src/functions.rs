@@ -942,14 +942,14 @@ fn create_jsonb_array_elements_udf() -> ScalarUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonBuildArrayUDF {
     signature: Signature,
-    aliases: Vec<String>,
+    aliases:   Vec<String>,
 }
 
 impl JsonBuildArrayUDF {
     fn new() -> Self {
         Self {
             signature: Signature::variadic_any(Volatility::Immutable),
-            aliases: vec![],
+            aliases:   vec![],
         }
     }
 }
@@ -999,14 +999,14 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ToJsonUDF {
     signature: Signature,
-    aliases: Vec<String>,
+    aliases:   Vec<String>,
 }
 
 impl ToJsonUDF {
     fn new() -> Self {
         Self {
             signature: Signature::any(1, Volatility::Immutable),
-            aliases: vec![],
+            aliases:   vec![],
         }
     }
 }
@@ -2020,10 +2020,10 @@ mod tests {
         let nums: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n as i64));
         let scalar = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some("tag".into())));
         let args = ScalarFunctionArgs {
-            args: vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
-            arg_fields: vec![],
-            number_rows: n,
-            return_field: Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
+            args:           vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
+            arg_fields:     vec![],
+            number_rows:    n,
+            return_field:   Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
         let start = std::time::Instant::now();

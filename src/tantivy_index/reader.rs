@@ -14,7 +14,7 @@ use crate::tantivy_index::schema::{ID_FIELD, TS_FIELD};
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hit {
     pub timestamp_micros: i64,
-    pub id: String,
+    pub id:               String,
 }
 
 /// Run a tantivy `Query` against the index and return hits up to `limit`.

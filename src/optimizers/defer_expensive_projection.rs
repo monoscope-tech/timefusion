@@ -98,7 +98,7 @@ impl OptimizerRule for DeferExpensiveProjection {
 
         let min_proj = Projection::try_new(needed.into_iter().map(Expr::Column).collect(), Arc::clone(&proj.input))?;
         let new_sort = LogicalPlan::Sort(Sort {
-            expr: new_sort_exprs,
+            expr:  new_sort_exprs,
             input: Arc::new(LogicalPlan::Projection(min_proj)),
             fetch: sort.fetch,
         });

@@ -32,67 +32,67 @@ fn ts_field(name: &str, nullable: bool) -> FieldDef {
 }
 fn utf8(name: &str, indexed: bool, tokenizer: &str) -> FieldDef {
     FieldDef {
-        name: name.into(),
-        data_type: "Utf8".into(),
-        nullable: true,
-        tantivy: indexed.then(|| TantivyFieldConfig {
-            indexed: true,
+        name:         name.into(),
+        data_type:    "Utf8".into(),
+        nullable:     true,
+        tantivy:      indexed.then(|| TantivyFieldConfig {
+            indexed:   true,
             tokenizer: Some(tokenizer.into()),
-            flatten: None,
+            flatten:   None,
         }),
-        dictionary: None,
+        dictionary:   None,
         bloom_filter: false,
     }
 }
 fn list_utf8(name: &str, tokenizer: &str) -> FieldDef {
     FieldDef {
-        name: name.into(),
-        data_type: "List(Utf8)".into(),
-        nullable: false,
-        tantivy: Some(TantivyFieldConfig {
-            indexed: true,
+        name:         name.into(),
+        data_type:    "List(Utf8)".into(),
+        nullable:     false,
+        tantivy:      Some(TantivyFieldConfig {
+            indexed:   true,
             tokenizer: Some(tokenizer.into()),
-            flatten: None,
+            flatten:   None,
         }),
-        dictionary: None,
+        dictionary:   None,
         bloom_filter: false,
     }
 }
 fn variant(name: &str, flatten: &str) -> FieldDef {
     FieldDef {
-        name: name.into(),
-        data_type: "Variant".into(),
-        nullable: true,
-        tantivy: Some(TantivyFieldConfig {
-            indexed: true,
+        name:         name.into(),
+        data_type:    "Variant".into(),
+        nullable:     true,
+        tantivy:      Some(TantivyFieldConfig {
+            indexed:   true,
             tokenizer: Some("default".into()),
-            flatten: Some(flatten.into()),
+            flatten:   Some(flatten.into()),
         }),
-        dictionary: None,
+        dictionary:   None,
         bloom_filter: false,
     }
 }
 
 fn small_table() -> TableSchema {
     TableSchema {
-        table_name: "t".into(),
-        partitions: vec![],
+        table_name:      "t".into(),
+        partitions:      vec![],
         sorting_columns: vec![SortingColumnDef {
-            name: "timestamp".into(),
-            descending: false,
+            name:        "timestamp".into(),
+            descending:  false,
             nulls_first: false,
         }],
         z_order_columns: vec![],
-        time_column: None,
-        dedup_keys: vec![],
-        fields: vec![
+        time_column:     None,
+        dedup_keys:      vec![],
+        fields:          vec![
             ts_field("timestamp", false),
             FieldDef {
-                name: "id".into(),
-                data_type: "Utf8".into(),
-                nullable: false,
-                tantivy: None,
-                dictionary: None,
+                name:         "id".into(),
+                data_type:    "Utf8".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
                 bloom_filter: false,
             },
             utf8("level", true, "raw"),
@@ -253,7 +253,7 @@ fn build_and_query_term_and_phrase() {
         hits,
         vec![Hit {
             timestamp_micros: 2_000_000,
-            id: "b".into(),
+            id:               "b".into(),
         }]
     );
 
