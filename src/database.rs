@@ -2283,6 +2283,14 @@ impl Database {
                         "delta.deletedFileRetentionDuration".to_string(),
                         Some(format!("interval {} hours", self.config.maintenance.timefusion_vacuum_retention_hours)),
                     );
+                    // Bound the _delta_log so per-commit version-discovery LISTs stay cheap.
+                    // Delta's 30-day default let the log reach 68k objects → ~35s commits
+                    // (2026-06-25 DLQ incident). enableExpiredLogCleanup prunes on checkpoint.
+                    config.insert(
+                        "delta.logRetentionDuration".to_string(),
+                        Some(format!("interval {} hours", self.config.maintenance.timefusion_log_retention_hours)),
+                    );
+                    config.insert("delta.enableExpiredLogCleanup".to_string(), Some("true".to_string()));
                     // Default of 32 leaf columns isn't enough for our wide schema (90+ fields);
                     // -1 = index all columns. Needed so kernel data-skipping can evaluate
                     // predicates on columns beyond the first 32 without "No such field" errors.
