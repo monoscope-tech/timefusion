@@ -2261,6 +2261,14 @@ impl Database {
                         "delta.checkpointInterval".to_string(),
                         self.config.parquet.timefusion_checkpoint_interval.to_string(),
                     ),
+                    // Reconcile _delta_log retention on EXISTING tables too — a config
+                    // change alone wouldn't shrink a table that baked in the old value
+                    // at create (the live otel_logs_and_spans sat at 1 day and regrew
+                    // its log to ~6.7k objects → 3-5s commits, 2026-06-26).
+                    (
+                        "delta.logRetentionDuration".to_string(),
+                        format!("interval {} hours", self.config.maintenance.timefusion_log_retention_hours),
+                    ),
                 ]);
                 Ok(ensure_table_properties(table, desired).await)
             }

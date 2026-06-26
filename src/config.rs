@@ -220,12 +220,15 @@ const_default!(d_stats_cache_size: usize = 50);
 // compaction churn at the 7-day delta default accumulated 38.5k tombstones
 // (93% of checkpoint actions) replayed on every snapshot refresh.
 const_default!(d_vacuum_retention: u64 = 24);
-// Delta _delta_log (transaction-log) retention. Default 1 day keeps the log
-// directory small (~commit-rate × 1d files) so every commit's version-discovery
-// LIST stays cheap. Delta's default is 30 DAYS — which let the log grow to 68k
-// objects and made each commit's list take ~35s (the 2026-06-25 DLQ-drain
-// incident). delta.enableExpiredLogCleanup (default true) prunes during checkpoints.
-const_default!(d_log_retention: u64 = 24);
+// Delta _delta_log (transaction-log) retention. Keeps the log directory small
+// (~commit-rate × retention files) so every commit's version-discovery LIST stays
+// cheap. Delta's default is 30 DAYS — which let the log grow to 68k objects and
+// made each commit's list take ~35s (2026-06-25 DLQ-drain incident). Even 1 day
+// regrew to ~6.7k objects (~3-5s/commit) under the multi-tenant per-project commit
+// rate (2026-06-26), so hold a tighter 6h window. enableExpiredLogCleanup (default
+// true) prunes during checkpoints; cross-project flush coalescing cuts the commit
+// rate that drives growth.
+const_default!(d_log_retention: u64 = 6);
 const_default!(d_optimize_window_hours: u64 = 48);
 const_default!(d_compact_min_files: usize = 5);
 const_default!(d_light_optimize_target: i64 = 16 * 1024 * 1024);
