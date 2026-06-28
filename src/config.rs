@@ -210,6 +210,19 @@ const_default!(d_checkpoint_interval: u64 = 10);
 // file, so the query downside is minimal for this (project_id,date)-partitioned
 // workload. Light/today optimize keeps its own 16MB target.
 const_default!(d_optimize_target: i64 = 256 * 1024 * 1024);
+// Cold tier: sealed partitions (older than `cold_optimize_after_days`) bin-pack
+// to 1GB. File size grows with partition age — recent days stay at 256MB (less
+// rewrite while the day still fills), sealed days consolidate to 1GB so the
+// Delta checkpoint (≈ live file count) shrinks, which is the dominant driver of
+// commit latency. Compression is per-row-group, so 1GB files don't change bytes
+// stored — the win is fewer files (smaller checkpoint, fewer S3 objects, cheaper
+// query planning). Re-runs are cheap: Compact skips files already ≥ target.
+const_default!(d_cold_optimize_target: i64 = 1024 * 1024 * 1024);
+// 1 day = everything past the current (day-partitioned) partition. Only today
+// still takes writes, so every sealed day consolidates to 1GB. The warm
+// optimize is clamped to dates newer than this boundary (see `optimize_table`)
+// so the 30-min Z-order never fragments these 1GB files back to 256MB.
+const_default!(d_cold_optimize_after_days: u64 = 1);
 const_default!(d_stats_cache_size: usize = 50);
 // Observability data is high-churn and rarely time-traveled; the only hard
 // floor is that retention must outlive any in-flight query (which holds a Delta
@@ -231,10 +244,18 @@ const_default!(d_vacuum_retention: u64 = 24);
 const_default!(d_log_retention: u64 = 6);
 const_default!(d_optimize_window_hours: u64 = 48);
 const_default!(d_compact_min_files: usize = 5);
-const_default!(d_light_optimize_target: i64 = 16 * 1024 * 1024);
+// Hot/today target stays small (32MB): the light job runs every 5 min on the
+// current partition, which takes constant writes — a large target would rewrite
+// the same growing files repeatedly (write amplification) and add in-process
+// merge memory on the hot path. Consolidation to 256MB/1GB happens later, once
+// the partition is sealed (warm optimize → daily cold consolidate).
+const_default!(d_light_optimize_target: i64 = 32 * 1024 * 1024);
 const_default!(d_optimize_concurrency: usize = 4);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
+// Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
+// cold target. Calendar-age driven; idempotent (skips ≥-target files).
+const_default!(d_consolidate_schedule: String = "0 30 2 * * *");
 // Every 6h (not daily): tombstones leave checkpoints once older than the
 // retention property, so vacuum must visit often enough to delete the files
 // before their tombstones are pruned — a daily cadence against a 24h
@@ -698,10 +719,23 @@ pub struct ParquetConfig {
     pub timefusion_checkpoint_interval:    u64,
     #[serde(default = "d_optimize_target")]
     pub timefusion_optimize_target_size:   i64,
+    #[serde(default = "d_cold_optimize_target")]
+    pub timefusion_cold_optimize_target_size: i64,
+    #[serde(default = "d_cold_optimize_after_days")]
+    pub timefusion_cold_optimize_after_days:  u64,
     #[serde(default = "d_stats_cache_size")]
     pub timefusion_stats_cache_size:       usize,
     #[serde(default)]
     pub timefusion_bloom_filter_disabled:  bool,
+}
+
+impl ParquetConfig {
+    /// Warm/cold boundary in days, floored at 1: the current (day-partitioned)
+    /// partition must always stay warm — it's still taking writes — so 0 is
+    /// never valid (it would consolidate today to 1GB mid-write).
+    pub fn cold_optimize_after_days(&self) -> u64 {
+        self.timefusion_cold_optimize_after_days.max(1)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -726,6 +760,8 @@ pub struct MaintenanceConfig {
     pub timefusion_light_optimize_schedule:       String,
     #[serde(default = "d_optimize_schedule")]
     pub timefusion_optimize_schedule:             String,
+    #[serde(default = "d_consolidate_schedule")]
+    pub timefusion_consolidate_schedule:          String,
     #[serde(default = "d_vacuum_schedule")]
     pub timefusion_vacuum_schedule:               String,
     #[serde(default = "d_recompress_schedule")]

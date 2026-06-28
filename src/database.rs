@@ -1418,6 +1418,34 @@ impl Database {
             info!("Optimize job scheduling skipped - empty schedule");
         }
 
+        // Consolidate job - daily cold sweep that bin-packs sealed partitions
+        // (older than cold_optimize_after_days) to the 1GB cold target. Covers
+        // "previous days and further" beyond the 48h warm window; idempotent.
+        let consolidate_schedule = &self.config.maintenance.timefusion_consolidate_schedule;
+        if !consolidate_schedule.is_empty() {
+            info!("Consolidate job scheduled with cron expression: {}", consolidate_schedule);
+            let consolidate_job = Job::new_async(consolidate_schedule.as_str(), {
+                let db = db.clone();
+                move |_, _| {
+                    let db = db.clone();
+                    Box::pin(async move {
+                        info!("Running scheduled cold consolidation on sealed partitions");
+                        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
+                            db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+                        targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
+                        for (name, table) in &targets {
+                            if let Err(e) = db.consolidate_sealed_partitions(table, name).await {
+                                error!("Consolidate (cold tier) failed for '{}': {}", name, e);
+                            }
+                        }
+                    })
+                }
+            })?;
+            scheduler.add(consolidate_job).await?;
+        } else {
+            info!("Consolidate job scheduling skipped - empty schedule");
+        }
+
         // Recompress job - daily tier upgrade for cold (14d+).
         // Skips partitions whose probe file already advertises the target tier
         // via Parquet footer metadata, so re-runs are cheap on stable data.
@@ -3299,7 +3327,17 @@ impl Database {
         let now = Utc::now();
         let today = now.date_naive();
         let num_days = (window_hours / 24).max(1);
-        let window_dates: Vec<chrono::NaiveDate> = (0..=num_days).map(|days_ago| (now - chrono::Duration::days(days_ago as i64)).date_naive()).collect();
+        // Cold consolidation (daily) owns sealed partitions older than
+        // `cold_optimize_after_days` and bin-packs them to the 1GB target.
+        // Exclude them from the 30-min warm Z-order so it can't fragment those
+        // 1GB files back to the warm target every cycle (oscillation = wasted
+        // S3 I/O). With after_days=1 this leaves warm processing only today —
+        // the partition still taking writes.
+        let after_days = self.config.parquet.cold_optimize_after_days();
+        let window_dates: Vec<chrono::NaiveDate> = (0..=num_days)
+            .map(|days_ago| (now - chrono::Duration::days(days_ago as i64)).date_naive())
+            .filter(|d| !Self::date_is_cold(today, *d, after_days))
+            .collect();
 
         // Snapshot the current live file set once: drives both the ZOrder
         // idempotence guard (below) and PR #39's warm/evict (`pre_uris`).
@@ -3485,14 +3523,48 @@ impl Database {
         out
     }
 
+    /// Partition-ownership boundary between the warm (30-min Z-order) and cold
+    /// (daily 1GB consolidate) tiers: a `date` is cold-owned once it's at least
+    /// `after_days` older than `today`. The warm optimize processes the
+    /// complement, so the two tiers never rewrite the same partition (no
+    /// 256MB↔1GB oscillation). Single source of truth for both schedulers.
+    fn date_is_cold(today: chrono::NaiveDate, date: chrono::NaiveDate, after_days: u64) -> bool {
+        (today - date).num_days() >= after_days as i64
+    }
+
+    /// Compacted-file target by partition age (calendar-based): sealed days
+    /// consolidate to the larger cold target (fewer files → smaller checkpoint
+    /// → faster commits); the current day stays at the warm target so a
+    /// still-filling partition isn't rewritten to 1GB repeatedly.
+    fn optimize_target_for_date(&self, date: chrono::NaiveDate) -> i64 {
+        if Self::date_is_cold(Utc::now().date_naive(), date, self.config.parquet.cold_optimize_after_days()) {
+            self.config.parquet.timefusion_cold_optimize_target_size
+        } else {
+            self.config.parquet.timefusion_optimize_target_size
+        }
+    }
+
     /// Compact a single `date=` partition by bin-packing its small files
     /// (`Compact`, not Z-order — a pure row-group merge that preserves
     /// Variant/Binary column bytes). Powers the on-demand `OPTIMIZE <table>
-    /// WHERE date = '...'` pgwire command and the `optimize` CLI subcommand,
-    /// which compact old partitions that fall outside the scheduled 48h Z-order
-    /// window. Commits once for this date; returns (files_removed, files_added).
+    /// WHERE date = '...'` pgwire command, the `optimize` CLI subcommand, and
+    /// the daily cold consolidation sweep — all compacting partitions outside
+    /// the scheduled 48h Z-order window. Target size scales with partition age
+    /// (`optimize_target_for_date`). Commits once; returns (removed, added).
     pub async fn compact_date(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate) -> Result<(u64, u64)> {
-        let target_size = self.config.parquet.timefusion_optimize_target_size;
+        self.compact_date_with(table_ref, table_name, date, self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
+            .await
+    }
+
+    /// `compact_date` with an explicit merge concurrency. The cold consolidation
+    /// sweep passes 1: a 1GB-target merge holds ~target-sized output buffers per
+    /// task, so concurrency × 1GB can OOM the memory-tight in-process instance
+    /// (the off-box recipe uses concurrency 1 for the same reason). The on-demand
+    /// pgwire/CLI callers keep the configured concurrency.
+    async fn compact_date_with(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, max_concurrent: usize,
+    ) -> Result<(u64, u64)> {
+        let target_size = self.optimize_target_for_date(date);
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?];
         // Old-event-time backlog data still lands in recent-old partitions, so a
@@ -3522,7 +3594,7 @@ impl Database {
                 .with_filters(&partition_filters)
                 .with_type(deltalake::operations::optimize::OptimizeType::Compact)
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
-                .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
+                .with_max_concurrent_tasks(max_concurrent)
                 .with_writer_properties(writer_properties)
                 .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
                 .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
@@ -3732,6 +3804,28 @@ impl Database {
             let date = today - chrono::Duration::days(days_ago as i64);
             if let Err(e) = self.recompress_partition(table_ref, table_name, date, target_level).await {
                 warn!("recompress_tier_window: skipping date={} after error: {}", date, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Daily cold consolidation: bin-pack every sealed partition (date older
+    /// than `cold_optimize_after_days`) toward the 1GB cold target. Calendar-age
+    /// driven and idempotent — `compact_date`'s Compact skips files already
+    /// ≥ target, so already-consolidated partitions cost a plan, not a rewrite
+    /// (bounds S3 I/O across the whole cold backlog). Covers "previous days and
+    /// further", picking up backfill that landed in old partitions.
+    pub async fn consolidate_sealed_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
+        let today = Utc::now().date_naive();
+        let after_days = self.config.parquet.cold_optimize_after_days();
+        let dates: Vec<chrono::NaiveDate> =
+            self.partition_dates(table_ref).await?.into_iter().filter(|d| Self::date_is_cold(today, *d, after_days)).collect();
+        info!("consolidate: table={} sweeping {} sealed partition(s) older than {}d", table_name, dates.len(), after_days);
+        for date in dates {
+            // Concurrency 1: bound peak memory of the 1GB-target merges so the
+            // daily in-process sweep can't OOM the instance (see compact_date_with).
+            if let Err(e) = self.compact_date_with(table_ref, table_name, date, 1).await {
+                warn!("consolidate: skipping date={} after error: {}", date, e);
             }
         }
         Ok(())
@@ -5628,6 +5722,32 @@ mod tests {
     /// predicate re-evaluation failure ("Transaction failed") — while permanent
     /// errors (protocol version, auth/IO) fail fast. Guards the dedup/optimize
     /// loops, which previously omitted some of these substrings.
+    // Warm (30-min Z-order) and cold (daily 1GB consolidate) tiers must own
+    // disjoint partitions, or they oscillate the same day 256MB↔1GB every cycle.
+    // `date_is_cold` is the single boundary both use; assert today is warm and
+    // every earlier day is cold at the default after_days=1 ("past the current
+    // day"), and that a larger boundary keeps the warm window in sync.
+    #[test]
+    fn warm_and_cold_partition_ownership_is_disjoint() {
+        use chrono::{Duration, NaiveDate};
+        let today = NaiveDate::from_ymd_opt(2026, 6, 28).unwrap();
+
+        // after_days = 1: only today is warm; yesterday and older are cold.
+        assert!(!Database::date_is_cold(today, today, 1), "today must be warm (still taking writes)");
+        assert!(Database::date_is_cold(today, today - Duration::days(1), 1), "yesterday must be cold");
+        assert!(Database::date_is_cold(today, today - Duration::days(90), 1), "old backfill day must be cold");
+
+        // Larger boundary keeps recent days warm; no date is ever both tiers.
+        for days_ago in 0..120 {
+            let d = today - Duration::days(days_ago);
+            let after = 3;
+            let cold = Database::date_is_cold(today, d, after);
+            let warm = !cold; // warm optimize processes exactly the complement
+            assert_ne!(cold, warm, "a partition must be warm xor cold, never both");
+            assert_eq!(cold, days_ago >= after as i64, "boundary off-by-one at days_ago={days_ago}");
+        }
+    }
+
     #[test]
     fn is_occ_conflict_err_classifies_retryable_vs_permanent() {
         for retryable in [
