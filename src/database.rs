@@ -3818,9 +3818,13 @@ impl Database {
     pub async fn consolidate_sealed_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         let today = Utc::now().date_naive();
         let after_days = self.config.parquet.cold_optimize_after_days();
-        let dates: Vec<chrono::NaiveDate> =
-            self.partition_dates(table_ref).await?.into_iter().filter(|d| Self::date_is_cold(today, *d, after_days)).collect();
-        info!("consolidate: table={} sweeping {} sealed partition(s) older than {}d", table_name, dates.len(), after_days);
+        let dates: Vec<chrono::NaiveDate> = self.partition_dates(table_ref).await?.into_iter().filter(|d| Self::date_is_cold(today, *d, after_days)).collect();
+        info!(
+            "consolidate: table={} sweeping {} sealed partition(s) older than {}d",
+            table_name,
+            dates.len(),
+            after_days
+        );
         for date in dates {
             // Concurrency 1: bound peak memory of the 1GB-target merges so the
             // daily in-process sweep can't OOM the instance (see compact_date_with).

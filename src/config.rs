@@ -702,31 +702,31 @@ impl CacheConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParquetConfig {
     #[serde(default = "d_page_rows")]
-    pub timefusion_page_row_count_limit:   usize,
+    pub timefusion_page_row_count_limit:      usize,
     /// ZSTD level for hot writes (flush + today's light optimize). Default 3.
     /// Aliased by the legacy env name; lower = faster ingest.
     #[serde(default = "d_zstd_level", alias = "timefusion_zstd_level_hot")]
-    pub timefusion_zstd_compression_level: i32,
+    pub timefusion_zstd_compression_level:    i32,
     #[serde(default = "d_zstd_level_warm")]
-    pub timefusion_zstd_level_warm:        i32,
+    pub timefusion_zstd_level_warm:           i32,
     #[serde(default = "d_zstd_level_cold")]
-    pub timefusion_zstd_level_cold:        i32,
+    pub timefusion_zstd_level_cold:           i32,
     #[serde(default = "d_cold_cutoff_days")]
-    pub timefusion_cold_cutoff_days:       u64,
+    pub timefusion_cold_cutoff_days:          u64,
     #[serde(default = "d_row_group_size")]
-    pub timefusion_max_row_group_size:     usize,
+    pub timefusion_max_row_group_size:        usize,
     #[serde(default = "d_checkpoint_interval")]
-    pub timefusion_checkpoint_interval:    u64,
+    pub timefusion_checkpoint_interval:       u64,
     #[serde(default = "d_optimize_target")]
-    pub timefusion_optimize_target_size:   i64,
+    pub timefusion_optimize_target_size:      i64,
     #[serde(default = "d_cold_optimize_target")]
     pub timefusion_cold_optimize_target_size: i64,
     #[serde(default = "d_cold_optimize_after_days")]
     pub timefusion_cold_optimize_after_days:  u64,
     #[serde(default = "d_stats_cache_size")]
-    pub timefusion_stats_cache_size:       usize,
+    pub timefusion_stats_cache_size:          usize,
     #[serde(default)]
-    pub timefusion_bloom_filter_disabled:  bool,
+    pub timefusion_bloom_filter_disabled:     bool,
 }
 
 impl ParquetConfig {
