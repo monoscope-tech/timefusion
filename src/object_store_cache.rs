@@ -2065,8 +2065,9 @@ mod tests {
         use crate::config::AppConfig;
         let mut cfg = AppConfig::default();
 
-        // Defaults: 2x the 128MB target == the 256MB configured floor.
-        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 256 * 1024 * 1024);
+        // Defaults: the 256MB optimize target doubles to 512MB, above the 256MB
+        // configured floor, so the block tracks 2x the target.
+        assert_eq!(FoyerCacheConfig::from_app_config(&cfg).block_size_bytes, 512 * 1024 * 1024);
 
         // Raise the optimize target past the floor → block auto-tracks to 2x,
         // so big outputs stay cacheable without touching the cache config.

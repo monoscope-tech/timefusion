@@ -283,8 +283,10 @@ ourselves, so you can reproduce results on your own infrastructure:
 
 **Getting good performance:**
 
-1. **Always filter on `project_id`** (and `date` where possible) — this is what
-   enables partition pruning.
+1. **Always filter on `project_id`** — it's the tenant routing key. A
+   `timestamp` range filter is automatically turned into a `date` partition
+   filter, so you don't need to add an explicit `date` predicate to get
+   partition pruning.
 2. **Batch your inserts** — larger batches amortize WAL and Delta commit cost.
 3. **Size the buffer and cache** (`TIMEFUSION_BUFFER_MAX_MEMORY_MB`,
    `TIMEFUSION_FOYER_*`) to your working set.
