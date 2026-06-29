@@ -106,8 +106,10 @@ pub struct StatsSnapshot {
     pub wal_shards_per_topic:           usize,
     pub wal_known_topics:               usize,
     pub bucket_duration_micros:         i64,
-    /// Oldest MemBuffer bucket age in secs (`now - min bucket.min_timestamp`),
-    /// None when empty. Alert at > 2× `flush_interval_secs`.
+    /// Oldest flushable MemBuffer bucket's flush-dwell in secs (`now - bucket
+    /// creation time`), None when none past the open window. Measures how long
+    /// a bucket has waited to flush — NOT its rows' event-time age — so
+    /// backfill/late data can't false-trip it. Alert at > 2× `flush_interval_secs`.
     pub oldest_bucket_age_secs:         Option<u64>,
     /// Cumulative flush successes/failures since start. Mirror the OTel
     /// `timefusion.flush.completed`/`failed` counters for OTel-free tests.

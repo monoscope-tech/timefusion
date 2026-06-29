@@ -244,6 +244,11 @@ pub struct TimeBucket {
     memory_bytes:    AtomicUsize,
     min_timestamp:   AtomicI64,
     max_timestamp:   AtomicI64,
+    /// Wall-clock micros (via `crate::clock`) when this bucket was created.
+    /// Drives the flush-dwell staleness signal — how long the bucket has
+    /// waited to flush — independent of its rows' event-time range, so
+    /// backfilled/late data can't false-trip the "oldest bucket" alarm.
+    created_micros:  i64,
     /// Per-shard WAL-entry counts (drive `advance_by_counts` on flush) and
     /// post-append walrus positions (written to Delta commit metadata for
     /// crash-mid-flush recovery). One mutex so a single append updates both
@@ -284,9 +289,12 @@ pub struct MemBufferStats {
     pub total_rows:             usize,
     pub total_batches:          usize,
     pub estimated_memory_bytes: usize,
-    /// Min `min_timestamp` across all buckets in microseconds, or None if empty.
-    /// Used to derive `mem_buffer_oldest_bucket_age_seconds` for the metrics
-    /// exporter — a key staleness signal (alert if > 2× flush interval).
+    /// Creation wall-clock micros of the oldest non-empty bucket that is
+    /// already flushable (`bucket_id < current`), or None. Used to derive
+    /// `mem_buffer_oldest_bucket_age_seconds` (`now - this`) — a flush-DWELL
+    /// staleness signal (alert if > 2× flush interval). Deliberately NOT the
+    /// rows' event-time min: backfilled/late data has a fresh creation time, so
+    /// it can't false-trip the alarm while flush is healthy.
     pub oldest_bucket_micros:   Option<i64>,
 }
 
@@ -1877,6 +1885,9 @@ impl MemBuffer {
         let (mut total_buckets, mut total_rows, mut total_batches) = (0, 0, 0);
         let mut project_ids = std::collections::HashSet::new();
         let mut oldest: Option<i64> = None;
+        // Only buckets the flush path should already have drained count toward
+        // the dwell signal — non-empty AND past the open window.
+        let current = Self::current_bucket_id();
 
         for table_entry in self.tables.iter() {
             let (project_id, _) = table_entry.key();
@@ -1886,10 +1897,11 @@ impl MemBuffer {
             total_buckets += table.buckets.len();
             for bucket in table.buckets.iter() {
                 total_rows += bucket.row_count.load(Ordering::Relaxed);
-                total_batches += bucket.batches.lock().len();
-                let ts = bucket.min_timestamp.load(Ordering::Relaxed);
-                if ts != i64::MAX {
-                    oldest = Some(oldest.map_or(ts, |o| o.min(ts)));
+                let batch_count = bucket.batches.lock().len();
+                total_batches += batch_count;
+                if batch_count > 0 && *bucket.key() < current {
+                    let created = bucket.created_micros;
+                    oldest = Some(oldest.map_or(created, |o| o.min(created)));
                 }
             }
         }
@@ -2043,6 +2055,7 @@ impl TimeBucket {
             memory_bytes:    AtomicUsize::new(0),
             min_timestamp:   AtomicI64::new(i64::MAX),
             max_timestamp:   AtomicI64::new(i64::MIN),
+            created_micros:  crate::clock::now_micros(),
             wal_shard_state: Mutex::new(WalShardState::default()),
         }
     }
@@ -2994,5 +3007,22 @@ mod tests {
         let parts = buf.query_partitioned("p", "t", std::slice::from_ref(&or)).unwrap();
         let rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(rows, 1258 + 13346, "OR of two Utf8View equalities must keep all matches");
+    }
+
+    /// Regression: a freshly-buffered batch carrying an OLD event timestamp
+    /// (backfill / late-arriving data, or a client pinning a fixed timestamp)
+    /// must NOT report a huge `oldest_bucket_age`. The staleness signal measures
+    /// how long a bucket has waited to flush (dwell), not its rows' event-time
+    /// age — otherwise it false-alarms at "6h stale" while flush is healthy
+    /// (prod 2026-06-29: age climbed in real time with flush_failed=0).
+    #[test]
+    fn oldest_bucket_age_reflects_dwell_not_event_time() {
+        let buffer = MemBuffer::new();
+        let old_event_ts = crate::clock::now_micros() - 6 * 3600 * 1_000_000; // 6h-old event time
+        buffer.insert("p", "t", make_batch_with_rows(old_event_ts, 10), old_event_ts).unwrap();
+
+        let oldest = buffer.get_stats().oldest_bucket_micros.expect("flushable bucket present");
+        let dwell_secs = (crate::clock::now_micros() - oldest) / 1_000_000;
+        assert!(dwell_secs < 60, "dwell should be ~0 for a freshly-buffered backfill bucket, got {dwell_secs}s");
     }
 }
