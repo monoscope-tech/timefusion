@@ -1,405 +1,330 @@
 # TimeFusion
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Built%20with-Rust-dca282?style=for-the-badge&logo=rust" alt="Built with Rust">
-  <img src="https://img.shields.io/badge/PostgreSQL-Compatible-4169E1?style=for-the-badge&logo=postgresql&logoColor=white" alt="PostgreSQL Compatible">
-  <img src="https://img.shields.io/badge/Storage-S3-569A31?style=for-the-badge&logo=amazons3&logoColor=white" alt="S3 Storage">
-</p>
+[![CI](https://github.com/monoscope-tech/timefusion/actions/workflows/ci.yml/badge.svg)](https://github.com/monoscope-tech/timefusion/actions/workflows/ci.yml)
+[![Rust edition 2024](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-<p align="center">
-  <a href="#-features">Features</a> •
-  <a href="#-quick-start">Quick Start</a> •
-  <a href="#-architecture">Architecture</a> •
-  <a href="#-configuration">Configuration</a> •
-  <a href="#-usage">Usage</a> •
-  <a href="#-performance">Performance</a> •
-  <a href="#-contributing">Contributing</a>
-</p>
+TimeFusion stores observability data — logs, traces, metrics, and events — as
+[Delta Lake](https://delta.io/) tables on your own S3-compatible object storage,
+and lets you query it over the **PostgreSQL wire protocol**. It uses
+[Apache DataFusion](https://datafusion.apache.org/) for query execution and a
+write-ahead log + in-memory buffer for sub-second write durability.
 
----
+If you already have a Postgres client, you already have a TimeFusion client.
 
-**TimeFusion** is a specialized time-series database engineered for high-performance storage and querying of events, logs, traces, and metrics. Built on Apache Arrow and Delta Lake, it speaks the PostgreSQL wire protocol while storing data in your own S3-compatible object storage.
+> **Status:** Pre-1.0. TimeFusion runs in production at
+> [APIToolkit](https://apitoolkit.io), but the schema, wire behavior, and
+> configuration surface can still change between releases — pin a version
+> before depending on it. (The version a client sees via `SHOW server_version`
+> reflects the embedded PostgreSQL-protocol layer, not TimeFusion's own.)
 
-## 🎯 Why TimeFusion?
+## Contents
 
-Traditional time-series databases force you to choose between performance, cost, and data ownership. TimeFusion eliminates these trade-offs:
+- [Why TimeFusion](#why-timefusion)
+- [How it works](#how-it-works)
+- [Quick start](#quick-start)
+- [Querying](#querying)
+- [Configuration](#configuration)
+- [Performance](#performance)
+- [Development](#development)
+- [License](#license)
 
-- **You Own Your Data**: All data is stored in your S3 bucket - no vendor lock-in
-- **PostgreSQL Compatible**: Use any PostgreSQL client, driver, or tool you already know
-- **Blazing Fast**: Leverages Apache Arrow's columnar format and intelligent caching
-- **Cost Effective**: Pay only for S3 storage and compute - no expensive proprietary storage
-- **Multi-Tenant Ready**: Built-in project isolation and partitioning
+## Why TimeFusion
 
-## ✨ Features
+- **Your data stays in your bucket.** Storage is plain Parquet under a Delta
+  Lake transaction log in your own S3 / MinIO / R2 bucket. No proprietary
+  format, no vendor storage to pay for, nothing to migrate out of.
+- **Postgres wire protocol.** Connect with `psql`, any Postgres driver, or
+  existing BI/observability tooling. No new client to learn.
+- **Columnar analytics.** DataFusion executes vectorized SQL with predicate
+  pushdown and partition pruning over Parquet.
+- **Durable, low-latency writes.** Inserts hit a write-ahead log and an
+  in-memory buffer before being flushed to Delta in the background, so writes
+  are acknowledged quickly without losing durability.
+- **Multi-tenant by design.** Data is partitioned and isolated by
+  `project_id`, with shared tables for default projects and dedicated tables
+  for projects that need isolation.
 
-### Core Capabilities
+## How it works
 
-- 🚀 **High-Performance Ingestion**: Batch processing with configurable intervals
-- 🔍 **Fast Queries**: Columnar storage with predicate pushdown and partition pruning
-- 🔒 **ACID Compliance**: Full transactional guarantees via Delta Lake
-- 📊 **Rich Query Support**: SQL aggregations, filters, and time-based operations
-- 🌐 **Multi-Tenant**: First-class support for project isolation
-- 🔄 **Auto-Optimization**: Background compaction and vacuuming
+```
+ Postgres client ──▶ pgwire ──▶ DataFusion query engine
+ (psql, drivers)                      │
+                                      ▼
+              ┌───────────── write path ─────────────┐
+              │  WAL (durable) ─▶ in-memory buffer    │
+              │            │ flush every ~10 min       │
+              │            ▼                            │
+              │      Delta Lake (Parquet) on S3        │
+              └────────────────────────────────────────┘
+                                      ▲
+                          Foyer cache (memory + disk)
+```
 
-### Storage & Caching
+- **Write:** `INSERT` → WAL append (durable) → in-memory buffer (fast ack).
+  Completed time buckets flush to Delta in the background.
+- **Read:** queries union the in-memory buffer with Delta on S3, so recently
+  written rows are visible immediately.
+- **Ingest:** besides pgwire `INSERT`, TimeFusion accepts gRPC streaming
+  ingestion of Arrow IPC payloads (`GRPC_PORT`, default `50051`).
 
-- 💾 **S3-Compatible Storage**: Works with AWS S3, MinIO, R2, and more
-- ⚡ **Intelligent Caching**: Two-tier cache (memory + disk) with configurable TTLs
-- 🗜️ **Compression**: Zstandard compression with tunable levels
-- 📦 **Parquet Format**: Industry-standard columnar storage
+**Storage layout:** events are written to a Delta table such as
+`otel_logs_and_spans`, partitioned by `[project_id, date]`. Table schemas live
+in [`schemas/`](schemas/) and are loaded at startup.
 
-### Operations
+> Queries **must** filter on `project_id` — it is the tenancy and partition
+> key. Queries without it scan across tenants and are far slower.
 
-- 📈 **Connection Limiting**: Built-in proxy to prevent overload
-- 🛡️ **Graceful Degradation**: Continues operating even under extreme load
-- 📝 **Comprehensive Logging**: Structured logs with tracing support
+## Quick start
 
-## 🚀 Quick Start
+### Try it locally (zero config)
 
-### Prerequisites
-
-- Rust 1.75+ (for building from source)
-- S3-compatible object storage (AWS S3, MinIO, etc.)
-
-### Installation
-
-#### Using Docker
+The bundled Compose stack runs TimeFusion against a local MinIO — no AWS account
+or credentials needed. It builds the image, starts MinIO, creates the bucket,
+and launches TimeFusion on port 5432:
 
 ```bash
-docker run -d \
-  -p 5432:5432 \
+git clone https://github.com/monoscope-tech/timefusion.git
+cd timefusion
+docker compose up
+```
+
+Then connect from another terminal — skip to [Connect](#connect).
+
+### Run against your own S3
+
+Images are published per commit to GitHub Container Registry, tagged with the
+git short SHA (see the
+[packages page](https://github.com/monoscope-tech/timefusion/pkgs/container/timefusion)
+for available tags):
+
+```bash
+docker run -d -p 5432:5432 \
   -e AWS_S3_BUCKET=your-bucket \
   -e AWS_ACCESS_KEY_ID=your-key \
   -e AWS_SECRET_ACCESS_KEY=your-secret \
-  timefusion/timefusion:latest
+  ghcr.io/monoscope-tech/timefusion:<tag>
 ```
 
-#### Building from Source
+### Build from source
+
+Requires a recent stable Rust toolchain (edition 2024 → **Rust 1.85+**).
 
 ```bash
-git clone https://github.com/apitoolkit/timefusion.git
+git clone https://github.com/monoscope-tech/timefusion.git
 cd timefusion
 cargo build --release
-./target/release/timefusion
+AWS_S3_BUCKET=your-bucket ./target/release/timefusion
 ```
 
-### Connect with Any PostgreSQL Client
+### Connect
 
 ```bash
 psql "postgresql://postgres:postgres@localhost:5432/postgres"
 ```
 
-### Insert Data
+### Insert and query
 
 ```sql
-INSERT INTO otel_logs_and_spans (
-  name, id, project_id, timestamp, date, hashes
-) VALUES (
-  'api.request',
-  '550e8400-e29b-41d4-a716-446655440000',
-  'prod-api-001',
-  '2025-01-17 14:25:00',
-  '2025-01-17',
-  ARRAY[]::text[]
-);
-```
+INSERT INTO otel_logs_and_spans (name, id, project_id, timestamp, date, hashes)
+VALUES ('api.request', '550e8400-e29b-41d4-a716-446655440000',
+        'prod-api-001', '2025-01-17 14:25:00', '2025-01-17', ARRAY[]::text[]);
 
-### Query Data
-
-```sql
--- Get recent logs for a project
-SELECT name, id, timestamp
+SELECT name, COUNT(*) AS count
 FROM otel_logs_and_spans
-WHERE project_id = 'prod-api-001'
-  AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00'
-ORDER BY timestamp DESC
-LIMIT 100;
-
--- Aggregate by name
-SELECT name, COUNT(*) as count
-FROM otel_logs_and_spans
-WHERE project_id = 'prod-api-001'
-  AND date = '2025-01-17'
+WHERE project_id = 'prod-api-001' AND date = '2025-01-17'
 GROUP BY name
 ORDER BY count DESC;
 ```
 
-### Complete psql Example Session
+## Querying
 
-Here's a real-world example showing TimeFusion's capabilities with API trace data:
+TimeFusion speaks analytical SQL: aggregations, window functions,
+`PERCENTILE_CONT`, `FILTER`, CTEs, and a TimescaleDB-compatible `time_bucket`.
+Here's finding slow API endpoints from trace data:
 
-```bash
-$ psql "postgresql://postgres:postgres@localhost:5432/postgres"
-
-psql (16.8 (Homebrew), server 0.28.0)
-WARNING: psql major version 16, server major version 0.28.
-         Some psql features might not work.
-Type "help" for help.
-
-postgres=> -- Insert sample API trace data
-postgres=> INSERT INTO otel_logs_and_spans (
-    name, id, project_id, timestamp, date, hashes,
-    duration, attributes___http___response___status_code,
-    attributes___user___id, attributes___error___type, kind
-) VALUES
-('POST /api/v1/users', '550e8400-e29b-41d4-a716-446655440001', 'prod-api-001', '2025-01-17 14:30:00', '2025-01-17', ARRAY['trace_123'], 245000000, 200, 'u_123', NULL, 'SERVER'),
-('POST /api/v1/users', '550e8400-e29b-41d4-a716-446655440002', 'prod-api-001', '2025-01-17 14:35:00', '2025-01-17', ARRAY['trace_124'], 1523000000, 500, NULL, 'database_timeout', 'SERVER'),
-('GET /api/v1/users/:id', '550e8400-e29b-41d4-a716-446655440003', 'prod-api-001', '2025-01-17 14:40:00', '2025-01-17', ARRAY['trace_125'], 89000000, 200, 'u_456', NULL, 'SERVER'),
-('POST /api/v1/payments', '550e8400-e29b-41d4-a716-446655440004', 'prod-api-001', '2025-01-17 14:45:00', '2025-01-17', ARRAY['trace_126'], 3421000000, 200, NULL, NULL, 'SERVER'),
-('GET /api/v1/users/:id', '550e8400-e29b-41d4-a716-446655440005', 'prod-api-001', '2025-01-17 14:50:00', '2025-01-17', ARRAY['trace_127'], 2100000000, 408, NULL, 'timeout', 'SERVER');
-INSERT 0 5
-
-postgres=> -- Find slow API endpoints (>1 second response time)
-postgres=> SELECT
-    name as endpoint,
-    COUNT(*) as request_count,
-    AVG(duration / 1000000)::INT as avg_duration_ms,
-    MAX(duration / 1000000)::INT as max_duration_ms,
-    ARRAY_AGG(DISTINCT attributes___http___response___status_code::TEXT) as status_codes
+```sql
+SELECT name AS endpoint,
+       COUNT(*)                       AS request_count,
+       AVG(duration / 1000000)::INT   AS avg_duration_ms,
+       MAX(duration / 1000000)::INT   AS max_duration_ms
 FROM otel_logs_and_spans
 WHERE project_id = 'prod-api-001'
-    AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00'
-    AND duration > 1000000000  -- 1 second in nanoseconds
+  AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00'
+  AND duration > 1000000000          -- 1 second, in nanoseconds
 GROUP BY name
 ORDER BY avg_duration_ms DESC;
+```
+```
+         endpoint        | request_count | avg_duration_ms | max_duration_ms
+-------------------------+---------------+-----------------+-----------------
+ POST /api/v1/payments   |             1 |            3421 |            3421
+ GET /api/v1/users/:id   |             1 |            2100 |            2100
+ POST /api/v1/users      |             1 |            1523 |            1523
+```
 
-         endpoint         | request_count | avg_duration_ms | max_duration_ms | status_codes
---------------------------+---------------+-----------------+-----------------+--------------
- POST /api/v1/payments    |             1 |            3421 |            3421 | {200}
- GET /api/v1/users/:id    |             1 |            2100 |            2100 | {408}
- POST /api/v1/users       |             1 |            1523 |            1523 | {500}
-(3 rows)
+<details>
+<summary><b>More query examples</b> — error rates, trace lookup, time-bucketed aggregation, moving averages</summary>
 
-postgres=> -- Analyze error rates by endpoint over time windows
-postgres=> SELECT
-    name as endpoint,
-    date_trunc('hour', timestamp) as hour,
-    COUNT(*) as total_requests,
-    COUNT(*) FILTER (WHERE attributes___http___response___status_code >= 400) as errors,
-    ROUND(100.0 * COUNT(*) FILTER (WHERE attributes___http___response___status_code >= 400) / COUNT(*), 2) as error_rate
+```sql
+-- Error rate per endpoint, per hour
+SELECT name AS endpoint,
+       date_trunc('hour', timestamp) AS hour,
+       COUNT(*) AS total_requests,
+       COUNT(*) FILTER (WHERE attributes___http___response___status_code >= 400) AS errors,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE attributes___http___response___status_code >= 400)
+             / COUNT(*), 2) AS error_rate
 FROM otel_logs_and_spans
 WHERE project_id = 'prod-api-001'
-    AND timestamp >= '2025-01-16 15:00:00' AND timestamp < '2025-01-17 15:00:00'
+  AND timestamp >= '2025-01-16 15:00:00' AND timestamp < '2025-01-17 15:00:00'
 GROUP BY name, date_trunc('hour', timestamp)
-HAVING COUNT(*) > 0
 ORDER BY hour DESC, error_rate DESC;
 
-         endpoint         |         hour         | total_requests | errors | error_rate
---------------------------+----------------------+----------------+--------+------------
- POST /api/v1/users       | 2025-01-17 15:00:00 |              2 |      1 |      50.00
- GET /api/v1/users/:id    | 2025-01-17 15:00:00 |              2 |      1 |      50.00
- POST /api/v1/payments    | 2025-01-17 15:00:00 |              1 |      0 |       0.00
-(3 rows)
-
-postgres=> -- Find traces with specific characteristics using hash lookups
-postgres=> SELECT
-    id as trace_id,
-    name as endpoint,
-    timestamp,
-    (duration / 1000000)::INT as duration_ms,
-    attributes___error___type as error_type
+-- Find a trace by hash
+SELECT id AS trace_id, name AS endpoint, timestamp,
+       (duration / 1000000)::INT AS duration_ms,
+       attributes___error___type AS error_type
 FROM otel_logs_and_spans
 WHERE project_id = 'prod-api-001'
-    AND 'trace_124' = ANY(hashes)
-    AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00';
+  AND 'trace_124' = ANY(hashes)
+  AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00';
 
-               trace_id               |    endpoint     |         timestamp          | duration_ms |     error_type
---------------------------------------+-----------------+----------------------------+-------------+--------------------
- 550e8400-e29b-41d4-a716-446655440002 | POST /api/v1/users | 2025-01-17 14:35:00.000000 |        1523 | database_timeout
-(1 row)
-
-postgres=> -- Time-series aggregation using TimescaleDB's time_bucket function
-postgres=> SELECT
-    time_bucket(INTERVAL '5 minutes', timestamp) as bucket,
-    COUNT(*) as requests,
-    AVG(duration / 1000000)::INT as avg_duration_ms,
-    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration / 1000000) as p95_duration_ms
+-- Requests and p95 latency, bucketed into 5-minute windows
+SELECT time_bucket(INTERVAL '5 minutes', timestamp) AS bucket,
+       COUNT(*) AS requests,
+       AVG(duration / 1000000)::INT AS avg_duration_ms,
+       PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration / 1000000) AS p95_duration_ms
 FROM otel_logs_and_spans
 WHERE project_id = 'prod-api-001'
-    AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00'
+  AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00'
 GROUP BY bucket
 ORDER BY bucket DESC;
 
-        bucket          | requests | avg_duration_ms | p95_duration_ms
-------------------------+----------+-----------------+-----------------
- 2025-01-17 14:45:00   |        2 |            2760 |            3421
- 2025-01-17 14:40:00   |        1 |              89 |              89
- 2025-01-17 14:35:00   |        1 |            1523 |            1523
- 2025-01-17 14:30:00   |        1 |             245 |             245
-(3 rows)
-
-postgres=> -- Advanced time-series: Moving averages with time_bucket
-postgres=> WITH time_series AS (
-    SELECT
-        time_bucket(INTERVAL '1 minute', timestamp) as minute,
-        name as endpoint,
-        COUNT(*) as requests,
-        AVG(duration / 1000000) as avg_duration_ms
-    FROM otel_logs_and_spans
-    WHERE project_id = 'prod-api-001'
-        AND timestamp >= '2025-01-17 14:30:00' AND timestamp < '2025-01-17 15:00:00'
-    GROUP BY minute, endpoint
+-- Per-endpoint 3-window moving average over 1-minute buckets
+WITH ts AS (
+  SELECT time_bucket(INTERVAL '1 minute', timestamp) AS minute,
+         name AS endpoint,
+         AVG(duration / 1000000) AS avg_duration_ms
+  FROM otel_logs_and_spans
+  WHERE project_id = 'prod-api-001'
+    AND timestamp >= '2025-01-17 14:30:00' AND timestamp < '2025-01-17 15:00:00'
+  GROUP BY minute, endpoint
 )
-SELECT
-    minute,
-    endpoint,
-    requests,
-    avg_duration_ms::INT,
-    AVG(avg_duration_ms) OVER (
-        PARTITION BY endpoint
-        ORDER BY minute
-        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-    )::INT as moving_avg_3min
-FROM time_series
+SELECT minute, endpoint, avg_duration_ms::INT,
+       AVG(avg_duration_ms) OVER (
+         PARTITION BY endpoint ORDER BY minute
+         ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+       )::INT AS moving_avg
+FROM ts
 ORDER BY endpoint, minute DESC;
-
-        minute          |       endpoint        | requests | avg_duration_ms | moving_avg_3min
-------------------------+-----------------------+----------+-----------------+-----------------
- GET /api/v1/users/:id  | 2025-01-17 14:50:00  |        1 |            2100 |            2100
- GET /api/v1/users/:id  | 2025-01-17 14:40:00  |        1 |              89 |            1094
- POST /api/v1/payments  | 2025-01-17 14:45:00  |        1 |            3421 |            3421
- POST /api/v1/users     | 2025-01-17 14:35:00  |        1 |            1523 |            1523
- POST /api/v1/users     | 2025-01-17 14:30:00  |        1 |             245 |             884
-(5 rows)
-
-postgres=> \q
 ```
 
-## 🏗️ Architecture
+</details>
 
-TimeFusion combines best-in-class technologies to deliver exceptional performance:
+## Configuration
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│ PostgreSQL Wire │────▶│   TimeFusion     │────▶│   Delta Lake    │
-│    Protocol     │     │  (DataFusion)    │     │   on S3/MinIO   │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-                               │                           │
-                               ▼
-                        ┌─────────────┐
-                        │ Memory/Disk │
-                        │    Cache    │
-                        └─────────────┘
-```
+TimeFusion is configured entirely through environment variables.
 
-### Technology Stack
+**Required — object storage**
 
-- **Query Engine**: Apache DataFusion (vectorized execution)
-- **Storage Format**: Delta Lake with Parquet files
-- **Wire Protocol**: PostgreSQL-compatible via pgwire
-- **Caching**: Foyer (adaptive caching with S3 admission policy)
-- **Async Runtime**: Tokio for high concurrency
+| Variable                | Description                       |
+| ----------------------- | --------------------------------- |
+| `AWS_S3_BUCKET`         | Bucket for Delta tables           |
+| `AWS_ACCESS_KEY_ID`     | Access key                        |
+| `AWS_SECRET_ACCESS_KEY` | Secret key                        |
+| `AWS_S3_ENDPOINT`       | Custom endpoint (MinIO, R2, etc.) |
 
-## ⚙️ Configuration
+**Server**
 
-### Essential Settings
+| Variable      | Description                          | Default |
+| ------------- | ------------------------------------ | ------- |
+| `PGWIRE_PORT` | PostgreSQL wire protocol port        | `5432`  |
+| `GRPC_PORT`   | gRPC ingestion port                  | `50051` |
+| `GRPC_TOKEN`  | Bearer token for gRPC (open if unset)| —       |
 
-| Variable                | Description                | Default  |
-| ----------------------- | -------------------------- | -------- |
-| `AWS_S3_BUCKET`         | S3 bucket for data storage | Required |
-| `AWS_ACCESS_KEY_ID`     | AWS access key             | Required |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret key             | Required |
-| `PGWIRE_PORT`           | PostgreSQL protocol port   | `5432`   |
+**Write buffer & flushing**
 
-### Performance Tuning
+| Variable                            | Description                      | Default |
+| ----------------------------------- | -------------------------------- | ------- |
+| `TIMEFUSION_BUFFER_MAX_MEMORY_MB`   | In-memory buffer size            | `4096`  |
+| `TIMEFUSION_FLUSH_INTERVAL_SECS`    | Background flush interval (secs) | `300`   |
+| `TIMEFUSION_BUFFER_RETENTION_MINS`  | Buffer retention before eviction | `70`    |
 
-| Variable                          | Description                                                                                | Default |
-| --------------------------------- | ------------------------------------------------------------------------------------------ | ------- |
-| `TIMEFUSION_PAGE_ROW_COUNT_LIMIT` | Rows per page                                                                              | `20000` |
-| `TIMEFUSION_MAX_ROW_GROUP_SIZE`   | Max row group size                                                                         | `128MB` |
-| `TIMEFUSION_OPTIMIZE_TARGET_SIZE` | Target file size                                                                           | `512MB` |
-| `TIMEFUSION_BATCH_QUEUE_CAPACITY` | Batch queue size                                                                           | `1000`  |
-| `TIMEFUSION_S3_CONNECT_TIMEOUT`   | S3 TCP/TLS connect bound (humantime). Tuned for same-region S3; widen behind slow proxies | `3s`    |
-
-### Cache Configuration
+**Cache (Foyer, memory + disk)**
 
 | Variable                       | Description       | Default           |
 | ------------------------------ | ----------------- | ----------------- |
-| `TIMEFUSION_FOYER_MEMORY_MB`   | Memory cache size | `512`             |
-| `TIMEFUSION_FOYER_DISK_GB`     | Disk cache size   | `100`             |
-| `TIMEFUSION_FOYER_TTL_SECONDS` | Cache TTL         | `604800` (7 days) |
+| `TIMEFUSION_FOYER_MEMORY_MB`   | Memory cache size | `1024`            |
+| `TIMEFUSION_FOYER_DISK_GB`     | Disk cache size   | `500`             |
+| `TIMEFUSION_FOYER_TTL_SECONDS` | Cache entry TTL   | `604800` (7 days) |
 
-### Connection Limiting
+See [DELTA_CONFIG.md](DELTA_CONFIG.md) for the full configuration reference,
+including Parquet sizing, compaction targets, and connection limiting.
 
-| Variable                             | Description                | Default |
-| ------------------------------------ | -------------------------- | ------- |
-| `TIMEFUSION_ENABLE_CONNECTION_LIMIT` | Enable connection limiting | `false` |
-| `TIMEFUSION_MAX_CONNECTIONS`         | Max concurrent connections | `100`   |
+## Performance
 
-See [DELTA_CONFIG.md](DELTA_CONFIG.md) for complete configuration reference.
+TimeFusion is built for high-throughput ingestion and low-latency analytical
+queries: columnar Parquet, predicate pushdown, partition pruning by
+`project_id`/`date`, a two-tier (memory + disk) cache, and background
+compaction of small files.
 
-## 📊 Performance
+We don't publish a single headline throughput number — real numbers depend
+heavily on hardware, payload shape, batch size, and S3 round-trip latency, and
+a number measured on one setup misleads on another. Instead, the
+[`bench/`](bench/) directory contains the harnesses we use to measure it
+ourselves, so you can reproduce results on your own infrastructure:
 
-TimeFusion is designed for high-throughput ingestion and low-latency queries:
+| Script                        | Measures                              |
+| ----------------------------- | ------------------------------------- |
+| `bench/run_insert_bench.sh`   | Insert throughput and tail latency    |
+| `bench/run_select_bench.sh`   | Query latency                         |
+| `bench/query_under_ingest.py` | Query latency during concurrent writes|
+| `bench/timeseries_lifecycle.py`| End-to-end ingest → flush → query    |
 
-### Benchmarks
+**Getting good performance:**
 
-- **Ingestion**: 500K+ events/second per instance
-- **Query Latency**: Sub-second for most analytical queries
-- **Compression**: 10-20x reduction with Zstandard
-- **Cache Hit Rate**: 95%+ for hot data
+1. **Always filter on `project_id`** (and `date` where possible) — this is what
+   enables partition pruning.
+2. **Batch your inserts** — larger batches amortize WAL and Delta commit cost.
+3. **Size the buffer and cache** (`TIMEFUSION_BUFFER_MAX_MEMORY_MB`,
+   `TIMEFUSION_FOYER_*`) to your working set.
 
-### Optimization Tips
-
-1. **Batch Inserts**: Use larger batches for better throughput
-2. **Partition by Date**: Queries filtering by date are much faster
-3. **Project Isolation**: Always include `project_id` in WHERE clauses
-4. **Regular Maintenance**: Enable auto-optimize and vacuum schedules
-
-## 🧪 Testing
-
-```bash
-# Run all tests
-cargo test
-
-# Run specific test suite
-cargo test --test sqllogictest
-cargo test --test integration_test
-cargo test --test concurrent_operations
-
-# Run with logging
-RUST_LOG=debug cargo test
-```
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-### Development Setup
+## Development
 
 ```bash
-# Clone the repository
 git clone https://github.com/monoscope-tech/timefusion.git
 cd timefusion
 
-# Install dependencies
-cargo build
-
-# Run with local MinIO
-docker-compose up -d minio
-export AWS_S3_BUCKET=timefusion
-export AWS_S3_ENDPOINT=http://localhost:9000
-export AWS_ACCESS_KEY_ID=minioadmin
-export AWS_SECRET_ACCESS_KEY=minioadmin
+# Start MinIO only, then run TimeFusion from source against it
+docker compose up -d minio createbucket
+export AWS_S3_BUCKET=timefusion \
+       AWS_S3_ENDPOINT=http://localhost:9000 \
+       AWS_ALLOW_HTTP=true \
+       AWS_ACCESS_KEY_ID=minioadmin \
+       AWS_SECRET_ACCESS_KEY=minioadmin
 cargo run
 ```
 
-## 📜 License
+**Tests:**
 
-TimeFusion is licensed under the [MIT License](LICENSE).
+```bash
+cargo test                          # unit tests (fast)
+cargo test --test sqllogictest      # SQL logic tests
+cargo test --test integration_test  # write-path integration
+cargo test --test e2e               # end-to-end (Docker required)
+RUST_LOG=debug cargo test           # with debug logging
+```
 
-## 🙏 Acknowledgments
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-TimeFusion is built on the shoulders of giants:
+## License
 
-- [Apache Arrow](https://arrow.apache.org/) & [DataFusion](https://arrow.apache.org/datafusion/)
-- [Delta Lake](https://delta.io/)
-- [pgwire](https://github.com/sunng87/pgwire)
-- The amazing Rust community
+MIT — see [LICENSE](LICENSE).
 
----
+## Built with
 
-<p align="center">
-  Made with ❤️ by the <a href="https://apitoolkit.io">APIToolkit</a> team
-</p>
-
+[Apache DataFusion](https://datafusion.apache.org/) ·
+[Delta Lake](https://delta.io/) ·
+[Apache Arrow](https://arrow.apache.org/) ·
+[pgwire](https://github.com/sunng87/pgwire) ·
+[Foyer](https://github.com/foyer-rs/foyer)
