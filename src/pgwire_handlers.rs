@@ -20,7 +20,7 @@ use datafusion_postgres::{
     },
 };
 use futures::Sink;
-use tracing::{Instrument, field::Empty, info, instrument};
+use tracing::{Instrument, error, field::Empty, info, instrument};
 
 use crate::{database::Database, plan_cache::PlanCacheHook};
 
@@ -182,7 +182,14 @@ impl ErrorHandler for LoggingErrorHandler {
     where
         C: ClientInfo,
     {
-        info!("PgWire error occurred: {}", error);
+        // `ApiError` wraps an internal failure (DataFusion error, including
+        // `Internal error` assertions that indicate a bug) — surface at error so
+        // it isn't buried. Everything else (client `UserError`, `IoError` /
+        // connection resets, protocol errors) is expected or infra noise — info.
+        match error {
+            PgWireError::ApiError(_) => error!("PgWire internal error: {}", error),
+            _ => info!("PgWire error: {}", error),
+        }
     }
 }
 

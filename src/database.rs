@@ -1680,6 +1680,19 @@ impl Database {
         let _ = options.set("datafusion.optimizer.filter_null_join_keys", "true");
         let _ = options.set("datafusion.optimizer.skip_failed_rules", "false");
 
+        // Disable leaf-expression pushdown (DF54 extract_leaf_expressions /
+        // push_down_leaf_projections). Those rules call
+        // `Unnest::with_new_exprs(unnest.expressions(), …)` while routing
+        // get_field (struct/map access) toward leaves, but `Unnest::expressions()`
+        // returns its exec_columns whereas `with_new_exprs` asserts none — so any
+        // multi-column UNNEST whose plan carries a get_field panics with
+        // "Assertion failed: expr.is_empty()" (upstream DF bug). This hit prod via
+        // monoscope's `UPDATE otel_logs_and_spans … FROM (SELECT unnest($1),
+        // unnest($2), unnest($3)) u` dual-write. The rules only fire on get_field;
+        // TF's Variant access uses the `variant_get` UDF (no MoveTowardsLeafNodes
+        // placement), so disabling them does not affect Variant query plans.
+        let _ = options.set("datafusion.optimizer.enable_leaf_expression_pushdown", "false");
+
         // Enable proper limit handling across partitions
         let _ = options.set("datafusion.optimizer.enable_distinct_aggregation_soft_limit", "true");
         let _ = options.set("datafusion.optimizer.enable_topk_aggregation", "true");
