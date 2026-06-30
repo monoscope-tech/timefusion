@@ -424,12 +424,19 @@ pub(crate) fn compact_batch(batch: RecordBatch) -> RecordBatch {
     }
 }
 
-/// Collapse rows in `batches` to one row per unique value of `keys`, keep-last.
+/// Collapse rows in `batches` to one row per unique value of `keys`.
 /// Empty `keys` or empty input → no-op. Surviving row order is preserved.
-/// Tiebreaker on identical key tuples: last occurrence in insertion order wins.
+///
+/// `tiebreak`: when rows share a key tuple, keep the one with the greatest value
+/// in this column (e.g. `observed_timestamp` so an enriched re-emit wins over the
+/// base row — parity plan Defect 3); ties fall back to last-occurrence. `None`
+/// = pure keep-last by position (the back-compat default; identical retries
+/// behave identically either way). Nulls sort lowest, so a non-null tiebreak
+/// always beats a null one.
+///
 /// Only collapses dupes inside this call's input — cross-bucket dupes need
-/// the read-side row_number() rewrite.
-pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String]) -> anyhow::Result<Vec<RecordBatch>> {
+/// the read-side dedup (`DedupExec`).
+pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String], tiebreak: Option<&str>) -> anyhow::Result<Vec<RecordBatch>> {
     if keys.is_empty() || batches.is_empty() {
         return Ok(batches);
     }
@@ -442,28 +449,47 @@ pub fn dedup_batches(batches: Vec<RecordBatch>, keys: &[String]) -> anyhow::Resu
     // …88a1a8). Key columns (e.g. `id`) are tiny, so concatenating just those is
     // safe; superseded rows are then dropped by filtering each batch in place,
     // keeping every output array bounded by its source batch.
-    let key_arrays: Vec<ArrayRef> = keys
-        .iter()
-        .map(|k| {
-            let cols = batches
-                .iter()
-                .map(|b| b.column_by_name(k).cloned().ok_or_else(|| anyhow::anyhow!("dedup key `{k}` missing from batch schema")))
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            Ok(concat(&cols.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?)
-        })
-        .collect::<anyhow::Result<_>>()?;
+    // Concatenate one named column across all batches (never the full payload).
+    let concat_col = |name: &str| -> anyhow::Result<ArrayRef> {
+        let cols = batches
+            .iter()
+            .map(|b| b.column_by_name(name).cloned().ok_or_else(|| anyhow::anyhow!("dedup column `{name}` missing from batch schema")))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(concat(&cols.iter().map(|a| a.as_ref()).collect::<Vec<_>>())?)
+    };
+    let key_arrays: Vec<ArrayRef> = keys.iter().map(|k| concat_col(k)).collect::<anyhow::Result<_>>()?;
     let converter = RowConverter::new(key_arrays.iter().map(|a| SortField::new(a.data_type().clone())).collect())?;
     let rows = converter.convert_columns(&key_arrays)?;
-    // Last occurrence of each key wins (keep-last across coalesced time windows).
-    let mut last: std::collections::HashMap<OwnedRow, u32> = std::collections::HashMap::with_capacity(rows.num_rows());
+
+    // Optional tiebreak column, encoded order-preservingly (same concat-just-this-
+    // -column trick as the keys, so we never fuse the fat payload).
+    let tb_rows = match tiebreak {
+        Some(col) => {
+            let arr = concat_col(col)?;
+            let conv = RowConverter::new(vec![SortField::new(arr.data_type().clone())])?;
+            Some(conv.convert_columns(&[arr])?)
+        }
+        None => None,
+    };
+
+    // Choose one surviving index per key. With no tiebreak: last occurrence wins
+    // (unconditional insert). With a tiebreak: the greatest value wins, ties →
+    // last (we only keep the existing pick when its tiebreak is strictly greater).
+    let mut chosen: std::collections::HashMap<OwnedRow, u32> = std::collections::HashMap::with_capacity(rows.num_rows());
     for i in 0..rows.num_rows() {
-        last.insert(rows.row(i).owned(), i as u32);
+        let k = rows.row(i).owned();
+        match (&tb_rows, chosen.get(&k)) {
+            (Some(tb), Some(&j)) if tb.row(i) < tb.row(j as usize) => {}
+            _ => {
+                chosen.insert(k, i as u32);
+            }
+        }
     }
-    if last.len() == rows.num_rows() {
+    if chosen.len() == rows.num_rows() {
         // No duplicates — return the batches untouched (never fused into one array).
         return Ok(batches);
     }
-    let keep: std::collections::HashSet<u32> = last.into_values().collect();
+    let keep: std::collections::HashSet<u32> = chosen.into_values().collect();
     // Filter each batch against its slice of the global row-index space.
     let mut out = Vec::with_capacity(batches.len());
     let mut base = 0u32;
@@ -2322,7 +2348,7 @@ mod tests {
             mk(vec![200], vec![2], vec!["v2-new"]),
         ];
         let keys = vec!["id".to_string(), "timestamp".to_string()];
-        let out = dedup_batches(batches, &keys).expect("dedup ok");
+        let out = dedup_batches(batches, &keys, None).expect("dedup ok");
         // Dedup filters each batch in place (no full-payload concat), so the
         // survivors come back as multiple batches — collect across all of them.
         let total: usize = out.iter().map(|b| b.num_rows()).sum();
@@ -2342,10 +2368,10 @@ mod tests {
     #[test]
     fn dedup_batches_noop_when_keys_empty_or_input_empty() {
         let empty: Vec<RecordBatch> = vec![];
-        assert!(dedup_batches(empty, &["id".to_string()]).unwrap().is_empty());
+        assert!(dedup_batches(empty, &["id".to_string()], None).unwrap().is_empty());
 
         let batch = create_test_batch(123);
-        let out = dedup_batches(vec![batch.clone()], &[]).unwrap();
+        let out = dedup_batches(vec![batch.clone()], &[], None).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].num_rows(), batch.num_rows());
     }
@@ -2370,7 +2396,7 @@ mod tests {
             .unwrap()
         };
         let batches = vec![mk(1, "a"), mk(2, "b"), mk(3, "c")];
-        let out = dedup_batches(batches, &["id".to_string()]).expect("dedup ok");
+        let out = dedup_batches(batches, &["id".to_string()], None).expect("dedup ok");
         assert_eq!(out.len(), 3, "distinct-key batches must be returned un-fused (no 2GB-prone concat)");
         assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
     }
@@ -2378,8 +2404,49 @@ mod tests {
     #[test]
     fn dedup_batches_errors_on_unknown_key() {
         let batch = create_test_batch(1);
-        let err = dedup_batches(vec![batch], &["nonexistent".to_string()]).unwrap_err();
+        let err = dedup_batches(vec![batch], &["nonexistent".to_string()], None).unwrap_err();
         assert!(err.to_string().contains("nonexistent"), "msg: {err}");
+    }
+
+    /// Defect 3: with a tiebreak column, the row with the greatest tiebreak value
+    /// wins per key (an enriched re-emit carries a later `observed_timestamp`),
+    /// regardless of input position — and a non-null tiebreak beats a null one.
+    #[test]
+    fn dedup_batches_tiebreak_keeps_greatest() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("observed", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+            Field::new("payload", DataType::Utf8View, false),
+        ]));
+        let mk = |ids: Vec<i64>, obs: Vec<Option<i64>>, pl: Vec<&str>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(TimestampMicrosecondArray::from(obs).with_timezone("UTC")),
+                    Arc::new(StringViewArray::from(pl)),
+                ],
+            )
+            .unwrap()
+        };
+        // id=1: base (observed=100) appears AFTER enriched (observed=200) in input —
+        //   keep-last would wrongly pick base; tiebreak must pick the observed=200 row.
+        // id=2: base has a NULL observed, enriched has 50 — non-null must win.
+        let batches = vec![
+            mk(vec![1, 2], vec![Some(200), None], vec!["1-enriched", "2-base"]),
+            mk(vec![1, 2], vec![Some(100), Some(50)], vec!["1-base", "2-enriched"]),
+        ];
+        let out = dedup_batches(batches, &["id".to_string()], Some("observed")).expect("dedup ok");
+        let mut got: Vec<(i64, String)> = out
+            .iter()
+            .flat_map(|b| {
+                let ids = b.column_by_name("id").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+                let pl = b.column_by_name("payload").unwrap().as_any().downcast_ref::<StringViewArray>().unwrap();
+                (0..b.num_rows()).map(move |i| (ids.value(i), pl.value(i).to_string())).collect::<Vec<_>>()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, vec![(1, "1-enriched".into()), (2, "2-enriched".into())]);
     }
 
     #[test]

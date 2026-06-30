@@ -9,6 +9,12 @@ partitions:
 dedup_keys:
   - id
   - timestamp
+# Tie-breaker when rows share (id, timestamp): keep the one with the greatest
+# observed_timestamp. The enrichment worker re-emits the enriched row with a
+# fresh observed_timestamp (parity plan Defect 3), so it wins over the base row.
+# Identical retries share observed_timestamp → tie falls back to keep-last (no
+# behavior change for the existing duplicate case).
+dedup_tiebreak: observed_timestamp
 # Hot paths: point lookup by (timestamp, id), and service_name queries within
 # a time range. Leading with `timestamp` keeps row-group min/max stats tight
 # for any timestamp-bound query; sorting by service_name next clusters rows

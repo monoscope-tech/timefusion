@@ -28,6 +28,12 @@ pub struct TableSchema {
     /// read-side row_number() rewrite.
     #[serde(default)]
     pub dedup_keys:      Vec<String>,
+    /// Tie-breaker column for dedup: when rows share `dedup_keys`, keep the one
+    /// with the greatest value here (ties → last seen, the back-compat default).
+    /// Lets an enriched re-emit with a later `observed_timestamp` win over the
+    /// base row (parity plan Defect 3). `None` = keep-last by position.
+    #[serde(default)]
+    pub dedup_tiebreak:  Option<String>,
 }
 
 impl TableSchema {
@@ -44,6 +50,16 @@ impl TableSchema {
                 .ok_or_else(|| anyhow::anyhow!("schema `{}`: dedup_keys references unknown field `{}`", self.table_name, k))?;
             if f.data_type == "Variant" {
                 anyhow::bail!("schema `{}`: dedup_keys cannot include Variant column `{}`", self.table_name, k);
+            }
+        }
+        if let Some(tb) = &self.dedup_tiebreak {
+            let f = self
+                .fields
+                .iter()
+                .find(|f| f.name == *tb)
+                .ok_or_else(|| anyhow::anyhow!("schema `{}`: dedup_tiebreak references unknown field `{}`", self.table_name, tb))?;
+            if f.data_type == "Variant" {
+                anyhow::bail!("schema `{}`: dedup_tiebreak cannot be a Variant column `{}`", self.table_name, tb);
             }
         }
         Ok(())

@@ -103,6 +103,24 @@ pub mod test_helpers {
         guard
     }
 
+    /// Physical row count from the Delta log's `num_records` stats, summed over
+    /// all active files. Bypasses the routed scan path entirely — unlike a
+    /// `query_delta_only` COUNT, it is NOT collapsed by the read-side `DedupExec`,
+    /// so it reflects on-disk duplicates (what the dedup *sweep* tests assert).
+    pub async fn delta_physical_row_count(table_ref: &Arc<tokio::sync::RwLock<deltalake::DeltaTable>>) -> anyhow::Result<i64> {
+        use datafusion::arrow::{
+            array::{Array, AsArray},
+            datatypes::Int64Type,
+        };
+        let guard = table_ref.read().await;
+        let batch = guard.snapshot()?.add_actions_table(true)?;
+        let arr = batch
+            .column_by_name("num_records")
+            .ok_or_else(|| anyhow::anyhow!("add_actions_table missing num_records"))?
+            .as_primitive::<Int64Type>();
+        Ok((0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i)).sum())
+    }
+
     /// Build a BufferedWriteLayer for tests/benches without repeating the registry boilerplate.
     pub fn test_layer(cfg: Arc<AppConfig>) -> anyhow::Result<crate::buffered_write_layer::BufferedWriteLayer> {
         crate::buffered_write_layer::BufferedWriteLayer::with_config(cfg, crate::functions::function_registry()?)

@@ -19,6 +19,7 @@ pub mod optimizers;
 pub mod pgwire_early_bind;
 pub mod pgwire_handlers;
 pub mod plan_cache;
+pub mod read_dedup;
 pub mod schema_loader;
 pub mod secret_crypto;
 pub mod snapshot_cache;

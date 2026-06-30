@@ -3975,7 +3975,7 @@ impl Database {
             if before == 0 {
                 continue;
             }
-            let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys)?;
+            let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref())?;
             let after: usize = deduped.iter().map(|b| b.num_rows()).sum();
             if before == after {
                 continue;
@@ -4100,35 +4100,43 @@ impl Database {
         if schema.dedup_keys.is_empty() {
             return Ok(());
         }
+        // Sweep today plus a lookback window: a cross-flush dupe that lands in a
+        // prior-day partition (late DLQ replay crossing midnight UTC) would never
+        // collapse under a today-only scope. The global version skip below still
+        // bounds cost — we only re-scan the window when the table has new commits.
         let today = Utc::now().date_naive();
-        let date_marker = format!("date={}", today);
+        let lookback = self.config.maintenance.timefusion_dedup_lookback_days as i64;
+        let dates: Vec<chrono::NaiveDate> = (0..=lookback).rev().map(|d| today - chrono::Duration::days(d)).collect();
 
-        let (pre_version, project_ids) = {
-            let table = table_ref.read().await;
-            let v = table.version().unwrap_or(0);
-            let pids: std::collections::HashSet<String> = table
-                .get_file_uris()?
-                .filter(|u| u.contains(&date_marker))
-                .filter_map(|uri| uri.split('/').find_map(|seg| seg.strip_prefix("project_id=").map(str::to_string)))
-                .collect();
-            (v, pids)
-        };
+        let pre_version = table_ref.read().await.version().unwrap_or(0);
         if self.last_dedup_versions.read().await.get(dedup_key).copied() == Some(pre_version) {
             debug!("dedup sweep: table={} version={} unchanged — skipping", table_name, pre_version);
             return Ok(());
         }
-        // Custom-project tables don't embed project_id in the path; sweep "default".
-        let project_ids = if project_ids.is_empty() { std::iter::once("default".to_string()).collect() } else { project_ids };
 
         let mut total_dropped = 0u64;
         let mut any_ok = false;
-        for pid in &project_ids {
-            match self.dedup_partition(table_ref, table_name, pid, today).await {
-                Ok(d) => {
-                    total_dropped += d;
-                    any_ok = true;
+        for date in dates {
+            let date_marker = format!("date={}", date);
+            // Project ids present in this date's partitions. Custom-project tables
+            // don't embed project_id in the path; sweep "default".
+            let project_ids: std::collections::HashSet<String> = {
+                let table = table_ref.read().await;
+                table
+                    .get_file_uris()?
+                    .filter(|u| u.contains(&date_marker))
+                    .filter_map(|uri| uri.split('/').find_map(|seg| seg.strip_prefix("project_id=").map(str::to_string)))
+                    .collect()
+            };
+            let project_ids = if project_ids.is_empty() { std::iter::once("default".to_string()).collect() } else { project_ids };
+            for pid in &project_ids {
+                match self.dedup_partition(table_ref, table_name, pid, date).await {
+                    Ok(d) => {
+                        total_dropped += d;
+                        any_ok = true;
+                    }
+                    Err(e) => warn!("dedup sweep: project={} date={} table={} failed: {}", pid, date, table_name, e),
                 }
-                Err(e) => warn!("dedup sweep: project={} date={} table={} failed: {}", pid, today, table_name, e),
             }
         }
         // Only refresh the skip cache when at least one partition ran cleanly,
@@ -4139,13 +4147,7 @@ impl Database {
             self.last_dedup_versions.write().await.insert(dedup_key.to_string(), post_version);
         }
         if total_dropped > 0 {
-            info!(
-                "dedup sweep: table={} key={} projects={} total_dropped={}",
-                table_name,
-                dedup_key,
-                project_ids.len(),
-                total_dropped
-            );
+            info!("dedup sweep: table={} key={} total_dropped={}", table_name, dedup_key, total_dropped);
         }
         Ok(())
     }
@@ -5304,12 +5306,54 @@ impl TableProvider for ProjectRoutingTable {
         // Send (Cell isn't) so the async future stays multi-thread-safe;
         // uncontended lock+unlock is sub-100ns so the overhead is dwarfed
         // by the work being measured.
+        // Read-side dedup setup (parity plan Defect 2 #1): collapse physical
+        // duplicates of dedup-key rows over the routed/pruned union at query
+        // time, so COUNT(*) is correct regardless of sweep timing. Augment the
+        // pushed projection with any dedup-key columns the query projected away
+        // (so DedupExec can see them); `output_projection` then restores the
+        // requested columns. No-op when the table declares no dedup_keys.
+        let dedup_keys: Vec<String> = crate::schema_loader::get_schema(&self.table_name).map(|s| s.dedup_keys.clone()).unwrap_or_default();
+        // Only a `Some` projection over a dedup_keys table can hide the keys: a
+        // `None` projection already scans every column and a no-dedup table needs
+        // nothing — both fold into the pass-through arm, which also skips the
+        // `self.schema()` build (it un-types Variant cols) on the common tables.
+        let (scan_projection, output_projection): (Option<Vec<usize>>, Option<Vec<usize>>) = match projection {
+            Some(p) if !dedup_keys.is_empty() => {
+                let full_schema = self.schema();
+                let missing: Vec<usize> = dedup_keys.iter().filter_map(|k| full_schema.index_of(k).ok()).filter(|i| !p.contains(i)).collect();
+                if missing.is_empty() {
+                    (Some(p.clone()), None)
+                } else {
+                    let mut aug = p.clone();
+                    aug.extend(missing);
+                    // Requested columns occupy the first p.len() positions of the augmented output.
+                    (Some(aug), Some((0..p.len()).collect()))
+                }
+            }
+            _ => (projection.cloned(), None),
+        };
+        let projection = scan_projection.as_ref();
+        // When DedupExec is active it drops rows AFTER the scan, so a pushed
+        // `limit` must NOT truncate the underlying scans — otherwise the deduped
+        // result can yield < limit distinct rows even when more exist below the
+        // cut, and the outer GlobalLimitExec (which DataFusion keeps) can't
+        // recover them. Suppress the per-scan limit; the outer limit still caps.
+        let limit = if dedup_keys.is_empty() { limit } else { None };
+
         let scan_state = parking_lot::Mutex::new(ScanShape::default());
         let wrap_result = |plan: Arc<dyn ExecutionPlan>| -> DFResult<Arc<dyn ExecutionPlan>> {
             let shape = *scan_state.lock();
             let us = scan_start.elapsed().as_micros() as u64;
             scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
-            Ok(plan)
+            if dedup_keys.is_empty() {
+                Ok(plan)
+            } else {
+                Ok(Arc::new(crate::read_dedup::DedupExec::new(
+                    plan,
+                    dedup_keys.clone(),
+                    output_projection.clone(),
+                )?))
+            }
         };
         let tag_shape = |f: &dyn Fn(&mut ScanShape)| {
             f(&mut scan_state.lock());
@@ -5512,6 +5556,7 @@ mod writer_properties_tests {
             fields,
             time_column: None,
             dedup_keys: vec![],
+            dedup_tiebreak: None,
         }
     }
 

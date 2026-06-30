@@ -29,6 +29,15 @@ use crate::{
 // `max_memory_bytes()`. Measured within ~10–15% of marginal heap growth
 // (bench/multiplier_bench.py, 2026-05-17).
 const MEMORY_OVERHEAD_MULTIPLIER: f64 = 1.15;
+
+/// Estimated reserved bytes for a write: raw Arrow size × the overhead multiplier.
+/// Single source of truth shared by `try_reserve_memory` and `force_reserve` so the
+/// admit and force-admit paths can't drift apart.
+fn estimate_reservation(batches: &[RecordBatch]) -> usize {
+    let batch_size: usize = batches.iter().map(estimate_batch_size).sum();
+    (batch_size as f64 * MEMORY_OVERHEAD_MULTIPLIER) as usize
+}
+
 /// Hard limit = `max_bytes + max_bytes / N` = 120% of budget (`5` → +20%),
 /// leaving headroom for in-flight writes without unbounded growth.
 const HARD_LIMIT_HEADROOM_DIVISOR: usize = 5;
@@ -482,8 +491,7 @@ impl BufferedWriteLayer {
     /// Returns estimated batch size on success, or error if hard limit exceeded.
     /// Uses exponential backoff to reduce CPU thrashing under contention.
     async fn try_reserve_memory(&self, batches: &[RecordBatch]) -> anyhow::Result<usize> {
-        let batch_size: usize = batches.iter().map(estimate_batch_size).sum();
-        let estimated_size = (batch_size as f64 * MEMORY_OVERHEAD_MULTIPLIER) as usize;
+        let estimated_size = estimate_reservation(batches);
 
         let max_bytes = self.max_memory_bytes();
         let hard_limit = max_bytes.saturating_add(max_bytes / HARD_LIMIT_HEADROOM_DIVISOR);
@@ -533,6 +541,17 @@ impl BufferedWriteLayer {
         self.reserved_bytes.fetch_sub(size, Ordering::Release);
     }
 
+    /// Reserve memory unconditionally — adds the estimated bytes even past the
+    /// hard limit. Only used on the `wal_admit_decouple` path when backpressure
+    /// is exhausted: we admit over-budget rather than drop, since the WAL already
+    /// holds the batch durably. Wakes the flush task to drain the overage.
+    fn force_reserve(&self, batches: &[RecordBatch]) -> usize {
+        let estimated_size = estimate_reservation(batches);
+        self.reserved_bytes.fetch_add(estimated_size, Ordering::AcqRel);
+        self.pressure_notify.notify_one();
+        estimated_size
+    }
+
     /// Reserve memory for a write, applying *backpressure* instead of dropping
     /// the write when the hard limit is hit. The rows are already destined for
     /// the durable WAL, and Delta/S3 is effectively unbounded "disk" — so when
@@ -580,8 +599,14 @@ impl BufferedWriteLayer {
                     if std::time::Instant::now() >= deadline {
                         crate::metrics::record_backpressure_rejected();
                         self.backpressure_rejected_total.fetch_add(1, Ordering::Relaxed);
+                        // NOTE: this rejection happens in `insert()` BEFORE
+                        // `wal.append_batch`, so the batch is NOT durable here —
+                        // the old "data remains in WAL" wording was wrong. The
+                        // batch is dropped from TF's side and recovery depends on
+                        // the caller retrying / the upstream DLQ. Removing this
+                        // loss seam is parity-plan Defect 1 (WAL-before-admit).
                         error!(
-                            "Write backpressure exhausted after {:?}: used={}MB still over hard limit — Delta flush is not freeing memory; rejecting (data remains in WAL)",
+                            "Write backpressure exhausted after {:?}: used={}MB still over hard limit — Delta flush is not freeing memory; rejecting batch (NOT yet durable — WAL append happens only after admission; caller must retry or rely on the upstream DLQ)",
                             timeout,
                             self.effective_memory_bytes() / (1024 * 1024)
                         );
@@ -725,7 +750,21 @@ impl BufferedWriteLayer {
         // Reserve memory atomically before writing - prevents race condition.
         // Applies backpressure (synchronous flush-to-Delta + retry) instead of
         // rejecting when at the hard limit — see `reserve_with_backpressure`.
-        let reserved_size = self.reserve_with_backpressure(&batches).await?;
+        let reserved_size = match self.reserve_with_backpressure(&batches).await {
+            Ok(sz) => sz,
+            // Decouple (parity plan Defect 1, default OFF): never DROP a write
+            // whose backpressure budget is exhausted. The WAL append below is the
+            // durability boundary, so admitting over-budget beats rejecting. The
+            // batch is still admitted to MemBuffer + recorded, so the count-based
+            // FIFO WAL advance stays correct (no skipped/un-admitted entry). Growth
+            // is bounded by the relief flush + WAL replay on restart — soak before
+            // prod enable.
+            Err(e) if self.config.buffer.wal_admit_decouple() => {
+                warn!("wal_admit_decouple: admitting over-budget instead of rejecting (WAL is durable): {}", e);
+                self.force_reserve(&batches)
+            }
+            Err(e) => return Err(e),
+        };
 
         // No per-topic mutex needed: WAL now shards each (project, table)
         // across N walrus collections via `WalManager::pick_shard`, so
@@ -1345,8 +1384,10 @@ impl BufferedWriteLayer {
         // Last-write-wins dedup on the per-table key set from schema YAML.
         // Empty key list = pass-through. Runs before both Delta write and the
         // tantivy sidecar so both see the same row set.
-        let dedup_keys = crate::schema_loader::get_schema(&bucket.table_name).map(|s| s.dedup_keys.as_slice()).unwrap_or(&[]);
-        let batches = crate::mem_buffer::dedup_batches(bucket.batches.clone(), dedup_keys)?;
+        let schema = crate::schema_loader::get_schema(&bucket.table_name);
+        let dedup_keys = schema.map(|s| s.dedup_keys.as_slice()).unwrap_or(&[]);
+        let tiebreak = schema.and_then(|s| s.dedup_tiebreak.as_deref());
+        let batches = crate::mem_buffer::dedup_batches(bucket.batches.clone(), dedup_keys, tiebreak)?;
         let after: usize = batches.iter().map(|b| b.num_rows()).sum();
         if bucket.row_count > after {
             let dropped = bucket.row_count - after;
@@ -1789,7 +1830,7 @@ mod tests {
     use std::path::PathBuf;
 
     use serial_test::serial;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     use super::*;
     use crate::test_utils::test_helpers::{json_to_batch, test_span};
@@ -2315,6 +2356,84 @@ mod tests {
         assert!(
             layer.snapshot_stats().backpressure_engaged_total >= 1,
             "backpressure_engaged_total must record the over-limit event"
+        );
+    }
+
+    /// Build a layer with a no-op (always-succeed) Delta callback and an old-bucket
+    /// batch maker, sharing the over-limit setup of the two decouple tests below.
+    /// `backpressure_secs = 0` makes `reserve_with_backpressure` return immediately
+    /// on the over-limit insert (no relief loop), so the exhaustion path is
+    /// deterministic without depending on flush timing.
+    /// Returns the `TempDir` guard too — the caller must hold it for the test's
+    /// lifetime (dropping it deletes the data dir out from under the layer).
+    fn decouple_test_layer(decouple: bool) -> (Arc<BufferedWriteLayer>, TempDir, impl Fn() -> RecordBatch) {
+        use arrow::{
+            array::{StringArray, TimestampMicrosecondArray},
+            datatypes::{DataType, Field, Schema, TimeUnit},
+        };
+        let dir = tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.core.timefusion_data_dir = dir.path().to_path_buf();
+        cfg.buffer.timefusion_buffer_max_memory_mb = 64; // floor → hard limit ~76.8MB
+        cfg.buffer.timefusion_write_backpressure_secs = 0; // exhaust immediately
+        cfg.buffer.timefusion_wal_admit_decouple = decouple;
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::new(cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
+        let old_ts = crate::clock::now_micros() - 2 * crate::mem_buffer::bucket_duration_micros();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let make_batch = move || {
+            let rows = 30_000usize;
+            let ts = TimestampMicrosecondArray::from(vec![old_ts; rows]);
+            let payload = StringArray::from(vec!["x".repeat(400); rows]); // ~12MB
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ts), Arc::new(payload)]).unwrap()
+        };
+        (Arc::new(layer), dir, make_batch)
+    }
+
+    /// Baseline for the decouple flag: with it OFF and backpressure exhausted
+    /// (timeout 0), an over-hard-limit insert is REJECTED — the loss seam parity
+    /// plan Defect 1 targets (the rejected batch was never WAL-appended).
+    #[serial]
+    #[tokio::test]
+    async fn wal_admit_decouple_off_rejects_when_backpressure_exhausted() {
+        let (layer, _dir, make_batch) = decouple_test_layer(false);
+        let mut rejected = false;
+        for _ in 0..8 {
+            if layer.insert("d", "d", vec![make_batch()]).await.is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "flag OFF: an over-hard-limit insert must be rejected once backpressure is exhausted");
+    }
+
+    /// Parity plan Defect 1 fix (flag ON): the same exhausted-backpressure scenario
+    /// must NOT drop. Every insert succeeds (admitted over-budget; the WAL append
+    /// is the durability boundary) and the rows are retained — closing the
+    /// drop-before-durability loss seam.
+    #[serial]
+    #[tokio::test]
+    async fn wal_admit_decouple_on_never_drops_over_budget() {
+        let (layer, _dir, make_batch) = decouple_test_layer(true);
+        for i in 0..8 {
+            layer
+                .insert("d", "d", vec![make_batch()])
+                .await
+                .unwrap_or_else(|e| panic!("flag ON: insert {i} must be admitted over-budget, not dropped; got {e}"));
+        }
+        assert!(!layer.is_empty(), "admitted rows must be retained (durable), not dropped");
+        // Over-budget by construction: effective memory exceeds the hard limit.
+        let max = layer.max_memory_bytes();
+        assert!(
+            layer.effective_memory_bytes() > max,
+            "decouple must admit past the hard limit ({}MB), got {}MB",
+            max / (1024 * 1024),
+            layer.effective_memory_bytes() / (1024 * 1024)
         );
     }
 

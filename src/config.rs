@@ -268,6 +268,11 @@ const_default!(d_warm_recency_days: u64 = 2);
 // ~64KB suffix ranges, well within R2/S3 burst limits.
 const_default!(d_warm_concurrency: usize = 16);
 const_default!(d_snapshot_reconcile: u64 = 500);
+// How many days back (in addition to today) the dedup sweep covers. today-only
+// left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
+// crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
+// Arbitrarily-late replays still need read-side dedup — see the parity plan.
+const_default!(d_dedup_lookback_days: u64 = 1);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_query_partitions: usize = 0);
@@ -493,6 +498,15 @@ pub struct BufferConfig {
     pub timefusion_flush_parallelism:        usize,
     #[serde(default)]
     pub timefusion_flush_immediately:        bool,
+    /// EXPERIMENTAL (default OFF), parity plan Defect 1: when set, `insert()`
+    /// admits over the memory hard limit instead of *rejecting* a write whose
+    /// backpressure budget is exhausted — the WAL append is the durability
+    /// boundary, so a slow/over-budget write is preferable to a dropped one.
+    /// Closes the drop-before-durability loss seam. Requires a soak (watch RSS /
+    /// flush throughput) before prod enable — over-budget admission trades a
+    /// reject for unbounded growth if Delta flush can't keep up.
+    #[serde(default)]
+    pub timefusion_wal_admit_decouple:       bool,
     #[serde(default = "d_wal_fsync_ms")]
     pub timefusion_wal_fsync_ms:             u64,
     #[serde(default = "d_wal_fsync_mode")]
@@ -565,6 +579,9 @@ impl BufferConfig {
     }
     pub fn flush_immediately(&self) -> bool {
         self.timefusion_flush_immediately
+    }
+    pub fn wal_admit_decouple(&self) -> bool {
+        self.timefusion_wal_admit_decouple
     }
     pub fn wal_fsync_ms(&self) -> u64 {
         self.timefusion_wal_fsync_ms.max(1)
@@ -810,6 +827,9 @@ pub struct MaintenanceConfig {
     /// from an incremental-replay bug. 0 disables reconciliation.
     #[serde(default = "d_snapshot_reconcile")]
     pub timefusion_snapshot_reconcile_commits:    u64,
+    /// Days back (plus today) the dedup sweep scans. See `d_dedup_lookback_days`.
+    #[serde(default = "d_dedup_lookback_days")]
+    pub timefusion_dedup_lookback_days:           u64,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.
