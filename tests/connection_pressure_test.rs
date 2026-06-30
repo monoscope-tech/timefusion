@@ -23,8 +23,8 @@ mod connection_pressure {
     use uuid::Uuid;
 
     struct PressureTestServer {
-        port:     u16,
-        test_id:  String,
+        port: u16,
+        test_id: String,
         shutdown: Arc<Notify>,
     }
 

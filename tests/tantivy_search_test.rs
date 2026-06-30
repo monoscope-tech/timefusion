@@ -24,43 +24,44 @@ use timefusion::{
 #[allow(dead_code)]
 fn schema_with(level_indexed: bool) -> TableSchema {
     TableSchema {
-        table_name:      "logs".into(),
-        partitions:      vec![],
+        table_name: "logs".into(),
+        partitions: vec![],
         sorting_columns: vec![SortingColumnDef {
-            name:        "timestamp".into(),
-            descending:  false,
+            name: "timestamp".into(),
+            descending: false,
             nulls_first: false,
         }],
         z_order_columns: vec![],
-        time_column:     None,
-        dedup_keys:      vec![],
-        fields:          vec![
+        time_column: None,
+        dedup_keys: vec![],
+        dedup_tiebreak: None,
+        fields: vec![
             FieldDef {
-                name:         "timestamp".into(),
-                data_type:    "Timestamp(Microsecond, Some(\"UTC\"))".into(),
-                nullable:     false,
-                tantivy:      None,
-                dictionary:   None,
+                name: "timestamp".into(),
+                data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(),
+                nullable: false,
+                tantivy: None,
+                dictionary: None,
                 bloom_filter: false,
             },
             FieldDef {
-                name:         "id".into(),
-                data_type:    "Utf8".into(),
-                nullable:     false,
-                tantivy:      None,
-                dictionary:   None,
+                name: "id".into(),
+                data_type: "Utf8".into(),
+                nullable: false,
+                tantivy: None,
+                dictionary: None,
                 bloom_filter: false,
             },
             FieldDef {
-                name:         "level".into(),
-                data_type:    "Utf8".into(),
-                nullable:     true,
-                tantivy:      level_indexed.then(|| TantivyFieldConfig {
-                    indexed:   true,
+                name: "level".into(),
+                data_type: "Utf8".into(),
+                nullable: true,
+                tantivy: level_indexed.then(|| TantivyFieldConfig {
+                    indexed: true,
                     tokenizer: Some("raw".into()),
-                    flatten:   None,
+                    flatten: None,
                 }),
-                dictionary:   None,
+                dictionary: None,
                 bloom_filter: false,
             },
         ],
@@ -150,14 +151,14 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
         "p1",
         "bucket-bad",
         ManifestEntry {
-            index:                None,
-            rows:                 0,
-            built_at:             chrono::Utc::now(),
-            schema_version:       manifest::SCHEMA_VERSION,
+            index: None,
+            rows: 0,
+            built_at: chrono::Utc::now(),
+            schema_version: manifest::SCHEMA_VERSION,
             min_timestamp_micros: None,
             max_timestamp_micros: None,
-            error:                Some("simulated build failure".into()),
-            covered_files:        vec![],
+            error: Some("simulated build failure".into()),
+            covered_files: vec![],
         },
     )
     .await
@@ -220,6 +221,64 @@ async fn gc_after_compaction_clears_manifest_and_blobs() {
 }
 
 #[tokio::test]
+async fn search_time_prunes_non_overlapping_indexes() {
+    // Two indexes in disjoint time windows. A query whose window overlaps only
+    // the OLD one must return only its hits (and never download the NEW blob) —
+    // this is the fix for the cold-old-data latency cliff. With no window, both
+    // are searched (today's behavior). Correctness: a pruned index only covers
+    // rows outside the window, which the query's timestamp filter excludes.
+    let table_name = "otel_logs_and_spans";
+    let project_id = "p1";
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let cfg = TantivyConfig {
+        timefusion_tantivy_compression_level: 3,
+        ..Default::default()
+    };
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(cfg)));
+    let cb = svc.callback();
+
+    let old_ts = 1_000_000_000i64; // ~16:40 1970
+    let new_ts = 2_000_000_000_000i64; // ~2033 — far from the old window
+    cb(
+        project_id.into(),
+        table_name.into(),
+        vec![batch(&[(old_ts, "old1", "ERROR")])],
+        vec!["uri-old".into()],
+    )
+    .await
+    .unwrap();
+    cb(
+        project_id.into(),
+        table_name.into(),
+        vec![batch(&[(new_ts, "new1", "ERROR")])],
+        vec!["uri-new".into()],
+    )
+    .await
+    .unwrap();
+
+    let cache = TempDir::new().unwrap();
+    let search = TantivySearchService::new(store, cache.path().to_path_buf());
+
+    // Window around the OLD index only → prune the NEW one.
+    let r = search
+        .search_with_stats(table_name, project_id, "level", "ERROR", 1000, Some((old_ts - 100, old_ts + 100)))
+        .await
+        .unwrap()
+        .expect("old index overlaps → usable");
+    assert_eq!(
+        r.hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(),
+        vec!["old1".to_string()],
+        "time-pruning must return only the overlapping index's hits"
+    );
+
+    // No range → both indexes searched (unchanged behavior).
+    let r_all = search.search_with_stats(table_name, project_id, "level", "ERROR", 1000, None).await.unwrap().unwrap();
+    let mut all: Vec<String> = r_all.hits.iter().map(|h| h.id.clone()).collect();
+    all.sort();
+    assert_eq!(all, vec!["new1".to_string(), "old1".to_string()], "no range must search all indexes");
+}
+
+#[tokio::test]
 async fn search_skips_indexes_that_dont_have_the_field() {
     // An older index won't have a newly-added field. search() must not error;
     // it should simply skip those indexes and return hits from the others.
@@ -237,7 +296,9 @@ async fn search_skips_indexes_that_dont_have_the_field() {
 
     let cache = TempDir::new().unwrap();
     let search = TantivySearchService::new(store, cache.path().to_path_buf());
-    // Querying a non-indexed field (e.g. parent_id) should yield no usable index → None.
-    let hits = search.search(table_name, project_id, "parent_id", "anything").await.unwrap();
+    // Querying a field that isn't tantivy-indexed (context___trace_state has no
+    // `tantivy:` config) yields no usable index → None. NB: parent_id/id/trace_id
+    // ARE indexed now (P0 equality routing), so this uses a still-unindexed field.
+    let hits = search.search(table_name, project_id, "context___trace_state", "anything").await.unwrap();
     assert!(hits.is_none());
 }

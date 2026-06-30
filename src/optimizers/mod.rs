@@ -24,6 +24,31 @@ pub fn extract_utf8_string(v: &ScalarValue) -> Option<String> {
     }
 }
 
+/// True if `expr` references column `name`, seen through any `Cast`/`TryCast`
+/// wrapper. TypeCoercion wraps a column in a Cast when the compared literal's
+/// unit/type differs (e.g. a µs `timestamp` column vs an ns `NOW() - INTERVAL`
+/// bound), which otherwise hides the column from filter-shape matching.
+pub fn is_col_through_cast(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Column(c) => c.name == name,
+        Expr::Cast(c) => is_col_through_cast(c.expr.as_ref(), name),
+        Expr::TryCast(c) => is_col_through_cast(c.expr.as_ref(), name),
+        _ => false,
+    }
+}
+
+/// Reverse a comparison operator for swapped operands (`lit < col` ≡ `col > lit`).
+/// Non-comparison operators pass through unchanged.
+pub fn swap_comparison(op: &Operator) -> Operator {
+    match op {
+        Operator::Gt => Operator::Lt,
+        Operator::GtEq => Operator::LtEq,
+        Operator::Lt => Operator::Gt,
+        Operator::LtEq => Operator::GtEq,
+        other => *other,
+    }
+}
+
 /// Utilities for converting timestamp filters to date partition filters
 /// for better partition pruning in Delta Lake
 pub mod time_range_partition_pruner {
@@ -40,11 +65,18 @@ pub mod time_range_partition_pruner {
         let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
             return None;
         };
-        let Expr::Column(col) = left.as_ref() else { return None };
-        if col.name != time_column {
+        // Match the time column on either side, through a Cast/TryCast (added by
+        // TypeCoercion when the bound's unit differs from the column's — e.g.
+        // `NOW() - INTERVAL` ns vs a µs column). Reversed operands flip the op.
+        let (lit_expr, op) = if is_col_through_cast(left.as_ref(), time_column) {
+            (right.as_ref(), *op)
+        } else if is_col_through_cast(right.as_ref(), time_column) {
+            (left.as_ref(), swap_comparison(op))
+        } else {
             return None;
-        }
-        let Expr::Literal(scalar, _) = right.as_ref() else { return None };
+        };
+        let op = &op;
+        let Expr::Literal(scalar, _) = lit_expr else { return None };
         let ts_nanos: i64 = match scalar {
             ScalarValue::TimestampNanosecond(Some(ts), _) => *ts,
             ScalarValue::TimestampMicrosecond(Some(ts), _) => ts.checked_mul(1_000)?,

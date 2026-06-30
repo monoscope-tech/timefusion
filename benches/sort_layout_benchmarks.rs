@@ -97,9 +97,9 @@ fn sort_batch(batch: &RecordBatch, by: &[&str]) -> RecordBatch {
     let cols: Vec<SortColumn> = by
         .iter()
         .map(|name| SortColumn {
-            values:  batch.column(batch.schema().index_of(name).unwrap()).clone(),
+            values: batch.column(batch.schema().index_of(name).unwrap()).clone(),
             options: Some(SortOptions {
-                descending:  false,
+                descending: false,
                 nulls_first: false,
             }),
         })

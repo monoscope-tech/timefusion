@@ -2,10 +2,16 @@
 //!
 //! Rewrites `col LIKE 'pattern'` and `col ILIKE 'pattern'` on tantivy-indexed
 //! columns by **additively** AND-ing a `text_match(col, q)` call to the
-//! predicate. Exact `=` / `!=` are deliberately left alone — bloom filters and
-//! column stats prune equality on the Delta side correctly (including under
-//! `OR`/`IN`) and faster than the tantivy id-prefilter. The original comparison
-//! is never removed — it
+//! predicate. Exact `col = 'lit'` on **raw-tokenized** columns is also routed
+//! (gated by `tantivy.route_equality`, default on) — this is the lever for
+//! high-cardinality id lookups (trace_id/span_id/id/parent_id) that bloom/stats
+//! can't prune when row groups are coarse. It is correctness-safe under `OR`
+//! because `collect_text_matches` skips OR subtrees: an equality under a
+//! disjunction simply isn't collected (falls back to a plain scan), and the
+//! original `=` predicate is always preserved as the post-filter backstop.
+//! `!=` and `IN`-lists are never routed — `!=` has no term form, and an
+//! intersect-only id-prefilter can't express the OR-union an `IN`-list needs.
+//! The original comparison is never removed — it
 //! still applies as a post-filter on MemBuffer rows and Delta files whose
 //! tantivy index hasn't built yet (post-flush lag). The `text_match` call,
 //! once picked up by the existing routing logic in `ProjectRoutingTable`,
@@ -22,7 +28,7 @@
 //!
 //! | SQL form              | raw   | default | ngram3 |
 //! |-----------------------|-------|---------|--------|
-//! | `col = 'lit'`         | ❌ (bloom/stats) | ❌ (bloom/stats) | ❌ (bloom/stats) |
+//! | `col = 'lit'`         | ✅ term (route_equality) | ❌ (bloom/stats) | ❌ (bloom/stats) |
 //! | `col LIKE 'lit'`      | ✅    | ✅      | ✅      |
 //! | `col LIKE 'pre%'`     | ✅ prefix | ✅ prefix | ✅ prefix |
 //! | `col LIKE '%suf'`     | ❌    | ❌      | ✅ via ngram |
@@ -67,7 +73,19 @@ use crate::{
 const NGRAM_MIN_QUERY_LEN: usize = 3;
 
 #[derive(Debug, Default)]
-pub struct TantivyPredicateRewriter;
+pub struct TantivyPredicateRewriter {
+    /// Route exact `=` on raw columns through tantivy (`tantivy.route_equality`).
+    /// Carried as a field rather than read from the global config singleton so
+    /// the rule works under tests that build a `Database` from a local config
+    /// (the singleton may be uninitialized → `config()` panics).
+    route_equality: bool,
+}
+
+impl TantivyPredicateRewriter {
+    pub fn new(route_equality: bool) -> Self {
+        Self { route_equality }
+    }
+}
 
 impl AnalyzerRule for TantivyPredicateRewriter {
     fn name(&self) -> &str {
@@ -78,11 +96,12 @@ impl AnalyzerRule for TantivyPredicateRewriter {
         if matches!(plan, LogicalPlan::Dml(_)) {
             return Ok(plan);
         }
-        Ok(plan.transform_down(rewrite_node)?.data)
+        let allow_eq = self.route_equality;
+        Ok(plan.transform_down(|p| rewrite_node(p, allow_eq))?.data)
     }
 }
 
-fn rewrite_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+fn rewrite_node(plan: LogicalPlan, allow_eq: bool) -> Result<Transformed<LogicalPlan>> {
     match plan {
         LogicalPlan::Filter(mut filter) => {
             let Some(table) = find_indexed_table(&filter.input) else {
@@ -92,7 +111,7 @@ fn rewrite_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
                 Some(c) if !c.is_empty() => c,
                 _ => return Ok(Transformed::no(LogicalPlan::Filter(filter))),
             };
-            let new_pred = filter.predicate.clone().transform_down(|e| rewrite_expr(e, columns))?.data;
+            let new_pred = filter.predicate.clone().transform_down(|e| rewrite_expr(e, columns, allow_eq))?.data;
             filter.predicate = new_pred;
             Ok(Transformed::yes(LogicalPlan::Filter(filter)))
         }
@@ -100,14 +119,14 @@ fn rewrite_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     }
 }
 
-fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>) -> Result<Transformed<Expr>> {
+fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Result<Transformed<Expr>> {
     // Skip the children of a text_match call (already a tantivy predicate).
     if let Expr::ScalarFunction(sf) = &expr
         && sf.func.name() == TEXT_MATCH_NAME
     {
         return Ok(Transformed::new(expr, false, TreeNodeRecursion::Jump));
     }
-    if let Some((column, query)) = match_indexed_predicate(&expr, indexed_columns) {
+    if let Some((column, query)) = match_indexed_predicate(&expr, indexed_columns, allow_eq) {
         let tm = text_match_call(column, query);
         let wrapped = Expr::BinaryExpr(BinaryExpr::new(Box::new(expr), Operator::And, Box::new(tm)));
         Ok(Transformed::new(wrapped, true, TreeNodeRecursion::Jump))
@@ -120,13 +139,32 @@ fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>) -> 
 /// `(column_name, tantivy_query)`. Decision depends on the column's
 /// tokenizer — raw can't do substring; ngram3 can do everything; default
 /// is in between.
-fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'static str>) -> Option<(String, String)> {
+fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Option<(String, String)> {
     match expr {
-        // Exact `=` / `!=` are intentionally NOT accelerated via tantivy:
-        // bloom filters + column stats prune equality on the Delta side
-        // correctly (including under OR/IN) and faster than the tantivy
-        // id-prefilter, which also intersects id sets and breaks under OR
-        // (2026-06-16 dashboard bug). Tantivy is reserved for substring/LIKE.
+        // Exact `col = 'lit'` on a RAW-tokenized column: route as a term query.
+        // Raw is a single case-sensitive token, so the tantivy match set equals
+        // the `=` match set (the id-prefilter is exact, not just a superset).
+        // Safe under OR — `collect_text_matches` skips OR subtrees, so this is
+        // only ever intersected as a top-level conjunct; elsewhere it's dropped
+        // and the preserved `=` post-filters. `!=` is never routed (no term
+        // form); IN-lists aren't either (intersect-only prefilter can't OR).
+        // Gated by `route_equality` for instant rollback to bloom/stats-only.
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) if allow_eq => {
+            let (c, s) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(s, _)) | (Expr::Literal(s, _), Expr::Column(c)) => (c, s),
+                _ => return None,
+            };
+            let name = c_name(c);
+            if *indexed_columns.get(&name)? != RAW_TOKENIZER {
+                return None; // only exact-match (raw) columns; ngram3/default are lossy for `=`
+            }
+            let v = extract_utf8_string(s)?;
+            // Bail on empty or QueryParser-unsafe literals (the `=` still applies).
+            if v.is_empty() || !v.chars().all(is_eq_term_safe) {
+                return None;
+            }
+            Some((name, v))
+        }
         Expr::Like(Like {
             negated: false,
             expr: l,
@@ -259,6 +297,19 @@ fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: bool)
 /// original `=` / `LIKE` re-filters as the correctness backstop.
 fn is_tantivy_safe_term_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '/' | '@')
+}
+
+/// Stricter than `is_tantivy_safe_term_char`, for exact `=` routing. The literal
+/// is fed to tantivy's `QueryParser` as a term against a raw-tokenized field
+/// (one token = the whole value). QueryParser still interprets whitespace as a
+/// term separator (→ AND of sub-terms that can't match the single raw token →
+/// empty hits → an `id IN ()` that silently drops the real row) and other
+/// punctuation as query syntax. Restrict to chars that pass through QueryParser
+/// and the raw tokenizer unchanged: alphanumerics, `-`, `_` — enough for
+/// trace/span ids, UUIDs (the embedded `-` is safe, see the e2e dashed-UUID
+/// test), and enum values. Anything else bails to the preserved `=` post-filter.
+fn is_eq_term_safe(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '-' | '_')
 }
 
 fn text_match_call(column: String, query: String) -> Expr {
@@ -394,20 +445,86 @@ mod tests {
         assert_eq!(classify_like_pattern("foo\\%", Some('\\'), false), None);
     }
 
+    fn eq(col: &str, val: &str) -> Expr {
+        Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(datafusion::common::Column::new_unqualified(col))),
+            Operator::Eq,
+            Box::new(lit(val)),
+        ))
+    }
+
     #[test]
-    fn match_exact_eq_is_not_accelerated() {
-        // Exact equality is served by bloom filters / stats, not tantivy —
-        // avoids the OR-intersection prefilter bug (2026-06-16). `!=` was
-        // never rewritten either.
-        let cols: HashMap<String, &'static str> = HashMap::from([("service_name".to_string(), RAW_TOKENIZER)]);
-        for op in [Operator::Eq, Operator::NotEq] {
-            let e = Expr::BinaryExpr(BinaryExpr::new(
-                Box::new(Expr::Column(datafusion::common::Column::new_unqualified("service_name"))),
-                op,
-                Box::new(lit("user-api")),
-            ));
-            assert_eq!(match_indexed_predicate(&e, &cols), None, "{op:?} must not be accelerated");
-        }
+    fn match_eq_routed_on_raw_when_enabled() {
+        // P0: exact `=` on a raw column is routed as a term query when the flag
+        // is on — the high-card trace/span lookup acceleration.
+        let cols: HashMap<String, &'static str> = HashMap::from([("context___trace_id".to_string(), RAW_TOKENIZER)]);
+        assert_eq!(
+            match_indexed_predicate(&eq("context___trace_id", "d01762b88f4ed54d"), &cols, true),
+            Some(("context___trace_id".into(), "d01762b88f4ed54d".into()))
+        );
+    }
+
+    #[test]
+    fn match_eq_not_routed_when_flag_off() {
+        // route_equality=false reverts to bloom/stats-only (the prior behavior).
+        let cols: HashMap<String, &'static str> = HashMap::from([("context___trace_id".to_string(), RAW_TOKENIZER)]);
+        assert_eq!(match_indexed_predicate(&eq("context___trace_id", "abc123"), &cols, false), None);
+    }
+
+    #[test]
+    fn match_eq_not_routed_on_ngram3_or_neq() {
+        // `=` only routes on raw (exact) tokenizers; ngram3 is lossy for equality.
+        let cols: HashMap<String, &'static str> = HashMap::from([("name".to_string(), NGRAM3_TOKENIZER), ("tid".to_string(), RAW_TOKENIZER)]);
+        assert_eq!(match_indexed_predicate(&eq("name", "runServer"), &cols, true), None);
+        // `!=` is never routed (no term form), regardless of the flag.
+        let neq = Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(Expr::Column(datafusion::common::Column::new_unqualified("tid"))),
+            Operator::NotEq,
+            Box::new(lit("abc")),
+        ));
+        assert_eq!(match_indexed_predicate(&neq, &cols, true), None);
+    }
+
+    #[test]
+    fn match_eq_unsafe_literal_bails() {
+        // Literals QueryParser would mis-handle against a single raw token are
+        // left to the plain `=` (correctness over acceleration).
+        let cols: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER)]);
+        assert_eq!(match_indexed_predicate(&eq("tid", "a:b"), &cols, true), None, "colon is query syntax");
+        assert_eq!(
+            match_indexed_predicate(&eq("tid", "foo bar"), &cols, true),
+            None,
+            "space → AND-split can't match one raw token"
+        );
+        assert_eq!(match_indexed_predicate(&eq("tid", "a.b"), &cols, true), None, "dot conservatively excluded");
+        assert_eq!(match_indexed_predicate(&eq("tid", ""), &cols, true), None, "empty");
+        // A dashed UUID IS allowed — the embedded `-` survives (e2e-proven).
+        let uid = "0fee13b9-ac71-5c55-acd1-109542595054";
+        assert_eq!(match_indexed_predicate(&eq("tid", uid), &cols, true), Some(("tid".into(), uid.into())));
+    }
+
+    #[test]
+    fn eq_under_or_is_not_collected_but_conjunct_is() {
+        // End-to-end OR-safety: rewrite a disjunction of two raw `=`s, then run
+        // the scan-side collector. It MUST skip the OR subtree (else the
+        // 2026-06-16 empty-intersection bug returns). A top-level conjunct of
+        // the same `=` MUST be collected (acceleration engaged).
+        use crate::tantivy_index::udf::collect_text_matches;
+        let cols: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER), ("sid".to_string(), RAW_TOKENIZER)]);
+
+        let or_pred = Expr::BinaryExpr(BinaryExpr::new(Box::new(eq("tid", "x")), Operator::Or, Box::new(eq("sid", "y"))));
+        let rewritten = or_pred.transform_down(|e| rewrite_expr(e, &cols, true)).unwrap().data;
+        assert!(
+            collect_text_matches(&[rewritten]).is_empty(),
+            "an `=` under OR must not seed the intersect-only id-prefilter"
+        );
+
+        let and_pred = Expr::BinaryExpr(BinaryExpr::new(Box::new(eq("tid", "x")), Operator::And, Box::new(lit(true))));
+        let rewritten = and_pred.transform_down(|e| rewrite_expr(e, &cols, true)).unwrap().data;
+        let got = collect_text_matches(&[rewritten]);
+        assert_eq!(got.len(), 1, "a top-level conjunct `=` must seed the prefilter");
+        assert_eq!(got[0].column, "tid");
+        assert_eq!(got[0].query, "x");
     }
 
     #[test]
@@ -416,25 +533,25 @@ mod tests {
         // miss case variants; skip the rewrite.
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), RAW_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated:          false,
-            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern:          Box::new(lit("foo")),
-            escape_char:      None,
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("foo")),
+            escape_char: None,
             case_insensitive: true,
         });
-        assert_eq!(match_indexed_predicate(&e, &cols), None);
+        assert_eq!(match_indexed_predicate(&e, &cols, true), None);
     }
 
     #[test]
     fn match_ilike_substring_works_on_ngram3() {
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated:          false,
-            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern:          Box::new(lit("%foo%")),
-            escape_char:      None,
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("%foo%")),
+            escape_char: None,
             case_insensitive: true,
         });
-        assert_eq!(match_indexed_predicate(&e, &cols), Some(("c".into(), "foo".into())));
+        assert_eq!(match_indexed_predicate(&e, &cols, true), Some(("c".into(), "foo".into())));
     }
 }

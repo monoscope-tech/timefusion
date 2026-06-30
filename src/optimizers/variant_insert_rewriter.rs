@@ -71,10 +71,10 @@ fn rewrite_insert_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
         if let Some(new_input) = new_input {
             let new_dml = LogicalPlan::Dml(DmlStatement {
-                op:            dml.op.clone(),
-                table_name:    dml.table_name.clone(),
-                target:        dml.target.clone(),
-                input:         Arc::new(new_input),
+                op: dml.op.clone(),
+                table_name: dml.table_name.clone(),
+                target: dml.target.clone(),
+                input: Arc::new(new_input),
                 output_schema: dml.output_schema.clone(),
             });
             return Ok(Transformed::yes(new_dml));

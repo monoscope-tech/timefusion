@@ -23,7 +23,7 @@ mod pgwire_dml_tag {
         "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary)";
 
     struct TestServer {
-        port:     u16,
+        port: u16,
         shutdown: Arc<Notify>,
     }
 
@@ -199,6 +199,61 @@ mod pgwire_dml_tag {
             msgs.iter().any(|m| matches!(m, SimpleQueryMessage::CommandComplete(_))),
             "expected CommandComplete"
         );
+        Ok(())
+    }
+
+    /// Regression: monoscope's UPDATE-2 dual-write (`BackgroundJobs.hs`
+    /// `dualExecPgTf`) sends the span/trace/tag arrays as bound params
+    /// (`unnest($1::text[])`, Hasql `#{spanIds'}::text[]`) over the extended
+    /// protocol. This crashed prod with `Internal error: Assertion failed:
+    /// expr.is_empty(): Unnest(…)` even after `c8724f3` disabled leaf-expression
+    /// pushdown — that flag never covered this path. The real trigger is
+    /// `plan_cache::fold_literal_casts`, run by the pgwire DML hook after param
+    /// substitution: it rebuilt every node via `Unnest::with_new_exprs`, which
+    /// asserts an empty expr list while `Unnest::expressions()` returns its
+    /// `exec_columns`. Only a real bind + execute hits that hook, so pure
+    /// `optimize()` / `create_physical_plan()` on the TF session never reproduced it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn update_from_param_unnest_executes() -> Result<()> {
+        let server = TestServer::start().await?;
+        let client = server.client().await?;
+        let id = Uuid::new_v4().to_string();
+
+        client
+            .execute(
+                "INSERT INTO otel_logs_and_spans \
+                   (project_id, date, timestamp, id, name, context___span_id, context___trace_id, hashes, summary) \
+                 VALUES ('test_project', CURRENT_DATE, NOW(), $1, 'n', 's1', 't1', ARRAY[]::text[], ARRAY['s'])",
+                &[&id],
+            )
+            .await?;
+
+        let span_ids: Vec<String> = vec!["s1".into(), "s2".into()];
+        let trace_ids: Vec<String> = vec!["t1".into(), "t2".into()];
+        let tags: Vec<String> = vec!["pat:a".into(), "pat:b".into()];
+        // The regression is the crash: before the fix, executing this bound
+        // multi-column-unnest UPDATE returned `Internal error: Assertion failed:
+        // expr.is_empty()`. Reaching a clean `CommandComplete` (any row count) is
+        // the guard. Row-matching across MemBuffer/Delta is a separate concern.
+        client
+            .execute(
+                "UPDATE otel_logs_and_spans o \
+                    SET hashes = COALESCE(o.hashes, '{}'::text[]) || ARRAY[u.tag] \
+                    FROM ( \
+                      SELECT unnest($1::text[]) AS span_id, \
+                             unnest($2::text[]) AS trace_id, \
+                             unnest($3::text[]) AS tag \
+                    ) u \
+                    WHERE o.project_id = 'test_project' \
+                      AND o.timestamp >= '2020-01-01T00:00:00Z' \
+                      AND o.timestamp <  '2099-01-01T00:00:00Z' \
+                      AND o.context___span_id = u.span_id \
+                      AND o.context___trace_id = u.trace_id \
+                      AND NOT (COALESCE(o.hashes, '{}'::text[]) @> ARRAY[u.tag])",
+                &[&span_ids, &trace_ids, &tags],
+            )
+            .await?;
         Ok(())
     }
 }

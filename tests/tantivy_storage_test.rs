@@ -26,43 +26,44 @@ use timefusion::{
 
 fn table() -> TableSchema {
     TableSchema {
-        table_name:      "logs".into(),
-        partitions:      vec![],
+        table_name: "logs".into(),
+        partitions: vec![],
         sorting_columns: vec![SortingColumnDef {
-            name:        "timestamp".into(),
-            descending:  false,
+            name: "timestamp".into(),
+            descending: false,
             nulls_first: false,
         }],
         z_order_columns: vec![],
-        time_column:     None,
-        dedup_keys:      vec![],
-        fields:          vec![
+        time_column: None,
+        dedup_keys: vec![],
+        dedup_tiebreak: None,
+        fields: vec![
             FieldDef {
-                name:         "timestamp".into(),
-                data_type:    "Timestamp(Microsecond, Some(\"UTC\"))".into(),
-                nullable:     false,
-                tantivy:      None,
-                dictionary:   None,
+                name: "timestamp".into(),
+                data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(),
+                nullable: false,
+                tantivy: None,
+                dictionary: None,
                 bloom_filter: false,
             },
             FieldDef {
-                name:         "id".into(),
-                data_type:    "Utf8".into(),
-                nullable:     false,
-                tantivy:      None,
-                dictionary:   None,
+                name: "id".into(),
+                data_type: "Utf8".into(),
+                nullable: false,
+                tantivy: None,
+                dictionary: None,
                 bloom_filter: false,
             },
             FieldDef {
-                name:         "level".into(),
-                data_type:    "Utf8".into(),
-                nullable:     true,
-                tantivy:      Some(TantivyFieldConfig {
-                    indexed:   true,
+                name: "level".into(),
+                data_type: "Utf8".into(),
+                nullable: true,
+                tantivy: Some(TantivyFieldConfig {
+                    indexed: true,
                     tokenizer: Some("raw".into()),
-                    flatten:   None,
+                    flatten: None,
                 }),
-                dictionary:   None,
+                dictionary: None,
                 bloom_filter: false,
             },
         ],
@@ -112,13 +113,78 @@ async fn pack_upload_download_unpack_query_roundtrip() {
         hits,
         vec![Hit {
             timestamp_micros: 2_000_000,
-            id:               "b".into(),
+            id: "b".into(),
         }]
     );
 
     // Delete, then ensure it's gone
     store::delete(store_obj.as_ref(), &path).await.expect("delete");
     assert!(store::download(store_obj.as_ref(), &path).await.is_err());
+}
+
+/// Phase 2 primitive: index a parquet file read back from object storage
+/// (no live flush batches), published at the deterministic partition-mirrored
+/// path with the manifest keyed by the parquet rel path. Confirms the round
+/// trip is searchable — the reused builder behind reconcile/backfill/reindex.
+/// Uses the real `otel_logs_and_spans` schema (the only registered schema
+/// `build_index_for_file` can look up) over an InMemory store (no MinIO).
+#[tokio::test]
+async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
+    use serde_json::json;
+    use timefusion::{
+        config::TantivyConfig,
+        tantivy_index::{search::TantivySearchService, service::TantivyIndexService},
+        test_utils::test_helpers::json_to_batch,
+    };
+
+    const TABLE: &str = "otel_logs_and_spans";
+    let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let parquet_rel = "project_id=p1/date=2026-06-30/part-00000-test-c000.zstd.parquet";
+
+    // A 3-row otel batch; `id` is a raw-tokenized indexed column (P0).
+    let b = json_to_batch(
+        ["aaa", "row-b", "ccc"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                json!({ "timestamp": 1_700_000_000_000_000i64 + i as i64, "id": id, "name": "n",
+                        "level": "INFO", "project_id": "p1", "date": "2026-06-30", "hashes": [], "summary": ["s"] })
+            })
+            .collect(),
+    )
+    .expect("json_to_batch");
+
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        use deltalake::datafusion::parquet::arrow::ArrowWriter;
+        let mut w = ArrowWriter::try_new(&mut buf, b.schema(), None).unwrap();
+        w.write(&b).unwrap();
+        w.close().unwrap();
+    }
+    object_store::ObjectStoreExt::put(store_obj.as_ref(), &object_store::path::Path::from(parquet_rel), buf.into())
+        .await
+        .expect("put parquet");
+
+    // Build the index for that committed file.
+    let svc = Arc::new(TantivyIndexService::new(store_obj.clone(), Arc::new(TantivyConfig::default())));
+    svc.build_index_for_file(TABLE, "p1", parquet_rel, store_obj.clone()).await.expect("build_index_for_file");
+
+    // Manifest entry is keyed by the parquet rel path, points at the
+    // deterministic partition-mirrored blob, and the blob exists.
+    let m = manifest::load(store_obj.as_ref(), TABLE, "p1").await.unwrap();
+    let entry = m.entries.get(parquet_rel).expect("manifest entry keyed by parquet rel");
+    assert_eq!(entry.rows, 3);
+    assert!(entry.error.is_none());
+    let expected_blob = store::index_path_for_parquet(TABLE, parquet_rel).to_string();
+    assert_eq!(entry.index.as_deref(), Some(expected_blob.as_str()));
+    assert_eq!(entry.covered_files, vec![parquet_rel.to_string()]);
+    store::download(store_obj.as_ref(), &object_store::path::Path::from(expected_blob)).await.expect("blob exists");
+
+    // And the published index is actually searchable end-to-end.
+    let cache = TempDir::new().unwrap();
+    let search = TantivySearchService::new(store_obj.clone(), cache.path().to_path_buf());
+    let hits = search.search(TABLE, "p1", "id", "row-b").await.expect("search").expect("some hits");
+    assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["row-b"]);
 }
 
 #[tokio::test]
@@ -133,14 +199,14 @@ async fn manifest_load_default_when_missing() {
 async fn manifest_upsert_and_remove_roundtrip() {
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let entry = ManifestEntry {
-        index:                Some("indexes/logs/v1/proj1/uuid-1.tantivy.tar.zst".into()),
-        rows:                 100,
-        built_at:             Utc::now(),
-        schema_version:       manifest::SCHEMA_VERSION,
+        index: Some("indexes/logs/v1/proj1/uuid-1.tantivy.tar.zst".into()),
+        rows: 100,
+        built_at: Utc::now(),
+        schema_version: manifest::SCHEMA_VERSION,
         min_timestamp_micros: Some(1_000_000),
         max_timestamp_micros: Some(2_000_000),
-        error:                None,
-        covered_files:        vec!["part-uuid-1.parquet".into()],
+        error: None,
+        covered_files: vec!["part-uuid-1.parquet".into()],
     };
     manifest::upsert(store_obj.as_ref(), "logs", "proj1", "part-uuid-1.parquet", entry.clone()).await.expect("upsert 1");
     manifest::upsert(
@@ -149,14 +215,14 @@ async fn manifest_upsert_and_remove_roundtrip() {
         "proj1",
         "part-uuid-2.parquet",
         ManifestEntry {
-            index:                None,
-            rows:                 0,
-            built_at:             Utc::now(),
-            schema_version:       1,
+            index: None,
+            rows: 0,
+            built_at: Utc::now(),
+            schema_version: 1,
             min_timestamp_micros: None,
             max_timestamp_micros: None,
-            error:                Some("boom".into()),
-            covered_files:        vec![],
+            error: Some("boom".into()),
+            covered_files: vec![],
         },
     )
     .await
@@ -189,14 +255,14 @@ async fn concurrent_upserts_last_writer_wins() {
                 "proj1",
                 "part-uuid-A.parquet",
                 ManifestEntry {
-                    index:                Some("a".into()),
-                    rows:                 1,
-                    built_at:             Utc::now(),
-                    schema_version:       1,
+                    index: Some("a".into()),
+                    rows: 1,
+                    built_at: Utc::now(),
+                    schema_version: 1,
                     min_timestamp_micros: None,
                     max_timestamp_micros: None,
-                    error:                None,
-                    covered_files:        vec![],
+                    error: None,
+                    covered_files: vec![],
                 },
             )
             .await
@@ -208,14 +274,14 @@ async fn concurrent_upserts_last_writer_wins() {
                 "proj1",
                 "part-uuid-B.parquet",
                 ManifestEntry {
-                    index:                Some("b".into()),
-                    rows:                 2,
-                    built_at:             Utc::now(),
-                    schema_version:       1,
+                    index: Some("b".into()),
+                    rows: 2,
+                    built_at: Utc::now(),
+                    schema_version: 1,
                     min_timestamp_micros: None,
                     max_timestamp_micros: None,
-                    error:                None,
-                    covered_files:        vec![],
+                    error: None,
+                    covered_files: vec![],
                 },
             )
             .await

@@ -50,15 +50,15 @@ use crate::errors::arrow_err;
 
 #[derive(Debug)]
 pub struct DedupExec {
-    input:             Arc<dyn ExecutionPlan>,
-    keys:              Vec<String>,
+    input: Arc<dyn ExecutionPlan>,
+    keys: Vec<String>,
     /// Indices of the key columns within `input.schema()`.
-    key_idxs:          Vec<usize>,
+    key_idxs: Vec<usize>,
     /// Indices into `input.schema()` to emit after dedup, restoring the
     /// originally-requested projection. `None` = emit the input schema as-is.
     output_projection: Option<Vec<usize>>,
-    schema:            SchemaRef,
-    properties:        Arc<PlanProperties>,
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
 }
 
 impl DedupExec {

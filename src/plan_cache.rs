@@ -67,11 +67,12 @@ use crate::errors::arrow_err;
 /// `ValuesExec` see plain literals.
 fn fold_literal_casts(plan: LogicalPlan) -> datafusion::error::Result<LogicalPlan> {
     plan.transform_up(|node| {
+        let mut changed = false;
         let new_exprs: Vec<Expr> = node
             .expressions()
             .into_iter()
             .map(|expr| {
-                expr.transform_up(|e| {
+                let t = expr.transform_up(|e| {
                     if let Expr::Cast(Cast { expr, field }) = &e
                         && let Expr::Literal(value, metadata) = expr.as_ref()
                     {
@@ -90,10 +91,21 @@ fn fold_literal_casts(plan: LogicalPlan) -> datafusion::error::Result<LogicalPla
                         };
                     }
                     Ok(Transformed::no(e))
-                })
-                .map(|t| t.data)
+                })?;
+                changed |= t.transformed;
+                Ok(t.data)
             })
             .collect::<datafusion::error::Result<_>>()?;
+        // Only rebuild when a cast was actually folded. `with_new_exprs` rejects
+        // some nodes whose `expressions()`/`with_new_exprs` round-trip isn't
+        // identity — notably `Unnest`, whose `expressions()` returns its
+        // `exec_columns` but `with_new_exprs` asserts an empty expr list (DF54).
+        // monoscope's `UPDATE … FROM (SELECT unnest($1::text[]) …)` dual-write
+        // carries exactly such an `Unnest`; rebuilding it unconditionally tripped
+        // `Internal error: Assertion failed: expr.is_empty()`.
+        if !changed {
+            return Ok(Transformed::no(node));
+        }
         let rebuilt = node.with_new_exprs(new_exprs, node.inputs().into_iter().cloned().collect())?;
         Ok(Transformed::yes(rebuilt))
     })
@@ -317,10 +329,10 @@ pub fn global() -> Option<std::sync::Arc<PlanCacheHook>> {
 /// that just clears the cache once exceeded — cheap, correct, and never holds
 /// a lock across the await in `handle_simple_query`.
 pub struct PlanCacheHook {
-    cache:    dashmap::DashMap<String, LogicalPlan>,
+    cache: dashmap::DashMap<String, LogicalPlan>,
     capacity: usize,
-    hits:     std::sync::atomic::AtomicU64,
-    misses:   std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
 }
 
 impl Default for PlanCacheHook {
@@ -332,10 +344,10 @@ impl Default for PlanCacheHook {
 impl PlanCacheHook {
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache:    dashmap::DashMap::new(),
+            cache: dashmap::DashMap::new(),
             capacity: capacity.max(1),
-            hits:     std::sync::atomic::AtomicU64::new(0),
-            misses:   std::sync::atomic::AtomicU64::new(0),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

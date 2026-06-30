@@ -12,6 +12,7 @@
 use std::{
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -26,6 +27,47 @@ pub const BLOB_SUFFIX: &str = ".tantivy.tar.zst";
 /// Object-store path for a given parquet file's index blob.
 pub fn blob_path(table: &str, project_id: &str, file_uuid: &str) -> ObjPath {
     ObjPath::from(format!("{INDEX_PREFIX}/{table}/{INDEX_VERSION}/{project_id}/{file_uuid}{BLOB_SUFFIX}"))
+}
+
+/// Partition-mirrored index blob path derived from a parquet file's path
+/// relative to its Delta table root, e.g.
+///   project_id=<uuid>/date=<d>/part-<id>-c000.zstd.parquet
+/// → indexes/{table}/v1/project_id=<uuid>/date=<d>/part-<id>-c000.zstd.tantivy.tar.zst
+///
+/// A pure suffix swap under the version prefix, so the mapping is 1:1 with the
+/// parquet tree and reversible (`index_to_parquet_rel` is the inverse):
+/// "does every live parquet have an index?" / "are there orphan blobs?" reduce
+/// to a list + diff against the Delta add-file set.
+pub fn index_path_for_parquet(table: &str, parquet_rel: &str) -> ObjPath {
+    let stem = parquet_rel.strip_suffix(".parquet").unwrap_or(parquet_rel);
+    ObjPath::from(format!("{INDEX_PREFIX}/{table}/{INDEX_VERSION}/{stem}{BLOB_SUFFIX}"))
+}
+
+/// Inverse of `index_path_for_parquet`: recover the table-relative parquet
+/// path from an index blob path, or `None` if it isn't a partition-mirrored
+/// blob for `table`. Used by reconcile to detect orphan blobs (no live parquet).
+pub fn index_to_parquet_rel(table: &str, blob_path: &str) -> Option<String> {
+    let prefix = format!("{INDEX_PREFIX}/{table}/{INDEX_VERSION}/");
+    let stem = blob_path.strip_prefix(&prefix)?.strip_suffix(BLOB_SUFFIX)?;
+    Some(format!("{stem}.parquet"))
+}
+
+/// Read a parquet file (path relative to the Delta table root) back into Arrow
+/// RecordBatches via the object store. Powers indexing a file that's already
+/// committed (post-optimize reindex, reconcile, backfill) — unlike the flush
+/// path it has no live in-memory batches to consume.
+pub async fn read_parquet_batches(store: Arc<dyn ObjectStore>, parquet_rel: &str) -> Result<Vec<arrow::record_batch::RecordBatch>> {
+    use deltalake::datafusion::parquet::arrow::async_reader::{ParquetObjectReader, ParquetRecordBatchStreamBuilder};
+    use futures::TryStreamExt;
+    let path = ObjPath::from(parquet_rel);
+    let meta = store.head(&path).await.with_context(|| format!("head {parquet_rel}"))?;
+    let reader = ParquetObjectReader::new(store, path).with_file_size(meta.size);
+    let stream = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .context("parquet stream builder")?
+        .build()
+        .context("build parquet stream")?;
+    stream.try_collect::<Vec<_>>().await.context("collect parquet batches")
 }
 
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot, then
@@ -109,4 +151,25 @@ pub async fn delete(store: &dyn ObjectStore, path: &ObjPath) -> Result<()> {
 /// Local cache directory for a (project_id, table, file_uuid).
 pub fn local_cache_path(root: &Path, table: &str, project_id: &str, file_uuid: &str) -> PathBuf {
     root.join("tantivy_cache").join(table).join(project_id).join(file_uuid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parquet_index_path_is_partition_mirrored_and_reversible() {
+        let table = "otel_logs_and_spans";
+        let rel = "project_id=abc-123/date=2026-06-30/part-00000-deadbeef-c000.zstd.parquet";
+        let blob = index_path_for_parquet(table, rel).to_string();
+        assert_eq!(
+            blob,
+            "indexes/otel_logs_and_spans/v1/project_id=abc-123/date=2026-06-30/part-00000-deadbeef-c000.zstd.tantivy.tar.zst"
+        );
+        // inverse recovers the exact parquet rel path
+        assert_eq!(index_to_parquet_rel(table, &blob).as_deref(), Some(rel));
+        // a blob for a different table / a non-blob path is not ours
+        assert_eq!(index_to_parquet_rel("other_table", &blob), None);
+        assert_eq!(index_to_parquet_rel(table, "indexes/otel_logs_and_spans/v1/foo.txt"), None);
+    }
 }

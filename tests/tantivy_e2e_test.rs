@@ -44,6 +44,7 @@ fn cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
     c.cache.timefusion_foyer_disabled = true;
     c.tantivy = TantivyConfig {
         timefusion_tantivy_compression_level: 3,
+        timefusion_tantivy_route_equality: true, // exercise the P0 `=` routing path
         ..Default::default()
     };
     Arc::new(c)
@@ -376,5 +377,160 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     let r2_off = collect_ids(&ctx2, &q2).await?;
     assert_eq!(r2_on, r2_off);
     assert_eq!(r2_on, vec!["k3".to_string(), "k4".to_string()]);
+    Ok(())
+}
+
+/// P0 end-to-end: exact `level = 'ERROR'` on a raw-tokenized column is routed
+/// through the tantivy id-prefilter (route_equality=true) after flush. Verifies
+/// (a) correctness — the prefiltered result equals the full-scan baseline, no
+/// rows dropped/duplicated; (b) the OR-safety regression: `level='ERROR' OR
+/// name='billing'` must NOT collapse to ∅ (the 2026-06-16 bug) — `collect_text_matches`
+/// skips the OR subtree, so the scan falls back and the original predicate runs.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn flushed_eq_prefilter_matches_baseline_and_or_is_safe() -> Result<()> {
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let (db, ctx, svc) = build_db(&format!("{id}-eq-on"), true).await?;
+    let (db2, ctx2, _) = build_db(&format!("{id}-eq-off"), false).await?;
+    let p = unique_project();
+    let svc = svc.expect("tantivy enabled");
+
+    // level derived from message: "failed"/"declined" → ERROR, else INFO.
+    let rows = vec![
+        ("k1", "auth", "login failed: bad password"), // ERROR
+        ("k2", "auth", "login successful"),           // INFO
+        ("k3", "billing", "charge declined"),         // ERROR
+        ("k4", "billing", "charge succeeded"),        // INFO
+    ];
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
+    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
+    db.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    db2.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    wait_for_manifest_entries(svc.object_store.as_ref(), &p, 1).await?;
+
+    // (a) Exact `=` routes through tantivy; result must equal the baseline.
+    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND level = 'ERROR'");
+    let r_on = collect_ids(&ctx, &q).await?;
+    let r_off = collect_ids(&ctx2, &q).await?;
+    assert_eq!(r_on, r_off, "`level='ERROR'` prefilter must match the full-scan baseline");
+    assert_eq!(r_on, vec!["k1".to_string(), "k3".to_string()]);
+
+    // (b) OR must not return ∅: ERROR rows (k1,k3) ∪ billing rows (k3,k4) = {k1,k3,k4}.
+    let q_or = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND (level = 'ERROR' OR name = 'billing')");
+    let or_on = collect_ids(&ctx, &q_or).await?;
+    let or_off = collect_ids(&ctx2, &q_or).await?;
+    assert_eq!(or_on, or_off, "OR of two `=`s must match baseline (no empty-intersection bug)");
+    assert_eq!(or_on, vec!["k1".to_string(), "k3".to_string(), "k4".to_string()]);
+    Ok(())
+}
+
+/// P0 regression: exact `id = '<uuid>'` on a raw-tokenized column where the
+/// value contains QueryParser-special chars (the `-` in a UUID is a NOT
+/// operator to tantivy's QueryParser). The prefilter MUST still return the
+/// matching flushed row, not zero it out. Reproduces the bug where routing
+/// equality through `QueryParser::parse_query` ate the dashes → empty hits →
+/// `id IN ()` → the real Delta row silently dropped.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let (db, ctx, svc) = build_db(&format!("{id}-uuideq-on"), true).await?;
+    let (db2, ctx2, _) = build_db(&format!("{id}-uuideq-off"), false).await?;
+    let p = unique_project();
+    let svc = svc.expect("tantivy enabled");
+
+    let uid = "0fee13b9-ac71-5c55-acd1-109542595054"; // realistic monoscope id: dashes = QueryParser NOT
+    let rows = vec![(uid, "auth", "login ok"), ("11111111-2222-3333-4444-555555555555", "auth", "other")];
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
+    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
+    db.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    db2.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    wait_for_manifest_entries(svc.object_store.as_ref(), &p, 1).await?;
+
+    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND id = '{uid}'");
+    let r_on = collect_ids(&ctx, &q).await?;
+    let r_off = collect_ids(&ctx2, &q).await?;
+    assert_eq!(
+        r_on, r_off,
+        "exact `id=` on a dashed UUID must match baseline (QueryParser must not eat the `-`)"
+    );
+    assert_eq!(r_on, vec![uid.to_string()]);
+
+    // DECISIVE: query the tantivy search service directly so the result can't
+    // be rescued by the full-scan fallback. If this returns the uid, the
+    // prefilter genuinely fires for exact dashed-UUID equality; if it's empty,
+    // the SQL test above only passed because the scan fell back (P0 = no-op).
+    let cache_root = std::path::PathBuf::from(format!("/tmp/timefusion-tantivy-e2e-{id}-uuideq-on"));
+    let search = TantivySearchService::new(svc.object_store.clone(), cache_root);
+    let hits: Vec<String> = search
+        .search_with_stats(TABLE, &p, "id", uid, 1000, None)
+        .await?
+        .map(|r| r.hits.into_iter().map(|h| h.id).collect())
+        .unwrap_or_default();
+    assert!(
+        hits.contains(&uid.to_string()),
+        "tantivy exact search on `id` must return the dashed UUID, not fall back; got {hits:?}"
+    );
+    assert!(
+        !hits.contains(&"11111111-2222-3333-4444-555555555555".to_string()),
+        "must not over-match other ids; got {hits:?}"
+    );
+    Ok(())
+}
+
+/// Read-side coverage gate: when a live Delta file overlapping the query window
+/// is NOT covered by a successful index (compacted away, external write, failed
+/// build), the `id IN (hits)` prefilter would silently drop that file's rows.
+/// The gate must detect the gap and skip the prefilter (full scan) so the
+/// result still equals the baseline. Reproduces the landmine: two flushes →
+/// two live parquet files; we neuter one manifest entry (index=None) leaving
+/// its file live-but-uncovered, then confirm `text_match` still returns BOTH
+/// files' rows. Without the gate, the prefilter intersects only the covered
+/// file's hits and the other file's matching row vanishes.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn uncovered_live_file_skips_prefilter_not_rows() -> Result<()> {
+    use timefusion::tantivy_index::manifest;
+
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let (db, ctx, svc) = build_db(&format!("{id}-cov-on"), true).await?;
+    let (db2, ctx2, _) = build_db(&format!("{id}-cov-off"), false).await?;
+    let p = unique_project();
+    let svc = svc.expect("tantivy enabled");
+
+    // Two separate flushes → two parquet files, each with its own index entry.
+    for (db_x, rows) in [(&db, ("c1", "login alpha")), (&db2, ("c1", "login alpha"))] {
+        db_x.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![(rows.0, "n", rows.1)])], false, None).await?;
+        db_x.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    }
+    for (db_x, rows) in [(&db, ("c2", "login beta")), (&db2, ("c2", "login beta"))] {
+        db_x.insert_records_batch(&p, TABLE, vec![make_batch(&p, vec![(rows.0, "n", rows.1)])], false, None).await?;
+        db_x.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    }
+    let store = svc.object_store.clone();
+    let m = wait_for_manifest_entries(store.as_ref(), &p, 2).await?;
+    assert_eq!(m.entries.len(), 2, "two flushes → two entries");
+
+    // Baseline: both rows match `login` before we break coverage.
+    let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND text_match(status_message, 'login')");
+    assert_eq!(collect_ids(&ctx, &q).await?, vec!["c1".to_string(), "c2".to_string()]);
+
+    // Neuter exactly one entry: its parquet stays LIVE in Delta but is now
+    // uncovered (index=None). The other entry remains valid + returns hits.
+    let mut m2 = manifest::load(store.as_ref(), TABLE, &p).await?;
+    let first_key = m2.entries.keys().next().cloned().unwrap();
+    let e = m2.entries.get_mut(&first_key).unwrap();
+    e.index = None;
+    e.error = Some("simulated uncovered file".into());
+    manifest::save(store.as_ref(), TABLE, &p, &m2).await?;
+
+    // With one live file uncovered, the prefilter must be skipped (gate trips),
+    // so the full scan still returns BOTH rows — equal to the tantivy-off
+    // baseline. A prefilter that ignored coverage would drop the uncovered
+    // file's row.
+    let r_on = collect_ids(&ctx, &q).await?;
+    let r_off = collect_ids(&ctx2, &q).await?;
+    assert_eq!(r_on, r_off, "uncovered live file must not drop rows from the prefilter");
+    assert_eq!(r_on, vec!["c1".to_string(), "c2".to_string()], "both matching rows survive the coverage gate");
     Ok(())
 }

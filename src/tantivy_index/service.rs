@@ -31,8 +31,8 @@ use crate::{
 /// Owns the object store + tantivy config and produces a callback.
 #[derive(Debug)]
 pub struct TantivyIndexService {
-    pub object_store:      Arc<dyn ObjectStore>,
-    pub config:            Arc<TantivyConfig>,
+    pub object_store: Arc<dyn ObjectStore>,
+    pub config: Arc<TantivyConfig>,
     /// Max `max_timestamp_micros` across every index this process has
     /// successfully published. Feeds the `index_lag_seconds` gauge. Loaded
     /// from manifests on first observation (lazy) and updated after each
@@ -87,51 +87,70 @@ impl TantivyIndexService {
     async fn build_and_publish(
         &self, project_id: &str, table_name: &str, batches: Vec<arrow::record_batch::RecordBatch>, added_files: Vec<String>,
     ) -> Result<()> {
-        let table = schema_loader::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?;
         let bucket_uuid = Uuid::new_v4().to_string();
-        // Build & pack
+        let path = store::blob_path(table_name, project_id, &bucket_uuid);
+        self.build_pack_upload(table_name, project_id, &bucket_key(&bucket_uuid), path, added_files, batches).await
+    }
+
+    /// Build & publish an index for a single already-committed parquet file,
+    /// reading it back from `delta_store` (rooted at the table), keyed by the
+    /// table-RELATIVE `parquet_rel` at the deterministic partition-mirrored
+    /// path. Idempotent. The reused primitive behind reconcile/backfill/reindex
+    /// (none hold the live flush batches). Not yet wired into the live path:
+    /// its relative keying doesn't match the absolute-URI flush entries the
+    /// coverage gate / `gc_after_compaction` check, pending Phase-3 unification.
+    pub async fn build_index_for_file(&self, table_name: &str, project_id: &str, parquet_rel: &str, delta_store: Arc<dyn ObjectStore>) -> Result<()> {
+        let batches = store::read_parquet_batches(delta_store, parquet_rel).await?;
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let path = store::index_path_for_parquet(table_name, parquet_rel);
+        self.build_pack_upload(table_name, project_id, parquet_rel, path, vec![parquet_rel.to_string()], batches).await
+    }
+
+    /// Build+pack `batches`, upload to `blob_path`, and upsert the manifest
+    /// entry keyed by `manifest_key`. On build failure records a failed entry
+    /// (index=None, error set) and returns the error. Shared by the flush
+    /// callback (random bucket key + flat path) and `build_index_for_file`
+    /// (parquet-rel key + partition-mirrored path).
+    async fn build_pack_upload(
+        &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>,
+        batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<()> {
+        let svc_table = schema_loader::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?.clone();
         let level = self.config.compression_level();
-        let svc_table = table.clone();
-        let svc_batches = batches.clone();
-        let pack_result = tokio::task::spawn_blocking(move || store::build_and_pack(&svc_table, &svc_batches, level))
-            .await
-            .context("join build")?;
+        let pack_result = tokio::task::spawn_blocking(move || store::build_and_pack(&svc_table, &batches, level)).await.context("join build")?;
         let (blob, stats) = match pack_result {
             Ok(v) => v,
             Err(e) => {
-                let key = bucket_key(&bucket_uuid);
                 let entry = ManifestEntry {
-                    index:                None,
-                    rows:                 0,
-                    built_at:             Utc::now(),
-                    schema_version:       manifest::SCHEMA_VERSION,
+                    index: None,
+                    rows: 0,
+                    built_at: Utc::now(),
+                    schema_version: manifest::SCHEMA_VERSION,
                     min_timestamp_micros: None,
                     max_timestamp_micros: None,
-                    error:                Some(format!("build failed: {e}")),
-                    covered_files:        added_files.clone(),
+                    error: Some(format!("build failed: {e}")),
+                    covered_files: covered_files.clone(),
                 };
-                let _ = manifest::upsert(self.object_store.as_ref(), table_name, project_id, &key, entry).await;
+                let _ = manifest::upsert(self.object_store.as_ref(), table_name, project_id, manifest_key, entry).await;
                 warn!("tantivy build failed for {project_id}/{table_name}: {e}");
                 return Err(e);
             }
         };
         debug!("tantivy index for {project_id}/{table_name} built: rows={} bytes={}", stats.rows, blob.len());
-
-        let path = store::blob_path(table_name, project_id, &bucket_uuid);
-        store::upload(self.object_store.as_ref(), &path, blob).await?;
-
-        let key = bucket_key(&bucket_uuid);
+        store::upload(self.object_store.as_ref(), &blob_path, blob).await?;
         let entry = ManifestEntry {
-            index:                Some(path.to_string()),
-            rows:                 stats.rows,
-            built_at:             Utc::now(),
-            schema_version:       manifest::SCHEMA_VERSION,
+            index: Some(blob_path.to_string()),
+            rows: stats.rows,
+            built_at: Utc::now(),
+            schema_version: manifest::SCHEMA_VERSION,
             min_timestamp_micros: stats.min_timestamp_micros,
             max_timestamp_micros: stats.max_timestamp_micros,
-            error:                None,
-            covered_files:        added_files,
+            error: None,
+            covered_files,
         };
-        manifest::upsert(self.object_store.as_ref(), table_name, project_id, &key, entry).await?;
+        manifest::upsert(self.object_store.as_ref(), table_name, project_id, manifest_key, entry).await?;
         self.observe_newest(stats.max_timestamp_micros);
         Ok(())
     }
@@ -188,8 +207,8 @@ impl TantivyIndexService {
 
 #[derive(Debug, Default, Clone)]
 pub struct GcReport {
-    pub kept:               usize,
-    pub entries_removed:    usize,
-    pub blobs_deleted:      usize,
+    pub kept: usize,
+    pub entries_removed: usize,
+    pub blobs_deleted: usize,
     pub blob_delete_errors: usize,
 }

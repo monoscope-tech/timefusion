@@ -61,9 +61,9 @@ type DeltaProviderCache = dashmap::DashMap<(String, String), (u64, Arc<DeltaProv
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanShape {
-    skipped_delta:    bool,
-    has_mem:          bool,
-    has_delta:        bool,
+    skipped_delta: bool,
+    has_mem: bool,
+    has_delta: bool,
     fast_resolve_hit: Option<bool>,
 }
 
@@ -73,13 +73,13 @@ struct ScanShape {
 /// compute without sorting.
 #[derive(Debug, Default)]
 pub struct ScanMetrics {
-    pub scans_total:              std::sync::atomic::AtomicU64,
-    pub scans_skipped_delta:      std::sync::atomic::AtomicU64,
-    pub scans_mem_only:           std::sync::atomic::AtomicU64,
-    pub scans_delta_only:         std::sync::atomic::AtomicU64,
-    pub scans_mem_plus_delta:     std::sync::atomic::AtomicU64,
-    pub fast_resolve_hits:        std::sync::atomic::AtomicU64,
-    pub fast_resolve_misses:      std::sync::atomic::AtomicU64,
+    pub scans_total: std::sync::atomic::AtomicU64,
+    pub scans_skipped_delta: std::sync::atomic::AtomicU64,
+    pub scans_mem_only: std::sync::atomic::AtomicU64,
+    pub scans_delta_only: std::sync::atomic::AtomicU64,
+    pub scans_mem_plus_delta: std::sync::atomic::AtomicU64,
+    pub fast_resolve_hits: std::sync::atomic::AtomicU64,
+    pub fast_resolve_misses: std::sync::atomic::AtomicU64,
     /// Delta TableProvider cache: hit = cached cell at the current snapshot
     /// version; miss = either no entry, or an entry at a stale version that
     /// had to be replaced. Operators tracking the cold-start vs steady-state
@@ -87,8 +87,8 @@ pub struct ScanMetrics {
     /// (project, table), this should stay high; a low ratio in prod means
     /// version is churning faster than expected (e.g. very aggressive
     /// compaction) and the cache isn't paying for itself.
-    pub provider_cache_hits:      std::sync::atomic::AtomicU64,
-    pub provider_cache_misses:    std::sync::atomic::AtomicU64,
+    pub provider_cache_hits: std::sync::atomic::AtomicU64,
+    pub provider_cache_misses: std::sync::atomic::AtomicU64,
     /// Provider builds that started against a version that was already
     /// stale by the time the build finished — the DashMap entry got
     /// replaced under us (a flush bumped the version) and the rebuilt
@@ -102,15 +102,15 @@ pub struct ScanMetrics {
     /// in a single bucket via `usize::leading_zeros` math. Bucket i holds
     /// scans whose duration_us fits in `[1<<i, 1<<(i+1))`. 32 buckets covers
     /// 1us through ~1.2 hours.
-    pub scan_latency_buckets:     [std::sync::atomic::AtomicU64; 32],
+    pub scan_latency_buckets: [std::sync::atomic::AtomicU64; 32],
     /// End-to-end pgwire query latency histogram (same bucket scheme as
     /// `scan_latency_buckets`). Recorded by `LoggingSimpleHandler` and
     /// `LoggingExtendedQueryHandler` around the `DfSessionService::do_query`
     /// call — the FULL server-side path from "harness received our query"
     /// through "result encoded back to client". Compare to scan p95/p99 to
     /// see how much of the user-visible tail is outside the scan call.
-    pub pgwire_total:             std::sync::atomic::AtomicU64,
-    pub pgwire_latency_buckets:   [std::sync::atomic::AtomicU64; 32],
+    pub pgwire_total: std::sync::atomic::AtomicU64,
+    pub pgwire_latency_buckets: [std::sync::atomic::AtomicU64; 32],
 }
 
 impl ScanMetrics {
@@ -325,6 +325,18 @@ fn within_recency(uri: &str, cutoff: Option<chrono::NaiveDate>) -> bool {
     // Single source of truth for `date=` partition recency parsing, shared with
     // the object-store cache admission window.
     crate::object_store_cache::date_partition_within(uri, cutoff)
+}
+
+/// Whether `uri`'s `date=YYYY-MM-DD` Hive partition overlaps the `[lo, hi]`
+/// microsecond window, at day granularity. Absent/unparseable date ⇒ `true`
+/// (conservative: treat as in-window so the coverage gate still demands an
+/// index for it). Open bounds (`i64::MIN`/`MAX`) match everything on that side.
+fn uri_date_in_window(uri: &str, lo: i64, hi: i64) -> bool {
+    let Some(d) = crate::object_store_cache::date_partition_of(uri) else {
+        return true;
+    };
+    let to_date = |ts: i64, open: i64| (ts != open).then(|| chrono::DateTime::from_timestamp_micros(ts)).flatten().map(|dt| dt.date_naive());
+    to_date(lo, i64::MIN).is_none_or(|l| d >= l) && to_date(hi, i64::MAX).is_none_or(|h| d <= h)
 }
 
 /// The cache-key prefix for a table: its URI minus any `?endpoint=...` query
@@ -799,22 +811,22 @@ const COMPRESSION_TIER_KEY: &str = "timefusion.compression_tier";
 
 #[derive(Clone, Serialize, Deserialize, sqlx::FromRow, derive_more::Debug)]
 struct StorageConfig {
-    project_id:           String,
-    table_name:           String,
-    s3_bucket:            String,
-    s3_prefix:            String,
-    s3_region:            String,
+    project_id: String,
+    table_name: String,
+    s3_bucket: String,
+    s3_prefix: String,
+    s3_region: String,
     /// Skipped on serialize so credentials never leak through serde-based dumps
     /// (debug endpoints, metrics serialization, etc.). sqlx::FromRow bypasses
     /// serde so DB-row loading is unaffected. `#[debug("[redacted]")]` keeps
     /// them out of `{:?}` log lines.
     #[serde(serialize_with = "redact_str")]
     #[debug("[redacted]")]
-    s3_access_key_id:     String,
+    s3_access_key_id: String,
     #[serde(serialize_with = "redact_str")]
     #[debug("[redacted]")]
     s3_secret_access_key: String,
-    s3_endpoint:          Option<String>,
+    s3_endpoint: Option<String>,
 }
 
 fn redact_str<S: serde::Serializer>(_: &str, ser: S) -> std::result::Result<S::Ok, S::Error> {
@@ -823,16 +835,16 @@ fn redact_str<S: serde::Serializer>(_: &str, ser: S) -> std::result::Result<S::O
 
 #[derive(Debug, Clone)]
 pub struct Database {
-    config:                          Arc<AppConfig>,
+    config: Arc<AppConfig>,
     /// One RuntimeEnv (and thus one memory pool) shared by every session
     /// context, across `Database` clones. Per-context pools each granted the
     /// full `memory_limit × fraction` budget, so N contexts oversubscribed
     /// the cgroup N×; the pool only enforces a global cap if it's global.
-    runtime_env:                     Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
-    unified_tables:                  UnifiedTables,
+    unified_tables: UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
-    custom_project_tables:           CustomProjectTables,
+    custom_project_tables: CustomProjectTables,
     /// Lock-free per-(project,table) cache of resolved Delta table refs. The
     /// inner `Arc<RwLock<DeltaTable>>` is the same object held in
     /// `unified_tables`/`custom_project_tables`, so update_state on the slow
@@ -855,7 +867,7 @@ pub struct Database {
     /// — entries for tables dropped at runtime persist until process
     /// restart. Watch `scan.fast_resolve_cache_entries` in
     /// `timefusion_stats` for unbounded growth.
-    fast_resolve_cache:              dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
+    fast_resolve_cache: dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
     /// Per-(project,table) sticky bit: "Delta may hold matching files."
     /// Two seed paths so the bit is always at least as conservative as truth
     /// — never falsely `false`:
@@ -882,7 +894,7 @@ pub struct Database {
     /// (incorrect — would lose visibility between clones) or removing the
     /// derive (invasive). The extra heap allocation per tenant pair is a
     /// few bytes and well off the hot path.
-    delta_has_files:                 dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
+    delta_has_files: dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
     /// Per-(project,table) cached Delta-side `TableProvider` along with the
     /// snapshot version it was built against. Steady-state (post-flush)
     /// queries that have to UNION mem + delta were rebuilding the provider
@@ -908,35 +920,35 @@ pub struct Database {
     /// churning create/drop pattern, expose `scan.provider_cache_entries`
     /// in `timefusion_stats` (already wired) for alerting, and add a
     /// TTL sweep here when it ever becomes a real problem.
-    delta_provider_cache:            DeltaProviderCache,
+    delta_provider_cache: DeltaProviderCache,
     /// Per-process scan-path counters. Read by `timefusion_stats` so operators
     /// can see — in prod — whether the in-memory shortcut is being taken,
     /// what the resolve cache hit rate looks like, and how the latency
     /// distribution shifts under real load. Counters are cumulative since
     /// process start; deltas are useful for rate analysis.
-    pub scan_metrics:                Arc<ScanMetrics>,
-    batch_queue:                     Option<Arc<crate::batch_queue::BatchQueue>>,
-    maintenance_shutdown:            Arc<CancellationToken>,
+    pub scan_metrics: Arc<ScanMetrics>,
+    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    maintenance_shutdown: Arc<CancellationToken>,
     /// One-shot guard for `preload_tables` — main.rs and bootstrap.rs are
     /// disjoint entry points today, but a second call must not double the
     /// boot-time S3 warm burst.
-    preload_started:                 Arc<std::sync::atomic::AtomicBool>,
-    config_pool:                     Option<PgPool>,
-    storage_configs:                 Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
+    preload_started: Arc<std::sync::atomic::AtomicBool>,
+    config_pool: Option<PgPool>,
+    storage_configs: Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
     /// Monotonic deadline (nanos since process start) for when the next
     /// storage-configs refresh from the config DB is allowed. Capped at 30s
     /// so a hot SQL path doesn't hit PG on every statement.
     storage_configs_next_refresh_ns: Arc<std::sync::atomic::AtomicU64>,
-    default_s3_bucket:               Option<String>,
-    default_s3_prefix:               Option<String>,
-    default_s3_endpoint:             Option<String>,
-    object_store_cache:              Option<Arc<SharedFoyerCache>>,
-    statistics_extractor:            Arc<DeltaStatisticsExtractor>,
-    last_written_versions:           Arc<RwLock<HashMap<(String, String), u64>>>,
+    default_s3_bucket: Option<String>,
+    default_s3_prefix: Option<String>,
+    default_s3_endpoint: Option<String>,
+    object_store_cache: Option<Arc<SharedFoyerCache>>,
+    statistics_extractor: Arc<DeltaStatisticsExtractor>,
+    last_written_versions: Arc<RwLock<HashMap<(String, String), u64>>>,
     /// Delta snapshot version at last dedup sweep, per scheduler key. Skips
     /// the sweep when the version hasn't moved (no commits → no new dupes).
     /// Same unbounded-growth caveat as `last_written_versions`.
-    last_dedup_versions:             Arc<RwLock<HashMap<String, u64>>>,
+    last_dedup_versions: Arc<RwLock<HashMap<String, u64>>>,
     /// Serializes in-process Delta commits (flush appends vs dedup
     /// replace_where). delta-kernel's OCC checker cannot evaluate the
     /// bare-string timestamp predicate replace_where commits carry (errors
@@ -944,10 +956,10 @@ pub struct Database {
     /// any concurrent append aborts — every attempt, forever, on a busy
     /// table. With commits serialized the rebase sees no newer versions and
     /// skips the checker entirely.
-    delta_commit_lock:               Arc<tokio::sync::Mutex<()>>,
-    buffered_layer:                  Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
-    tantivy_search:                  Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
-    tantivy_indexer:                 Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
+    delta_commit_lock: Arc<tokio::sync::Mutex<()>>,
+    buffered_layer: Option<Arc<crate::buffered_write_layer::BufferedWriteLayer>>,
+    tantivy_search: Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
+    tantivy_indexer: Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
     /// Per-table, per-date set of live file URIs as of the last successful full
     /// (z-order) optimize. delta-rs's ZOrder planner has no idempotence guard —
     /// it rewrites every file in the window on every run, even sealed days that
@@ -956,7 +968,7 @@ pub struct Database {
     /// `optimize_table` skip a sealed partition whose file set is unchanged.
     /// Keyed by table storage URL (unique per physical table). In-memory only:
     /// a restart re-z-orders each partition once, which is harmless.
-    zorder_filesets:                 ZOrderFilesets,
+    zorder_filesets: ZOrderFilesets,
 }
 
 impl Database {
@@ -1750,7 +1762,7 @@ impl Database {
             // Tantivy predicate rewriter runs BEFORE TypeCoercion so the
             // injected `text_match(col, lit)` calls get coerced like any
             // other UDF args (Utf8 vs Utf8View etc).
-            Arc::new(crate::optimizers::TantivyPredicateRewriter),
+            Arc::new(crate::optimizers::TantivyPredicateRewriter::new(self.config.tantivy.route_equality())),
             // Expands `f(qualifier.*)` into `f(qualifier.c1, …, qualifier.cN)`
             // before TypeCoercion rejects the typeless wildcard. Postgres parity.
             Arc::new(crate::optimizers::WildcardFnArgExpander),
@@ -2702,12 +2714,12 @@ impl Database {
 
         // Configure retry with exponential backoff for transient network errors
         let retry_config = RetryConfig {
-            max_retries:   5,
+            max_retries: 5,
             retry_timeout: Duration::from_secs(180),
-            backoff:       BackoffConfig {
+            backoff: BackoffConfig {
                 init_backoff: Duration::from_millis(100),
-                max_backoff:  Duration::from_secs(15),
-                base:         2.0,
+                max_backoff: Duration::from_secs(15),
+                base: 2.0,
             },
         };
 
@@ -4466,9 +4478,9 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     let sort_cols: Vec<SortColumn> = sort_idx
         .iter()
         .map(|(i, sc)| SortColumn {
-            values:  combined.column(*i).clone(),
+            values: combined.column(*i).clone(),
             options: Some(SortOptions {
-                descending:  sc.descending,
+                descending: sc.descending,
                 nulls_first: sc.nulls_first,
             }),
         })
@@ -4592,10 +4604,10 @@ fn build_writer_properties(
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
-    database:        Arc<Database>,
-    schema:          SchemaRef,
-    _batch_queue:    Option<Arc<crate::batch_queue::BatchQueue>>,
-    table_name:      String,
+    database: Arc<Database>,
+    schema: SchemaRef,
+    _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    table_name: String,
 }
 
 impl ProjectRoutingTable {
@@ -5004,28 +5016,59 @@ impl ProjectRoutingTable {
         self.scan_delta_table(&table, state, projection, filters, limit).await
     }
 
+    /// Read-side coverage gate for the tantivy prefilter. Returns `true` iff
+    /// every live Delta file whose `date=` partition overlaps the query window
+    /// is present in `covered` (the union of successful indexes' covered files).
+    ///
+    /// Sound at day granularity even though search time-prunes at microsecond
+    /// granularity: any divergence (a file the gate counts in-window but whose
+    /// covering index search pruned, or an uncovered out-of-window file) only
+    /// concerns rows the query's own timestamp filter already excludes. If the
+    /// table can't be resolved, returns `false` (fail safe — skip the prefilter
+    /// rather than risk dropping rows).
+    async fn prefilter_coverage_complete(&self, project_id: &str, window: Option<(i64, i64)>, covered: &std::collections::HashSet<String>) -> bool {
+        let Ok(table_ref) = self.database.resolve_table(project_id, &self.table_name).await else {
+            return false;
+        };
+        let Ok(uris) = ({ table_ref.read().await.get_file_uris().map(|it| it.collect::<Vec<String>>()) }) else {
+            return false;
+        };
+        let (lo, hi) = window.unwrap_or((i64::MIN, i64::MAX));
+        uris.into_iter().filter(|u| u.ends_with(".parquet") && uri_date_in_window(u, lo, hi)).all(|u| covered.contains(&u))
+    }
+
     /// Extract time range (min, max) from query filters.
     /// Returns None if no time constraints found.
     fn extract_time_range_from_filters(&self, filters: &[Expr]) -> Option<(i64, i64)> {
+        use crate::optimizers::{is_col_through_cast, swap_comparison};
+        // Literal bound → microseconds. Strict (no Cast unwrap) so a cast-to-a-
+        // different-unit literal yields None (→ widest window) rather than a
+        // wrong-narrow one that could prune indexes holding matching rows.
+        fn literal_micros(e: &Expr) -> Option<i64> {
+            match e {
+                Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
+                Expr::Literal(ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
+                Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
+                Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
+                _ => None,
+            }
+        }
+
         let mut min_ts: Option<i64> = None;
         let mut max_ts: Option<i64> = None;
 
         for filter in filters {
             if let Expr::BinaryExpr(BinaryExpr { left, op, right }) = filter {
-                // Check if left side is timestamp column
-                let is_timestamp_col = matches!(left.as_ref(), Expr::Column(c) if c.name == "timestamp");
-                if !is_timestamp_col {
+                // Accept `timestamp <op> lit`, `lit <op> timestamp` (operands
+                // reversed → flip the comparison), and a Cast-wrapped column.
+                let (ts_value, op) = if is_col_through_cast(left, "timestamp") {
+                    (literal_micros(right), *op)
+                } else if is_col_through_cast(right, "timestamp") {
+                    (literal_micros(left), swap_comparison(op))
+                } else {
                     continue;
-                }
-
-                // Extract timestamp value from right side
-                let ts_value = match right.as_ref() {
-                    Expr::Literal(ScalarValue::TimestampMicrosecond(Some(ts), _), _) => Some(*ts),
-                    Expr::Literal(ScalarValue::TimestampNanosecond(Some(ts), _), _) => Some(*ts / 1000),
-                    Expr::Literal(ScalarValue::TimestampMillisecond(Some(ts), _), _) => Some(*ts * 1000),
-                    Expr::Literal(ScalarValue::TimestampSecond(Some(ts), _), _) => Some(*ts * 1_000_000),
-                    _ => None,
                 };
+                let op = &op;
 
                 if let Some(ts) = ts_value {
                     match op {
@@ -5233,6 +5276,11 @@ impl TableProvider for ProjectRoutingTable {
         //    would re-introduce the race where a concurrent insert lands a
         //    row in the snapshot that isn't in the pre-computed id set.
         let text_match_preds = crate::tantivy_index::udf::collect_text_matches(&optimized_filters);
+        // Query [lo,hi] timestamp window, shared by the tantivy prefilter (time-
+        // prunes the sidecar search + scopes the coverage gate to a needle's
+        // window, not every index the project built) and the skip-delta
+        // watermark check below.
+        let query_time_range = self.extract_time_range_from_filters(&optimized_filters);
         let mut tantivy_id_filter: Option<Expr> = None;
         if !text_match_preds.is_empty()
             && let Some(svc) = self.database.tantivy_search()
@@ -5245,13 +5293,22 @@ impl TableProvider for ProjectRoutingTable {
 
             let mut delta_ids: Option<std::collections::HashSet<String>> = None;
             let mut delta_indexed_rows: u64 = 0;
+            let mut delta_covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut delta_field_gap = false;
             let mut delta_any_usable = false;
             let mut abort_reason: Option<&'static str> = None;
             for p in &text_match_preds {
-                match svc.search_with_stats(&self.table_name, &project_id, &p.column, &p.query, max_hits).await {
+                match svc.search_with_stats(&self.table_name, &project_id, &p.column, &p.query, max_hits, query_time_range).await {
                     Ok(Some(result)) => {
                         delta_any_usable = true;
-                        delta_indexed_rows = delta_indexed_rows.saturating_add(result.indexed_rows);
+                        // MAX, not sum: every predicate's search scans the SAME
+                        // in-window index set, so `indexed_rows` is the same
+                        // denominator each iteration. Summing inflates it N× (N =
+                        // predicate count) and the selectivity cutoff below then
+                        // admits IN-lists it should reject (large-IN planning cost).
+                        delta_indexed_rows = delta_indexed_rows.max(result.indexed_rows);
+                        delta_covered.extend(result.covered_files);
+                        delta_field_gap |= result.field_coverage_gap;
                         let ids: std::collections::HashSet<String> = result.hits.into_iter().map(|h| h.id).collect();
                         // Intersect: this is sound only because predicates are AND-ed.
                         // `collect_text_matches` skips OR subtrees so disjunctive terms
@@ -5295,11 +5352,27 @@ impl TableProvider for ProjectRoutingTable {
                         // re-runs as the correctness backstop.
                         crate::metrics::record_tantivy_prefilter_skipped();
                         debug!("Tantivy prefilter skipped for {}/{}: low_selectivity", project_id, self.table_name);
+                    } else if delta_field_gap {
+                        // An in-window index lacked one of the queried fields
+                        // (schema evolution added a tantivy column after it was
+                        // built). It can't answer that predicate yet appears
+                        // "covered", so the IN-list would drop its rows — skip.
+                        crate::metrics::record_tantivy_prefilter_skipped();
+                        debug!("Tantivy prefilter skipped for {}/{}: field_coverage_gap", project_id, self.table_name);
+                    } else if !self.prefilter_coverage_complete(&project_id, query_time_range, &delta_covered).await {
+                        // Coverage gate (correctness): `id IN (hits)` intersects,
+                        // so a live file overlapping the window that ISN'T covered
+                        // by a successful index would have its matching rows
+                        // silently dropped. If any in-window live file is
+                        // uncovered (compacted, external write, failed build),
+                        // skip the prefilter — the original predicate full-scans.
+                        crate::metrics::record_tantivy_prefilter_skipped();
+                        debug!("Tantivy prefilter skipped for {}/{}: incomplete_coverage", project_id, self.table_name);
                     } else {
                         crate::metrics::record_tantivy_prefilter_used();
                         tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
-                            expr:    Box::new(datafusion::logical_expr::col("id")),
-                            list:    ids.into_iter().map(lit).collect(),
+                            expr: Box::new(datafusion::logical_expr::col("id")),
+                            list: ids.into_iter().map(lit).collect(),
                             negated: false,
                         }));
                     }
@@ -5388,9 +5461,6 @@ impl TableProvider for ProjectRoutingTable {
 
         span.record("scan.uses_mem_buffer", true);
 
-        // Extract query time range from filters
-        let query_time_range = self.extract_time_range_from_filters(&optimized_filters);
-
         // Skip Delta when the query's lower bound is strictly above the
         // per-table flushed watermark (max row ts ever handed to a Delta
         // commit, floored at boot) — Delta provably holds nothing newer, so
@@ -5470,18 +5540,18 @@ impl TableProvider for ProjectRoutingTable {
         for (start, end) in &mem_ranges {
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr {
-                left:  ts_col(),
-                op:    Operator::Lt,
+                left: ts_col(),
+                op: Operator::Lt,
                 right: ts_lit(*start),
             });
             let at_or_above = Expr::BinaryExpr(BinaryExpr {
-                left:  ts_col(),
-                op:    Operator::GtEq,
+                left: ts_col(),
+                op: Operator::GtEq,
                 right: ts_lit(*end),
             });
             delta_filters.push(Expr::BinaryExpr(BinaryExpr {
-                left:  Box::new(below),
-                op:    Operator::Or,
+                left: Box::new(below),
+                op: Operator::Or,
                 right: Box::new(at_or_above),
             }));
         }
@@ -5544,11 +5614,11 @@ mod writer_properties_tests {
 
     fn field(name: &str, dt: &str) -> FieldDef {
         FieldDef {
-            name:         name.into(),
-            data_type:    dt.into(),
-            nullable:     true,
-            tantivy:      None,
-            dictionary:   None,
+            name: name.into(),
+            data_type: dt.into(),
+            nullable: true,
+            tantivy: None,
+            dictionary: None,
             bloom_filter: false,
         }
     }
@@ -5560,8 +5630,8 @@ mod writer_properties_tests {
             sorting_columns: sort
                 .into_iter()
                 .map(|n| SortingColumnDef {
-                    name:        n.into(),
-                    descending:  false,
+                    name: n.into(),
+                    descending: false,
                     nulls_first: false,
                 })
                 .collect(),
@@ -5571,6 +5641,25 @@ mod writer_properties_tests {
             dedup_keys: vec![],
             dedup_tiebreak: None,
         }
+    }
+
+    #[test]
+    fn uri_date_in_window_gates_on_partition_day() {
+        let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+        let u = "s3://b/timefusion/default/otel/project_id=p/date=2026-06-15/f.parquet";
+        // window squarely containing the partition day
+        assert!(uri_date_in_window(u, day(2026, 6, 1), day(2026, 6, 30)));
+        // window entirely before / after the partition day
+        assert!(!uri_date_in_window(u, day(2026, 6, 16), day(2026, 6, 20)));
+        assert!(!uri_date_in_window(u, day(2026, 5, 1), day(2026, 6, 14)));
+        // boundary days are inclusive
+        assert!(uri_date_in_window(u, day(2026, 6, 15), day(2026, 6, 15)));
+        // open bounds match that side
+        assert!(uri_date_in_window(u, i64::MIN, day(2026, 6, 30)));
+        assert!(uri_date_in_window(u, day(2026, 6, 1), i64::MAX));
+        assert!(uri_date_in_window(u, i64::MIN, i64::MAX));
+        // missing/unparseable date ⇒ conservatively in-window (demand coverage)
+        assert!(uri_date_in_window("s3://b/no-partition/f.parquet", day(2026, 6, 16), day(2026, 6, 20)));
     }
 
     #[test]
@@ -6688,14 +6777,14 @@ mod tests {
             db.storage_configs.write().await.insert(
                 (pb.clone(), table.clone()),
                 StorageConfig {
-                    project_id:           pb.clone(),
-                    table_name:           table.clone(),
-                    s3_bucket:            "timefusion-tests".to_string(),
-                    s3_prefix:            format!("custom-{prefix}"),
-                    s3_region:            "us-east-1".to_string(),
-                    s3_access_key_id:     "minioadmin".to_string(),
+                    project_id: pb.clone(),
+                    table_name: table.clone(),
+                    s3_bucket: "timefusion-tests".to_string(),
+                    s3_prefix: format!("custom-{prefix}"),
+                    s3_region: "us-east-1".to_string(),
+                    s3_access_key_id: "minioadmin".to_string(),
                     s3_secret_access_key: "minioadmin".to_string(),
-                    s3_endpoint:          Some("http://127.0.0.1:9000".to_string()),
+                    s3_endpoint: Some("http://127.0.0.1:9000".to_string()),
                 },
             );
 

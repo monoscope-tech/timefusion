@@ -58,10 +58,12 @@ fields:
     data_type: Utf8
     nullable: false
     bloom_filter: true
+    tantivy: { indexed: true, tokenizer: raw }
   - name: parent_id
     data_type: Utf8
     nullable: true
     bloom_filter: true
+    tantivy: { indexed: true, tokenizer: raw }
   - name: hashes
     data_type: "List(Utf8)"
     nullable: true
@@ -115,10 +117,12 @@ fields:
     data_type: Utf8
     nullable: true
     bloom_filter: true
+    tantivy: { indexed: true, tokenizer: raw }
   - name: context___span_id
     data_type: Utf8
     nullable: true
     bloom_filter: true
+    tantivy: { indexed: true, tokenizer: raw }
   - name: context___trace_state
     data_type: Utf8
     nullable: true
