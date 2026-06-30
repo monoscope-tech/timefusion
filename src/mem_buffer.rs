@@ -164,7 +164,7 @@ pub type TableKey = (Arc<str>, Arc<str>);
 pub struct MemBuffer {
     /// Flattened structure: (project_id, table_name) → TableBuffer
     /// Reduces 3 hash lookups to 1 for table access.
-    tables: DashMap<TableKey, Arc<TableBuffer>>,
+    tables:               DashMap<TableKey, Arc<TableBuffer>>,
     /// Running approximation of in-memory bytes across all live buckets.
     /// Reported via `timefusion_stats` as `mem_buffer.estimated_bytes_approx`.
     ///
@@ -194,21 +194,21 @@ pub struct MemBuffer {
     /// decisions where a false-high reading would cause incorrect
     /// throttling. The `pressure_pct` reported on `buffered_layer` is
     /// what the flush task and the memory-reservation CAS actually use.
-    estimated_bytes: AtomicUsize,
+    estimated_bytes:      AtomicUsize,
     /// Mirrors `WalManager::shards_per_topic` so `FlushableBucket.wal_shard_counts`
     /// is always sized correctly when snapshotted at seal time.
-    shards_per_topic: usize,
+    shards_per_topic:     usize,
     /// LRU cache of per-bucket tantivy indexes. Lives at the MemBuffer
     /// level (not on individual TimeBuckets) so the LRU has a global view
     /// for byte-budget eviction. Entries are dropped:
     /// - when `text_index_max_bytes` is exceeded (LRU-evict tail)
     /// - when the bucket receives an insert (cache_invalidate by key)
     /// - when the bucket drains/evicts (cache_invalidate by key)
-    text_index_cache: parking_lot::Mutex<lru::LruCache<BucketCacheKey, Arc<crate::tantivy_index::mem_index::BucketTextIndex>>>,
+    text_index_cache:     parking_lot::Mutex<lru::LruCache<BucketCacheKey, Arc<crate::tantivy_index::mem_index::BucketTextIndex>>>,
     /// Sum of `size_bytes` across cached entries. Kept in an atomic so the
     /// hot insert path can do a single load to check "over budget?" without
     /// taking the LRU mutex.
-    text_index_bytes: AtomicUsize,
+    text_index_bytes:     AtomicUsize,
     /// Soft budget for cached text indexes (bytes). When exceeded, LRU
     /// evictions drop oldest cached buckets until under. Auto-tuned from
     /// `buffer_max_memory_mb` at MemBuffer construction.
@@ -223,7 +223,7 @@ pub struct MemBuffer {
     /// TableBuffer/TimeBucket — so the mark survives empty-bucket reclaim in
     /// `take_bucket_for_flush` and bucket/table re-creation by later inserts.
     /// Pruned on drain and eviction.
-    force_flushed: DashMap<TableKey, std::collections::HashSet<i64>>,
+    force_flushed:        DashMap<TableKey, std::collections::HashSet<i64>>,
 }
 
 /// Cache key: (project_id, table_name, bucket_id). All three are cheap to
@@ -232,23 +232,23 @@ pub struct MemBuffer {
 pub type BucketCacheKey = (Arc<str>, Arc<str>, i64);
 
 pub struct TableBuffer {
-    buckets: DashMap<i64, TimeBucket>,
-    schema: SchemaRef, // Immutable after creation - no lock needed
+    buckets:    DashMap<i64, TimeBucket>,
+    schema:     SchemaRef, // Immutable after creation - no lock needed
     project_id: Arc<str>,
     table_name: Arc<str>,
 }
 
 pub struct TimeBucket {
-    batches: Mutex<Vec<RecordBatch>>,
-    row_count: AtomicUsize,
-    memory_bytes: AtomicUsize,
-    min_timestamp: AtomicI64,
-    max_timestamp: AtomicI64,
+    batches:         Mutex<Vec<RecordBatch>>,
+    row_count:       AtomicUsize,
+    memory_bytes:    AtomicUsize,
+    min_timestamp:   AtomicI64,
+    max_timestamp:   AtomicI64,
     /// Wall-clock micros (via `crate::clock`) when this bucket was created.
     /// Drives the flush-dwell staleness signal — how long the bucket has
     /// waited to flush — independent of its rows' event-time range, so
     /// backfilled/late data can't false-trip the "oldest bucket" alarm.
-    created_micros: i64,
+    created_micros:  i64,
     /// Per-shard WAL-entry counts (drive `advance_by_counts` on flush) and
     /// post-append walrus positions (written to Delta commit metadata for
     /// crash-mid-flush recovery). One mutex so a single append updates both
@@ -258,36 +258,36 @@ pub struct TimeBucket {
 
 #[derive(Debug, Default, Clone)]
 struct WalShardState {
-    counts: Vec<u64>,
+    counts:    Vec<u64>,
     positions: Vec<Option<walrus_rust::WalPosition>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FlushableBucket {
-    pub project_id: String,
-    pub table_name: String,
-    pub bucket_id: i64,
-    pub batches: Vec<RecordBatch>,
-    pub row_count: usize,
+    pub project_id:       String,
+    pub table_name:       String,
+    pub bucket_id:        i64,
+    pub batches:          Vec<RecordBatch>,
+    pub row_count:        usize,
     /// Drives `Wal::advance_by_counts` after a successful flush.
     pub wal_shard_counts: Vec<u64>,
     /// Written into Delta commit metadata so a crash between Delta commit
     /// and `advance_by_counts` can recover the cursor from Delta on restart.
-    pub wal_positions: Vec<Option<walrus_rust::WalPosition>>,
+    pub wal_positions:    Vec<Option<walrus_rust::WalPosition>>,
     /// Actual min/max timestamp of the taken rows, captured before the source
     /// bucket's atomics were reset. `restore_taken_bucket` replays these so a
     /// restored bucket keeps its true time range (and stays visible to
     /// time-range pruning) rather than collapsing to the bucket's start.
-    pub min_timestamp: i64,
-    pub max_timestamp: i64,
+    pub min_timestamp:    i64,
+    pub max_timestamp:    i64,
 }
 
 #[derive(Debug, Default)]
 pub struct MemBufferStats {
-    pub project_count: usize,
-    pub total_buckets: usize,
-    pub total_rows: usize,
-    pub total_batches: usize,
+    pub project_count:          usize,
+    pub total_buckets:          usize,
+    pub total_rows:             usize,
+    pub total_batches:          usize,
     pub estimated_memory_bytes: usize,
     /// Creation wall-clock micros of the oldest non-empty bucket that is
     /// already flushable (`bucket_id < current`), or None. Used to derive
@@ -295,7 +295,7 @@ pub struct MemBufferStats {
     /// staleness signal (alert if > 2× flush interval). Deliberately NOT the
     /// rows' event-time min: backfilled/late data has a fresh creation time, so
     /// it can't false-trip the alarm while flush is healthy.
-    pub oldest_bucket_micros: Option<i64>,
+    pub oldest_bucket_micros:   Option<i64>,
 }
 
 /// Per-batch fixed overhead: RecordBatch struct, schema Arc bump, ArrayData
@@ -1875,8 +1875,8 @@ impl MemBuffer {
             .collect::<DFResult<Vec<_>>>()?;
 
         let source = crate::dml::UpdateSource {
-            schema: source_batch.schema(),
-            batch: source_batch,
+            schema:    source_batch.schema(),
+            batch:     source_batch,
             join_keys: join_keys.to_vec(),
         };
         self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source)
@@ -2076,12 +2076,12 @@ impl TableBuffer {
 impl TimeBucket {
     fn new() -> Self {
         Self {
-            batches: Mutex::new(Vec::new()),
-            row_count: AtomicUsize::new(0),
-            memory_bytes: AtomicUsize::new(0),
-            min_timestamp: AtomicI64::new(i64::MAX),
-            max_timestamp: AtomicI64::new(i64::MIN),
-            created_micros: crate::clock::now_micros(),
+            batches:         Mutex::new(Vec::new()),
+            row_count:       AtomicUsize::new(0),
+            memory_bytes:    AtomicUsize::new(0),
+            min_timestamp:   AtomicI64::new(i64::MAX),
+            max_timestamp:   AtomicI64::new(i64::MIN),
+            created_micros:  crate::clock::now_micros(),
             wal_shard_state: Mutex::new(WalShardState::default()),
         }
     }
@@ -2478,7 +2478,7 @@ mod tests {
 
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query: "auth".into(),
+            query:  "auth".into(),
         }];
         let got = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).expect("search");
         let ids = got.expect("indexed table produces Some");
@@ -2496,7 +2496,7 @@ mod tests {
 
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query: "test".into(),
+            query:  "test".into(),
         }];
         let got = buffer.search_text_match("p1", "table1", &preds).expect("search");
         assert!(got.is_none(), "unindexed table should return None, got {:?}", got);
@@ -2513,7 +2513,7 @@ mod tests {
         buffer.insert("p1", "otel_logs_and_spans", batch1, ts).unwrap();
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query: "beta".into(),
+            query:  "beta".into(),
         }];
         let initial = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).unwrap().unwrap();
         assert!(initial.is_empty(), "no 'beta' row inserted yet");
@@ -2544,7 +2544,7 @@ mod tests {
 
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query: "alpha".into(),
+            query:  "alpha".into(),
         }];
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], &preds).unwrap();
         let total_rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();

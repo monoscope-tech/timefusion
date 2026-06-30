@@ -13,27 +13,27 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableSchema {
-    pub table_name: String,
-    pub partitions: Vec<String>,
+    pub table_name:      String,
+    pub partitions:      Vec<String>,
     pub sorting_columns: Vec<SortingColumnDef>,
     pub z_order_columns: Vec<String>,
-    pub fields: Vec<FieldDef>,
+    pub fields:          Vec<FieldDef>,
     /// Column the optimizer should rewrite into a `date` partition filter.
     /// Defaults to `"timestamp"` for back-compat with existing schemas.
     #[serde(default)]
-    pub time_column: Option<String>,
+    pub time_column:     Option<String>,
     /// Composite key for last-write-wins dedup at flush time. Empty = no dedup
     /// (append-only). E.g. `[id, timestamp]`. Variant columns rejected at load.
     /// Only collapses dupes inside one bucket; cross-bucket dupes need the
     /// read-side row_number() rewrite.
     #[serde(default)]
-    pub dedup_keys: Vec<String>,
+    pub dedup_keys:      Vec<String>,
     /// Tie-breaker column for dedup: when rows share `dedup_keys`, keep the one
     /// with the greatest value here (ties → last seen, the back-compat default).
     /// Lets an enriched re-emit with a later `observed_timestamp` win over the
     /// base row (parity plan Defect 3). `None` = keep-last by position.
     #[serde(default)]
-    pub dedup_tiebreak: Option<String>,
+    pub dedup_tiebreak:  Option<String>,
 }
 
 impl TableSchema {
@@ -68,23 +68,23 @@ impl TableSchema {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SortingColumnDef {
-    pub name: String,
-    pub descending: bool,
+    pub name:        String,
+    pub descending:  bool,
     pub nulls_first: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FieldDef {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
+    pub name:         String,
+    pub data_type:    String,
+    pub nullable:     bool,
     #[serde(default)]
-    pub tantivy: Option<TantivyFieldConfig>,
+    pub tantivy:      Option<TantivyFieldConfig>,
     /// Opt-out for dictionary encoding. Default on. Set false for high-entropy
     /// free-text columns (stacktraces, raw queries, full URLs) where dict just
     /// builds a useless 8MB before falling back to PLAIN — wasted writer pass.
     #[serde(default)]
-    pub dictionary: Option<bool>,
+    pub dictionary:   Option<bool>,
     /// Per-column bloom filter opt-in. Default off. Enable for high-cardinality
     /// equality-lookup columns (ids, trace_ids, span_ids, session_ids).
     #[serde(default)]
@@ -103,11 +103,11 @@ pub struct FieldDef {
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct TantivyFieldConfig {
     #[serde(default)]
-    pub indexed: bool,
+    pub indexed:   bool,
     #[serde(default)]
     pub tokenizer: Option<String>,
     #[serde(default)]
-    pub flatten: Option<String>,
+    pub flatten:   Option<String>,
 }
 
 impl TableSchema {
@@ -171,8 +171,8 @@ impl TableSchema {
             .iter()
             .filter_map(|col| {
                 self.fields.iter().position(|f| f.name == col.name).map(|idx| SortingColumn {
-                    column_idx: idx as i32,
-                    descending: col.descending,
+                    column_idx:  idx as i32,
+                    descending:  col.descending,
                     nulls_first: col.nulls_first,
                 })
             })

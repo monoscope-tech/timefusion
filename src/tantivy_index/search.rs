@@ -26,11 +26,11 @@ use crate::tantivy_index::{
 
 #[derive(Debug)]
 pub struct SearchResult {
-    pub hits: Vec<Hit>,
+    pub hits:               Vec<Hit>,
     /// Sum of `rows` across all manifest entries that contributed (whether
     /// they hit or not). Lets the caller compute hit_count / indexed_rows
     /// for the selectivity cutoff.
-    pub indexed_rows: u64,
+    pub indexed_rows:       u64,
     /// Union of `covered_files` (parquet URIs) over every **successful**
     /// manifest entry (index present, no build error), regardless of the
     /// time-prune window. The read-side coverage gate intersects this with the
@@ -39,7 +39,7 @@ pub struct SearchResult {
     /// so the caller skips the prefilter (full scan). Collected over ALL
     /// successful entries (not just opened ones) because a time-pruned entry
     /// still legitimately covers its file — its rows are simply out of window.
-    pub covered_files: std::collections::HashSet<String>,
+    pub covered_files:      std::collections::HashSet<String>,
     /// True if any **in-window** index (one that wasn't time-pruned) lacks the
     /// queried field. `covered_files` is field-independent (an entry covers its
     /// file for all of the current schema's indexed columns), so it can't catch
@@ -53,7 +53,7 @@ pub struct SearchResult {
 #[derive(Debug)]
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
-    pub cache_root: PathBuf,
+    pub cache_root:   PathBuf,
 }
 
 impl TantivySearchService {

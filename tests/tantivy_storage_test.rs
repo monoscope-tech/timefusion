@@ -26,44 +26,44 @@ use timefusion::{
 
 fn table() -> TableSchema {
     TableSchema {
-        table_name: "logs".into(),
-        partitions: vec![],
+        table_name:      "logs".into(),
+        partitions:      vec![],
         sorting_columns: vec![SortingColumnDef {
-            name: "timestamp".into(),
-            descending: false,
+            name:        "timestamp".into(),
+            descending:  false,
             nulls_first: false,
         }],
         z_order_columns: vec![],
-        time_column: None,
-        dedup_keys: vec![],
-        dedup_tiebreak: None,
-        fields: vec![
+        time_column:     None,
+        dedup_keys:      vec![],
+        dedup_tiebreak:  None,
+        fields:          vec![
             FieldDef {
-                name: "timestamp".into(),
-                data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(),
-                nullable: false,
-                tantivy: None,
-                dictionary: None,
+                name:         "timestamp".into(),
+                data_type:    "Timestamp(Microsecond, Some(\"UTC\"))".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
                 bloom_filter: false,
             },
             FieldDef {
-                name: "id".into(),
-                data_type: "Utf8".into(),
-                nullable: false,
-                tantivy: None,
-                dictionary: None,
+                name:         "id".into(),
+                data_type:    "Utf8".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
                 bloom_filter: false,
             },
             FieldDef {
-                name: "level".into(),
-                data_type: "Utf8".into(),
-                nullable: true,
-                tantivy: Some(TantivyFieldConfig {
-                    indexed: true,
+                name:         "level".into(),
+                data_type:    "Utf8".into(),
+                nullable:     true,
+                tantivy:      Some(TantivyFieldConfig {
+                    indexed:   true,
                     tokenizer: Some("raw".into()),
-                    flatten: None,
+                    flatten:   None,
                 }),
-                dictionary: None,
+                dictionary:   None,
                 bloom_filter: false,
             },
         ],
@@ -113,7 +113,7 @@ async fn pack_upload_download_unpack_query_roundtrip() {
         hits,
         vec![Hit {
             timestamp_micros: 2_000_000,
-            id: "b".into(),
+            id:               "b".into(),
         }]
     );
 
@@ -199,14 +199,14 @@ async fn manifest_load_default_when_missing() {
 async fn manifest_upsert_and_remove_roundtrip() {
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
     let entry = ManifestEntry {
-        index: Some("indexes/logs/v1/proj1/uuid-1.tantivy.tar.zst".into()),
-        rows: 100,
-        built_at: Utc::now(),
-        schema_version: manifest::SCHEMA_VERSION,
+        index:                Some("indexes/logs/v1/proj1/uuid-1.tantivy.tar.zst".into()),
+        rows:                 100,
+        built_at:             Utc::now(),
+        schema_version:       manifest::SCHEMA_VERSION,
         min_timestamp_micros: Some(1_000_000),
         max_timestamp_micros: Some(2_000_000),
-        error: None,
-        covered_files: vec!["part-uuid-1.parquet".into()],
+        error:                None,
+        covered_files:        vec!["part-uuid-1.parquet".into()],
     };
     manifest::upsert(store_obj.as_ref(), "logs", "proj1", "part-uuid-1.parquet", entry.clone()).await.expect("upsert 1");
     manifest::upsert(
@@ -215,14 +215,14 @@ async fn manifest_upsert_and_remove_roundtrip() {
         "proj1",
         "part-uuid-2.parquet",
         ManifestEntry {
-            index: None,
-            rows: 0,
-            built_at: Utc::now(),
-            schema_version: 1,
+            index:                None,
+            rows:                 0,
+            built_at:             Utc::now(),
+            schema_version:       1,
             min_timestamp_micros: None,
             max_timestamp_micros: None,
-            error: Some("boom".into()),
-            covered_files: vec![],
+            error:                Some("boom".into()),
+            covered_files:        vec![],
         },
     )
     .await
@@ -255,14 +255,14 @@ async fn concurrent_upserts_last_writer_wins() {
                 "proj1",
                 "part-uuid-A.parquet",
                 ManifestEntry {
-                    index: Some("a".into()),
-                    rows: 1,
-                    built_at: Utc::now(),
-                    schema_version: 1,
+                    index:                Some("a".into()),
+                    rows:                 1,
+                    built_at:             Utc::now(),
+                    schema_version:       1,
                     min_timestamp_micros: None,
                     max_timestamp_micros: None,
-                    error: None,
-                    covered_files: vec![],
+                    error:                None,
+                    covered_files:        vec![],
                 },
             )
             .await
@@ -274,14 +274,14 @@ async fn concurrent_upserts_last_writer_wins() {
                 "proj1",
                 "part-uuid-B.parquet",
                 ManifestEntry {
-                    index: Some("b".into()),
-                    rows: 2,
-                    built_at: Utc::now(),
-                    schema_version: 1,
+                    index:                Some("b".into()),
+                    rows:                 2,
+                    built_at:             Utc::now(),
+                    schema_version:       1,
                     min_timestamp_micros: None,
                     max_timestamp_micros: None,
-                    error: None,
-                    covered_files: vec![],
+                    error:                None,
+                    covered_files:        vec![],
                 },
             )
             .await
