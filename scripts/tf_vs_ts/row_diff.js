@@ -16,9 +16,11 @@ const fs = require('fs');
 const [PID, T0, T1] = process.argv.slice(2);
 if (!PID || !T0 || !T1) { console.error('usage: row_diff.js <project_id> <start> <end>'); process.exit(1); }
 
-const TS_URL = '***REMOVED-CREDENTIAL***';
-const TF_URL = (fs.readFileSync('/Users/tonyalaribe/Projects/apitoolkit/monoscope/.env', 'utf8')
-  .match(/^TIMEFUSION_PG_URL=(.*)$/m) || [])[1];
+// Credentials are sourced from monoscope's .env (never hardcoded). Override via env if needed.
+const ENV = fs.readFileSync(process.env.MONOSCOPE_ENV || '/Users/tonyalaribe/Projects/apitoolkit/monoscope/.env', 'utf8');
+const envVal = k => (ENV.match(new RegExp(`^${k}=(.*)$`, 'm')) || [])[1];
+const TS_URL = process.env.TS_URL || envVal('DATABASE_URL');
+const TF_URL = process.env.TF_URL || envVal('TIMEFUSION_PG_URL');
 
 const US = '\x1f'; // unit separator between id and value
 const WHERE = `project_id='${PID}' and timestamp >= '${T0}+00' and timestamp < '${T1}+00'`;
