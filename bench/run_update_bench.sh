@@ -17,13 +17,7 @@ pkill -f 'target/(debug|release|release-iter)/timefusion' 2>/dev/null || true
 sleep 1
 rm -rf "$data_dir"; mkdir -p "$data_dir"
 
-[ -f .env ] && { set -a; source .env; set +a; }
-# Pin local MinIO regardless of what .env points at (prod .env targets R2).
-export AWS_S3_ENDPOINT=http://127.0.0.1:9000
-export AWS_ALLOW_HTTP=true
-export AWS_ACCESS_KEY_ID=minioadmin
-export AWS_SECRET_ACCESS_KEY=minioadmin
-export AWS_S3_BUCKET=timefusion-bench
+source bench/bench-env.sh
 export TIMEFUSION_DATA_DIR="$data_dir"
 export TIMEFUSION_TABLE_PREFIX="uchurn-${label}"
 export RUST_LOG="${RUST_LOG_OVERRIDE:-warn,timefusion=info}"
@@ -32,12 +26,7 @@ export RUST_LOG="${RUST_LOG_OVERRIDE:-warn,timefusion=info}"
 # (10-min buckets never complete during a short bench run otherwise).
 export TIMEFUSION_BUFFER_FLUSH_INTERVAL_SECS=15
 export TIMEFUSION_BUFFER_FLUSH_IMMEDIATELY="${FLUSH_IMMEDIATELY:-true}"
-export TIMEFUSION_BUFFER_MAX_MEMORY_MB=2048
-export TIMEFUSION_FOYER_METADATA_MEMORY_MB=64
-export TIMEFUSION_ALLOW_INSECURE_AUTH=true
 export MAX_PG_CONNECTIONS=128
-unset OTEL_EXPORTER_OTLP_ENDPOINT
-export OTEL_SDK_DISABLED=true
 
 nohup "$bin" >"$log" 2>&1 &
 echo $! > /tmp/tf-uchurn.pid

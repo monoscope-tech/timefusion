@@ -600,6 +600,13 @@ pub(crate) fn is_occ_conflict_err(msg: &str) -> bool {
         || msg.contains("Transaction failed")
 }
 
+/// Exponential backoff between OCC conflict retries — single policy for every
+/// retry site (flush, optimize, dedup, DML): 150, 300, 600ms… capped so the
+/// shift can't overflow if a caller raises its attempt limit.
+pub(crate) fn occ_backoff(attempt: usize) -> tokio::time::Duration {
+    tokio::time::Duration::from_millis(150 << attempt.min(6))
+}
+
 /// True for transient S3/network transport failures worth retrying the whole
 /// operation on. object_store retries individual requests (max_retries/180s),
 /// but a multipart part whose connection drops mid-body (R2 under concurrent
@@ -975,8 +982,11 @@ pub struct Database {
     /// Per-clone override for `query_delta_only`: hides the shared layer so
     /// scans bypass the in-memory buffer.
     bypass_buffer: bool,
-    tantivy_search: Option<Arc<crate::tantivy_index::search::TantivySearchService>>,
-    tantivy_indexer: Option<Arc<crate::tantivy_index::service::TantivyIndexService>>,
+    /// Late-binding shared cells like `buffered_layer`: attached by `with_*`
+    /// builders after boot has already cloned Database into sessions/planners,
+    /// so a plain Option would leave those clones silently service-less.
+    tantivy_search: Arc<std::sync::OnceLock<Arc<crate::tantivy_index::search::TantivySearchService>>>,
+    tantivy_indexer: Arc<std::sync::OnceLock<Arc<crate::tantivy_index::service::TantivyIndexService>>>,
     /// Per-table, per-date set of live file URIs as of the last successful full
     /// (z-order) optimize. delta-rs's ZOrder planner has no idempotence guard —
     /// it rewrites every file in the window on every run, even sealed days that
@@ -1286,8 +1296,8 @@ impl Database {
             dml_locks: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
             bypass_buffer: false,
-            tantivy_search: None,
-            tantivy_indexer: None,
+            tantivy_search: Arc::new(std::sync::OnceLock::new()),
+            tantivy_indexer: Arc::new(std::sync::OnceLock::new()),
             zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
         };
 
@@ -1324,25 +1334,26 @@ impl Database {
     }
 
     /// Attach the tantivy search service used by the scan-side prefilter.
-    pub fn with_tantivy_search(mut self, svc: Arc<crate::tantivy_index::search::TantivySearchService>) -> Self {
-        self.tantivy_search = Some(svc);
+    /// Publishes to every existing clone (shared OnceLock, set-once).
+    pub fn with_tantivy_search(self, svc: Arc<crate::tantivy_index::search::TantivySearchService>) -> Self {
+        let _ = self.tantivy_search.set(svc);
         self
     }
 
     pub fn tantivy_search(&self) -> Option<&Arc<crate::tantivy_index::search::TantivySearchService>> {
-        self.tantivy_search.as_ref()
+        self.tantivy_search.get()
     }
 
     /// Attach the write-side tantivy service. Used by the compaction-GC hook
     /// in `optimize_table` to clean up stale sidecar indexes after files are
-    /// rewritten away.
-    pub fn with_tantivy_indexer(mut self, svc: Arc<crate::tantivy_index::service::TantivyIndexService>) -> Self {
-        self.tantivy_indexer = Some(svc);
+    /// rewritten away. Publishes to every existing clone (shared OnceLock).
+    pub fn with_tantivy_indexer(self, svc: Arc<crate::tantivy_index::service::TantivyIndexService>) -> Self {
+        let _ = self.tantivy_indexer.set(svc);
         self
     }
 
     pub fn tantivy_indexer(&self) -> Option<&Arc<crate::tantivy_index::service::TantivyIndexService>> {
-        self.tantivy_indexer.as_ref()
+        self.tantivy_indexer.get()
     }
 
     /// Query Delta tables directly, bypassing the in-memory buffer (for testing).
@@ -3005,8 +3016,6 @@ impl Database {
             commit_properties
         };
         let max_retries = 5;
-        // Exponential backoff between OCC conflict retries (shared by both paths).
-        let retry_backoff = |n: u32| tokio::time::Duration::from_millis(100 * 2_u64.pow(n.min(5)));
         // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the
         // global `delta_commit_lock`, then serialize only the tiny commit-log
         // append. The old path held the lock across the whole `.write()`
@@ -3134,7 +3143,7 @@ impl Database {
                             return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", max_retries, e));
                         }
                         debug!("staged commit conflict, retrying ({}/{}): {}", retry_count, max_retries, e);
-                        tokio::time::sleep(retry_backoff(retry_count)).await;
+                        tokio::time::sleep(occ_backoff(retry_count as usize)).await;
                     }
                 }
             }
@@ -3187,7 +3196,7 @@ impl Database {
                         // not remove. Holding it across the sleep serializes
                         // every other writer behind this writer's backoff.
                         drop(commit_guard);
-                        tokio::time::sleep(retry_backoff(retry_count)).await;
+                        tokio::time::sleep(occ_backoff(retry_count as usize)).await;
                         drop(table); // stale clone — the retry re-clones after the reload
                         if let Err(reload_err) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
                             debug!("Failed to reload table state after conflict: {}", reload_err);
@@ -3669,7 +3678,7 @@ impl Database {
                     // Exponential backoff before re-submitting — matches dedup_partition
                     // (150ms << attempt). Zero-delay retries under concurrent heavy
                     // ingest amplify commit contention instead of resolving it.
-                    tokio::time::sleep(tokio::time::Duration::from_millis(150u64 << attempt)).await;
+                    tokio::time::sleep(occ_backoff(attempt)).await;
                 }
                 Err(e) if is_transient_s3_err(&e.to_string()) && attempt + 1 < MAX_ATTEMPTS => {
                     // A multipart part connection-dropped mid-merge (nothing committed).
@@ -4130,7 +4139,7 @@ impl Database {
                             project_id,
                             date_str
                         );
-                        tokio::time::sleep(tokio::time::Duration::from_millis(150u64 << attempt)).await;
+                        tokio::time::sleep(occ_backoff(attempt)).await;
                         last_err = Some(e);
                     }
                 }
@@ -4306,10 +4315,7 @@ impl Database {
                     // It usually clears on a fresh re-scan, so treat as transient.
                     let is_transient_schema = msg.contains("Found unmasked nulls");
                     if (is_conflict || is_transient_schema) && attempt + 1 < MAX_RETRIES {
-                        // Quick backoff scaled so we straddle multiple flush
-                        // ticks (~2s each) — picks 150, 300, 600 ms.
-                        let backoff_ms = 150u64 << attempt;
-                        tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                        tokio::time::sleep(occ_backoff(attempt)).await;
                         last_err = Some(e);
                         continue;
                     }

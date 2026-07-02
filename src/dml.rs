@@ -905,7 +905,7 @@ where
                 attempt += 1;
                 crate::metrics::record_dml_conflict();
                 warn!("DML delta op conflict on {}/{}, retrying ({}/{}): {}", project_id, table_name, attempt, DML_MAX_ATTEMPTS, e);
-                tokio::time::sleep(std::time::Duration::from_millis(150 << attempt)).await;
+                tokio::time::sleep(crate::database::occ_backoff(attempt)).await;
             }
             Err(e) => return Err(e),
         }

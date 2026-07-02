@@ -1411,6 +1411,14 @@ impl BufferedWriteLayer {
             // forever with no log (see `d_flush_bucket_timeout_secs`). On elapse
             // we bail so the caller counts flush_failed + retries next cycle;
             // rows stay durable in MemBuffer + WAL. 0 disables the watchdog.
+            //
+            // Abandoned-commit window: dropping the timed-out future cancels
+            // its polling, but a Delta commit PUT already issued to S3 can
+            // still land after the drop. The retained bucket is then re-
+            // committed next cycle → the same rows land twice. Accepted:
+            // dedup_keys (write-side) and DedupExec (read-side) collapse the
+            // duplicates, and a slow-but-successful commit is rare next to a
+            // truly hung one; size the timeout well above normal commit p99.
             let timeout = self.config.buffer.flush_bucket_timeout();
             if timeout.is_zero() {
                 commit.await?
