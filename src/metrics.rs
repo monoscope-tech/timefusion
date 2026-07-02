@@ -81,6 +81,7 @@ counter_registry! {
     backpressure_force_flush   => "timefusion.ingest.backpressure_force_flush": "Current open-bucket force-flushes triggered by sustained backpressure (escalation tier)",
     optimize_conflict          => "timefusion.optimize.conflict": "Optimize/compaction commits that hit an OCC conflict (a concurrent txn touched a file the merge read). Retried — but a sustained nonzero rate means optimize is losing commit races to dedup/flush. WARN if rate() stays > 0 across several ticks",
     optimize_failed            => "timefusion.optimize.failed": "Optimize/compaction runs that ultimately errored or gave up after exhausting retries. The partition stays fragmented until a later run succeeds, so small files pile up silently. PAGE if > 0 sustained",
+    dml_conflict               => "timefusion.dml.conflict": "DML (UPDATE/DELETE) Delta operations that lost an OCC race to a concurrent commit and were retried on a fresh snapshot. Sustained rate > 0 means UPDATE churn is racing flush commits",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -353,5 +354,12 @@ pub fn record_optimize_conflict() {
 pub fn record_optimize_failed() {
     if let Some(m) = METRICS.get() {
         m.optimize_failed.add(1, &[]);
+    }
+}
+
+/// One DML Delta operation OCC conflict (retried on a fresh snapshot).
+pub fn record_dml_conflict() {
+    if let Some(m) = METRICS.get() {
+        m.dml_conflict.add(1, &[]);
     }
 }

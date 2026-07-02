@@ -89,7 +89,7 @@ mod test_dml_operations {
         let batch = &result[0];
         assert_eq!(batch.num_rows(), 1);
 
-        let rows_updated = batch.column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_updated = batch.column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
 
         // Verify the update
@@ -145,7 +145,7 @@ mod test_dml_operations {
         let batch = &result[0];
         assert_eq!(batch.num_rows(), 1);
 
-        let rows_deleted = batch.column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_deleted = batch.column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_deleted, 1, "Expected 1 row to be deleted");
 
         // Verify the delete
@@ -238,7 +238,7 @@ mod test_dml_operations {
         let df = ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?;
         let result = df.collect().await?;
 
-        let rows_deleted = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_deleted = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_deleted, 3, "Expected 3 rows to be deleted");
 
         // Verify only the INFO record remains
@@ -289,7 +289,7 @@ mod test_dml_operations {
             .await?;
         let result = df.collect().await?;
 
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
 
         // Verify both columns were updated
@@ -371,7 +371,7 @@ mod test_dml_operations {
         // Delete ERROR records
         let df = ctx.sql("DELETE FROM otel_logs_and_spans WHERE project_id = 'test_project' AND level = 'ERROR'").await?;
         let result = df.collect().await?;
-        let rows_deleted = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_deleted = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_deleted, 2, "Should delete 2 ERROR records");
 
         // Verify final count
@@ -415,7 +415,7 @@ mod test_dml_operations {
             )
             .await?;
         let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "Expected Bob's row to be updated");
 
         let df = ctx.sql("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
@@ -473,7 +473,7 @@ mod test_dml_operations {
             )
             .await?;
         let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 2, "Expected 2 rows updated (Bob, Alice)");
 
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 500);
@@ -508,7 +508,7 @@ mod test_dml_operations {
             )
             .await?;
         let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 0, "Expected 0 rows updated");
 
         // All three original durations intact.
@@ -546,7 +546,7 @@ mod test_dml_operations {
             )
             .await?;
         let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "Predicate should narrow to Bob only");
 
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 777);
@@ -592,7 +592,7 @@ mod test_dml_operations {
             )
             .await?;
         let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 2, "Expected 2 rows tagged (Bob, Alice)");
         Ok(())
     }
@@ -632,8 +632,129 @@ mod test_dml_operations {
                       AND NOT (COALESCE(o.hashes, '{}'::text[]) @> ARRAY[u.tag])";
         let _ = ctx.sql(sql).await?.collect().await?;
         let r2 = ctx.sql(sql).await?.collect().await?;
-        let n = r2[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let n = r2[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(n, 0, "Re-running idempotent UPDATE must touch zero rows");
+        Ok(())
+    }
+
+    /// Regression: main.rs creates the pgwire SessionContext (and its
+    /// DmlQueryPlanner) BEFORE attaching the BufferedWriteLayer (the WAL-replay
+    /// registry needs the context first). The planner used to capture a
+    /// pre-layer clone of Database, so every pgwire UPDATE/DELETE silently
+    /// skipped the mem-buffer leg: updates to rows still in the buffer matched
+    /// zero rows and were lost when the row later flushed with pre-update
+    /// values. The layer must be late-binding — visible to sessions created
+    /// before it was attached.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_mem_leg_survives_late_layer_attach() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        // SAFETY: walrus-rust reads WALRUS_DATA_DIR from environment; #[serial]
+        // prevents concurrent access to this process-global.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
+        let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+
+        let db0 = Database::with_config(cfg).await?;
+        // Session context created BEFORE the layer is attached — main.rs order.
+        let mut ctx = Arc::new(db0.clone()).create_session_context();
+        let db = Arc::new(db0.with_buffered_layer(Arc::clone(&layer)));
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let records = create_test_records(now);
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+        // skip_queue=false → rows land in the buffer, not Delta.
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], false, None).await?;
+
+        let df = ctx.sql("UPDATE otel_logs_and_spans SET duration = 500 WHERE project_id = 'test_project' AND name = 'Bob'").await?;
+        let result = df.collect().await?;
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+        assert_eq!(rows_updated, 1, "UPDATE must reach buffer rows through a session created before the layer was attached");
+        assert_eq!(duration_by_name(&ctx, "Bob").await?, 500);
+        Ok(())
+    }
+
+    /// Regression: the UPDATE's Delta leg must not hold the table's write lock
+    /// across the multi-second merge (update_state → scan → parquet rewrite →
+    /// commit). It used to, which convoyed every reader (SELECT needs the read
+    /// lock) and every insert (commit swap needs the write lock) behind each
+    /// UPDATE — the mechanical cause of prod flush starvation at ~2k UPDATEs/h.
+    /// A SELECT and an insert issued mid-UPDATE must complete while the UPDATE
+    /// is still running.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_from_does_not_block_readers_or_writers() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let cfg = create_test_config(&test_id);
+        let db = Arc::new(Database::with_config(cfg).await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        // Many separate commits → many files; the merge below matches one row
+        // in every file, so it must rewrite all of them — slow enough to
+        // observe concurrent operations overlapping it.
+        let now = chrono::Utc::now();
+        const FILES: usize = 24;
+        const ROWS_PER_FILE: usize = 400;
+        for f in 0..FILES {
+            let records: Vec<serde_json::Value> = (0..ROWS_PER_FILE)
+                .map(|r| {
+                    serde_json::json!({
+                        "id": format!("f{f}_r{r}"),
+                        "name": if r == 0 { format!("T{f}") } else { format!("f{f}_r{r}") },
+                        "project_id": "test_project",
+                        "timestamp": now.timestamp_micros(),
+                        "level": "INFO", "status_code": "OK", "duration": 100,
+                        "date": now.date_naive().to_string(), "hashes": [], "summary": []
+                    })
+                })
+                .collect();
+            let batch = timefusion::test_utils::test_helpers::json_to_batch(records)?;
+            db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+        }
+
+        let values = (0..FILES).map(|f| format!("('T{f}', {f})")).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "UPDATE otel_logs_and_spans SET duration = u.d \
+             FROM (VALUES {values}) AS u(name, d) \
+             WHERE project_id = 'test_project' AND otel_logs_and_spans.name = u.name"
+        );
+        let update_ctx = ctx.clone();
+        let update_handle = tokio::spawn(async move { update_ctx.sql(&sql).await?.collect().await.map_err(anyhow::Error::from) });
+
+        // Give the UPDATE time to get into its Delta merge.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(!update_handle.is_finished(), "UPDATE finished too fast to observe concurrency — grow FILES/ROWS_PER_FILE");
+
+        // Reader mid-UPDATE.
+        let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
+        let results = df.collect().await?;
+        let count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(count as usize, FILES * ROWS_PER_FILE);
+        assert!(!update_handle.is_finished(), "SELECT should complete while the UPDATE is still merging — reader was convoyed behind the DML write lock");
+
+        // Writer mid-UPDATE (direct Delta insert commits + swaps the handle).
+        let extra = timefusion::test_utils::test_helpers::json_to_batch(vec![serde_json::json!({
+            "id": "extra", "name": "Extra", "project_id": "test_project",
+            "timestamp": now.timestamp_micros(), "level": "INFO", "status_code": "OK",
+            "duration": 1, "date": now.date_naive().to_string(), "hashes": [], "summary": []
+        })])?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![extra], true, None).await?;
+        assert!(!update_handle.is_finished(), "insert should complete while the UPDATE is still merging — writer was convoyed behind the DML write lock");
+
+        let result = update_handle.await??;
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+        assert_eq!(rows_updated as usize, FILES);
+
+        // The mid-UPDATE insert must not just be un-blocked — its row must
+        // survive the UPDATE's snapshot swap.
+        let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
+        let results = df.collect().await?;
+        let final_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        assert_eq!(final_count as usize, FILES * ROWS_PER_FILE + 1, "concurrent insert's row lost across the DML swap");
         Ok(())
     }
 
@@ -664,7 +785,7 @@ mod test_dml_operations {
             )
             .await?;
         let result = df.collect().await?;
-        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+        let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1);
 
         let df = ctx.sql("SELECT duration, level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
