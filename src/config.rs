@@ -170,7 +170,15 @@ const_default!(d_write_backpressure_secs: u64 = 60);
 // (counted in flush_failed + flush_stalled), releasing the lock so relief
 // retries; rows stay in MemBuffer + WAL, so it's safe. Must exceed a normal
 // backfill commit but stay well under retention.
-const_default!(d_flush_bucket_timeout_secs: u64 = 120);
+//
+// 600s, NOT 120s: the timeout covers the whole callback — parquet encode +
+// S3 upload + commit — and a post-restart WAL-replay backlog produces
+// multi-GB coalesced commits that legitimately take minutes. At 120s the
+// watchdog aborted every big drain, wasting the work and retrying forever
+// while MemBuffer grew to the memcg limit (2026-07-02 OOM loop: stalled=42
+// vs flush-ok=22, RSS 89GB). The watchdog exists for the *infinitely* hung
+// commit, so a generous ceiling loses nothing.
+const_default!(d_flush_bucket_timeout_secs: u64 = 600);
 // Durability mode for the WAL. One of:
 //   "ms"        — async fsync every `wal_fsync_ms` (default; ~200ms loss window)
 //   "sync_each" — fsync after every entry (zero data-loss window, ~1ms per write)
