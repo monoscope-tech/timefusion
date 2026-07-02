@@ -1745,9 +1745,22 @@ impl MemBuffer {
 
         let mut total_updated = 0u64;
         let mut total_delta: i64 = 0;
+        // Bucket-level time pruning, same as the query path: at prod scale the
+        // buffer holds GBs across many buckets, and probing every row of every
+        // batch per UPDATE (~2k/h) is enough transient allocation to balloon
+        // RSS via allocator retention. The predicate arrives as one nested AND
+        // — split it, since extract_timestamp_range only reads top-level
+        // conjuncts.
+        let conjuncts: Vec<Expr> = predicate
+            .map(|p| datafusion::logical_expr::utils::split_conjunction(p).into_iter().cloned().collect())
+            .unwrap_or_default();
+        let ts_range = extract_timestamp_range(&conjuncts);
 
         for mut bucket_entry in table.buckets.iter_mut() {
             let bucket = bucket_entry.value_mut();
+            if !bucket_overlaps_range(bucket, &ts_range) {
+                continue;
+            }
             let mut batches = bucket.batches.lock();
             let mut bucket_delta: i64 = 0;
             let mut new_batches: Vec<RecordBatch> = Vec::with_capacity(batches.len());
@@ -1773,6 +1786,15 @@ impl MemBuffer {
                 let tgt_rows = row_converter.convert_columns(&tgt_key_cols).map_err(arrow_err)?;
 
                 let src_idxs: UInt32Array = (0..num_rows).map(|i| src_lookup.get(&tgt_rows.row(i).owned()).copied()).collect();
+
+                // The common case is zero joined rows in this batch (source is a
+                // handful of ids vs the whole buffer): skip the widened-batch
+                // materialization entirely — the predicate can only narrow the
+                // join match, never widen it.
+                if src_idxs.null_count() == num_rows {
+                    new_batches.push(batch);
+                    continue;
+                }
 
                 // Build widened batch by appending source cols taken at probed indices.
                 let mut widened_cols: Vec<ArrayRef> = batch.columns().to_vec();
