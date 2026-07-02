@@ -671,7 +671,10 @@ mod test_dml_operations {
         let df = ctx.sql("UPDATE otel_logs_and_spans SET duration = 500 WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         let result = df.collect().await?;
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(rows_updated, 1, "UPDATE must reach buffer rows through a session created before the layer was attached");
+        assert_eq!(
+            rows_updated, 1,
+            "UPDATE must reach buffer rows through a session created before the layer was attached"
+        );
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 500);
         Ok(())
     }
@@ -727,14 +730,20 @@ mod test_dml_operations {
 
         // Give the UPDATE time to get into its Delta merge.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        assert!(!update_handle.is_finished(), "UPDATE finished too fast to observe concurrency — grow FILES/ROWS_PER_FILE");
+        assert!(
+            !update_handle.is_finished(),
+            "UPDATE finished too fast to observe concurrency — grow FILES/ROWS_PER_FILE"
+        );
 
         // Reader mid-UPDATE.
         let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(count as usize, FILES * ROWS_PER_FILE);
-        assert!(!update_handle.is_finished(), "SELECT should complete while the UPDATE is still merging — reader was convoyed behind the DML write lock");
+        assert!(
+            !update_handle.is_finished(),
+            "SELECT should complete while the UPDATE is still merging — reader was convoyed behind the DML write lock"
+        );
 
         // Writer mid-UPDATE (direct Delta insert commits + swaps the handle).
         let extra = timefusion::test_utils::test_helpers::json_to_batch(vec![serde_json::json!({
@@ -743,7 +752,10 @@ mod test_dml_operations {
             "duration": 1, "date": now.date_naive().to_string(), "hashes": [], "summary": []
         })])?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![extra], true, None).await?;
-        assert!(!update_handle.is_finished(), "insert should complete while the UPDATE is still merging — writer was convoyed behind the DML write lock");
+        assert!(
+            !update_handle.is_finished(),
+            "insert should complete while the UPDATE is still merging — writer was convoyed behind the DML write lock"
+        );
 
         let result = update_handle.await??;
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
@@ -754,7 +766,11 @@ mod test_dml_operations {
         let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let final_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-        assert_eq!(final_count as usize, FILES * ROWS_PER_FILE + 1, "concurrent insert's row lost across the DML swap");
+        assert_eq!(
+            final_count as usize,
+            FILES * ROWS_PER_FILE + 1,
+            "concurrent insert's row lost across the DML swap"
+        );
         Ok(())
     }
 

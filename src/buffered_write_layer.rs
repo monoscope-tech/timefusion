@@ -2631,7 +2631,10 @@ mod tests {
         // Outer bound proves the watchdog broke the hang (well above the 1s
         // watchdog, well below "forever").
         let res = tokio::time::timeout(Duration::from_secs(10), layer.force_flush_current_buckets()).await;
-        assert!(res.is_ok(), "force_flush must return once the flush watchdog trips — it hung waiting on the stalled commit");
+        assert!(
+            res.is_ok(),
+            "force_flush must return once the flush watchdog trips — it hung waiting on the stalled commit"
+        );
         res.unwrap().unwrap();
 
         // Commit never succeeded → rows restored, still buffered (and in the WAL).

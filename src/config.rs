@@ -503,21 +503,21 @@ impl CoreConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BufferConfig {
     #[serde(default = "d_flush_interval")]
-    pub timefusion_flush_interval_secs:      u64,
+    pub timefusion_flush_interval_secs:       u64,
     #[serde(default = "d_retention_mins")]
-    pub timefusion_buffer_retention_mins:    u64,
+    pub timefusion_buffer_retention_mins:     u64,
     #[serde(default = "d_eviction_interval")]
-    pub timefusion_eviction_interval_secs:   u64,
+    pub timefusion_eviction_interval_secs:    u64,
     #[serde(default = "d_buffer_max_memory")]
-    pub timefusion_buffer_max_memory_mb:     usize,
+    pub timefusion_buffer_max_memory_mb:      usize,
     #[serde(default = "d_stop_grace")]
-    pub timefusion_stop_grace_secs:          u64,
+    pub timefusion_stop_grace_secs:           u64,
     #[serde(default = "d_wal_corruption_threshold")]
-    pub timefusion_wal_corruption_threshold: usize,
+    pub timefusion_wal_corruption_threshold:  usize,
     #[serde(default = "d_flush_parallelism")]
-    pub timefusion_flush_parallelism:        usize,
+    pub timefusion_flush_parallelism:         usize,
     #[serde(default)]
-    pub timefusion_flush_immediately:        bool,
+    pub timefusion_flush_immediately:         bool,
     /// EXPERIMENTAL (default OFF), parity plan Defect 1: when set, `insert()`
     /// admits over the memory hard limit instead of *rejecting* a write whose
     /// backpressure budget is exhausted — the WAL append is the durability
@@ -526,34 +526,34 @@ pub struct BufferConfig {
     /// flush throughput) before prod enable — over-budget admission trades a
     /// reject for unbounded growth if Delta flush can't keep up.
     #[serde(default)]
-    pub timefusion_wal_admit_decouple:       bool,
+    pub timefusion_wal_admit_decouple:        bool,
     #[serde(default = "d_wal_fsync_ms")]
-    pub timefusion_wal_fsync_ms:             u64,
+    pub timefusion_wal_fsync_ms:              u64,
     #[serde(default = "d_wal_fsync_mode")]
-    pub timefusion_wal_fsync_mode:           String,
+    pub timefusion_wal_fsync_mode:            String,
     #[serde(default = "d_wal_max_files")]
-    pub timefusion_wal_max_file_count:       usize,
+    pub timefusion_wal_max_file_count:        usize,
     #[serde(default = "d_bucket_duration_secs")]
-    pub timefusion_bucket_duration_secs:     u64,
+    pub timefusion_bucket_duration_secs:      u64,
     #[serde(default = "d_pressure_flush_pct")]
-    pub timefusion_pressure_flush_pct:       u32,
+    pub timefusion_pressure_flush_pct:        u32,
     #[serde(default = "d_write_backpressure_secs")]
-    pub timefusion_write_backpressure_secs:  u64,
+    pub timefusion_write_backpressure_secs:   u64,
     #[serde(default = "d_flush_bucket_timeout_secs")]
     pub timefusion_flush_bucket_timeout_secs: u64,
     /// WAL shards per (project, table) topic. Higher = more append parallelism
     /// at the cost of O(shards) recovery memory and more file handles.
     #[serde(default = "d_wal_shards_per_topic")]
-    pub timefusion_wal_shards_per_topic:     usize,
+    pub timefusion_wal_shards_per_topic:      usize,
     /// Max concurrent S3/R2 reads when reconciling per-table Delta watermarks
     /// at boot. Only used when the cursor snapshot is missing or stale.
     #[serde(default = "d_delta_scan_concurrency")]
-    pub timefusion_delta_scan_concurrency:   usize,
+    pub timefusion_delta_scan_concurrency:    usize,
     /// Per-table Delta commit history depth scanned at boot. The cursor
     /// snapshot covers the bulk of the watermark; this only needs to catch
     /// a writer that committed after the last snapshot was written.
     #[serde(default = "d_delta_scan_depth")]
-    pub timefusion_delta_scan_depth:         usize,
+    pub timefusion_delta_scan_depth:          usize,
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
