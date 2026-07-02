@@ -163,6 +163,14 @@ const_default!(d_pressure_flush_pct: u32 = 75);
 // ride out a flush cycle / drain a replayed backlog, finite so a genuinely
 // down Delta can't pile blocked writers up without bound.
 const_default!(d_write_backpressure_secs: u64 = 60);
+// Watchdog for a single bucket's Delta commit inside `flush_bucket`. A hung S3
+// commit / commit-lock wait otherwise pins `flush_lock` forever with no log:
+// flushes freeing zero memory while inserts wedge at the hard limit (prod
+// 2026-07-01 — 0 flushes, 0 errors, 1300+ rejects). On timeout the flush errors
+// (counted in flush_failed + flush_stalled), releasing the lock so relief
+// retries; rows stay in MemBuffer + WAL, so it's safe. Must exceed a normal
+// backfill commit but stay well under retention.
+const_default!(d_flush_bucket_timeout_secs: u64 = 120);
 // Durability mode for the WAL. One of:
 //   "ms"        — async fsync every `wal_fsync_ms` (default; ~200ms loss window)
 //   "sync_each" — fsync after every entry (zero data-loss window, ~1ms per write)
@@ -531,6 +539,8 @@ pub struct BufferConfig {
     pub timefusion_pressure_flush_pct:       u32,
     #[serde(default = "d_write_backpressure_secs")]
     pub timefusion_write_backpressure_secs:  u64,
+    #[serde(default = "d_flush_bucket_timeout_secs")]
+    pub timefusion_flush_bucket_timeout_secs: u64,
     /// WAL shards per (project, table) topic. Higher = more append parallelism
     /// at the cost of O(shards) recovery memory and more file handles.
     #[serde(default = "d_wal_shards_per_topic")]
@@ -616,6 +626,11 @@ impl BufferConfig {
     }
     pub fn write_backpressure_timeout(&self) -> Duration {
         Duration::from_secs(self.timefusion_write_backpressure_secs)
+    }
+    /// Per-bucket Delta-commit watchdog inside `flush_bucket`. 0 disables it
+    /// (unbounded wait — the pre-2026-07-01 behavior).
+    pub fn flush_bucket_timeout(&self) -> Duration {
+        Duration::from_secs(self.timefusion_flush_bucket_timeout_secs)
     }
 
     /// Total graceful-shutdown budget — see `d_stop_grace`.

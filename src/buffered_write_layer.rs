@@ -1401,13 +1401,31 @@ impl BufferedWriteLayer {
             // Await ensures Delta commit completes before we return. The
             // wal_positions snapshot becomes the watermark recorded in
             // commit metadata for exact-once crash recovery.
-            callback(
+            let commit = callback(
                 bucket.project_id.clone(),
                 bucket.table_name.clone(),
                 batches.clone(),
                 bucket.wal_positions.clone(),
-            )
-            .await?
+            );
+            // Watchdog: an un-timed-out commit that hangs would pin `flush_lock`
+            // forever with no log (see `d_flush_bucket_timeout_secs`). On elapse
+            // we bail so the caller counts flush_failed + retries next cycle;
+            // rows stay durable in MemBuffer + WAL. 0 disables the watchdog.
+            let timeout = self.config.buffer.flush_bucket_timeout();
+            if timeout.is_zero() {
+                commit.await?
+            } else {
+                tokio::time::timeout(timeout, commit)
+                    .await
+                    .map_err(|_| {
+                        crate::metrics::record_flush_stalled();
+                        error!(
+                            "flush_bucket Delta commit stalled >{:?} (project={}, table={}, bucket_id={}) — aborting this flush so flush_lock releases and relief can retry; rows remain durable in MemBuffer + WAL",
+                            timeout, bucket.project_id, bucket.table_name, bucket.bucket_id
+                        );
+                        anyhow::anyhow!("flush_bucket commit timed out after {:?} (Delta/S3 stalled)", timeout)
+                    })??
+            }
         } else {
             warn!("No delta write callback configured, skipping flush");
             Vec::new()
@@ -2570,6 +2588,46 @@ mod tests {
             "stuck tenant's completed bucket must stay un-advanced (per-topic WAL gate); flushed={:?}",
             flushed
         );
+    }
+
+    /// Regression: prod 2026-07-01 wedged with the write buffer pinned at the
+    /// hard limit, 1300+ inserts rejected, yet 0 flushes / 0 flush errors — a
+    /// Delta commit hung inside `flush_bucket`, pinning `flush_lock` forever so
+    /// no relief could free memory and the stall was invisible. The
+    /// `flush_bucket_timeout` watchdog must abort a hung commit: the flush
+    /// returns instead of hanging, rows are restored to MemBuffer (still durable
+    /// in the WAL), and the lock releases so the next cycle retries. Pre-fix this
+    /// test hangs forever (outer timeout fires); post-fix it completes in ~1s.
+    #[serial]
+    #[tokio::test]
+    async fn flush_bucket_watchdog_aborts_hung_commit() {
+        let dir = tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.core.timefusion_data_dir = dir.path().to_path_buf();
+        cfg.buffer.timefusion_flush_bucket_timeout_secs = 1; // trip the watchdog fast
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        let cfg = Arc::new(cfg);
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("w{}", test_id);
+        let table = format!("w{}", test_id);
+
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        // Callback that never resolves — models a stalled S3/commit-lock wait.
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(std::future::pending())));
+        let layer = Arc::new(layer);
+
+        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.unwrap();
+
+        // Outer bound proves the watchdog broke the hang (well above the 1s
+        // watchdog, well below "forever").
+        let res = tokio::time::timeout(Duration::from_secs(10), layer.force_flush_current_buckets()).await;
+        assert!(res.is_ok(), "force_flush must return once the flush watchdog trips — it hung waiting on the stalled commit");
+        res.unwrap().unwrap();
+
+        // Commit never succeeded → rows restored, still buffered (and in the WAL).
+        assert!(!layer.is_empty(), "a timed-out flush must restore the bucket, not drop it");
     }
 
     #[serial]

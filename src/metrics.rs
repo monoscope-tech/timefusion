@@ -65,6 +65,7 @@ counter_registry! {
     wal_gc_deleted_files       => "timefusion.wal.gc_deleted_files": "Stale WAL files reclaimed by the mtime reaper (walrus leaks files across restarts)",
     flush_completed            => "timefusion.flush.completed": "Flush cycles that committed to Delta",
     flush_failed               => "timefusion.flush.failed": "Flush cycles that errored",
+    flush_stalled              => "timefusion.flush.stalled": "Flush bucket commits that exceeded the flush-bucket watchdog timeout (Delta/S3 commit hung, holding flush_lock). A stalled flush frees no MemBuffer memory → inserts wedge at the hard limit. PAGE if > 0",
     query_executions           => "timefusion.query.executions": "SQL query plans executed",
     tantivy_prefilter_attempts => "timefusion.tantivy.prefilter_attempts": "Queries where at least one text_match predicate triggered a tantivy lookup",
     tantivy_prefilter_used     => "timefusion.tantivy.prefilter_used": "Queries where the tantivy id-set prefilter was applied to the Delta scan",
@@ -315,6 +316,7 @@ simple_recorders! {
     record_backpressure_engaged => backpressure_engaged,
     record_backpressure_rejected => backpressure_rejected,
     record_backpressure_force_flush => backpressure_force_flush,
+    record_flush_stalled => flush_stalled,
 }
 
 pub fn record_dedup_dropped(rows: u64) {
