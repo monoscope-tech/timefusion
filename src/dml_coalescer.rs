@@ -112,7 +112,7 @@ impl DecomposedPredicate {
                 (false, false) => Operator::Lt,
             };
             Expr::BinaryExpr(BinaryExpr {
-                left:  Box::new(datafusion::prelude::col(time_col)),
+                left: Box::new(datafusion::prelude::col(time_col)),
                 op,
                 right: Box::new(lit(b.value.clone())),
             })
@@ -238,7 +238,10 @@ fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> Clamp
         None => d.lower.is_some(), // only add a bound when a time window exists at all
     };
     if tighter {
-        d.upper = Some(TimeBound { value: wm, inclusive: true });
+        d.upper = Some(TimeBound {
+            value:     wm,
+            inclusive: true,
+        });
         ClampAction::Clamped
     } else {
         ClampAction::Unchanged
@@ -250,11 +253,7 @@ fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> Clamp
 /// Nth distinct payload, in arrival order) so no single MERGE sees duplicate
 /// source keys — Delta rejects a source that matches a target row twice.
 fn split_rounds(batch: &RecordBatch, key_indices: &[usize]) -> Result<Vec<RecordBatch>> {
-    let to_fields = |idxs: &[usize]| {
-        idxs.iter()
-            .map(|&i| SortField::new(batch.column(i).data_type().clone()))
-            .collect::<Vec<_>>()
-    };
+    let to_fields = |idxs: &[usize]| idxs.iter().map(|&i| SortField::new(batch.column(i).data_type().clone())).collect::<Vec<_>>();
     let key_cols: Vec<_> = key_indices.iter().map(|&i| batch.column(i).clone()).collect();
     let all_idx: Vec<usize> = (0..batch.num_columns()).collect();
     let key_rows = RowConverter::new(to_fields(key_indices))?.convert_columns(&key_cols)?;
@@ -353,18 +352,17 @@ impl DmlCoalescer {
     pub fn new(interval_secs: u64) -> Self {
         Self {
             interval_secs: interval_secs.max(1),
-            groups: std::sync::Mutex::new(HashMap::new()),
-            queued_rows: AtomicUsize::new(0),
-            drain_notify: Notify::new(),
-            drain_lock: tokio::sync::Mutex::new(()),
+            groups:        std::sync::Mutex::new(HashMap::new()),
+            queued_rows:   AtomicUsize::new(0),
+            drain_notify:  Notify::new(),
+            drain_lock:    tokio::sync::Mutex::new(()),
         }
     }
 
     /// Defer a statement's Delta merge. The caller has already applied the
     /// mem leg (and its WAL append) and verified committed data exists.
     pub fn enqueue(
-        &self, project_id: &str, table_name: &str, predicate: Option<&Expr>, assignments: &[(String, Expr)], source: &UpdateSource,
-        session: Arc<dyn Session>,
+        &self, project_id: &str, table_name: &str, predicate: Option<&Expr>, assignments: &[(String, Expr)], source: &UpdateSource, session: Arc<dyn Session>,
     ) {
         let time_col = table_time_column(table_name);
         let decomposed = DecomposedPredicate::decompose(predicate, time_col);
@@ -574,8 +572,20 @@ mod tests {
     fn decompose_extracts_bounds_and_residual() {
         let pred = col("project_id").eq(lit("p1")).and(window(100, 200));
         let d = DecomposedPredicate::decompose(Some(&pred), "timestamp");
-        assert_eq!(d.lower, Some(TimeBound { value: ts(100), inclusive: true }));
-        assert_eq!(d.upper, Some(TimeBound { value: ts(200), inclusive: false }));
+        assert_eq!(
+            d.lower,
+            Some(TimeBound {
+                value:     ts(100),
+                inclusive: true,
+            })
+        );
+        assert_eq!(
+            d.upper,
+            Some(TimeBound {
+                value:     ts(200),
+                inclusive: false,
+            })
+        );
         assert_eq!(d.residual.len(), 1);
         // Round-trip preserves the conjunction (order may differ).
         let rebuilt = d.reconstruct("timestamp").unwrap();
@@ -618,7 +628,13 @@ mod tests {
         match clamp_to_watermark(Some(&pred), "timestamp", 500) {
             WatermarkClamp::Keep(Some(p)) => {
                 let d = DecomposedPredicate::decompose(Some(&p), "timestamp");
-                assert_eq!(d.upper, Some(TimeBound { value: ts(500), inclusive: true }));
+                assert_eq!(
+                    d.upper,
+                    Some(TimeBound {
+                        value:     ts(500),
+                        inclusive: true,
+                    })
+                );
                 assert_eq!(d.lower.unwrap().value, ts(100));
             }
             _ => panic!("expected clamped predicate"),

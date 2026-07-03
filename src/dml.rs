@@ -713,9 +713,7 @@ impl<'a> DmlContext<'a> {
             custom_tables.contains_key(&(self.project_id.to_string(), self.table_name.to_string())) || unified_tables.contains_key(self.table_name)
         };
 
-        if has_committed
-            && let Some(delta_pred) = delta_leg_predicate(self.buffered_layer, self.table_name, self.project_id, self.predicate.as_ref())
-        {
+        if has_committed && let Some(delta_pred) = delta_leg_predicate(self.buffered_layer, self.table_name, self.project_id, self.predicate.as_ref()) {
             total_rows += delta_op(delta_pred).await?;
         }
 
@@ -736,9 +734,7 @@ impl<'a> DmlContext<'a> {
 /// at-or-above every row whose Delta copy might be stale. Clamping with an
 /// earlier watermark would cut exactly those rows out of the merge and lose
 /// the update.
-fn delta_leg_predicate(
-    buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<&Expr>,
-) -> Option<Option<Expr>> {
+fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<&Expr>) -> Option<Option<Expr>> {
     let Some(layer) = buffered_layer else {
         return Some(predicate.cloned());
     };
