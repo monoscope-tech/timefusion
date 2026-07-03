@@ -163,6 +163,18 @@ const_default!(d_pressure_flush_pct: u32 = 75);
 // ride out a flush cycle / drain a replayed backlog, finite so a genuinely
 // down Delta can't pile blocked writers up without bound.
 const_default!(d_write_backpressure_secs: u64 = 60);
+// DML coalescing (0 = disabled). When > 0, the Delta leg of `UPDATE ... FROM`
+// statements is deferred and batched: sources accumulate per (project, table,
+// statement shape) and a background task merges them every N seconds, cutting
+// one-Delta-commit-per-statement churn (which starves OPTIMIZE via OCC and
+// piles up small files) down to a few commits per interval. The in-memory leg
+// still applies synchronously, so reads that overlay the buffer stay
+// read-your-writes. CONTRACT: statements must be idempotent under
+// re-application (e.g. guard appends with `NOT (col @> val)`), because a row
+// flushed between the mem leg and the drain sees the assignment applied
+// twice, and a failed drain retries whole groups. Timestamp-range conjuncts
+// are widened to the union across coalesced statements.
+const_default!(d_dml_coalesce_secs: u64 = 0);
 // Watchdog for a single bucket's Delta commit inside `flush_bucket`. A hung S3
 // commit / commit-lock wait otherwise pins `flush_lock` forever with no log:
 // flushes freeing zero memory while inserts wedge at the hard limit (prod
@@ -547,6 +559,10 @@ pub struct BufferConfig {
     pub timefusion_pressure_flush_pct:        u32,
     #[serde(default = "d_write_backpressure_secs")]
     pub timefusion_write_backpressure_secs:   u64,
+    /// See `d_dml_coalesce_secs` — drain interval for deferred UPDATE ... FROM
+    /// Delta merges; 0 keeps the synchronous per-statement path.
+    #[serde(default = "d_dml_coalesce_secs")]
+    pub timefusion_dml_coalesce_secs:         u64,
     #[serde(default = "d_flush_bucket_timeout_secs")]
     pub timefusion_flush_bucket_timeout_secs: u64,
     /// WAL shards per (project, table) topic. Higher = more append parallelism
@@ -600,6 +616,9 @@ impl BufferConfig {
     }
     pub fn flush_parallelism(&self) -> usize {
         self.timefusion_flush_parallelism.max(1)
+    }
+    pub fn dml_coalesce_secs(&self) -> u64 {
+        self.timefusion_dml_coalesce_secs
     }
     pub fn delta_scan_concurrency(&self) -> usize {
         self.timefusion_delta_scan_concurrency.max(1)

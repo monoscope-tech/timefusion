@@ -665,11 +665,14 @@ struct DmlContext<'a> {
 impl<'a> DmlContext<'a> {
     /// `delta_op` is a closure (not a bare Future) so its body — which may
     /// acquire a write lock and call `update_state` — is only constructed
-    /// when there is committed data to operate on.
+    /// when there is committed data to operate on. It receives the
+    /// watermark-clamped predicate (see [`delta_leg_predicate`]), computed
+    /// here so no DML path can run a Delta leg with an unclamped window or
+    /// a pre-`await_inflight_flushes` watermark.
     async fn execute<F, G, Fut>(self, mem_op: F, delta_op: G) -> Result<u64>
     where
         F: FnOnce(&BufferedWriteLayer, Option<&Expr>) -> Result<u64>,
-        G: FnOnce() -> Fut,
+        G: FnOnce(Option<Expr>) -> Fut,
         Fut: std::future::Future<Output = Result<u64>>,
     {
         let mut total_rows = 0u64;
@@ -687,6 +690,17 @@ impl<'a> DmlContext<'a> {
             total_rows
         );
 
+        // Order the Delta leg AFTER any airborne flush commit of this table:
+        // a commit snapshotted before the mem leg above lands PRE-DML row
+        // values, and only a Delta merge/delete that runs after it can
+        // correct them (critical for DELETE — the removed rows have nothing
+        // left in memory to supersede the stale copies). Also makes the
+        // has_committed check below see a table whose first-ever commit was
+        // airborne when this statement arrived.
+        if let Some(layer) = self.buffered_layer {
+            layer.await_inflight_flushes(self.project_id, self.table_name).await;
+        }
+
         // Check if there's committed data: either in custom project tables or unified tables.
         // The unified-tables lookup intentionally uses table_name only (no project_id):
         // unified tables are shared across all default projects, so a hit here means "some
@@ -699,11 +713,44 @@ impl<'a> DmlContext<'a> {
             custom_tables.contains_key(&(self.project_id.to_string(), self.table_name.to_string())) || unified_tables.contains_key(self.table_name)
         };
 
-        if has_committed {
-            total_rows += delta_op().await?;
+        if has_committed
+            && let Some(delta_pred) = delta_leg_predicate(self.buffered_layer, self.table_name, self.project_id, self.predicate.as_ref())
+        {
+            total_rows += delta_op(delta_pred).await?;
         }
 
         Ok(total_rows)
+    }
+}
+
+/// Watermark-clamp a Delta leg's predicate (see
+/// `dml_coalescer::clamp_to_watermark`): rows above the flush watermark are
+/// buffer-only, so the mem leg already updated them and the flush persists
+/// their post-DML values. `None` means the whole window is unflushed and the
+/// Delta leg can be skipped outright.
+///
+/// Called only from `DmlContext::execute`, after its `await_inflight_flushes`:
+/// a flush snapshotted before the mem leg commits PRE-DML values that only
+/// the Delta leg can correct, and that flush raises the watermark before
+/// committing — so only a post-await watermark is guaranteed to sit
+/// at-or-above every row whose Delta copy might be stale. Clamping with an
+/// earlier watermark would cut exactly those rows out of the merge and lose
+/// the update.
+fn delta_leg_predicate(
+    buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<&Expr>,
+) -> Option<Option<Expr>> {
+    let Some(layer) = buffered_layer else {
+        return Some(predicate.cloned());
+    };
+    let time_col = crate::dml_coalescer::table_time_column(table_name);
+    let watermark = layer.delta_flushed_watermark(project_id, table_name);
+    match crate::dml_coalescer::clamp_to_watermark(predicate, time_col, watermark) {
+        crate::dml_coalescer::WatermarkClamp::Keep(p) => Some(p),
+        crate::dml_coalescer::WatermarkClamp::SkipDelta => {
+            crate::metrics::record_dml_delta_leg_skipped();
+            debug!("DML delta leg skipped for {project_id}/{table_name}: time window entirely above flush watermark");
+            None
+        }
     }
 }
 
@@ -713,21 +760,33 @@ async fn perform_update_with_buffer(
     assignments: Vec<(String, Expr)>, source: Option<UpdateSource>, session: Arc<dyn Session>, span: &tracing::Span,
 ) -> Result<u64> {
     // `UPDATE ... FROM` path: MemBuffer takes the join via update_with_source,
-    // Delta path uses MergeBuilder via perform_delta_merge_update.
+    // Delta path uses MergeBuilder via perform_delta_merge_update — either
+    // synchronously or deferred through the coalescer when enabled.
     if let Some(src) = source {
         let update_span = tracing::trace_span!(parent: span, "delta.merge_update");
         let src_for_mem = src.clone();
         let src_for_delta = src;
+        let coalescer = database.dml_coalescer().cloned();
+        // `async move` must not take the Vec itself — the mem closure borrows it.
+        let assignments = &assignments;
         return DmlContext {
             database,
             buffered_layer,
             table_name,
             project_id,
-            predicate: predicate.clone(),
+            predicate,
         }
         .execute(
-            |layer, pred| layer.update_with_source(project_id, table_name, pred, &assignments, &src_for_mem),
-            || perform_delta_merge_update(database, table_name, project_id, predicate, assignments.clone(), src_for_delta, session).instrument(update_span),
+            |layer, pred| layer.update_with_source(project_id, table_name, pred, assignments, &src_for_mem),
+            |delta_pred| async move {
+                if let Some(coalescer) = coalescer {
+                    coalescer.enqueue(project_id, table_name, delta_pred.as_ref(), assignments, &src_for_delta, session);
+                    return Ok(0);
+                }
+                perform_delta_merge_update(database, table_name, project_id, delta_pred, assignments.clone(), src_for_delta, session)
+                    .instrument(update_span)
+                    .await
+            },
         )
         .await;
     }
@@ -740,11 +799,11 @@ async fn perform_update_with_buffer(
         buffered_layer,
         table_name,
         project_id,
-        predicate: predicate.clone(),
+        predicate,
     }
     .execute(
         |layer, pred| layer.update(project_id, table_name, pred, &assignments),
-        || perform_delta_update(database, table_name, project_id, predicate, assignments.clone(), session).instrument(update_span),
+        |delta_pred| perform_delta_update(database, table_name, project_id, delta_pred, assignments.clone(), session).instrument(update_span),
     )
     .await
 }
@@ -754,16 +813,19 @@ async fn perform_delete_with_buffer(
     session: Arc<dyn Session>, span: &tracing::Span,
 ) -> Result<u64> {
     let delete_span = tracing::trace_span!(parent: span, "delta.delete");
+    // The clamp applies to deletes too: rows above the flush watermark were
+    // removed from the buffer by the mem leg and will never flush, so Delta
+    // has nothing to do.
     DmlContext {
         database,
         buffered_layer,
         table_name,
         project_id,
-        predicate: predicate.clone(),
+        predicate,
     }
     .execute(
         |layer, pred| layer.delete(project_id, table_name, pred),
-        || perform_delta_delete(database, table_name, project_id, predicate, session).instrument(delete_span),
+        |delta_pred| perform_delta_delete(database, table_name, project_id, delta_pred, session).instrument(delete_span),
     )
     .await
 }
@@ -875,7 +937,7 @@ where
         .await
         .map_err(|e| DataFusionError::Execution(format!("Table not found: {} for project {}: {}", table_name, project_id, e)))?;
 
-    let dml_lock = database.dml_lock(project_id, table_name);
+    let dml_lock = database.dml_lock(project_id, table_name).await;
     let _dml_guard = dml_lock.lock().await;
 
     let mut attempt = 0;

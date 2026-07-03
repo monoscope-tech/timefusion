@@ -987,6 +987,11 @@ pub struct Database {
     /// so a plain Option would leave those clones silently service-less.
     tantivy_search:                  Arc<std::sync::OnceLock<Arc<crate::tantivy_index::search::TantivySearchService>>>,
     tantivy_indexer:                 Arc<std::sync::OnceLock<Arc<crate::tantivy_index::service::TantivyIndexService>>>,
+    /// Deferred-DML coalescer (see `dml_coalescer`) — populated by
+    /// `start_dml_coalescer` when `TIMEFUSION_DML_COALESCE_SECS > 0`. Same
+    /// late-binding shared-cell pattern as `buffered_layer`: the DML planner
+    /// clones Database before boot wiring finishes.
+    dml_coalescer:                   Arc<std::sync::OnceLock<Arc<crate::dml_coalescer::DmlCoalescer>>>,
     /// Per-table, per-date set of live file URIs as of the last successful full
     /// (z-order) optimize. delta-rs's ZOrder planner has no idempotence guard —
     /// it rewrites every file in the window on every run, even sealed days that
@@ -1298,6 +1303,7 @@ impl Database {
             bypass_buffer: false,
             tantivy_search: Arc::new(std::sync::OnceLock::new()),
             tantivy_indexer: Arc::new(std::sync::OnceLock::new()),
+            dml_coalescer: Arc::new(std::sync::OnceLock::new()),
             zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
         };
 
@@ -1331,6 +1337,26 @@ impl Database {
     /// Get the buffered write layer if configured
     pub fn buffered_layer(&self) -> Option<&Arc<crate::buffered_write_layer::BufferedWriteLayer>> {
         if self.bypass_buffer { None } else { self.buffered_layer.get() }
+    }
+
+    /// The deferred-DML coalescer, when enabled (see `start_dml_coalescer`).
+    pub fn dml_coalescer(&self) -> Option<&Arc<crate::dml_coalescer::DmlCoalescer>> {
+        self.dml_coalescer.get()
+    }
+
+    /// Start the DML coalescer + its background drain task when
+    /// `TIMEFUSION_DML_COALESCE_SECS > 0`. Idempotent (shared OnceLock).
+    /// The drain loop stops — after one final drain — on the same
+    /// cancellation token as the maintenance tasks.
+    pub fn start_dml_coalescer(&self) {
+        let secs = self.config.buffer.dml_coalesce_secs();
+        if secs == 0 {
+            return;
+        }
+        let coalescer = Arc::new(crate::dml_coalescer::DmlCoalescer::new(secs));
+        if self.dml_coalescer.set(coalescer.clone()).is_ok() {
+            tokio::spawn(coalescer.run(self.clone(), (*self.maintenance_shutdown).clone()));
+        }
     }
 
     /// Attach the tantivy search service used by the scan-side prefilter.
@@ -2827,9 +2853,20 @@ impl Database {
         self.config.maintenance.timefusion_incremental_snapshot
     }
 
-    /// The per-table DML serialization mutex for `(project_id, table_name)`.
-    pub(crate) fn dml_lock(&self, project_id: &str, table_name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.dml_locks.entry((project_id.to_string(), table_name.to_string())).or_default().clone()
+    /// The DML serialization mutex for the PHYSICAL table backing
+    /// `(project_id, table_name)`. Unified tables are one shared Delta table
+    /// across all default projects, so their key drops the project — two
+    /// projects' merges on `otel_logs_and_spans` would otherwise run
+    /// concurrently, OCC-conflict at the shared Delta log, and redo full
+    /// parquet rewrites (observed as sustained `dml.conflict` in prod).
+    /// Custom-storage tables are physically isolated and keep the full key.
+    pub(crate) async fn dml_lock(&self, project_id: &str, table_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let project_key = if self.has_custom_storage(project_id, table_name).await {
+            project_id.to_string()
+        } else {
+            String::new() // not a valid project_id, so it can't collide
+        };
+        self.dml_locks.entry((project_key, table_name.to_string())).or_default().clone()
     }
 
     /// Persist `table`'s post-commit snapshot locally (detached) so the next
@@ -3330,7 +3367,7 @@ impl Database {
 
     /// Read the latest commit metadata for each WAL topic and fast-forward the
     /// walrus persisted-read cursor to `max(local, delta)` per shard. Closes
-    /// the crash-mid-flush window where Delta committed but `advance_by_counts`
+    /// the crash-mid-flush window where Delta committed but the watermark advance
     /// didn't finish — without this, restart replays entries already in Delta
     /// and the next flush writes them a second time.
     ///
@@ -4411,6 +4448,14 @@ impl Database {
     /// Gracefully shutdown the database, including cache and maintenance tasks
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down TimeFusion database...");
+
+        // Flush deferred DML merges before anything is torn down. The drain
+        // task also runs a final drain on cancellation, but doing it here
+        // deterministically (drains are serialized + idempotent) means
+        // shutdown doesn't race the task's select loop.
+        if let Some(coalescer) = self.dml_coalescer() {
+            coalescer.drain(self).await;
+        }
 
         // Cancel maintenance tasks
         self.maintenance_shutdown.cancel();

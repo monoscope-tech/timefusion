@@ -8,6 +8,7 @@ pub mod clock;
 pub mod config;
 pub mod database;
 pub mod dml;
+pub mod dml_coalescer;
 pub mod errors;
 pub mod functions;
 pub mod grpc_handlers;

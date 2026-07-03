@@ -82,6 +82,10 @@ counter_registry! {
     optimize_conflict          => "timefusion.optimize.conflict": "Optimize/compaction commits that hit an OCC conflict (a concurrent txn touched a file the merge read). Retried — but a sustained nonzero rate means optimize is losing commit races to dedup/flush. WARN if rate() stays > 0 across several ticks",
     optimize_failed            => "timefusion.optimize.failed": "Optimize/compaction runs that ultimately errored or gave up after exhausting retries. The partition stays fragmented until a later run succeeds, so small files pile up silently. PAGE if > 0 sustained",
     dml_conflict               => "timefusion.dml.conflict": "DML (UPDATE/DELETE) Delta operations that lost an OCC race to a concurrent commit and were retried on a fresh snapshot. Sustained rate > 0 means UPDATE churn is racing flush commits",
+    dml_delta_leg_skipped      => "timefusion.dml.delta_leg_skipped": "DML Delta legs skipped because the predicate's time window lies entirely above the flush watermark — the matched rows are buffer-only, so the flush persists their post-DML values and the Delta merge would scan+commit for nothing",
+    dml_coalesce_enqueued      => "timefusion.dml.coalesce_enqueued": "UPDATE ... FROM statements whose Delta leg was deferred into the coalescer queue",
+    dml_coalesce_merges        => "timefusion.dml.coalesce_merges": "Delta merges executed by coalescer drains (each replaces N deferred statement-merges; compare with coalesce_enqueued for the batching ratio)",
+    dml_coalesce_dropped       => "timefusion.dml.coalesce_dropped": "Coalesced DML groups dropped after exhausting drain retries — deferred Delta updates were LOST for rows already in Delta (buffer-resident rows are unaffected). PAGE if > 0",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -361,5 +365,33 @@ pub fn record_optimize_failed() {
 pub fn record_dml_conflict() {
     if let Some(m) = METRICS.get() {
         m.dml_conflict.add(1, &[]);
+    }
+}
+
+/// One DML Delta leg skipped because its time window is entirely unflushed.
+pub fn record_dml_delta_leg_skipped() {
+    if let Some(m) = METRICS.get() {
+        m.dml_delta_leg_skipped.add(1, &[]);
+    }
+}
+
+/// One `UPDATE ... FROM` Delta leg deferred into the coalescer.
+pub fn record_dml_coalesce_enqueued() {
+    if let Some(m) = METRICS.get() {
+        m.dml_coalesce_enqueued.add(1, &[]);
+    }
+}
+
+/// One Delta merge executed by a coalescer drain.
+pub fn record_dml_coalesce_merge() {
+    if let Some(m) = METRICS.get() {
+        m.dml_coalesce_merges.add(1, &[]);
+    }
+}
+
+/// One coalesced DML group dropped after exhausting drain retries.
+pub fn record_dml_coalesce_dropped() {
+    if let Some(m) = METRICS.get() {
+        m.dml_coalesce_dropped.add(1, &[]);
     }
 }

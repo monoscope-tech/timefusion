@@ -243,6 +243,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
 
     // Apply buffered layer to database
     db = db.with_buffered_layer(Arc::clone(&buffered_layer));
+    db.start_dml_coalescer();
 
     // Start maintenance schedulers for regular optimize and vacuum
     db = db.start_maintenance_schedulers().await?;

@@ -811,4 +811,112 @@ mod test_dml_operations {
         assert_eq!(get_str(b.column(1).as_ref(), 0), "WARN");
         Ok(())
     }
+
+    // ==========================================================================
+    // DML coalescer + flush-watermark tests
+    // ==========================================================================
+
+    /// With `TIMEFUSION_DML_COALESCE_SECS > 0`, the Delta leg of
+    /// `UPDATE ... FROM` defers: statements return without touching Delta,
+    /// same-shape statements coalesce into one drained merge, and same-key
+    /// statements apply in arrival order (split into merge rounds).
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_from_coalesced_defers_and_drains() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let mut cfg = (*create_test_config(&test_id)).clone();
+        cfg.buffer.timefusion_dml_coalesce_secs = 3600; // timer never fires; drains are explicit
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        db.start_dml_coalescer();
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(create_test_records(now))?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        let update = |val: i64, name: &str| {
+            format!(
+                "UPDATE otel_logs_and_spans
+                   SET duration = u.d
+                   FROM (VALUES ('{name}', {val})) AS u(name, d)
+                   WHERE project_id = 'test_project'
+                     AND otel_logs_and_spans.name = u.name"
+            )
+        };
+        for sql in [update(500, "Bob"), update(999, "Alice")] {
+            let result = ctx.sql(&sql).await?.collect().await?;
+            let rows = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+            assert_eq!(rows, 0, "deferred statement reports 0 rows (no mem leg here)");
+        }
+        // Nothing merged yet: Delta untouched until a drain.
+        assert_eq!(duration_by_name(&ctx, "Bob").await?, 200);
+        assert_eq!(duration_by_name(&ctx, "Alice").await?, 100);
+
+        db.dml_coalescer().expect("coalescer enabled").drain(&db).await;
+        assert_eq!(duration_by_name(&ctx, "Bob").await?, 500);
+        assert_eq!(duration_by_name(&ctx, "Alice").await?, 999);
+        assert_eq!(duration_by_name(&ctx, "Charlie").await?, 300, "unmatched row untouched");
+
+        // Same key updated twice before one drain: rounds apply in arrival
+        // order, so the later statement wins.
+        ctx.sql(&update(777, "Bob")).await?.collect().await?;
+        ctx.sql(&update(888, "Bob")).await?.collect().await?;
+        db.dml_coalescer().expect("coalescer enabled").drain(&db).await;
+        assert_eq!(duration_by_name(&ctx, "Bob").await?, 888);
+        Ok(())
+    }
+
+    /// With a buffered layer, the mem leg updates buffer-resident rows
+    /// synchronously and the flush persists the POST-DML values to Delta —
+    /// the invariant that makes both the watermark clamp and coalescer
+    /// deferral sound. Exercises update-before-flush, then verifies Delta
+    /// (buffer bypassed) holds the updated row.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_update_from_buffered_rows_persisted_by_flush() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let cfg = timefusion::test_utils::test_helpers::TestConfigBuilder::new("dml_wm").build();
+        // SAFETY: same #[serial]-guarded process-global env dance as
+        // buffer_consistency_test.rs.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", &cfg.core.timefusion_data_dir) };
+        let layer = Arc::new(timefusion::test_utils::test_helpers::test_layer(Arc::clone(&cfg))?);
+        let db = Arc::new(Database::with_config(cfg).await?.with_buffered_layer(Arc::clone(&layer)));
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(create_test_records(now))?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        // Rows are buffer-resident. The mem leg applies; the Delta leg has
+        // nothing committed to touch (and a time window above the watermark
+        // is clamped away entirely).
+        let df = ctx
+            .sql(
+                "UPDATE otel_logs_and_spans
+                   SET duration = u.d
+                   FROM (VALUES ('Bob', 4242)) AS u(name, d)
+                   WHERE project_id = 'test_project'
+                     AND otel_logs_and_spans.name = u.name",
+            )
+            .await?;
+        let result = df.collect().await?;
+        let rows = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
+        assert_eq!(rows, 1, "mem leg updated the buffered row");
+        assert_eq!(duration_by_name(&ctx, "Bob").await?, 4242, "overlay read sees the update immediately");
+
+        // Flush → Delta must hold the POST-update value.
+        layer.flush_all_now().await?;
+        let delta = db
+            .query_delta_only("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'")
+            .await?;
+        assert_eq!(
+            delta[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0),
+            4242,
+            "flush persisted the post-DML value"
+        );
+        Ok(())
+    }
 }

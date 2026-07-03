@@ -134,6 +134,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     buffered_layer.start_background_tasks().await;
 
     db = db.with_buffered_layer(Arc::clone(&buffered_layer));
+    db.start_dml_coalescer();
     db = db.start_maintenance_schedulers().await?;
     let db = Arc::new(db);
     db.setup_session_tables(&mut session_context)?;
