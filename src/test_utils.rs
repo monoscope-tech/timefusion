@@ -126,6 +126,24 @@ pub mod test_helpers {
         crate::buffered_write_layer::BufferedWriteLayer::with_config(cfg, crate::functions::function_registry()?)
     }
 
+    /// Collect a string column out of a layer query result as `Vec<String>`,
+    /// casting through Utf8 so Utf8View/Utf8 storage both work. Collapses the
+    /// cast/downcast/flat_map plumbing the WAL-watermark regression tests
+    /// would otherwise each repeat.
+    pub fn query_col_strings(layer: &crate::buffered_write_layer::BufferedWriteLayer, project: &str, table: &str, col: &str) -> Vec<String> {
+        use datafusion::arrow::{array::StringArray, datatypes::DataType};
+        layer
+            .query(project, table, &[])
+            .unwrap()
+            .iter()
+            .flat_map(|b| {
+                let arr = datafusion::arrow::compute::cast(b.column(b.schema().index_of(col).unwrap()), &DataType::Utf8).unwrap();
+                let arr = arr.as_any().downcast_ref::<StringArray>().unwrap();
+                (0..b.num_rows()).map(|i| arr.value(i).to_string()).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     pub fn json_to_batch(records: Vec<Value>) -> anyhow::Result<RecordBatch> {
         let target_schema = get_default_schema().schema_ref();
 

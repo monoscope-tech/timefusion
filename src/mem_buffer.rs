@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicI64, AtomicUsize, Ordering},
+    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 
 use arrow::{
@@ -21,7 +21,7 @@ use datafusion::{
     },
 };
 use parking_lot::Mutex;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::{errors::arrow_err, functions::FnRegistry};
 
@@ -147,14 +147,18 @@ fn types_compatible(existing: &DataType, incoming: &DataType) -> bool {
 /// Extract the min timestamp from a batch's "timestamp" column (if present).
 /// Returns None if no timestamp column exists or it's empty.
 pub fn extract_min_timestamp(batch: &RecordBatch) -> Option<i64> {
+    batch_timestamp_range(batch).map(|(min, _)| min)
+}
+
+/// (min, max) of the batch's `timestamp` column, if present.
+pub fn batch_timestamp_range(batch: &RecordBatch) -> Option<(i64, i64)> {
     let schema = batch.schema();
     let ts_idx = schema
         .fields()
         .iter()
         .position(|f| f.name() == "timestamp" && matches!(f.data_type(), DataType::Timestamp(TimeUnit::Microsecond, _)))?;
-    let ts_col = batch.column(ts_idx);
-    let ts_array = ts_col.as_any().downcast_ref::<TimestampMicrosecondArray>()?;
-    arrow::compute::min(ts_array)
+    let ts_array = batch.column(ts_idx).as_any().downcast_ref::<TimestampMicrosecondArray>()?;
+    Some((arrow::compute::min(ts_array)?, arrow::compute::max(ts_array)?))
 }
 
 /// Table key type using Arc<str> for efficient cloning and comparison.
@@ -174,7 +178,7 @@ pub struct MemBuffer {
     ///   the post-concat size, but this MemBuffer-level total isn't
     ///   decremented — so the running sum stays high until the bucket
     ///   drains.
-    /// - `-= freed_bytes` on `drain_bucket` and eviction (sees the
+    /// - `-= freed_bytes` on flushed-prefix drain and eviction (sees the
     ///   post-coalesce bucket size, fully reconciling that bucket's
     ///   contribution).
     ///
@@ -195,7 +199,7 @@ pub struct MemBuffer {
     /// throttling. The `pressure_pct` reported on `buffered_layer` is
     /// what the flush task and the memory-reservation CAS actually use.
     estimated_bytes:      AtomicUsize,
-    /// Mirrors `WalManager::shards_per_topic` so `FlushableBucket.wal_shard_counts`
+    /// Mirrors `WalManager::shards_per_topic` so `FlushableBucket.wal_first_positions`
     /// is always sized correctly when snapshotted at seal time.
     shards_per_topic:     usize,
     /// LRU cache of per-bucket tantivy indexes. Lives at the MemBuffer
@@ -239,47 +243,71 @@ pub struct TableBuffer {
 }
 
 pub struct TimeBucket {
-    batches:         Mutex<Vec<RecordBatch>>,
-    row_count:       AtomicUsize,
-    memory_bytes:    AtomicUsize,
-    min_timestamp:   AtomicI64,
-    max_timestamp:   AtomicI64,
+    batches:             Mutex<Vec<RecordBatch>>,
+    row_count:           AtomicUsize,
+    memory_bytes:        AtomicUsize,
+    min_timestamp:       AtomicI64,
+    max_timestamp:       AtomicI64,
     /// Wall-clock micros (via `crate::clock`) when this bucket was created.
     /// Drives the flush-dwell staleness signal — how long the bucket has
     /// waited to flush — independent of its rows' event-time range, so
     /// backfilled/late data can't false-trip the "oldest bucket" alarm.
-    created_micros:  i64,
-    /// Per-shard WAL-entry counts (drive `advance_by_counts` on flush) and
-    /// post-append walrus positions (written to Delta commit metadata for
-    /// crash-mid-flush recovery). One mutex so a single append updates both
-    /// atomically — a snapshot can't see counts ahead of positions.
-    wal_shard_state: Mutex<WalShardState>,
+    created_micros:      i64,
+    /// Per-shard walrus positions captured BEFORE this bucket's first WAL
+    /// entry on each shard (min-merged). These are the bucket's read-cursor
+    /// *holds*: while the bucket is unflushed, the cursor must not advance
+    /// past `first_positions[shard]`, or a crash would replay past this
+    /// bucket's acked entries and lose them (prod 2026-07-03).
+    wal_shard_state:     Mutex<WalShardState>,
+    /// While a flush snapshot is airborne, the first N batches are the
+    /// snapshot's prefix: insert-time coalesce must not fold across this
+    /// boundary or the post-commit prefix drain would remove late
+    /// (unflushed) rows merged into a combined batch. 0 = no snapshot in
+    /// flight.
+    flush_pinned_prefix: AtomicUsize,
+    /// Bumped by every in-place DML mutation of this bucket's batches (under
+    /// the batches lock). A flush snapshot captures it; if it changed by
+    /// commit time, the commit landed pre-DML row values and the prefix
+    /// indices may have shifted (DELETE drops emptied batches), so
+    /// `finish_flushed_snapshot` must NOT drain — the bucket re-flushes
+    /// whole next cycle with the post-DML values.
+    mutation_gen:        AtomicU64,
+    /// Wall-clock micros of the newest WAL entry pinned on this bucket
+    /// (WalEntry timestamps are append-time, so this is ARRIVAL time — the
+    /// same clock the replay retention filter uses). Drives
+    /// [`MemBuffer::reap_expired_empty_buckets`]: once every pinned entry is
+    /// past the replay cutoff, an empty shell's holds can be released
+    /// without any resurrection risk.
+    last_wal_pin_micros: AtomicI64,
 }
 
 #[derive(Debug, Default, Clone)]
 struct WalShardState {
-    counts:    Vec<u64>,
-    positions: Vec<Option<walrus_rust::WalPosition>>,
+    first_positions: Vec<Option<walrus_rust::WalPosition>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct FlushableBucket {
-    pub project_id:       String,
-    pub table_name:       String,
-    pub bucket_id:        i64,
-    pub batches:          Vec<RecordBatch>,
-    pub row_count:        usize,
-    /// Drives `Wal::advance_by_counts` after a successful flush.
-    pub wal_shard_counts: Vec<u64>,
-    /// Written into Delta commit metadata so a crash between Delta commit
-    /// and `advance_by_counts` can recover the cursor from Delta on restart.
-    pub wal_positions:    Vec<Option<walrus_rust::WalPosition>>,
+    pub project_id:          String,
+    pub table_name:          String,
+    pub bucket_id:           i64,
+    pub batches:             Vec<RecordBatch>,
+    pub row_count:           usize,
+    /// Per-shard positions BEFORE this bucket's first WAL entry — the bucket's
+    /// read-cursor holds. Registered as in-flight holds while the flush is
+    /// airborne; restored to the bucket if the Delta commit fails.
+    pub wal_first_positions: Vec<Option<walrus_rust::WalPosition>>,
+    /// `mutation_gen` at snapshot time (snapshot-flush path only). If the
+    /// bucket's gen moved by commit time, a DML mutated it mid-flight: the
+    /// commit landed pre-DML values, so `finish_flushed_snapshot` must keep
+    /// the rows and re-flush instead of draining.
+    pub snapshot_gen:        u64,
     /// Actual min/max timestamp of the taken rows, captured before the source
     /// bucket's atomics were reset. `restore_taken_bucket` replays these so a
     /// restored bucket keeps its true time range (and stays visible to
     /// time-range pruning) rather than collapsing to the bucket's start.
-    pub min_timestamp:    i64,
-    pub max_timestamp:    i64,
+    pub min_timestamp:       i64,
+    pub max_timestamp:       i64,
 }
 
 #[derive(Debug, Default)]
@@ -780,7 +808,7 @@ impl MemBuffer {
     }
 
     /// Drop the cached entry for a bucket. Called by `insert_batch` and
-    /// `drain_bucket` to keep the cache from going stale.
+    /// drain to keep the cache from going stale.
     fn cache_invalidate(&self, key: &BucketCacheKey) {
         if let Some(old) = self.text_index_cache.lock().pop(key) {
             self.text_index_bytes.fetch_sub(old.size_bytes, Ordering::Relaxed);
@@ -876,9 +904,20 @@ impl MemBuffer {
 
     #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
     pub fn insert(&self, project_id: &str, table_name: &str, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<()> {
+        self.insert_with_hold(project_id, table_name, batch, timestamp_micros, None)
+    }
+
+    /// `wal_hold` = (shard, pre-append position) of the batch's WAL entry;
+    /// recorded atomically with the batch (under the bucket lock) so a
+    /// concurrent take can never separate rows from their cursor hold. Pass
+    /// None only when the entry needs no pin (WAL replay pins via
+    /// [`Self::record_replay_holds`] instead).
+    pub fn insert_with_hold(
+        &self, project_id: &str, table_name: &str, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>,
+    ) -> anyhow::Result<()> {
         let schema = batch.schema();
         let table = self.get_or_create_table(project_id, table_name, &schema)?;
-        let (batch_size, bucket_id) = table.insert_batch(batch, timestamp_micros)?;
+        let (batch_size, bucket_id) = table.insert_batch(batch, timestamp_micros, wal_hold)?;
         self.estimated_bytes.fetch_add(batch_size, Ordering::Relaxed);
         // Drop any stale text-index cache entry for this bucket — the
         // `indexed_rows == snapshot_rows` check would reject it on the
@@ -888,28 +927,56 @@ impl MemBuffer {
         Ok(())
     }
 
-    /// Record that `count` WAL entries for `(project_id, table_name)` were
-    /// appended to walrus `shard`, attributing them to the MemBuffer bucket
-    /// covering `timestamp_micros`. Called by the write path *after*
-    /// `Wal::append*` returns the chosen shard. Not called during WAL replay
-    /// (those entries are *read from* walrus, not appended to it).
-    ///
-    /// No-op if the bucket doesn't exist — the caller must have already
-    /// inserted into the same bucket via `insert` / `insert_batches`, so
-    /// missing-bucket here would mean a TOCTOU race we don't currently
-    /// expose (insert + record are both synchronous, no await between them
-    /// at the call site).
-    pub fn record_wal_append(
-        &self, project_id: &str, table_name: &str, timestamp_micros: i64, shard: usize, count: u64, position: Option<walrus_rust::WalPosition>,
-    ) {
+    /// Pin the bucket owning `timestamp_micros` at the given per-shard
+    /// positions (min-merge). Used by WAL recovery: replayed entries' exact
+    /// positions aren't observable, so every replay-created bucket is pinned
+    /// at the pre-recovery cursor `P0` for its whole topic — conservative
+    /// (re-replays flushed neighbors on a later crash; dedup collapses those)
+    /// but never lossy.
+    pub fn record_replay_holds(&self, project_id: &str, table_name: &str, timestamp_micros: i64, holds: &[Option<walrus_rust::WalPosition>]) {
         let key = Self::make_key(project_id, table_name);
         let Some(table) = self.tables.get(&key) else {
             return;
         };
         let bucket_id = Self::compute_bucket_id(timestamp_micros);
         if let Some(bucket) = table.buckets.get(&bucket_id) {
-            bucket.record_wal_append(shard, count, position);
+            for (shard, pos) in holds.iter().enumerate() {
+                bucket.record_wal_append(shard, *pos);
+            }
         }
+    }
+
+    /// Per-shard min of `first_positions` across every live bucket of the
+    /// table — the earliest WAL entry still owned by unflushed in-memory
+    /// data. The flush path advances the read cursor to exactly this (or the
+    /// write tail when no bucket holds a position).
+    pub fn wal_holds(&self, project_id: &str, table_name: &str, shards_per_topic: usize) -> Vec<Option<walrus_rust::WalPosition>> {
+        let mut holds: Vec<Option<walrus_rust::WalPosition>> = vec![None; shards_per_topic];
+        if let Some(table) = self.get_table(project_id, table_name) {
+            for bucket in table.buckets.iter() {
+                for (shard, pos) in bucket.snapshot_wal_shard_state(shards_per_topic).into_iter().enumerate() {
+                    if let Some(pos) = pos {
+                        holds[shard] = Some(holds[shard].map_or(pos, |prev| prev.min(pos)));
+                    }
+                }
+            }
+        }
+        holds
+    }
+
+    /// (project_id, table_name, bucket_id) for every bucket whose id passes
+    /// `filter`. Drives the take-based flush paths.
+    pub fn bucket_keys(&self, filter: impl Fn(i64) -> bool) -> Vec<(String, String, i64)> {
+        let mut out = Vec::new();
+        for t in self.tables.iter() {
+            let (project_id, table_name) = t.key();
+            for b in t.value().buckets.iter() {
+                if filter(*b.key()) {
+                    out.push((project_id.to_string(), table_name.to_string(), *b.key()));
+                }
+            }
+        }
+        out
     }
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
@@ -923,7 +990,7 @@ impl MemBuffer {
         let mut total_size = 0usize;
         let mut touched_buckets: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for batch in batches {
-            let (sz, bucket_id) = table.insert_batch(batch, timestamp_micros)?;
+            let (sz, bucket_id) = table.insert_batch(batch, timestamp_micros, None)?;
             total_size += sz;
             touched_buckets.insert(bucket_id);
         }
@@ -1166,35 +1233,200 @@ impl MemBuffer {
         ranges
     }
 
-    #[instrument(skip(self), fields(project_id, table_name, bucket_id))]
-    pub fn drain_bucket(&self, project_id: &str, table_name: &str, bucket_id: i64) -> Option<Vec<RecordBatch>> {
-        let key = Self::make_key(project_id, table_name);
-        if let Some(table) = self.tables.get(&key).map(|e| e.value().clone())
-            && let Some((_, bucket)) = table.buckets.remove(&bucket_id)
-        {
-            let freed_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
-            self.estimated_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
-            let batches = bucket.batches.into_inner();
-            // Bucket is gone — drop its text-index cache entry so the LRU
-            // doesn't hold ~MB of dead postings until natural eviction.
-            self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
+    /// Snapshot a sealed bucket for flush WITHOUT removing its rows — they
+    /// stay queryable while the Delta commit is airborne (a take here made
+    /// every periodic flush a multi-minute read blackout for that window).
+    /// WAL holds are taken (reset) exactly like `take_bucket_for_flush`, so
+    /// late arrivals pin themselves and the snapshot's holds ride the
+    /// caller's in-flight registry. After the commit lands,
+    /// [`Self::finish_flushed_snapshot`] removes exactly the snapshotted
+    /// batches (or keeps them when a DML dirtied the bucket); on failure
+    /// [`Self::restore_snapshot_holds`] merges the holds
+    /// back (the rows never left).
+    pub fn snapshot_bucket_for_flush(&self, project_id: &str, table_name: &str, bucket_id: i64) -> Option<FlushableBucket> {
+        let table = self.get_table(project_id, table_name)?;
+        let bucket_ref = table.buckets.get(&bucket_id)?;
+        let bucket = bucket_ref.value();
+        let batches_g = bucket.batches.lock();
+        if batches_g.is_empty() {
+            return None;
+        }
+        let mut wal_g = bucket.wal_shard_state.lock();
+        let batches: Vec<RecordBatch> = batches_g.iter().cloned().collect();
+        let wal_state = std::mem::take(&mut *wal_g);
+        // Fence the snapshot prefix against insert-time coalesce (see field docs).
+        bucket.flush_pinned_prefix.store(batches.len(), Ordering::Relaxed);
+        // Capture the DML generation under the same lock as the batch clones,
+        // so a mutation can't slip between clone and capture.
+        let snapshot_gen = bucket.mutation_gen.load(Ordering::Relaxed);
+        drop(wal_g);
+        drop(batches_g);
+        let mut first_positions = vec![None; self.shards_per_topic];
+        for (i, p) in wal_state.first_positions.iter().take(self.shards_per_topic).enumerate() {
+            first_positions[i] = *p;
+        }
+        Some(FlushableBucket {
+            project_id: project_id.to_string(),
+            table_name: table_name.to_string(),
+            bucket_id,
+            row_count: batches.iter().map(|b| b.num_rows()).sum(),
+            batches,
+            wal_first_positions: first_positions,
+            snapshot_gen,
+            min_timestamp: bucket.min_timestamp.load(Ordering::Relaxed),
+            max_timestamp: bucket.max_timestamp.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Complete a successful snapshot-flush for one source bucket.
+    ///
+    /// Clean case (`mutation_gen` unchanged since the snapshot): remove
+    /// exactly the snapshotted prefix batches, preserving any appended since
+    /// (their holds were recorded post-snapshot and still pin them), and drop
+    /// the bucket entirely when nothing remains.
+    ///
+    /// Dirty case (a DML mutated the bucket while the commit was airborne):
+    /// the commit landed PRE-DML values and the prefix indices may have
+    /// shifted (DELETE drops emptied batches), so draining would both lose
+    /// the post-DML rows and remove the wrong batches. Keep all rows and
+    /// merge the snapshot's holds back. The stale Delta copies are corrected
+    /// by the DML's own Delta leg, which `DmlContext` orders AFTER in-flight
+    /// commits (`BufferedWriteLayer::await_inflight_flushes`) — updates get
+    /// merged, deletes removed — while the living bucket's exclusion masks
+    /// them in the interim. The next cycle re-flushes the post-DML state.
+    ///
+    /// Returns true when the prefix was drained (clean case) — callers count
+    /// flush metrics only for drained buckets, since a dirty-kept bucket's
+    /// rows are neither freed nor authoritative in Delta yet.
+    pub fn finish_flushed_snapshot(&self, b: &FlushableBucket) -> bool {
+        let key = Self::make_key(&b.project_id, &b.table_name);
+        // Source evaporated while airborne (evicted/reaped): the commit's
+        // rows are durably in Delta and nothing remains to drain — count as
+        // drained, same as the bucket-gone case below.
+        let Some(table) = self.get_table(&b.project_id, &b.table_name) else {
+            return true;
+        };
+        let mut emptied = false;
+        if let Some(bucket_ref) = table.buckets.get(&b.bucket_id) {
+            let bucket = bucket_ref.value();
+            let mut g = bucket.batches.lock();
+            if bucket.mutation_gen.load(Ordering::Relaxed) != b.snapshot_gen {
+                // Dirty: re-pin and re-flush next cycle.
+                for (shard, pos) in b.wal_first_positions.iter().enumerate() {
+                    bucket.record_wal_append(shard, *pos);
+                }
+                bucket.flush_pinned_prefix.store(0, Ordering::Relaxed);
+                // No further drain-progress escalation needed for sustained
+                // DML churn: backpressure relief force-flushes via take-based
+                // snapshots, which a racing DML cannot dirty.
+                info!(
+                    "finish_flushed_snapshot: bucket {}.{}/{} mutated mid-flight — keeping rows for re-flush",
+                    b.project_id, b.table_name, b.bucket_id
+                );
+                return false;
+            }
+            let n = b.batches.len().min(g.len());
+            let (freed, rows): (usize, usize) =
+                g.drain(..n).map(|batch| (estimate_batch_size(&batch), batch.num_rows())).fold((0, 0), |a, x| (a.0 + x.0, a.1 + x.1));
+            emptied = g.is_empty();
+            if !emptied {
+                // Narrow the surviving bucket's time range to the remaining
+                // (late-arrival) rows: the old span still covered the DRAINED
+                // rows, and the whole-range exclusion would mask their
+                // freshly committed Delta copies for up to a flush cycle.
+                // Narrowing (instead of a force_flushed exemption) keeps the
+                // exclusion armed for a later DML + airborne-commit race on
+                // this bucket, which relies on the mask.
+                let (min, max) = g.iter().filter_map(batch_timestamp_range).fold((i64::MAX, i64::MIN), |a, r| (a.0.min(r.0), a.1.max(r.1)));
+                bucket.min_timestamp.store(min, Ordering::Relaxed);
+                bucket.max_timestamp.store(max, Ordering::Relaxed);
+            }
+            bucket.flush_pinned_prefix.store(0, Ordering::Relaxed);
+            drop(g);
+            bucket.memory_bytes.fetch_sub(freed.min(bucket.memory_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+            bucket.row_count.fetch_sub(rows.min(bucket.row_count.load(Ordering::Relaxed)), Ordering::Relaxed);
+            self.estimated_bytes.fetch_sub(freed, Ordering::Relaxed);
+        }
+        self.cache_invalidate(&Self::cache_key(&b.project_id, &b.table_name, b.bucket_id));
+        // remove_if re-checks under the shard lock (bucket_ref dropped above,
+        // so no self-deadlock); a racing insert that repopulated the bucket
+        // keeps it AND its force_flushed marker — clearing the marker on a
+        // survived bucket would re-mask its force-flushed Delta rows.
+        let bucket_removed = emptied && table.buckets.remove_if(&b.bucket_id, |_, bk| bk.batches.lock().is_empty()).is_some();
+        if bucket_removed {
             if let Some(mut s) = self.force_flushed.get_mut(&key) {
-                s.remove(&bucket_id);
+                s.remove(&b.bucket_id);
             }
             self.force_flushed.remove_if(&key, |_, s| s.is_empty());
-            debug!(
-                "MemBuffer drain: project={}, table={}, bucket={}, batches={}, freed_bytes={}",
-                project_id,
-                table_name,
-                bucket_id,
-                batches.len(),
-                freed_bytes
-            );
             drop(table);
             self.try_drop_empty_table(&key);
-            return Some(batches);
         }
-        None
+        true
+    }
+
+    /// Merge a snapshot's WAL holds back after a failed commit (rows never
+    /// left the bucket). Returns false when the bucket no longer exists
+    /// (e.g. evicted) — the caller must then keep its in-flight holds so the
+    /// entries stay replayable.
+    #[must_use]
+    pub fn restore_snapshot_holds(&self, b: &FlushableBucket) -> bool {
+        let Some(table) = self.get_table(&b.project_id, &b.table_name) else {
+            return false;
+        };
+        let Some(bucket) = table.buckets.get(&b.bucket_id) else {
+            return false;
+        };
+        for (shard, pos) in b.wal_first_positions.iter().enumerate() {
+            bucket.record_wal_append(shard, *pos);
+        }
+        bucket.flush_pinned_prefix.store(0, Ordering::Relaxed);
+        true
+    }
+
+    /// Remove empty bucket shells whose pinned WAL entries are all past the
+    /// replay cutoff, releasing their cursor holds so the topic's WAL can
+    /// advance and GC. A DML that empties a sealed bucket leaves such a
+    /// shell: it can never flush (snapshot/take return None on empty), so
+    /// without this sweep its holds pin the watermark for the process
+    /// lifetime — unbounded WAL growth for DML-heavy topics.
+    ///
+    /// `arrival_cutoff_micros` MUST be the replay retention cutoff (WalEntry
+    /// timestamps are append-time): past it, replay filters the entries
+    /// regardless, so releasing can't skip an insert while replaying its
+    /// DELETE or vice versa (and a DELETE always arrives after the inserts
+    /// it affected). Shells with an airborne snapshot are skipped.
+    pub fn reap_expired_empty_buckets(&self, arrival_cutoff_micros: i64) -> usize {
+        let mut reaped = 0usize;
+        for table in self.tables.iter() {
+            let expired: Vec<i64> = table
+                .buckets
+                .iter()
+                .filter(|b| {
+                    b.batches.lock().is_empty()
+                        && b.flush_pinned_prefix.load(Ordering::Relaxed) == 0
+                        && b.last_wal_pin_micros.load(Ordering::Relaxed) < arrival_cutoff_micros
+                })
+                .map(|b| *b.key())
+                .collect();
+            for id in expired {
+                // Re-check emptiness under the shard lock — a concurrent
+                // insert that repopulated the shell keeps it.
+                if table
+                    .buckets
+                    .remove_if(&id, |_, b| {
+                        b.batches.lock().is_empty() && b.last_wal_pin_micros.load(Ordering::Relaxed) < arrival_cutoff_micros
+                    })
+                    .is_some()
+                {
+                    self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, id));
+                    reaped += 1;
+                }
+            }
+        }
+        if reaped > 0 {
+            debug!("reap_expired_empty_buckets: released {} expired empty shell(s)", reaped);
+        }
+        reaped
     }
 
     /// Race-safe removal of an empty TableBuffer. `remove_if` holds the shard
@@ -1204,89 +1436,10 @@ impl MemBuffer {
         self.tables.remove_if(key, |_, v| v.buckets.is_empty() && Arc::strong_count(v) == 1).is_some()
     }
 
-    pub fn get_flushable_buckets(&self, cutoff_bucket_id: i64) -> Vec<FlushableBucket> {
-        let flushable = self.collect_buckets(|bucket_id| bucket_id < cutoff_bucket_id);
-        debug!("MemBuffer flushable buckets: count={}, cutoff={}", flushable.len(), cutoff_bucket_id);
-        flushable
-    }
-
-    pub fn get_all_buckets(&self) -> Vec<FlushableBucket> {
-        self.collect_buckets(|_| true)
-    }
-
-    fn collect_buckets(&self, filter: impl Fn(i64) -> bool) -> Vec<FlushableBucket> {
-        let mut result = Vec::new();
-        for table_entry in self.tables.iter() {
-            let (project_id, table_name) = table_entry.key();
-            let table = table_entry.value();
-            for bucket in table.buckets.iter() {
-                let bucket_id = *bucket.key();
-                if !filter(bucket_id) {
-                    continue;
-                }
-                // Snapshot under the lock with Arc-bumps only — no deep copy.
-                // Parquet writer downstream regroups rows into row groups
-                // regardless of input batch boundaries, so pre-compaction is
-                // unnecessary and would temporarily double bucket memory.
-                let batches: Vec<RecordBatch> = bucket.batches.lock().iter().cloned().collect();
-                if batches.is_empty() {
-                    continue;
-                }
-                let (wal_shard_counts, wal_positions) = bucket.snapshot_wal_shard_state(self.shards_per_topic);
-                result.push(FlushableBucket {
-                    project_id: project_id.to_string(),
-                    table_name: table_name.to_string(),
-                    bucket_id,
-                    batches,
-                    wal_positions,
-                    row_count: bucket.row_count.load(Ordering::Relaxed),
-                    wal_shard_counts,
-                    min_timestamp: bucket.min_timestamp.load(Ordering::Relaxed),
-                    max_timestamp: bucket.max_timestamp.load(Ordering::Relaxed),
-                });
-            }
-        }
-        result
-    }
-
-    /// (project_id, table_name, bucket_id) for every bucket at or after
-    /// `min_bucket_id` — i.e. the still-open current bucket(s). Used by the
-    /// insert-path backpressure escalation to force-flush the open window when
-    /// flushing completed buckets alone can't relieve memory pressure.
-    pub fn current_bucket_keys(&self, min_bucket_id: i64) -> Vec<(String, String, i64)> {
-        let mut out = Vec::new();
-        for t in self.tables.iter() {
-            let (project_id, table_name) = t.key();
-            for b in t.value().buckets.iter() {
-                if *b.key() >= min_bucket_id {
-                    out.push((project_id.to_string(), table_name.to_string(), *b.key()));
-                }
-            }
-        }
-        out
-    }
-
-    /// Cheap existence check (no batch cloning) for any bucket of *this topic*
-    /// strictly older than `cutoff_bucket_id`. Gates current-bucket force-flush:
-    /// advancing the WAL cursor past the open bucket is only correct once every
-    /// older bucket on the shard has been flushed + advanced (the cursor consumes
-    /// entries sequentially, not by logical bucket). A leftover completed bucket
-    /// means a failed flush left the cursor behind it.
-    ///
-    /// Scoped per `(project, table)` because the WAL invariant it protects is
-    /// per-topic (`advance_by_counts` is per-topic). A global check let a stuck
-    /// completed bucket in one table freeze current-bucket force-flush for *every*
-    /// table — one poison tenant wedged the whole instance at the hard limit,
-    /// rejecting all inserts.
-    pub fn has_buckets_before(&self, project_id: &str, table_name: &str, cutoff_bucket_id: i64) -> bool {
-        self.get_table(project_id, table_name).is_some_and(|t| t.buckets.iter().any(|b| *b.key() < cutoff_bucket_id))
-    }
-
-    /// Atomically take a bucket's rows + WAL counts for an out-of-band flush.
-    /// Unlike `collect_buckets` + `drain_bucket` (safe only on sealed buckets),
-    /// this is safe on the *current* still-written bucket: the take happens
-    /// under the same `batches` lock inserts use, so no row can be lost between
-    /// snapshot and removal. The now-empty bucket stays in the map so
+    /// Atomically take a bucket's rows + WAL holds for a flush. The take
+    /// happens under the same `batches` lock inserts use, so no row can be
+    /// lost between snapshot and removal — safe on sealed AND current
+    /// still-written buckets. The now-empty bucket stays in the map so
     /// concurrent/subsequent inserts keep writing into it. Returns None when
     /// the bucket is absent or already empty.
     pub fn take_bucket_for_flush(&self, project_id: &str, table_name: &str, bucket_id: i64) -> Option<FlushableBucket> {
@@ -1297,11 +1450,13 @@ impl MemBuffer {
         if batches_g.is_empty() {
             return None;
         }
-        // Lock wal_shard_state too so the taken counts match the taken rows
-        // exactly — advance_by_counts must not over- or under-advance.
+        // Lock wal_shard_state too so the taken holds match the taken rows
+        // exactly: appends after the take record fresh (later) holds, so the
+        // taken holds cover exactly the taken rows' WAL entries.
         let mut wal_g = bucket.wal_shard_state.lock();
         let batches: Vec<RecordBatch> = std::mem::take(&mut *batches_g);
         let wal_state = std::mem::take(&mut *wal_g);
+        bucket.flush_pinned_prefix.store(0, Ordering::Relaxed);
         let freed = bucket.memory_bytes.swap(0, Ordering::Relaxed);
         let row_count = bucket.row_count.swap(0, Ordering::Relaxed);
         // Capture the real range as we reset the sentinels so a restore (on
@@ -1314,22 +1469,16 @@ impl MemBuffer {
         self.estimated_bytes.fetch_sub(freed, Ordering::Relaxed);
         self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
 
-        // Drop the now-empty bucket so a stale empty shell can't — once time rolls
-        // past its window (id < current) — make `has_buckets_before` permanently
-        // gate off future current-bucket force-flushes. `remove_if` re-checks
-        // emptiness under the shard write lock, so a concurrent insert that
+        // Drop the now-empty bucket so stale empty shells don't accumulate.
+        // `remove_if` re-checks emptiness under the shard write lock, so a concurrent insert that
         // repopulated the bucket between the take and here is preserved.
         table.buckets.remove_if(&bucket_id, |_, b| b.batches.lock().is_empty());
 
-        // Pad to shards_per_topic so advance_by_counts indices line up.
+        // Pad to shards_per_topic so watermark indices line up.
         let shards = self.shards_per_topic;
-        let mut counts = vec![0u64; shards];
-        let mut positions = vec![None; shards];
-        for (i, &c) in wal_state.counts.iter().take(shards).enumerate() {
-            counts[i] = c;
-        }
-        for (i, p) in wal_state.positions.iter().take(shards).enumerate() {
-            positions[i] = *p;
+        let mut first_positions = vec![None; shards];
+        for (i, p) in wal_state.first_positions.iter().take(shards).enumerate() {
+            first_positions[i] = *p;
         }
         Some(FlushableBucket {
             project_id: project_id.to_string(),
@@ -1337,8 +1486,8 @@ impl MemBuffer {
             bucket_id,
             batches,
             row_count,
-            wal_shard_counts: counts,
-            wal_positions: positions,
+            wal_first_positions: first_positions,
+            snapshot_gen: 0, // take removes rows; the gen check is snapshot-path-only
             min_timestamp,
             max_timestamp,
         })
@@ -1346,11 +1495,32 @@ impl MemBuffer {
 
     /// Re-insert a bucket previously removed by `take_bucket_for_flush` whose
     /// Delta commit then failed. Restores rows (query visibility) and merges
-    /// the WAL counts back so the next flush advances the cursor correctly.
+    /// the WAL holds back so the cursor stays pinned behind them.
     /// Durability never depended on this — the rows are still in the WAL — but
     /// it avoids a query-visibility gap until the next restart/replay.
-    pub fn restore_taken_bucket(&self, b: &FlushableBucket) {
-        let Some(table) = self.get_table(&b.project_id, &b.table_name) else { return };
+    ///
+    /// Returns false when the rows could NOT be restored (e.g. the table was
+    /// recreated with an incompatible schema while the bucket was airborne).
+    /// The caller must then keep its in-flight cursor holds registered so the
+    /// watermark can't pass the un-restored entries — they stay replayable.
+    #[must_use]
+    pub fn restore_taken_bucket(&self, b: &FlushableBucket) -> bool {
+        // Recreate the table if it was reaped while the bucket was airborne —
+        // a silent no-op here would drop the rows from memory AND their
+        // cursor holds, letting the watermark pass acked entries.
+        let Some(schema) = b.batches.first().map(|batch| batch.schema()) else {
+            return true; // nothing to restore
+        };
+        let table = match self.get_or_create_table(&b.project_id, &b.table_name, &schema) {
+            Ok(t) => t,
+            Err(e) => {
+                error!(
+                    "restore_taken_bucket: cannot restore {} rows for {}.{} bucket {} ({}); rows stay WAL-only until restart replay",
+                    b.row_count, b.project_id, b.table_name, b.bucket_id, e
+                );
+                return false;
+            }
+        };
         let bucket = table.buckets.entry(b.bucket_id).or_insert_with(TimeBucket::new);
         let mut batches_g = bucket.batches.lock();
         let mut wal_g = bucket.wal_shard_state.lock();
@@ -1358,18 +1528,12 @@ impl MemBuffer {
         for batch in &b.batches {
             batches_g.push(batch.clone());
         }
-        if wal_g.counts.len() < b.wal_shard_counts.len() {
-            wal_g.counts.resize(b.wal_shard_counts.len(), 0);
+        if wal_g.first_positions.len() < b.wal_first_positions.len() {
+            wal_g.first_positions.resize(b.wal_first_positions.len(), None);
         }
-        for (i, &c) in b.wal_shard_counts.iter().enumerate() {
-            wal_g.counts[i] += c;
-        }
-        if wal_g.positions.len() < b.wal_positions.len() {
-            wal_g.positions.resize(b.wal_positions.len(), None);
-        }
-        for (i, p) in b.wal_positions.iter().enumerate() {
+        for (i, p) in b.wal_first_positions.iter().enumerate() {
             if let Some(pos) = p {
-                wal_g.positions[i] = Some(wal_g.positions[i].map_or(*pos, |prev| prev.max(*pos)));
+                wal_g.first_positions[i] = Some(wal_g.first_positions[i].map_or(*pos, |prev| prev.min(*pos)));
             }
         }
         bucket.memory_bytes.fetch_add(added, Ordering::Relaxed);
@@ -1383,6 +1547,7 @@ impl MemBuffer {
         drop(batches_g);
         self.estimated_bytes.fetch_add(added, Ordering::Relaxed);
         self.cache_invalidate(&Self::cache_key(&b.project_id, &b.table_name, b.bucket_id));
+        true
     }
 
     /// Count buckets whose `max_timestamp` is older than `cutoff_micros`.
@@ -1416,7 +1581,7 @@ impl MemBuffer {
                     freed_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
                     evicted_count += 1;
                     // Free the bucket's text-index cache entry alongside its
-                    // batches — same reasoning as in drain_bucket.
+                    // batches — same reasoning as in the flush drain.
                     self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, bucket_id));
                 }
             }
@@ -1462,8 +1627,10 @@ impl MemBuffer {
 
     /// Delete rows matching the predicate from the buffer.
     /// Returns the number of rows deleted.
-    #[instrument(skip(self, predicate), fields(project_id, table_name, rows_deleted))]
-    pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&Expr>) -> DFResult<u64> {
+    /// `wal_hold` = the DELETE WAL entry's (shard, pre-append position),
+    /// pinned onto every bucket this call mutates (see `note_dml_mutation`).
+    #[instrument(skip(self, predicate, wal_hold), fields(project_id, table_name, rows_deleted))]
+    pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&Expr>, wal_hold: Option<(usize, walrus_rust::WalPosition)>) -> DFResult<u64> {
         let Some(table) = self.get_table(project_id, table_name) else {
             return Ok(0);
         };
@@ -1517,6 +1684,7 @@ impl MemBuffer {
 
             *batches = new_batches;
             if bucket_rows_removed > 0 {
+                bucket.note_dml_mutation(wal_hold);
                 bucket.row_count.fetch_sub(bucket_rows_removed, Ordering::Relaxed);
             }
             if bucket_freed > 0 {
@@ -1537,7 +1705,10 @@ impl MemBuffer {
     /// Update rows matching the predicate with new values.
     /// Returns the number of rows updated.
     #[instrument(skip(self, predicate, assignments), fields(project_id, table_name, rows_updated))]
-    pub fn update(&self, project_id: &str, table_name: &str, predicate: Option<&Expr>, assignments: &[(String, Expr)]) -> DFResult<u64> {
+    pub fn update(
+        &self, project_id: &str, table_name: &str, predicate: Option<&Expr>, assignments: &[(String, Expr)],
+        wal_hold: Option<(usize, walrus_rust::WalPosition)>,
+    ) -> DFResult<u64> {
         if assignments.is_empty() {
             return Ok(0);
         }
@@ -1568,6 +1739,7 @@ impl MemBuffer {
         for mut bucket_entry in table.buckets.iter_mut() {
             let bucket = bucket_entry.value_mut();
             let mut batches = bucket.batches.lock();
+            let updated_before = total_updated;
 
             // Track delta only for batches actually rebuilt — unchanged batches
             // contribute 0 to the delta and don't need re-estimation.
@@ -1616,6 +1788,9 @@ impl MemBuffer {
                 .collect::<DFResult<Vec<_>>>()?;
 
             *batches = new_batches;
+            if total_updated > updated_before {
+                bucket.note_dml_mutation(wal_hold);
+            }
             apply_signed_delta(&bucket.memory_bytes, bucket_delta);
             total_delta += bucket_delta;
         }
@@ -1640,6 +1815,7 @@ impl MemBuffer {
     #[instrument(skip(self, predicate, assignments, source), fields(project_id, table_name, rows_updated))]
     pub fn update_with_source(
         &self, project_id: &str, table_name: &str, predicate: Option<&Expr>, assignments: &[(String, Expr)], source: &crate::dml::UpdateSource,
+        wal_hold: Option<(usize, walrus_rust::WalPosition)>,
     ) -> DFResult<u64> {
         use std::collections::HashMap;
 
@@ -1762,6 +1938,7 @@ impl MemBuffer {
                 continue;
             }
             let mut batches = bucket.batches.lock();
+            let updated_before = total_updated;
             let mut bucket_delta: i64 = 0;
             let mut new_batches: Vec<RecordBatch> = Vec::with_capacity(batches.len());
 
@@ -1846,6 +2023,9 @@ impl MemBuffer {
             }
 
             *batches = new_batches;
+            if total_updated > updated_before {
+                bucket.note_dml_mutation(wal_hold);
+            }
             apply_signed_delta(&bucket.memory_bytes, bucket_delta);
             total_delta += bucket_delta;
         }
@@ -1864,7 +2044,7 @@ impl MemBuffer {
     pub fn delete_by_sql(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, registry: Option<&FnRegistry>) -> DFResult<u64> {
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
-        self.delete(project_id, table_name, predicate.as_ref())
+        self.delete(project_id, table_name, predicate.as_ref(), None)
     }
 
     /// WAL replay path for `UPDATE ... FROM`. Reconstructs an
@@ -1901,7 +2081,7 @@ impl MemBuffer {
             batch:     source_batch,
             join_keys: join_keys.to_vec(),
         };
-        self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source)
+        self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source, None)
     }
 
     /// Update rows using SQL strings (for WAL recovery).
@@ -1916,7 +2096,7 @@ impl MemBuffer {
             .iter()
             .map(|(col, val_sql)| parse_sql_predicate(val_sql, &df_schema, registry).map(|expr| (col.clone(), expr)))
             .collect::<DFResult<Vec<_>>>()?;
-        self.update(project_id, table_name, predicate.as_ref(), &parsed_assignments)
+        self.update(project_id, table_name, predicate.as_ref(), &parsed_assignments, None)
     }
 
     /// DFSchema of the in-memory table, or `DFSchema::empty()` if it isn't
@@ -2010,7 +2190,7 @@ impl TableBuffer {
     /// reflected in `bucket.memory_bytes` directly (authoritative) but not
     /// in the value returned (the caller's MemBuffer-level counter is
     /// approximate by design — converges on drain/evict).
-    pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64) -> anyhow::Result<(usize, i64)> {
+    pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>) -> anyhow::Result<(usize, i64)> {
         let batch = compact_batch(batch);
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
@@ -2020,6 +2200,15 @@ impl TableBuffer {
 
         {
             let mut g = bucket.batches.lock();
+            // Record the WAL cursor hold under the SAME lock as the batch
+            // push: `take_bucket_for_flush` snapshots batches + holds under
+            // this lock too, so a concurrent take can never grab the rows
+            // without their hold (a two-step insert-then-record left a window
+            // where the take got hold-less rows and a failed commit's restore
+            // left the entry unpinned — acked-write loss on crash).
+            if let Some((shard, pos)) = wal_hold {
+                bucket.record_wal_append(shard, Some(pos));
+            }
             g.push(batch);
             bucket.memory_bytes.fetch_add(new_size, Ordering::Relaxed);
             // Coalesce gate: fold only the trailing run of batches that are
@@ -2041,8 +2230,11 @@ impl TableBuffer {
             // pushed batch back to the caller as Err, who'd then retry
             // and insert a duplicate.
             if g.len() > MAX_BATCH_COUNT_PER_BUCKET {
+                // Never fold across an airborne flush snapshot's prefix — see
+                // `flush_pinned_prefix` docs.
+                let pinned = bucket.flush_pinned_prefix.load(Ordering::Relaxed);
                 let mut tail_start = g.len();
-                while tail_start > 0 && estimate_batch_size(&g[tail_start - 1]) <= MAX_BATCH_BYTES_FOR_COALESCE {
+                while tail_start > pinned && estimate_batch_size(&g[tail_start - 1]) <= MAX_BATCH_BYTES_FOR_COALESCE {
                     tail_start -= 1;
                 }
                 if g.len() - tail_start > MAX_BATCH_COUNT_PER_BUCKET {
@@ -2098,41 +2290,47 @@ impl TableBuffer {
 impl TimeBucket {
     fn new() -> Self {
         Self {
-            batches:         Mutex::new(Vec::new()),
-            row_count:       AtomicUsize::new(0),
-            memory_bytes:    AtomicUsize::new(0),
-            min_timestamp:   AtomicI64::new(i64::MAX),
-            max_timestamp:   AtomicI64::new(i64::MIN),
-            created_micros:  crate::clock::now_micros(),
-            wal_shard_state: Mutex::new(WalShardState::default()),
+            batches:             Mutex::new(Vec::new()),
+            row_count:           AtomicUsize::new(0),
+            memory_bytes:        AtomicUsize::new(0),
+            min_timestamp:       AtomicI64::new(i64::MAX),
+            max_timestamp:       AtomicI64::new(i64::MIN),
+            created_micros:      crate::clock::now_micros(),
+            wal_shard_state:     Mutex::new(WalShardState::default()),
+            flush_pinned_prefix: AtomicUsize::new(0),
+            mutation_gen:        AtomicU64::new(0),
+            last_wal_pin_micros: AtomicI64::new(crate::clock::now_micros()),
         }
     }
 
-    fn record_wal_append(&self, shard: usize, count: u64, position: Option<walrus_rust::WalPosition>) {
-        let mut s = self.wal_shard_state.lock();
-        if s.counts.len() <= shard {
-            s.counts.resize(shard + 1, 0);
+    /// Note an in-place DML mutation: bump the generation and pin the DML's
+    /// WAL entry on this bucket. Call while holding the `batches` lock so
+    /// snapshot/drain observe a consistent (rows, gen, holds) triple.
+    fn note_dml_mutation(&self, wal_hold: Option<(usize, walrus_rust::WalPosition)>) {
+        self.mutation_gen.fetch_add(1, Ordering::Relaxed);
+        if let Some((shard, pos)) = wal_hold {
+            self.record_wal_append(shard, Some(pos));
         }
-        s.counts[shard] += count;
-        if let Some(pos) = position {
-            if s.positions.len() <= shard {
-                s.positions.resize(shard + 1, None);
+    }
+
+    fn record_wal_append(&self, shard: usize, pre_position: Option<walrus_rust::WalPosition>) {
+        self.last_wal_pin_micros.fetch_max(crate::clock::now_micros(), Ordering::Relaxed);
+        if let Some(pos) = pre_position {
+            let mut s = self.wal_shard_state.lock();
+            if s.first_positions.len() <= shard {
+                s.first_positions.resize(shard + 1, None);
             }
-            s.positions[shard] = Some(s.positions[shard].map_or(pos, |prev| prev.max(pos)));
+            s.first_positions[shard] = Some(s.first_positions[shard].map_or(pos, |prev| prev.min(pos)));
         }
     }
 
-    fn snapshot_wal_shard_state(&self, shards_per_topic: usize) -> (Vec<u64>, Vec<Option<walrus_rust::WalPosition>>) {
+    fn snapshot_wal_shard_state(&self, shards_per_topic: usize) -> Vec<Option<walrus_rust::WalPosition>> {
         let s = self.wal_shard_state.lock();
-        let mut counts = vec![0u64; shards_per_topic];
-        let mut positions = vec![None; shards_per_topic];
-        for (i, &c) in s.counts.iter().take(shards_per_topic).enumerate() {
-            counts[i] = c;
+        let mut first_positions = vec![None; shards_per_topic];
+        for (i, p) in s.first_positions.iter().take(shards_per_topic).enumerate() {
+            first_positions[i] = *p;
         }
-        for (i, p) in s.positions.iter().take(shards_per_topic).enumerate() {
-            positions[i] = *p;
-        }
-        (counts, positions)
+        first_positions
     }
 
     fn update_timestamps(&self, timestamp: i64) {
@@ -2609,7 +2807,7 @@ mod tests {
         let taken = buffer.take_bucket_for_flush("p1", "otel_logs_and_spans", bucket_id).expect("bucket taken");
         assert_eq!((taken.min_timestamp, taken.max_timestamp), (ts, ts), "take must capture the real row range");
 
-        buffer.restore_taken_bucket(&taken); // simulate Delta commit failure
+        assert!(buffer.restore_taken_bucket(&taken), "restore into a live table must succeed"); // simulate Delta commit failure
         let again = buffer.take_bucket_for_flush("p1", "otel_logs_and_spans", bucket_id).expect("restored bucket present");
         assert_eq!((again.min_timestamp, again.max_timestamp), (ts, ts), "restore must preserve the true range");
         assert_ne!(again.min_timestamp, bucket_id * dur, "must not collapse to bucket start");
@@ -2633,20 +2831,117 @@ mod tests {
         assert_eq!(stats.total_buckets, 2);
     }
 
+    /// Snapshot-flush lifecycle: rows stay queryable after the snapshot, a
+    /// late insert survives the prefix drain, and its post-snapshot hold is
+    /// preserved.
     #[test]
-    fn test_drain_bucket() {
+    fn snapshot_then_prefix_drain_preserves_late_rows() {
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
         let bucket_id = MemBuffer::compute_bucket_id(ts);
 
         buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+        let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
+        assert_eq!(snap.batches.len(), 1);
+        assert_eq!(
+            buffer.query("project1", "table1", &[]).unwrap().len(),
+            1,
+            "rows must stay visible while the snapshot is airborne"
+        );
 
-        let drained = buffer.drain_bucket("project1", "table1", bucket_id);
-        assert!(drained.is_some());
-        assert_eq!(drained.unwrap().len(), 1);
+        // Late arrival after the snapshot, with its own cursor hold.
+        buffer
+            .insert_with_hold(
+                "project1",
+                "table1",
+                create_test_batch(ts),
+                ts,
+                Some((0, walrus_rust::WalPosition { block_id: 9, offset: 9 })),
+            )
+            .unwrap();
 
-        let results = buffer.query("project1", "table1", &[]).unwrap();
-        assert!(results.is_empty());
+        assert!(buffer.finish_flushed_snapshot(&snap), "clean (non-dirty) snapshot must report drained");
+        let remaining: usize = buffer.query("project1", "table1", &[]).unwrap().iter().map(|b| b.num_rows()).sum();
+        assert_eq!(remaining, create_test_batch(ts).num_rows(), "late rows must survive the prefix drain");
+        let holds = buffer.wal_holds("project1", "table1", 4);
+        assert!(holds[0].is_some(), "late arrival's hold must survive the prefix drain");
+    }
+
+    /// Regression: a bucket surviving the prefix drain (late arrivals) kept
+    /// a min/max span covering the DRAINED rows, so `get_bucket_ranges`
+    /// masked the drained rows' freshly committed Delta copies for up to a
+    /// full flush cycle. The drain must narrow the range to the surviving
+    /// rows (not blanket-exempt the bucket — the exclusion stays armed for a
+    /// later DML + airborne-commit race, which relies on the mask).
+    #[test]
+    fn prefix_drain_narrows_survivor_range_to_late_rows() {
+        let buffer = MemBuffer::new();
+        // Sealed (old) bucket, aligned to its window start so ts+60s stays
+        // inside the same bucket. get_bucket_ranges only reports non-current
+        // buckets.
+        let ts = (chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS) / BUCKET_DURATION_MICROS * BUCKET_DURATION_MICROS;
+        let bucket_id = MemBuffer::compute_bucket_id(ts);
+
+        buffer.insert("project1", "table1", create_test_batch(ts), ts).unwrap();
+        let snap = buffer.snapshot_bucket_for_flush("project1", "table1", bucket_id).unwrap();
+        assert!(
+            !buffer.get_bucket_ranges("project1", "table1").is_empty(),
+            "sealed bucket masks Delta pre-flush"
+        );
+
+        // Late arrival, deeper into the same bucket's window.
+        let late_ts = ts + 60_000_000;
+        assert_eq!(MemBuffer::compute_bucket_id(late_ts), bucket_id, "late row must land in the same bucket");
+        buffer.insert("project1", "table1", create_test_batch(late_ts), late_ts).unwrap();
+        assert!(buffer.finish_flushed_snapshot(&snap));
+
+        let ranges = buffer.get_bucket_ranges("project1", "table1");
+        assert_eq!(
+            ranges,
+            vec![(late_ts, late_ts + 1)],
+            "survivor's mask must cover only the late rows so the drained rows' Delta copies stay visible"
+        );
+    }
+
+    /// Regression: a DML that empties a sealed bucket leaves an empty shell
+    /// whose WAL holds would pin the topic's cursor forever — it can never
+    /// flush (snapshot/take return None on empty). The reap sweep releases
+    /// it, but only once its pinned entries' ARRIVAL time passes the replay
+    /// cutoff.
+    #[test]
+    fn reap_releases_dml_emptied_bucket_holds_after_replay_cutoff() {
+        let buffer = MemBuffer::new();
+        // Event-time old (sealed) but ARRIVING NOW — the reap must key on
+        // arrival, not event time, or backfilled deletes release too early.
+        let ts = chrono::Utc::now().timestamp_micros() - 2 * BUCKET_DURATION_MICROS;
+
+        buffer
+            .insert_with_hold(
+                "project1",
+                "table1",
+                create_test_batch(ts),
+                ts,
+                Some((0, walrus_rust::WalPosition { block_id: 3, offset: 3 })),
+            )
+            .unwrap();
+        let deleted = buffer.delete("project1", "table1", None, Some((1, walrus_rust::WalPosition { block_id: 4, offset: 4 }))).unwrap();
+        assert!(deleted > 0);
+
+        // Entries arrived just now: a replay-cutoff in the past must NOT
+        // release the pins (their WAL entries would still replay — a partial
+        // cross-shard release could resurrect the deleted rows).
+        buffer.reap_expired_empty_buckets(crate::clock::now_micros() - 1_000_000);
+        let holds = buffer.wal_holds("project1", "table1", 4);
+        assert!(
+            holds[0].is_some() && holds[1].is_some(),
+            "emptied bucket must keep pinning while its entries are inside the replay window, got {holds:?}"
+        );
+
+        // Once the cutoff passes the entries' arrival time, the shell is
+        // reaped and the pins release.
+        buffer.reap_expired_empty_buckets(crate::clock::now_micros() + 1_000_000);
+        let holds = buffer.wal_holds("project1", "table1", 4);
+        assert!(holds.iter().all(Option::is_none), "reap must release the expired shell's holds, got {holds:?}");
     }
 
     #[test]
@@ -2687,7 +2982,7 @@ mod tests {
         buffer.insert("project1", "table1", batch, ts).unwrap();
 
         // Delete all rows (no predicate)
-        let deleted = buffer.delete("project1", "table1", None).unwrap();
+        let deleted = buffer.delete("project1", "table1", None, None).unwrap();
         assert_eq!(deleted, 3);
 
         let results = buffer.query("project1", "table1", &[]).unwrap();
@@ -2706,7 +3001,7 @@ mod tests {
 
         // Delete rows where id = 2
         let predicate = col("id").eq(lit(2i64));
-        let deleted = buffer.delete("project1", "table1", Some(&predicate)).unwrap();
+        let deleted = buffer.delete("project1", "table1", Some(&predicate), None).unwrap();
         assert_eq!(deleted, 1);
 
         let results = buffer.query("project1", "table1", &[]).unwrap();
@@ -2727,7 +3022,7 @@ mod tests {
         // Update name to "updated" where id = 2
         let predicate = col("id").eq(lit(2i64));
         let assignments = vec![("name".to_string(), lit("updated"))];
-        let updated = buffer.update("project1", "table1", Some(&predicate), &assignments).unwrap();
+        let updated = buffer.update("project1", "table1", Some(&predicate), &assignments, None).unwrap();
         assert_eq!(updated, 1);
 
         // Verify the update
@@ -2759,7 +3054,7 @@ mod tests {
         buffer.insert("project1", "table1", batch, ts).unwrap();
 
         let predicate = Expr::Column(Column::new(Some(TableReference::bare("table1")), "id")).eq(lit(2i64));
-        let deleted = buffer.delete("project1", "table1", Some(&predicate)).unwrap();
+        let deleted = buffer.delete("project1", "table1", Some(&predicate), None).unwrap();
         assert_eq!(deleted, 1);
     }
 
@@ -2780,7 +3075,7 @@ mod tests {
         // produces these when the SET RHS reads from the same table.
         let value_expr = Expr::Column(Column::new(Some(TableReference::bare("table1")), "name"));
         let assignments = vec![("name".to_string(), value_expr)];
-        let updated = buffer.update("project1", "table1", Some(&predicate), &assignments).unwrap();
+        let updated = buffer.update("project1", "table1", Some(&predicate), &assignments, None).unwrap();
         assert_eq!(updated, 1);
     }
 
@@ -2940,7 +3235,11 @@ mod tests {
         }
 
         let cutoff = MemBuffer::compute_bucket_id(ts) + 1;
-        let flushable = buffer.get_flushable_buckets(cutoff);
+        let flushable: Vec<_> = buffer
+            .bucket_keys(|id| id < cutoff)
+            .into_iter()
+            .filter_map(|(p, t, id)| buffer.take_bucket_for_flush(&p, &t, id))
+            .collect();
         assert_eq!(flushable.len(), 1, "all inserts share one time bucket");
         assert_eq!(flushable[0].row_count, total_rows);
         let summed: usize = flushable[0].batches.iter().map(|b| b.num_rows()).sum();

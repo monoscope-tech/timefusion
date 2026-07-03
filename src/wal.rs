@@ -56,6 +56,8 @@ const SNAPSHOT_VERSION: u32 = 1;
 /// `WalPosition` serialized as `(block_id, offset)` — tuples already have
 /// Serialize/Deserialize, so we skip the mirror struct.
 type SnapPos = (u64, u64);
+/// Per-(project, table) per-shard cursor positions (`None` = never persisted).
+pub type TopicPositions = std::collections::HashMap<(String, String), Vec<Option<WalPosition>>>;
 fn pos_to_snap(p: WalPosition) -> SnapPos {
     (p.block_id, p.offset)
 }
@@ -406,32 +408,43 @@ impl WalManager {
     /// concurrent same-shard appends queue instead of erroring. The guard
     /// drops when this returns, so callers' `persist_topic` file I/O runs
     /// outside the critical section — keep it after the call, not before.
-    fn locked_append(&self, walrus_key: &str, entry: &WalEntry) -> Result<(), WalError> {
+    /// `on_pre` fires with the pre-append tail under the lock — same
+    /// hold-registration contract as [`Self::append_batch`].
+    fn locked_append(&self, walrus_key: &str, entry: &WalEntry, on_pre: impl FnOnce(Option<WalPosition>)) -> Result<(), WalError> {
         let entry_bytes = serialize_wal_entry(entry)?;
         let _guard = self.append_lock(walrus_key);
+        on_pre(self.wal.current_position(walrus_key).ok());
         self.wal.append_for_topic(walrus_key, &entry_bytes)?;
         Ok(())
     }
 
-    /// Returns the shard the entry was appended to. Callers must record this
-    /// against their MemBuffer bucket so the WAL cursor can later be advanced
-    /// by exactly the right count per shard (see `advance_by_counts`).
+    /// Returns the shard the entry was appended to.
     #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
     pub fn append(&self, project_id: &str, table_name: &str, batch: &RecordBatch) -> Result<usize, WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let entry = WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?);
-        self.locked_append(&walrus_key, &entry)?;
+        self.locked_append(&walrus_key, &entry, |_| {})?;
         self.persist_topic(&topic);
         debug!("WAL append INSERT: topic={}, shard={}, rows={}", topic, shard, batch.num_rows());
         Ok(shard)
     }
 
-    /// Returns `(shard, entry_count)` — every batch becomes one walrus entry
-    /// on the chosen shard, so `entry_count == batches.len()`.
-    #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
-    pub fn append_batch(&self, project_id: &str, table_name: &str, batches: &[RecordBatch]) -> Result<(usize, usize), WalError> {
+    /// Returns `(shard, pre_append_position)` — every batch becomes one walrus
+    /// entry on the chosen shard.
+    ///
+    /// `on_pre_append(shard, position)` fires under the shard's append lock
+    /// BEFORE the entries exist, with the shard's write tail at that instant.
+    /// Callers register a read-cursor *hold* there: because registration
+    /// happens-before the append, a concurrent watermark computation that
+    /// snapshots the tail first and then reads holds can never advance the
+    /// cursor past an entry whose hold it hasn't seen (see
+    /// `BufferedWriteLayer::compute_wal_watermark`).
+    #[instrument(skip(self, batches, on_pre_append), fields(project_id, table_name, batch_count))]
+    pub fn append_batch(
+        &self, project_id: &str, table_name: &str, batches: &[RecordBatch], on_pre_append: impl FnOnce(usize, Option<WalPosition>),
+    ) -> Result<(usize, Option<WalPosition>), WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
@@ -441,19 +454,25 @@ impl WalManager {
             .collect::<Result<_, _>>()?;
 
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let pre_pos;
         {
             // Guard scoped tightly: dropped before persist_topic so the shard
             // lock never covers persist_topic's synchronous file I/O.
             let _guard = self.append_lock(&walrus_key);
+            pre_pos = self.wal.current_position(&walrus_key).ok();
+            on_pre_append(shard, pre_pos);
             self.wal.batch_append_for_topic(&walrus_key, &payload_refs)?;
         }
         self.persist_topic(&topic);
         debug!("WAL batch append INSERT: topic={}, shard={}, batches={}", topic, shard, batches.len());
-        Ok((shard, batches.len()))
+        Ok((shard, pre_pos))
     }
 
-    #[instrument(skip(self), fields(project_id, table_name))]
-    pub fn append_delete(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>) -> Result<usize, WalError> {
+    /// `on_pre_append` — same hold-registration contract as [`Self::append_batch`].
+    #[instrument(skip(self, on_pre_append), fields(project_id, table_name))]
+    pub fn append_delete(
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, on_pre_append: impl FnOnce(usize, Option<WalPosition>),
+    ) -> Result<usize, WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
@@ -464,14 +483,18 @@ impl WalManager {
             BINCODE_CONFIG,
         )?;
         let entry = WalEntry::new(project_id, table_name, WalOperation::Delete, data);
-        self.locked_append(&walrus_key, &entry)?;
+        self.locked_append(&walrus_key, &entry, |pre| on_pre_append(shard, pre))?;
         self.persist_topic(&topic);
         debug!("WAL append DELETE: topic={}, shard={}, predicate={:?}", topic, shard, predicate_sql);
         Ok(shard)
     }
 
-    #[instrument(skip(self, assignments), fields(project_id, table_name))]
-    pub fn append_update(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)]) -> Result<usize, WalError> {
+    /// `on_pre_append` — same hold-registration contract as [`Self::append_batch`].
+    #[instrument(skip(self, assignments, on_pre_append), fields(project_id, table_name))]
+    pub fn append_update(
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)],
+        on_pre_append: impl FnOnce(usize, Option<WalPosition>),
+    ) -> Result<usize, WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
@@ -480,7 +503,7 @@ impl WalManager {
             assignments:   assignments.to_vec(),
         };
         let entry = WalEntry::new(project_id, table_name, WalOperation::Update, bincode::encode_to_vec(&payload, BINCODE_CONFIG)?);
-        self.locked_append(&walrus_key, &entry)?;
+        self.locked_append(&walrus_key, &entry, |pre| on_pre_append(shard, pre))?;
         self.persist_topic(&topic);
         debug!(
             "WAL append UPDATE: topic={}, shard={}, predicate={:?}, assignments={}",
@@ -495,9 +518,11 @@ impl WalManager {
     /// Append an `UPDATE ... FROM` entry. Stores the source `RecordBatch`
     /// (already serialized to Arrow IPC bytes by the caller) alongside the
     /// predicate + assignments so WAL replay can reconstruct the join.
-    #[instrument(skip(self, assignments, source), fields(project_id, table_name, source_ipc_bytes = source.batch_ipc.len()))]
+    /// `on_pre_append` — same hold-registration contract as [`Self::append_batch`].
+    #[instrument(skip(self, assignments, source, on_pre_append), fields(project_id, table_name, source_ipc_bytes = source.batch_ipc.len()))]
     pub fn append_update_with_source(
         &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], source: &SerializedSource,
+        on_pre_append: impl FnOnce(usize, Option<WalPosition>),
     ) -> Result<usize, WalError> {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
@@ -513,7 +538,7 @@ impl WalManager {
             WalOperation::UpdateWithSource,
             bincode::encode_to_vec(&payload, BINCODE_CONFIG)?,
         );
-        self.locked_append(&walrus_key, &entry)?;
+        self.locked_append(&walrus_key, &entry, |pre| on_pre_append(shard, pre))?;
         self.persist_topic(&topic);
         debug!(
             "WAL append UPDATE_WITH_SOURCE: topic={}, shard={}, predicate={:?}, assignments={}, source_keys={}, source_bytes={}",
@@ -690,49 +715,19 @@ impl WalManager {
         Ok(self.known_topics.iter().filter_map(|t| Self::parse_topic(&t)).collect())
     }
 
-    /// Advance the walrus read cursor by exactly `counts[shard]` entries on
-    /// each shard for `(project_id, table_name)`. Callers pass the per-shard
-    /// WAL-entry counts they recorded against a successfully-flushed bucket
-    /// (snapshotted at bucket-seal time) — so the cursor advances only over
-    /// rows that are definitely in Delta now, never past entries belonging
-    /// to a still-accumulating bucket.
-    ///
-    /// `counts.len()` must equal `shards_per_topic`.
-    ///
-    /// Replaces the older `checkpoint`, which drained each shard to its tail
-    /// regardless of bucket boundaries and silently lost entries belonging
-    /// to the open follow-on bucket on crash.
-    #[instrument(skip(self, counts))]
-    pub fn advance_by_counts(&self, project_id: &str, table_name: &str, counts: &[u64]) -> Result<(), WalError> {
-        self.check_shard_len("advance_by_counts", counts.len())?;
-        let topic = Self::make_topic(project_id, table_name);
-        let mut total = 0u64;
-        for (shard, &target) in counts.iter().enumerate() {
-            if target == 0 {
-                continue;
+    /// Set each shard's persisted read cursor to `positions[shard]`
+    /// unconditionally — backward moves allowed (unlike the forward-only
+    /// [`Self::merge_persisted_positions`]). Used by WAL recovery, which
+    /// consumes to tail while replaying and must then park the cursor back at
+    /// the earliest entry still owned by an unflushed MemBuffer bucket.
+    /// `None` shards are left untouched.
+    pub fn set_positions_allow_rewind(&self, project_id: &str, table_name: &str, positions: &[Option<WalPosition>]) -> Result<(), WalError> {
+        self.check_shard_len("set_positions_allow_rewind", positions.len())?;
+        for (shard, pos) in positions.iter().enumerate() {
+            if let Some(pos) = pos {
+                let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
+                self.wal.set_persisted_read_position(&walrus_key, *pos).map_err(WalError::Io)?;
             }
-            let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
-            let mut consumed = 0u64;
-            while consumed < target {
-                match self.wal.read_next(&walrus_key, true) {
-                    Ok(Some(_)) => consumed += 1,
-                    Ok(None) => {
-                        warn!(
-                            "advance_by_counts short read: topic={}, shard={}, expected={}, got={} — cursor may be behind expected position",
-                            topic, shard, target, consumed
-                        );
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("Error during advance_by_counts for {} shard {}: {}", topic, shard, e);
-                        break;
-                    }
-                }
-            }
-            total += consumed;
-        }
-        if total > 0 {
-            debug!("WAL advance: topic={}, consumed={}", topic, total);
         }
         Ok(())
     }
@@ -786,6 +781,21 @@ impl WalManager {
 
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
+    }
+
+    /// Test hook: append raw bytes as a WAL entry so recovery-corruption
+    /// paths can be exercised (a valid appender can't produce a corrupt
+    /// payload by construction).
+    #[cfg(test)]
+    pub fn append_raw_for_test(&self, project_id: &str, table_name: &str, bytes: &[u8]) -> Result<(), WalError> {
+        let topic = Self::make_topic(project_id, table_name);
+        let shard = self.pick_shard(&topic);
+        let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
+        let _guard = self.append_lock(&walrus_key);
+        self.wal.append_for_topic(&walrus_key, bytes)?;
+        drop(_guard);
+        self.persist_topic(&topic);
+        Ok(())
     }
 
     fn cursor_snapshot_path(&self) -> PathBuf {
@@ -848,6 +858,113 @@ impl WalManager {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(WalError::Io(e)),
+        }
+    }
+
+    fn recovery_rewind_path(&self) -> PathBuf {
+        self.data_dir.join(".timefusion_meta").join("recovery_rewind.json")
+    }
+
+    /// Crash-safety for WAL replay: replay consumes the walrus cursor as it
+    /// reads (persisting progress), so a crash mid-replay would skip the
+    /// consumed entries on the next boot even though their data never reached
+    /// Delta. Before replaying, the recovery path persists this marker with
+    /// the pre-recovery cursors; a marker found at boot means the previous
+    /// recovery crashed — rewind to it and re-replay (into a fresh MemBuffer,
+    /// so re-application is exact). Deleted only after the post-replay
+    /// watermark parks the cursor safely.
+    ///
+    /// Returns the captured pre-recovery positions per (project, table) so
+    /// the caller can pin replay-created buckets at them.
+    pub fn write_recovery_rewind_marker(&self) -> Result<TopicPositions, WalError> {
+        let mut entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>> = std::collections::BTreeMap::new();
+        let mut p0 = std::collections::HashMap::new();
+        for (project_id, table_name) in self.list_topic_pairs()? {
+            let positions = self.persisted_read_positions(&project_id, &table_name)?;
+            entries.insert(
+                Self::make_topic(&project_id, &table_name),
+                positions.iter().map(|p| p.map(pos_to_snap)).collect(),
+            );
+            // Never-persisted shards (None) become explicit ORIGIN holds: a
+            // brand-new topic's replayed buckets must still be pinned, or the
+            // consumed-to-tail cursor + deleted marker would lose them on the
+            // next crash before their first flush.
+            p0.insert(
+                (project_id, table_name),
+                positions.into_iter().map(|p| Some(p.unwrap_or(WalPosition::ORIGIN))).collect(),
+            );
+        }
+        let target = self.recovery_rewind_path();
+        let tmp = target.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(&entries).map_err(|e| WalError::Internal(format!("rewind marker encode: {}", e)))?;
+        // The marker's whole job is surviving a crash mid-replay while walrus
+        // fsyncs cursor progress — match that durability (sync file + dir).
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &target)?;
+        if let Some(dir) = target.parent()
+            && let Ok(d) = std::fs::File::open(dir)
+        {
+            let _ = d.sync_all();
+        }
+        Ok(p0)
+    }
+
+    /// Apply a leftover rewind marker (see `write_recovery_rewind_marker`).
+    /// Returns true when a marker was found and applied.
+    pub fn apply_recovery_rewind_marker(&self) -> Result<bool, WalError> {
+        let bytes = match std::fs::read(self.recovery_rewind_path()) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(WalError::Io(e)),
+        };
+        let entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>> =
+            serde_json::from_slice(&bytes).map_err(|e| WalError::Internal(format!("rewind marker decode: {}", e)))?;
+        for (topic, positions) in &entries {
+            let Some((project_id, table_name)) = Self::parse_topic(topic) else {
+                // Same reasoning as the shard-count mismatch below: silently
+                // skipping lets recovery overwrite the marker with the crashed
+                // replay's consumed cursors, losing what it consumed.
+                return Err(WalError::Internal(format!(
+                    "rewind marker has unparseable topic {:?} — refusing to recover past it",
+                    topic
+                )));
+            };
+            if positions.len() != self.shards_per_topic {
+                // Skipping would let recover_from_wal overwrite the marker
+                // with the crashed replay's already-consumed cursors —
+                // permanently losing the entries it consumed. Fail the boot
+                // so an operator restores the shard config (or resolves by
+                // hand) with the marker intact.
+                return Err(WalError::Internal(format!(
+                    "rewind marker entry for {} has {} shards but topic has {} — refusing to recover with a shard-count mismatch (restore TIMEFUSION_WAL_SHARDS_PER_TOPIC or handle the marker manually)",
+                    topic,
+                    positions.len(),
+                    self.shards_per_topic
+                )));
+            }
+            // A None marker shard means "never persisted" = cursor at origin
+            // pre-recovery; the crashed replay may have persisted progress on
+            // it since, so rewind it explicitly to ORIGIN.
+            let positions: Vec<Option<WalPosition>> = positions.iter().map(|p| Some(p.map_or(WalPosition::ORIGIN, snap_to_pos))).collect();
+            self.set_positions_allow_rewind(&project_id, &table_name, &positions)?;
+        }
+        warn!(
+            "Applied recovery rewind marker for {} topic(s) — previous replay crashed mid-run; re-replaying",
+            entries.len()
+        );
+        Ok(true)
+    }
+
+    pub fn remove_recovery_rewind_marker(&self) {
+        if let Err(e) = std::fs::remove_file(self.recovery_rewind_path())
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!("failed to remove recovery rewind marker: {}", e);
         }
     }
 
@@ -1272,9 +1389,10 @@ mod tests {
                         // Interleave append_batch with append_update_with_source so a
                         // same-shard collision exercises both append paths' locking.
                         let res = if i % 2 == 0 {
-                            wal.append_batch("proj", &table, std::slice::from_ref(&batch)).map(|_| ())
+                            wal.append_batch("proj", &table, std::slice::from_ref(&batch), |_, _| {}).map(|_| ())
                         } else {
-                            wal.append_update_with_source("proj", &table, Some("id = 1"), &[("v".into(), "1".into())], &source).map(|_| ())
+                            wal.append_update_with_source("proj", &table, Some("id = 1"), &[("v".into(), "1".into())], &source, |_, _| {})
+                                .map(|_| ())
                         };
                         if res.is_err() {
                             errors.fetch_add(1, Ordering::Relaxed);
@@ -1288,6 +1406,42 @@ mod tests {
             0,
             "concurrent same-topic appends must queue, not error with 'another batch write already in progress'"
         );
+    }
+
+    /// Rewind marker round-trip: capture P0, consume the cursor (simulating
+    /// a crashed replay's checkpoint progress), apply the marker → cursor is
+    /// back at P0 and the entry is readable again. Also: P0 for a
+    /// never-persisted shard must come back as an explicit ORIGIN hold, and
+    /// removing the marker is idempotent.
+    #[test]
+    #[serial_test::serial]
+    fn recovery_rewind_marker_restores_consumed_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let table = format!("rw_{}", uuid::Uuid::new_v4().simple());
+        let wal = WalManager::with_fsync_mode_and_shards(path, crate::config::WalFsyncMode::SyncEach, 4).unwrap();
+        wal.append("proj", &table, &create_test_batch()).unwrap();
+
+        let p0 = wal.write_recovery_rewind_marker().unwrap();
+        let holds = &p0[&("proj".to_string(), table.clone())];
+        assert!(
+            holds.iter().all(Option::is_some),
+            "P0 must map never-persisted shards to explicit ORIGIN holds, got {holds:?}"
+        );
+
+        // Simulate a crashed replay: consume to tail (persists progress).
+        let (entries, _) = wal.read_entries_raw("proj", &table, None, true).unwrap();
+        assert_eq!(entries.len(), 1);
+        let (entries, _) = wal.read_entries_raw("proj", &table, None, true).unwrap();
+        assert!(entries.is_empty(), "cursor must be at tail after consuming");
+
+        assert!(wal.apply_recovery_rewind_marker().unwrap(), "marker must be found and applied");
+        let (entries, _) = wal.read_entries_raw("proj", &table, None, true).unwrap();
+        assert_eq!(entries.len(), 1, "rewind must make the consumed entry replayable again");
+
+        wal.remove_recovery_rewind_marker();
+        assert!(!wal.apply_recovery_rewind_marker().unwrap(), "marker gone after removal");
+        wal.remove_recovery_rewind_marker(); // idempotent
     }
 
     /// Round-trip cursor snapshot: write, drop the manager, re-open, restore.
@@ -1317,9 +1471,10 @@ mod tests {
             let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
             let batch = create_test_batch();
             wal.append("proj", &table, &batch).unwrap();
-            // Advance by 1 on the only shard we wrote to (round-robin picks
-            // shard 0 first for an unseen topic).
-            wal.advance_by_counts("proj", &table, &[1, 0, 0, 0]).unwrap();
+            // Advance shard 0 (the only shard written — round-robin picks it
+            // first for an unseen topic) to the write tail, watermark-style.
+            let tail = wal.current_position("proj", &table).unwrap();
+            wal.merge_persisted_positions("proj", &table, &[Some(tail[0]), None, None, None]).unwrap();
             let before = wal.persisted_read_positions("proj", &table).unwrap();
             assert!(before[0].is_some_and(|p| !p.is_origin()), "advance must move shard 0 off origin");
 
@@ -1376,7 +1531,8 @@ mod tests {
         {
             let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
             wal.append("proj", &table, &create_test_batch()).unwrap();
-            wal.advance_by_counts("proj", &table, &[1, 0, 0, 0]).unwrap();
+            let tail = wal.current_position("proj", &table).unwrap();
+            wal.merge_persisted_positions("proj", &table, &[Some(tail[0]), None, None, None]).unwrap();
             wal.write_cursor_snapshot(true).unwrap();
         }
         // Re-open with a different shard count — load must refuse.
@@ -1529,7 +1685,8 @@ mod tests {
         // Unique topic per run — see cursor_snapshot_roundtrip_restores_persisted_positions.
         let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
         wal.append("proj", &table, &create_test_batch()).unwrap();
-        wal.advance_by_counts("proj", &table, &[1, 0, 0, 0]).unwrap();
+        let tail = wal.current_position("proj", &table).unwrap();
+        wal.merge_persisted_positions("proj", &table, &[Some(tail[0]), None, None, None]).unwrap();
         wal.write_cursor_snapshot(false).unwrap();
 
         let snap = wal.load_cursor_snapshot().expect("dirty snapshot must still be loadable");
