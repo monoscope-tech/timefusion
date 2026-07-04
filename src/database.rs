@@ -646,15 +646,15 @@ const DEDUP_FILE_COL: &str = "__tf_dedup_file";
 /// drops rows, unlike optimize's data-preserving `data_change: false`).
 fn remove_for_add(add: &deltalake::kernel::Add) -> deltalake::kernel::Remove {
     deltalake::kernel::Remove {
-        path: add.path.clone(),
-        data_change: true,
-        deletion_timestamp: Some(Utc::now().timestamp_millis()),
-        size: Some(add.size),
-        extended_file_metadata: Some(true),
-        partition_values: Some(add.partition_values.clone()),
-        tags: add.tags.clone(),
-        deletion_vector: add.deletion_vector.clone(),
-        base_row_id: add.base_row_id,
+        path:                       add.path.clone(),
+        data_change:                true,
+        deletion_timestamp:         Some(Utc::now().timestamp_millis()),
+        size:                       Some(add.size),
+        extended_file_metadata:     Some(true),
+        partition_values:           Some(add.partition_values.clone()),
+        tags:                       add.tags.clone(),
+        deletion_vector:            add.deletion_vector.clone(),
+        base_row_id:                add.base_row_id,
         default_row_commit_version: add.default_row_commit_version,
     }
 }
@@ -3572,7 +3572,10 @@ impl Database {
             // Avoid the BinaryView read for Variant columns (same issue as
             // optimize_table_light); delta-rs's internal session defaults to
             // schema_force_view_types=true.
-            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
+            .with_session_state(Arc::new(build_optimize_session_state(
+                self.config.memory.timefusion_query_partitions,
+                self.shared_runtime_env(),
+            )))
             .await;
 
         match optimize_result {
@@ -3750,7 +3753,10 @@ impl Database {
                 .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
                 .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
                 // Variant columns: same BinaryView-avoidance session as optimize_table.
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
+                .with_session_state(Arc::new(build_optimize_session_state(
+                    self.config.memory.timefusion_query_partitions,
+                    self.shared_runtime_env(),
+                )))
                 .await;
             match result {
                 Ok((new_table, metrics)) => {
@@ -3919,7 +3925,10 @@ impl Database {
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
             .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
+            .with_session_state(Arc::new(build_optimize_session_state(
+                self.config.memory.timefusion_query_partitions,
+                self.shared_runtime_env(),
+            )))
             .await;
 
         match optimize_result {
@@ -4017,7 +4026,10 @@ impl Database {
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
-        let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env()));
+        let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
+            self.config.memory.timefusion_query_partitions,
+            self.shared_runtime_env(),
+        ));
         let scan_name = "__dedup_src";
         ctx.register_table(scan_name, Arc::new(provider))?;
         // project_id is currently always a UUID/controlled identifier, but defend in depth: escape single quotes
@@ -4144,8 +4156,8 @@ impl Database {
     /// commit never touches.
     #[allow(clippy::too_many_arguments)]
     async fn dedup_rewrite_chunk(
-        &self, ctx: &datafusion::prelude::SessionContext, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str,
-        schema: &crate::schema_loader::TableSchema, scan_name: &str, partition_filter: &str, chunk_filter: &str, label: &str,
+        &self, ctx: &datafusion::prelude::SessionContext, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema,
+        scan_name: &str, partition_filter: &str, chunk_filter: &str, label: &str,
     ) -> Result<u64> {
         use deltalake::{
             kernel::{Action, transaction::TableReference},
@@ -4229,14 +4241,7 @@ impl Database {
             // instead of OOM-killing the process).
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
             let rows_sql = format!("SELECT * FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list})");
-            let batches: Vec<RecordBatch> = ctx
-                .sql(&rows_sql)
-                .await?
-                .collect()
-                .await?
-                .into_iter()
-                .map(|b| drop_batch_column(b, DEDUP_FILE_COL))
-                .collect();
+            let batches: Vec<RecordBatch> = ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
             let before: usize = batches.iter().map(|b| b.num_rows()).sum();
             if before == 0 {
                 return Ok(0);
@@ -4265,8 +4270,7 @@ impl Database {
                 let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
                 writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
             }
-            let adds: Vec<Action> =
-                writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add).collect();
+            let adds: Vec<Action> = writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add).collect();
             let stage_store = staging_table.log_store().object_store(None);
             let removes: Vec<Action> = targets.iter().map(|a| Action::Remove(remove_for_add(a))).collect();
 
@@ -4284,15 +4288,18 @@ impl Database {
                 if targets.iter().any(|t| !live.contains(&t.path)) {
                     drop(commit_guard);
                     Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                    debug!("dedup rewrite: target rewritten concurrently, re-planning table={} chunk=[{}]", table_name, label);
+                    debug!(
+                        "dedup rewrite: target rewritten concurrently, re-planning table={} chunk=[{}]",
+                        table_name, label
+                    );
                     tokio::time::sleep(occ_backoff(replan)).await;
                     break; // out of the commit loop → next re-plan iteration
                 }
                 let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
                 let op = DeltaOperation::Write {
-                    mode: deltalake::protocol::SaveMode::Overwrite,
+                    mode:         deltalake::protocol::SaveMode::Overwrite,
                     partition_by: (!schema.partitions.is_empty()).then(|| schema.partitions.clone()),
-                    predicate: None,
+                    predicate:    None,
                 };
                 let commit_res =
                     deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
@@ -4324,7 +4331,13 @@ impl Database {
                             Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
                             return Err(anyhow::anyhow!("dedup rewrite commit failed: {e}"));
                         }
-                        debug!("dedup rewrite OCC conflict (attempt {}/{}) table={} chunk=[{}]", attempt + 1, MAX_RETRIES, table_name, label);
+                        debug!(
+                            "dedup rewrite OCC conflict (attempt {}/{}) table={} chunk=[{}]",
+                            attempt + 1,
+                            MAX_RETRIES,
+                            table_name,
+                            label
+                        );
                         tokio::time::sleep(occ_backoff(attempt)).await;
                     }
                 }
@@ -4482,7 +4495,10 @@ impl Database {
                 // the optimize-internal Parquet read uses `schema_force_view_types=true`
                 // (delta-rs's default), it returns BinaryView and the rewrite blows up
                 // mid-scan with "Expected ... Binary, got ... BinaryView".
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
+                .with_session_state(Arc::new(build_optimize_session_state(
+                    self.config.memory.timefusion_query_partitions,
+                    self.shared_runtime_env(),
+                )))
                 .await;
             match optimize_result {
                 Ok((new_table, metrics)) => {
