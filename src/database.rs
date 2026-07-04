@@ -1001,6 +1001,11 @@ pub struct Database {
     /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
     /// pacing. Cleared on success; in-memory only (a restart retries once).
     dedup_backoff:                   Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
+    /// Skip-if-busy gate for the light-optimize/dedup job: a tick that
+    /// outlives the 5-minute cron interval (observed 5m45s in prod) must not
+    /// stack a second sweep on top — concurrent sweeps churn each other's
+    /// target files into re-plan storms and multiply peak memory.
+    light_optimize_gate:             Arc<tokio::sync::Mutex<()>>,
     /// Serializes in-process Delta commits (flush appends vs dedup
     /// replace_where). delta-kernel's OCC checker cannot evaluate the
     /// bare-string timestamp predicate replace_where commits carry (errors
@@ -1341,6 +1346,7 @@ impl Database {
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
+            light_optimize_gate: Arc::new(tokio::sync::Mutex::new(())),
             delta_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             dml_locks: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
@@ -1462,6 +1468,10 @@ impl Database {
                 move |_, _| {
                     let db = db.clone();
                     Box::pin(async move {
+                        let Ok(_gate) = db.light_optimize_gate.try_lock() else {
+                            warn!("light optimize tick skipped: previous tick still running");
+                            return;
+                        };
                         info!("Running scheduled light optimize on recent small files");
                         // Optimize unified tables. Run dedup FIRST so the
                         // light compact bin-packs already-deduped files —
@@ -4014,15 +4024,12 @@ impl Database {
             let table = table_ref.read().await;
             (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
         };
+        // Probe-only provider (chunk detection). The rewrite builds its own
+        // provider per attempt — from a FRESH snapshot, with the synthetic
+        // source-file column — in `dedup_rewrite_chunk`.
         let provider = TableProviderBuilder::default()
             .with_log_store(log_store)
             .with_eager_snapshot(snapshot)
-            // Synthetic per-row source-file column: the rewrite below targets
-            // exact FILES (remove+add), so it needs to learn which files hold
-            // the duplicate window's rows and then re-read those files' full
-            // row sets — including rows outside the window, which are carried
-            // into the replacement files verbatim.
-            .with_file_column(DEDUP_FILE_COL)
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
@@ -4133,7 +4140,7 @@ impl Database {
 
         let mut total_dropped = 0u64;
         for (chunk_filter, label) in chunks {
-            total_dropped += self.dedup_rewrite_chunk(&ctx, table_ref, table_name, schema, scan_name, &filter, &chunk_filter, &label).await?;
+            total_dropped += self.dedup_rewrite_chunk(table_ref, table_name, schema, scan_name, &filter, &chunk_filter, &label).await?;
         }
         Ok(total_dropped)
     }
@@ -4156,8 +4163,8 @@ impl Database {
     /// commit never touches.
     #[allow(clippy::too_many_arguments)]
     async fn dedup_rewrite_chunk(
-        &self, ctx: &datafusion::prelude::SessionContext, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema,
-        scan_name: &str, partition_filter: &str, chunk_filter: &str, label: &str,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, scan_name: &str,
+        partition_filter: &str, chunk_filter: &str, label: &str,
     ) -> Result<u64> {
         use deltalake::{
             kernel::{Action, transaction::TableReference},
@@ -4178,6 +4185,33 @@ impl Database {
         // commit lock; the chunk is re-planned from a fresh snapshot.
         const MAX_REPLANS: usize = 3;
         for replan in 0..MAX_REPLANS {
+            // Scan and file-mapping MUST share one snapshot: the caller's ctx
+            // is pinned at dedup_partition entry, and on the heavily-churned
+            // unified table the live file set diverges from it within seconds
+            // (flush appends + light optimize) — mapping scan results against
+            // the LIVE snapshot mismatched on every attempt in prod
+            // (28/28 re-plan exhaustions, zero successes, 2026-07-04). Each
+            // re-plan therefore rebuilds provider + ctx from a fresh eager
+            // snapshot; the commit-time liveness check below still guards the
+            // remaining snapshot→commit window.
+            let (chunk_snapshot, chunk_log_store) = {
+                let table = table_ref.read().await;
+                (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store())
+            };
+            use deltalake::delta_datafusion::TableProviderBuilder;
+            let provider = TableProviderBuilder::default()
+                .with_log_store(chunk_log_store)
+                .with_eager_snapshot(Arc::clone(&chunk_snapshot))
+                .with_file_column(DEDUP_FILE_COL)
+                .build()
+                .await
+                .map_err(|e| anyhow::anyhow!("dedup rewrite provider: {e}"))?;
+            let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
+                self.config.memory.timefusion_query_partitions,
+                self.shared_runtime_env(),
+            ));
+            ctx.register_table(scan_name, Arc::new(provider))?;
+
             // 1. Which files hold the chunk's rows — ground truth from the
             // scan itself, no per-file stats parsing.
             let files_sql = format!("SELECT DISTINCT \"{DEDUP_FILE_COL}\" FROM {scan_name} WHERE {chunk_filter}");
@@ -4185,34 +4219,31 @@ impl Database {
             if file_ids.is_empty() {
                 return Ok(0);
             }
-            // 2. Map scan values to live Add actions (suffix-match either
-            // direction: the scan column carries the store path, the log a
-            // table-relative one).
-            let targets: Vec<deltalake::kernel::Add> = {
-                let table = table_ref.read().await;
-                table
-                    .snapshot()?
-                    .log_data()
-                    .iter()
-                    .filter(|f| {
-                        let p = f.path();
-                        file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
-                    })
-                    // Deprecated in favour of arrow-direct access, but the
-                    // Remove tombstones below need the Add's exact fields.
-                    .map(|f| {
-                        #[allow(deprecated)]
-                        f.add_action()
-                    })
-                    .collect()
-            };
+            // 2. Map scan values to Add actions in the SAME snapshot
+            // (suffix-match either direction: the scan column carries the
+            // store path, the log a table-relative one).
+            let targets: Vec<deltalake::kernel::Add> = chunk_snapshot
+                .log_data()
+                .iter()
+                .filter(|f| {
+                    let p = f.path();
+                    file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
+                })
+                // Deprecated in favour of arrow-direct access, but the
+                // Remove tombstones below need the Add's exact fields.
+                .map(|f| {
+                    #[allow(deprecated)]
+                    f.add_action()
+                })
+                .collect();
             if targets.len() != file_ids.len() {
-                debug!(
-                    "dedup rewrite: mapped {}/{} files for table={} chunk=[{}], re-planning",
+                warn!(
+                    "dedup rewrite: mapped {}/{} files for table={} chunk=[{}] (sample scan value: {:?}), re-planning",
                     targets.len(),
                     file_ids.len(),
                     table_name,
-                    label
+                    label,
+                    file_ids.first()
                 );
                 tokio::time::sleep(occ_backoff(replan)).await;
                 continue;
