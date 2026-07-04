@@ -1,6 +1,24 @@
 // main.rs
 #![recursion_limit = "512"]
 
+// Production profiling (--features profiling, Linux): jemalloc as the global
+// allocator with its heap profiler, plus a pprof CPU sampler (started in
+// async_main). Deployed to attribute the prod OOM. See src/profiling.rs.
+#[cfg(all(feature = "profiling", target_os = "linux"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc reads this symbol at startup — bakes the profiler config into the
+// binary so no MALLOC_CONF env (host is read-only) is needed. prof_active
+// samples live allocations; lg_prof_sample:19 = ~512KiB sampling (low
+// overhead); lg_prof_interval:33 auto-dumps a .heap every ~8GiB allocated so
+// the dumps just before each ~89GB OOM capture the offending call stacks;
+// prof_prefix points into the data-dir volume we can read off the host.
+// Analyze: `jeprof --svg <binary> <prof_prefix>.*.heap`.
+#[cfg(all(feature = "profiling", target_os = "linux"))]
+#[unsafe(export_name = "malloc_conf")]
+pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:33,prof_prefix:/app/data/timefusion/profiles/jeprof\0";
+
 use std::sync::Arc;
 
 use datafusion_postgres::ServerOptions;
@@ -52,6 +70,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Initialize OpenTelemetry with OTLP exporter
     telemetry::init_telemetry(&cfg.telemetry)?;
     clock::init_from_env();
+
+    // Start heap+CPU profiling (no-op unless --features profiling on Linux).
+    // Early, so the profiles dir exists before jemalloc's first interval dump.
+    timefusion::profiling::start(cfg.core.timefusion_data_dir.clone());
 
     info!("Starting TimeFusion application");
 

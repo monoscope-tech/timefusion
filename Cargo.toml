@@ -149,6 +149,19 @@ test = []
 # testcontainers path doesn't run in the main `cargo test` job — the
 # dedicated `e2e` CI job opts in via `--features e2e`.
 e2e = []
+# Production heap (jemalloc prof) + CPU (pprof) profiling, deployed to attribute
+# the prod OOM (2026-07-04). Off by default: the deps are Linux-only and add
+# allocator/sampler overhead. The Docker image opts in (see Dockerfile) and
+# builds with symbols (CARGO_PROFILE_RELEASE_STRIP=none) so jeprof/pprof can
+# resolve stacks. Artifacts land in <data_dir>/timefusion/profiles + the
+# jemalloc prof_prefix (see src/main.rs malloc_conf).
+profiling = ["dep:tikv-jemallocator", "dep:pprof"]
+
+# Profiling deps are Linux-only (jemalloc prof needs it; and prod is Linux) so a
+# macOS `--features profiling` check doesn't try to build jemalloc with prof.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"], optional = true }
+pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 
 [[test]]
 name = "e2e"

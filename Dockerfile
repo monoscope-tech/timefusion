@@ -47,7 +47,12 @@ FROM chef AS builder
 # reason as in the planner stage (path-deps) — the duplication is necessary.
 COPY --from=planner /app/recipe.json recipe.json
 COPY vendor/ vendor/
-RUN cargo chef cook --release --locked --recipe-path recipe.json
+# --features profiling: deploy the jemalloc-heap + pprof-CPU profilers to
+# attribute the prod OOM (2026-07-04). STRIP=none keeps symbols so jeprof/pprof
+# resolve stacks (the release profile strips by default). Set on cook AND build
+# so cargo-chef's cached dep layer matches the final build's profile.
+ENV CARGO_PROFILE_RELEASE_STRIP=none
+RUN cargo chef cook --release --locked --features profiling --recipe-path recipe.json
 
 # Now compile the real binary. Deps are already built, so this only rebuilds
 # the crate itself when src/, build.rs, or proto/ change. proto/ must be
@@ -56,7 +61,7 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY proto/ proto/
 COPY src/ src/
 COPY schemas/ schemas/
-RUN cargo build --release --locked
+RUN cargo build --release --locked --features profiling
 
 # App state dirs (distroless runtime has no shell to mkdir at runtime).
 RUN mkdir -p /queue_db /data
