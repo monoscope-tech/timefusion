@@ -4163,8 +4163,8 @@ impl Database {
     /// commit never touches.
     #[allow(clippy::too_many_arguments)]
     async fn dedup_rewrite_chunk(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, scan_name: &str,
-        partition_filter: &str, chunk_filter: &str, label: &str,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, scan_name: &str, partition_filter: &str,
+        chunk_filter: &str, label: &str,
     ) -> Result<u64> {
         use deltalake::{
             kernel::{Action, transaction::TableReference},
