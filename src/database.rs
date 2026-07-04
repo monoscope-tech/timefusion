@@ -3575,27 +3575,38 @@ impl Database {
         // Same trade-off as optimize_table_light: best-effort, don't pause
         // flushes (see comment there). Z-order full optimize is daily-ish,
         // so an occasional OCC failure is fine.
-        let optimize_result = table_clone
-            .optimize()
-            .with_filters(&partition_filters)
-            .with_type(if schema.z_order_columns.is_empty() {
-                deltalake::operations::optimize::OptimizeType::Compact
-            } else {
-                deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone())
-            })
-            .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
-            .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
-            .with_writer_properties(writer_properties)
-            .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
-            .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-            // Avoid the BinaryView read for Variant columns (same issue as
-            // optimize_table_light); delta-rs's internal session defaults to
-            // schema_force_view_types=true.
-            .with_session_state(Arc::new(build_optimize_session_state(
-                self.config.memory.timefusion_query_partitions,
-                self.shared_runtime_env(),
-            )))
-            .await;
+        //
+        // Hold a maintenance-rewrite permit across the .optimize() — this is
+        // the HEAVIEST rewrite (full-window ZOrder/Compact materializing a
+        // large pool-invisible Arrow set), so leaving it outside the
+        // concurrency cap would let it stack with a dedup/recompress and
+        // reproduce the cgroup OOM the cap exists to prevent (prod 2026-07-04).
+        // Scoped to the optimize call so the post-commit warm/evict bookkeeping
+        // below runs without the permit.
+        let optimize_result = {
+            let _rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
+            table_clone
+                .optimize()
+                .with_filters(&partition_filters)
+                .with_type(if schema.z_order_columns.is_empty() {
+                    deltalake::operations::optimize::OptimizeType::Compact
+                } else {
+                    deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone())
+                })
+                .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+                .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
+                .with_writer_properties(writer_properties)
+                .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
+                .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                // Avoid the BinaryView read for Variant columns (same issue as
+                // optimize_table_light); delta-rs's internal session defaults to
+                // schema_force_view_types=true.
+                .with_session_state(Arc::new(build_optimize_session_state(
+                    self.config.memory.timefusion_query_partitions,
+                    self.shared_runtime_env(),
+                )))
+                .await
+        };
 
         match optimize_result {
             Ok((new_table, metrics)) => {
@@ -4275,9 +4286,17 @@ impl Database {
             //      buffers are NOT accounted by DataFusion's memory pool, so the
             //      pool never errors — the process OOMs (prod 2026-07-04: a
             //      ~1M-row chunk under the 2GiB compressed budget decoded past
-            //      the 85GiB cgroup). We estimate from per-file `num_records`
-            //      when stats are present, else `compressed × inflation`, and
-            //      ×2 for the RowConverter's parallel keyed copy in dedup_batches.
+            //      the 85GiB cgroup). Per file we take the MAX of a row-count
+            //      estimate (`num_records × bytes_per_row`) and a
+            //      compressed-inflation estimate (`size × inflation`), ×2 for
+            //      the RowConverter's parallel keyed copy in dedup_batches.
+            //      Max, not either-or: biasing to over-estimate is the safe
+            //      direction for an OOM guard, and it closes the hole where a
+            //      file whose stats report `num_records=0` (delta-rs can leave
+            //      it unpopulated) would otherwise estimate ~0 and slip a large
+            //      decode past the guard. Over-estimating only defers physical
+            //      dedup (read-side dedup keeps queries correct); under-
+            //      estimating OOMs the process.
             let rewrite_bytes: i64 = targets.iter().map(|a| a.size).sum();
             let budget = self.config.maintenance.timefusion_dedup_max_rewrite_bytes;
             let inflation = self.config.maintenance.timefusion_dedup_decode_inflation.max(1);
@@ -4285,15 +4304,19 @@ impl Database {
             let bytes_per_row = self.config.maintenance.timefusion_dedup_bytes_per_row;
             let est_decoded_bytes: u64 = targets
                 .iter()
-                .map(|a| match a.get_stats().ok().flatten() {
-                    // num_records directly tracks the Arrow row count (best signal).
-                    Some(s) if bytes_per_row > 0 => (s.num_records.max(0) as u64).saturating_mul(bytes_per_row),
-                    // No stats → inflate compressed size.
-                    _ => (a.size.max(0) as u64).saturating_mul(inflation),
+                .map(|a| {
+                    let by_rows = a.get_stats().ok().flatten().map_or(0, |s| (s.num_records.max(0) as u64).saturating_mul(bytes_per_row));
+                    let by_size = (a.size.max(0) as u64).saturating_mul(inflation);
+                    by_rows.max(by_size)
                 })
                 .sum::<u64>()
                 .saturating_mul(2); // RowConverter keyed copy in dedup_batches
-            if rewrite_bytes.max(0) as u64 > budget || est_decoded_bytes > decoded_budget {
+            // decoded_budget == 0 disables the decoded guard (idiomatic here —
+            // see pressure_flush_pct / corruption_threshold), so a fat-fingered
+            // 0 can't make every chunk skip forever; the compressed guard and
+            // the maintenance semaphore still apply.
+            let over_decoded = decoded_budget > 0 && est_decoded_bytes > decoded_budget;
+            if rewrite_bytes.max(0) as u64 > budget || over_decoded {
                 crate::metrics::record_dedup_chunk_skipped();
                 error!(
                     "dedup rewrite SKIPPED (over budget): table={} chunk=[{}] files={} compressed_bytes={} compressed_budget={} est_decoded_bytes={} decoded_budget={} — duplicates persist (read-side dedup keeps queries correct) until compaction shrinks the file set",
@@ -4311,8 +4334,12 @@ impl Database {
             // plus out-of-window rows carried through verbatim. Bounded by the
             // decoded-byte estimate above (the pool does NOT bound this collect)
             // AND the maintenance-rewrite semaphore (only N heavy materializations
-            // in flight at once — the aggregate backstop for estimate error).
-            let _rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
+            // in flight at once — the aggregate backstop for estimate error). The
+            // permit covers only the Arrow-heavy materialize+encode (collect →
+            // dedup → write → flush); it is dropped before the commit-retry loop
+            // so an OCC backoff can't hold the single permit hostage while no
+            // Arrow is in flight.
+            let rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
             let rows_sql = format!("SELECT * FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list})");
             let batches: Vec<RecordBatch> = ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
@@ -4345,6 +4372,9 @@ impl Database {
                 writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
             }
             let adds: Vec<Action> = writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add).collect();
+            // Arrow materialization done — release the permit before the
+            // commit-retry loop (log write + OCC backoff sleeps decode nothing).
+            drop(rewrite_permit);
             let stage_store = staging_table.log_store().object_store(None);
             let removes: Vec<Action> = targets.iter().map(|a| Action::Remove(remove_for_add(a))).collect();
 

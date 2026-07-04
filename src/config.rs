@@ -911,7 +911,10 @@ pub struct MaintenanceConfig {
     /// NOT accounted by DataFusion's memory pool — so a compressed-under-budget
     /// chunk decoded to tens of GB and OOM-killed the process (prod 2026-07-04,
     /// 89GB cgroup kill). Over this ceiling the chunk is skipped (read-side
-    /// dedup keeps queries correct). See `d_dedup_max_decoded_bytes`.
+    /// dedup keeps queries correct). 0 disables the decoded guard (the
+    /// compressed budget + maintenance semaphore still apply), so a
+    /// fat-fingered 0 can't make every chunk skip forever. See
+    /// `d_dedup_max_decoded_bytes`.
     #[serde(default = "d_dedup_max_decoded_bytes")]
     pub timefusion_dedup_max_decoded_bytes:         u64,
     /// Compressed→decoded inflation factor used to estimate a dedup chunk's
