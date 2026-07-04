@@ -325,3 +325,59 @@ async fn optimize_preserves_all_partition_values() -> Result<()> {
     );
     Ok(())
 }
+
+/// The dedup rewrite is a TARGETED file transaction (remove+add of exactly
+/// the files holding the duplicate chunk's rows) — a bystander file in the
+/// same partition but outside the duplicate's 10-minute window must survive
+/// byte-identical (same path, never rewritten), while the duplicate-bearing
+/// files are replaced. Pins the 2026-07-04 fix: the old replace_where's
+/// bare-string predicate planned against the whole table.
+#[serial]
+#[tokio::test]
+async fn dedup_rewrite_targets_only_duplicate_files() -> Result<()> {
+    let cfg = TestConfigBuilder::new("dedup_targeted").with_buffer_mode(BufferMode::Enabled).build();
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Duplicate pair 3h back (sealed); bystander 20 minutes earlier — a
+    // different 10-minute chunk, usually the same date partition (if the test
+    // straddles midnight UTC the bystander lands in a different partition,
+    // which only makes the untouched assertion trivially true).
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let ts_bystander = ts - chrono::Duration::minutes(20).num_microseconds().unwrap();
+    let dup = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)]) };
+
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![dup("first")?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![dup("second")?], true, None).await?;
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    let files_before_bystander: std::collections::HashSet<String> = table_ref.read().await.get_file_uris()?.collect();
+
+    db.insert_records_batch(
+        &project_id,
+        "otel_logs_and_spans",
+        vec![json_to_batch(vec![test_span_ts("bystander", "witness", &project_id, ts_bystander)])?],
+        true,
+        None,
+    )
+    .await?;
+    let bystander_files: Vec<String> = {
+        let now: std::collections::HashSet<String> = table_ref.read().await.get_file_uris()?.collect();
+        now.difference(&files_before_bystander).cloned().collect()
+    };
+    assert!(!bystander_files.is_empty(), "bystander insert must add a file");
+
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
+    let dropped = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
+    assert_eq!(dropped, 1, "expected exactly the duplicate row dropped");
+
+    let files_after: std::collections::HashSet<String> = table_ref.read().await.get_file_uris()?.collect();
+    for f in &bystander_files {
+        assert!(files_after.contains(f), "bystander file must be untouched by the targeted rewrite: {f}");
+    }
+    for f in files_before_bystander {
+        assert!(!files_after.contains(&f), "duplicate-bearing file must have been replaced: {f}");
+    }
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "post-dedup: 1 deduped row + 1 bystander");
+    Ok(())
+}

@@ -86,6 +86,7 @@ counter_registry! {
     dml_coalesce_enqueued      => "timefusion.dml.coalesce_enqueued": "UPDATE ... FROM statements whose Delta leg was deferred into the coalescer queue",
     dml_coalesce_merges        => "timefusion.dml.coalesce_merges": "Delta merges executed by coalescer drains (each replaces N deferred statement-merges; compare with coalesce_enqueued for the batching ratio)",
     dml_coalesce_dropped       => "timefusion.dml.coalesce_dropped": "Coalesced DML groups dropped after exhausting drain retries — deferred Delta updates were LOST for rows already in Delta (buffer-resident rows are unaffected). PAGE if > 0",
+    dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -393,5 +394,12 @@ pub fn record_dml_coalesce_merge() {
 pub fn record_dml_coalesce_dropped() {
     if let Some(m) = METRICS.get() {
         m.dml_coalesce_dropped.add(1, &[]);
+    }
+}
+
+/// One dedup chunk rewrite skipped (over budget or in failure backoff).
+pub fn record_dedup_chunk_skipped() {
+    if let Some(m) = METRICS.get() {
+        m.dedup_chunk_skipped.add(1, &[]);
     }
 }

@@ -296,6 +296,13 @@ const_default!(d_warm_recency_days: u64 = 2);
 // ~64KB suffix ranges, well within R2/S3 burst limits.
 const_default!(d_warm_concurrency: usize = 16);
 const_default!(d_snapshot_reconcile: u64 = 500);
+// Hard byte ceiling on the file set a single dedup chunk rewrite may
+// materialize (sum of target parquet file sizes). Chunks over budget are
+// SKIPPED loudly instead of rewritten — read-side dedup keeps queries
+// correct, and the skip metric (timefusion.dedup.chunk_skipped) surfaces the
+// debt. Guards against e.g. a z-ordered whole-day file (1GB+ on disk, several
+// GB decompressed × copies) dragging the whole day into one rewrite.
+const_default!(d_dedup_max_rewrite_bytes: u64 = 2 * 1024 * 1024 * 1024);
 // How many days back (in addition to today) the dedup sweep covers. today-only
 // left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
@@ -884,6 +891,9 @@ pub struct MaintenanceConfig {
     /// Days back (plus today) the dedup sweep scans. See `d_dedup_lookback_days`.
     #[serde(default = "d_dedup_lookback_days")]
     pub timefusion_dedup_lookback_days:           u64,
+    /// Byte ceiling per dedup chunk rewrite. See `d_dedup_max_rewrite_bytes`.
+    #[serde(default = "d_dedup_max_rewrite_bytes")]
+    pub timefusion_dedup_max_rewrite_bytes:       u64,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.

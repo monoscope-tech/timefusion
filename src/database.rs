@@ -495,14 +495,19 @@ pub fn partition_batch_by_project(batch: RecordBatch, default_project: &str) -> 
 /// out ("Expected ... Binary, got ... BinaryView"). Passing this session
 /// via `.with_session_state(...)` overrides the default and keeps the
 /// read schema as declared.
-fn build_optimize_session_state(target_partitions: usize) -> datafusion::execution::session_state::SessionState {
+fn build_optimize_session_state(
+    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
     let mut cfg = SessionConfig::new().set_bool("datafusion.execution.parquet.schema_force_view_types", false);
     // Same CPU-quota cap as the query session (see autotune::apply); 0 = default.
     if target_partitions > 0 {
         cfg = cfg.with_target_partitions(target_partitions);
     }
-    SessionStateBuilder::new().with_config(cfg).with_default_features().build()
+    // The shared pooled runtime (see `shared_runtime_env`): maintenance
+    // allocations count against the process-wide budget and FAIL as query
+    // errors instead of growing until the kernel OOM-kills the process.
+    SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build()
 }
 
 /// Cast Variant struct columns (Struct{BinaryView,BinaryView}) to the
@@ -629,6 +634,39 @@ fn is_transient_s3_err(msg: &str) -> bool {
         || msg.contains("reset by peer")
         || msg.contains("timed out")
         || msg.contains("timeout")
+}
+
+/// Synthetic per-row source-file column exposed on the dedup sweep's table
+/// provider (see `dedup_partition`): the targeted rewrite needs to know which
+/// FILES hold the duplicate window's rows so it can commit exact Remove+Add
+/// actions instead of a predicate-evaluated replace_where.
+const DEDUP_FILE_COL: &str = "__tf_dedup_file";
+
+/// A `Remove` tombstone for `add` with `data_change: true` (the dedup rewrite
+/// drops rows, unlike optimize's data-preserving `data_change: false`).
+fn remove_for_add(add: &deltalake::kernel::Add) -> deltalake::kernel::Remove {
+    deltalake::kernel::Remove {
+        path: add.path.clone(),
+        data_change: true,
+        deletion_timestamp: Some(Utc::now().timestamp_millis()),
+        size: Some(add.size),
+        extended_file_metadata: Some(true),
+        partition_values: Some(add.partition_values.clone()),
+        tags: add.tags.clone(),
+        deletion_vector: add.deletion_vector.clone(),
+        base_row_id: add.base_row_id,
+        default_row_commit_version: add.default_row_commit_version,
+    }
+}
+
+/// Drop `name` from `batch` (no-op when absent) — strips the synthetic
+/// [`DEDUP_FILE_COL`] before deduped rows are written back.
+fn drop_batch_column(batch: RecordBatch, name: &str) -> RecordBatch {
+    let Ok(idx) = batch.schema().index_of(name) else { return batch };
+    let mut cols = batch.columns().to_vec();
+    cols.remove(idx);
+    let fields: Vec<_> = batch.schema().fields().iter().enumerate().filter(|(i, _)| *i != idx).map(|(_, f)| f.clone()).collect();
+    RecordBatch::try_new(Arc::new(datafusion::arrow::datatypes::Schema::new(fields)), cols).expect("row count unchanged")
 }
 
 /// write. No-op for any column that's not a Variant struct or already in
@@ -958,6 +996,11 @@ pub struct Database {
     /// the sweep when the version hasn't moved (no commits → no new dupes).
     /// Same unbounded-growth caveat as `last_written_versions`.
     last_dedup_versions:             Arc<RwLock<HashMap<String, u64>>>,
+    /// Exponential failure backoff per (table, project, date) dedup target:
+    /// (attempts, earliest next try). Without it a failing partition re-runs
+    /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
+    /// pacing. Cleared on success; in-memory only (a restart retries once).
+    dedup_backoff:                   Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
     /// Serializes in-process Delta commits (flush appends vs dedup
     /// replace_where). delta-kernel's OCC checker cannot evaluate the
     /// bare-string timestamp predicate replace_where commits carry (errors
@@ -1297,6 +1340,7 @@ impl Database {
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
+            dedup_backoff: Arc::new(dashmap::DashMap::new()),
             delta_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             dml_locks: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
@@ -1775,7 +1819,6 @@ impl Database {
         let _ = options.set("datafusion.optimizer.max_passes", "5");
 
         // Configure memory limit for DataFusion operations
-        let memory_limit_bytes = self.config.memory.memory_limit_bytes();
         let memory_fraction = self.config.memory.timefusion_memory_fraction;
         let sort_spill_reservation_bytes = self.config.memory.timefusion_sort_spill_reservation_bytes.unwrap_or(67_108_864);
 
@@ -1783,23 +1826,7 @@ impl Database {
         let _ = options.set("datafusion.execution.memory_fraction", &memory_fraction.to_string());
         let _ = options.set("datafusion.execution.sort_spill_reservation_bytes", &sort_spill_reservation_bytes.to_string());
 
-        // Memory pool: defaults to Greedy (single global cap, no per-consumer slicing)
-        // for ingest-heavy workloads. Opt into FairSpill for ad-hoc multi-tenant
-        // query workloads via TIMEFUSION_MEMORY_POOL=fair_spill.
-        // Built once and shared by every session context (pgwire, internal SQL,
-        // maintenance) so the cap is a real process-wide budget.
-        let runtime_env = self
-            .runtime_env
-            .get_or_init(|| {
-                let pool_size = (memory_limit_bytes as f64 * memory_fraction) as usize;
-                let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
-                    crate::config::MemoryPoolKind::Greedy => Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
-                    crate::config::MemoryPoolKind::FairSpill => Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
-                };
-                let meta_cache_bytes = self.config.cache.timefusion_df_metadata_cache_mb * 1024 * 1024;
-                Arc::new(build_query_runtime_env(pool, meta_cache_bytes))
-            })
-            .clone();
+        let runtime_env = self.shared_runtime_env();
 
         // Set up tracing options with configurable sampling
         let record_metrics = self.config.memory.timefusion_tracing_record_metrics;
@@ -2853,6 +2880,31 @@ impl Database {
         self.config.maintenance.timefusion_incremental_snapshot
     }
 
+    /// The process-wide `RuntimeEnv`: one memory pool + parquet-metadata cache
+    /// shared by EVERY session (pgwire, internal SQL, maintenance) so the
+    /// `TIMEFUSION_MEMORY_LIMIT_GB × fraction` cap is a real budget. Memory
+    /// pool: defaults to Greedy (single global cap, no per-consumer slicing)
+    /// for ingest-heavy workloads; opt into FairSpill via
+    /// `TIMEFUSION_MEMORY_POOL=fair_spill`. Maintenance jobs (optimize, dedup,
+    /// recompress) MUST run under this env — the 2026-07-04 crash-loop was the
+    /// dedup sweep materializing chunks in a fresh unpooled session and OOM-
+    /// killing the process instead of erroring.
+    fn shared_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+        self.runtime_env
+            .get_or_init(|| {
+                let memory_limit_bytes = self.config.memory.memory_limit_bytes();
+                let memory_fraction = self.config.memory.timefusion_memory_fraction;
+                let pool_size = (memory_limit_bytes as f64 * memory_fraction) as usize;
+                let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
+                    crate::config::MemoryPoolKind::Greedy => Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
+                    crate::config::MemoryPoolKind::FairSpill => Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
+                };
+                let meta_cache_bytes = self.config.cache.timefusion_df_metadata_cache_mb * 1024 * 1024;
+                Arc::new(build_query_runtime_env(pool, meta_cache_bytes))
+            })
+            .clone()
+    }
+
     /// The DML serialization mutex for the PHYSICAL table backing
     /// `(project_id, table_name)`. Unified tables are one shared Delta table
     /// across all default projects, so their key drops the project — two
@@ -3520,7 +3572,7 @@ impl Database {
             // Avoid the BinaryView read for Variant columns (same issue as
             // optimize_table_light); delta-rs's internal session defaults to
             // schema_force_view_types=true.
-            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
+            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
             .await;
 
         match optimize_result {
@@ -3698,7 +3750,7 @@ impl Database {
                 .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
                 .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
                 // Variant columns: same BinaryView-avoidance session as optimize_table.
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
+                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
                 .await;
             match result {
                 Ok((new_table, metrics)) => {
@@ -3867,7 +3919,7 @@ impl Database {
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
             .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
+            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
             .await;
 
         match optimize_result {
@@ -3956,10 +4008,16 @@ impl Database {
         let provider = TableProviderBuilder::default()
             .with_log_store(log_store)
             .with_eager_snapshot(snapshot)
+            // Synthetic per-row source-file column: the rewrite below targets
+            // exact FILES (remove+add), so it needs to learn which files hold
+            // the duplicate window's rows and then re-read those files' full
+            // row sets — including rows outside the window, which are carried
+            // into the replacement files verbatim.
+            .with_file_column(DEDUP_FILE_COL)
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
-        let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions));
+        let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env()));
         let scan_name = "__dedup_src";
         ctx.register_table(scan_name, Arc::new(provider))?;
         // project_id is currently always a UUID/controlled identifier, but defend in depth: escape single quotes
@@ -4028,17 +4086,12 @@ impl Database {
                     let (s, e) = (start.format("%Y-%m-%d %H:%M:%S"), end.format("%Y-%m-%d %H:%M:%S"));
                     Some((
                         format!("{filter} AND \"timestamp\" >= TIMESTAMP '{s}' AND \"timestamp\" < TIMESTAMP '{e}'"),
-                        // Bare-string timestamp bounds: delta-rs can't stringify
-                        // typed TIMESTAMP/CAST literals into the commit's predicate
-                        // ("Unable to convert expression to string"), so this is the
-                        // only commit-able form. Trade-off: when a concurrent commit
-                        // lands mid-write, the OCC checker re-evaluates this with
-                        // delta-kernel's engine and errors on the string→timestamp
-                        // coercion ("arrow_cast should have been simplified") — the
-                        // widened is_conflict below turns that into a rebase+retry,
-                        // and a rebased attempt with no newer commits skips the
-                        // checker entirely.
-                        format!("project_id = '{safe_pid}' AND date = '{date_str}' AND timestamp >= '{s}' AND timestamp < '{e}'"),
+                        // Log label only. The rewrite commits targeted
+                        // Remove+Add actions — no replace_where, so no
+                        // predicate ever needs kernel evaluation (the old
+                        // bare-string predicate defeated file pruning AND
+                        // errored delta-kernel's OCC checker).
+                        format!("project_id = '{safe_pid}' AND date = '{date_str}' AND timestamp in ['{s}', '{e}')"),
                     ))
                 })
                 .collect()
@@ -4067,133 +4120,223 @@ impl Database {
         }
 
         let mut total_dropped = 0u64;
-        for (chunk_filter, predicate) in chunks {
-            let select = format!("SELECT * FROM {scan_name} WHERE {chunk_filter}");
-            let batches = ctx.sql(&select).await?.collect().await?;
-            let before: usize = batches.iter().map(|b| b.num_rows()).sum();
-            if before == 0 {
-                continue;
-            }
-            let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref())?;
-            let after: usize = deduped.iter().map(|b| b.num_rows()).sum();
-            if before == after {
-                continue;
-            }
-            let dropped = (before - after) as u64;
-
-            // Variant struct columns may still be BinaryView if the partition mixes
-            // tiers — cast to Binary so the delta-kernel write accepts the schema.
-            let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-            // Keep the rewritten chunk sorted (same as the flush path); declare
-            // the footer only when the sort actually succeeded (per chunk, since
-            // a schema-evolved chunk falls back to unsorted).
-            let (deduped, sorted) = sort_batches_by_schema(schema, deduped);
-            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
-
-            // OCC retry — same shape as optimize_table_light_inner. Best-effort;
-            // exhaustion bubbles up as Err (the caller in `dedup_today_partitions`
-            // logs and continues), so the partition only retries when the next
-            // scheduler tick sees a file-count change.
-            const MAX_RETRIES: usize = 4;
-            let mut last_err: Option<deltalake::DeltaTableError> = None;
-            let mut committed = false;
-            for attempt in 0..MAX_RETRIES {
-                // Refresh UNDER the lock before cloning, exactly like the flush
-                // staged-commit path. Holding the lock alone is NOT enough: a
-                // prior committer advances the Delta log but our in-memory
-                // `table_ref` handle lags it, so building the replace_where on
-                // the stale handle commits a base_version behind latest and the
-                // OCC checker rebases — re-running the full file-matching scan
-                // every attempt (the conflicts_checked>0 retry storm seen in
-                // prod). Refreshing here makes base_version == latest, so the
-                // commit lands first-try and the bare-string predicate's OCC
-                // checker never runs. Refresh is probe-cheap (404-short-circuit
-                // when already current).
-                let commit_guard = self.delta_commit_lock.lock().await;
-                if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
-                    debug!("dedup pre-commit refresh failed (attempt {}): {}", attempt + 1, e);
-                }
-                let table_clone = {
-                    let table = table_ref.read().await;
-                    table.clone()
-                };
-                let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                // Apply this replace_where's Add+Remove to the materialized
-                // snapshot incrementally (drop tombstoned paths, append new)
-                // instead of the post-commit hook re-materializing all active
-                // files — the 2-8s/commit full scan on the 26k-file unified
-                // table that the dedup sweep otherwise pays under the commit lock.
-                let result = table_clone
-                    .write(deduped.clone())
-                    .with_partition_columns(schema.partitions.clone())
-                    .with_writer_properties(writer_properties.clone())
-                    .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
-                    .with_replace_where(predicate.clone())
-                    .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                    .await;
-                match result {
-                    Ok(new_table) => {
-                        // Release the commit lock BEFORE post-commit work, matching
-                        // the flush staged-commit path. The commit has landed; the
-                        // version-guarded swap + cache refresh no longer need the
-                        // lock, and holding it across get_file_uris (26k paths),
-                        // persist_snapshot, and the table write-lock would serialize
-                        // every concurrent flush append behind this window.
-                        drop(commit_guard);
-                        // Swap + warm-added/evict-removed exactly like the optimize
-                        // paths; a bare swap left the replace_where outputs stone-cold
-                        // (1.5 s first read observed against OVH) and the tombstoned
-                        // files' cache entries alive until TTL.
-                        self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
-                        crate::metrics::record_compaction_dedup_dropped(dropped);
-                        info!(
-                            "dedup compaction: table={} project={} date={} chunk=[{}] dropped={} (before={} after={})",
-                            table_name, project_id, date_str, predicate, dropped, before, after
-                        );
-                        total_dropped += dropped;
-                        committed = true;
-                        break;
-                    }
-                    Err(e) => {
-                        // Drop BEFORE the backoff sleep below — do not remove.
-                        // Holding the commit lock across the sleep would block
-                        // every concurrent append behind this dedup retry.
-                        drop(commit_guard);
-                        let msg = e.to_string();
-                        // "Transaction failed" covers the conflict checker erroring
-                        // while evaluating our predicate against a concurrent commit
-                        // (seen in prod as "Failed to commit transaction: Error
-                        // evaluating predicate") — rebasing on retry resolves it.
-                        let is_conflict = is_occ_conflict_err(&msg);
-                        if !is_conflict || attempt + 1 == MAX_RETRIES {
-                            return Err(anyhow::anyhow!("dedup_partition write failed: {}", e));
-                        }
-                        debug!(
-                            "dedup_partition OCC conflict (attempt {}/{}): table={} project={} date={}",
-                            attempt + 1,
-                            MAX_RETRIES,
-                            table_name,
-                            project_id,
-                            date_str
-                        );
-                        tokio::time::sleep(occ_backoff(attempt)).await;
-                        last_err = Some(e);
-                    }
-                }
-            }
-            if !committed {
-                return Err(anyhow::anyhow!(
-                    "dedup_partition exhausted retries: {}",
-                    last_err.map(|e| e.to_string()).unwrap_or_default()
-                ));
-            }
+        for (chunk_filter, label) in chunks {
+            total_dropped += self.dedup_rewrite_chunk(&ctx, table_ref, table_name, schema, scan_name, &filter, &chunk_filter, &label).await?;
         }
         Ok(total_dropped)
     }
 
+    /// Rewrite one duplicate-bearing chunk as a TARGETED file transaction:
+    /// learn exactly which files hold the chunk's rows (via the provider's
+    /// synthetic [`DEDUP_FILE_COL`]), re-read those files' FULL row sets (rows
+    /// outside the chunk window are carried into the replacements verbatim),
+    /// dedup, stage replacement parquet, and commit Remove(old)+Add(new) in
+    /// one transaction.
+    ///
+    /// No `replace_where`: its predicate had to be a bare string (delta-rs
+    /// can't stringify typed TIMESTAMP literals into the commit), which
+    /// delta-kernel can't evaluate — defeating file pruning (observed planning
+    /// against all 3.6k files / 124GB, the 2026-07-04 OOM crash-loop) and
+    /// erroring the OCC checker on every mid-write concurrent commit. With
+    /// explicit file actions the conflict surface is exactly the touched
+    /// files, and — since files are immutable — there is no race against
+    /// concurrent flush appends: fresh rows in the window live in files this
+    /// commit never touches.
+    #[allow(clippy::too_many_arguments)]
+    async fn dedup_rewrite_chunk(
+        &self, ctx: &datafusion::prelude::SessionContext, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str,
+        schema: &crate::schema_loader::TableSchema, scan_name: &str, partition_filter: &str, chunk_filter: &str, label: &str,
+    ) -> Result<u64> {
+        use deltalake::{
+            kernel::{Action, transaction::TableReference},
+            protocol::DeltaOperation,
+            writer::DeltaWriter,
+        };
+        let read_string_column = |batches: Vec<RecordBatch>| -> Result<Vec<String>> {
+            let mut out = Vec::new();
+            for batch in batches {
+                let col = datafusion::arrow::compute::cast(batch.column(0), &datafusion::arrow::datatypes::DataType::Utf8)?;
+                let col = col.as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("cast to Utf8");
+                out.extend((0..col.len()).filter(|&i| !col.is_null(i)).map(|i| col.value(i).to_string()));
+            }
+            Ok(out)
+        };
+        // Re-plan loop: a concurrent rewrite (optimize / z-order / another
+        // dedup) can remove a target file mid-flight. Detected under the
+        // commit lock; the chunk is re-planned from a fresh snapshot.
+        const MAX_REPLANS: usize = 3;
+        for replan in 0..MAX_REPLANS {
+            // 1. Which files hold the chunk's rows — ground truth from the
+            // scan itself, no per-file stats parsing.
+            let files_sql = format!("SELECT DISTINCT \"{DEDUP_FILE_COL}\" FROM {scan_name} WHERE {chunk_filter}");
+            let file_ids = read_string_column(ctx.sql(&files_sql).await?.collect().await?)?;
+            if file_ids.is_empty() {
+                return Ok(0);
+            }
+            // 2. Map scan values to live Add actions (suffix-match either
+            // direction: the scan column carries the store path, the log a
+            // table-relative one).
+            let targets: Vec<deltalake::kernel::Add> = {
+                let table = table_ref.read().await;
+                table
+                    .snapshot()?
+                    .log_data()
+                    .iter()
+                    .filter(|f| {
+                        let p = f.path();
+                        file_ids.iter().any(|v| v.ends_with(p.as_ref()) || p.ends_with(v.as_str()))
+                    })
+                    // Deprecated in favour of arrow-direct access, but the
+                    // Remove tombstones below need the Add's exact fields.
+                    .map(|f| {
+                        #[allow(deprecated)]
+                        f.add_action()
+                    })
+                    .collect()
+            };
+            if targets.len() != file_ids.len() {
+                debug!(
+                    "dedup rewrite: mapped {}/{} files for table={} chunk=[{}], re-planning",
+                    targets.len(),
+                    file_ids.len(),
+                    table_name,
+                    label
+                );
+                tokio::time::sleep(occ_backoff(replan)).await;
+                continue;
+            }
+            // 3. Budget guard — skip loudly rather than materialize an
+            // unbounded file set (a z-ordered whole-day file would drag the
+            // entire day into one rewrite). Read-side dedup keeps queries
+            // correct while the duplicates persist.
+            let rewrite_bytes: i64 = targets.iter().map(|a| a.size).sum();
+            let budget = self.config.maintenance.timefusion_dedup_max_rewrite_bytes;
+            if rewrite_bytes.max(0) as u64 > budget {
+                crate::metrics::record_dedup_chunk_skipped();
+                error!(
+                    "dedup rewrite SKIPPED (over budget): table={} chunk=[{}] files={} bytes={} budget={} — duplicates persist until compaction shrinks the file set",
+                    table_name,
+                    label,
+                    targets.len(),
+                    rewrite_bytes,
+                    budget
+                );
+                return Ok(0);
+            }
+            // 4. Full row set of the target files: chunk-window rows to dedup
+            // plus out-of-window rows carried through verbatim. Bounded by the
+            // budget above AND the shared memory pool (a miss errors here
+            // instead of OOM-killing the process).
+            let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
+            let rows_sql = format!("SELECT * FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list})");
+            let batches: Vec<RecordBatch> = ctx
+                .sql(&rows_sql)
+                .await?
+                .collect()
+                .await?
+                .into_iter()
+                .map(|b| drop_batch_column(b, DEDUP_FILE_COL))
+                .collect();
+            let before: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if before == 0 {
+                return Ok(0);
+            }
+            let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref())?;
+            let after: usize = deduped.iter().map(|b| b.num_rows()).sum();
+            if before == after {
+                return Ok(0);
+            }
+            let dropped = (before - after) as u64;
+
+            // Variant struct columns may still be BinaryView if the partition
+            // mixes tiers — cast to Binary so the write accepts the schema.
+            let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
+            let (deduped, sorted) = sort_batches_by_schema(schema, deduped);
+            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
+
+            // 5. Stage replacement parquet (no commit) — outside the lock,
+            // mirroring the flush staged-commit path.
+            let staging_table = { table_ref.read().await.clone() };
+            let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
+                .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
+                .with_writer_properties(writer_properties);
+            let target_schema = writer.arrow_schema();
+            for b in &deduped {
+                let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
+                writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
+            }
+            let adds: Vec<Action> =
+                writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add).collect();
+            let stage_store = staging_table.log_store().object_store(None);
+            let removes: Vec<Action> = targets.iter().map(|a| Action::Remove(remove_for_add(a))).collect();
+
+            // 6. Commit Remove+Add under the commit lock, verifying every
+            // target file is still live in the refreshed snapshot (a missing
+            // one means a concurrent rewrite superseded our read → re-plan).
+            const MAX_RETRIES: usize = 4;
+            for attempt in 0..MAX_RETRIES {
+                let commit_guard = self.delta_commit_lock.lock().await;
+                if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
+                    debug!("dedup rewrite pre-commit refresh failed (attempt {}): {}", attempt + 1, e);
+                }
+                let mut new_table = { table_ref.read().await.clone() };
+                let live: std::collections::HashSet<String> = new_table.snapshot()?.log_data().iter().map(|f| f.path().into_owned()).collect();
+                if targets.iter().any(|t| !live.contains(&t.path)) {
+                    drop(commit_guard);
+                    Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                    debug!("dedup rewrite: target rewritten concurrently, re-planning table={} chunk=[{}]", table_name, label);
+                    tokio::time::sleep(occ_backoff(replan)).await;
+                    break; // out of the commit loop → next re-plan iteration
+                }
+                let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                let op = DeltaOperation::Write {
+                    mode: deltalake::protocol::SaveMode::Overwrite,
+                    partition_by: (!schema.partitions.is_empty()).then(|| schema.partitions.clone()),
+                    predicate: None,
+                };
+                let commit_res =
+                    deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                        .with_actions(removes.iter().chain(adds.iter()).cloned().collect::<Vec<_>>())
+                        .build(Some(new_table.snapshot()? as &dyn TableReference), new_table.log_store(), op)
+                        .await;
+                match commit_res {
+                    Ok(finalized) => {
+                        new_table.state = Some(finalized.snapshot());
+                        // Release before post-commit work (swap + cache warm), matching
+                        // the flush staged path — holding it would serialize appends.
+                        drop(commit_guard);
+                        self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                        crate::metrics::record_compaction_dedup_dropped(dropped);
+                        info!(
+                            "dedup rewrite: table={} chunk=[{}] files={} dropped={} (before={} after={})",
+                            table_name,
+                            label,
+                            targets.len(),
+                            dropped,
+                            before,
+                            after
+                        );
+                        return Ok(dropped);
+                    }
+                    Err(e) => {
+                        drop(commit_guard);
+                        if !is_occ_conflict_err(&e.to_string()) || attempt + 1 == MAX_RETRIES {
+                            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                            return Err(anyhow::anyhow!("dedup rewrite commit failed: {e}"));
+                        }
+                        debug!("dedup rewrite OCC conflict (attempt {}/{}) table={} chunk=[{}]", attempt + 1, MAX_RETRIES, table_name, label);
+                        tokio::time::sleep(occ_backoff(attempt)).await;
+                    }
+                }
+            }
+        }
+        anyhow::bail!("dedup rewrite: re-plan attempts exhausted for table={} chunk=[{}]", table_name, label)
+    }
+
     /// Sweep every `(project_id, today)` partition in this table via
     /// `dedup_partition`. Skips when Delta version is unchanged since the
-    /// last sweep. Best-effort: per-partition errors are logged.
+    /// last sweep, and skips partitions in failure backoff. Best-effort:
+    /// per-partition errors are logged and back the partition off.
     pub async fn dedup_today_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
@@ -4229,12 +4372,37 @@ impl Database {
             };
             let project_ids = if project_ids.is_empty() { std::iter::once("default".to_string()).collect() } else { project_ids };
             for pid in &project_ids {
+                let backoff_key = format!("{dedup_key}:{pid}:{date}");
+                if let Some(entry) = self.dedup_backoff.get(&backoff_key)
+                    && std::time::Instant::now() < entry.value().1
+                {
+                    crate::metrics::record_dedup_chunk_skipped();
+                    debug!("dedup sweep: {} in failure backoff, skipping", backoff_key);
+                    continue;
+                }
                 match self.dedup_partition(table_ref, table_name, pid, date).await {
                     Ok(d) => {
+                        self.dedup_backoff.remove(&backoff_key);
                         total_dropped += d;
                         any_ok = true;
                     }
-                    Err(e) => warn!("dedup sweep: project={} date={} table={} failed: {}", pid, date, table_name, e),
+                    Err(e) => {
+                        // Exponential backoff, 10min doubling to a 6h cap —
+                        // a failing partition must not re-run (and re-fail)
+                        // on every 5-minute sweep tick.
+                        let attempts = self.dedup_backoff.get(&backoff_key).map_or(0, |e| e.value().0) + 1;
+                        let delay = std::time::Duration::from_secs((600u64 << (attempts.min(7) - 1)).min(21_600));
+                        self.dedup_backoff.insert(backoff_key, (attempts, std::time::Instant::now() + delay));
+                        warn!(
+                            "dedup sweep: project={} date={} table={} failed (attempt {}, next retry in {}s): {}",
+                            pid,
+                            date,
+                            table_name,
+                            attempts,
+                            delay.as_secs(),
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -4314,7 +4482,7 @@ impl Database {
                 // the optimize-internal Parquet read uses `schema_force_view_types=true`
                 // (delta-rs's default), it returns BinaryView and the rewrite blows up
                 // mid-scan with "Expected ... Binary, got ... BinaryView".
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions)))
+                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
                 .await;
             match optimize_result {
                 Ok((new_table, metrics)) => {
