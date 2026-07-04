@@ -5,9 +5,11 @@
 ##############################
 FROM rust:1.91-slim-bookworm AS chef
 WORKDIR /app
-# protoc is required by tonic-prost-build (build.rs).
+# protoc is required by tonic-prost-build (build.rs). make is required by
+# tikv-jemalloc-sys (jemalloc compiles from C source under --features
+# profiling); the slim image ships cc but not make.
 RUN apt-get update && \
-    apt-get install -y pkg-config libssl-dev protobuf-compiler && \
+    apt-get install -y pkg-config libssl-dev protobuf-compiler make && \
     rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --version 0.1.77 --locked
 
