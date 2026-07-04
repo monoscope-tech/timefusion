@@ -1006,6 +1006,12 @@ pub struct Database {
     /// stack a second sweep on top — concurrent sweeps churn each other's
     /// target files into re-plan storms and multiply peak memory.
     light_optimize_gate:             Arc<tokio::sync::Mutex<()>>,
+    /// Caps concurrent heavy maintenance rewrites (dedup / optimize /
+    /// recompress) that materialize Arrow. Their footprint is invisible to the
+    /// DataFusion memory pool (a `SELECT * … collect()` doesn't reserve through
+    /// it), so aggregate concurrency — not the pool — is the real bound against
+    /// the cgroup OOM (prod 2026-07-04). Permits = `timefusion_maintenance_rewrite_concurrency`.
+    maintenance_rewrite_sem:         Arc<tokio::sync::Semaphore>,
     /// Serializes in-process Delta commits (flush appends vs dedup
     /// replace_where). delta-kernel's OCC checker cannot evaluate the
     /// bare-string timestamp predicate replace_where commits carry (errors
@@ -1323,6 +1329,8 @@ impl Database {
         let page_row_limit = cfg.parquet.timefusion_page_row_count_limit;
         let statistics_extractor = Arc::new(DeltaStatisticsExtractor::new(stats_cache_size, 300, page_row_limit));
 
+        // Captured before `cfg` is moved into the struct literal below.
+        let maint_rewrite_permits = cfg.maintenance.timefusion_maintenance_rewrite_concurrency.max(1);
         let db = Self {
             config: cfg,
             runtime_env: Arc::new(std::sync::OnceLock::new()),
@@ -1347,6 +1355,7 @@ impl Database {
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             light_optimize_gate: Arc::new(tokio::sync::Mutex::new(())),
+            maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             delta_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             dml_locks: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
@@ -3852,6 +3861,11 @@ impl Database {
             return Ok(());
         }
 
+        // Recompress rewrites whole partitions — same pool-invisible Arrow
+        // materialization as dedup/optimize; hold a maintenance-rewrite permit.
+        // Acquired after the empty-partition early-out so no-op calls are free.
+        let _rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
+
         // Probe one file's footer KV metadata. URIs returned by delta-rs are
         // absolute (s3://bucket/...); the table's object_store is rooted at
         // table_uri, so the relative key is the URI with that prefix stripped.
@@ -4248,28 +4262,57 @@ impl Database {
                 tokio::time::sleep(occ_backoff(replan)).await;
                 continue;
             }
-            // 3. Budget guard — skip loudly rather than materialize an
-            // unbounded file set (a z-ordered whole-day file would drag the
-            // entire day into one rewrite). Read-side dedup keeps queries
-            // correct while the duplicates persist.
+            // 3. Budget guards — skip loudly rather than materialize a chunk
+            // that would blow the cgroup. Read-side dedup keeps queries correct
+            // while the duplicates persist.
+            //
+            // Two ceilings, because the two failure modes differ:
+            //  (a) compressed on-disk bytes (`sum(add.size)`) — cheap early-out
+            //      against a z-ordered whole-day file dragging the whole day in.
+            //  (b) ESTIMATED DECODED (Arrow) bytes — the one that actually
+            //      matters. A `SELECT * … collect()` decodes to Arrow at 5-20×
+            //      the compressed size for wide Variant/JSON columns, and those
+            //      buffers are NOT accounted by DataFusion's memory pool, so the
+            //      pool never errors — the process OOMs (prod 2026-07-04: a
+            //      ~1M-row chunk under the 2GiB compressed budget decoded past
+            //      the 85GiB cgroup). We estimate from per-file `num_records`
+            //      when stats are present, else `compressed × inflation`, and
+            //      ×2 for the RowConverter's parallel keyed copy in dedup_batches.
             let rewrite_bytes: i64 = targets.iter().map(|a| a.size).sum();
             let budget = self.config.maintenance.timefusion_dedup_max_rewrite_bytes;
-            if rewrite_bytes.max(0) as u64 > budget {
+            let inflation = self.config.maintenance.timefusion_dedup_decode_inflation.max(1);
+            let decoded_budget = self.config.maintenance.timefusion_dedup_max_decoded_bytes;
+            let bytes_per_row = self.config.maintenance.timefusion_dedup_bytes_per_row;
+            let est_decoded_bytes: u64 = targets
+                .iter()
+                .map(|a| match a.get_stats().ok().flatten() {
+                    // num_records directly tracks the Arrow row count (best signal).
+                    Some(s) if bytes_per_row > 0 => (s.num_records.max(0) as u64).saturating_mul(bytes_per_row),
+                    // No stats → inflate compressed size.
+                    _ => (a.size.max(0) as u64).saturating_mul(inflation),
+                })
+                .sum::<u64>()
+                .saturating_mul(2); // RowConverter keyed copy in dedup_batches
+            if rewrite_bytes.max(0) as u64 > budget || est_decoded_bytes > decoded_budget {
                 crate::metrics::record_dedup_chunk_skipped();
                 error!(
-                    "dedup rewrite SKIPPED (over budget): table={} chunk=[{}] files={} bytes={} budget={} — duplicates persist until compaction shrinks the file set",
+                    "dedup rewrite SKIPPED (over budget): table={} chunk=[{}] files={} compressed_bytes={} compressed_budget={} est_decoded_bytes={} decoded_budget={} — duplicates persist (read-side dedup keeps queries correct) until compaction shrinks the file set",
                     table_name,
                     label,
                     targets.len(),
                     rewrite_bytes,
-                    budget
+                    budget,
+                    est_decoded_bytes,
+                    decoded_budget
                 );
                 return Ok(0);
             }
             // 4. Full row set of the target files: chunk-window rows to dedup
             // plus out-of-window rows carried through verbatim. Bounded by the
-            // budget above AND the shared memory pool (a miss errors here
-            // instead of OOM-killing the process).
+            // decoded-byte estimate above (the pool does NOT bound this collect)
+            // AND the maintenance-rewrite semaphore (only N heavy materializations
+            // in flight at once — the aggregate backstop for estimate error).
+            let _rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
             let rows_sql = format!("SELECT * FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list})");
             let batches: Vec<RecordBatch> = ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
@@ -4491,6 +4534,10 @@ impl Database {
         writer_properties: &WriterProperties, start_time: std::time::Instant,
     ) -> Result<()> {
         const MAX_RETRIES: usize = 4;
+        // Optimize rewrites (compaction) materialize Arrow like dedup — hold a
+        // maintenance-rewrite permit so it can't stack with a concurrent dedup
+        // or recompress and blow the cgroup (their footprint is pool-invisible).
+        let _rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
         let mut last_err: Option<deltalake::DeltaTableError> = None;
         for attempt in 0..MAX_RETRIES {
             let table_clone = {

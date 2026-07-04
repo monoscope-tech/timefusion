@@ -303,6 +303,16 @@ const_default!(d_snapshot_reconcile: u64 = 500);
 // debt. Guards against e.g. a z-ordered whole-day file (1GB+ on disk, several
 // GB decompressed × copies) dragging the whole day into one rewrite.
 const_default!(d_dedup_max_rewrite_bytes: u64 = 2 * 1024 * 1024 * 1024);
+// 4 GiB estimated decoded footprint — a single chunk this large already
+// dwarfs the DataFusion pool; larger chunks skip rather than risk the cgroup.
+const_default!(d_dedup_max_decoded_bytes: u64 = 4 * 1024 * 1024 * 1024);
+// 12× compressed→decoded: zstd on wide Variant/JSON otel rows routinely
+// decodes 10-20×; 12 is a deliberately conservative floor.
+const_default!(d_dedup_decode_inflation: u64 = 12);
+// 4 KiB/row decoded estimate for otel spans (wide Variant/JSON bodies).
+const_default!(d_dedup_bytes_per_row: u64 = 4096);
+// Serial by default: one heavy maintenance rewrite in flight at a time.
+const_default!(d_maintenance_rewrite_concurrency: usize = 1);
 // How many days back (in addition to today) the dedup sweep covers. today-only
 // left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
@@ -819,81 +829,109 @@ impl ParquetConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MaintenanceConfig {
     #[serde(default = "d_vacuum_retention")]
-    pub timefusion_vacuum_retention_hours:        u64,
+    pub timefusion_vacuum_retention_hours:          u64,
     #[serde(default = "d_log_retention")]
-    pub timefusion_log_retention_hours:           u64,
+    pub timefusion_log_retention_hours:             u64,
     #[serde(default = "d_optimize_window_hours")]
-    pub timefusion_optimize_window_hours:         u64,
+    pub timefusion_optimize_window_hours:           u64,
     #[serde(default = "d_compact_min_files")]
-    pub timefusion_compact_min_files:             usize,
+    pub timefusion_compact_min_files:               usize,
     #[serde(default = "d_light_optimize_target")]
-    pub timefusion_light_optimize_target_size:    i64,
+    pub timefusion_light_optimize_target_size:      i64,
     /// Concurrent merge tasks per optimize run. delta-rs defaults to
     /// num_cpus (48 on prod), where each task holds decompressed batches
     /// plus a zstd writer buffer — 2026-06-11 this OOM-killed the process
     /// every optimize tick once small files accumulated.
     #[serde(default = "d_optimize_concurrency")]
-    pub timefusion_optimize_max_concurrent_tasks: usize,
+    pub timefusion_optimize_max_concurrent_tasks:   usize,
     #[serde(default = "d_light_schedule")]
-    pub timefusion_light_optimize_schedule:       String,
+    pub timefusion_light_optimize_schedule:         String,
     #[serde(default = "d_optimize_schedule")]
-    pub timefusion_optimize_schedule:             String,
+    pub timefusion_optimize_schedule:               String,
     #[serde(default = "d_consolidate_schedule")]
-    pub timefusion_consolidate_schedule:          String,
+    pub timefusion_consolidate_schedule:            String,
     #[serde(default = "d_vacuum_schedule")]
-    pub timefusion_vacuum_schedule:               String,
+    pub timefusion_vacuum_schedule:                 String,
     #[serde(default = "d_recompress_schedule")]
-    pub timefusion_recompress_schedule:           String,
+    pub timefusion_recompress_schedule:             String,
     /// Proactively warm the Foyer cache for files written by a flush/optimize
     /// commit, so recent partitions dashboards read don't cold-start after
     /// every compaction. Footers are always warmed when enabled.
     #[serde(default = "d_true")]
-    pub timefusion_warm_after_compaction:         bool,
+    pub timefusion_warm_after_compaction:           bool,
     /// In addition to footers, warm the full file contents into the main
     /// (full-file) cache. Off by default — footers carry most of the
     /// planning-latency win at a fraction of the bytes; enable for data-read
     /// warmth on the hottest partitions.
     #[serde(default)]
-    pub timefusion_warm_full_files:               bool,
+    pub timefusion_warm_full_files:                 bool,
     /// Only warm files whose `date=` partition is within this many days of
     /// today. Bounds warming to the partitions dashboards actually query.
     /// 0 = no recency limit.
     #[serde(default = "d_warm_recency_days")]
-    pub timefusion_warm_recency_days:             u64,
+    pub timefusion_warm_recency_days:               u64,
     /// Warm parquet footers for EVERY live file (not just recency-window
     /// ones). Footers are tens of KB each, but on tables with thousands of
     /// files the boot-time GET burst may matter on small instances — disable
     /// to fall back to recency-bounded footer warming.
     #[serde(default = "d_true")]
-    pub timefusion_warm_all_footers:              bool,
+    pub timefusion_warm_all_footers:                bool,
     /// Max concurrent warm fetches per commit. Bounds the S3 GET burst a
     /// warm job adds right after a compaction.
     #[serde(default = "d_warm_concurrency")]
-    pub timefusion_warm_concurrency:              usize,
+    pub timefusion_warm_concurrency:                usize,
     /// After a compaction commit, proactively evict the cached full-file bytes
     /// of the files it tombstoned (no longer in the live set), instead of
     /// waiting for VACUUM / TTL / LRU to reclaim them. Cheap (in-cache only, no
     /// S3) and keeps the cache from filling with dead compaction outputs.
     #[serde(default = "d_true")]
-    pub timefusion_evict_after_compaction:        bool,
+    pub timefusion_evict_after_compaction:          bool,
     /// Advance the post-commit snapshot by appending only the files the commit
     /// added, instead of re-materializing the whole active file set (2-8s over
     /// 26k files every flush in prod). Produces an identical file set — a
     /// faster, equivalent replay, safe regardless of writer count. Off reverts
     /// to the full re-materialize per commit.
     #[serde(default = "d_true")]
-    pub timefusion_incremental_snapshot:          bool,
+    pub timefusion_incremental_snapshot:            bool,
     /// Belt-and-suspenders for the above: every Nth commit per table, drop the
     /// materialized files and re-materialize from S3 truth, bounding any drift
     /// from an incremental-replay bug. 0 disables reconciliation.
     #[serde(default = "d_snapshot_reconcile")]
-    pub timefusion_snapshot_reconcile_commits:    u64,
+    pub timefusion_snapshot_reconcile_commits:      u64,
     /// Days back (plus today) the dedup sweep scans. See `d_dedup_lookback_days`.
     #[serde(default = "d_dedup_lookback_days")]
-    pub timefusion_dedup_lookback_days:           u64,
-    /// Byte ceiling per dedup chunk rewrite. See `d_dedup_max_rewrite_bytes`.
+    pub timefusion_dedup_lookback_days:             u64,
+    /// Byte ceiling per dedup chunk rewrite, measured as COMPRESSED on-disk
+    /// bytes (`sum(add.size)`). Cheap early-out. See `d_dedup_max_rewrite_bytes`.
     #[serde(default = "d_dedup_max_rewrite_bytes")]
-    pub timefusion_dedup_max_rewrite_bytes:       u64,
+    pub timefusion_dedup_max_rewrite_bytes:         u64,
+    /// Ceiling on the ESTIMATED DECODED (in-memory Arrow) footprint of a dedup
+    /// chunk rewrite. The compressed budget above under-counts by 5-20× for
+    /// wide Variant/JSON columns, and `SELECT * … collect()` Arrow buffers are
+    /// NOT accounted by DataFusion's memory pool — so a compressed-under-budget
+    /// chunk decoded to tens of GB and OOM-killed the process (prod 2026-07-04,
+    /// 89GB cgroup kill). Over this ceiling the chunk is skipped (read-side
+    /// dedup keeps queries correct). See `d_dedup_max_decoded_bytes`.
+    #[serde(default = "d_dedup_max_decoded_bytes")]
+    pub timefusion_dedup_max_decoded_bytes:         u64,
+    /// Compressed→decoded inflation factor used to estimate a dedup chunk's
+    /// in-memory footprint when per-file `num_records` stats are unavailable.
+    /// See `d_dedup_decode_inflation`.
+    #[serde(default = "d_dedup_decode_inflation")]
+    pub timefusion_dedup_decode_inflation:          u64,
+    /// Estimated decoded Arrow bytes per row, used with per-file `num_records`
+    /// to size a dedup chunk's in-memory footprint. otel spans carry wide
+    /// Variant/JSON bodies; 4 KiB is a conservative average. See
+    /// `d_dedup_bytes_per_row`.
+    #[serde(default = "d_dedup_bytes_per_row")]
+    pub timefusion_dedup_bytes_per_row:             u64,
+    /// Max concurrent heavy maintenance rewrites (dedup / optimize / recompress)
+    /// that may materialize Arrow at once. 1 = strictly serial. Backstop for
+    /// decoded-footprint mis-estimates: their Arrow memory is invisible to the
+    /// DataFusion pool, so aggregate concurrency is the real bound. See
+    /// `d_maintenance_rewrite_concurrency`.
+    #[serde(default = "d_maintenance_rewrite_concurrency")]
+    pub timefusion_maintenance_rewrite_concurrency: usize,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.

@@ -381,3 +381,51 @@ async fn dedup_rewrite_targets_only_duplicate_files() -> Result<()> {
     assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "post-dedup: 1 deduped row + 1 bystander");
     Ok(())
 }
+
+/// Regression (prod 2026-07-04, 89GB cgroup OOM crash-loop): the dedup budget
+/// measured COMPRESSED on-disk bytes (`sum(add.size)`), but the rewrite
+/// `SELECT * … collect()`s the chunk to Arrow at 5-20× — and those buffers are
+/// invisible to DataFusion's memory pool, so a compressed-under-budget chunk
+/// decoded past the cgroup and OOM-killed the process. dedup must instead skip
+/// (returning 0, leaving the physical dupe for read-side dedup) when the
+/// ESTIMATED DECODED footprint exceeds `timefusion_dedup_max_decoded_bytes`.
+///
+/// Pre-fix there was no decoded budget, so setting it low had no effect and
+/// dedup dropped the dupe (returned 1) — this test's `dropped == 0` assertion
+/// fails on old code.
+#[serial]
+#[tokio::test]
+async fn dedup_skips_chunk_over_decoded_budget() -> Result<()> {
+    let cfg = TestConfigBuilder::new("dedup_decoded_budget").with_buffer_mode(BufferMode::Enabled).build();
+    // Fresh Arc (refcount 1) → unwrap to set a 1-byte decoded ceiling. The
+    // compressed budget stays at its 2GiB default, so ONLY the new decoded
+    // guard can trip: proves the decoded estimate — not compressed size — gates.
+    let mut cfg = Arc::try_unwrap(cfg).expect("fresh config Arc");
+    cfg.maintenance.timefusion_dedup_max_decoded_bytes = 1;
+    let cfg = Arc::new(cfg);
+
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)]) };
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "pre-dedup: 2 physical rows");
+
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
+    let dropped = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
+    assert_eq!(
+        dropped, 0,
+        "over the decoded budget, dedup must SKIP (not materialize) — dupe persists for read-side dedup"
+    );
+    assert_eq!(
+        delta_physical_row_count(&table_ref).await?,
+        2,
+        "skipped chunk must be left physically intact (no rewrite, no OOM risk)"
+    );
+    Ok(())
+}
