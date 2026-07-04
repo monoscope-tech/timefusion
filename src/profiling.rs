@@ -22,9 +22,13 @@ mod imp {
 
     use tracing::{info, warn};
 
-    /// Directory (under the data dir) for profiling artifacts. Created on init.
+    /// Directory for profiling artifacts. MUST equal the parent of the baked
+    /// jemalloc `prof_prefix` in main.rs (`<data_dir>/profiles`) so the heap
+    /// dumps land in a dir we create — jemalloc does NOT mkdir its prefix, and
+    /// the earlier doubled `timefusion/timefusion/profiles` meant the prefix
+    /// dir never existed and every .heap silently failed.
     fn profiles_dir(data_dir: &std::path::Path) -> PathBuf {
-        data_dir.join("timefusion").join("profiles")
+        data_dir.join("profiles")
     }
 
     /// Start background profiling. Heap profiling is already active via the
