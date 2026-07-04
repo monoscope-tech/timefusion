@@ -1973,53 +1973,93 @@ impl MemBuffer {
                     continue;
                 }
 
-                // Build widened batch by appending source cols taken at probed indices.
-                let mut widened_cols: Vec<ArrayRef> = batch.columns().to_vec();
-                for i in 0..source.schema.fields().len() {
-                    let src_col = source.batch.column(i);
-                    let taken = arrow::compute::take(src_col.as_ref(), &src_idxs, None).map_err(arrow_err)?;
-                    widened_cols.push(taken);
-                }
-                let widened_batch = RecordBatch::try_new(widened_schema.clone(), widened_cols).map_err(arrow_err)?;
-
-                // has_match: source idx was non-null (a join match existed).
+                // Matched-rows-only path. The old code widened the WHOLE batch,
+                // evaluated the predicate + every assignment over all `num_rows`,
+                // and `merge_arrays`/`zip`ped each assignment column over the full
+                // column — and `zip` on Utf8View/BinaryView (Variant/string)
+                // columns calls `to_data`, materializing the entire column.
+                // Matches are sparse (a few source ids vs a whole bucket), so
+                // that was ~all wasted work and the source of the 89GB OOM
+                // (confirmed by heap+CPU profile 2026-07-04: update_with_source →
+                // arrow zip / make_array / GenericByteViewArray::to_data).
+                //
+                // Instead: widen + evaluate ONLY the matched candidate rows, and
+                // preserve the rest with a single `filter` (which shares
+                // byte-view data buffers — no `to_data` materialization). Output
+                // is [preserved-rows, updated-rows]; row order within the bucket
+                // is not semantically meaningful (queries sort; dedup keys on
+                // values), so splitting is safe.
                 let has_match = BooleanArray::from((0..num_rows).map(|i| !src_idxs.is_null(i)).collect::<Vec<_>>());
 
-                let pred_mask = if let Some(ref phys_pred) = physical_predicate {
-                    let result = phys_pred.evaluate(&widened_batch)?;
-                    let arr = result.into_array(num_rows)?;
+                // Candidate rows (source matched) — widen only these.
+                let cand_batch = filter_record_batch(&batch, &has_match).map_err(arrow_err)?;
+                let cand_src_idxs = arrow::compute::filter(&src_idxs, &has_match).map_err(arrow_err)?;
+                let cand_src_idxs = cand_src_idxs.as_any().downcast_ref::<UInt32Array>().expect("filter preserves UInt32 type");
+                let cand_n = cand_batch.num_rows();
+
+                let mut widened_cols: Vec<ArrayRef> = cand_batch.columns().to_vec();
+                for i in 0..source.schema.fields().len() {
+                    let taken = arrow::compute::take(source.batch.column(i).as_ref(), cand_src_idxs, None).map_err(arrow_err)?;
+                    widened_cols.push(taken);
+                }
+                let cand_widened = RecordBatch::try_new(widened_schema.clone(), widened_cols).map_err(arrow_err)?;
+
+                // Predicate over candidates (all already have a source match).
+                let cand_pred = if let Some(ref phys_pred) = physical_predicate {
+                    let arr = phys_pred.evaluate(&cand_widened)?.into_array(cand_n)?;
                     arr.as_any()
                         .downcast_ref::<BooleanArray>()
                         .cloned()
                         .ok_or_else(|| datafusion::error::DataFusionError::Execution("Predicate did not return boolean".into()))?
                 } else {
-                    BooleanArray::from(vec![true; num_rows])
+                    BooleanArray::from(vec![true; cand_n])
                 };
 
-                let mask = arrow::compute::and(&pred_mask, &has_match).map_err(arrow_err)?;
-
-                let matching_count = mask.iter().filter(|v| v == &Some(true)).count();
+                let matching_count = cand_pred.iter().filter(|v| v == &Some(true)).count();
                 if matching_count == 0 {
                     new_batches.push(batch);
                     continue;
                 }
                 total_updated += matching_count as u64;
-
                 let old_size = estimate_batch_size(&batch);
-                let new_columns: Vec<ArrayRef> = (0..batch.num_columns())
+
+                // Preserved = rows NOT updated. Map the candidate-space predicate
+                // back to full-batch positions (candidates are the has_match rows
+                // in order), then one filter over the original batch.
+                let mut updated_full = vec![false; num_rows];
+                let mut c = 0usize;
+                for (i, u) in updated_full.iter_mut().enumerate() {
+                    if has_match.value(i) {
+                        if cand_pred.value(c) {
+                            *u = true;
+                        }
+                        c += 1;
+                    }
+                }
+                let not_updated = arrow::compute::not(&BooleanArray::from(updated_full)).map_err(arrow_err)?;
+                let preserved = filter_record_batch(&batch, &not_updated).map_err(arrow_err)?;
+
+                // Updated rows: matched candidates that passed the predicate.
+                // Target columns are the first N of the widened batch, so
+                // non-assignment columns come straight from it (matched subset).
+                let upd_widened = filter_record_batch(&cand_widened, &cand_pred).map_err(arrow_err)?;
+                let upd_n = upd_widened.num_rows();
+                let new_columns: Vec<ArrayRef> = (0..target_schema.fields().len())
                     .map(|col_idx| {
                         if let Some((_, phys_expr)) = physical_assignments.iter().find(|(idx, _)| *idx == col_idx) {
-                            let new_values = phys_expr.evaluate(&widened_batch)?.into_array(num_rows)?;
-                            merge_arrays(batch.column(col_idx), &new_values, &mask)
+                            phys_expr.evaluate(&upd_widened)?.into_array(upd_n)
                         } else {
-                            Ok(batch.column(col_idx).clone())
+                            Ok(upd_widened.column(col_idx).clone())
                         }
                     })
                     .collect::<DFResult<Vec<_>>>()?;
+                let updated_batch = RecordBatch::try_new(batch.schema(), new_columns).map_err(arrow_err)?;
 
-                let new_batch = RecordBatch::try_new(batch.schema(), new_columns).map_err(arrow_err)?;
-                bucket_delta += estimate_batch_size(&new_batch) as i64 - old_size as i64;
-                new_batches.push(new_batch);
+                bucket_delta += (estimate_batch_size(&preserved) + estimate_batch_size(&updated_batch)) as i64 - old_size as i64;
+                if preserved.num_rows() > 0 {
+                    new_batches.push(preserved);
+                }
+                new_batches.push(updated_batch);
             }
 
             *batches = new_batches;
@@ -3077,6 +3117,84 @@ mod tests {
         let assignments = vec![("name".to_string(), value_expr)];
         let updated = buffer.update("project1", "table1", Some(&predicate), &assignments, None).unwrap();
         assert_eq!(updated, 1);
+    }
+
+    /// id -> name from a buffer query, for asserting the full row set.
+    fn collect_id_name(buffer: &MemBuffer) -> std::collections::HashMap<i64, String> {
+        use arrow::array::AsArray;
+        let mut out = std::collections::HashMap::new();
+        for b in buffer.query("p", "t", &[]).unwrap() {
+            let ids = b.column(b.schema().index_of("id").unwrap()).as_primitive::<arrow::datatypes::Int64Type>();
+            let names = arrow::compute::cast(b.column(b.schema().index_of("name").unwrap()), &DataType::Utf8).unwrap();
+            let names = names.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+            for i in 0..b.num_rows() {
+                out.insert(ids.value(i), names.value(i).to_string());
+            }
+        }
+        out
+    }
+
+    fn id_source() -> crate::dml::UpdateSource {
+        // Int64 join key (no Utf8/Utf8View RowConverter mismatch); Utf8View
+        // new_name to match the target `name` type on assignment.
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("new_name", DataType::Utf8View, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![2i64, 4])), Arc::new(arrow::array::StringViewArray::from(vec!["B", "D"]))],
+        )
+        .unwrap();
+        crate::dml::UpdateSource {
+            schema,
+            batch,
+            join_keys: vec![("id".to_string(), "id".to_string())],
+        }
+    }
+
+    /// update_with_source must update exactly the source-matched rows and keep
+    /// every other row intact — proving the matched-rows-only split rewrite
+    /// (the 89GB-OOM fix) doesn't lose/duplicate rows or corrupt unmatched ones.
+    #[test]
+    fn update_with_source_updates_only_matched_and_preserves_rest() {
+        use datafusion::logical_expr::col;
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        buffer.insert("p", "t", create_multi_row_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]), ts).unwrap();
+
+        let n = buffer.update_with_source("p", "t", None, &[("name".to_string(), col("new_name"))], &id_source(), None).unwrap();
+        assert_eq!(n, 2, "exactly the 2 source-matched rows update");
+
+        let rows = collect_id_name(&buffer);
+        assert_eq!(rows.len(), 5, "no rows lost or duplicated by the split rebuild");
+        assert_eq!(rows.get(&1).map(String::as_str), Some("a"));
+        assert_eq!(rows.get(&2).map(String::as_str), Some("B"), "matched row updated");
+        assert_eq!(rows.get(&3).map(String::as_str), Some("c"));
+        assert_eq!(rows.get(&4).map(String::as_str), Some("D"), "matched row updated");
+        assert_eq!(rows.get(&5).map(String::as_str), Some("e"));
+    }
+
+    /// A source-matched row that FAILS the predicate must be preserved
+    /// UNCHANGED (not updated, not dropped) — the critical path of the split
+    /// rewrite (`updated_full` scatter + not-updated filter).
+    #[test]
+    fn update_with_source_respects_predicate_and_preserves_unmatched_predicate_rows() {
+        use datafusion::logical_expr::{col, lit};
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        buffer.insert("p", "t", create_multi_row_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]), ts).unwrap();
+
+        // Source matches 2 and 4; predicate keeps only id=2.
+        let pred = col("id").eq(lit(2i64));
+        let n = buffer.update_with_source("p", "t", Some(&pred), &[("name".to_string(), col("new_name"))], &id_source(), None).unwrap();
+        assert_eq!(n, 1, "only the source-matched row passing the predicate updates");
+
+        let rows = collect_id_name(&buffer);
+        assert_eq!(rows.len(), 5, "no rows lost");
+        assert_eq!(rows.get(&2).map(String::as_str), Some("B"), "matched + predicate-true → updated");
+        assert_eq!(rows.get(&4).map(String::as_str), Some("d"), "matched but predicate-false → preserved unchanged");
+        assert_eq!(rows.get(&1).map(String::as_str), Some("a"));
     }
 
     fn test_table_df_schema() -> DFSchema {
