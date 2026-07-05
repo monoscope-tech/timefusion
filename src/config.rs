@@ -351,7 +351,9 @@ pub struct AppConfig {
 
 const_default!(d_tantivy_max_index_mb: u64 = 64);
 const_default!(d_tantivy_cache_disk_gb: u64 = 4);
-const_default!(d_tantivy_zstd_level: i32 = 19);
+// Level 3: index packing is on the flush hot path; level 19 cost ~88% of a CPU
+// window per flush for ~10-15% smaller output (profiled 2026-07-05).
+const_default!(d_tantivy_zstd_level: i32 = 3);
 const_default!(d_tantivy_min_files: usize = 2);
 const_default!(d_tantivy_prefilter_max_hits: usize = 100_000);
 const_default!(d_tantivy_prefilter_min_selectivity_pct: u32 = 50);
