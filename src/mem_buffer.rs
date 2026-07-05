@@ -716,7 +716,7 @@ fn bucket_overlaps_range(bucket: &TimeBucket, range: &(Option<i64>, Option<i64>)
 /// Strip table qualifiers from Column refs (e.g. `otel_logs_and_spans.timestamp` → `timestamp`)
 /// so exprs from SQL planning resolve against the bare-column DFSchema built from the
 /// in-memory table.
-fn strip_column_qualifiers(expr: Expr) -> DFResult<Expr> {
+pub(crate) fn strip_column_qualifiers(expr: Expr) -> DFResult<Expr> {
     expr.transform(|e| match &e {
         Expr::Column(col) => Ok(datafusion::common::tree_node::Transformed::yes(Expr::Column(Column::from_name(&col.name)))),
         _ => Ok(datafusion::common::tree_node::Transformed::no(e)),
@@ -3195,6 +3195,33 @@ mod tests {
         assert_eq!(rows.get(&2).map(String::as_str), Some("B"), "matched + predicate-true → updated");
         assert_eq!(rows.get(&4).map(String::as_str), Some("d"), "matched but predicate-false → preserved unchanged");
         assert_eq!(rows.get(&1).map(String::as_str), Some("a"));
+    }
+
+    /// WAL-replay regression (2026-07-05 quarantine flood): the DML unparser
+    /// emitted table/alias-qualified column refs (`otel_logs_and_spans.x`,
+    /// `u.y`), but replay parses against the bare buffer schema (+`source__`
+    /// source cols), so every `UPDATE ... FROM` quarantined with "No field named
+    /// otel_logs_and_spans.…". Guard: the qualified form fails to parse, the
+    /// normalized bare/`source__` form (what the fixed serializer stores) applies.
+    #[test]
+    fn update_with_source_by_sql_replay_requires_normalized_columns() {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        buffer.insert("p", "t", create_multi_row_batch(vec![1, 2, 3, 4, 5], vec!["a", "b", "c", "d", "e"]), ts).unwrap();
+        let src = id_source(); // id (Int64) join key, new_name (Utf8View); matches 2 & 4
+        let assigns = [("name".to_string(), "source__new_name".to_string())];
+        let keys = [("id".to_string(), "id".to_string())];
+
+        // Table-qualified predicate (the pre-fix stored form) can't resolve.
+        let bad = buffer.update_with_source_by_sql("p", "t", Some("t.id > 0"), &assigns, &keys, src.batch.clone(), None);
+        assert!(bad.is_err(), "table-qualified predicate must fail against the bare replay schema (bug repro)");
+
+        // Bare predicate (the normalized stored form) parses and applies.
+        let n = buffer.update_with_source_by_sql("p", "t", Some("id > 0"), &assigns, &keys, src.batch, None).unwrap();
+        assert_eq!(n, 2);
+        let rows = collect_id_name(&buffer);
+        assert_eq!(rows.get(&2).map(String::as_str), Some("B"));
+        assert_eq!(rows.get(&4).map(String::as_str), Some("D"));
     }
 
     fn test_table_df_schema() -> DFSchema {

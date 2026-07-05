@@ -18,7 +18,7 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::{
     config::AppConfig,
     errors::wal_err,
-    mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp},
+    mem_buffer::{FlushableBucket, MemBuffer, MemBufferStats, estimate_batch_size, extract_min_timestamp, strip_column_qualifiers},
     wal::{DeletePayload, UpdatePayload, UpdateWithSourcePayload, WalEntry, WalManager, WalOperation, decode_payload, deserialize_record_batch},
 };
 
@@ -2058,8 +2058,43 @@ impl BufferedWriteLayer {
         })
     }
 
-    fn assignments_to_wal_sql(assignments: &[(String, datafusion::logical_expr::Expr)]) -> Vec<(String, String)> {
-        assignments.iter().map(|(col, expr)| (col.clone(), Self::expr_to_wal_sql(expr))).collect()
+    /// Normalize a DML expr to the bare-target + `source__`-prefixed-source form
+    /// that WAL replay parses against (mirrors `MemBuffer::update_with_source`'s
+    /// internal rewrite), THEN unparse. Without this the unparser emits table-
+    /// and alias-qualified columns (`otel_logs_and_spans.x`, `o.y`, `u.z`) that
+    /// the replay schema — bare target fields + `source__`-prefixed source
+    /// fields — cannot resolve, quarantining every `UPDATE ... FROM` on restart
+    /// (the 2026-07-05 "No field named otel_logs_and_spans.context___span_id"
+    /// flood). `source_cols` are the source batch's field names.
+    fn normalized_wal_sql(expr: &datafusion::logical_expr::Expr, source_cols: &std::collections::HashSet<String>) -> String {
+        use datafusion::{common::tree_node::TreeNode, logical_expr::Expr};
+        let bare = strip_column_qualifiers(expr.clone()).unwrap_or_else(|_| expr.clone());
+        let normalized = bare
+            .transform(|e| {
+                use datafusion::common::{Column, tree_node::Transformed};
+                match &e {
+                    Expr::Column(c) if c.relation.is_none() && source_cols.contains(&c.name) => {
+                        Ok(Transformed::yes(Expr::Column(Column::from_name(format!("source__{}", c.name)))))
+                    }
+                    _ => Ok(Transformed::no(e)),
+                }
+            })
+            .map(|t| t.data)
+            .unwrap_or_else(|_| expr.clone());
+        Self::expr_to_wal_sql(&normalized)
+    }
+
+    /// Plain (non-source) UPDATE/DELETE replay parses against the bare buffer
+    /// schema, so strip qualifiers before unparsing — same qualifier hazard as
+    /// [`Self::normalized_wal_sql`] but with no source side.
+    fn stripped_wal_sql(expr: &datafusion::logical_expr::Expr) -> String {
+        Self::expr_to_wal_sql(&strip_column_qualifiers(expr.clone()).unwrap_or_else(|_| expr.clone()))
+    }
+
+    fn assignments_to_wal_sql(
+        assignments: &[(String, datafusion::logical_expr::Expr)], source_cols: &std::collections::HashSet<String>,
+    ) -> Vec<(String, String)> {
+        assignments.iter().map(|(col, expr)| (col.clone(), Self::normalized_wal_sql(expr, source_cols))).collect()
     }
 
     /// Run a WAL append + in-memory apply while pinning the entry at every
@@ -2103,7 +2138,7 @@ impl BufferedWriteLayer {
     /// Returns the number of rows deleted.
     #[instrument(skip(self, predicate), fields(project_id, table_name))]
     pub fn delete(&self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>) -> datafusion::error::Result<u64> {
-        let predicate_sql = predicate.map(Self::expr_to_wal_sql);
+        let predicate_sql = predicate.map(Self::stripped_wal_sql);
         // Log to WAL first for durability. Failure here means the delete is
         // not recoverable after a crash — propagate so the client knows the
         // operation didn't commit, rather than apply in-memory and lose it
@@ -2124,8 +2159,8 @@ impl BufferedWriteLayer {
     pub fn update(
         &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>, assignments: &[(String, datafusion::logical_expr::Expr)],
     ) -> datafusion::error::Result<u64> {
-        let predicate_sql = predicate.map(Self::expr_to_wal_sql);
-        let assignments_sql = Self::assignments_to_wal_sql(assignments);
+        let predicate_sql = predicate.map(Self::stripped_wal_sql);
+        let assignments_sql = Self::assignments_to_wal_sql(assignments, &std::collections::HashSet::new());
         // See `delete()` — WAL failure must propagate so the client doesn't
         // see a "successful" update that disappears on the next restart.
         self.with_wal_pin(
@@ -2146,8 +2181,9 @@ impl BufferedWriteLayer {
         &self, project_id: &str, table_name: &str, predicate: Option<&datafusion::logical_expr::Expr>,
         assignments: &[(String, datafusion::logical_expr::Expr)], source: &crate::dml::UpdateSource,
     ) -> datafusion::error::Result<u64> {
-        let predicate_sql = predicate.map(Self::expr_to_wal_sql);
-        let assignments_sql = Self::assignments_to_wal_sql(assignments);
+        let source_cols: std::collections::HashSet<String> = source.schema.fields().iter().map(|f| f.name().clone()).collect();
+        let predicate_sql = predicate.map(|p| Self::normalized_wal_sql(p, &source_cols));
+        let assignments_sql = Self::assignments_to_wal_sql(assignments, &source_cols);
 
         let batch_ipc = crate::wal::serialize_record_batch(&source.batch).map_err(wal_err("source serialize"))?;
         let serialized_source = crate::wal::SerializedSource {
@@ -2177,6 +2213,27 @@ mod tests {
 
     use super::*;
     use crate::test_utils::test_helpers::{json_to_batch, test_span};
+
+    /// The stored WAL SQL must be normalized (bare target cols + `source__`
+    /// source cols) so replay's bare-schema parser resolves it — otherwise
+    /// every UPDATE...FROM quarantines (2026-07-05). Guards the serializer emits
+    /// that form where raw unparse would keep the qualifiers.
+    #[test]
+    fn normalized_wal_sql_strips_qualifiers_and_prefixes_source() {
+        use datafusion::logical_expr::col;
+        let source_cols: std::collections::HashSet<String> = ["id", "tag"].iter().map(|s| s.to_string()).collect();
+
+        let pred = col("otel_logs_and_spans.context___span_id").is_not_null();
+        let norm = BufferedWriteLayer::normalized_wal_sql(&pred, &source_cols);
+        assert!(!norm.contains("otel_logs_and_spans"), "target qualifier must be stripped: {norm}");
+        assert!(norm.contains("context___span_id"));
+        // Raw unparse keeps the qualifier — the exact form that broke replay.
+        assert!(BufferedWriteLayer::expr_to_wal_sql(&pred).contains("otel_logs_and_spans"));
+
+        // Source-aliased col → `source__`-prefixed so it resolves against the
+        // widened replay schema.
+        assert_eq!(BufferedWriteLayer::normalized_wal_sql(&col("u.tag"), &source_cols), "source__tag");
+    }
 
     fn create_test_config(data_dir: PathBuf) -> Arc<AppConfig> {
         let mut cfg = AppConfig::default();
