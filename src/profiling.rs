@@ -87,18 +87,25 @@ mod imp {
             .expect("spawn cpu-profiler thread");
     }
 
-    /// Keep only the newest `keep` files whose name starts with `prefix`.
+    /// Keep only the newest `keep` files whose name starts with `prefix`,
+    /// ordered by mtime — NOT filename. The CPU seq counter resets to 0 on every
+    /// process restart, so a dead process's high-seq files (`cpu-000902`) would
+    /// outsort a live process's fresh low-seq files (`cpu-000003`) by name and
+    /// survive pruning forever, leaving us blind to the current run's CPU. mtime
+    /// is monotonic across restarts, so newest-by-mtime always keeps the live
+    /// process's files and evicts the stale ones.
     fn prune_old(dir: &std::path::Path, prefix: &str, keep: usize) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
-        let mut files: Vec<PathBuf> = rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(prefix)))
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(prefix)))
+            .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
             .collect();
         if files.len() <= keep {
             return;
         }
-        files.sort();
-        for old in &files[..files.len() - keep] {
+        files.sort_by_key(|(mtime, _)| *mtime);
+        for (_, old) in &files[..files.len() - keep] {
             let _ = std::fs::remove_file(old);
         }
     }
