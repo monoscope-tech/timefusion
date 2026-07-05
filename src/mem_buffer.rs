@@ -555,7 +555,15 @@ fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&FnRegistr
         .map_err(|e| datafusion::error::DataFusionError::SQL(e.into(), None))?
         .parse_expr()
         .map_err(|e| datafusion::error::DataFusionError::SQL(e.into(), None))?;
-    let context_provider = RegistryContextProvider { registry };
+    // Register the same expr planners the live session has, so DML SQL that
+    // uses array literals (`[...]`), struct/field access, etc. re-parses on WAL
+    // replay. Without the nested-expression planner the monoscope `hashes`
+    // UPDATE...FROM (`array_concat(CASE ..., [tag])`) fails with "Could not plan
+    // array literal" and quarantines — even after qualifier normalization.
+    // VariantAwareExprPlanner first (matches live ordering for `->`/`->>`).
+    let mut expr_planners: Vec<Arc<dyn datafusion::logical_expr::planner::ExprPlanner>> = vec![Arc::new(crate::functions::VariantAwareExprPlanner)];
+    expr_planners.extend(datafusion::execution::SessionStateDefaults::default_expr_planners());
+    let context_provider = RegistryContextProvider { registry, expr_planners };
     let planner = SqlToRel::new(&context_provider);
     let expr = planner.sql_to_expr(sql_expr, schema, &mut Default::default())?;
     // DF54's comparison kernels no longer auto-coerce mismatched string views
@@ -565,7 +573,8 @@ fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&FnRegistr
 }
 
 struct RegistryContextProvider<'a> {
-    registry: Option<&'a FnRegistry>,
+    registry:      Option<&'a FnRegistry>,
+    expr_planners: Vec<Arc<dyn datafusion::logical_expr::planner::ExprPlanner>>,
 }
 
 impl<'a> datafusion::sql::planner::ContextProvider for RegistryContextProvider<'a> {
@@ -574,6 +583,9 @@ impl<'a> datafusion::sql::planner::ContextProvider for RegistryContextProvider<'
     }
     fn get_function_meta(&self, name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::ScalarUDF>> {
         self.registry?.udf(name).ok()
+    }
+    fn get_expr_planners(&self) -> &[Arc<dyn datafusion::logical_expr::planner::ExprPlanner>] {
+        &self.expr_planners
     }
     fn get_aggregate_meta(&self, name: &str) -> Option<std::sync::Arc<datafusion::logical_expr::AggregateUDF>> {
         self.registry?.udaf(name).ok()
@@ -2047,7 +2059,19 @@ impl MemBuffer {
                 let new_columns: Vec<ArrayRef> = (0..target_schema.fields().len())
                     .map(|col_idx| {
                         if let Some((_, phys_expr)) = physical_assignments.iter().find(|(idx, _)| *idx == col_idx) {
-                            phys_expr.evaluate(&upd_widened)?.into_array(upd_n)
+                            let evaluated = phys_expr.evaluate(&upd_widened)?.into_array(upd_n)?;
+                            // The RHS may evaluate to a related-but-distinct type
+                            // (e.g. `array_concat(..., [Utf8View])` → List<Utf8View>
+                            // while target `hashes` is List<Utf8>; or Utf8 literal →
+                            // Utf8View column). Cast to the target column type so the
+                            // rebuilt batch matches the buffer schema — otherwise
+                            // RecordBatch::try_new rejects it and the DML quarantines.
+                            let want = target_schema.field(col_idx).data_type();
+                            if evaluated.data_type() == want {
+                                Ok(evaluated)
+                            } else {
+                                arrow::compute::cast(&evaluated, want).map_err(arrow_err)
+                            }
                         } else {
                             Ok(upd_widened.column(col_idx).clone())
                         }
@@ -3224,6 +3248,75 @@ mod tests {
         assert_eq!(rows.get(&4).map(String::as_str), Some("D"));
     }
 
+    /// End-to-end reprocessing of the EXACT prod quarantine shape: a buffer row
+    /// with a `hashes` List<Utf8> column, updated via the normalized
+    /// `array_concat(CASE WHEN hashes ... , [source__tag])` assignment. Proves
+    /// parse AND physical eval (array_concat of List<Utf8> with a Utf8View array
+    /// literal) succeed — the full path a reprocessed entry takes.
+    #[test]
+    fn update_with_source_by_sql_applies_normalized_hashes_shape() {
+        use arrow::{
+            array::{Int64Array, ListBuilder, StringBuilder, StringViewArray},
+            datatypes::{DataType, Field},
+        };
+
+        let tgt_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("hashes", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true),
+        ]));
+        let mut hb = ListBuilder::new(StringBuilder::new());
+        hb.values().append_value("h1");
+        hb.append(true); // row id=1: ["h1"]
+        hb.values().append_value("h2");
+        hb.append(true); // row id=2: ["h2"]
+        let tgt = RecordBatch::try_new(tgt_schema, vec![Arc::new(Int64Array::from(vec![1i64, 2])), Arc::new(hb.finish())]).unwrap();
+
+        let buffer = MemBuffer::new();
+        buffer.insert("p", "t", tgt, chrono::Utc::now().timestamp_micros()).unwrap();
+
+        let src_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("tag", DataType::Utf8View, false),
+        ]));
+        let src_batch = RecordBatch::try_new(
+            src_schema,
+            vec![Arc::new(Int64Array::from(vec![1i64])), Arc::new(StringViewArray::from(vec!["newtag"]))],
+        )
+        .unwrap();
+
+        let n = buffer
+            .update_with_source_by_sql(
+                "p",
+                "t",
+                None,
+                &[(
+                    "hashes".to_string(),
+                    "array_concat(CASE WHEN hashes IS NOT NULL THEN hashes ELSE [] END, [source__tag])".to_string(),
+                )],
+                &[("id".to_string(), "id".to_string())],
+                src_batch,
+                Some(crate::functions::function_registry().unwrap().as_ref()),
+            )
+            .expect("normalized hashes UPDATE...FROM must parse AND apply");
+        assert_eq!(n, 1, "only id=1 matches the source");
+
+        // id=1 hashes must now be ["h1","newtag"]; id=2 untouched.
+        use arrow::array::AsArray;
+        let mut got: std::collections::HashMap<i64, Vec<String>> = Default::default();
+        for b in buffer.query("p", "t", &[]).unwrap() {
+            let ids = b.column(b.schema().index_of("id").unwrap()).as_primitive::<arrow::datatypes::Int64Type>();
+            let lists = b.column(b.schema().index_of("hashes").unwrap()).as_list::<i32>();
+            for i in 0..b.num_rows() {
+                let v = lists.value(i);
+                let s = arrow::compute::cast(&v, &DataType::Utf8).unwrap();
+                let s = s.as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+                got.insert(ids.value(i), (0..s.len()).map(|j| s.value(j).to_string()).collect());
+            }
+        }
+        assert_eq!(got.get(&1), Some(&vec!["h1".to_string(), "newtag".to_string()]), "matched row appends the tag");
+        assert_eq!(got.get(&2), Some(&vec!["h2".to_string()]), "unmatched row unchanged");
+    }
+
     fn test_table_df_schema() -> DFSchema {
         let buffer = MemBuffer::new();
         let ts = chrono::Utc::now().timestamp_micros();
@@ -3241,6 +3334,44 @@ mod tests {
             err.to_string().contains("No functions registered"),
             "expected 'No functions registered' error, got: {err}"
         );
+    }
+
+    /// The 4273 prod quarantines are ONE shape: the monoscope `hashes`
+    /// enrichment UPDATE...FROM. Verify the NORMALIZED form of that exact
+    /// predicate + assignment (array_concat + CASE + array literals `[]`/`[x]`,
+    /// source col → `source__tag`) actually parses against the widened replay
+    /// schema — qualifier-stripping alone is not enough if the array/UDF syntax
+    /// also fails to re-parse.
+    #[test]
+    fn parse_prod_hashes_update_from_shape_after_normalization() {
+        use arrow::datatypes::{DataType, Field, TimeUnit};
+        let widened = DFSchema::try_from(Schema::new(vec![
+            Field::new("context___span_id", DataType::Utf8View, true),
+            Field::new("context___trace_id", DataType::Utf8View, true),
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), true),
+            Field::new("hashes", DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))), true),
+            Field::new("source__tag", DataType::Utf8View, true),
+        ]))
+        .unwrap();
+        let reg = crate::functions::function_registry().unwrap();
+
+        // Normalized predicate (table qualifier stripped).
+        super::parse_sql_predicate(
+            "((context___span_id IS NOT NULL AND context___trace_id IS NOT NULL) \
+             AND (\"timestamp\" >= CAST('2026-07-05T14:37:49.995+00:00' AS TIMESTAMP)) \
+             AND (\"timestamp\" < CAST('2026-07-05T14:38:22.731+00:00' AS TIMESTAMP)))",
+            &widened,
+            Some(reg.as_ref()),
+        )
+        .expect("normalized hashes-update predicate must parse");
+
+        // Normalized assignment RHS (`o.`→bare, `u."tag"`→source__tag).
+        super::parse_sql_predicate(
+            "array_concat(CASE WHEN hashes IS NOT NULL THEN hashes ELSE [] END, [source__tag])",
+            &widened,
+            Some(reg.as_ref()),
+        )
+        .expect("normalized hashes-update assignment must parse");
     }
 
     #[test]
