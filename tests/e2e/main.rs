@@ -8,6 +8,7 @@ mod harness;
 mod cache_warmth;
 mod eviction;
 mod flush_lifecycle;
+mod insert_unnest_variant;
 mod multi_tenant_isolation;
 mod or_utf8view_delta;
 mod pressure_flush;
