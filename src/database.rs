@@ -1025,6 +1025,13 @@ pub struct Database {
     /// rewrites, so they queue here — without touching the table's RwLock,
     /// which stays free for readers and insert commits.
     dml_locks:                       DmlLocks,
+    /// Last time each table's snapshot was persisted to disk (keyed by table
+    /// url). `persist_snapshot` throttles on this: the on-disk snapshot is only
+    /// a boot-recovery seed (restore V, replay commits > V), so rewriting the
+    /// whole 5k-file state on *every* commit is wasted CPU (13% in the
+    /// 2026-07-05 profile, serde_json + zstd). A slightly stale snapshot just
+    /// makes boot replay a few more (sub-second) commits.
+    snapshot_persist_gate:           Arc<dashmap::DashMap<String, std::time::Instant>>,
     /// Late-binding shared cell: boot must create the pgwire SessionContext
     /// (whose FunctionRegistry the WAL replay needs) BEFORE the layer exists,
     /// so the layer is published through a OnceLock shared across all clones —
@@ -1358,6 +1365,7 @@ impl Database {
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             delta_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
             dml_locks: Arc::new(dashmap::DashMap::new()),
+            snapshot_persist_gate: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
             bypass_buffer: false,
             tantivy_search: Arc::new(std::sync::OnceLock::new()),
@@ -1796,9 +1804,15 @@ impl Database {
         // Enable bloom filter pruning if available in Parquet files
         let _ = options.set("datafusion.execution.parquet.bloom_filter_on_read", "true");
 
-        // Time-series optimized settings
-        // Larger batch size for better throughput with time-series data
-        let _ = options.set("datafusion.execution.batch_size", "65536");
+        // Batch size = DataFusion's 8192 default. A prior 65536 (8×) was set for
+        // "time-series throughput", but on the wide otel schema (body/attributes/
+        // resource are KB-wide byte-view columns) it made every CoalesceBatchesExec
+        // in-progress buffer hold 65536 wide rows — per partition, per concurrent
+        // query — and that buffering is NOT pool-accounted. Heap profiling
+        // (2026-07-05) showed InProgressByteViewArray::coalesce as the dominant
+        // live consumer at 10-27GB. 8192 cuts the per-buffer footprint 8× for
+        // negligible per-batch overhead on an IO-bound DB.
+        let _ = options.set("datafusion.execution.batch_size", "8192");
 
         // Optimize for sorted data (timestamps are typically sorted)
         let _ = options.set("datafusion.optimizer.prefer_existing_sort", "true");
@@ -1832,7 +1846,7 @@ impl Database {
 
         // Memory management for large time-series queries
         let _ = options.set("datafusion.execution.coalesce_batches", "true");
-        let _ = options.set("datafusion.execution.coalesce_target_batch_size", "65536");
+        let _ = options.set("datafusion.execution.coalesce_target_batch_size", "8192");
 
         // Enable all optimizer rules for maximum optimization
         let _ = options.set("datafusion.optimizer.max_passes", "5");
@@ -2944,8 +2958,19 @@ impl Database {
     /// boot restores it and replays only later commits (see `snapshot_cache`).
     /// Called from every commit path that swaps a fresh table state in.
     pub(crate) fn persist_snapshot(&self, table: &DeltaTable) {
+        // Throttle: at most one persist per table per interval. The snapshot is
+        // a boot-recovery seed, not a durability requirement, so skipping most
+        // commits just replays a few extra commits on next boot (see field docs).
+        const MIN_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        let url = table.table_url().to_string();
+        let now = std::time::Instant::now();
+        match self.snapshot_persist_gate.get(&url) {
+            Some(last) if now.duration_since(*last) < MIN_PERSIST_INTERVAL => return,
+            _ => {}
+        }
         if let Some(state) = table.state.clone() {
-            let (dir, url) = (Self::delta_snapshot_dir(&self.config), table.table_url().to_string());
+            self.snapshot_persist_gate.insert(url.clone(), now);
+            let dir = Self::delta_snapshot_dir(&self.config);
             tokio::task::spawn_blocking(move || crate::snapshot_cache::store(&dir, &url, &state));
         }
     }
