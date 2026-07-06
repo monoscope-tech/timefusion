@@ -1990,12 +1990,15 @@ impl Database {
         // Set up tracing options with configurable sampling
         let record_metrics = self.config.memory.timefusion_tracing_record_metrics;
 
-        let tracing_options = InstrumentationOptions::builder().record_metrics(record_metrics).preview_limit(5).build();
+        // Cell-capped preview formatter — the default renders whole cell values;
+        // see `telemetry::capped_preview_fn` for the 2026-07-06 OOM it prevents.
+        let tracing_options = InstrumentationOptions::builder()
+            .record_metrics(record_metrics)
+            .preview_limit(5)
+            .preview_fn(Arc::new(crate::telemetry::capped_preview_fn))
+            .build();
 
-        // Create instrumentation rule
-        let instrument_rule = instrument_with_info_spans!(
-            options: tracing_options,
-        );
+        let instrument_rule = instrument_with_info_spans!(options: tracing_options);
 
         // Create session state with tracing rule and DML support
         // Rule ordering: VariantInsertRewriter runs BEFORE TypeCoercion (rewrites string->json_to_variant)

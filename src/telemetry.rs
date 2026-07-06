@@ -106,3 +106,87 @@ pub fn shutdown_telemetry() {
         let _ = p.shutdown();
     }
 }
+
+/// Cell-capped preview formatter for datafusion-tracing spans, replacing the
+/// crate's `default_preview_fn` (comfy_table over WHOLE cell values). Cells
+/// here are unbounded — Variant/JSON bodies on SELECTs, and on an
+/// INSERT…unnest input node ONE cell holds an entire bind array — so the
+/// default burned 86–93% CPU and drove the 85GiB OOM loop of 2026-07-06.
+/// The capped writer aborts each cell's `Display` after `PREVIEW_CELL_CAP`
+/// bytes, so oversized values are never materialized, only their prefix.
+pub fn capped_preview_fn(batch: &arrow::record_batch::RecordBatch) -> Result<String, arrow::error::ArrowError> {
+    use std::fmt::Write;
+
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    const PREVIEW_CELL_CAP: usize = 256;
+
+    /// `fmt::Write` that stops accepting bytes after `left` is exhausted; the
+    /// resulting `fmt::Error` aborts the value's `Display` mid-render.
+    struct Capped<'a> {
+        buf:  &'a mut String,
+        left: usize,
+    }
+    impl std::fmt::Write for Capped<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let take = (0..=s.len().min(self.left)).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+            self.buf.push_str(&s[..take]);
+            self.left -= take;
+            if take < s.len() { Err(std::fmt::Error) } else { Ok(()) }
+        }
+    }
+
+    let opts = FormatOptions::default();
+    let formatters = batch.columns().iter().map(|c| ArrayFormatter::try_new(c.as_ref(), &opts)).collect::<Result<Vec<_>, _>>()?;
+    let mut out = String::new();
+    for row in 0..batch.num_rows() {
+        for (formatter, field) in formatters.iter().zip(batch.schema().fields()) {
+            let _ = write!(out, "{}=", field.name());
+            let mut w = Capped {
+                buf:  &mut out,
+                left: PREVIEW_CELL_CAP,
+            };
+            if write!(w, "{}", formatter.value(row)).is_err() {
+                out.push('…');
+            }
+            out.push_str("  ");
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{ListBuilder, StringArray, StringBuilder},
+        record_batch::RecordBatch,
+    };
+
+    use super::*;
+
+    /// Regression guard for the 2026-07-06 OOM: a cell holding a huge value
+    /// (like an INSERT…unnest bind array) must preview as a bounded prefix,
+    /// not render in full.
+    #[test]
+    fn capped_preview_bounds_giant_cells() {
+        let mut list = ListBuilder::new(StringBuilder::new());
+        for _ in 0..10_000 {
+            list.values().append_value("x".repeat(100));
+        }
+        list.append(true);
+        let names = StringArray::from(vec!["row1"]);
+        let batch = RecordBatch::try_from_iter([
+            ("name", Arc::new(names) as arrow::array::ArrayRef),
+            ("bind_array", Arc::new(list.finish()) as arrow::array::ArrayRef),
+        ])
+        .unwrap();
+
+        let out = capped_preview_fn(&batch).unwrap();
+        assert!(out.len() < 1024, "1MB cell must not render in full, got {} bytes", out.len());
+        assert!(out.contains('…'), "oversized cell must be marked truncated");
+        assert!(out.contains("name=row1"), "small cells render whole");
+    }
+}
