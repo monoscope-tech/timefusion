@@ -4933,7 +4933,17 @@ impl Database {
 
     /// Vacuum the Delta table to clean up old files that are no longer needed
     /// This reduces storage costs and improves query performance
-    async fn vacuum_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, retention_hours: u64) {
+    /// On-demand vacuum of a single unified table (pgwire `VACUUM <table>`).
+    /// `retention_hours = None` uses the configured default. Mirrors
+    /// `compact_date`: resolves the table then delegates, keeping config private.
+    pub async fn vacuum_named(&self, table_name: &str, retention_hours: Option<u64>) -> Result<usize> {
+        let retention = retention_hours.unwrap_or(self.config.maintenance.timefusion_vacuum_retention_hours);
+        let table_ref = self.get_or_create_unified_table(table_name).await?;
+        Ok(self.vacuum_table(&table_ref, retention).await)
+    }
+
+    /// Returns the number of files deleted (0 on failure — the error is logged).
+    async fn vacuum_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, retention_hours: u64) -> usize {
         // Log the start of the vacuum operation
         let start_time = std::time::Instant::now();
         info!("Starting vacuum operation with retention period of {} hours", retention_hours);
@@ -4980,8 +4990,12 @@ impl Database {
                 } else {
                     error!("Failed to update table state after vacuum");
                 }
+                files_deleted
             }
-            Err(e) => error!("Vacuum operation failed: {}", e),
+            Err(e) => {
+                error!("Vacuum operation failed: {}", e);
+                0
+            }
         }
     }
 

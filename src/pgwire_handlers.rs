@@ -231,15 +231,29 @@ impl LoggingSimpleQueryHandler {
     async fn run_optimize(&self, cmd: OptimizeCmd) -> PgWireResult<Vec<Response>> {
         let db = match self.db.as_ref() {
             Some(d) => d,
-            None => return Err(optimize_err("OPTIMIZE is not available on this server")),
+            None => return Err(admin_err("OPTIMIZE is not available on this server")),
         };
         let table_ref = db
             .get_or_create_unified_table(&cmd.table)
             .await
-            .map_err(|e| optimize_err(&format!("OPTIMIZE: open table '{}': {e}", cmd.table)))?;
-        let (removed, added) = db.compact_date(&table_ref, &cmd.table, cmd.date).await.map_err(|e| optimize_err(&e.to_string()))?;
+            .map_err(|e| admin_err(&format!("OPTIMIZE: open table '{}': {e}", cmd.table)))?;
+        let (removed, added) = db.compact_date(&table_ref, &cmd.table, cmd.date).await.map_err(|e| admin_err(&e.to_string()))?;
         info!("pgwire OPTIMIZE {} date={}: {removed} removed, {added} added", cmd.table, cmd.date);
         Ok(vec![Response::Execution(Tag::new(&format!("OPTIMIZE {removed} {added}")))])
+    }
+
+    /// Execute an intercepted `VACUUM <table> [RETAIN <n> HOURS]`.
+    async fn run_vacuum(&self, cmd: VacuumCmd) -> PgWireResult<Vec<Response>> {
+        let db = match self.db.as_ref() {
+            Some(d) => d,
+            None => return Err(admin_err("VACUUM is not available on this server")),
+        };
+        let deleted = db
+            .vacuum_named(&cmd.table, cmd.retention_hours)
+            .await
+            .map_err(|e| admin_err(&format!("VACUUM '{}': {e}", cmd.table)))?;
+        info!("pgwire VACUUM {} retention={:?}: {deleted} files deleted", cmd.table, cmd.retention_hours);
+        Ok(vec![Response::Execution(Tag::new(&format!("VACUUM {deleted}")))])
     }
 }
 
@@ -250,7 +264,7 @@ pub(crate) struct OptimizeCmd {
     pub date:  chrono::NaiveDate,
 }
 
-fn optimize_err(msg: &str) -> PgWireError {
+fn admin_err(msg: &str) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new("ERROR".to_string(), "42601".to_string(), msg.to_string())))
 }
 
@@ -294,6 +308,52 @@ pub(crate) fn parse_optimize(query: &str) -> Result<Option<OptimizeCmd>, String>
     Ok(Some(OptimizeCmd {
         table: table.to_string(),
         date,
+    }))
+}
+
+/// An intercepted `VACUUM <table> [RETAIN <n> HOURS]` admin command.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct VacuumCmd {
+    pub table:           String,
+    /// `None` → use the configured default retention.
+    pub retention_hours: Option<u64>,
+}
+
+/// Parse `VACUUM <table> [RETAIN <n> HOURS]`.
+///
+/// - `Ok(None)`: not a VACUUM statement — fall through to DataFusion.
+/// - `Ok(Some(_))`: valid, run it.
+/// - `Err(msg)`: it *is* VACUUM but malformed. A bare `VACUUM` (no table) is
+///   rejected on purpose — name the table explicitly. Unlike OPTIMIZE, VACUUM is
+///   table-wide (all partitions) and takes no date filter; the optional
+///   `RETAIN <n> HOURS` overrides the configured retention.
+pub(crate) fn parse_vacuum(query: &str) -> Result<Option<VacuumCmd>, String> {
+    let q = query.trim().trim_end_matches(';').trim();
+    let lower = q.to_ascii_lowercase();
+    let is_vacuum = lower == "vacuum" || lower.strip_prefix("vacuum").is_some_and(|r| r.starts_with(char::is_whitespace));
+    if !is_vacuum {
+        return Ok(None);
+    }
+    let rest = q[6..].trim(); // "vacuum" is 6 ASCII bytes
+    let (table, tail) = rest.split_once(char::is_whitespace).map(|(t, w)| (t.trim(), w.trim())).unwrap_or((rest, ""));
+    if table.is_empty() {
+        return Err("VACUUM requires a table: VACUUM <table> [RETAIN <n> HOURS] (bare VACUUM is disabled — name the table)".to_string());
+    }
+    let retention_hours = if tail.is_empty() {
+        None
+    } else {
+        let after = tail
+            .to_ascii_lowercase()
+            .strip_prefix("retain")
+            .ok_or_else(|| format!("VACUUM {table}: expected optional `RETAIN <n> HOURS`, got '{tail}'"))?
+            .trim()
+            .to_string();
+        let num = after.strip_suffix("hours").or_else(|| after.strip_suffix("hour")).unwrap_or(&after).trim();
+        Some(num.parse::<u64>().map_err(|_| format!("VACUUM {table}: invalid retention '{after}', expected `RETAIN <n> HOURS`"))?)
+    };
+    Ok(Some(VacuumCmd {
+        table: table.to_string(),
+        retention_hours,
     }))
 }
 
@@ -392,7 +452,15 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         match parse_optimize(query) {
             Ok(Some(cmd)) => return self.run_optimize(cmd).await,
             Ok(None) => {}
-            Err(msg) => return Err(optimize_err(&msg)),
+            Err(msg) => return Err(admin_err(&msg)),
+        }
+
+        // VACUUM <table> [RETAIN <n> HOURS] — admin file reclamation, caught
+        // before DataFusion (whose parser rejects VACUUM).
+        match parse_vacuum(query) {
+            Ok(Some(cmd)) => return self.run_vacuum(cmd).await,
+            Ok(None) => {}
+            Err(msg) => return Err(admin_err(&msg)),
         }
 
         let span = tracing::Span::current();
@@ -529,7 +597,7 @@ pub async fn serve_with_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_optimize, rewrite_pg_synonyms};
+    use super::{parse_optimize, parse_vacuum, rewrite_pg_synonyms};
 
     #[test]
     fn optimize_parses_table_and_date() {
@@ -561,6 +629,33 @@ mod tests {
         // Don't false-match an identifier that merely starts with "optimize".
         assert_eq!(parse_optimize("SELECT optimizer FROM t"), Ok(None));
         assert_eq!(parse_optimize("optimizer_stats"), Ok(None));
+    }
+
+    #[test]
+    fn vacuum_parses_table_and_optional_retention() {
+        let cmd = parse_vacuum("VACUUM otel_logs_and_spans").unwrap().unwrap();
+        assert_eq!(cmd.table, "otel_logs_and_spans");
+        assert_eq!(cmd.retention_hours, None);
+        // RETAIN clause, case / plural / trailing-semicolon tolerance.
+        assert_eq!(parse_vacuum("vacuum t RETAIN 48 HOURS;").unwrap().unwrap().retention_hours, Some(48));
+        assert_eq!(parse_vacuum("  VACUUM  t  retain  1  hour  ").unwrap().unwrap().retention_hours, Some(1));
+    }
+
+    #[test]
+    fn vacuum_rejects_bare_and_malformed() {
+        // Bare VACUUM (no table) is rejected — must name the table.
+        assert!(parse_vacuum("VACUUM").is_err());
+        // Unknown trailing clause, non-numeric retention.
+        assert!(parse_vacuum("VACUUM t WHERE date = '2026-01-01'").is_err());
+        assert!(parse_vacuum("VACUUM t RETAIN abc HOURS").is_err());
+    }
+
+    #[test]
+    fn non_vacuum_queries_fall_through() {
+        assert_eq!(parse_vacuum("SELECT 1"), Ok(None));
+        // Don't false-match an identifier that merely starts with "vacuum".
+        assert_eq!(parse_vacuum("SELECT vacuumed FROM t"), Ok(None));
+        assert_eq!(parse_vacuum("vacuum_log"), Ok(None));
     }
 
     #[test]
