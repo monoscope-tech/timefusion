@@ -248,10 +248,7 @@ impl LoggingSimpleQueryHandler {
             Some(d) => d,
             None => return Err(admin_err("VACUUM is not available on this server")),
         };
-        let deleted = db
-            .vacuum_named(&cmd.table, cmd.retention_hours)
-            .await
-            .map_err(|e| admin_err(&format!("VACUUM '{}': {e}", cmd.table)))?;
+        let deleted = db.vacuum_named(&cmd.table, cmd.retention_hours).await.map_err(|e| admin_err(&format!("VACUUM '{}': {e}", cmd.table)))?;
         info!("pgwire VACUUM {} retention={:?}: {deleted} files deleted", cmd.table, cmd.retention_hours);
         Ok(vec![Response::Execution(Tag::new(&format!("VACUUM {deleted}")))])
     }
