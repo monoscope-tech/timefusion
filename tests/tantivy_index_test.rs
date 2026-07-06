@@ -255,6 +255,7 @@ fn build_and_query_term_and_phrase() {
         vec![Hit {
             timestamp_micros: 2_000_000,
             id:               "b".into(),
+            row_ordinal:      Some(1),
         }]
     );
 

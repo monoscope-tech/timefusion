@@ -58,8 +58,8 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
 
     // Run the new dedup compaction on the partition.
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
-    let dropped = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
-    assert_eq!(dropped, 1, "expected exactly one duplicate row dropped");
+    let (dropped, complete) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
+    assert_eq!((dropped, complete), (1, true), "expected exactly one duplicate row dropped in a complete pass");
 
     // After the sweep, the duplicate is physically gone (1 row on disk).
     assert_eq!(
@@ -261,7 +261,7 @@ async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
-    let dropped = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
+    let (dropped, _complete) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
     stop.store(true, Release);
     let appended = appender.await?;
     assert!(appended > 0, "appender must have raced at least one commit");
@@ -368,7 +368,7 @@ async fn dedup_rewrite_targets_only_duplicate_files() -> Result<()> {
     assert!(!bystander_files.is_empty(), "bystander insert must add a file");
 
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
-    let dropped = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
+    let (dropped, _complete) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
     assert_eq!(dropped, 1, "expected exactly the duplicate row dropped");
 
     let files_after: std::collections::HashSet<String> = table_ref.read().await.get_file_uris()?.collect();
@@ -417,10 +417,11 @@ async fn dedup_skips_chunk_over_decoded_budget() -> Result<()> {
     assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "pre-dedup: 2 physical rows");
 
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
-    let dropped = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
+    let (dropped, complete) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
     assert_eq!(
-        dropped, 0,
-        "over the decoded budget, dedup must SKIP (not materialize) — dupe persists for read-side dedup"
+        (dropped, complete),
+        (0, false),
+        "over the decoded budget, dedup must SKIP (not materialize) — dupe persists AND the pass must not certify clean"
     );
     assert_eq!(
         delta_physical_row_count(&table_ref).await?,

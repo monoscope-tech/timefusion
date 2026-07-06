@@ -1075,6 +1075,7 @@ impl MemBuffer {
     ///   - Snapshot batches + run text_match search → ID set (under the
     ///     same `batches` lock).
     ///   - Apply `id IN (ids)` and the rest of `filters` to the snapshot.
+    ///
     /// This guarantees the prefilter and the data come from the same point
     /// in time — closing the race where a concurrent insert would otherwise
     /// be visible in the data but absent from the prefilter ID set.

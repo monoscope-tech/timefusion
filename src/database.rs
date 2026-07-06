@@ -5443,6 +5443,7 @@ impl ProjectRoutingTable {
     /// restricted to the remaining files via the provider's `FileSelection`
     /// — file-level pruning, computed against THIS `table`'s snapshot so a
     /// concurrent compaction can't shift rows out of the selection.
+    #[allow(clippy::too_many_arguments)]
     async fn scan_delta_table(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
         exclude_files: Option<&std::collections::HashSet<String>>, row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
