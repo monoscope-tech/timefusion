@@ -273,6 +273,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     db.setup_session_tables(&mut session_context)?;
     // Non-blocking: snapshot load + footer warm-up off the first query's path.
     db.preload_tables();
+    // Config-gated background index maintenance: backfill uncovered files,
+    // warm the local index cache with recent blobs.
+    db.spawn_tantivy_backfill();
+    db.spawn_tantivy_prefetch();
 
     // Start PGWire server on the listener we pre-bound at the top of
     // async_main. First, hand control of that listener back from the

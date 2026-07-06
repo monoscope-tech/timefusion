@@ -121,6 +121,12 @@ impl QueryPlanner for DmlQueryPlanner {
         )
     )]
     async fn create_physical_plan(&self, logical_plan: &LogicalPlan, session_state: &SessionState) -> Result<Arc<dyn ExecutionPlan>> {
+        // COUNT(*) stats pushdown — answers gate-eligible count tiles from
+        // Delta add-action stats with zero parquet IO; declines to `None`
+        // for anything it can't prove exact.
+        if let Some(exec) = crate::count_pushdown::try_count_pushdown(logical_plan, &self.database).await? {
+            return Ok(exec);
+        }
         match logical_plan {
             LogicalPlan::Dml(dml) if matches!(dml.op, WriteOp::Update | WriteOp::Delete) => {
                 let span = tracing::Span::current();

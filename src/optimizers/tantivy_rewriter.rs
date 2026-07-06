@@ -5,12 +5,13 @@
 //! predicate. Exact `col = 'lit'` on **raw-tokenized** columns is also routed
 //! (gated by `tantivy.route_equality`, default on) — this is the lever for
 //! high-cardinality id lookups (trace_id/span_id/id/parent_id) that bloom/stats
-//! can't prune when row groups are coarse. It is correctness-safe under `OR`
-//! because `collect_text_matches` skips OR subtrees: an equality under a
-//! disjunction simply isn't collected (falls back to a plain scan), and the
-//! original `=` predicate is always preserved as the post-filter backstop.
-//! `!=` and `IN`-lists are never routed — `!=` has no term form, and an
-//! intersect-only id-prefilter can't express the OR-union an `IN`-list needs.
+//! can't prune when row groups are coarse. `IN`-lists on raw columns route as
+//! an OR of per-item `text_match` calls (same gates as `=`, capped at
+//! `MAX_ROUTED_IN_LIST`). Correctness under `OR` is enforced by
+//! `collect_text_match_tree`: an OR node is only routable when every branch
+//! is completely covered by a `text_match`, and the original predicate is
+//! always preserved as the post-filter backstop. `!=` / `NOT IN` are never
+//! routed — negation has no term form.
 //! The original comparison is never removed — it
 //! still applies as a post-filter on MemBuffer rows and Delta files whose
 //! tantivy index hasn't built yet (post-flush lag). The `text_match` call,
@@ -63,14 +64,9 @@ use crate::{
     optimizers::extract_utf8_string,
     tantivy_index::{
         schema::{DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER},
-        udf::{TEXT_MATCH_NAME, TextMatchUdf},
+        udf::{NGRAM_MIN_QUERY_LEN, TEXT_MATCH_NAME, TextMatchUdf, classify_like_pattern, is_eq_term_safe},
     },
 };
-
-/// Minimum literal length we'll accelerate on ngram3. Tantivy's 3-gram
-/// tokenizer produces no tokens for inputs shorter than `n` characters, so
-/// a 2-char query would match every doc (degenerate) — bail to scan.
-const NGRAM_MIN_QUERY_LEN: usize = 3;
 
 #[derive(Debug, Default)]
 pub struct TantivyPredicateRewriter {
@@ -119,6 +115,11 @@ fn rewrite_node(plan: LogicalPlan, allow_eq: bool) -> Result<Transformed<Logical
     }
 }
 
+/// Longest IN-list we'll expand into an OR of `text_match` calls. Beyond
+/// this the per-item query cost outweighs the pruning (and the selectivity
+/// cutoff would likely reject the hit set anyway).
+const MAX_ROUTED_IN_LIST: usize = 100;
+
 fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Result<Transformed<Expr>> {
     // Skip the children of a text_match call (already a tantivy predicate).
     if let Expr::ScalarFunction(sf) = &expr
@@ -126,44 +127,117 @@ fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>, all
     {
         return Ok(Transformed::new(expr, false, TreeNodeRecursion::Jump));
     }
-    if let Some((column, query)) = match_indexed_predicate(&expr, indexed_columns, allow_eq) {
-        let tm = text_match_call(column, query);
+    if let Some((column, route)) = match_indexed_predicate(&expr, indexed_columns, allow_eq) {
+        let tm = match route {
+            Route::Ready(query) => text_match_call(column, query),
+            Route::Deferred { rhs, kind } => text_match_deferred_call(column, rhs, kind),
+        };
         let wrapped = Expr::BinaryExpr(BinaryExpr::new(Box::new(expr), Operator::And, Box::new(tm)));
-        Ok(Transformed::new(wrapped, true, TreeNodeRecursion::Jump))
-    } else {
-        Ok(Transformed::no(expr))
+        return Ok(Transformed::new(wrapped, true, TreeNodeRecursion::Jump));
     }
+    if let Some((column, items)) = match_indexed_in_list(&expr, indexed_columns, allow_eq) {
+        let ors = items
+            .into_iter()
+            .map(|route| match route {
+                Route::Ready(q) => text_match_call(column.clone(), q),
+                Route::Deferred { rhs, kind } => text_match_deferred_call(column.clone(), rhs, kind),
+            })
+            .reduce(|a, b| Expr::BinaryExpr(BinaryExpr::new(Box::new(a), Operator::Or, Box::new(b))))
+            .expect("non-empty by construction");
+        let wrapped = Expr::BinaryExpr(BinaryExpr::new(Box::new(expr), Operator::And, Box::new(ors)));
+        return Ok(Transformed::new(wrapped, true, TreeNodeRecursion::Jump));
+    }
+    Ok(Transformed::no(expr))
+}
+
+/// `col IN ('a','b',...)` on a RAW-tokenized column → the per-item term
+/// queries, under the same gates as exact `=` routing (raw tokenizer,
+/// eq-term-safe literals, `route_equality` flag). Placeholder items defer to
+/// scan-time classification. `NOT IN` is never routed.
+fn match_indexed_in_list(expr: &Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Option<(String, Vec<Route>)> {
+    use datafusion::logical_expr::expr::InList;
+    let Expr::InList(InList { expr: col, list, negated: false }) = expr else {
+        return None;
+    };
+    if !allow_eq || list.is_empty() || list.len() > MAX_ROUTED_IN_LIST {
+        return None;
+    }
+    let Expr::Column(c) = col.as_ref() else { return None };
+    let name = c_name(c);
+    if *indexed_columns.get(&name)? != RAW_TOKENIZER {
+        return None;
+    }
+    let items: Option<Vec<Route>> = list
+        .iter()
+        .map(|e| match e {
+            Expr::Literal(s, _) => extract_utf8_string(s)
+                .filter(|v| !v.is_empty() && v.chars().all(is_eq_term_safe))
+                .map(Route::Ready),
+            Expr::Placeholder(_) => Some(Route::Deferred {
+                rhs:  e.clone(),
+                kind: "eq".to_string(),
+            }),
+            _ => None,
+        })
+        .collect();
+    items.map(|items| (name, items))
+}
+
+/// How a routed predicate reaches tantivy.
+#[derive(Debug, PartialEq)]
+enum Route {
+    /// Literal classified at plan time → `text_match(col, query)`.
+    Ready(String),
+    /// `$N` placeholder — can't classify until parameter substitution.
+    /// Emitted as `text_match(col, $N, kind)`; the scan-side collector runs
+    /// `classify_deferred(kind, value)` once the literal is known and treats
+    /// unclassifiable values as opaque (original predicate post-filters).
+    Deferred { rhs: Expr, kind: String },
 }
 
 /// If `expr` is a rewritable predicate on an indexed column, return
-/// `(column_name, tantivy_query)`. Decision depends on the column's
+/// `(column_name, route)`. Decision depends on the column's
 /// tokenizer — raw can't do substring; ngram3 can do everything; default
 /// is in between.
-fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Option<(String, String)> {
+fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Option<(String, Route)> {
     match expr {
         // Exact `col = 'lit'` on a RAW-tokenized column: route as a term query.
         // Raw is a single case-sensitive token, so the tantivy match set equals
         // the `=` match set (the id-prefilter is exact, not just a superset).
-        // Safe under OR — `collect_text_matches` skips OR subtrees, so this is
-        // only ever intersected as a top-level conjunct; elsewhere it's dropped
+        // Safe under OR — `collect_text_match_tree` only routes an OR when
+        // every branch is completely covered; otherwise the subtree is opaque
         // and the preserved `=` post-filters. `!=` is never routed (no term
-        // form); IN-lists aren't either (intersect-only prefilter can't OR).
-        // Gated by `route_equality` for instant rollback to bloom/stats-only.
+        // form). Gated by `route_equality` for instant rollback.
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) if allow_eq => {
-            let (c, s) = match (left.as_ref(), right.as_ref()) {
-                (Expr::Column(c), Expr::Literal(s, _)) | (Expr::Literal(s, _), Expr::Column(c)) => (c, s),
+            let (c, rhs) = match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), other) | (other, Expr::Column(c)) => (c, other),
                 _ => return None,
             };
             let name = c_name(c);
             if *indexed_columns.get(&name)? != RAW_TOKENIZER {
                 return None; // only exact-match (raw) columns; ngram3/default are lossy for `=`
             }
-            let v = extract_utf8_string(s)?;
-            // Bail on empty or QueryParser-unsafe literals (the `=` still applies).
-            if v.is_empty() || !v.chars().all(is_eq_term_safe) {
-                return None;
+            match rhs {
+                Expr::Literal(s, _) => {
+                    let v = extract_utf8_string(s)?;
+                    // Bail on empty or QueryParser-unsafe literals (the `=` still applies).
+                    if v.is_empty() || !v.chars().all(is_eq_term_safe) {
+                        return None;
+                    }
+                    Some((name, Route::Ready(v)))
+                }
+                // Prepared-statement path: value unknown until Bind. Route
+                // with a deferred tag so plans cached with placeholders keep
+                // the prefilter (classified at scan time post-substitution).
+                Expr::Placeholder(_) => Some((
+                    name,
+                    Route::Deferred {
+                        rhs:  rhs.clone(),
+                        kind: "eq".to_string(),
+                    },
+                )),
+                _ => None,
             }
-            Some((name, v))
         }
         Expr::Like(Like {
             negated: false,
@@ -179,20 +253,33 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
             if *case_insensitive && tok == RAW_TOKENIZER {
                 return None;
             }
-            let Expr::Literal(s, _) = r.as_ref() else { return None };
-            let pat = extract_utf8_string(s)?;
-            let allow_substring = tok == NGRAM3_TOKENIZER;
-            let q = classify_like_pattern(&pat, *escape_char, allow_substring)?;
-            // ngram3 tokenizer lowercases on both index and query side, so
-            // ILIKE comes for free. For "default" tokenizer (also lowercased)
-            // the query parser also lowercases. So no extra work needed —
-            // case sensitivity is already lost in the prefilter, and the
-            // original LIKE/ILIKE predicate re-runs on the Delta side with
-            // correct semantics.
-            if tok == NGRAM3_TOKENIZER && q.chars().filter(|c| *c != '*').count() < NGRAM_MIN_QUERY_LEN {
-                return None;
+            match r.as_ref() {
+                Expr::Literal(s, _) => {
+                    let pat = extract_utf8_string(s)?;
+                    let allow_substring = tok == NGRAM3_TOKENIZER;
+                    let q = classify_like_pattern(&pat, *escape_char, allow_substring)?;
+                    // ngram3 tokenizer lowercases on both index and query side, so
+                    // ILIKE comes for free. For "default" tokenizer (also lowercased)
+                    // the query parser also lowercases. So no extra work needed —
+                    // case sensitivity is already lost in the prefilter, and the
+                    // original LIKE/ILIKE predicate re-runs on the Delta side with
+                    // correct semantics.
+                    if tok == NGRAM3_TOKENIZER && q.chars().filter(|c| *c != '*').count() < NGRAM_MIN_QUERY_LEN {
+                        return None;
+                    }
+                    Some((c_name(c), Route::Ready(q)))
+                }
+                // Pattern arrives at Bind: defer classification. Custom escape
+                // chars aren't carried in the tag — don't route them.
+                Expr::Placeholder(_) if escape_char.is_none() => Some((
+                    c_name(c),
+                    Route::Deferred {
+                        rhs:  r.as_ref().clone(),
+                        kind: format!("{}:{tok}", if *case_insensitive { "ilike" } else { "like" }),
+                    },
+                )),
+                _ => None,
             }
-            Some((c_name(c), q))
         }
         _ => None,
     }
@@ -202,120 +289,19 @@ fn c_name(c: &datafusion::common::Column) -> String {
     c.name.clone()
 }
 
-/// Decide which Tantivy query form a SQL LIKE pattern maps to.
-///
-/// `allow_substring=false` (raw/default tokenizer):
-///   - `'foo'`     → term `foo`
-///   - `'foo%'`    → prefix `foo*`
-///   - `'%foo'`, `'%foo%'`, embedded `%` → unsupported (None)
-///
-/// `allow_substring=true` (ngram3 tokenizer):
-///   - `'foo'`     → term `foo`
-///   - `'foo%'`    → prefix `foo*`
-///   - `'%foo'`    → term `foo`  (n-gram match by tantivy)
-///   - `'%foo%'`   → term `foo`
-///   - Embedded `%` between literal chars (e.g. `'a%b'`) → unsupported
-///
-/// `_` (single-char wildcard) is never accelerable. Returns None.
-fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: bool) -> Option<String> {
-    let esc = escape.unwrap_or('\\');
-    let chars: Vec<char> = pat.chars().collect();
-    let total = chars.len();
-    if total == 0 {
-        return None;
-    }
-    let mut out = String::new();
-    let mut i = 0;
-    let mut leading_wildcard = false;
-    let mut trailing_wildcard = false;
-    // Detect leading %
-    if chars[0] == '%' {
-        leading_wildcard = true;
-        i = 1;
-    }
-    while i < total {
-        let c = chars[i];
-        if c == esc {
-            // Next char is literal.
-            i += 1;
-            if i >= total {
-                return None; // trailing escape
-            }
-            let n = chars[i];
-            if !is_tantivy_safe_term_char(n) {
-                return None;
-            }
-            out.push(n);
-            i += 1;
-            continue;
-        }
-        if c == '_' {
-            return None;
-        }
-        if c == '%' {
-            if i + 1 == total {
-                trailing_wildcard = true;
-                break;
-            }
-            // Embedded %: only the leading-or-trailing-only forms are
-            // handled here. `'a%b'` would need positional ranking that
-            // tantivy can't trivially give us. Bail.
-            return None;
-        }
-        if !is_tantivy_safe_term_char(c) {
-            return None;
-        }
-        out.push(c);
-        i += 1;
-    }
-    if out.is_empty() {
-        return None;
-    }
-    Some(match (leading_wildcard, trailing_wildcard) {
-        // Plain exact / prefix / suffix / infix matches.
-        (false, false) => out,                // 'foo'
-        (false, true) => format!("{}*", out), // 'foo%' (prefix)
-        // Suffix-only and infix forms only meaningful on ngram3; for raw/
-        // default tokenizers we'd be sending tantivy a query that matches
-        // the substring as a whole token (it won't). Bail.
-        (true, false) | (true, true) if !allow_substring => return None,
-        (true, _) => out, // ngram3 will trigram-match the substring
-    })
-}
-
-/// Conservative: only allow alnum, dot, dash, underscore, slash, `@`, and
-/// space. Colon is deliberately *excluded* — Tantivy QueryParser treats it as
-/// field-delimiter syntax. The QueryParser also interprets many other ASCII
-/// punctuation chars (`+ - && || ! ( ) { } [ ] ^ " ~ * ? : \\ /`) as syntax;
-/// if the literal contains anything outside our allowlist we leave the
-/// predicate alone (the original `=` / `LIKE` still applies — correctness
-/// preserved).
-///
-/// Note: space is treated by the QueryParser as an implicit `AND` between
-/// terms, so `'foo bar'` matches docs containing both `foo` and `bar`, not
-/// the phrase. Acceptable here because `text_match` is additive — the
-/// original `=` / `LIKE` re-filters as the correctness backstop.
-fn is_tantivy_safe_term_char(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '/' | '@')
-}
-
-/// Stricter than `is_tantivy_safe_term_char`, for exact `=` routing. The literal
-/// is fed to tantivy's `QueryParser` as a term against a raw-tokenized field
-/// (one token = the whole value). QueryParser still interprets whitespace as a
-/// term separator (→ AND of sub-terms that can't match the single raw token →
-/// empty hits → an `id IN ()` that silently drops the real row) and other
-/// punctuation as query syntax. Restrict to chars that pass through QueryParser
-/// and the raw tokenizer unchanged: alphanumerics, `-`, `_` — enough for
-/// trace/span ids, UUIDs (the embedded `-` is safe, see the e2e dashed-UUID
-/// test), and enum values. Anything else bails to the preserved `=` post-filter.
-fn is_eq_term_safe(c: char) -> bool {
-    c.is_alphanumeric() || matches!(c, '-' | '_')
-}
-
 fn text_match_call(column: String, query: String) -> Expr {
     Expr::ScalarFunction(ScalarFunction {
         func: text_match_udf_arc(),
         args: vec![Expr::Column(datafusion::common::Column::new_unqualified(column)), lit(query)],
+    })
+}
+
+/// Deferred form: the value expr is a `$N` placeholder; `kind` tells the
+/// scan-side collector how to classify it after substitution.
+fn text_match_deferred_call(column: String, rhs: Expr, kind: String) -> Expr {
+    Expr::ScalarFunction(ScalarFunction {
+        func: text_match_udf_arc(),
+        args: vec![Expr::Column(datafusion::common::Column::new_unqualified(column)), rhs, lit(kind)],
     })
 }
 
@@ -460,7 +446,7 @@ mod tests {
         let cols: HashMap<String, &'static str> = HashMap::from([("context___trace_id".to_string(), RAW_TOKENIZER)]);
         assert_eq!(
             match_indexed_predicate(&eq("context___trace_id", "d01762b88f4ed54d"), &cols, true),
-            Some(("context___trace_id".into(), "d01762b88f4ed54d".into()))
+            Some(("context___trace_id".into(), Route::Ready("d01762b88f4ed54d".into())))
         );
     }
 
@@ -500,31 +486,75 @@ mod tests {
         assert_eq!(match_indexed_predicate(&eq("tid", ""), &cols, true), None, "empty");
         // A dashed UUID IS allowed — the embedded `-` survives (e2e-proven).
         let uid = "0fee13b9-ac71-5c55-acd1-109542595054";
-        assert_eq!(match_indexed_predicate(&eq("tid", uid), &cols, true), Some(("tid".into(), uid.into())));
+        assert_eq!(match_indexed_predicate(&eq("tid", uid), &cols, true), Some(("tid".into(), Route::Ready(uid.into()))));
     }
 
     #[test]
-    fn eq_under_or_is_not_collected_but_conjunct_is() {
-        // End-to-end OR-safety: rewrite a disjunction of two raw `=`s, then run
-        // the scan-side collector. It MUST skip the OR subtree (else the
-        // 2026-06-16 empty-intersection bug returns). A top-level conjunct of
-        // the same `=` MUST be collected (acceleration engaged).
-        use crate::tantivy_index::udf::collect_text_matches;
+    fn or_of_routed_eqs_becomes_or_node_but_partial_or_is_opaque() {
+        // End-to-end OR-safety with the tree collector: a disjunction where
+        // BOTH branches are rewritten routes as an Or node (union — new
+        // capability); a disjunction with one unroutable branch must yield NO
+        // prefilter at all (else the 2026-06-16 empty/partial-union bug
+        // returns). A top-level conjunct still routes.
+        use crate::tantivy_index::udf::{PredNode, collect_text_match_tree};
         let cols: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER), ("sid".to_string(), RAW_TOKENIZER)]);
 
         let or_pred = Expr::BinaryExpr(BinaryExpr::new(Box::new(eq("tid", "x")), Operator::Or, Box::new(eq("sid", "y"))));
         let rewritten = or_pred.transform_down(|e| rewrite_expr(e, &cols, true)).unwrap().data;
-        assert!(
-            collect_text_matches(&[rewritten]).is_empty(),
-            "an `=` under OR must not seed the intersect-only id-prefilter"
+        match collect_text_match_tree(&[rewritten]) {
+            Some(PredNode::Or(kids)) => assert_eq!(kids.len(), 2, "both routed branches must union"),
+            other => panic!("expected Or node, got {other:?}"),
+        }
+
+        // One branch on an UN-indexed column → whole OR must be opaque.
+        let cols_partial: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER)]);
+        let or_pred = Expr::BinaryExpr(BinaryExpr::new(Box::new(eq("tid", "x")), Operator::Or, Box::new(eq("unindexed", "y"))));
+        let rewritten = or_pred.transform_down(|e| rewrite_expr(e, &cols_partial, true)).unwrap().data;
+        assert_eq!(
+            collect_text_match_tree(&[rewritten]),
+            None,
+            "an OR with an unroutable branch must not seed the prefilter"
         );
 
         let and_pred = Expr::BinaryExpr(BinaryExpr::new(Box::new(eq("tid", "x")), Operator::And, Box::new(lit(true))));
         let rewritten = and_pred.transform_down(|e| rewrite_expr(e, &cols, true)).unwrap().data;
-        let got = collect_text_matches(&[rewritten]);
-        assert_eq!(got.len(), 1, "a top-level conjunct `=` must seed the prefilter");
-        assert_eq!(got[0].column, "tid");
-        assert_eq!(got[0].query, "x");
+        match collect_text_match_tree(&[rewritten]) {
+            Some(PredNode::Leaf(p)) => {
+                assert_eq!(p.column, "tid");
+                assert_eq!(p.query, "x");
+            }
+            other => panic!("expected Leaf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_list_routes_as_or_of_terms() {
+        let cols: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER), ("name".to_string(), NGRAM3_TOKENIZER)]);
+        let in_list = |col: &str, items: &[&str], negated: bool| {
+            Expr::InList(datafusion::logical_expr::expr::InList {
+                expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified(col))),
+                list: items.iter().map(|s| lit(*s)).collect(),
+                negated,
+            })
+        };
+        // Routable IN-list → collector sees an Or of leaves (complete via the
+        // AND with the preserved original).
+        use crate::tantivy_index::udf::{PredNode, collect_text_match_tree};
+        let rewritten = in_list("tid", &["a", "b"], false).transform_down(|e| rewrite_expr(e, &cols, true)).unwrap().data;
+        match collect_text_match_tree(&[rewritten]) {
+            Some(PredNode::Or(kids)) => assert_eq!(kids.len(), 2),
+            other => panic!("expected Or of 2 leaves, got {other:?}"),
+        }
+        // NOT IN, ngram3 column, unsafe literal, flag off → never routed.
+        for (e, allow) in [
+            (in_list("tid", &["a"], true), true),
+            (in_list("name", &["abc"], false), true),
+            (in_list("tid", &["a:b"], false), true),
+            (in_list("tid", &["a"], false), false),
+        ] {
+            let rewritten = e.transform_down(|ex| rewrite_expr(ex, &cols, allow)).unwrap().data;
+            assert_eq!(collect_text_match_tree(&[rewritten]), None);
+        }
     }
 
     #[test]
@@ -552,6 +582,6 @@ mod tests {
             escape_char:      None,
             case_insensitive: true,
         });
-        assert_eq!(match_indexed_predicate(&e, &cols, true), Some(("c".into(), "foo".into())));
+        assert_eq!(match_indexed_predicate(&e, &cols, true), Some(("c".into(), Route::Ready("foo".into()))));
     }
 }

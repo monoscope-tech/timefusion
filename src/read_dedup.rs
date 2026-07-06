@@ -48,6 +48,31 @@ use futures::StreamExt;
 
 use crate::errors::arrow_err;
 
+/// The input's output ordering, remapped through `output_projection` onto the
+/// dedup output schema. Keeps the longest prefix of plain-column sort exprs
+/// whose columns survive the projection; `None` when nothing survives or the
+/// input declares no ordering.
+fn remap_ordering(
+    input: &Arc<dyn ExecutionPlan>, output_projection: &Option<Vec<usize>>, schema: &SchemaRef,
+) -> Option<datafusion::physical_expr::LexOrdering> {
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column};
+    let in_ordering = input.properties().output_ordering()?;
+    let mut out: Vec<PhysicalSortExpr> = Vec::new();
+    for se in in_ordering.iter() {
+        // Explicit Any upcast — the PhysicalExpr trait's `as_any` collides
+        // with downcast-rs's blanket method in this crate's scope.
+        let any: &dyn std::any::Any = se.expr.as_ref();
+        let Some(col) = any.downcast_ref::<Column>() else { break };
+        let new_idx = match output_projection {
+            None => Some(col.index()),
+            Some(idxs) => idxs.iter().position(|&i| i == col.index()),
+        };
+        let Some(new_idx) = new_idx else { break };
+        out.push(PhysicalSortExpr::new(Arc::new(Column::new(schema.field(new_idx).name(), new_idx)), se.options));
+    }
+    LexOrdering::new(out)
+}
+
 #[derive(Debug)]
 pub struct DedupExec {
     input:             Arc<dyn ExecutionPlan>,
@@ -72,8 +97,17 @@ impl DedupExec {
             Some(idxs) => Arc::new(in_schema.project(idxs)?),
             None => in_schema.clone(),
         };
+        // Keep-first dedup preserves the input's row order, so the input's
+        // output ordering remains valid on the output (remapped through the
+        // projection). Without this the sorted Delta scan's declared order
+        // (fork sort-order pushdown) dies here and `ORDER BY timestamp
+        // LIMIT n` re-sorts the whole window instead of early-terminating.
+        let eq = match remap_ordering(&input, &output_projection, &schema) {
+            Some(ordering) => datafusion::physical_expr::EquivalenceProperties::new_with_orderings(schema.clone(), [ordering]),
+            None => datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
+        };
         let properties = Arc::new(PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
+            eq,
             datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
             input.properties().emission_type,
             input.properties().boundedness,
@@ -108,6 +142,13 @@ impl ExecutionPlan for DedupExec {
     fn required_input_distribution(&self) -> Vec<Distribution> {
         // Global dedup needs every row in one partition.
         vec![Distribution::SinglePartition]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // Streaming keep-first: surviving rows appear in input order. Lets
+        // EnforceSorting swap the single-partition coalesce below for a
+        // SortPreservingMergeExec when a downstream ordering requires it.
+        vec![true]
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

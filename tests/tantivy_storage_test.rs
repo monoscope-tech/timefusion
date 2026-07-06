@@ -114,6 +114,7 @@ async fn pack_upload_download_unpack_query_roundtrip() {
         vec![Hit {
             timestamp_micros: 2_000_000,
             id:               "b".into(),
+            row_ordinal:      Some(1),
         }]
     );
 
@@ -167,7 +168,8 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
 
     // Build the index for that committed file.
     let svc = Arc::new(TantivyIndexService::new(store_obj.clone(), Arc::new(TantivyConfig::default())));
-    svc.build_index_for_file(TABLE, "p1", parquet_rel, store_obj.clone()).await.expect("build_index_for_file");
+    let parquet_uri = format!("s3://bucket/tf/{TABLE}/{parquet_rel}");
+    svc.build_index_for_file(TABLE, "p1", parquet_rel, &parquet_uri, store_obj.clone()).await.expect("build_index_for_file");
 
     // Manifest entry is keyed by the parquet rel path, points at the
     // deterministic partition-mirrored blob, and the blob exists.
@@ -177,7 +179,8 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     assert!(entry.error.is_none());
     let expected_blob = store::index_path_for_parquet(TABLE, parquet_rel).to_string();
     assert_eq!(entry.index.as_deref(), Some(expected_blob.as_str()));
-    assert_eq!(entry.covered_files, vec![parquet_rel.to_string()]);
+    assert_eq!(entry.covered_files, vec![parquet_uri.clone()], "covered_files must carry the absolute URI (coverage gate / GC keying)");
+    assert!(entry.ordinals_valid, "read-back build indexes parquet row order → ordinals valid for row selection");
     store::download(store_obj.as_ref(), &object_store::path::Path::from(expected_blob)).await.expect("blob exists");
 
     // And the published index is actually searchable end-to-end.
@@ -207,6 +210,7 @@ async fn manifest_upsert_and_remove_roundtrip() {
         max_timestamp_micros: Some(2_000_000),
         error:                None,
         covered_files:        vec!["part-uuid-1.parquet".into()],
+ordinals_valid: false,
     };
     manifest::upsert(store_obj.as_ref(), "logs", "proj1", "part-uuid-1.parquet", entry.clone()).await.expect("upsert 1");
     manifest::upsert(
@@ -223,6 +227,7 @@ async fn manifest_upsert_and_remove_roundtrip() {
             max_timestamp_micros: None,
             error:                Some("boom".into()),
             covered_files:        vec![],
+ordinals_valid: false,
         },
     )
     .await
@@ -263,6 +268,7 @@ async fn concurrent_upserts_last_writer_wins() {
                     max_timestamp_micros: None,
                     error:                None,
                     covered_files:        vec![],
+ordinals_valid: false,
                 },
             )
             .await
@@ -282,6 +288,7 @@ async fn concurrent_upserts_last_writer_wins() {
                     max_timestamp_micros: None,
                     error:                None,
                     covered_files:        vec![],
+ordinals_valid: false,
                 },
             )
             .await

@@ -1026,9 +1026,9 @@ impl MemBuffer {
     pub fn search_text_match(
         &self, project_id: &str, table_name: &str, preds: &[crate::tantivy_index::udf::TextMatchPred],
     ) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
-        if preds.is_empty() {
+        let Some(node) = crate::tantivy_index::udf::PredNode::from_preds(preds) else {
             return Ok(None);
-        }
+        };
         let Some(table_schema) = crate::schema_loader::get_schema(table_name) else {
             return Ok(None);
         };
@@ -1056,7 +1056,7 @@ impl MemBuffer {
             let bucket_id = *bucket_entry.key();
             let bucket = bucket_entry.value();
             let key = Self::cache_key(project_id, table_name, bucket_id);
-            let (_snapshot, ids_opt) = self.search_with_snapshot(bucket, &key, table_schema, preds)?;
+            let (_snapshot, ids_opt) = self.search_with_snapshot(bucket, &key, table_schema, &node)?;
             if let Some(ids) = ids_opt {
                 any_usable = true;
                 acc = Some(match acc.take() {
@@ -1079,15 +1079,30 @@ impl MemBuffer {
     /// in time — closing the race where a concurrent insert would otherwise
     /// be visible in the data but absent from the prefilter ID set.
     ///
-    /// When `preds` is empty or the table has no indexed fields, behaves
+    /// When `node` is None or the table has no indexed fields, behaves
     /// exactly like `query_partitioned`.
-    #[instrument(skip(self, filters, preds), fields(project_id, table_name))]
+    /// Any buffered rows for (project, table) whose timestamps could fall in
+    /// `[lo, hi]`? Bucket-granular (min/max check) — may report `true` for a
+    /// bucket whose actual rows all fall outside, which is the safe direction
+    /// for callers gating exact-count shortcuts.
+    pub fn has_rows_in_range(&self, project_id: &str, table_name: &str, lo: i64, hi: i64) -> bool {
+        let Some(table) = self.get_table(project_id, table_name) else {
+            return false;
+        };
+        let range = (Some(lo), Some(hi));
+        table
+            .buckets
+            .iter()
+            .any(|b| b.value().row_count.load(Ordering::Relaxed) > 0 && bucket_overlaps_range(b.value(), &range))
+    }
+
+    #[instrument(skip(self, filters, node), fields(project_id, table_name))]
     pub fn query_partitioned_with_text_match(
-        &self, project_id: &str, table_name: &str, filters: &[Expr], preds: &[crate::tantivy_index::udf::TextMatchPred],
+        &self, project_id: &str, table_name: &str, filters: &[Expr], node: Option<&crate::tantivy_index::udf::PredNode>,
     ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
-        if preds.is_empty() {
+        let Some(node) = node else {
             return self.query_partitioned(project_id, table_name, filters);
-        }
+        };
         let table_schema = crate::schema_loader::get_schema(table_name);
         let has_indexed = table_schema.as_ref().is_some_and(|s| s.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)));
         if !has_indexed {
@@ -1111,7 +1126,7 @@ impl MemBuffer {
                 continue;
             }
             let key = Self::cache_key(project_id, table_name, bucket_id);
-            let (snapshot, ids_opt) = self.search_with_snapshot(&bucket, &key, table_schema, preds)?;
+            let (snapshot, ids_opt) = self.search_with_snapshot(&bucket, &key, table_schema, node)?;
             if snapshot.is_empty() {
                 continue;
             }
@@ -2426,17 +2441,29 @@ impl MemBuffer {
     /// SQL predicate on the snapshot.
     fn search_with_snapshot(
         &self, bucket: &TimeBucket, cache_key: &BucketCacheKey, table_schema: &crate::schema_loader::TableSchema,
-        preds: &[crate::tantivy_index::udf::TextMatchPred],
+        node: &crate::tantivy_index::udf::PredNode,
     ) -> anyhow::Result<(Vec<arrow::record_batch::RecordBatch>, Option<std::collections::HashSet<String>>)> {
         let (snapshot, snapshot_rows) = bucket.snapshot();
-        if preds.is_empty() || snapshot.is_empty() {
+        if snapshot.is_empty() {
             return Ok((snapshot, None));
         }
 
         // Try the cache. Reuse only if its row count matches the snapshot.
+        // Index build/search failures must DEGRADE to the unfiltered snapshot
+        // (ids=None → the SQL predicate still filters), never error: the scan
+        // maps an Err to "no MemBuffer data", silently dropping every acked-
+        // but-unflushed row (2026-07-05 review hardening). This also covers
+        // hand-written `text_match(unindexed_col, ..)` reaching a bucket
+        // index that has no such field.
         let mut idx = self.cache_get(cache_key);
         if idx.as_ref().is_none_or(|i| i.indexed_rows != snapshot_rows) {
-            let built = crate::tantivy_index::mem_index::BucketTextIndex::build(table_schema, &snapshot, snapshot_rows)?;
+            let built = match crate::tantivy_index::mem_index::BucketTextIndex::build(table_schema, &snapshot, snapshot_rows) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("mem text index build failed (degrading to unfiltered snapshot): {e}");
+                    return Ok((snapshot, None));
+                }
+            };
             let Some(built) = built else {
                 return Ok((snapshot, None));
             };
@@ -2444,13 +2471,16 @@ impl MemBuffer {
         }
         let idx = idx.expect("idx is Some on this path");
 
-        // Run each predicate and intersect — sound only because predicates are
-        // AND-ed; `collect_text_matches` skips OR subtrees so disjunctive terms
-        // never reach here (else x_ids ∩ y_ids = ∅ would drop every match).
-        let ids_per_pred: anyhow::Result<Vec<std::collections::HashSet<String>>> =
-            preds.iter().map(|p| idx.search(p).map(|hits| hits.into_iter().map(|h| h.id).collect())).collect();
-        let combined = ids_per_pred?.into_iter().reduce(|a, b| a.intersection(&b).cloned().collect()).unwrap_or_default();
-        Ok((snapshot, Some(combined)))
+        // One combined boolean query. `collect_text_match_tree` only emits
+        // OR nodes whose every branch is completely covered, so evaluating
+        // the tree in-engine (And→Must, Or→Should) yields a sound superset.
+        match idx.search_node(node) {
+            Ok(hits) => Ok((snapshot, Some(hits.into_iter().map(|h| h.id).collect()))),
+            Err(e) => {
+                warn!("mem text index search failed (degrading to unfiltered snapshot): {e}");
+                Ok((snapshot, None))
+            }
+        }
     }
 }
 
@@ -2830,7 +2860,8 @@ mod tests {
             column: "name".into(),
             query:  "alpha".into(),
         }];
-        let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], &preds).unwrap();
+        let node = crate::tantivy_index::udf::PredNode::from_preds(&preds);
+        let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], node.as_ref()).unwrap();
         let total_rows: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1, "expected only the matching row, got {} rows in {:?}", total_rows, parts);
 
@@ -2850,7 +2881,7 @@ mod tests {
         let batch = json_to_batch(vec![test_span("a", "svc", "p1"), test_span("b", "svc", "p1")]).unwrap();
         buffer.insert("p1", "otel_logs_and_spans", batch, ts).unwrap();
 
-        let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], &[]).unwrap();
+        let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], None).unwrap();
         let total: usize = parts.iter().flatten().map(|b| b.num_rows()).sum();
         assert_eq!(total, 2, "no text_match preds → all rows returned");
     }

@@ -65,6 +65,8 @@ struct ScanShape {
     has_mem:          bool,
     has_delta:        bool,
     fast_resolve_hit: Option<bool>,
+    /// Read-side dedup skip engaged (all window partitions sweep-verified clean).
+    skip_dedup:       bool,
 }
 
 /// Counters surfaced via `timefusion_stats` for production debugging. Cheap to
@@ -642,6 +644,29 @@ fn is_transient_s3_err(msg: &str) -> bool {
 /// actions instead of a predicate-evaluated replace_where.
 const DEDUP_FILE_COL: &str = "__tf_dedup_file";
 
+/// Order-insensitive fingerprint of a partition's live file set (read-side
+/// dedup skip): sorted-uris hash, so any add/remove/rewrite changes it.
+fn partition_file_fp(mut files: Vec<String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    files.sort();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    files.hash(&mut h);
+    h.finish()
+}
+
+/// UTC dates covered by a `[lo, hi]` microsecond window, or `None` when the
+/// window is unbounded/invalid/wider than a year (bounds the per-date
+/// fingerprint checks; such queries just keep DedupExec).
+fn window_dates(lo: i64, hi: i64) -> Option<Vec<chrono::NaiveDate>> {
+    let lo_d = chrono::DateTime::from_timestamp_micros(lo)?.date_naive();
+    let hi_d = chrono::DateTime::from_timestamp_micros(hi)?.date_naive();
+    let span = (hi_d - lo_d).num_days();
+    if !(0..=366).contains(&span) {
+        return None;
+    }
+    Some((0..=span).map(|d| lo_d + chrono::Duration::days(d)).collect())
+}
+
 /// A `Remove` tombstone for `add` with `data_change: true` (the dedup rewrite
 /// drops rows, unlike optimize's data-preserving `data_change: false`).
 fn remove_for_add(add: &deltalake::kernel::Add) -> deltalake::kernel::Remove {
@@ -996,6 +1021,15 @@ pub struct Database {
     /// the sweep when the version hasn't moved (no commits → no new dupes).
     /// Same unbounded-growth caveat as `last_written_versions`.
     last_dedup_versions:             Arc<RwLock<HashMap<String, u64>>>,
+    /// (project, table, date) → fingerprint (hash of the partition's sorted
+    /// live file set) captured when a dedup sweep pass found ZERO duplicates
+    /// and the file set was unchanged across the pass. A query whose window
+    /// partitions all fingerprint-match the current snapshot provably reads
+    /// no duplicates from Delta, so `DedupExec` (and its LIMIT-pushdown
+    /// suppression) can be skipped (`timefusion_read_dedup_skip_swept`).
+    /// Any commit touching the partition changes its file set → mismatch →
+    /// dedup stays on until the next clean sweep pass.
+    dedup_clean_fp:                  Arc<dashmap::DashMap<(String, String, String), u64>>,
     /// Exponential failure backoff per (table, project, date) dedup target:
     /// (attempts, earliest next try). Without it a failing partition re-runs
     /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
@@ -1360,6 +1394,7 @@ impl Database {
             statistics_extractor,
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
+            dedup_clean_fp: Arc::new(dashmap::DashMap::new()),
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             light_optimize_gate: Arc::new(tokio::sync::Mutex::new(())),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
@@ -1447,6 +1482,95 @@ impl Database {
 
     pub fn tantivy_indexer(&self) -> Option<&Arc<crate::tantivy_index::service::TantivyIndexService>> {
         self.tantivy_indexer.get()
+    }
+
+    /// Startup backfill (gated on `timefusion_tantivy_backfill`): build
+    /// partition-mirrored indexes for live parquet files that no successful
+    /// manifest entry covers, oldest partition first. Every covered file
+    /// widens the windows where the coverage gate lets the prefilter engage
+    /// (pre-tantivy history, failed builds, pre-reindex compactions).
+    pub fn spawn_tantivy_backfill(&self) {
+        let Some(svc) = self.tantivy_indexer().cloned() else { return };
+        if !self.config.tantivy.timefusion_tantivy_backfill {
+            return;
+        }
+        let db = self.clone();
+        tokio::spawn(async move {
+            for table_name in svc.config.indexed_tables() {
+                match db.backfill_table_indexes(&svc, &table_name).await {
+                    Ok(0) => {}
+                    Ok(n) => info!("tantivy backfill: table={} built={}", table_name, n),
+                    Err(e) => warn!("tantivy backfill failed for {}: {}", table_name, e),
+                }
+            }
+        });
+    }
+
+    /// Startup cache warmer (gated on `timefusion_tantivy_prefetch_days`):
+    /// pull recent index blobs into the local disk cache in the background.
+    pub fn spawn_tantivy_prefetch(&self) {
+        let days = self.config.tantivy.timefusion_tantivy_prefetch_days;
+        let Some(search) = self.tantivy_search().cloned() else { return };
+        if days == 0 {
+            return;
+        }
+        let tables = self.config.tantivy.indexed_tables();
+        tokio::spawn(async move {
+            for t in tables {
+                match search.warm_recent(&t, days).await {
+                    Ok(0) => {}
+                    Ok(n) => info!("tantivy prefetch: table={} blobs_warmed={}", t, n),
+                    Err(e) => warn!("tantivy prefetch failed for {}: {}", t, e),
+                }
+            }
+        });
+    }
+
+    async fn backfill_table_indexes(&self, svc: &Arc<crate::tantivy_index::service::TantivyIndexService>, table_name: &str) -> anyhow::Result<usize> {
+        use crate::tantivy_index::{
+            manifest,
+            service::{parquet_rel_of_uri, project_id_of_uri},
+        };
+        // Unified table ("default") holds every default-routed project's
+        // files; custom project tables are resolved separately.
+        let mut roots: Vec<String> = vec!["default".into()];
+        roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone()));
+        let mut built = 0usize;
+        for root in roots {
+            let Ok(table_ref) = self.resolve_table(&root, table_name).await else { continue };
+            let (uris, delta_store) = {
+                let t = table_ref.read().await;
+                (t.get_file_uris()?.collect::<Vec<String>>(), t.log_store().object_store(None))
+            };
+            // Group live files by owning project (partition segment).
+            let mut by_pid: HashMap<String, Vec<String>> = HashMap::new();
+            for u in uris.into_iter().filter(|u| u.ends_with(".parquet")) {
+                if let Some(pid) = project_id_of_uri(&u) {
+                    by_pid.entry(pid.to_string()).or_default().push(u);
+                }
+            }
+            for (pid, mut uris) in by_pid {
+                let m = manifest::load(svc.object_store.as_ref(), table_name, &pid).await?;
+                let covered: std::collections::HashSet<&String> =
+                    m.entries.values().filter(|e| e.index.is_some() && e.error.is_none()).flat_map(|e| e.covered_files.iter()).collect();
+                uris.retain(|u| !covered.contains(u));
+                uris.sort(); // lexical == chronological for date= partitions
+                let work: Vec<(String, String)> = uris.iter().filter_map(|uri| Some((parquet_rel_of_uri(uri)?.to_string(), uri.clone()))).collect();
+                let table_owned = table_name.to_string();
+                let mut jobs = futures::stream::iter(work.into_iter().map(|(rel, uri)| {
+                    let (svc, store, pid, table) = (svc.clone(), delta_store.clone(), pid.clone(), table_owned.clone());
+                    async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
+                }))
+                .buffer_unordered(2);
+                while let Some(r) = jobs.next().await {
+                    match r {
+                        Ok(()) => built += 1,
+                        Err(e) => warn!("tantivy backfill build failed table={} project={}: {}", table_name, pid, e),
+                    }
+                }
+            }
+        }
+        Ok(built)
     }
 
     /// Query Delta tables directly, bypassing the in-memory buffer (for testing).
@@ -3677,8 +3801,45 @@ impl Database {
                 // newly-added files, evict tombstoned ones). Returns the new
                 // live file URIs for the tantivy GC hook below.
                 let live_uris = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
-                // Tantivy compaction GC — drop sidecar indexes for files that
-                // were rewritten away. Best-effort: errors are logged.
+                // Tantivy compaction reindex + GC. Order matters: build
+                // indexes for the compaction's OUTPUT files first, then GC the
+                // inputs' entries — so window coverage never regresses (the
+                // pre-existing gap where GC deleted indexes nothing rebuilt
+                // left old windows permanently un-prefiltered). Best-effort:
+                // errors are logged; the coverage gate keeps queries correct.
+                if let Some(svc) = self.tantivy_indexer().cloned()
+                    && svc.config.is_table_indexed(table_name)
+                {
+                    use crate::tantivy_index::service::{parquet_rel_of_uri, project_id_of_uri};
+                    let delta_store = { table_ref.read().await.log_store().object_store(None) };
+                    let added: Vec<(String, String, String)> = live_uris
+                        .iter()
+                        .filter(|u| !pre_uris.contains(*u) && u.ends_with(".parquet"))
+                        .filter_map(|u| Some((project_id_of_uri(u)?.to_string(), parquet_rel_of_uri(u)?.to_string(), u.clone())))
+                        .collect();
+                    let mut built = 0usize;
+                    let mut reindex_errs = 0usize;
+                    let table_owned = table_name.to_string();
+                    let mut jobs = futures::stream::iter(added.into_iter().map(|(pid, rel, uri)| {
+                        let (svc, store, table) = (svc.clone(), delta_store.clone(), table_owned.clone());
+                        async move { svc.build_index_for_file(&table, &pid, &rel, &uri, store).await }
+                    }))
+                    .buffer_unordered(2);
+                    while let Some(r) = jobs.next().await {
+                        match r {
+                            Ok(()) => built += 1,
+                            Err(e) => {
+                                reindex_errs += 1;
+                                warn!("tantivy post-optimize reindex failed for table={}: {}", table_name, e);
+                            }
+                        }
+                    }
+                    drop(jobs);
+                    if built > 0 || reindex_errs > 0 {
+                        info!("tantivy post-optimize reindex: table={} built={} errors={}", table_name, built, reindex_errs);
+                    }
+                }
+                // Drop sidecar index entries for files rewritten away.
                 if let Some(svc) = self.tantivy_indexer().cloned() {
                     let svc_table = table_name.to_string();
                     // Per-project: collect all (project_id, ...) values from
@@ -4059,10 +4220,17 @@ impl Database {
     /// schema's `dedup_keys` (last-write-wins) and write back via
     /// `replace_where`. No-op on no dedup_keys / no duplicates (avoids
     /// gratuitous Foyer churn). Returns rows dropped.
-    pub async fn dedup_partition(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate) -> Result<u64> {
+    /// Returns `(rows_dropped, complete)`. `complete=false` means duplicate-
+    /// bearing work was SKIPPED (unsealed chunks, rewrite budget, vanished
+    /// snapshot rows) — the partition must NOT be fingerprinted clean
+    /// (2026-07-05 review: a clean fp over skipped dupes let the read-side
+    /// dedup skip and the COUNT pushdown serve duplicates).
+    pub async fn dedup_partition(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
+    ) -> Result<(u64, bool)> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
-            return Ok(0);
+            return Ok((0, true));
         }
         let date_str = date.to_string();
 
@@ -4111,7 +4279,7 @@ impl Database {
         // materialization below to one hour of one project instead of the
         // whole day (the crash-loop backlog made EVERY project probe-positive,
         // so the probe alone still ballooned tens of GB per sweep).
-        let chunks: Vec<(String, String)> = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
+        let (chunks, skipped_any): (Vec<(String, String)>, bool) = if schema.dedup_keys.iter().any(|k| k == "timestamp") {
             // 10-minute bins (not hours): one HOUR of the largest project is
             // >2.1GB of string data — past Arrow's i32 offset limit ("Offset
             // overflow error: 2222394106" in prod) and tens of GB materialized.
@@ -4138,7 +4306,8 @@ impl Database {
             // holds up to ~70 min of data, so only hours sealed for 2h+ are
             // rewritten; newer dupes clear on a later sweep.
             let sealed_before = Utc::now().naive_utc() - chrono::Duration::hours(2);
-            hours
+            let mut skipped_unsealed = 0usize;
+            let built: Vec<_> = hours
                 .into_iter()
                 .filter_map(|h| {
                     // CAST .. AS VARCHAR may append fractional seconds or a
@@ -4150,6 +4319,7 @@ impl Database {
                     let end = start + chrono::Duration::minutes(10);
                     if end > sealed_before {
                         debug!("dedup: skipping unsealed chunk starting {start} (cleared on a later sweep)");
+                        skipped_unsealed += 1;
                         return None;
                     }
                     let (s, e) = (start.format("%Y-%m-%d %H:%M:%S"), end.format("%Y-%m-%d %H:%M:%S"));
@@ -4163,7 +4333,8 @@ impl Database {
                         format!("project_id = '{safe_pid}' AND date = '{date_str}' AND timestamp in ['{s}', '{e}')"),
                     ))
                 })
-                .collect()
+                .collect();
+            (built, skipped_unsealed > 0)
         } else {
             // No timestamp dedup key → can't chunk safely; whole-partition
             // rewrite, gated on the same any-dupes probe.
@@ -4179,20 +4350,23 @@ impl Database {
                 .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0)))
                 .unwrap_or(0);
             if dup_rows <= 0 {
-                Vec::new()
+                (Vec::new(), false)
             } else {
-                vec![(filter.clone(), format!("project_id = '{safe_pid}' AND date = '{date_str}'"))]
+                (vec![(filter.clone(), format!("project_id = '{safe_pid}' AND date = '{date_str}'"))], false)
             }
         };
         if chunks.is_empty() {
-            return Ok(0);
+            return Ok((0, !skipped_any));
         }
 
         let mut total_dropped = 0u64;
+        let mut all_complete = !skipped_any;
         for (chunk_filter, label) in chunks {
-            total_dropped += self.dedup_rewrite_chunk(table_ref, table_name, schema, scan_name, &filter, &chunk_filter, &label).await?;
+            let (dropped, complete) = self.dedup_rewrite_chunk(table_ref, table_name, schema, scan_name, &filter, &chunk_filter, &label).await?;
+            total_dropped += dropped;
+            all_complete &= complete;
         }
-        Ok(total_dropped)
+        Ok((total_dropped, all_complete))
     }
 
     /// Rewrite one duplicate-bearing chunk as a TARGETED file transaction:
@@ -4215,7 +4389,7 @@ impl Database {
     async fn dedup_rewrite_chunk(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, scan_name: &str, partition_filter: &str,
         chunk_filter: &str, label: &str,
-    ) -> Result<u64> {
+    ) -> Result<(u64, bool)> {
         use deltalake::{
             kernel::{Action, transaction::TableReference},
             protocol::DeltaOperation,
@@ -4267,7 +4441,9 @@ impl Database {
             let files_sql = format!("SELECT DISTINCT \"{DEDUP_FILE_COL}\" FROM {scan_name} WHERE {chunk_filter}");
             let file_ids = read_string_column(ctx.sql(&files_sql).await?.collect().await?)?;
             if file_ids.is_empty() {
-                return Ok(0);
+                // Probe saw dupes but this snapshot has no rows for the chunk
+                // (concurrent rewrite) — nothing verified, don't certify clean.
+                return Ok((0, false));
             }
             // 2. Map scan values to Add actions in the SAME snapshot
             // (suffix-match either direction: the scan column carries the
@@ -4353,7 +4529,7 @@ impl Database {
                     est_decoded_bytes,
                     decoded_budget
                 );
-                return Ok(0);
+                return Ok((0, false));
             }
             // 4. Full row set of the target files: chunk-window rows to dedup
             // plus out-of-window rows carried through verbatim. Bounded by the
@@ -4370,12 +4546,12 @@ impl Database {
             let batches: Vec<RecordBatch> = ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
             let before: usize = batches.iter().map(|b| b.num_rows()).sum();
             if before == 0 {
-                return Ok(0);
+                return Ok((0, false));
             }
             let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref())?;
             let after: usize = deduped.iter().map(|b| b.num_rows()).sum();
             if before == after {
-                return Ok(0);
+                return Ok((0, true)); // probe false-positive: chunk verified duplicate-free
             }
             let dropped = (before - after) as u64;
 
@@ -4452,7 +4628,7 @@ impl Database {
                             before,
                             after
                         );
-                        return Ok(dropped);
+                        return Ok((dropped, true));
                     }
                     Err(e) => {
                         drop(commit_guard);
@@ -4473,6 +4649,51 @@ impl Database {
             }
         }
         anyhow::bail!("dedup rewrite: re-plan attempts exhausted for table={} chunk=[{}]", table_name, label)
+    }
+
+    /// Live parquet files of one `date=` partition, grouped by the
+    /// `project_id=` path segment ("default" when absent — custom-project
+    /// tables don't embed it). Shared by the sweep's fingerprint capture and
+    /// the read-side dedup-skip check so both hash identical groupings.
+    fn partition_files_by_pid(table: &DeltaTable, date_marker: &str) -> Result<HashMap<String, Vec<String>>> {
+        let mut m: HashMap<String, Vec<String>> = HashMap::new();
+        for uri in table.get_file_uris()?.filter(|u| u.contains(date_marker) && u.ends_with(".parquet")) {
+            let pid = uri.split('/').find_map(|seg| seg.strip_prefix("project_id=")).unwrap_or("default").to_string();
+            m.entry(pid).or_default().push(uri);
+        }
+        Ok(m)
+    }
+
+    /// True iff every (project, date) partition overlapping `window` carries
+    /// a clean fingerprint matching its CURRENT live file set (0-drop sweep
+    /// pass, unchanged since). Shared by the read-side DedupExec skip and the
+    /// COUNT(*) stats pushdown — both need duplicates provably absent.
+    /// Takes the SAME `table` guard the caller will scan/sum from, so the
+    /// fingerprint verdict and the data read share one snapshot (no
+    /// check-then-use window; 2026-07-05 review hardening).
+    pub(crate) fn dedup_window_clean(&self, table: &DeltaTable, project_id: &str, table_name: &str, (lo, hi): (i64, i64)) -> bool {
+        let Some(dates) = window_dates(lo, hi) else { return false };
+        for date in dates {
+            let marker = format!("date={date}");
+            let Ok(mut by_pid) = Self::partition_files_by_pid(table, &marker) else {
+                return false;
+            };
+            // The sweep keys custom-project tables (no project_id= path
+            // segment) under "default"; match its grouping exactly.
+            let (key_pid, files) = if let Some(f) = by_pid.remove(project_id) {
+                (project_id.to_string(), f)
+            } else if let Some(f) = by_pid.remove("default") {
+                ("default".to_string(), f)
+            } else {
+                continue; // no Delta files for this date → nothing to dedup
+            };
+            let fp_key = (key_pid, table_name.to_string(), date.to_string());
+            match self.dedup_clean_fp.get(&fp_key) {
+                Some(fp) if *fp.value() == partition_file_fp(files) => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Sweep every `(project_id, today)` partition in this table via
@@ -4502,17 +4723,14 @@ impl Database {
         let mut any_ok = false;
         for date in dates {
             let date_marker = format!("date={}", date);
-            // Project ids present in this date's partitions. Custom-project tables
+            // Per-project live file lists for this date. Custom-project tables
             // don't embed project_id in the path; sweep "default".
-            let project_ids: std::collections::HashSet<String> = {
+            let files_by_pid: HashMap<String, Vec<String>> = {
                 let table = table_ref.read().await;
-                table
-                    .get_file_uris()?
-                    .filter(|u| u.contains(&date_marker))
-                    .filter_map(|uri| uri.split('/').find_map(|seg| seg.strip_prefix("project_id=").map(str::to_string)))
-                    .collect()
+                Self::partition_files_by_pid(&table, &date_marker)?
             };
-            let project_ids = if project_ids.is_empty() { std::iter::once("default".to_string()).collect() } else { project_ids };
+            let project_ids: std::collections::HashSet<String> =
+                if files_by_pid.is_empty() { std::iter::once("default".to_string()).collect() } else { files_by_pid.keys().cloned().collect() };
             for pid in &project_ids {
                 let backoff_key = format!("{dedup_key}:{pid}:{date}");
                 if let Some(entry) = self.dedup_backoff.get(&backoff_key)
@@ -4523,10 +4741,30 @@ impl Database {
                     continue;
                 }
                 match self.dedup_partition(table_ref, table_name, pid, date).await {
-                    Ok(d) => {
+                    Ok((d, complete)) => {
                         self.dedup_backoff.remove(&backoff_key);
                         total_dropped += d;
                         any_ok = true;
+                        // Clean-partition fingerprint for the read-side dedup
+                        // skip: a 0-drop pass over a file set that is STILL
+                        // the live set proves the partition duplicate-free.
+                        // Any concurrent commit (flush/compaction) changes
+                        // the set → don't mark; a >0 pass marks nothing (the
+                        // NEXT 0-drop pass confirms the rewrite held).
+                        let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
+                        let pre = files_by_pid.get(pid).cloned().unwrap_or_default();
+                        let post = {
+                            let table = table_ref.read().await;
+                            Self::partition_files_by_pid(&table, &date_marker)?.remove(pid).unwrap_or_default()
+                        };
+                        // `complete` is required: Ok(0) with skipped unsealed/
+                        // over-budget dup chunks must NOT certify the partition.
+                        let fp_post = partition_file_fp(post.clone());
+                        if d == 0 && complete && !post.is_empty() && partition_file_fp(pre) == fp_post {
+                            self.dedup_clean_fp.insert(fp_key, fp_post);
+                        } else {
+                            self.dedup_clean_fp.remove(&fp_key);
+                        }
                     }
                     Err(e) => {
                         // Exponential backoff, 10min doubling to a 6h cap —
@@ -4535,6 +4773,7 @@ impl Database {
                         let attempts = self.dedup_backoff.get(&backoff_key).map_or(0, |e| e.value().0) + 1;
                         let delay = std::time::Duration::from_secs((600u64 << (attempts.min(7) - 1)).min(21_600));
                         self.dedup_backoff.insert(backoff_key, (attempts, std::time::Instant::now() + delay));
+                        self.dedup_clean_fp.remove(&(pid.clone(), table_name.to_string(), date.to_string()));
                         warn!(
                             "dedup sweep: project={} date={} table={} failed (attempt {}, next retry in {}s): {}",
                             pid,
@@ -5193,8 +5432,15 @@ impl ProjectRoutingTable {
 
     /// Scan a Delta table and coerce output schema to match our expected types.
     /// Handles object store registration, projection translation, and type coercion (e.g., Utf8 -> Utf8View).
+    ///
+    /// `exclude_files`: parquet URIs the tantivy prefilter proved hold no
+    /// matching rows (zero-hit covering index). When present, the scan is
+    /// restricted to the remaining files via the provider's `FileSelection`
+    /// — file-level pruning, computed against THIS `table`'s snapshot so a
+    /// concurrent compaction can't shift rows out of the selection.
     async fn scan_delta_table(
         &self, table: &DeltaTable, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
+        exclude_files: Option<&std::collections::HashSet<String>>, row_selections: Option<&std::collections::HashMap<String, Vec<u64>>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Extract project_id from filters for the provider cache key.
         // Falls back to table_name-only key if absent (multi-project queries).
@@ -5202,6 +5448,62 @@ impl ProjectRoutingTable {
         let cache_key = (project_id, self.table_name.clone());
 
         table.update_datafusion_session(state).map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        // File-pruned scans bypass the provider cache (the selection is
+        // query-specific). Bail to the unrestricted path unless EVERY
+        // surviving live file maps to a table-relative path — a restriction
+        // that silently missed an unmappable file would drop its rows.
+        let file_selection: Option<Vec<String>> = exclude_files.filter(|e| !e.is_empty()).and_then(|exclude| {
+            // Scoped so the (non-Send) file-view iterator drops before any await.
+            let uris = table.get_file_uris().ok()?;
+            let mut selected: Vec<String> = Vec::new();
+            for u in uris.filter(|u| u.ends_with(".parquet")) {
+                if exclude.contains(&u) {
+                    continue;
+                }
+                selected.push(crate::tantivy_index::service::parquet_rel_of_uri(&u)?.to_string());
+            }
+            Some(selected)
+        });
+        // Row-selection pushdown: per-file matching ordinals keyed by rel path.
+        // Purely narrowing — files without an entry scan normally — so unlike
+        // `file_selection` an unmappable URI just drops that file's selection.
+        let ordinal_selections: std::collections::HashMap<String, Vec<u64>> = row_selections
+            .into_iter()
+            .flatten()
+            .filter_map(|(uri, ords)| Some((crate::tantivy_index::service::parquet_rel_of_uri(uri)?.to_string(), ords.clone())))
+            .collect();
+        if file_selection.is_some() || !ordinal_selections.is_empty() {
+            use deltalake::delta_datafusion::{FileSelection, MissingSelectedFilePolicy};
+            if let Some(sel) = &file_selection {
+                debug!(
+                    "tantivy file pruning: {}/{} scanning {} files (excluded {})",
+                    cache_key.0,
+                    self.table_name,
+                    sel.len(),
+                    exclude_files.map_or(0, |e| e.len())
+                );
+            }
+            let session_state = state.as_any().downcast_ref::<datafusion::execution::context::SessionState>().cloned();
+            let mut builder = table.table_provider();
+            if let Some(selected) = file_selection {
+                builder = builder.with_file_selection(FileSelection::from_file_paths(selected).with_missing_file_policy(MissingSelectedFilePolicy::Ignore));
+            }
+            if !ordinal_selections.is_empty() {
+                debug!(
+                    "tantivy row selection: {}/{} selections for {} files",
+                    cache_key.0,
+                    self.table_name,
+                    ordinal_selections.len()
+                );
+                builder = builder.with_row_ordinal_selections(ordinal_selections);
+            }
+            if let Some(ss) = session_state {
+                builder = builder.with_session(Arc::new(ss));
+            }
+            let provider: Arc<dyn TableProvider> = Arc::new(builder.build().await.map_err(|e| DataFusionError::External(Box::new(e)))?);
+            return self.scan_via_provider(provider, state, projection, filters, limit).await;
+        }
 
         // Per-(project,table) provider cache: only rebuild when the Delta
         // snapshot version changes. Provider construction is parameter-
@@ -5319,6 +5621,14 @@ impl ProjectRoutingTable {
             self.database.scan_metrics.provider_build_abandoned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
+        self.scan_via_provider(provider, state, projection, filters, limit).await
+    }
+
+    /// Shared tail of the Delta scan: projection-index translation into the
+    /// provider's schema, the provider scan itself, and type coercion.
+    async fn scan_via_provider(
+        &self, provider: Arc<dyn TableProvider>, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
         // Translate projection indices from our schema to delta table's schema.
         // DataFusion passes indices based on ProjectRoutingTable.schema, but the
         // delta table provider expects indices based on its own schema.
@@ -5403,15 +5713,6 @@ impl ProjectRoutingTable {
         Ok(Arc::new(ProjectionExec::try_new(cast_exprs, plan)?))
     }
 
-    /// Helper to scan Delta only (when no MemBuffer data)
-    async fn scan_delta_only(
-        &self, state: &dyn Session, project_id: &str, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let delta_table = self.database.resolve_table(project_id, &self.table_name).await?;
-        let table = delta_table.read().await;
-        self.scan_delta_table(&table, state, projection, filters, limit).await
-    }
-
     /// Read-side coverage gate for the tantivy prefilter. Returns `true` iff
     /// every live Delta file whose `date=` partition overlaps the query window
     /// is present in `covered` (the union of successful indexes' covered files).
@@ -5431,6 +5732,19 @@ impl ProjectRoutingTable {
         };
         let (lo, hi) = window.unwrap_or((i64::MIN, i64::MAX));
         uris.into_iter().filter(|u| u.ends_with(".parquet") && uri_date_in_window(u, lo, hi)).all(|u| covered.contains(&u))
+    }
+
+    /// Read-side dedup skip (`timefusion_read_dedup_skip_swept`): true iff
+    /// every (project, date) partition in the query window carries a clean
+    /// fingerprint that STILL matches the live file set — i.e. a sweep pass
+    /// proved it duplicate-free and nothing has committed to it since. Only
+    /// consulted on Delta-only paths (mem∪delta overlap needs DedupExec).
+    fn dedup_skip_allowed(&self, table: &DeltaTable, project_id: &str, window: Option<(i64, i64)>, dedup_keys: &[String]) -> bool {
+        if dedup_keys.is_empty() || !self.database.config.maintenance.timefusion_read_dedup_skip_swept {
+            return false;
+        }
+        let Some(window) = window else { return false };
+        self.database.dedup_window_clean(table, project_id, &self.table_name, window)
     }
 
     /// Extract time range (min, max) from query filters.
@@ -5671,14 +5985,20 @@ impl TableProvider for ProjectRoutingTable {
         //    caller (us) does NOT compute or pass MemBuffer ids — doing so
         //    would re-introduce the race where a concurrent insert lands a
         //    row in the snapshot that isn't in the pre-computed id set.
-        let text_match_preds = crate::tantivy_index::udf::collect_text_matches(&optimized_filters);
+        let text_match_tree = crate::tantivy_index::udf::collect_text_match_tree(&optimized_filters);
         // Query [lo,hi] timestamp window, shared by the tantivy prefilter (time-
         // prunes the sidecar search + scopes the coverage gate to a needle's
         // window, not every index the project built) and the skip-delta
         // watermark check below.
         let query_time_range = self.extract_time_range_from_filters(&optimized_filters);
         let mut tantivy_id_filter: Option<Expr> = None;
-        if !text_match_preds.is_empty()
+        // Files the prefilter proved hold no matches (zero-hit covering
+        // index) — excluded from the Delta scan when file pruning is on.
+        let mut tantivy_exclude: Option<std::collections::HashSet<String>> = None;
+        // Per-file matching row ordinals (row-selection pushdown), for files
+        // whose covering index was built in parquet row order.
+        let mut tantivy_row_selections: Option<std::collections::HashMap<String, Vec<u64>>> = None;
+        if let Some(tree) = text_match_tree.as_ref()
             && let Some(svc) = self.database.tantivy_search()
         {
             use datafusion::logical_expr::{Expr, lit};
@@ -5690,45 +6010,36 @@ impl TableProvider for ProjectRoutingTable {
             let mut delta_ids: Option<std::collections::HashSet<String>> = None;
             let mut delta_indexed_rows: u64 = 0;
             let mut delta_covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut delta_zero_hit: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut delta_row_sel: std::collections::HashMap<String, Vec<u64>> = std::collections::HashMap::new();
             let mut delta_field_gap = false;
             let mut delta_any_usable = false;
             let mut abort_reason: Option<&'static str> = None;
-            for p in &text_match_preds {
-                match svc.search_with_stats(&self.table_name, &project_id, &p.column, &p.query, max_hits, query_time_range).await {
-                    Ok(Some(result)) => {
-                        delta_any_usable = true;
-                        // MAX, not sum: every predicate's search scans the SAME
-                        // in-window index set, so `indexed_rows` is the same
-                        // denominator each iteration. Summing inflates it N× (N =
-                        // predicate count) and the selectivity cutoff below then
-                        // admits IN-lists it should reject (large-IN planning cost).
-                        delta_indexed_rows = delta_indexed_rows.max(result.indexed_rows);
-                        delta_covered.extend(result.covered_files);
-                        delta_field_gap |= result.field_coverage_gap;
-                        let ids: std::collections::HashSet<String> = result.hits.into_iter().map(|h| h.id).collect();
-                        // Intersect: this is sound only because predicates are AND-ed.
-                        // `collect_text_matches` skips OR subtrees so disjunctive terms
-                        // never reach here (else x_ids ∩ y_ids = ∅ would drop everything).
-                        delta_ids = Some(match delta_ids.take() {
-                            None => ids,
-                            Some(prev) => prev.intersection(&ids).cloned().collect(),
-                        });
-                    }
-                    Ok(None) => {
-                        abort_reason = Some("delta_no_index_or_cap_exceeded");
-                        delta_any_usable = false;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!(
-                            "tantivy search failed for {}/{}: {} — falling back to full scan",
-                            project_id, self.table_name, e
-                        );
-                        crate::metrics::record_tantivy_prefilter_error();
-                        abort_reason = Some("delta_error");
-                        delta_any_usable = false;
-                        break;
-                    }
+            // ONE pass over the in-window index set: the routable predicate
+            // tree compiles to a single tantivy BooleanQuery per index
+            // (And→Must, Or→Should; `collect_text_match_tree` only emits OR
+            // nodes whose every branch is completely covered), hits unioned
+            // across indexes (they cover disjoint row sets).
+            match svc.search_with_stats(&self.table_name, &project_id, tree, max_hits, query_time_range).await {
+                Ok(Some(result)) => {
+                    delta_any_usable = true;
+                    delta_indexed_rows = result.indexed_rows;
+                    delta_covered = result.covered_files;
+                    delta_field_gap = result.field_coverage_gap;
+                    delta_zero_hit = result.zero_hit_files;
+                    delta_row_sel = result.row_selections;
+                    delta_ids = Some(result.hits.into_iter().map(|h| h.id).collect());
+                }
+                Ok(None) => {
+                    abort_reason = Some("delta_no_index_or_cap_exceeded");
+                }
+                Err(e) => {
+                    warn!(
+                        "tantivy search failed for {}/{}: {} — falling back to full scan",
+                        project_id, self.table_name, e
+                    );
+                    crate::metrics::record_tantivy_prefilter_error();
+                    abort_reason = Some("delta_error");
                 }
             }
 
@@ -5771,6 +6082,16 @@ impl TableProvider for ProjectRoutingTable {
                             list:    ids.into_iter().map(lit).collect(),
                             negated: false,
                         }));
+                        // File pruning is only sound once every gate above
+                        // passed (coverage complete, no field gap): a
+                        // zero-hit covering index then proves its files hold
+                        // no matches for the routed predicates.
+                        if tcfg.timefusion_tantivy_file_pruning && !delta_zero_hit.is_empty() {
+                            tantivy_exclude = Some(delta_zero_hit);
+                        }
+                        if tcfg.timefusion_tantivy_row_selection && !delta_row_sel.is_empty() {
+                            tantivy_row_selections = Some(delta_row_sel);
+                        }
                     }
                 }
             } else {
@@ -5820,6 +6141,8 @@ impl TableProvider for ProjectRoutingTable {
         // result can yield < limit distinct rows even when more exist below the
         // cut, and the outer GlobalLimitExec (which DataFusion keeps) can't
         // recover them. Suppress the per-scan limit; the outer limit still caps.
+        // `orig_limit` is restored on Delta-only paths that skip DedupExec.
+        let orig_limit = limit;
         let limit = if dedup_keys.is_empty() { limit } else { None };
 
         let scan_state = parking_lot::Mutex::new(ScanShape::default());
@@ -5827,7 +6150,7 @@ impl TableProvider for ProjectRoutingTable {
             let shape = *scan_state.lock();
             let us = scan_start.elapsed().as_micros() as u64;
             scan_metrics.record_scan(us, shape.skipped_delta, shape.has_mem, shape.has_delta, shape.fast_resolve_hit);
-            if dedup_keys.is_empty() {
+            if dedup_keys.is_empty() || shape.skip_dedup {
                 Ok(plan)
             } else {
                 Ok(Arc::new(crate::read_dedup::DedupExec::new(
@@ -5851,7 +6174,20 @@ impl TableProvider for ProjectRoutingTable {
             if let Some(f) = tantivy_id_filter.clone() {
                 delta_only_filters.push(f);
             }
-            let plan = self.scan_delta_only(state, &project_id, projection, &delta_only_filters, limit).await?;
+            // Skip is only sound when no output-projection restore is needed
+            // (an augmented projection minus DedupExec would leak key columns).
+            let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
+            let table = delta_table.read().await;
+            // Same guard for the dedup gate and the scan: the fingerprint
+            // verdict applies to exactly the snapshot being read.
+            let skip_dedup = output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            if skip_dedup {
+                tag_shape(&|s| s.skip_dedup = true);
+            }
+            let eff_limit = if skip_dedup { orig_limit } else { limit };
+            let plan = self
+                .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
+                .await?;
             return wrap_result(plan);
         };
 
@@ -5882,7 +6218,7 @@ impl TableProvider for ProjectRoutingTable {
         // own atomic per-bucket prefilter inside the bucket lock — we must
         // NOT prepend `tantivy_id_filter` here (that filter is derived from
         // delta-side IDs only and would drop legitimate MemBuffer rows).
-        let mem_partitions = match layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, &text_match_preds) {
+        let mem_partitions = match layer.query_partitioned_with_text_match(&project_id, &self.table_name, &optimized_filters, text_match_tree.as_ref()) {
             Ok(partitions) => partitions,
             Err(e) => {
                 warn!("Failed to query mem buffer: {}", e);
@@ -5899,7 +6235,17 @@ impl TableProvider for ProjectRoutingTable {
                 delta_only_filters.push(f);
             }
             tag_shape(&|s| s.has_delta = true);
-            let plan = self.scan_delta_only(state, &project_id, projection, &delta_only_filters, limit).await?;
+            let delta_table = self.database.resolve_table(&project_id, &self.table_name).await?;
+            let table = delta_table.read().await;
+            // Same guard for the dedup gate and the scan (see branch above).
+            let skip_dedup = output_projection.is_none() && self.dedup_skip_allowed(&table, &project_id, query_time_range, &dedup_keys);
+            if skip_dedup {
+                tag_shape(&|s| s.skip_dedup = true);
+            }
+            let eff_limit = if skip_dedup { orig_limit } else { limit };
+            let plan = self
+                .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
+                .await?;
             return wrap_result(plan);
         }
 
@@ -5969,7 +6315,9 @@ impl TableProvider for ProjectRoutingTable {
             }
         };
         let table = delta_table.read().await;
-        let delta_plan = self.scan_delta_table(&table, state, projection, &delta_filters, limit).await?;
+        let delta_plan = self
+            .scan_delta_table(&table, state, projection, &delta_filters, limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
+            .await?;
         tag_shape(&|s| {
             s.has_mem = true;
             s.has_delta = true;
@@ -6208,6 +6556,24 @@ mod writer_properties_tests {
         let bytes = 321 * 1024 * 1024;
         let rt = build_query_runtime_env(pool, bytes);
         assert_eq!(rt.cache_manager.get_metadata_cache_limit(), bytes);
+    }
+
+    // Read-side dedup skip: fingerprint is order-insensitive but content-
+    // sensitive, and the window→dates expansion bounds itself.
+    #[test]
+    fn dedup_skip_fingerprint_and_window_dates() {
+        let a = vec!["p/date=2026-07-01/f1.parquet".to_string(), "p/date=2026-07-01/f2.parquet".to_string()];
+        let mut b = a.clone();
+        b.reverse();
+        assert_eq!(partition_file_fp(a.clone()), partition_file_fp(b), "order must not matter");
+        let c = vec![a[0].clone()];
+        assert_ne!(partition_file_fp(a), partition_file_fp(c), "content must matter");
+
+        let day = 86_400_000_000i64;
+        assert_eq!(window_dates(0, 0).map(|d| d.len()), Some(1));
+        assert_eq!(window_dates(0, 2 * day).map(|d| d.len()), Some(3));
+        assert_eq!(window_dates(2 * day, 0), None, "inverted window");
+        assert_eq!(window_dates(0, 400 * day), None, "wider than a year → keep DedupExec");
     }
 
     // Fix #4: batches are globally sorted by the declared lead key before write.

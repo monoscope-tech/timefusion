@@ -18,8 +18,16 @@ use timefusion::{
         manifest::{self, ManifestEntry},
         search::TantivySearchService,
         service::TantivyIndexService,
+        udf::TextMatchPred,
     },
 };
+
+fn level_error_node() -> timefusion::tantivy_index::udf::PredNode {
+    timefusion::tantivy_index::udf::PredNode::Leaf(TextMatchPred {
+        column: "level".into(),
+        query:  "ERROR".into(),
+    })
+}
 
 #[allow(dead_code)]
 fn schema_with(level_indexed: bool) -> TableSchema {
@@ -126,6 +134,93 @@ async fn callback_builds_index_and_search_returns_hits() {
 }
 
 #[tokio::test]
+async fn multi_pred_and_is_single_pass_and_conjunctive() {
+    // Two predicates run as ONE combined query per index: only the row
+    // matching BOTH survives, and indexed_rows counts the index set once
+    // (not once per predicate).
+    let table_name = "otel_logs_and_spans";
+    let project_id = "p-multipred";
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default())));
+    let cb = svc.callback();
+    let b = batch(&[(1_000_000, "a", "INFO"), (2_000_000, "b", "ERROR"), (3_000_000, "c", "ERROR")]);
+    cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
+
+    let cache = TempDir::new().unwrap();
+    let search = TantivySearchService::new(store, cache.path().to_path_buf());
+    let preds = vec![
+        TextMatchPred {
+            column: "level".into(),
+            query:  "ERROR".into(),
+        },
+        TextMatchPred {
+            column: "id".into(),
+            query:  "c".into(),
+        },
+    ];
+    let node = timefusion::tantivy_index::udf::PredNode::from_preds(&preds).expect("non-empty");
+    let r = search.search_with_stats(table_name, project_id, &node, 1000, None).await.unwrap().expect("usable");
+    assert_eq!(r.hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), vec!["c".to_string()]);
+    assert_eq!(r.indexed_rows, 3, "denominator must count the index set once, not per predicate");
+}
+
+#[tokio::test]
+async fn single_file_flush_publishes_partition_mirrored_blob() {
+    // A flush commit that added exactly one parquet file must key the
+    // manifest entry by the table-relative path and upload the blob at the
+    // partition-mirrored location (suffix swap), while still covering the
+    // ORIGINAL absolute URI for the coverage gate.
+    let table_name = "otel_logs_and_spans";
+    let project_id = "p-mirrored";
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default())));
+    let cb = svc.callback();
+    let uri = format!("s3://bucket/timefusion/default/{table_name}/project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
+    let rel = format!("project_id={project_id}/date=2026-07-05/part-00000-abc-c000.zstd.parquet");
+    let b = batch(&[(1_000_000, "a", "ERROR")]);
+    cb(project_id.to_string(), table_name.to_string(), vec![b], vec![uri.clone()]).await.unwrap();
+
+    let m = manifest::load(store.as_ref(), table_name, project_id).await.unwrap();
+    let entry = m.entries.get(&rel).expect("manifest keyed by table-relative parquet path");
+    assert_eq!(entry.covered_files, vec![uri], "covered_files must keep the absolute URI");
+    let blob = entry.index.as_ref().expect("index built");
+    assert_eq!(
+        blob,
+        &timefusion::tantivy_index::store::index_path_for_parquet(table_name, &rel).to_string(),
+        "blob must live at the partition-mirrored path"
+    );
+
+    // And the read side must find + query it.
+    let cache = TempDir::new().unwrap();
+    let search = TantivySearchService::new(store, cache.path().to_path_buf());
+    let hits = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[tokio::test]
+async fn reader_cache_avoids_reopen_across_queries() {
+    let table_name = "otel_logs_and_spans";
+    let project_id = "p-readercache";
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
+    let svc = Arc::new(TantivyIndexService::new(store.clone(), Arc::new(TantivyConfig::default())));
+    let cb = svc.callback();
+    let b = batch(&[(1_000_000, "a", "ERROR")]);
+    cb(project_id.to_string(), table_name.to_string(), vec![b], vec!["f1".into()]).await.unwrap();
+
+    let cache = TempDir::new().unwrap();
+    let search = TantivySearchService::new(store, cache.path().to_path_buf());
+    for _ in 0..3 {
+        let hits = search.search(table_name, project_id, "level", "ERROR").await.unwrap().unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+    assert_eq!(
+        search.index_opens.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "one cold open; subsequent queries must hit the reader LRU"
+    );
+}
+
+#[tokio::test]
 async fn callback_skips_when_table_not_indexed() {
     // Tantivy is now auto-on for any table whose schema declares
     // `tantivy.indexed: true` fields. Pass a synthetic table name with
@@ -159,6 +254,7 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
             max_timestamp_micros: None,
             error:                Some("simulated build failure".into()),
             covered_files:        vec![],
+ordinals_valid: false,
         },
     )
     .await
@@ -261,7 +357,7 @@ async fn search_time_prunes_non_overlapping_indexes() {
 
     // Window around the OLD index only → prune the NEW one.
     let r = search
-        .search_with_stats(table_name, project_id, "level", "ERROR", 1000, Some((old_ts - 100, old_ts + 100)))
+        .search_with_stats(table_name, project_id, &level_error_node(), 1000, Some((old_ts - 100, old_ts + 100)))
         .await
         .unwrap()
         .expect("old index overlaps → usable");
@@ -272,7 +368,7 @@ async fn search_time_prunes_non_overlapping_indexes() {
     );
 
     // No range → both indexes searched (unchanged behavior).
-    let r_all = search.search_with_stats(table_name, project_id, "level", "ERROR", 1000, None).await.unwrap().unwrap();
+    let r_all = search.search_with_stats(table_name, project_id, &level_error_node(), 1000, None).await.unwrap().unwrap();
     let mut all: Vec<String> = r_all.hits.iter().map(|h| h.id.clone()).collect();
     all.sort();
     assert_eq!(all, vec!["new1".to_string(), "old1".to_string()], "no range must search all indexes");

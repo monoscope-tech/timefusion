@@ -2030,11 +2030,11 @@ impl BufferedWriteLayer {
     /// routing layer when text_match predicates are present — guarantees
     /// the per-bucket prefilter and the returned snapshot reflect the same
     /// point-in-time bucket state. Falls through to `query_partitioned`
-    /// behavior when `preds` is empty or the table has no indexed fields.
+    /// behavior when `node` is None or the table has no indexed fields.
     pub fn query_partitioned_with_text_match(
-        &self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr], preds: &[crate::tantivy_index::udf::TextMatchPred],
+        &self, project_id: &str, table_name: &str, filters: &[datafusion::logical_expr::Expr], node: Option<&crate::tantivy_index::udf::PredNode>,
     ) -> anyhow::Result<Vec<Vec<RecordBatch>>> {
-        self.mem_buffer.query_partitioned_with_text_match(project_id, table_name, filters, preds)
+        self.mem_buffer.query_partitioned_with_text_match(project_id, table_name, filters, node)
     }
 
     /// Check if a table exists in the memory buffer.

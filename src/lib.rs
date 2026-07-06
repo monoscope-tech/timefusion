@@ -6,6 +6,7 @@ pub mod bootstrap;
 pub mod buffered_write_layer;
 pub mod clock;
 pub mod config;
+pub mod count_pushdown;
 pub mod database;
 pub mod dml;
 pub mod dml_coalescer;

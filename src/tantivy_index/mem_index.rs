@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use arrow::record_batch::RecordBatch;
-use tantivy::{Index, query::QueryParser};
+use tantivy::Index;
 
 use crate::{
     schema_loader::TableSchema,
@@ -79,14 +79,19 @@ impl BucketTextIndex {
 
     /// Run a `text_match`-style query against this index and return hits.
     pub fn search(&self, pred: &TextMatchPred) -> Result<Vec<Hit>> {
-        let schema = self.index.schema();
-        let field = schema.get_field(&pred.column).map_err(|_| anyhow!("field {} not in mem-index", pred.column))?;
-        let mut qp = QueryParser::for_index(&self.index, vec![field]);
-        // AND multi-token queries — see comments in search.rs for why this
-        // is critical for n-gram-indexed columns.
-        qp.set_conjunction_by_default();
-        let q = qp.parse_query(&pred.query).map_err(|e| anyhow!("parse mem-index query '{}': {e}", pred.query))?;
-        crate::tantivy_index::reader::query_index(&self.index, &*q, None)
+        self.search_node(&crate::tantivy_index::udf::PredNode::Leaf(pred.clone()))
+    }
+
+    /// Evaluate a routable predicate tree as ONE combined query. Shares the
+    /// query builder with the Delta sidecar search so both sides interpret
+    /// predicates identically (And→Must, Or→Should).
+    pub fn search_node(&self, node: &crate::tantivy_index::udf::PredNode) -> Result<Vec<Hit>> {
+        match crate::tantivy_index::reader::build_node_query(&self.index, node)? {
+            crate::tantivy_index::reader::PredsQuery::MissingField => {
+                Err(anyhow!("field not in mem-index (schema drift within bucket lifetime)"))
+            }
+            crate::tantivy_index::reader::PredsQuery::Query(q) => crate::tantivy_index::reader::query_index(&self.index, &*q, None),
+        }
     }
 }
 

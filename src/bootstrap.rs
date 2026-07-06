@@ -140,6 +140,10 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db.setup_session_tables(&mut session_context)?;
     // Non-blocking: snapshot load + footer warm-up off the first query's path.
     db.preload_tables();
+    // Non-blocking: index live files no manifest entry covers (config-gated),
+    // and warm the local index cache with recent blobs (config-gated).
+    db.spawn_tantivy_backfill();
+    db.spawn_tantivy_prefetch();
 
     Ok(Bootstrapped {
         db,

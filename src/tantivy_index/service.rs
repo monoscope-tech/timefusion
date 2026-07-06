@@ -87,25 +87,43 @@ impl TantivyIndexService {
     async fn build_and_publish(
         &self, project_id: &str, table_name: &str, batches: Vec<arrow::record_batch::RecordBatch>, added_files: Vec<String>,
     ) -> Result<()> {
+        // Partition-mirrored 1:1 path when the commit added exactly one file
+        // (the common case: a 10-min bucket lands in one date partition).
+        // Multi-file commits keep the legacy one-blob-covers-all shape — rows
+        // can't be attributed to files without re-deriving the partition
+        // split, and a multi-covered entry is still correct for coverage.
+        if added_files.len() == 1
+            && let Some(rel) = parquet_rel_of_uri(&added_files[0])
+        {
+            let rel = rel.to_string();
+            let path = store::index_path_for_parquet(table_name, &rel);
+            // ordinals_valid=false: flush batches are indexed BEFORE the
+            // Delta writer's sort, so doc order ≠ parquet row order.
+            return self.build_pack_upload(table_name, project_id, &rel, path, added_files, batches, false).await;
+        }
         let bucket_uuid = Uuid::new_v4().to_string();
         let path = store::blob_path(table_name, project_id, &bucket_uuid);
-        self.build_pack_upload(table_name, project_id, &bucket_key(&bucket_uuid), path, added_files, batches).await
+        self.build_pack_upload(table_name, project_id, &bucket_key(&bucket_uuid), path, added_files, batches, false).await
     }
 
     /// Build & publish an index for a single already-committed parquet file,
     /// reading it back from `delta_store` (rooted at the table), keyed by the
     /// table-RELATIVE `parquet_rel` at the deterministic partition-mirrored
-    /// path. Idempotent. The reused primitive behind reconcile/backfill/reindex
-    /// (none hold the live flush batches). Not yet wired into the live path:
-    /// its relative keying doesn't match the absolute-URI flush entries the
-    /// coverage gate / `gc_after_compaction` check, pending Phase-3 unification.
-    pub async fn build_index_for_file(&self, table_name: &str, project_id: &str, parquet_rel: &str, delta_store: Arc<dyn ObjectStore>) -> Result<()> {
+    /// path. `parquet_uri` is the same file as it appears in
+    /// `get_file_uris()` — recorded in `covered_files` so the coverage gate
+    /// and `gc_after_compaction` (both URI-keyed) recognize the entry.
+    /// Idempotent. The reused primitive behind compaction-reindex/backfill.
+    pub async fn build_index_for_file(
+        &self, table_name: &str, project_id: &str, parquet_rel: &str, parquet_uri: &str, delta_store: Arc<dyn ObjectStore>,
+    ) -> Result<()> {
         let batches = store::read_parquet_batches(delta_store, parquet_rel).await?;
         if batches.is_empty() {
             return Ok(());
         }
         let path = store::index_path_for_parquet(table_name, parquet_rel);
-        self.build_pack_upload(table_name, project_id, parquet_rel, path, vec![parquet_rel.to_string()], batches).await
+        // ordinals_valid=true: batches came from the committed parquet in row
+        // order, so `_row_ordinal` is a valid parquet row index.
+        self.build_pack_upload(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], batches, true).await
     }
 
     /// Build+pack `batches`, upload to `blob_path`, and upsert the manifest
@@ -115,7 +133,7 @@ impl TantivyIndexService {
     /// (parquet-rel key + partition-mirrored path).
     async fn build_pack_upload(
         &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>,
-        batches: Vec<arrow::record_batch::RecordBatch>,
+        batches: Vec<arrow::record_batch::RecordBatch>, ordinals_valid: bool,
     ) -> Result<()> {
         let svc_table = schema_loader::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?.clone();
         let level = self.config.compression_level();
@@ -132,6 +150,7 @@ impl TantivyIndexService {
                     max_timestamp_micros: None,
                     error:                Some(format!("build failed: {e}")),
                     covered_files:        covered_files.clone(),
+                    ordinals_valid:       false,
                 };
                 let _ = manifest::upsert(self.object_store.as_ref(), table_name, project_id, manifest_key, entry).await;
                 warn!("tantivy build failed for {project_id}/{table_name}: {e}");
@@ -149,6 +168,7 @@ impl TantivyIndexService {
             max_timestamp_micros: stats.max_timestamp_micros,
             error: None,
             covered_files,
+            ordinals_valid,
         };
         manifest::upsert(self.object_store.as_ref(), table_name, project_id, manifest_key, entry).await?;
         self.observe_newest(stats.max_timestamp_micros);
@@ -158,6 +178,22 @@ impl TantivyIndexService {
 
 fn bucket_key(uuid: &str) -> String {
     format!("bucket-{uuid}")
+}
+
+/// Table-relative parquet path from an absolute add-file URI, anchored at the
+/// `project_id=` partition segment (all indexed tables partition by
+/// [project_id, date]). `None` for URIs that don't follow the layout —
+/// callers fall back to the legacy flat blob path.
+pub fn parquet_rel_of_uri(uri: &str) -> Option<&str> {
+    let idx = uri.find("project_id=")?;
+    let rel = &uri[idx..];
+    rel.ends_with(".parquet").then_some(rel)
+}
+
+/// project_id encoded in an add-file URI's partition segment.
+pub fn project_id_of_uri(uri: &str) -> Option<&str> {
+    let rel = &uri[uri.find("project_id=")? + "project_id=".len()..];
+    rel.split('/').next().filter(|s| !s.is_empty())
 }
 
 impl TantivyIndexService {

@@ -384,8 +384,9 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
 /// through the tantivy id-prefilter (route_equality=true) after flush. Verifies
 /// (a) correctness — the prefiltered result equals the full-scan baseline, no
 /// rows dropped/duplicated; (b) the OR-safety regression: `level='ERROR' OR
-/// name='billing'` must NOT collapse to ∅ (the 2026-06-16 bug) — `collect_text_matches`
-/// skips the OR subtree, so the scan falls back and the original predicate runs.
+/// name='billing'` must NOT collapse to ∅ (the 2026-06-16 bug) — `name` is
+/// ngram3 so its `=` isn't routed, `collect_text_match_tree` marks the OR
+/// opaque, the scan falls back, and the original predicate runs.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn flushed_eq_prefilter_matches_baseline_and_or_is_safe() -> Result<()> {
@@ -421,6 +422,53 @@ async fn flushed_eq_prefilter_matches_baseline_and_or_is_safe() -> Result<()> {
     let or_off = collect_ids(&ctx2, &q_or).await?;
     assert_eq!(or_on, or_off, "OR of two `=`s must match baseline (no empty-intersection bug)");
     assert_eq!(or_on, vec!["k1".to_string(), "k3".to_string(), "k4".to_string()]);
+    Ok(())
+}
+
+/// OR-union + IN-list routing: a disjunction of two ROUTABLE raw `=`s and an
+/// `id IN (...)` list both engage the prefilter (PredTree Or → tantivy
+/// Should) and must match the full-scan baseline exactly.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn flushed_or_union_and_in_list_match_baseline() -> Result<()> {
+    let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+    let (db, ctx, svc) = build_db(&format!("{id}-orin-on"), true).await?;
+    let (db2, ctx2, _) = build_db(&format!("{id}-orin-off"), false).await?;
+    let p = unique_project();
+    let svc = svc.expect("tantivy enabled");
+
+    let rows = vec![
+        ("k1", "auth", "login failed: bad password"), // ERROR
+        ("k2", "auth", "login successful"),           // INFO
+        ("k3", "billing", "charge declined"),         // ERROR
+        ("k4", "billing", "charge succeeded"),        // INFO
+    ];
+    db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
+    db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
+    db.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    db2.buffered_layer().cloned().unwrap().flush_all_now().await?;
+    wait_for_manifest_entries(svc.object_store.as_ref(), &p, 1).await?;
+
+    // OR of two raw `=`s (level and id are both raw-tokenized): union.
+    let q_or = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND (level = 'ERROR' OR id = 'k4')");
+    let on = collect_ids(&ctx, &q_or).await?;
+    let off = collect_ids(&ctx2, &q_or).await?;
+    assert_eq!(on, off, "routable OR must union, not intersect");
+    assert_eq!(on, vec!["k1".to_string(), "k3".to_string(), "k4".to_string()]);
+
+    // IN-list on a raw column routes as OR-of-terms.
+    let q_in = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND id IN ('k2','k3')");
+    let on = collect_ids(&ctx, &q_in).await?;
+    let off = collect_ids(&ctx2, &q_in).await?;
+    assert_eq!(on, off, "IN-list routing must match baseline");
+    assert_eq!(on, vec!["k2".to_string(), "k3".to_string()]);
+
+    // NOT IN must never be routed (no term form) — baseline correctness only.
+    let q_nin = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND id NOT IN ('k2','k3')");
+    let on = collect_ids(&ctx, &q_nin).await?;
+    let off = collect_ids(&ctx2, &q_nin).await?;
+    assert_eq!(on, off);
+    assert_eq!(on, vec!["k1".to_string(), "k4".to_string()]);
     Ok(())
 }
 
@@ -463,7 +511,16 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
     let cache_root = std::path::PathBuf::from(format!("/tmp/timefusion-tantivy-e2e-{id}-uuideq-on"));
     let search = TantivySearchService::new(svc.object_store.clone(), cache_root);
     let hits: Vec<String> = search
-        .search_with_stats(TABLE, &p, "id", uid, 1000, None)
+        .search_with_stats(
+            TABLE,
+            &p,
+            &timefusion::tantivy_index::udf::PredNode::Leaf(timefusion::tantivy_index::udf::TextMatchPred {
+                column: "id".into(),
+                query:  uid.into(),
+            }),
+            1000,
+            None,
+        )
         .await?
         .map(|r| r.hits.into_iter().map(|h| h.id).collect())
         .unwrap_or_default();

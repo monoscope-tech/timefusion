@@ -101,7 +101,9 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
         stats.min_timestamp_micros = Some(stats.min_timestamp_micros.map_or(ts, |m| m.min(ts)));
         stats.max_timestamp_micros = Some(stats.max_timestamp_micros.map_or(ts, |m| m.max(ts)));
         let id = id_extract(row).unwrap_or_default();
-        let mut doc = doc!(built.timestamp => ts, built.id => id);
+        // stats.rows counts docs already added → the global ordinal of this
+        // one, valid as a parquet row index only for read-back builds.
+        let mut doc = doc!(built.timestamp => ts, built.id => id, built.row_ordinal => stats.rows);
         for uc in &user_cols {
             if uc.column.is_null(row) {
                 continue;

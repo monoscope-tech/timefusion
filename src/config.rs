@@ -384,13 +384,38 @@ pub struct TantivyConfig {
     pub timefusion_tantivy_prefilter_min_selectivity_pct: u32,
     /// Route exact `col = 'lit'` on raw-tokenized high-cardinality columns
     /// (trace_id/span_id/id/parent_id) through the tantivy id-prefilter, not
-    /// just LIKE. Correctness-safe under OR: `collect_text_matches` skips OR
-    /// subtrees, so an equality under a disjunction falls back to a plain scan,
-    /// and the original `=` predicate is always preserved as the post-filter
-    /// backstop. Targets the ~6× trace/span lookup gap vs the indexed PG path.
+    /// just LIKE (and `IN`-lists as OR-of-terms). Correctness-safe under OR:
+    /// `collect_text_match_tree` only routes a disjunction when every branch
+    /// is completely covered by a text_match, and the original predicate is
+    /// always preserved as the post-filter backstop. Targets the ~6× trace/
+    /// span lookup gap vs the indexed PG path.
     /// Default ON; set false to revert to bloom/stats-only equality pruning.
     #[serde(default = "d_true")]
     pub timefusion_tantivy_route_equality:                bool,
+    /// Startup backfill: build partition-mirrored indexes for live parquet
+    /// files no successful manifest entry covers (pre-tantivy history, failed
+    /// builds, files landed while the feature was off). Oldest-first, bounded
+    /// concurrency; each covered file widens the windows where the prefilter
+    /// can engage. Off by default — reads every uncovered file back from S3.
+    #[serde(default)]
+    pub timefusion_tantivy_backfill:                      bool,
+    /// File-level scan pruning: when the prefilter engages, files whose
+    /// covering index returned zero hits are excluded from the Delta scan
+    /// entirely (needle queries read only the files that can match). Off
+    /// switch for instant rollback to id-IN-list-only pruning.
+    #[serde(default = "d_true")]
+    pub timefusion_tantivy_file_pruning:                  bool,
+    /// Warm the local index cache with blobs whose data is at most this many
+    /// days old, at startup (0 = off). Turns the cold-window download cliff
+    /// into a background cost after restarts.
+    #[serde(default)]
+    pub timefusion_tantivy_prefetch_days:                 u32,
+    /// Row-selection pushdown: when the prefilter engages, files whose index
+    /// was built in parquet row order get a per-file ParquetAccessPlan so the
+    /// reader decodes only matching row groups/rows. Off switch for instant
+    /// rollback to id-IN-list-only filtering inside surviving files.
+    #[serde(default = "d_true")]
+    pub timefusion_tantivy_row_selection:                 bool,
 }
 
 impl TantivyConfig {
@@ -903,6 +928,20 @@ pub struct MaintenanceConfig {
     /// Days back (plus today) the dedup sweep scans. See `d_dedup_lookback_days`.
     #[serde(default = "d_dedup_lookback_days")]
     pub timefusion_dedup_lookback_days:             u64,
+    /// Skip the read-side DedupExec (and restore per-scan LIMIT pushdown) for
+    /// Delta-only queries whose every in-window (project, date) partition was
+    /// verified duplicate-free by a sweep pass AND whose file set is unchanged
+    /// since (fingerprint match). Off by default until COUNT parity is
+    /// validated on prod-shaped data.
+    #[serde(default)]
+    pub timefusion_read_dedup_skip_swept:           bool,
+    /// Answer gate-eligible `SELECT COUNT(*) ... WHERE project_id AND
+    /// timestamp range` from Delta add-action stats (zero parquet IO). Only
+    /// fires when the window is fully flushed, dedup-provably-clean, and
+    /// every overlapping file lies entirely inside the window — otherwise
+    /// the normal scan runs. See src/count_pushdown.rs.
+    #[serde(default = "d_true")]
+    pub timefusion_count_pushdown:                  bool,
     /// Byte ceiling per dedup chunk rewrite, measured as COMPRESSED on-disk
     /// bytes (`sum(add.size)`). Cheap early-out. See `d_dedup_max_rewrite_bytes`.
     #[serde(default = "d_dedup_max_rewrite_bytes")]

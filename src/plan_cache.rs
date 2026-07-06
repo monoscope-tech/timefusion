@@ -329,10 +329,94 @@ pub fn global() -> Option<std::sync::Arc<PlanCacheHook>> {
 /// that just clears the cache once exceeded — cheap, correct, and never holds
 /// a lock across the await in `handle_simple_query`.
 pub struct PlanCacheHook {
-    cache:    dashmap::DashMap<String, LogicalPlan>,
-    capacity: usize,
-    hits:     std::sync::atomic::AtomicU64,
-    misses:   std::sync::atomic::AtomicU64,
+    cache:       dashmap::DashMap<String, LogicalPlan>,
+    capacity:    usize,
+    hits:        std::sync::atomic::AtomicU64,
+    misses:      std::sync::atomic::AtomicU64,
+    /// Shape cache for LITERAL-bearing SELECTs (generated dashboard SQL that
+    /// never repeats verbatim): keyed by the statement with every string
+    /// literal replaced by `$N`, storing the pre-optimized placeholder plan +
+    /// inferred parameter types. A hit clones the plan and substitutes the
+    /// query's actual literals (cast to the inferred types) — skipping parse,
+    /// analyze, AND optimize. `None` = negative entry: this shape failed to
+    /// plan/parameterize once; don't retry it per query.
+    shapes:      dashmap::DashMap<String, Option<ShapeEntry>>,
+    /// Canonical texts we served a pre-optimized substituted plan for, so
+    /// `was_pre_optimized` can tell the handler to skip `state.optimize()`.
+    /// Literal-bearing texts are one-shot (next dashboard refresh has new
+    /// literals), so recency semantics with a soft cap are enough — a false
+    /// `false` after eviction merely re-optimizes an optimized plan.
+    served:      dashmap::DashMap<String, ()>,
+    shape_hits:  std::sync::atomic::AtomicU64,
+    shape_skips: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone)]
+struct ShapeEntry {
+    plan:        LogicalPlan,
+    /// Inferred DataType per `$N` (index 0 = `$1`); substituted literals are
+    /// cast to these so the plan's expression types stay exact.
+    param_types: Vec<Option<datafusion::arrow::datatypes::DataType>>,
+}
+
+/// Statements whose optimized plan embeds the QUERY START TIME must never be
+/// cached: DataFusion const-folds these Stable functions during
+/// `state.optimize()` (SimplifyExpressions reads query_execution_start_time),
+/// so a cached plan would freeze `now()` at first-build time and serve stale
+/// windows forever. Applies to BOTH the `$N` template cache and the shape
+/// cache — such statements re-plan per query instead.
+fn contains_plan_time_folded_fn(stmt: &Statement) -> bool {
+    use std::ops::ControlFlow;
+
+    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, visit_expressions};
+    const TIME_FNS: &[&str] = &[
+        "now",
+        "current_timestamp",
+        "current_date",
+        "current_time",
+        "localtimestamp",
+        "localtime",
+        "statement_timestamp",
+        "transaction_timestamp",
+        "clock_timestamp",
+        "today",
+    ];
+    let mut found = false;
+    let _: ControlFlow<()> = visit_expressions(stmt, |e: &SqlExpr| {
+        if let SqlExpr::Function(f) = e
+            && let Some(name) = f.name.0.last()
+            && let Some(ident) = name.as_ident()
+            && TIME_FNS.contains(&ident.value.to_lowercase().as_str())
+        {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// Replace every string literal in a SELECT with `$N` (walk order), returning
+/// the parameterized statement + the extracted values. `None` when there's
+/// nothing to extract. Numbers/booleans stay inline — they steer plan shape
+/// (LIMIT, bucket sizes) and vary little; strings carry the high-churn values
+/// (timestamps, project ids, search terms).
+fn parameterize_statement(stmt: &Statement) -> Option<(Statement, Vec<ScalarValue>)> {
+    use std::ops::ControlFlow;
+
+    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value, visit_expressions_mut};
+    let mut stmt = stmt.clone();
+    let mut values: Vec<ScalarValue> = Vec::new();
+    let _: ControlFlow<()> = visit_expressions_mut(&mut stmt, |e: &mut SqlExpr| {
+        if let SqlExpr::Value(vs) = e
+            && let Value::SingleQuotedString(s) = &vs.value
+        {
+            values.push(ScalarValue::Utf8(Some(s.clone())));
+            vs.value = Value::Placeholder(format!("${}", values.len()));
+        }
+        ControlFlow::Continue(())
+    });
+    (!values.is_empty()).then_some((stmt, values))
 }
 
 impl Default for PlanCacheHook {
@@ -344,10 +428,14 @@ impl Default for PlanCacheHook {
 impl PlanCacheHook {
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache:    dashmap::DashMap::new(),
-            capacity: capacity.max(1),
-            hits:     std::sync::atomic::AtomicU64::new(0),
-            misses:   std::sync::atomic::AtomicU64::new(0),
+            cache:       dashmap::DashMap::new(),
+            capacity:    capacity.max(1),
+            hits:        std::sync::atomic::AtomicU64::new(0),
+            misses:      std::sync::atomic::AtomicU64::new(0),
+            shapes:      dashmap::DashMap::new(),
+            served:      dashmap::DashMap::new(),
+            shape_hits:  std::sync::atomic::AtomicU64::new(0),
+            shape_skips: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -355,6 +443,78 @@ impl PlanCacheHook {
     pub fn counters(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         (self.hits.load(Relaxed), self.misses.load(Relaxed))
+    }
+
+    /// Returns (shape_hits, shape_skips) for stats observability.
+    pub fn shape_counters(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.shape_hits.load(Relaxed), self.shape_skips.load(Relaxed))
+    }
+
+    /// Shape-cache path for literal-bearing SELECTs. Returns a fully
+    /// substituted, pre-optimized plan, or `None` to fall back to the normal
+    /// parse→optimize pipeline. Every failure installs a negative entry so a
+    /// shape that can't parameterize is only attempted once.
+    async fn try_shape_cached_plan(&self, statement: &Statement, canonical: &str, session_context: &SessionContext) -> Option<LogicalPlan> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !matches!(statement, Statement::Query(_)) {
+            return None;
+        }
+        let (param_stmt, values) = parameterize_statement(statement)?;
+        let shape_key = param_stmt.to_string();
+
+        let entry: Option<ShapeEntry> = match self.shapes.get(&shape_key) {
+            Some(e) => e.value().clone(), // Some(entry) hit / None negative
+            None => {
+                // Build the placeholder plan once for this shape.
+                let state = session_context.state();
+                let built = match state.statement_to_plan(DfStatement::Statement(Box::new(param_stmt))).await {
+                    Ok(p) => state.optimize(&p).ok(),
+                    Err(_) => None,
+                };
+                let built = built.and_then(|plan| {
+                    let types = plan.get_parameter_types().ok()?;
+                    let param_types = (1..=values.len()).map(|i| types.get(&format!("${i}")).cloned().flatten()).collect();
+                    Some(ShapeEntry { plan, param_types })
+                });
+                if built.is_none() {
+                    self.shape_skips.fetch_add(1, Relaxed);
+                    debug!(target: "plan_cache", "shape negative-cached: {shape_key}");
+                }
+                // Soft cap shares the template cache's philosophy: clear half
+                // on overflow (shape variety should be tiny in steady state).
+                if self.shapes.len() >= self.capacity {
+                    let cap = self.capacity;
+                    self.shapes.retain(|_, _| fastrand::usize(..cap) >= cap / 2);
+                }
+                self.shapes.insert(shape_key.clone(), built.clone());
+                built
+            }
+        };
+        let entry = entry?; // negative entry → normal path
+
+        // Substitute this query's literals, cast to the inferred types.
+        let cast_values: Vec<ScalarValue> = values
+            .into_iter()
+            .zip(entry.param_types.iter())
+            .map(|(v, ty)| match ty {
+                Some(t) => v.cast_to(t).unwrap_or(v),
+                None => v,
+            })
+            .collect();
+        let plan = entry
+            .plan
+            .clone()
+            .replace_params_with_values(&ParamValues::List(cast_values.into_iter().map(Into::into).collect()))
+            .ok()?;
+        let plan = fold_literal_casts(plan).ok()?;
+        self.shape_hits.fetch_add(1, Relaxed);
+        // Mark so `was_pre_optimized` lets the handler skip state.optimize().
+        if self.served.len() >= 4096 {
+            self.served.retain(|_, _| fastrand::bool());
+        }
+        self.served.insert(canonical.to_string(), ());
+        Some(plan)
     }
 
     /// Cheap pre-check on the AST kind. Skipping non-DML before paying for
@@ -402,9 +562,18 @@ impl QueryHook for PlanCacheHook {
         if !Self::kind_is_cacheable(statement) {
             return None;
         }
+        // now()/current_date/... are const-folded by the optimizer using the
+        // query start time — a cached optimized plan would freeze them. Plan
+        // fresh every time for such statements (template AND shape paths).
+        if contains_plan_time_folded_fn(statement) {
+            return None;
+        }
         let canonical = statement.to_string();
         if !Self::has_placeholder(&canonical) {
-            return None;
+            // Literal-bearing SELECT: try the shape cache (parameterize →
+            // cached placeholder plan → substitute). Falls back to the
+            // normal pipeline on any miss/failure.
+            return self.try_shape_cached_plan(statement, &canonical, session_context).await.map(Ok);
         }
 
         // Lock-free read: DashMap.get returns a guard that just locks the
@@ -560,6 +729,55 @@ impl QueryHook for PlanCacheHook {
     /// short-circuit) — at most a few hundred microseconds of redundant
     /// work, well below the per-query budget. No correctness risk.
     fn was_pre_optimized(&self, canonical_sql: &str) -> bool {
-        self.cache.contains_key(canonical_sql)
+        self.cache.contains_key(canonical_sql) || self.served.contains_key(canonical_sql)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(sql: &str) -> Statement {
+        use datafusion::sql::sqlparser::{dialect::PostgreSqlDialect, parser::Parser};
+        Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap().remove(0)
+    }
+
+    #[test]
+    fn parameterize_extracts_strings_in_walk_order_and_skips_numbers() {
+        let stmt = parse("SELECT id FROM t WHERE project_id = 'p1' AND ts > '2026-07-01' AND n = 5 LIMIT 100");
+        let (param, values) = parameterize_statement(&stmt).expect("has string literals");
+        let text = param.to_string();
+        assert!(text.contains("$1") && text.contains("$2"), "strings become placeholders: {text}");
+        assert!(text.contains("= 5") && text.contains("LIMIT 100"), "numbers stay inline: {text}");
+        assert_eq!(
+            values,
+            vec![ScalarValue::Utf8(Some("p1".into())), ScalarValue::Utf8(Some("2026-07-01".into()))],
+            "values extracted in walk order"
+        );
+        // Same shape with different literals → identical shape key.
+        let stmt2 = parse("SELECT id FROM t WHERE project_id = 'p2' AND ts > '2026-07-04' AND n = 5 LIMIT 100");
+        let (param2, _) = parameterize_statement(&stmt2).unwrap();
+        assert_eq!(text, param2.to_string(), "shape key must be literal-insensitive");
+    }
+
+    #[test]
+    fn parameterize_none_without_string_literals() {
+        assert!(parameterize_statement(&parse("SELECT count(*) FROM t WHERE n = 5")).is_none());
+    }
+
+    #[test]
+    fn time_functions_disqualify_caching() {
+        // Optimizer const-folds these from the query start time — caching the
+        // optimized plan would freeze the window (2026-07-05 review finding).
+        for sql in [
+            "SELECT id FROM t WHERE project_id = 'p' AND ts > now()",
+            "SELECT id FROM t WHERE project_id = 'p' AND d = current_date",
+            "SELECT id FROM t WHERE project_id = 'p' AND ts > NOW() - INTERVAL '1 hour'",
+        ] {
+            assert!(contains_plan_time_folded_fn(&parse(sql)), "{sql}");
+        }
+        assert!(!contains_plan_time_folded_fn(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > '2026-07-01'")));
+        // A column merely NAMED now must not disqualify.
+        assert!(!contains_plan_time_folded_fn(&parse("SELECT now FROM t WHERE project_id = 'p'")));
     }
 }

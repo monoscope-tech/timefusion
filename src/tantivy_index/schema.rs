@@ -44,12 +44,18 @@ pub const RAW_TOKENIZER: &str = "raw";
 
 pub const TS_FIELD: &str = "_timestamp";
 pub const ID_FIELD: &str = "_id";
+/// Global row offset of the doc within the file the index covers (FAST).
+/// Only meaningful when the index was built by reading the parquet back in
+/// row order (`ManifestEntry.ordinals_valid`) — the flush path indexes
+/// pre-sort batches whose order differs from the written file.
+pub const ROW_ORDINAL_FIELD: &str = "_row_ordinal";
 
 /// Result of building a tantivy schema for a table.
 pub struct BuiltSchema {
     pub schema:      Schema,
     pub timestamp:   Field,
     pub id:          Field,
+    pub row_ordinal: Field,
     /// Map of source-column-name → tantivy field. Only contains user columns
     /// that were `indexed: true` in YAML. Variants/lists are included here.
     pub user_fields: HashMap<String, UserField>,
@@ -65,6 +71,7 @@ pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
     let mut b = SchemaBuilder::new();
     let timestamp = b.add_i64_field(TS_FIELD, NumericOptions::default() | STORED | FAST | INDEXED);
     let id = b.add_text_field(ID_FIELD, raw_id_options());
+    let row_ordinal = b.add_u64_field(ROW_ORDINAL_FIELD, NumericOptions::default() | FAST);
 
     let mut user_fields = HashMap::new();
     for fd in &table.fields {
@@ -83,12 +90,19 @@ pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
         schema: b.build(),
         timestamp,
         id,
+        row_ordinal,
         user_fields,
     }
 }
 
 fn raw_id_options() -> TextOptions {
-    TextOptions::default().set_indexing_options(TextFieldIndexing::default().set_tokenizer("raw").set_index_option(IndexRecordOption::Basic)) | STORED
+    // FAST (raw-normalized) lets the reader pull hit ids from the columnar
+    // store instead of per-doc doc-store fetches. STORED is kept so indexes
+    // remain readable by the pre-fast-field fallback path (and older readers).
+    TextOptions::default()
+        .set_indexing_options(TextFieldIndexing::default().set_tokenizer("raw").set_index_option(IndexRecordOption::Basic))
+        .set_fast(Some("raw"))
+        | STORED
 }
 
 /// Map a YAML tokenizer name to tantivy `TextOptions`. Unknown names fall

@@ -43,6 +43,13 @@ pub struct ManifestEntry {
     /// will deserialize to an empty Vec.
     #[serde(default)]
     pub covered_files:        Vec<String>,
+    /// True when the index's `_row_ordinal` fast field equals parquet row
+    /// order — i.e. the index was built by reading the committed file back
+    /// (compaction reindex / backfill). Flush-path indexes see batches
+    /// BEFORE the writer's sort, so their ordinals must not drive row
+    /// selection. Old entries deserialize to false.
+    #[serde(default)]
+    pub ordinals_valid:       bool,
 }
 
 impl Default for Manifest {
@@ -80,8 +87,19 @@ pub async fn save(store: &dyn ObjectStore, table: &str, project_id: &str, manife
 }
 
 /// Load the manifest, apply `f`, and save it back. The shared load/save
-/// skeleton behind `upsert` and `remove_many`.
+/// skeleton behind `upsert` and `remove_many`. Serialized per
+/// (table, project_id) — concurrent bucket flushes upserting the same
+/// manifest would otherwise interleave load/save and drop each other's
+/// entries (last-writer-wins), silently un-covering files and disabling
+/// the prefilter via the coverage gate.
 async fn mutate<F: FnOnce(&mut Manifest)>(store: &dyn ObjectStore, table: &str, project_id: &str, f: F) -> Result<()> {
+    static LOCKS: std::sync::OnceLock<dashmap::DashMap<(String, String), std::sync::Arc<tokio::sync::Mutex<()>>>> = std::sync::OnceLock::new();
+    let lock = LOCKS
+        .get_or_init(Default::default)
+        .entry((table.to_string(), project_id.to_string()))
+        .or_default()
+        .clone();
+    let _guard = lock.lock().await;
     let mut m = load(store, table, project_id).await?;
     f(&mut m);
     save(store, table, project_id, &m).await
