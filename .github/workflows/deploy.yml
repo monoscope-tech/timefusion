@@ -42,7 +42,12 @@ jobs:
 
       - name: Preset Image Name
         run: |
-          echo "IMAGE_URL=$(echo ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:$(echo ${{ github.sha }} | cut -c1-7) | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          REPO=$(echo ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }} | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_URL=${REPO}:$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_ENV
+          # Mutable :latest so downstream consumers (e.g. monoscope CI's TF service
+          # container) can track the newest master build without pinning a SHA.
+          # This workflow only runs on master push, so :latest == latest master.
+          echo "IMAGE_LATEST=${REPO}:latest" >> $GITHUB_ENV
 
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v5
@@ -50,7 +55,9 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ env.IMAGE_URL }}
+          tags: |
+            ${{ env.IMAGE_URL }}
+            ${{ env.IMAGE_LATEST }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           debug: true
