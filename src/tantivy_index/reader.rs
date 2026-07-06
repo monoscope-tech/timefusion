@@ -102,7 +102,11 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
     // Per-segment fast-field columns, resolved lazily on first hit in that
     // segment. `None` in the outer Option = not yet resolved; inner `None`
     // = this segment has no fast `_id` (pre-fast-field index) → doc store.
-    type FfCols = (tantivy::columnar::Column<i64>, tantivy::columnar::StrColumn, Option<tantivy::columnar::Column<u64>>);
+    type FfCols = (
+        tantivy::columnar::Column<i64>,
+        tantivy::columnar::StrColumn,
+        Option<tantivy::columnar::Column<u64>>,
+    );
     let mut ff_cols: Vec<Option<Option<FfCols>>> = vec![None; searcher.segment_readers().len()];
     let mut hits = Vec::with_capacity(top.len());
     let mut id_buf = String::new();

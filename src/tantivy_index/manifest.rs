@@ -94,11 +94,7 @@ pub async fn save(store: &dyn ObjectStore, table: &str, project_id: &str, manife
 /// the prefilter via the coverage gate.
 async fn mutate<F: FnOnce(&mut Manifest)>(store: &dyn ObjectStore, table: &str, project_id: &str, f: F) -> Result<()> {
     static LOCKS: std::sync::OnceLock<dashmap::DashMap<(String, String), std::sync::Arc<tokio::sync::Mutex<()>>>> = std::sync::OnceLock::new();
-    let lock = LOCKS
-        .get_or_init(Default::default)
-        .entry((table.to_string(), project_id.to_string()))
-        .or_default()
-        .clone();
+    let lock = LOCKS.get_or_init(Default::default).entry((table.to_string(), project_id.to_string())).or_default().clone();
     let _guard = lock.lock().await;
     let mut m = load(store, table, project_id).await?;
     f(&mut m);

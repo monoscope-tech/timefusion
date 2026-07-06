@@ -156,7 +156,12 @@ fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>, all
 /// scan-time classification. `NOT IN` is never routed.
 fn match_indexed_in_list(expr: &Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Option<(String, Vec<Route>)> {
     use datafusion::logical_expr::expr::InList;
-    let Expr::InList(InList { expr: col, list, negated: false }) = expr else {
+    let Expr::InList(InList {
+        expr: col,
+        list,
+        negated: false,
+    }) = expr
+    else {
         return None;
     };
     if !allow_eq || list.is_empty() || list.len() > MAX_ROUTED_IN_LIST {
@@ -170,9 +175,7 @@ fn match_indexed_in_list(expr: &Expr, indexed_columns: &HashMap<String, &'static
     let items: Option<Vec<Route>> = list
         .iter()
         .map(|e| match e {
-            Expr::Literal(s, _) => extract_utf8_string(s)
-                .filter(|v| !v.is_empty() && v.chars().all(is_eq_term_safe))
-                .map(Route::Ready),
+            Expr::Literal(s, _) => extract_utf8_string(s).filter(|v| !v.is_empty() && v.chars().all(is_eq_term_safe)).map(Route::Ready),
             Expr::Placeholder(_) => Some(Route::Deferred {
                 rhs:  e.clone(),
                 kind: "eq".to_string(),
@@ -486,7 +489,10 @@ mod tests {
         assert_eq!(match_indexed_predicate(&eq("tid", ""), &cols, true), None, "empty");
         // A dashed UUID IS allowed — the embedded `-` survives (e2e-proven).
         let uid = "0fee13b9-ac71-5c55-acd1-109542595054";
-        assert_eq!(match_indexed_predicate(&eq("tid", uid), &cols, true), Some(("tid".into(), Route::Ready(uid.into()))));
+        assert_eq!(
+            match_indexed_predicate(&eq("tid", uid), &cols, true),
+            Some(("tid".into(), Route::Ready(uid.into())))
+        );
     }
 
     #[test]

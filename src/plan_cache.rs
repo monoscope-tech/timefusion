@@ -776,7 +776,9 @@ mod tests {
         ] {
             assert!(contains_plan_time_folded_fn(&parse(sql)), "{sql}");
         }
-        assert!(!contains_plan_time_folded_fn(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > '2026-07-01'")));
+        assert!(!contains_plan_time_folded_fn(&parse(
+            "SELECT id FROM t WHERE project_id = 'p' AND ts > '2026-07-01'"
+        )));
         // A column merely NAMED now must not disqualify.
         assert!(!contains_plan_time_folded_fn(&parse("SELECT now FROM t WHERE project_id = 'p'")));
     }

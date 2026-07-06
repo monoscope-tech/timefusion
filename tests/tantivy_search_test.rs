@@ -254,7 +254,7 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
             max_timestamp_micros: None,
             error:                Some("simulated build failure".into()),
             covered_files:        vec![],
-ordinals_valid: false,
+            ordinals_valid:       false,
         },
     )
     .await

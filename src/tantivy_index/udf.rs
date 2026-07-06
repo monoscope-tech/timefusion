@@ -429,7 +429,11 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
         };
     }
     match e {
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And,
+            right,
+        }) => {
             let (a, b) = (expr_node(left), expr_node(right));
             let mut kids: Vec<PredNode> = Vec::new();
             for n in [a.node, b.node].into_iter().flatten() {
@@ -465,10 +469,16 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
                         complete: true,
                     }
                 }
-                _ => NodeRes { node: None, complete: false },
+                _ => NodeRes {
+                    node:     None,
+                    complete: false,
+                },
             }
         }
-        _ => NodeRes { node: None, complete: false },
+        _ => NodeRes {
+            node:     None,
+            complete: false,
+        },
     }
 }
 

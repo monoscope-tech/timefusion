@@ -99,7 +99,12 @@ fn classify_conjunct(e: &Expr) -> Option<Conjunct> {
 
 /// Split a predicate into conjuncts (`AND` tree flatten).
 fn split_conjunction(e: &Expr, out: &mut Vec<Expr>) {
-    if let Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) = e {
+    if let Expr::BinaryExpr(BinaryExpr {
+        left,
+        op: Operator::And,
+        right,
+    }) = e
+    {
         split_conjunction(left, out);
         split_conjunction(right, out);
     } else {
@@ -219,8 +224,8 @@ fn match_count_plan(plan: &LogicalPlan) -> Option<CountQuery> {
     Some(CountQuery {
         table_name: scan.table_name.table().to_string(),
         project_id: project_id?,
-        lo: lo?,
-        hi: hi?,
+        lo:         lo?,
+        hi:         hi?,
     })
 }
 
@@ -288,7 +293,10 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
         total
     };
 
-    debug!("count_pushdown: answered {}/{} [{}, {}] = {} from add-action stats", q.project_id, q.table_name, q.lo, q.hi, total);
+    debug!(
+        "count_pushdown: answered {}/{} [{}, {}] = {} from add-action stats",
+        q.project_id, q.table_name, q.lo, q.hi, total
+    );
     crate::metrics::record_count_pushdown_used();
     // Single-row result matching the plan's output schema (count is Int64).
     let out_schema: datafusion::arrow::datatypes::SchemaRef = Arc::new(plan.schema().as_arrow().clone());

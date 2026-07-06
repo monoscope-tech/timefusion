@@ -2440,8 +2440,7 @@ impl MemBuffer {
     /// or "no preds passed" — caller falls back to running the original
     /// SQL predicate on the snapshot.
     fn search_with_snapshot(
-        &self, bucket: &TimeBucket, cache_key: &BucketCacheKey, table_schema: &crate::schema_loader::TableSchema,
-        node: &crate::tantivy_index::udf::PredNode,
+        &self, bucket: &TimeBucket, cache_key: &BucketCacheKey, table_schema: &crate::schema_loader::TableSchema, node: &crate::tantivy_index::udf::PredNode,
     ) -> anyhow::Result<(Vec<arrow::record_batch::RecordBatch>, Option<std::collections::HashSet<String>>)> {
         let (snapshot, snapshot_rows) = bucket.snapshot();
         if snapshot.is_empty() {

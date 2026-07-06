@@ -1537,7 +1537,9 @@ impl Database {
         roots.extend(self.custom_project_tables.read().await.keys().filter(|(_, t)| t == table_name).map(|(p, _)| p.clone()));
         let mut built = 0usize;
         for root in roots {
-            let Ok(table_ref) = self.resolve_table(&root, table_name).await else { continue };
+            let Ok(table_ref) = self.resolve_table(&root, table_name).await else {
+                continue;
+            };
             let (uris, delta_store) = {
                 let t = table_ref.read().await;
                 (t.get_file_uris()?.collect::<Vec<String>>(), t.log_store().object_store(None))
@@ -4729,8 +4731,11 @@ impl Database {
                 let table = table_ref.read().await;
                 Self::partition_files_by_pid(&table, &date_marker)?
             };
-            let project_ids: std::collections::HashSet<String> =
-                if files_by_pid.is_empty() { std::iter::once("default".to_string()).collect() } else { files_by_pid.keys().cloned().collect() };
+            let project_ids: std::collections::HashSet<String> = if files_by_pid.is_empty() {
+                std::iter::once("default".to_string()).collect()
+            } else {
+                files_by_pid.keys().cloned().collect()
+            };
             for pid in &project_ids {
                 let backoff_key = format!("{dedup_key}:{pid}:{date}");
                 if let Some(entry) = self.dedup_backoff.get(&backoff_key)
@@ -6186,7 +6191,15 @@ impl TableProvider for ProjectRoutingTable {
             }
             let eff_limit = if skip_dedup { orig_limit } else { limit };
             let plan = self
-                .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
+                .scan_delta_table(
+                    &table,
+                    state,
+                    projection,
+                    &delta_only_filters,
+                    eff_limit,
+                    tantivy_exclude.as_ref(),
+                    tantivy_row_selections.as_ref(),
+                )
                 .await?;
             return wrap_result(plan);
         };
@@ -6244,7 +6257,15 @@ impl TableProvider for ProjectRoutingTable {
             }
             let eff_limit = if skip_dedup { orig_limit } else { limit };
             let plan = self
-                .scan_delta_table(&table, state, projection, &delta_only_filters, eff_limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
+                .scan_delta_table(
+                    &table,
+                    state,
+                    projection,
+                    &delta_only_filters,
+                    eff_limit,
+                    tantivy_exclude.as_ref(),
+                    tantivy_row_selections.as_ref(),
+                )
                 .await?;
             return wrap_result(plan);
         }
@@ -6316,7 +6337,15 @@ impl TableProvider for ProjectRoutingTable {
         };
         let table = delta_table.read().await;
         let delta_plan = self
-            .scan_delta_table(&table, state, projection, &delta_filters, limit, tantivy_exclude.as_ref(), tantivy_row_selections.as_ref())
+            .scan_delta_table(
+                &table,
+                state,
+                projection,
+                &delta_filters,
+                limit,
+                tantivy_exclude.as_ref(),
+                tantivy_row_selections.as_ref(),
+            )
             .await?;
         tag_shape(&|s| {
             s.has_mem = true;

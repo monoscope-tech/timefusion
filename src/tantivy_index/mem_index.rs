@@ -87,9 +87,7 @@ impl BucketTextIndex {
     /// predicates identically (And→Must, Or→Should).
     pub fn search_node(&self, node: &crate::tantivy_index::udf::PredNode) -> Result<Vec<Hit>> {
         match crate::tantivy_index::reader::build_node_query(&self.index, node)? {
-            crate::tantivy_index::reader::PredsQuery::MissingField => {
-                Err(anyhow!("field not in mem-index (schema drift within bucket lifetime)"))
-            }
+            crate::tantivy_index::reader::PredsQuery::MissingField => Err(anyhow!("field not in mem-index (schema drift within bucket lifetime)")),
             crate::tantivy_index::reader::PredsQuery::Query(q) => crate::tantivy_index::reader::query_index(&self.index, &*q, None),
         }
     }
