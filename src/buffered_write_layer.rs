@@ -866,10 +866,8 @@ impl BufferedWriteLayer {
         // `derive_wal_cursors_from_delta` would skip entries the commit never
         // contained. Floored at P0, mid-replay commits are merely
         // conservative (re-replay + dedup collapse the overlap).
-        let replay_guards: Vec<((String, String), u64)> = p0
-            .iter()
-            .map(|((p, t), holds)| ((p.clone(), t.clone()), self.register_inflight_holds(p, t, holds.clone())))
-            .collect();
+        let replay_guards: Vec<((String, String), u64)> =
+            p0.iter().map(|((p, t), holds)| ((p.clone(), t.clone()), self.register_inflight_holds(p, t, holds.clone()))).collect();
 
         // Stream entries one at a time and replay directly into MemBuffer.
         // Bounded recovery memory: O(1) entries in flight rather than
@@ -2015,7 +2013,12 @@ impl BufferedWriteLayer {
         // (buckets, airborne takes, orphans).
         let drained = self.oldest_unflushed_wal_append_micros().is_none();
         let wal_for_snap = self.wal.clone();
-        match tokio::time::timeout_at(hard_deadline, tokio::task::spawn_blocking(move || wal_for_snap.write_cursor_snapshot(true, drained))).await {
+        match tokio::time::timeout_at(
+            hard_deadline,
+            tokio::task::spawn_blocking(move || wal_for_snap.write_cursor_snapshot(true, drained)),
+        )
+        .await
+        {
             Ok(Ok(Ok(()))) => info!("Cursor snapshot written (clean_shutdown=true, drained={drained})"),
             Ok(Ok(Err(e))) => warn!("Cursor snapshot on shutdown failed: {} — next boot will Delta-scan", e),
             Ok(Err(join_err)) => warn!("Cursor snapshot blocking task panicked: {} — next boot will Delta-scan", join_err),
@@ -2094,7 +2097,13 @@ impl BufferedWriteLayer {
                 if self.mem_buffer.restore_taken_bucket(bucket) {
                     self.release_inflight_holds(&bucket.project_id, &bucket.table_name, token);
                 } else {
-                    self.orphan_inflight_holds(&bucket.project_id, &bucket.table_name, token, bucket.wal_first_positions.clone(), bucket.first_wal_pin_micros);
+                    self.orphan_inflight_holds(
+                        &bucket.project_id,
+                        &bucket.table_name,
+                        token,
+                        bucket.wal_first_positions.clone(),
+                        bucket.first_wal_pin_micros,
+                    );
                 }
                 Err(e)
             }
@@ -2191,9 +2200,7 @@ impl BufferedWriteLayer {
             flush_freed_bytes_total: self.flush_freed_bytes_total.load(Ordering::Relaxed),
             process_rss_bytes: process_rss_bytes(),
             orphaned_topics: self.orphaned_wal_holds.len(),
-            orphan_pin_age_secs: self
-                .oldest_orphan_pin_micros()
-                .map(|pin| ((chrono::Utc::now().timestamp_micros() - pin).max(0) / 1_000_000) as u64),
+            orphan_pin_age_secs: self.oldest_orphan_pin_micros().map(|pin| ((chrono::Utc::now().timestamp_micros() - pin).max(0) / 1_000_000) as u64),
         }
     }
 
@@ -2605,7 +2612,10 @@ mod tests {
 
         layer.recover_from_wal().await.unwrap();
 
-        assert!(flushes.load(Ordering::Relaxed) > 0, "replay never drained to Delta despite exceeding the budget");
+        assert!(
+            flushes.load(Ordering::Relaxed) > 0,
+            "replay never drained to Delta despite exceeding the budget"
+        );
         assert_eq!(tail_claims.load(Ordering::Relaxed), 0, "mid-replay commit claimed a watermark beyond P0");
         // 2026-07-08 review finding: mid-replay relief flushes must not
         // persist consumed-ahead cursors. The post-recovery snapshot must

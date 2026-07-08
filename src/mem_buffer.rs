@@ -251,41 +251,41 @@ pub struct TableBuffer {
 }
 
 pub struct TimeBucket {
-    batches:             Mutex<Vec<RecordBatch>>,
-    row_count:           AtomicUsize,
-    memory_bytes:        AtomicUsize,
-    min_timestamp:       AtomicI64,
-    max_timestamp:       AtomicI64,
+    batches:              Mutex<Vec<RecordBatch>>,
+    row_count:            AtomicUsize,
+    memory_bytes:         AtomicUsize,
+    min_timestamp:        AtomicI64,
+    max_timestamp:        AtomicI64,
     /// Wall-clock micros (via `crate::clock`) when this bucket was created.
     /// Drives the flush-dwell staleness signal — how long the bucket has
     /// waited to flush — independent of its rows' event-time range, so
     /// backfilled/late data can't false-trip the "oldest bucket" alarm.
-    created_micros:      i64,
+    created_micros:       i64,
     /// Per-shard walrus positions captured BEFORE this bucket's first WAL
     /// entry on each shard (min-merged). These are the bucket's read-cursor
     /// *holds*: while the bucket is unflushed, the cursor must not advance
     /// past `first_positions[shard]`, or a crash would replay past this
     /// bucket's acked entries and lose them (prod 2026-07-03).
-    wal_shard_state:     Mutex<WalShardState>,
+    wal_shard_state:      Mutex<WalShardState>,
     /// While a flush snapshot is airborne, the first N batches are the
     /// snapshot's prefix: insert-time coalesce must not fold across this
     /// boundary or the post-commit prefix drain would remove late
     /// (unflushed) rows merged into a combined batch. 0 = no snapshot in
     /// flight.
-    flush_pinned_prefix: AtomicUsize,
+    flush_pinned_prefix:  AtomicUsize,
     /// Bumped by every in-place DML mutation of this bucket's batches (under
     /// the batches lock). A flush snapshot captures it; if it changed by
     /// commit time, the commit landed pre-DML row values and the prefix
     /// indices may have shifted (DELETE drops emptied batches), so
     /// `finish_flushed_snapshot` must NOT drain — the bucket re-flushes
     /// whole next cycle with the post-DML values.
-    mutation_gen:        AtomicU64,
+    mutation_gen:         AtomicU64,
     /// Wall-clock micros of the newest WAL entry pinned on this bucket
     /// (WalEntry timestamps are append-time, so this is ARRIVAL time).
     /// Drives [`MemBuffer::reap_expired_empty_buckets`]'s grace period —
     /// see its doc for the (pair-netting) soundness argument; replay itself
     /// no longer filters by age.
-    last_wal_pin_micros: AtomicI64,
+    last_wal_pin_micros:  AtomicI64,
     /// Real-clock micros of the OLDEST WAL append this bucket's un-flushed
     /// data may depend on — the WAL GC floor: no WAL file whose mtime is at
     /// or after `min(first_wal_pin)` across live buckets may be deleted.
@@ -312,26 +312,26 @@ struct WalShardState {
 
 #[derive(Debug, Clone)]
 pub struct FlushableBucket {
-    pub project_id:          String,
-    pub table_name:          String,
-    pub bucket_id:           i64,
-    pub batches:             Vec<RecordBatch>,
-    pub row_count:           usize,
+    pub project_id:           String,
+    pub table_name:           String,
+    pub bucket_id:            i64,
+    pub batches:              Vec<RecordBatch>,
+    pub row_count:            usize,
     /// Per-shard positions BEFORE this bucket's first WAL entry — the bucket's
     /// read-cursor holds. Registered as in-flight holds while the flush is
     /// airborne; restored to the bucket if the Delta commit fails.
-    pub wal_first_positions: Vec<Option<walrus_rust::WalPosition>>,
+    pub wal_first_positions:  Vec<Option<walrus_rust::WalPosition>>,
     /// `mutation_gen` at snapshot time (snapshot-flush path only). If the
     /// bucket's gen moved by commit time, a DML mutated it mid-flight: the
     /// commit landed pre-DML values, so `finish_flushed_snapshot` must keep
     /// the rows and re-flush instead of draining.
-    pub snapshot_gen:        u64,
+    pub snapshot_gen:         u64,
     /// Actual min/max timestamp of the taken rows, captured before the source
     /// bucket's atomics were reset. `restore_taken_bucket` replays these so a
     /// restored bucket keeps its true time range (and stays visible to
     /// time-range pruning) rather than collapsing to the bucket's start.
-    pub min_timestamp:       i64,
-    pub max_timestamp:       i64,
+    pub min_timestamp:        i64,
+    pub max_timestamp:        i64,
     /// Source bucket's `first_wal_pin_micros` (WAL GC floor) — carried so an
     /// airborne take/commit keeps flooring the GC, and a failed commit's
     /// restore re-applies it.
@@ -2462,16 +2462,16 @@ impl TableBuffer {
 impl TimeBucket {
     fn new() -> Self {
         Self {
-            batches:             Mutex::new(Vec::new()),
-            row_count:           AtomicUsize::new(0),
-            memory_bytes:        AtomicUsize::new(0),
-            min_timestamp:       AtomicI64::new(i64::MAX),
-            max_timestamp:       AtomicI64::new(i64::MIN),
-            created_micros:      crate::clock::now_micros(),
-            wal_shard_state:     Mutex::new(WalShardState::default()),
-            flush_pinned_prefix: AtomicUsize::new(0),
-            mutation_gen:        AtomicU64::new(0),
-            last_wal_pin_micros: AtomicI64::new(crate::clock::now_micros()),
+            batches:              Mutex::new(Vec::new()),
+            row_count:            AtomicUsize::new(0),
+            memory_bytes:         AtomicUsize::new(0),
+            min_timestamp:        AtomicI64::new(i64::MAX),
+            max_timestamp:        AtomicI64::new(i64::MIN),
+            created_micros:       crate::clock::now_micros(),
+            wal_shard_state:      Mutex::new(WalShardState::default()),
+            flush_pinned_prefix:  AtomicUsize::new(0),
+            mutation_gen:         AtomicU64::new(0),
+            last_wal_pin_micros:  AtomicI64::new(crate::clock::now_micros()),
             first_wal_pin_micros: AtomicI64::new(i64::MAX),
         }
     }

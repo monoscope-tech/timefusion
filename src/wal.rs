@@ -653,14 +653,14 @@ impl WalManager {
     /// parks the cursor back afterwards via `set_positions_allow_rewind`.
     pub fn replay_iter(&self) -> Result<WalReplayIter<'_>, WalError> {
         Ok(WalReplayIter {
-            wal: self,
-            topics: self.list_topics()?,
-            topic_idx: 0,
-            heap: std::collections::BinaryHeap::new(),
+            wal:        self,
+            topics:     self.list_topics()?,
+            topic_idx:  0,
+            heap:       std::collections::BinaryHeap::new(),
             shard_keys: Vec::new(),
-            pending: Vec::new(),
-            total: 0,
-            errors: 0,
+            pending:    Vec::new(),
+            total:      0,
+            errors:     0,
         })
     }
 
