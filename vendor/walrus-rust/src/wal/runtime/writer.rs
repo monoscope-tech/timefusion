@@ -434,6 +434,14 @@ struct BatchRevertInfo {
 }
 
 impl Writer {
+    /// Durably flush the active block's storage. Sealed blocks are flushed at
+    /// seal time and `batch_write` flushes what it touched, so after this
+    /// every byte previously accepted by `write()` is on disk.
+    pub(super) fn sync(&self) -> std::io::Result<()> {
+        let block = self.current_block.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned"))?;
+        block.mmap.flush()
+    }
+
     pub(super) fn snapshot_block(&self) -> std::io::Result<(Block, u64)> {
         let block = self.current_block.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned"))?;
         let offset = self.current_offset.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned"))?;

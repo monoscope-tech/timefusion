@@ -85,7 +85,16 @@ pub struct CursorSnapshot {
     pub shards_per_topic:  usize,
     /// True only when written by the graceful-shutdown path. Boot uses this
     /// flag to decide whether the Delta verifier can be skipped entirely.
+    /// NOT a drain claim — shutdown writes it even after a partial/timed-out
+    /// flush (the WAL holds the remainder); see `drained` for that.
     pub clean_shutdown:    bool,
+    /// True only when the shutdown flush left NOTHING un-flushed (no
+    /// MemBuffer buckets, no airborne or orphaned holds). Sole authorizer of
+    /// the pure-mtime boot WAL GC — with un-flushed data the old files may
+    /// BE the backlog. `#[serde(default)]`: snapshots from older builds parse
+    /// as drained=false, which just skips the boot sweep (safe direction).
+    #[serde(default)]
+    pub drained:           bool,
     /// `"project_id:table_name"` → per-shard cursor (None = never written).
     pub entries:           std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
 }
@@ -208,6 +217,10 @@ pub struct WalManager {
     /// an in-memory write; fsync is decoupled) instead of erroring the insert,
     /// which would dead-letter the row. Striped by `walrus_key` hash.
     append_locks:     Vec<std::sync::Mutex<()>>,
+    /// Fsync the shard before returning from single-entry (DML) appends —
+    /// see `BufferConfig::timefusion_wal_ack_fsync`. Batched INSERT appends
+    /// are always flushed before return by walrus's `batch_write`.
+    ack_fsync:        bool,
 }
 
 impl WalManager {
@@ -265,6 +278,7 @@ impl WalManager {
             shard_counter: dashmap::DashMap::new(),
             shards_per_topic,
             append_locks: (0..WAL_APPEND_LOCK_STRIPES).map(|_| std::sync::Mutex::new(())).collect(),
+            ack_fsync: false,
         })
     }
 
@@ -404,6 +418,12 @@ impl WalManager {
         self.append_locks[idx].lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Enable fsync-before-ack for single-entry appends (`TIMEFUSION_WAL_ACK_FSYNC`).
+    pub fn with_ack_fsync(mut self, on: bool) -> Self {
+        self.ack_fsync = on;
+        self
+    }
+
     /// Serialize and append one entry under the shard's `append_lock` so
     /// concurrent same-shard appends queue instead of erroring. The guard
     /// drops when this returns, so callers' `persist_topic` file I/O runs
@@ -412,9 +432,18 @@ impl WalManager {
     /// hold-registration contract as [`Self::append_batch`].
     fn locked_append(&self, walrus_key: &str, entry: &WalEntry, on_pre: impl FnOnce(Option<WalPosition>)) -> Result<(), WalError> {
         let entry_bytes = serialize_wal_entry(entry)?;
-        let _guard = self.append_lock(walrus_key);
+        let guard = self.append_lock(walrus_key);
         on_pre(self.wal.current_position(walrus_key).ok());
         self.wal.append_for_topic(walrus_key, &entry_bytes)?;
+        // Sync OUTSIDE the stripe lock: the entry's bytes are already in the
+        // mmap and `Writer::sync` flushes the whole active block, so
+        // sync-before-ack holds — while an ms-scale msync under the stripe
+        // would stall every same-stripe append (the lock's contract is
+        // "fast, in-memory only").
+        drop(guard);
+        if self.ack_fsync {
+            self.wal.sync_topic(walrus_key).map_err(WalError::Io)?;
+        }
         Ok(())
     }
 
@@ -604,79 +633,44 @@ impl WalManager {
         Ok((results, error_count))
     }
 
-    /// Stream every WAL entry past `since_timestamp_micros` through `callback`.
+    /// Pull-based stream of every un-consumed WAL entry, topic by topic.
     /// Bounded recovery memory: at most one entry per shard is alive at a
     /// time, vs the old `read_all_entries_raw` which materialized the entire
-    /// post-cutoff slice (millions of entries / GiBs at long retention) into
-    /// a Vec.
+    /// slice (millions of entries / GiBs at long retention) into a Vec.
     ///
     /// Within each topic, the N shard streams are merged by `timestamp_micros`
     /// using a min-heap (k-way merge), so DELETE-after-INSERT ordering within
     /// a topic is preserved even when those operations happen on different
     /// shards. Cross-topic ordering is not preserved — that's fine because
     /// DELETE and UPDATE only mutate their own topic's MemBuffer.
-    #[instrument(skip(self, callback))]
-    pub fn for_each_entry<F>(&self, since_timestamp_micros: Option<i64>, checkpoint: bool, mut callback: F) -> Result<(u64, usize), WalError>
-    where
-        F: FnMut(WalEntry),
-    {
-        use std::{cmp::Reverse, collections::BinaryHeap};
-
-        let cutoff = since_timestamp_micros.unwrap_or(0);
-        let mut total_entries = 0u64;
-        let mut total_errors = 0usize;
-
-        for topic in self.list_topics()? {
-            let Some((project_id, table_name)) = Self::parse_topic(&topic) else {
-                continue;
-            };
-
-            // Prime the heap with each shard's first eligible entry. Heap is
-            // keyed by (timestamp, shard) so smaller timestamps come out first;
-            // shard index breaks ties deterministically. The entry payload
-            // travels alongside the key in a parallel Vec slot indexed by
-            // shard, avoiding the `Ord` bound on `WalEntry`.
-            //
-            // Invariant: at most one in-flight entry per shard is alive at a
-            // time → recovery memory is O(shards_per_topic), not O(total entries).
-            let mut heap: BinaryHeap<Reverse<(i64, usize)>> = BinaryHeap::with_capacity(self.shards_per_topic);
-            let shard_keys: Vec<String> = (0..self.shards_per_topic).map(|s| Self::walrus_topic_key(&project_id, &table_name, s)).collect();
-            let mut pending: Vec<Option<WalEntry>> = (0..self.shards_per_topic).map(|_| None).collect();
-            for shard in 0..self.shards_per_topic {
-                if let Some(entry) = Self::next_eligible_from_shard(&self.wal, &shard_keys[shard], cutoff, checkpoint, &mut total_errors) {
-                    heap.push(Reverse((entry.timestamp_micros, shard)));
-                    pending[shard] = Some(entry);
-                }
-            }
-
-            while let Some(Reverse((_, shard))) = heap.pop() {
-                let entry = pending[shard].take().expect("heap and pending out of sync");
-                total_entries += 1;
-                callback(entry);
-                if let Some(next) = Self::next_eligible_from_shard(&self.wal, &shard_keys[shard], cutoff, checkpoint, &mut total_errors) {
-                    heap.push(Reverse((next.timestamp_micros, shard)));
-                    pending[shard] = Some(next);
-                }
-            }
-        }
-
-        if total_errors > 0 {
-            warn!("WAL read all: total_entries={}, cutoff={}, errors={}", total_entries, cutoff, total_errors);
-        } else {
-            info!("WAL read all: total_entries={}, cutoff={}", total_entries, cutoff);
-        }
-        Ok((total_entries, total_errors))
+    ///
+    /// Pull-based (vs the old callback `for_each_entry`) so `recover_from_wal`
+    /// can await flush-to-make-room between entries — budget-bounded replay.
+    ///
+    /// Always checkpointing: an uncheckpointed `read_next` never advances the
+    /// cursor, so a read-until-None stream would re-read the first entry
+    /// forever (2026-07-08: hung the suite and OOM'd the host). Recovery
+    /// parks the cursor back afterwards via `set_positions_allow_rewind`.
+    pub fn replay_iter(&self) -> Result<WalReplayIter<'_>, WalError> {
+        Ok(WalReplayIter {
+            wal: self,
+            topics: self.list_topics()?,
+            topic_idx: 0,
+            heap: std::collections::BinaryHeap::new(),
+            shard_keys: Vec::new(),
+            pending: Vec::new(),
+            total: 0,
+            errors: 0,
+        })
     }
 
-    /// Read until we get an entry whose timestamp is `>= cutoff`, dropping
-    /// older entries and skipping corrupted ones. Returns `None` at end of
-    /// stream. Shared by `for_each_entry`'s k-way merge.
-    fn next_eligible_from_shard(wal: &Walrus, key: &str, cutoff: i64, checkpoint: bool, errors: &mut usize) -> Option<WalEntry> {
+    /// Read the next entry from a shard, skipping corrupted ones. Returns
+    /// `None` at end of stream. Shared by `WalReplayIter`'s k-way merge.
+    fn next_from_shard(wal: &Walrus, key: &str, checkpoint: bool, errors: &mut usize) -> Option<WalEntry> {
         loop {
             match wal.read_next(key, checkpoint) {
                 Ok(Some(d)) => match deserialize_wal_entry(&d.data) {
-                    Ok(entry) if entry.timestamp_micros >= cutoff => return Some(entry),
-                    Ok(_) => continue, // drop pre-cutoff
+                    Ok(entry) => return Some(entry),
                     Err(e @ WalError::UnsupportedVersion { .. }) => {
                         error!(
                             "WAL on-disk version mismatch on shard {} ({e}); IN-FLIGHT DATA WILL BE LOST. \
@@ -799,7 +793,7 @@ impl WalManager {
     }
 
     fn cursor_snapshot_path(&self) -> PathBuf {
-        self.data_dir.join(".timefusion_meta").join("cursor_snapshot.json")
+        cursor_snapshot_path_in(&self.data_dir)
     }
 
     /// Capture every known topic's per-shard persisted-read cursor to a single
@@ -814,7 +808,7 @@ impl WalManager {
     /// Atomic: writes to `.tmp` then renames. Best-effort: returns Err but the
     /// caller logs-and-continues — a missing snapshot only costs us the next
     /// boot's fast path, never correctness.
-    pub fn write_cursor_snapshot(&self, clean_shutdown: bool) -> Result<(), WalError> {
+    pub fn write_cursor_snapshot(&self, clean_shutdown: bool, drained: bool) -> Result<(), WalError> {
         let mut entries = std::collections::BTreeMap::new();
         for (project_id, table_name) in self.list_topic_pairs()? {
             let positions = match self.persisted_read_positions(&project_id, &table_name) {
@@ -834,18 +828,19 @@ impl WalManager {
             written_at_micros: crate::clock::now_micros(),
             shards_per_topic: self.shards_per_topic,
             clean_shutdown,
+            drained,
             entries,
         };
         // `.timefusion_meta/` is created in `with_fsync_mode_and_shards`; no
         // create_dir_all needed on every flush.
         let target = self.cursor_snapshot_path();
-        let tmp = target.with_extension("json.tmp");
         // Defensive: serde_json::to_vec on a struct with only primitive +
         // standard-collection fields is infallible. Keep the map_err so a
         // future field addition (custom Serialize) still surfaces clearly.
         let bytes = serde_json::to_vec(&snap).map_err(|e| WalError::Internal(format!("cursor snapshot encode: {}", e)))?;
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, &target)?;
+        // Not durable: a lost snapshot only costs the next boot's fast path,
+        // and drained=true reverting to absent is the safe direction.
+        write_atomic(&target, &bytes, false)?;
         Ok(())
     }
 
@@ -895,22 +890,10 @@ impl WalManager {
             );
         }
         let target = self.recovery_rewind_path();
-        let tmp = target.with_extension("json.tmp");
         let bytes = serde_json::to_vec(&entries).map_err(|e| WalError::Internal(format!("rewind marker encode: {}", e)))?;
         // The marker's whole job is surviving a crash mid-replay while walrus
         // fsyncs cursor progress — match that durability (sync file + dir).
-        {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, &target)?;
-        if let Some(dir) = target.parent()
-            && let Ok(d) = std::fs::File::open(dir)
-        {
-            let _ = d.sync_all();
-        }
+        write_atomic(&target, &bytes, true)?;
         Ok(p0)
     }
 
@@ -971,19 +954,7 @@ impl WalManager {
     /// Read the cursor snapshot if present. Returns None on missing/parse/version
     /// mismatch so the boot path falls through to Delta reconciliation.
     pub fn load_cursor_snapshot(&self) -> Option<CursorSnapshot> {
-        let path = self.cursor_snapshot_path();
-        let bytes = std::fs::read(&path).ok()?;
-        let snap: CursorSnapshot = match serde_json::from_slice(&bytes) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("cursor snapshot at {:?} unreadable, falling back to Delta scan: {}", path, e);
-                return None;
-            }
-        };
-        if snap.version != SNAPSHOT_VERSION {
-            warn!("cursor snapshot version {} != {} — ignoring", snap.version, SNAPSHOT_VERSION);
-            return None;
-        }
+        let snap = read_cursor_snapshot(&self.data_dir)?;
         if snap.shards_per_topic != self.shards_per_topic {
             warn!(
                 "cursor snapshot shards_per_topic {} != current {} — ignoring (config changed)",
@@ -1156,6 +1127,173 @@ pub fn decode_payload<T: Decode<()>>(data: &[u8]) -> Result<T, WalError> {
     Ok(payload)
 }
 
+/// See [`WalManager::replay_iter`]. Heap is keyed by `(timestamp, shard)` so
+/// smaller timestamps come out first; shard index breaks ties
+/// deterministically. The entry payload travels in a parallel Vec slot
+/// indexed by shard, avoiding an `Ord` bound on `WalEntry`. Invariant: at
+/// most one in-flight entry per shard is alive at a time → replay memory is
+/// O(shards_per_topic), not O(total entries).
+pub struct WalReplayIter<'a> {
+    wal:        &'a WalManager,
+    topics:     Vec<String>,
+    topic_idx:  usize,
+    heap:       std::collections::BinaryHeap<std::cmp::Reverse<(i64, usize)>>,
+    shard_keys: Vec<String>,
+    pending:    Vec<Option<WalEntry>>,
+    /// Entries yielded so far.
+    pub total:  u64,
+    /// Corrupt/unreadable entries skipped so far.
+    pub errors: usize,
+}
+
+impl WalReplayIter<'_> {
+    pub fn next_entry(&mut self) -> Option<WalEntry> {
+        use std::cmp::Reverse;
+        loop {
+            if let Some(Reverse((_, shard))) = self.heap.pop() {
+                let entry = self.pending[shard].take().expect("heap and pending out of sync");
+                self.total += 1;
+                if let Some(next) = WalManager::next_from_shard(&self.wal.wal, &self.shard_keys[shard], true, &mut self.errors) {
+                    self.heap.push(Reverse((next.timestamp_micros, shard)));
+                    self.pending[shard] = Some(next);
+                }
+                return Some(entry);
+            }
+            // Current topic exhausted — prime the next parseable topic.
+            let (project_id, table_name) = loop {
+                let topic = self.topics.get(self.topic_idx)?;
+                self.topic_idx += 1;
+                if let Some(pair) = WalManager::parse_topic(topic) {
+                    break pair;
+                }
+            };
+            let shards = self.wal.shards_per_topic;
+            self.shard_keys = (0..shards).map(|s| WalManager::walrus_topic_key(&project_id, &table_name, s)).collect();
+            self.pending = (0..shards).map(|_| None).collect();
+            for shard in 0..shards {
+                if let Some(entry) = WalManager::next_from_shard(&self.wal.wal, &self.shard_keys[shard], true, &mut self.errors) {
+                    self.heap.push(Reverse((entry.timestamp_micros, shard)));
+                    self.pending[shard] = Some(entry);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn cursor_snapshot_path_in(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join(".timefusion_meta").join("cursor_snapshot.json")
+}
+
+/// Atomic file write via tmp + rename. `durable` additionally fsyncs the file
+/// before the rename and the parent dir after — required whenever the content
+/// authorizes destructive action (rewind marker, drained-flag consumption);
+/// pure hint files (post-flush cursor snapshot) skip the syncs.
+fn write_atomic(target: &std::path::Path, bytes: &[u8], durable: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = target.with_extension("json.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        if durable {
+            f.sync_all()?;
+        }
+    }
+    std::fs::rename(&tmp, target)?;
+    if durable
+        && let Some(dir) = target.parent()
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
+/// Read + parse + version-check the cursor snapshot. Free function so the
+/// pre-walrus boot path can use it; `WalManager::load_cursor_snapshot` adds
+/// the shard-count and staleness checks on top.
+fn read_cursor_snapshot(wal_dir: &std::path::Path) -> Option<CursorSnapshot> {
+    let path = cursor_snapshot_path_in(wal_dir);
+    let bytes = std::fs::read(&path).ok()?;
+    let snap: CursorSnapshot = match serde_json::from_slice(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("cursor snapshot at {:?} unreadable, falling back to Delta scan: {}", path, e);
+            return None;
+        }
+    };
+    if snap.version != SNAPSHOT_VERSION {
+        warn!("cursor snapshot version {} != {} — ignoring", snap.version, SNAPSHOT_VERSION);
+        return None;
+    }
+    Some(snap)
+}
+
+/// Pre-walrus boot WAL GC, shared by `main.rs` and the e2e `bootstrap()`.
+///
+/// Deletes dead files before walrus enumerates the dir (accumulated leaks
+/// dominated startup — 467 GB / 12-min boot, see `wal_bloat_startup.md`).
+/// A pure-mtime sweep is sound ONLY when the previous life's shutdown flush
+/// fully drained (snapshot `drained=true`): otherwise the old files may BE
+/// the un-flushed backlog (2026-07-08 acked-write loss). After sweeping, the
+/// drained claim is consumed (rewritten false): this life will accept new
+/// acked writes, and if it crashes before its first successful flush the
+/// stale claim must not authorize the NEXT boot's sweep. Dirty/undrained
+/// boot: skip — the floor-aware runtime sweep (first pass right after replay
+/// parks the cursors) reclaims instead.
+pub fn boot_wal_gc(wal_dir: &std::path::Path, max_age: std::time::Duration) {
+    let t = std::time::Instant::now();
+    let Some(mut snap) = read_cursor_snapshot(wal_dir).filter(|s| s.drained) else {
+        info!("bootstrap.phase=wal_gc skipped=not_drained (runtime sweep reclaims post-replay)");
+        return;
+    };
+    // Consume the drained claim FIRST and DURABLY (sync file + dir, matching
+    // the rewind marker — the WAL data itself is msync'd within 200ms, so an
+    // un-fsynced flag would be the weakest link in a deletion authorization):
+    // sweep-then-consume fails open — a power loss reverting the un-fsynced
+    // rewrite would resurrect drained=true for the next boot's unsound sweep
+    // after this boot's deletions already persisted.
+    snap.drained = false;
+    let target = cursor_snapshot_path_in(wal_dir);
+    let consume = serde_json::to_vec(&snap).map_err(std::io::Error::other).and_then(|bytes| write_atomic(&target, &bytes, true));
+    if let Err(e) = consume {
+        // Fail closed: without a durable consume the authorization must not
+        // be used. Try to remove the stale claim entirely (costs one Delta
+        // scan, never correctness); if even that fails, surface it loudly —
+        // the un-swept dir only costs startup time, and the next boot
+        // re-attempts.
+        warn!("bootstrap.phase=wal_gc could not consume drained flag ({e}) — skipping sweep, deleting snapshot");
+        if let Err(rm) = std::fs::remove_file(&target)
+            && rm.kind() != std::io::ErrorKind::NotFound
+        {
+            error!(
+                "bootstrap.phase=wal_gc stale drained=true snapshot could not be removed ({rm}) — \
+                 delete {:?} manually before the next restart or the boot sweep may delete un-flushed WAL",
+                target
+            );
+        }
+        return;
+    }
+    match gc_wal_files(wal_dir, max_age, None) {
+        Ok((deleted, bytes_freed)) => info!(
+            "bootstrap.phase=wal_gc deleted={deleted} bytes_freed={bytes_freed} elapsed_ms={}",
+            t.elapsed().as_millis()
+        ),
+        Err(e) => warn!("bootstrap.phase=wal_gc error={e} elapsed_ms={}", t.elapsed().as_millis()),
+    }
+}
+
+/// Slack subtracted from the durability floor before it bounds GC: covers
+/// the insert path's append→bucket-record window and mtime granularity.
+///
+/// ASSUMPTION: the wall clock never steps BACKWARD by more than this slack.
+/// A larger backward step (hard NTP step, VM pause/resume) can rewrite a
+/// shared active file's mtime below `floor − slack` while it still holds
+/// pre-step un-flushed entries, defeating both cutoff arms (2026-07-08
+/// review). NTP slew is fine; if hosts can hard-step >10min, widen this or
+/// move to position-based deletability (file deletable iff every entry ≤
+/// every shard's persisted cursor).
+const GC_FLOOR_SLACK_MICROS: i64 = 10 * 60 * 1_000_000;
+
 /// Delete WAL files older than `max_age` by mtime, recursing into subdirs.
 /// Skips dotfiles/dotdirs (`.timefusion_meta/`).
 ///
@@ -1163,14 +1301,23 @@ pub fn decode_payload<T: Decode<()>>(data: &[u8]) -> Result<T, WalError> {
 /// in-process `HashMap`. On restart every file walrus wrote previously is
 /// invisible to its delete predicate, so files leak forever. Prod was at
 /// 467 GB of orphaned WAL on 2026-06-09 (12-min startup); see memory
-/// `wal_bloat_startup.md`. This is a TF-side safety net: files whose newest
-/// entry is past `retention_mins` are dead weight because `recover_from_wal`
-/// already skips entries past that cutoff. mtime is a sufficient proxy —
-/// walrus rotates to a new file once one is fully allocated, so an old
-/// file's mtime is bounded by when its last block was written.
-pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration) -> std::io::Result<(u64, u64)> {
+/// `wal_bloat_startup.md`. mtime is a sufficient proxy for a file's newest
+/// entry — walrus rotates to a new file once one is fully allocated.
+///
+/// `unflushed_floor_micros` makes the age heuristic sound: mtime age alone
+/// assumed "old ⇒ already flushed", which deleted un-flushed backlog during
+/// crash loops / flush wedges (the 2026-07-08 acked-write loss). Callers pass
+/// the oldest WAL-append time any un-flushed data may depend on
+/// (`BufferedWriteLayer::oldest_unflushed_wal_append_micros`); no file at or
+/// after `floor − slack` is deleted, whatever its age. `None` = no un-flushed
+/// data ⇒ pure mtime.
+pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::io::Result<(u64, u64)> {
     use std::time::SystemTime;
-    let cutoff = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut cutoff = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
+    if let Some(floor) = unflushed_floor_micros {
+        let floor_ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(floor.saturating_sub(GC_FLOOR_SLACK_MICROS).max(0) as u64);
+        cutoff = cutoff.min(floor_ts);
+    }
     let mut deleted = 0u64;
     let mut bytes_freed = 0u64;
     let mut stack: Vec<PathBuf> = vec![wal_dir.to_path_buf()];
@@ -1350,6 +1497,32 @@ mod tests {
         }
     }
 
+    /// `TIMEFUSION_WAL_ACK_FSYNC` plumbing: single-entry (DML) appends sync
+    /// the shard before returning and stay readable. (True power-loss
+    /// durability isn't unit-testable; this guards the sync_topic call path.)
+    #[serial_test::serial]
+    #[test]
+    fn ack_fsync_appends_are_synced_and_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(dir.path());
+        let table = format!("tbl_{}", uuid::Uuid::new_v4().simple());
+        let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::Milliseconds(60_000), 2)
+            .unwrap()
+            .with_ack_fsync(true);
+
+        wal.append_delete("proj", &table, Some("id = 'x'"), |_, _| {}).unwrap();
+        wal.append_batch("proj", &table, &[create_test_batch()], |_, _| {}).unwrap();
+
+        // checkpoint=true: walrus's uncheckpointed read_next never advances
+        // the cursor, so a read-all loop with `false` re-reads the first
+        // entry forever (2026-07-08: hung the suite and OOM'd the host).
+        let (entries, errors) = wal.read_entries_raw("proj", &table, None, true).unwrap();
+        assert_eq!(errors, 0);
+        assert_eq!(entries.len(), 2, "both appends must be present and readable with ack_fsync on");
+        assert!(entries.iter().any(|e| e.operation == WalOperation::Delete));
+        assert!(entries.iter().any(|e| e.operation == WalOperation::Insert));
+    }
+
     /// Concurrent appends to a *single* topic must queue, not error. Walrus
     /// rejects concurrent appends to one collection ("another batch write
     /// already in progress"); `pick_shard` only spreads across
@@ -1357,8 +1530,8 @@ mod tests {
     /// shard. The per-collection `append_lock` serializes them. Regression for
     /// the 2026-06-22 prod DLQ flood, where these errors dead-lettered live
     /// inserts under backfill concurrency.
-    #[test]
     #[serial_test::serial]
+    #[test]
     fn concurrent_appends_same_topic_do_not_error() {
         use std::sync::{
             Arc,
@@ -1478,7 +1651,7 @@ mod tests {
             let before = wal.persisted_read_positions("proj", &table).unwrap();
             assert!(before[0].is_some_and(|p| !p.is_origin()), "advance must move shard 0 off origin");
 
-            wal.write_cursor_snapshot(true).unwrap();
+            wal.write_cursor_snapshot(true, true).unwrap();
             assert!(path.join(".timefusion_meta/cursor_snapshot.json").exists());
         }
 
@@ -1533,7 +1706,7 @@ mod tests {
             wal.append("proj", &table, &create_test_batch()).unwrap();
             let tail = wal.current_position("proj", &table).unwrap();
             wal.merge_persisted_positions("proj", &table, &[Some(tail[0]), None, None, None]).unwrap();
-            wal.write_cursor_snapshot(true).unwrap();
+            wal.write_cursor_snapshot(true, true).unwrap();
         }
         // Re-open with a different shard count — load must refuse.
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 8).unwrap();
@@ -1569,6 +1742,7 @@ mod tests {
             written_at_micros: 0,
             shards_per_topic: 4,
             clean_shutdown: true,
+            drained: false,
             entries,
         };
         let tables_advanced = wal.restore_cursor_snapshot(&snap).unwrap();
@@ -1611,7 +1785,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
-        wal.write_cursor_snapshot(true).unwrap();
+        wal.write_cursor_snapshot(true, true).unwrap();
         let meta = path.join(".timefusion_meta");
         let target = meta.join("cursor_snapshot.json");
 
@@ -1619,7 +1793,7 @@ mod tests {
         let original = std::fs::metadata(&meta).unwrap().permissions();
         std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-        assert!(wal.write_cursor_snapshot(false).is_err(), "write into RO dir must fail");
+        assert!(wal.write_cursor_snapshot(false, false).is_err(), "write into RO dir must fail");
         assert!(wal.delete_cursor_snapshot().is_err(), "unlink under RO parent must fail");
         assert!(target.exists(), "stale snapshot survives both failures");
 
@@ -1639,14 +1813,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_path_buf();
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
-        wal.write_cursor_snapshot(true).unwrap();
+        wal.write_cursor_snapshot(true, true).unwrap();
         let target = path.join(".timefusion_meta/cursor_snapshot.json");
         let tmp = path.join(".timefusion_meta/cursor_snapshot.json.tmp");
         assert!(target.exists());
 
         // Force the next write to fail by squatting on the tmp path with a dir.
         std::fs::create_dir(&tmp).unwrap();
-        assert!(wal.write_cursor_snapshot(false).is_err(), "tmp-path collision must fail the write");
+        assert!(wal.write_cursor_snapshot(false, false).is_err(), "tmp-path collision must fail the write");
         assert!(target.exists(), "stale snapshot still on disk after failed write");
 
         // BufferedWriteLayer's recovery: delete the stale file.
@@ -1665,7 +1839,7 @@ mod tests {
         let wal = WalManager::with_fsync_mode_and_shards(path.clone(), crate::config::WalFsyncMode::SyncEach, 4).unwrap();
         // Missing → Ok.
         wal.delete_cursor_snapshot().unwrap();
-        wal.write_cursor_snapshot(true).unwrap();
+        wal.write_cursor_snapshot(true, true).unwrap();
         assert!(path.join(".timefusion_meta/cursor_snapshot.json").exists());
         wal.delete_cursor_snapshot().unwrap();
         assert!(!path.join(".timefusion_meta/cursor_snapshot.json").exists());
@@ -1687,7 +1861,7 @@ mod tests {
         wal.append("proj", &table, &create_test_batch()).unwrap();
         let tail = wal.current_position("proj", &table).unwrap();
         wal.merge_persisted_positions("proj", &table, &[Some(tail[0]), None, None, None]).unwrap();
-        wal.write_cursor_snapshot(false).unwrap();
+        wal.write_cursor_snapshot(false, false).unwrap();
 
         let snap = wal.load_cursor_snapshot().expect("dirty snapshot must still be loadable");
         assert!(!snap.clean_shutdown, "dirty snapshot must not claim clean_shutdown");
@@ -1726,7 +1900,7 @@ mod tests {
         std::fs::write(&f2, vec![0u8; 2048]).unwrap();
 
         // Pass 1: max_age = 1h. Both files were created just now → kept.
-        let (deleted, bytes_freed) = gc_wal_files(root, Duration::from_secs(3600)).unwrap();
+        let (deleted, bytes_freed) = gc_wal_files(root, Duration::from_secs(3600), None).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(bytes_freed, 0);
         assert!(f1.exists() && f2.exists());
@@ -1734,12 +1908,103 @@ mod tests {
         // Pass 2: max_age = 0 → cutoff is "now" → every existing file is
         // strictly older than the cutoff and gets deleted, but `.timefusion_meta`
         // is exempt.
-        let (deleted, bytes_freed) = gc_wal_files(root, Duration::ZERO).unwrap();
+        let (deleted, bytes_freed) = gc_wal_files(root, Duration::ZERO, None).unwrap();
         assert_eq!(deleted, 2);
         assert_eq!(bytes_freed, 1024 + 2048);
         assert!(!f1.exists() && !f2.exists());
         assert!(root.join(".timefusion_meta/cursor_snapshot.json").exists(), "meta dir must be skipped");
         assert!(root.join(".timefusion_meta/topics").exists());
+    }
+
+    /// Regression: prod 2026-07-08. GC deleted files purely by mtime,
+    /// assuming "old ⇒ already flushed" — during a crash loop the aged files
+    /// WERE the un-flushed backlog. The durability floor must override age.
+    #[test]
+    fn gc_wal_files_respects_unflushed_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let f = root.join("1770000000000");
+        std::fs::write(&f, vec![0u8; 512]).unwrap();
+
+        // max_age=0 alone would delete it (mtime < now) — but un-flushed data
+        // depends on appends from 1h ago, so the floor (minus slack) keeps
+        // every file modified since then.
+        let floor = chrono::Utc::now().timestamp_micros() - 3600 * 1_000_000;
+        let (deleted, _) = gc_wal_files(root, std::time::Duration::ZERO, Some(floor)).unwrap();
+        assert_eq!(deleted, 0, "file newer than the un-flushed floor must survive");
+        assert!(f.exists());
+
+        // A floor far in the future imposes no extra protection beyond age.
+        let (deleted, _) = gc_wal_files(root, std::time::Duration::ZERO, Some(chrono::Utc::now().timestamp_micros() + 3600 * 1_000_000)).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(!f.exists());
+    }
+
+    /// Boot GC gating (2026-07-08 review findings): `clean_shutdown=true` is
+    /// NOT a drain claim — shutdown writes it even after a partial flush, so
+    /// only `drained=true` may authorize the pure-mtime sweep. And the
+    /// drained claim must be CONSUMED by the boot that uses it: a stale
+    /// drained=true surviving a crash-without-flush life would authorize the
+    /// next boot to delete that life's un-flushed backlog.
+    #[test]
+    fn boot_wal_gc_requires_drained_and_consumes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let meta = root.join(".timefusion_meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        let snap_path = meta.join("cursor_snapshot.json");
+        // An old-mtime WAL file that may be the un-flushed backlog.
+        let old_file = root.join("00.wal");
+        let make_old_file = || {
+            std::fs::write(&old_file, b"data").unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+            let f = std::fs::File::options().append(true).open(&old_file).unwrap();
+            f.set_times(std::fs::FileTimes::new().set_modified(old)).unwrap();
+        };
+        let write_snap = |clean: bool, drained: bool, version: u32| {
+            let bytes = serde_json::to_vec(&CursorSnapshot {
+                version,
+                written_at_micros: 0,
+                shards_per_topic: 4,
+                clean_shutdown: clean,
+                drained,
+                entries: Default::default(),
+            })
+            .unwrap();
+            std::fs::write(&snap_path, bytes).unwrap();
+        };
+        let max_age = std::time::Duration::from_secs(60);
+
+        make_old_file();
+        boot_wal_gc(root, max_age); // missing snapshot → skip
+        std::fs::write(&snap_path, b"not json").unwrap();
+        boot_wal_gc(root, max_age); // unreadable → skip
+        write_snap(true, false, SNAPSHOT_VERSION);
+        boot_wal_gc(root, max_age); // clean but NOT drained (partial flush) → skip
+        write_snap(true, true, 999);
+        boot_wal_gc(root, max_age); // version mismatch → skip
+        assert!(old_file.exists(), "un-drained/unreadable snapshots must never authorize the mtime sweep");
+
+        // drained=true authorizes exactly one sweep, then is consumed.
+        write_snap(true, true, SNAPSHOT_VERSION);
+        boot_wal_gc(root, max_age);
+        assert!(!old_file.exists(), "drained snapshot must run the sweep");
+        let reread: CursorSnapshot = serde_json::from_slice(&std::fs::read(&snap_path).unwrap()).unwrap();
+        assert!(!reread.drained, "the drained claim must be consumed by the boot that used it");
+        assert!(reread.clean_shutdown, "consuming drained must not clobber the cursor-restore flag");
+        make_old_file();
+        boot_wal_gc(root, max_age);
+        assert!(old_file.exists(), "second boot must not reuse the consumed drained claim");
+
+        // Fail-closed (2026-07-08 review finding 3): if the drained flag
+        // cannot be durably consumed, the sweep must NOT run — sweeping
+        // first would fail open (a power loss reverting the un-fsynced
+        // rewrite resurrects the authorization after files are gone).
+        write_snap(true, true, SNAPSHOT_VERSION);
+        std::fs::create_dir_all(meta.join("cursor_snapshot.json.tmp")).unwrap(); // blocks File::create(tmp)
+        boot_wal_gc(root, max_age);
+        assert!(old_file.exists(), "sweep must be skipped when the drained consume fails");
+        assert!(!snap_path.exists(), "unconsumable drained snapshot must be deleted (fail closed)");
     }
 
     #[test]
@@ -1748,7 +2013,7 @@ mod tests {
         // must not error.
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
-        let (deleted, bytes_freed) = gc_wal_files(&missing, std::time::Duration::ZERO).unwrap();
+        let (deleted, bytes_freed) = gc_wal_files(&missing, std::time::Duration::ZERO, None).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(bytes_freed, 0);
     }

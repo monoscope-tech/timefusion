@@ -595,6 +595,13 @@ pub struct BufferConfig {
     pub timefusion_wal_fsync_ms:              u64,
     #[serde(default = "d_wal_fsync_mode")]
     pub timefusion_wal_fsync_mode:            String,
+    /// Fsync the WAL shard before acking DML appends (machine-crash
+    /// durability). Batched INSERT appends are always flushed before ack by
+    /// walrus's `batch_write`; only single-entry DML appends defer to the
+    /// background fsync thread — this closes that window. Default off: an
+    /// OOM/SIGKILL never loses mmap'd writes, only power loss does.
+    #[serde(default)]
+    pub timefusion_wal_ack_fsync:             bool,
     #[serde(default = "d_wal_max_files")]
     pub timefusion_wal_max_file_count:        usize,
     #[serde(default = "d_bucket_duration_secs")]
@@ -639,10 +646,12 @@ impl BufferConfig {
     pub fn retention_mins(&self) -> u64 {
         self.timefusion_buffer_retention_mins.max(1)
     }
-    /// Age past which a WAL file is dead weight: `recover_from_wal` skips
-    /// entries older than `retention_mins`, so anything last written before
-    /// that (plus slack for clock skew / an in-flight flush) can never be
-    /// replayed. Shared by the boot-time and runtime GC passes.
+    /// mtime age past which a WAL file is PRESUMED dead weight. This is a
+    /// heuristic, not a soundness bound: replay is cursor-bounded (no age
+    /// cutoff — see `recover_from_wal`), so GC soundness comes from the
+    /// un-flushed floor (`gc_wal_files`'s `unflushed_floor_micros`) and the
+    /// drained-gated boot sweep, NEVER from age alone. Do not tighten or
+    /// bypass the floor on the strength of this age.
     pub fn wal_gc_max_age(&self) -> Duration {
         Duration::from_secs((self.retention_mins() + 20) * 60)
     }
@@ -678,6 +687,9 @@ impl BufferConfig {
     }
     pub fn wal_fsync_ms(&self) -> u64 {
         self.timefusion_wal_fsync_ms.max(1)
+    }
+    pub fn wal_ack_fsync(&self) -> bool {
+        self.timefusion_wal_ack_fsync
     }
     pub fn wal_fsync_mode(&self) -> WalFsyncMode {
         match self.timefusion_wal_fsync_mode.to_ascii_lowercase().as_str() {

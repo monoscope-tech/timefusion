@@ -95,10 +95,20 @@ impl E2eEnvBuilder {
         // Freeze clock BEFORE bootstrap so background tasks see test time.
         clock::set_micros(self.frozen_at_micros);
 
-        let minio = MinIO::default().start().await.context("start MinIO container")?;
-        let host = minio.get_host().await.context("get MinIO host")?.to_string();
-        let port = minio.get_host_port_ipv4(9000).await.context("get MinIO port")?;
-        let endpoint = format!("http://{host}:{port}");
+        // MinIO is a single native binary — Docker/testcontainers is only the
+        // zero-setup default. Point TIMEFUSION_TEST_S3_ENDPOINT at a running
+        // MinIO (e.g. `minio server /tmp/minio-e2e`) to skip Docker entirely;
+        // per-test isolation comes from the unique bucket, not the container.
+        let (minio, endpoint) = match std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
+            Ok(ep) => (None, ep),
+            Err(_) => {
+                let minio = MinIO::default().start().await.context("start MinIO container")?;
+                let host = minio.get_host().await.context("get MinIO host")?.to_string();
+                let port = minio.get_host_port_ipv4(9000).await.context("get MinIO port")?;
+                let endpoint = format!("http://{host}:{port}");
+                (Some(minio), endpoint)
+            }
+        };
 
         let test_id = Uuid::new_v4().to_string()[..8].to_string();
         let bucket = format!("e2e-{test_id}");
@@ -173,7 +183,8 @@ impl E2eEnvBuilder {
 }
 
 pub struct E2eEnv {
-    _minio:       ContainerAsync<MinIO>,
+    /// None when running against an external MinIO (TIMEFUSION_TEST_S3_ENDPOINT).
+    _minio:       Option<ContainerAsync<MinIO>>,
     pub data_dir: PathBuf,
     pub pg_port:  u16,
     pub bucket:   String,

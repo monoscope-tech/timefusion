@@ -228,6 +228,14 @@ pub struct MemBuffer {
     /// `take_bucket_for_flush` and bucket/table re-creation by later inserts.
     /// Pruned on drain and eviction.
     force_flushed:        DashMap<TableKey, std::collections::HashSet<i64>>,
+    /// GC-floor pins of buckets mid-take: `take_bucket_for_flush` removes a
+    /// bucket (and its `first_wal_pin_micros`) from the tables map before the
+    /// flush path registers its inflight pin; a GC sweep sampling the floor
+    /// in that gap would miss the airborne bucket and could delete its
+    /// backing WAL file. The pin parks here from before the removal until
+    /// [`Self::release_taking_pin`]. Keyed by `taking_seq`.
+    taking_pins:          DashMap<u64, i64>,
+    taking_seq:           AtomicU64,
 }
 
 /// Cache key: (project_id, table_name, bucket_id). All three are cheap to
@@ -273,12 +281,28 @@ pub struct TimeBucket {
     /// whole next cycle with the post-DML values.
     mutation_gen:        AtomicU64,
     /// Wall-clock micros of the newest WAL entry pinned on this bucket
-    /// (WalEntry timestamps are append-time, so this is ARRIVAL time — the
-    /// same clock the replay retention filter uses). Drives
-    /// [`MemBuffer::reap_expired_empty_buckets`]: once every pinned entry is
-    /// past the replay cutoff, an empty shell's holds can be released
-    /// without any resurrection risk.
+    /// (WalEntry timestamps are append-time, so this is ARRIVAL time).
+    /// Drives [`MemBuffer::reap_expired_empty_buckets`]'s grace period —
+    /// see its doc for the (pair-netting) soundness argument; replay itself
+    /// no longer filters by age.
     last_wal_pin_micros: AtomicI64,
+    /// Real-clock micros of the OLDEST WAL append this bucket's un-flushed
+    /// data may depend on — the WAL GC floor: no WAL file whose mtime is at
+    /// or after `min(first_wal_pin)` across live buckets may be deleted.
+    /// Stamped `Utc::now()` on live inserts and DML pins (the append just
+    /// happened); replay buckets are additionally floored at the entry's
+    /// original append time via [`MemBuffer::record_replay_holds`]. Event
+    /// time is deliberately NOT used: a backfill of old events would drag
+    /// the floor days back and suspend WAL GC for the backfill's duration.
+    /// Deliberately real-clock (chrono, not `crate::clock`) — it is compared
+    /// against file mtimes.
+    first_wal_pin_micros: AtomicI64,
+}
+
+/// Decode the `i64::MAX = no pin` sentinel used by `first_wal_pin_micros`
+/// and everything that carries it (taking/inflight/orphan pins).
+pub(crate) fn pin_opt(v: i64) -> Option<i64> {
+    (v != i64::MAX).then_some(v)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -308,6 +332,14 @@ pub struct FlushableBucket {
     /// time-range pruning) rather than collapsing to the bucket's start.
     pub min_timestamp:       i64,
     pub max_timestamp:       i64,
+    /// Source bucket's `first_wal_pin_micros` (WAL GC floor) — carried so an
+    /// airborne take/commit keeps flooring the GC, and a failed commit's
+    /// restore re-applies it.
+    pub first_wal_pin_micros: i64,
+    /// Key of this take's entry in `MemBuffer::taking_pins`; the flush path
+    /// releases it via [`MemBuffer::release_taking_pin`] once its own
+    /// inflight pin is registered.
+    pub taking_pin_seq:       u64,
 }
 
 #[derive(Debug, Default)]
@@ -757,6 +789,8 @@ impl MemBuffer {
             text_index_bytes: AtomicUsize::new(0),
             text_index_max_bytes,
             force_flushed: DashMap::new(),
+            taking_pins: DashMap::new(),
+            taking_seq: AtomicU64::new(0),
         }
     }
 
@@ -955,7 +989,33 @@ impl MemBuffer {
             for (shard, pos) in holds.iter().enumerate() {
                 bucket.record_wal_append(shard, *pos);
             }
+            // GC floor at the entry's ORIGINAL append time (replay entry
+            // timestamps are append-time): the backing file's mtime is that
+            // old, so the insert path's now-stamp alone would let GC delete
+            // it from under the parked cursor.
+            bucket.first_wal_pin_micros.fetch_min(timestamp_micros, Ordering::Relaxed);
         }
+    }
+
+    /// Oldest WAL-append real-clock micros any un-flushed bucket may depend
+    /// on — the WAL GC floor. `None` when nothing is buffered. Includes
+    /// buckets mid-take (see `taking_pins`): between `take_bucket_for_flush`
+    /// removing a bucket and the flush path registering its inflight pin, the
+    /// pin must stay visible or a concurrent GC sweep can delete the bucket's
+    /// backing file. See `TimeBucket::first_wal_pin_micros`.
+    pub fn oldest_wal_append_micros(&self) -> Option<i64> {
+        self.tables
+            .iter()
+            .filter_map(|t| t.buckets.iter().filter_map(|b| pin_opt(b.first_wal_pin_micros.load(Ordering::Relaxed))).min())
+            .chain(self.taking_pins.iter().map(|e| *e.value()))
+            .min()
+    }
+
+    /// Drop a take-in-progress pin once the flush path has registered its own
+    /// inflight pin for the taken bucket (always paired with a successful
+    /// `take_bucket_for_flush`).
+    pub fn release_taking_pin(&self, seq: u64) {
+        self.taking_pins.remove(&seq);
     }
 
     /// Per-shard min of `first_positions` across every live bucket of the
@@ -1303,6 +1363,11 @@ impl MemBuffer {
             snapshot_gen,
             min_timestamp: bucket.min_timestamp.load(Ordering::Relaxed),
             max_timestamp: bucket.max_timestamp.load(Ordering::Relaxed),
+            first_wal_pin_micros: bucket.first_wal_pin_micros.load(Ordering::Relaxed),
+            // Snapshot leaves the bucket (and its pin) in the map — no
+            // taking-pin gap to cover. u64::MAX is never allocated by
+            // `taking_seq`, so releasing it is a no-op.
+            taking_pin_seq: u64::MAX,
         })
     }
 
@@ -1411,18 +1476,23 @@ impl MemBuffer {
         true
     }
 
-    /// Remove empty bucket shells whose pinned WAL entries are all past the
-    /// replay cutoff, releasing their cursor holds so the topic's WAL can
-    /// advance and GC. A DML that empties a sealed bucket leaves such a
-    /// shell: it can never flush (snapshot/take return None on empty), so
-    /// without this sweep its holds pin the watermark for the process
-    /// lifetime — unbounded WAL growth for DML-heavy topics.
+    /// Remove empty bucket shells whose pinned WAL entries have aged past
+    /// `arrival_cutoff_micros`, releasing their cursor holds so the topic's
+    /// WAL can advance and GC. A DML that empties a sealed bucket leaves
+    /// such a shell: it can never flush (snapshot/take return None on
+    /// empty), so without this sweep its holds pin the watermark for the
+    /// process lifetime — unbounded WAL growth for DML-heavy topics.
     ///
-    /// `arrival_cutoff_micros` MUST be the replay retention cutoff (WalEntry
-    /// timestamps are append-time): past it, replay filters the entries
-    /// regardless, so releasing can't skip an insert while replaying its
-    /// DELETE or vice versa (and a DELETE always arrives after the inserts
-    /// it affected). Shells with an airborne snapshot are skipped.
+    /// SOUNDNESS (load-bearing since replay lost its age cutoff, 2026-07-08):
+    /// releasing a shell's holds lets the watermark consume its entries, so
+    /// this is only exact because an empty shell's pinned entries are always
+    /// an insert set plus the DML(s) that emptied it — skipping ALL of them
+    /// on a later replay nets to the same zero rows, and the DML's Delta leg
+    /// completed before its ack. Any future path that leaves holds on an
+    /// empty bucket whose entries do NOT net to zero must not be reaped
+    /// here. The age gate (default: retention) is only a grace period so an
+    /// airborne DML pair isn't split; shells with an airborne snapshot are
+    /// skipped.
     pub fn reap_expired_empty_buckets(&self, arrival_cutoff_micros: i64) -> usize {
         let mut reaped = 0usize;
         for table in self.tables.iter() {
@@ -1491,6 +1561,16 @@ impl MemBuffer {
         // Delta commit failure) can replay it instead of guessing bucket-start.
         let min_timestamp = bucket.min_timestamp.swap(i64::MAX, Ordering::Relaxed);
         let max_timestamp = bucket.max_timestamp.swap(i64::MIN, Ordering::Relaxed);
+        // Park the GC-floor pin in `taking_pins` BEFORE clearing it from the
+        // bucket, so a concurrent GC sweep between this take and the flush
+        // path's `register_inflight_pin` still sees the floor (see
+        // `taking_pins`). Released via `release_taking_pin`.
+        let first_wal_pin_micros = bucket.first_wal_pin_micros.load(Ordering::Relaxed);
+        let taking_pin_seq = self.taking_seq.fetch_add(1, Ordering::Relaxed);
+        if let Some(pin) = pin_opt(first_wal_pin_micros) {
+            self.taking_pins.insert(taking_pin_seq, pin);
+        }
+        bucket.first_wal_pin_micros.store(i64::MAX, Ordering::Relaxed);
         drop(wal_g);
         drop(batches_g);
         drop(bucket_ref);
@@ -1518,6 +1598,8 @@ impl MemBuffer {
             snapshot_gen: 0, // take removes rows; the gen check is snapshot-path-only
             min_timestamp,
             max_timestamp,
+            first_wal_pin_micros,
+            taking_pin_seq,
         })
     }
 
@@ -1571,6 +1653,7 @@ impl MemBuffer {
         // are preserved since fetch_min/max only widens.
         bucket.update_timestamps(b.min_timestamp);
         bucket.update_timestamps(b.max_timestamp);
+        bucket.first_wal_pin_micros.fetch_min(b.first_wal_pin_micros, Ordering::Relaxed);
         drop(wal_g);
         drop(batches_g);
         self.estimated_bytes.fetch_add(added, Ordering::Relaxed);
@@ -2289,6 +2372,15 @@ impl TableBuffer {
             if let Some((shard, pos)) = wal_hold {
                 bucket.record_wal_append(shard, Some(pos));
             }
+            // WAL GC floor (see `first_wal_pin_micros`): the append just
+            // happened, so `now` IS the append time. The live path (hold
+            // present) was already stamped by record_wal_append above; only
+            // replay inserts (no wal_hold) need it here, and they are
+            // additionally floored at the entry's original append time in
+            // `record_replay_holds`.
+            if wal_hold.is_none() {
+                bucket.first_wal_pin_micros.fetch_min(chrono::Utc::now().timestamp_micros(), Ordering::Relaxed);
+            }
             g.push(batch);
             bucket.memory_bytes.fetch_add(new_size, Ordering::Relaxed);
             // Coalesce gate: fold only the trailing run of batches that are
@@ -2380,6 +2472,7 @@ impl TimeBucket {
             flush_pinned_prefix: AtomicUsize::new(0),
             mutation_gen:        AtomicU64::new(0),
             last_wal_pin_micros: AtomicI64::new(crate::clock::now_micros()),
+            first_wal_pin_micros: AtomicI64::new(i64::MAX),
         }
     }
 
@@ -2395,6 +2488,10 @@ impl TimeBucket {
 
     fn record_wal_append(&self, shard: usize, pre_position: Option<walrus_rust::WalPosition>) {
         self.last_wal_pin_micros.fetch_max(crate::clock::now_micros(), Ordering::Relaxed);
+        // GC-floor stamp for DML pins. Replay pins go through here with "now"
+        // too, but their buckets were already floored at the original append
+        // time by `insert_batch`, so fetch_min can only keep the older value.
+        self.first_wal_pin_micros.fetch_min(chrono::Utc::now().timestamp_micros(), Ordering::Relaxed);
         if let Some(pos) = pre_position {
             let mut s = self.wal_shard_state.lock();
             if s.first_positions.len() <= shard {
@@ -2541,6 +2638,53 @@ mod tests {
             None,
         )));
         RecordBatch::try_new(schema, cols).unwrap()
+    }
+
+    /// 2026-07-08 review finding: the WAL GC floor must be the APPEND time.
+    /// Stamping event time meant one old-event-time backfill row dragged the
+    /// floor days back and suspended WAL file GC for the backfill's duration.
+    #[test]
+    fn live_insert_gc_floor_is_append_time_not_event_time() {
+        let buffer = MemBuffer::new();
+        let ten_days_ago = chrono::Utc::now().timestamp_micros() - 10 * 24 * 3600 * 1_000_000;
+        buffer.insert("p1", "t1", create_test_batch(ten_days_ago), ten_days_ago).unwrap();
+        let floor = buffer.oldest_wal_append_micros().expect("un-flushed bucket must floor GC");
+        let hour = 3600 * 1_000_000;
+        assert!(
+            floor > chrono::Utc::now().timestamp_micros() - hour,
+            "backfill event time leaked into the GC floor: {floor} (≈10 days old)"
+        );
+        // Replay counterpart: record_replay_holds floors at the entry's
+        // ORIGINAL append time so the old backing file stays protected.
+        buffer.record_replay_holds("p1", "t1", ten_days_ago, &[None]);
+        assert_eq!(
+            buffer.oldest_wal_append_micros(),
+            Some(ten_days_ago),
+            "replay pins must keep the original append time as the floor"
+        );
+    }
+
+    /// 2026-07-08 review finding: `take_bucket_for_flush` removed the bucket
+    /// (and its GC-floor pin) before the flush path registered its inflight
+    /// pin — a GC sweep sampling the floor in that gap could delete the
+    /// airborne bucket's backing WAL file. The pin must stay visible from
+    /// take until `release_taking_pin`.
+    #[test]
+    fn taken_bucket_pin_stays_visible_until_released() {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        buffer.insert("p1", "t1", create_test_batch(ts), ts).unwrap();
+        let pin_before = buffer.oldest_wal_append_micros().expect("insert must set the floor");
+
+        let bucket_id = MemBuffer::compute_bucket_id(ts);
+        let taken = buffer.take_bucket_for_flush("p1", "t1", bucket_id).expect("bucket must be takeable");
+        assert_eq!(
+            buffer.oldest_wal_append_micros(),
+            Some(pin_before),
+            "floor must not blink out between take and inflight-pin registration"
+        );
+        buffer.release_taking_pin(taken.taking_pin_seq);
+        assert_eq!(buffer.oldest_wal_append_micros(), None, "released take must drop the floor");
     }
 
     #[test]

@@ -61,18 +61,9 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db.setup_session_udfs(&mut session_context)?;
     let registry: Arc<crate::functions::FnRegistry> = Arc::new(session_context.state());
 
-    // Pre-init WAL GC: delete dead files before walrus enumerates the dir on
-    // construction. Without this, accumulated leaks from prior process
-    // lifetimes dominate startup (see memory `wal_bloat_startup.md` — prod
-    // hit 467 GB / 12-min startup).
-    let t_gc = std::time::Instant::now();
-    match crate::wal::gc_wal_files(&cfg.core.wal_dir(), cfg.buffer.wal_gc_max_age()) {
-        Ok((deleted, bytes_freed)) => tracing::info!(
-            "bootstrap.phase=wal_gc deleted={deleted} bytes_freed={bytes_freed} elapsed_ms={}",
-            t_gc.elapsed().as_millis()
-        ),
-        Err(e) => tracing::warn!("bootstrap.phase=wal_gc error={e} elapsed_ms={}", t_gc.elapsed().as_millis()),
-    }
+    // Pre-init WAL GC (gated + drained-flag consumption inside the helper —
+    // same call as main.rs so the e2e path mirrors prod).
+    crate::wal::boot_wal_gc(&cfg.core.wal_dir(), cfg.buffer.wal_gc_max_age());
 
     let t_layer = std::time::Instant::now();
     let mut layer = BufferedWriteLayer::with_config(Arc::clone(&cfg), registry)?.with_delta_writer(delta_write_callback);

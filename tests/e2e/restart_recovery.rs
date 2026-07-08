@@ -38,18 +38,14 @@ async fn flushed_rows_survive_restart() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Known gap: the in-process restart harness re-runs `recover_from_wal` with
-// `checkpoint=true` during the second bootstrap, but the second-pass read
-// returns zero entries even though the WAL on disk still holds the inserts
-// (wal_files=3, wal_disk_bytes≈2GB post-restart). The production WAL unit
-// test in `src/buffered_write_layer.rs::wal_replay_preserves_open_bucket`
-// hits the same recover path successfully via a more direct
-// `test_helpers::test_layer` setup, so the regression is harness-side
-// (most likely the cursor_snapshot.json written during the first bootstrap's
-// "clean" shutdown path advances cursors past our writes). The
-// `flushed_rows_survive_restart` test still covers the durability path via
-// Delta, so this gap doesn't lower coverage of the production crash class.
-#[ignore = "harness restart path doesn't replay WAL — see comment"]
+// Formerly #[ignore]d as a "harness-side gap": the second-pass read returned
+// zero entries though the WAL held the inserts. That was not harness-side —
+// it was the 2026-07-08 acked-write-loss bug itself: replay's retention
+// cutoff compared virtual-clock `now` (frozen at ~2030 here) against the
+// real-clock WAL stamps, so every entry looked aged-out and was
+// checkpoint-consumed without being applied. With the cutoff removed (the
+// persisted cursor is the replay boundary), this passes and guards the
+// production crash class end-to-end.
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {

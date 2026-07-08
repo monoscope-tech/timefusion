@@ -30,6 +30,10 @@ const RAM_FRACTION_FOYER_META: f64 = 0.02;
 const DISK_FRACTION_FOYER: f64 = 0.40;
 const DISK_FRACTION_FOYER_META: f64 = 0.02;
 
+/// Warn when the final (post-override) sum of memory reservations exceeds
+/// this share of detected RAM — the counterpart of the ≈72% budget above.
+const OVERSUB_WARN_PCT: usize = 85;
+
 const MIN_QUERY_POOL_GB: usize = 1;
 const MAX_QUERY_POOL_GB: usize = 32;
 const MIN_BUFFER_MB: usize = 256;
@@ -150,6 +154,38 @@ pub fn apply(config: &mut AppConfig) {
         let summary = applied.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(", ");
         info!("Auto-tune applied: {}", summary);
     }
+
+    // Coherence guard: user-pinned envs can oversubscribe RAM (prod ran a
+    // hand-set combination for months before the 2026-07-08 OOM loop). The
+    // auto-derived split respects the ≈72% invariant by construction; this
+    // checks the FINAL post-override sum and warns loudly — operators keep
+    // authority, but the failure mode becomes visible instead of an OOM.
+    if let Some((reserved_mb, limit_mb)) = memory_oversubscription(config, total_ram_mb) {
+        tracing::warn!(
+            "Memory budget oversubscribed: TIMEFUSION_MEMORY_LIMIT_GB ({}GB) + TIMEFUSION_BUFFER_MAX_MEMORY_MB ({}MB) + \
+             TIMEFUSION_FOYER_MEMORY_MB ({}MB) + TIMEFUSION_FOYER_METADATA_MEMORY_MB ({}MB) = {}MB > {}MB ({}% of {}MB detected RAM) \
+             — expect OOM kills under load; lower one of these knobs",
+            config.memory.timefusion_memory_limit_gb,
+            config.buffer.timefusion_buffer_max_memory_mb,
+            config.cache.timefusion_foyer_memory_mb,
+            config.cache.timefusion_foyer_metadata_memory_mb,
+            reserved_mb,
+            limit_mb,
+            OVERSUB_WARN_PCT,
+            total_ram_mb
+        );
+    }
+}
+
+/// Fix E (2026-07-08 plan): `Some((reserved_mb, limit_mb))` when the final
+/// (post-override) memory reservations exceed [`OVERSUB_WARN_PCT`] of RAM.
+fn memory_oversubscription(config: &AppConfig, total_ram_mb: usize) -> Option<(usize, usize)> {
+    let reserved_mb = config.memory.timefusion_memory_limit_gb * 1024
+        + config.buffer.timefusion_buffer_max_memory_mb
+        + config.cache.timefusion_foyer_memory_mb
+        + config.cache.timefusion_foyer_metadata_memory_mb;
+    let limit_mb = total_ram_mb * OVERSUB_WARN_PCT / 100;
+    (total_ram_mb > 0 && reserved_mb > limit_mb).then_some((reserved_mb, limit_mb))
 }
 
 fn env_unset(name: &str) -> bool {
@@ -234,6 +270,23 @@ mod tests {
         assert_eq!(cfg.buffer.timefusion_buffer_max_memory_mb, snapshot.buffer.timefusion_buffer_max_memory_mb);
         assert_eq!(cfg.memory.timefusion_memory_limit_gb, snapshot.memory.timefusion_memory_limit_gb);
         let _ = buffer_before;
+    }
+
+    #[test]
+    fn oversubscribed_pinned_envs_are_flagged() {
+        let mut cfg = AppConfig::default();
+        cfg.memory.timefusion_memory_limit_gb = 24; // 24576MB
+        cfg.buffer.timefusion_buffer_max_memory_mb = 8192;
+        cfg.cache.timefusion_foyer_memory_mb = 2048;
+        cfg.cache.timefusion_foyer_metadata_memory_mb = 512;
+        // 35328MB reserved vs 32GB host → over the 85% line (27852MB).
+        let (reserved, limit) = memory_oversubscription(&cfg, 32 * 1024).expect("must flag oversubscription");
+        assert_eq!(reserved, 35328);
+        assert_eq!(limit, 27852);
+        // Same knobs on a 64GB host are fine.
+        assert_eq!(memory_oversubscription(&cfg, 64 * 1024), None);
+        // Unknown RAM (0) must not divide-by-zero or false-positive.
+        assert_eq!(memory_oversubscription(&cfg, 0), None);
     }
 
     #[test]
