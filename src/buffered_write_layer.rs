@@ -985,7 +985,13 @@ impl BufferedWriteLayer {
                 }
                 WalOperation::Delete => match decode_payload::<DeletePayload>(&entry.data) {
                     Ok(payload) => {
-                        if let Err(e) = mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), registry_ref, Some((shard, pos))) {
+                        if let Err(e) = mem_buffer.delete_by_sql(
+                            &entry.project_id,
+                            &entry.table_name,
+                            payload.predicate_sql.as_deref(),
+                            registry_ref,
+                            Some((shard, pos)),
+                        ) {
                             error!("WAL REPLAY FAILED: DELETE for {}.{}: {}", entry.project_id, entry.table_name, e);
                             if !quarantine_entry(&quarantine_dir, &entry, "delete_replay_failed", &e.to_string()) {
                                 quarantine_failures.fetch_add(1, Ordering::Relaxed);
@@ -2823,7 +2829,11 @@ mod tests {
             flushes.load(Ordering::Relaxed) > 0,
             "replay never drained to Delta despite exceeding the budget"
         );
-        assert_eq!(unsafe_claims.load(Ordering::Relaxed), 0, "mid-replay commit claimed a watermark beyond the durable read cursor");
+        assert_eq!(
+            unsafe_claims.load(Ordering::Relaxed),
+            0,
+            "mid-replay commit claimed a watermark beyond the durable read cursor"
+        );
         // 2026-07-08 review finding: mid-replay relief flushes must not
         // persist consumed-ahead cursors. The post-recovery snapshot must
         // hold exactly the PARKED positions — anything ahead of them would

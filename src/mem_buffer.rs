@@ -3583,14 +3583,16 @@ mod tests {
         let ts = chrono::Utc::now().timestamp_micros();
         let ins = walrus_rust::WalPosition { block_id: 3, offset: 30 };
         let del = walrus_rust::WalPosition { block_id: 5, offset: 50 };
-        buffer
-            .insert_with_hold("p", "t", create_multi_row_batch(vec![1, 2], vec!["a", "b"]), ts, Some((0, ins)))
-            .unwrap();
+        buffer.insert_with_hold("p", "t", create_multi_row_batch(vec![1, 2], vec!["a", "b"]), ts, Some((0, ins))).unwrap();
         let deleted = buffer.delete_by_sql("p", "t", Some("id = 1"), None, Some((1, del))).unwrap();
         assert_eq!(deleted, 1, "DELETE must match the row it targets");
         let holds = buffer.wal_holds("p", "t", 4);
         assert_eq!(holds[0], Some(ins), "insert hold must remain on the bucket");
-        assert_eq!(holds[1], Some(del), "DELETE's WAL hold must be migrated onto the mutated bucket (else the marker skips it on crash-resume)");
+        assert_eq!(
+            holds[1],
+            Some(del),
+            "DELETE's WAL hold must be migrated onto the mutated bucket (else the marker skips it on crash-resume)"
+        );
     }
 
     fn test_table_df_schema() -> DFSchema {
@@ -3681,7 +3683,9 @@ mod tests {
         assert_eq!(updated, 1);
 
         assert!(
-            buffer.update_by_sql("project1", "table1", Some("upper(name) = 'A'"), &[("name".into(), "'x'".into())], None, None).is_err(),
+            buffer
+                .update_by_sql("project1", "table1", Some("upper(name) = 'A'"), &[("name".into(), "'x'".into())], None, None)
+                .is_err(),
             "without registry, UDF planning should fail rather than silently no-op"
         );
     }

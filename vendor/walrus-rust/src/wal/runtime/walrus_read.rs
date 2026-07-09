@@ -181,7 +181,13 @@ impl Walrus {
                             new_off
                         );
                         // Position of THIS entry = the read head before advancing.
-                        return Ok(Some((entry, WalPosition { block_id: block.id, offset: off })));
+                        return Ok(Some((
+                            entry,
+                            WalPosition {
+                                block_id: block.id,
+                                offset:   off,
+                            },
+                        )));
                     }
                     Err(_) => {
                         debug_print!("[reader] read_next: read error col={}, block_id={}, offset={}", col_name, block.id, off);
@@ -308,7 +314,13 @@ impl Walrus {
                             new_off
                         );
                         // Position of THIS entry = the tail read head before advancing.
-                        return Ok(Some((entry, WalPosition { block_id: active_block.id, offset: tail_off })));
+                        return Ok(Some((
+                            entry,
+                            WalPosition {
+                                block_id: active_block.id,
+                                offset:   tail_off,
+                            },
+                        )));
                     }
                     Err(_) => {
                         debug_print!(
