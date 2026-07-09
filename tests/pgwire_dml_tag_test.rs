@@ -202,6 +202,69 @@ mod pgwire_dml_tag {
         Ok(())
     }
 
+    /// Regression guard for the per-execute planning fix (2026-07-08).
+    /// Monoscope's bulk insert is `INSERT … SELECT … FROM unnest($N::text[])`
+    /// — a Projection/Unnest subtree that `try_fast_path_insert` (Values-only)
+    /// declines, so it flows through the executor fall-through. That path now
+    /// builds the physical plan directly (skipping the redundant per-execute
+    /// `state.optimize()` that `DataFrame::collect` re-ran). This asserts the
+    /// unnest INSERT still writes every row and reports the right affected count
+    /// through the rewritten path. (The fast_path_hits/fallthrough counters are
+    /// wired into `timefusion_stats` for prod, but the `set_global` OnceLock is
+    /// first-write-wins so they can't be asserted across the shared-process
+    /// serial harness.)
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn insert_select_unnest_falls_through_and_writes_rows() -> Result<()> {
+        let server = TestServer::start().await?;
+        let client = server.client().await?;
+
+        // unnest shape (monoscope prod) → fast-path decline → executor fall-through.
+        let ids: Vec<String> = vec![Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+        let pids = vec!["test_project".to_string(); 2];
+        let dates = vec!["2026-07-08".to_string(); 2];
+        let tss = vec!["2026-07-08T00:00:00Z".to_string(); 2];
+        let names = vec!["n".to_string(); 2];
+        let hashes = vec!["".to_string(); 2];
+        let summaries = vec!["a\u{1f}b".to_string(); 2];
+        let unnest_n = client
+            .execute(
+                "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, hashes, summary) \
+                 SELECT u.pid, u.d::date, u.ts::timestamp, u.id, u.nm, string_to_array(u.h, chr(31)), string_to_array(u.s, chr(31)) \
+                 FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[]) \
+                 AS u(pid, d, ts, id, nm, h, s)",
+                &[&pids, &dates, &tss, &ids, &names, &hashes, &summaries],
+            )
+            .await?;
+        assert_eq!(unnest_n, 2, "unnest INSERT must report all rows affected");
+
+        for id in &ids {
+            let row = client.query_one("SELECT id FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", id]).await?;
+            assert_eq!(&row.get::<_, String>(0), id, "unnest row must be readable back");
+        }
+
+        // A parameterised UPDATE is cached + pre-optimized, so it too takes the
+        // skip-optimize fall-through branch. Assert the affected-row count is
+        // exact — proof that bypassing the execute-time re-optimize preserves
+        // DML semantics for the non-INSERT shapes, not just INSERT.
+        let upd = client
+            .execute(
+                "UPDATE otel_logs_and_spans SET name = $1 WHERE project_id = $2 AND id = $3",
+                &[&"renamed", &"test_project", &ids[0]],
+            )
+            .await?;
+        assert_eq!(upd, 1, "pre-optimized UPDATE (skip-optimize branch) must affect exactly the matched row");
+        let name: String = client
+            .query_one(
+                "SELECT name FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"test_project", &ids[0]],
+            )
+            .await?
+            .get(0);
+        assert_eq!(name, "renamed", "UPDATE must actually mutate the row through the rewritten path");
+        Ok(())
+    }
+
     /// Regression: monoscope's UPDATE-2 dual-write (`BackgroundJobs.hs`
     /// `dualExecPgTf`) sends the span/trace/tag arrays as bound params
     /// (`unnest($1::text[])`, Hasql `#{spanIds'}::text[]`) over the extended

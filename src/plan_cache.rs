@@ -283,23 +283,25 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
 /// divergence here (no compile error, wrong wire response). Search for the
 /// `RE-SYNC-DML-COMPLETION` marker below and confirm parity.
 // RE-SYNC-DML-COMPLETION: keep in sync with apitoolkit/datafusion-postgres@timefusion-df54 src/handlers.rs.
-async fn dml_completion(df: datafusion::dataframe::DataFrame) -> PgWireResult<Option<Response>> {
-    let tag = match df.logical_plan() {
+// Takes the already-collected DML output batches (the hook builds the physical
+// plan itself to skip a redundant re-optimize, so there is no DataFrame to
+// collect) and derives the CommandComplete tag + affected-row count.
+fn dml_response(plan: &LogicalPlan, batches: &[RecordBatch]) -> Option<Response> {
+    let tag = match plan {
         LogicalPlan::Dml(d) => match d.op {
             WriteOp::Insert(_) => Tag::new("INSERT").with_oid(0),
             WriteOp::Update => Tag::new("UPDATE"),
             WriteOp::Delete => Tag::new("DELETE"),
-            _ => return Ok(None),
+            _ => return None,
         },
-        _ => return Ok(None),
+        _ => return None,
     };
-    let batches = df.collect().await.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
     let rows = batches
         .first()
         .and_then(|b| b.column_by_name("count"))
         .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
         .map_or(0, |a| a.value(0) as usize);
-    Ok(Some(Response::Execution(tag.with_rows(rows))))
+    Some(Response::Execution(tag.with_rows(rows)))
 }
 
 const DEFAULT_PLAN_CACHE_CAPACITY: usize = 256;
@@ -349,6 +351,14 @@ pub struct PlanCacheHook {
     served: dashmap::DashMap<String, ()>,
     shape_hits: std::sync::atomic::AtomicU64,
     shape_skips: std::sync::atomic::AtomicU64,
+    /// INSERT executes that took `try_fast_path_insert` (`fast_path_hits`) vs.
+    /// those that fell through to the executor (`fast_path_fallthrough`). The
+    /// fast path silently stops matching when the client's INSERT shape drifts
+    /// (e.g. monoscope's 2026-07-05 switch to `INSERT…SELECT…unnest`), so a
+    /// hit-rate collapse here is the earliest signal that the write path
+    /// regressed to full planning.
+    fast_path_hits: std::sync::atomic::AtomicU64,
+    fast_path_fallthrough: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -436,6 +446,8 @@ impl PlanCacheHook {
             served: dashmap::DashMap::new(),
             shape_hits: std::sync::atomic::AtomicU64::new(0),
             shape_skips: std::sync::atomic::AtomicU64::new(0),
+            fast_path_hits: std::sync::atomic::AtomicU64::new(0),
+            fast_path_fallthrough: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -449,6 +461,12 @@ impl PlanCacheHook {
     pub fn shape_counters(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering::Relaxed;
         (self.shape_hits.load(Relaxed), self.shape_skips.load(Relaxed))
+    }
+
+    /// Returns (fast_path_hits, fast_path_fallthrough) for stats observability.
+    pub fn fast_path_counters(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (self.fast_path_hits.load(Relaxed), self.fast_path_fallthrough.load(Relaxed))
     }
 
     /// Shape-cache path for literal-bearing SELECTs. Returns a fully
@@ -673,8 +691,9 @@ impl QueryHook for PlanCacheHook {
     }
 
     async fn handle_extended_query(
-        &self, _statement: &Statement, logical_plan: &LogicalPlan, params: &ParamValues, session_context: &SessionContext, _client: &mut dyn HookClient,
+        &self, statement: &Statement, logical_plan: &LogicalPlan, params: &ParamValues, session_context: &SessionContext, _client: &mut dyn HookClient,
     ) -> Option<PgWireResult<Response>> {
+        use std::sync::atomic::Ordering::Relaxed;
         // Only intercept DML — for SELECTs the vendored path is fine.
         // The win here is post-substitution constant folding of `CAST(Literal, T)`
         // exprs that `insert_coerce` puts around every placeholder; folding them
@@ -683,32 +702,46 @@ impl QueryHook for PlanCacheHook {
         if !matches!(logical_plan, LogicalPlan::Dml(_)) {
             return None;
         }
-        let substituted = match logical_plan.clone().replace_params_with_values(params) {
-            Ok(p) => p,
-            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
-        };
-        let folded = match fold_literal_casts(substituted) {
-            Ok(p) => p,
-            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
-        };
-        // Fast-path: `Dml(Insert) → [Projection →] Values(literals)` skips the
-        // executor entirely and writes the batch straight into the buffered
-        // layer. Saves the ~5-6 ms/row that `ValuesExec` + `DataSinkExec`
-        // were costing at the 88-col schema.
-        match try_fast_path_insert(&folded, session_context).await {
-            Ok(Some(rows)) => return Some(Ok(Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(rows as usize)))),
-            Ok(None) => {} // fall through to the normal executor
-            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
+        fn api_err(e: datafusion::error::DataFusionError) -> PgWireError {
+            PgWireError::ApiError(Box::new(e))
         }
-        let df = match session_context.execute_logical_plan(folded).await {
-            Ok(df) => df,
-            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
-        };
-        Some(match dml_completion(df).await {
-            Ok(Some(resp)) => Ok(resp),
-            Ok(None) => Err(PgWireError::ApiError("internal error: DML plan returned non-DML completion".to_string().into())),
-            Err(e) => Err(e),
-        })
+        Some(
+            async {
+                let substituted = logical_plan.clone().replace_params_with_values(params).map_err(api_err)?;
+                let folded = fold_literal_casts(substituted).map_err(api_err)?;
+                // Fast-path: `Dml(Insert) → [Projection →] Values(literals)` skips the
+                // executor entirely and writes the batch straight into the buffered
+                // layer. Saves the ~5-6 ms/row that `ValuesExec` + `DataSinkExec`
+                // were costing at the 88-col schema.
+                if let Some(rows) = try_fast_path_insert(&folded, session_context).await.map_err(api_err)? {
+                    self.fast_path_hits.fetch_add(1, Relaxed);
+                    return Ok(Response::Execution(Tag::new("INSERT").with_oid(0).with_rows(rows as usize)));
+                }
+                self.fast_path_fallthrough.fetch_add(1, Relaxed);
+                // Build the physical plan from a single `state` snapshot rather than via
+                // `execute_logical_plan` + `DataFrame::collect`, whose `create_physical_plan`
+                // re-runs the FULL logical optimizer on every execute. The portal plan was
+                // already optimized at parse time and `replace_params_with_values`/
+                // `fold_literal_casts` preserve that (the substituted values only feed
+                // parameter-independent rules), so re-optimizing an 89-column unnest INSERT
+                // per statement is pure waste (~5% of total CPU, measured). Only skip the
+                // optimize when the plan came from the pre-optimizing parse cache; ad-hoc
+                // DML that never hit the cache still gets a full optimize. `create_physical_plan`
+                // is `optimize()` + `query_planner().create_physical_plan()`, so this is that
+                // minus the redundant optimize. Reuse `state` for planning AND `task_ctx` so
+                // execution runs against the same snapshot the plan was built against.
+                let state = session_context.state();
+                let folded = if self.was_pre_optimized(&statement.to_string()) {
+                    folded
+                } else {
+                    state.optimize(&folded).map_err(api_err)?
+                };
+                let phys = state.query_planner().create_physical_plan(&folded, &state).await.map_err(api_err)?;
+                let batches = datafusion::physical_plan::collect(phys, state.task_ctx()).await.map_err(api_err)?;
+                dml_response(&folded, &batches).ok_or_else(|| PgWireError::ApiError("internal error: DML plan returned non-DML completion".to_string().into()))
+            }
+            .await,
+        )
     }
 
     /// Signal to the do_query path that any plan we returned is already
