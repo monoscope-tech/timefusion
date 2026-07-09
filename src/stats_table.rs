@@ -173,6 +173,27 @@ impl StatsTableProvider {
             rows.push(("buffered_layer", "status".into(), "disabled".into()));
         }
 
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let m = crate::metrics::maintenance_stats();
+            rows.push(("maintenance", "checkpoints_created".into(), m.checkpoints_created.load(Relaxed).to_string()));
+            rows.push(("maintenance", "checkpoint_failed".into(), m.checkpoint_failed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "log_files_cleaned".into(), m.log_files_cleaned.load(Relaxed).to_string()));
+            rows.push(("maintenance", "log_cleanup_failed".into(), m.log_cleanup_failed.load(Relaxed).to_string()));
+            // Max version lag (current - last checkpointed) seen at the last
+            // checkpoint tick. Should stay near checkpoint_interval; a large,
+            // growing value means the checkpoint task is failing or wedged.
+            rows.push((
+                "maintenance",
+                "checkpoint_lag_versions".into(),
+                m.checkpoint_lag_versions.load(Relaxed).to_string(),
+            ));
+            // NONZERO = committed parquet was destroyed elsewhere (2026-07-09
+            // commit-path deletion bug). PAGE and investigate.
+            rows.push(("maintenance", "dangling_removed".into(), m.dangling_removed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "reconcile_failed".into(), m.reconcile_failed.load(Relaxed).to_string()));
+        }
+
         if let Some(pc) = crate::plan_cache::global() {
             let (hits, misses) = pc.counters();
             let total = hits + misses;

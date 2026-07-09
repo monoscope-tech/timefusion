@@ -290,6 +290,19 @@ const_default!(d_consolidate_schedule: String = "0 30 2 * * *");
 // retention orphans most of a day's churn (VacuumMode::Full backstops any
 // that slip through).
 const_default!(d_vacuum_schedule: String = "0 15 */6 * * *");
+// Out-of-band checkpoint + expired-log cleanup. These run in the delta-rs
+// post-commit hook by default, but a hook failure (R2 500 on the checkpoint PUT
+// or the bulk log ?delete) surfaces as a commit error AFTER the commit landed,
+// which the flush path misreads as a failed commit and then deletes the
+// committed parquet (2026-07-09 incident). Disabled on the commit path
+// (base_commit_properties) and driven here instead, every 2 min, tolerant of
+// R2 500s. Faster than the ~1.5s commit cadence so the log stays bounded.
+const_default!(d_checkpoint_schedule: String = "0 */2 * * * *");
+// Reconcile active Add entries against object-store truth: HEAD every live file
+// and commit Remove actions for any that are missing. Repairs dangling Adds
+// left by past commit-path parquet deletions (the 2026-07-09 incident left 14);
+// a nonzero removal count means committed data was destroyed elsewhere.
+const_default!(d_reconcile_schedule: String = "0 0 * * * *");
 const_default!(d_warm_recency_days: u64 = 2);
 // 16: at concurrency 4 prod's 3.1k-file boot warm ran >55 min and was cut
 // short by a restart every time; 16 finishes it in ~1-3 min. Footer GETs are
@@ -893,6 +906,12 @@ pub struct MaintenanceConfig {
     pub timefusion_vacuum_schedule:                 String,
     #[serde(default = "d_recompress_schedule")]
     pub timefusion_recompress_schedule:             String,
+    /// Out-of-band checkpoint + expired-log-cleanup schedule. See d_checkpoint_schedule.
+    #[serde(default = "d_checkpoint_schedule")]
+    pub timefusion_checkpoint_schedule:             String,
+    /// Dangling-Add reconcile schedule. See d_reconcile_schedule.
+    #[serde(default = "d_reconcile_schedule")]
+    pub timefusion_reconcile_schedule:              String,
     /// Proactively warm the Foyer cache for files written by a flush/optimize
     /// commit, so recent partitions dashboards read don't cold-start after
     /// every compaction. Footers are always warmed when enabled.

@@ -11,6 +11,7 @@ mod flush_lifecycle;
 mod insert_unnest_variant;
 mod multi_tenant_isolation;
 mod or_utf8view_delta;
+mod postcommit_hooks;
 mod pressure_flush;
 mod restart_recovery;
 mod smoke;

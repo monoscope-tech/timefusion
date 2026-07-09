@@ -568,6 +568,18 @@ fn max_watermark_across_commits<'a>(
     acc
 }
 
+/// Base [`CommitProperties`] for every ingest/maintenance commit. Disables the
+/// delta-rs post-commit checkpoint + expired-log-cleanup hooks: those run AFTER
+/// `N.json` is durably written, but a hook failure (R2 500 on the checkpoint
+/// PUT or the bulk `?delete`) is surfaced as a commit error — which the flush/
+/// dedup error arms misread as "commit never landed" and then delete the parquet
+/// the landed commit references (2026-07-09 incident: 14 dangling Adds). Both
+/// hooks now run out-of-band in the maintenance scheduler, tolerant of R2 500s.
+/// `Some(false)` overrides the `enableExpiredLogCleanup` table property per-commit.
+fn base_commit_properties() -> CommitProperties {
+    CommitProperties::default().with_create_checkpoint(false).with_cleanup_expired_logs(Some(false))
+}
+
 /// Build [`CommitProperties`] carrying the watermark under [`WAL_WATERMARK_KEY`].
 /// Empty when the watermark has no positions (e.g. WAL-replay-derived buckets);
 /// delta-rs writes the commit without the key in that case, and recovery
@@ -575,11 +587,11 @@ fn max_watermark_across_commits<'a>(
 fn build_watermark_commit_properties(watermark: &crate::buffered_write_layer::DeltaWatermark) -> CommitProperties {
     let entries = serialize_watermark_to_json(watermark);
     if entries.is_empty() {
-        return CommitProperties::default();
+        return base_commit_properties();
     }
     let mut meta = std::collections::HashMap::new();
     meta.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(entries));
-    CommitProperties::default().with_metadata(meta)
+    base_commit_properties().with_metadata(meta)
 }
 
 /// `CommitProperties` for a compaction/dedup commit (Add + Remove): when
@@ -587,7 +599,7 @@ fn build_watermark_commit_properties(watermark: &crate::buffered_write_layer::De
 /// incrementally instead of re-materializing every active file. `false` is the
 /// plain full-update behaviour.
 fn incremental_commit_properties(enabled: bool) -> CommitProperties {
-    CommitProperties::default().with_incremental_advance(enabled)
+    base_commit_properties().with_incremental_advance(enabled)
 }
 
 /// True for the retryable Delta OCC conflicts — a single retry on a refreshed
@@ -669,6 +681,22 @@ fn window_dates(lo: i64, hi: i64) -> Option<Vec<chrono::NaiveDate>> {
 
 /// A `Remove` tombstone for `add` with `data_change: true` (the dedup rewrite
 /// drops rows, unlike optimize's data-preserving `data_change: false`).
+/// Whether a commit that returned an error actually landed. delta-rs surfaces a
+/// post-commit hook / snapshot-refresh failure as a commit `Err` even though
+/// `N.json` is already durably written (2026-07-09: an R2 500 on the checkpoint
+/// PUT / bulk log `?delete`). Deleting the staged parquet in that case orphans
+/// the Adds the landed commit references, so the flush path must tell the cases
+/// apart. See `Database::probe_commit_landed`.
+enum CommitProbe {
+    /// `N.json` landed; every staged Add is active. Treat as success + drain.
+    Landed,
+    /// Confirmed the commit did not land; the staged parquet is safe to delete.
+    NotLanded,
+    /// Could not confirm (snapshot refresh / read failed) — leak the staged
+    /// parquet rather than risk deleting files a landed commit references.
+    Inconclusive,
+}
+
 fn remove_for_add(add: &deltalake::kernel::Add) -> deltalake::kernel::Remove {
     deltalake::kernel::Remove {
         path:                       add.path.clone(),
@@ -1096,6 +1124,13 @@ pub struct Database {
     /// Keyed by table storage URL (unique per physical table). In-memory only:
     /// a restart re-z-orders each partition once, which is harmless.
     zorder_filesets:                 ZOrderFilesets,
+    /// Last version the out-of-band checkpoint task checkpointed, keyed by table
+    /// storage URL. Lets that task skip idle tables and tables whose version
+    /// hasn't advanced by `checkpoint_interval` since the last checkpoint. Since
+    /// checkpoint/log-cleanup no longer run in the commit hook (base_commit_properties),
+    /// this task is the only checkpoint driver. In-memory only: after a restart
+    /// the first tick checkpoints every table once, which is harmless.
+    checkpoint_versions:             Arc<dashmap::DashMap<String, u64>>,
 }
 
 impl Database {
@@ -1407,6 +1442,7 @@ impl Database {
             tantivy_indexer: Arc::new(std::sync::OnceLock::new()),
             dml_coalescer: Arc::new(std::sync::OnceLock::new()),
             zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
+            checkpoint_versions: Arc::new(dashmap::DashMap::new()),
         };
 
         Ok(db)
@@ -1787,6 +1823,42 @@ impl Database {
             scheduler.add(vacuum_job).await?;
         } else {
             info!("Vacuum job scheduling skipped - empty schedule");
+        }
+
+        // Checkpoint + expired-log cleanup job — runs the post-commit hooks
+        // out-of-band (see base_commit_properties / the 2026-07-09 incident) so
+        // R2 500s on the checkpoint PUT or bulk log ?delete never fail a landed
+        // commit. Faster cadence than the ~1.5s commit rate keeps the log bounded.
+        let checkpoint_schedule = self.config.maintenance.timefusion_checkpoint_schedule.clone();
+        if !checkpoint_schedule.is_empty() {
+            info!("Checkpoint job scheduled with cron expression: {}", checkpoint_schedule);
+            let checkpoint_job = Job::new_async(checkpoint_schedule.as_str(), {
+                let db = db.clone();
+                move |_, _| {
+                    let db = db.clone();
+                    Box::pin(async move { db.run_checkpoint_maintenance().await })
+                }
+            })?;
+            scheduler.add(checkpoint_job).await?;
+        } else {
+            info!("Checkpoint job scheduling skipped - empty schedule");
+        }
+
+        // Reconcile job — repair dangling Add entries (committed parquet deleted
+        // by a past commit-path failure) by Remove'ing them via filesystem_check.
+        let reconcile_schedule = self.config.maintenance.timefusion_reconcile_schedule.clone();
+        if !reconcile_schedule.is_empty() {
+            info!("Reconcile job scheduled with cron expression: {}", reconcile_schedule);
+            let reconcile_job = Job::new_async(reconcile_schedule.as_str(), {
+                let db = db.clone();
+                move |_, _| {
+                    let db = db.clone();
+                    Box::pin(async move { db.run_reconcile_maintenance().await })
+                }
+            })?;
+            scheduler.add(reconcile_job).await?;
+        } else {
+            info!("Reconcile job scheduling skipped - empty schedule");
         }
 
         // Cache stats job - every 5 minutes
@@ -3273,7 +3345,7 @@ impl Database {
         // MetaData/schema change IS applied; only the file-list re-materialize
         // is skipped.
         let commit_properties = if self.config.maintenance.timefusion_incremental_snapshot {
-            Some(commit_properties.unwrap_or_default().with_incremental_advance(true))
+            Some(commit_properties.unwrap_or_else(base_commit_properties).with_incremental_advance(true))
         } else {
             commit_properties
         };
@@ -3366,7 +3438,7 @@ impl Database {
                 let _refresh_ms = _t_refresh.elapsed().as_millis();
                 let mut new_table = { table_ref.read().await.clone() };
                 let _t_build = std::time::Instant::now();
-                let commit_res = deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone().unwrap_or_default())
+                let commit_res = deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone().unwrap_or_else(base_commit_properties))
                     .with_actions(adds.clone())
                     .build(Some(new_table.snapshot()? as &dyn TableReference), new_table.log_store(), op.clone())
                     .await;
@@ -3395,17 +3467,44 @@ impl Database {
                     }
                     Err(e) => {
                         drop(commit_guard);
-                        if !is_occ_conflict_err(&e.to_string()) {
-                            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                            return Err(anyhow::anyhow!("staged commit failed: {}", e));
+                        if is_occ_conflict_err(&e.to_string()) {
+                            retry_count += 1;
+                            if retry_count >= max_retries {
+                                Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                                return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", max_retries, e));
+                            }
+                            debug!("staged commit conflict, retrying ({}/{}): {}", retry_count, max_retries, e);
+                            tokio::time::sleep(occ_backoff(retry_count as usize)).await;
+                            continue;
                         }
-                        retry_count += 1;
-                        if retry_count >= max_retries {
-                            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                            return Err(anyhow::anyhow!("staged commit failed after {} retries: {}", max_retries, e));
+                        // Non-OCC error: the commit MAY have landed (post-commit
+                        // hook / snapshot refresh failed AFTER N.json was written).
+                        // Capture the pre-commit file set from the still-pre-commit
+                        // clone (only on this rare branch — the OCC-retry path must
+                        // not pay the full-table URI walk), then probe.
+                        let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                        match self.probe_commit_landed(&table_ref, &adds).await {
+                            CommitProbe::Landed => {
+                                warn!(
+                                    "staged commit for {}/{} reported an error but LANDED (post-commit hook failed) — draining bucket: {}",
+                                    project_id, table_name, e
+                                );
+                                let post = { table_ref.read().await.clone() };
+                                let committed = self.record_committed_write(&table_ref, &project_id, &table_name, post, &pre_uris, watermark.is_some()).await;
+                                return Ok(committed);
+                            }
+                            CommitProbe::NotLanded => {
+                                Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                                return Err(anyhow::anyhow!("staged commit failed: {}", e));
+                            }
+                            CommitProbe::Inconclusive => {
+                                warn!(
+                                    "staged commit for {}/{} errored and landing is UNCONFIRMED (snapshot read failed) — leaving staged parquet in place to avoid a dangling Add: {}",
+                                    project_id, table_name, e
+                                );
+                                return Err(anyhow::anyhow!("staged commit failed (landing unconfirmed): {}", e));
+                            }
                         }
-                        debug!("staged commit conflict, retrying ({}/{}): {}", retry_count, max_retries, e);
-                        tokio::time::sleep(occ_backoff(retry_count as usize)).await;
                     }
                 }
             }
@@ -3429,17 +3528,17 @@ impl Database {
 
             let write_span = tracing::trace_span!(parent: &span, "delta.write_operation", retry_attempt = retry_count + 1);
             let write_result = async {
-                let mut builder = table
+                table
                     .clone()
                     .write(batches.clone())
                     .with_partition_columns(schema.partitions.clone())
                     .with_writer_properties(writer_properties.clone())
                     .with_save_mode(deltalake::protocol::SaveMode::Append)
-                    .with_schema_mode(deltalake::operations::write::SchemaMode::Merge);
-                if let Some(cp) = commit_properties.clone() {
-                    builder = builder.with_commit_properties(cp);
-                }
-                builder.await
+                    .with_schema_mode(deltalake::operations::write::SchemaMode::Merge)
+                    // Always set base properties (hooks off) — a None here would
+                    // let WriteBuilder's own default re-enable the checkpoint hook.
+                    .with_commit_properties(commit_properties.clone().unwrap_or_else(base_commit_properties))
+                    .await
             }
             .instrument(write_span)
             .await;
@@ -3475,6 +3574,39 @@ impl Database {
             max_retries,
             last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
         ))
+    }
+
+    /// Probe whether a staged commit landed despite returning an error: refresh
+    /// the snapshot from the log and check that every Add we tried to commit is
+    /// now active. `Landed` ⇒ treat as success (drain the bucket); `NotLanded` ⇒
+    /// safe to delete the staged parquet; `Inconclusive` ⇒ the refresh/read
+    /// itself failed, so we can't confirm — leak the parquet rather than risk
+    /// deleting files a landed commit references.
+    async fn probe_commit_landed(&self, table_ref: &Arc<RwLock<DeltaTable>>, adds: &[deltalake::kernel::Action]) -> CommitProbe {
+        use deltalake::kernel::Action;
+        if refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await.is_err() {
+            return CommitProbe::Inconclusive;
+        }
+        let our_paths: Vec<&str> = adds
+            .iter()
+            .filter_map(|a| match a {
+                Action::Add(add) => Some(add.path.as_str()),
+                _ => None,
+            })
+            .collect();
+        if our_paths.is_empty() {
+            return CommitProbe::NotLanded;
+        }
+        let guard = table_ref.read().await;
+        let Ok(snap) = guard.snapshot() else {
+            return CommitProbe::Inconclusive;
+        };
+        let active: std::collections::HashSet<String> = snap.log_data().iter().map(|f| f.path().into_owned()).collect();
+        if our_paths.iter().all(|p| active.contains(*p)) {
+            CommitProbe::Landed
+        } else {
+            CommitProbe::NotLanded
+        }
     }
 
     /// Best-effort delete of staged-but-uncommitted parquet after a terminal
@@ -4637,18 +4769,45 @@ impl Database {
                     }
                     Err(e) => {
                         drop(commit_guard);
-                        if !is_occ_conflict_err(&e.to_string()) || attempt + 1 == MAX_RETRIES {
-                            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                            return Err(anyhow::anyhow!("dedup rewrite commit failed: {e}"));
+                        if is_occ_conflict_err(&e.to_string()) && attempt + 1 < MAX_RETRIES {
+                            debug!(
+                                "dedup rewrite OCC conflict (attempt {}/{}) table={} chunk=[{}]",
+                                attempt + 1,
+                                MAX_RETRIES,
+                                table_name,
+                                label
+                            );
+                            tokio::time::sleep(occ_backoff(attempt)).await;
+                        } else {
+                            // Terminal (non-OCC, or retries exhausted): probe before
+                            // deleting the NEW files. A landed-but-hook-failed commit
+                            // already Removed the OLD files, so the new files are the
+                            // only live copy — deleting them loses data (unlike the
+                            // pure-append flush path, where the originals survive).
+                            match self.probe_commit_landed(table_ref, &adds).await {
+                                CommitProbe::Landed => {
+                                    warn!(
+                                        "dedup rewrite for '{}' chunk=[{}] reported an error but LANDED (post-commit hook failed): {}",
+                                        table_name, label, e
+                                    );
+                                    let post = { table_ref.read().await.clone() };
+                                    self.swap_and_refresh_cache(table_ref, post, &pre_uris).await;
+                                    crate::metrics::record_compaction_dedup_dropped(dropped);
+                                    return Ok((dropped, true));
+                                }
+                                CommitProbe::NotLanded => {
+                                    Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                                    return Err(anyhow::anyhow!("dedup rewrite commit failed: {e}"));
+                                }
+                                CommitProbe::Inconclusive => {
+                                    warn!(
+                                        "dedup rewrite for '{}' chunk=[{}] errored, landing UNCONFIRMED — leaving new files in place: {}",
+                                        table_name, label, e
+                                    );
+                                    return Err(anyhow::anyhow!("dedup rewrite commit failed (landing unconfirmed): {e}"));
+                                }
+                            }
                         }
-                        debug!(
-                            "dedup rewrite OCC conflict (attempt {}/{}) table={} chunk=[{}]",
-                            attempt + 1,
-                            MAX_RETRIES,
-                            table_name,
-                            label
-                        );
-                        tokio::time::sleep(occ_backoff(attempt)).await;
                     }
                 }
             }
@@ -4997,6 +5156,190 @@ impl Database {
                 0
             }
         }
+    }
+
+    /// Out-of-band checkpoint + expired-log cleanup for one table. Runs on the
+    /// maintenance schedule instead of in the delta-rs commit hook
+    /// (`base_commit_properties` disables the hook) so an R2 500 on the
+    /// checkpoint PUT or the bulk log `?delete` can never fail a landed commit
+    /// (2026-07-09 incident). Best-effort: any error is logged + counted and
+    /// retried next tick; ingest is never touched. Checkpoints only when the
+    /// version advanced by ≥ `checkpoint_interval` since the last checkpoint
+    /// (tracked in-memory per table URL), so idle tables are skipped.
+    async fn checkpoint_and_cleanup_table(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Checkpoint the latest committed version, not a stale clone.
+        let _ = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
+        let (table, url, version) = {
+            let g = table_ref.read().await;
+            (g.clone(), g.table_url().to_string(), g.version().unwrap_or(0))
+        };
+        let interval = self.config.parquet.timefusion_checkpoint_interval.max(1);
+        let lag = version.saturating_sub(self.checkpoint_versions.get(&url).map(|e| *e).unwrap_or(0));
+        // Gauge: max lag seen this tick (job resets to 0 first). A large, growing
+        // value means the checkpoint task is failing or wedged.
+        crate::metrics::maintenance_stats().checkpoint_lag_versions.fetch_max(lag, Relaxed);
+        if lag < interval {
+            return;
+        }
+        match deltalake::checkpoints::create_checkpoint(&table, None).await {
+            Ok(()) => {
+                self.checkpoint_versions.insert(url, version);
+                crate::metrics::maintenance_stats().checkpoints_created.fetch_add(1, Relaxed);
+                debug!("out-of-band checkpoint created for '{}' at v{}", table_name, version);
+            }
+            Err(e) => {
+                crate::metrics::record_checkpoint_failed();
+                warn!("out-of-band checkpoint failed for '{}' at v{}: {} (retry next tick)", table_name, version, e);
+                return; // no fresh checkpoint boundary → skip cleanup this tick
+            }
+        }
+        // Log cleanup prunes only up to a checkpoint boundary, so run it after a
+        // successful checkpoint. Uses the table's logRetentionDuration.
+        match deltalake::checkpoints::cleanup_metadata(&table, None).await {
+            Ok(n) if n > 0 => {
+                crate::metrics::maintenance_stats().log_files_cleaned.fetch_add(n as u64, Relaxed);
+                debug!("out-of-band log cleanup removed {} expired files for '{}'", n, table_name);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::metrics::record_log_cleanup_failed();
+                warn!("out-of-band log cleanup failed for '{}': {} (retry next tick)", table_name, e);
+            }
+        }
+    }
+
+    /// Reconcile a table's active Add entries against object-store truth and
+    /// commit `Remove` actions for any whose parquet is missing. Repairs
+    /// dangling Adds left by a commit-path parquet deletion (2026-07-09: an
+    /// R2-500 post-commit-hook failure made the flush delete files the landed
+    /// commit referenced). Those rows were re-flushed into fresh files, so the
+    /// Remove is lossless — it just stops queries 404-ing on the dead paths. A
+    /// nonzero removal count means committed data was destroyed elsewhere, so it
+    /// is logged loudly + counted (PAGE-worthy). delta-rs `filesystem_check`
+    /// does the list-and-diff; we only force hooks off and surface the count.
+    async fn reconcile_dangling_adds(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
+        let _ = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
+        let table = { table_ref.read().await.clone() };
+        match table.filesystem_check().with_commit_properties(base_commit_properties()).await {
+            Ok((_, metrics)) => {
+                let n = metrics.files_removed.len();
+                if n > 0 {
+                    crate::metrics::record_dangling_removed(n as u64);
+                    warn!(
+                        "reconcile: '{}' had {} dangling Add(s) (committed parquet missing from store) — Remove'd: {:?}",
+                        table_name, n, metrics.files_removed
+                    );
+                    let _ = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await;
+                }
+            }
+            Err(e) => {
+                crate::metrics::maintenance_stats().reconcile_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!("reconcile filesystem_check failed for '{}': {} (retry next tick)", table_name, e);
+            }
+        }
+    }
+
+    /// One out-of-band checkpoint + log-cleanup tick across every registered
+    /// table. Driven by the checkpoint cron job (and directly by tests).
+    pub async fn run_checkpoint_maintenance(&self) {
+        // Reset the lag gauge so it reflects THIS tick's worst table.
+        crate::metrics::maintenance_stats().checkpoint_lag_versions.store(0, std::sync::atomic::Ordering::Relaxed);
+        for (name, table) in self.all_tables().await {
+            self.checkpoint_and_cleanup_table(&table, &name).await;
+        }
+    }
+
+    /// One dangling-Add reconcile tick across every registered table. Driven by
+    /// the reconcile cron job (and directly by tests).
+    pub async fn run_reconcile_maintenance(&self) {
+        for (name, table) in self.all_tables().await {
+            self.reconcile_dangling_adds(&table, &name).await;
+        }
+    }
+
+    /// Test-only: run `probe_commit_landed` against the table's current active
+    /// files. Returns true iff the probe reports `Landed` (every active file's
+    /// object is present). Lets an e2e test exercise the landed-vs-not-landed
+    /// decision deterministically against a real store, without fighting
+    /// delta-rs's post-commit error timing.
+    #[cfg(any(test, feature = "e2e"))]
+    #[allow(deprecated)] // add_action() is deprecated but fine for a test-only probe
+    pub async fn test_probe_landed(&self, project_id: &str, table_name: &str) -> Result<bool> {
+        let table_ref = self.get_or_create_table(project_id, table_name).await?;
+        let adds: Vec<deltalake::kernel::Action> = {
+            let guard = table_ref.read().await;
+            guard.snapshot()?.log_data().iter().map(|f| deltalake::kernel::Action::Add(f.add_action())).collect()
+        };
+        Ok(matches!(self.probe_commit_landed(&table_ref, &adds).await, CommitProbe::Landed))
+    }
+
+    /// Test-only: probe with a fabricated Add whose path was never committed.
+    /// The probe must report NOT landed (the "commit didn't write our adds to
+    /// the log" case that the flush error arm treats as safe-to-clean-up).
+    #[cfg(any(test, feature = "e2e"))]
+    pub async fn test_probe_bogus_not_landed(&self, project_id: &str, table_name: &str) -> Result<bool> {
+        let table_ref = self.get_or_create_table(project_id, table_name).await?;
+        let bogus = deltalake::kernel::Action::Add(deltalake::kernel::Add {
+            path:                       "project_id=nope/date=1970-01-01/part-never-committed.parquet".to_string(),
+            partition_values:           std::collections::HashMap::new(),
+            size:                       1,
+            modification_time:          0,
+            data_change:                true,
+            stats:                      None,
+            tags:                       None,
+            deletion_vector:            None,
+            base_row_id:                None,
+            default_row_commit_version: None,
+            clustering_provider:        None,
+        });
+        Ok(matches!(self.probe_commit_landed(&table_ref, &[bogus]).await, CommitProbe::NotLanded))
+    }
+
+    /// Test-only: number of `.checkpoint.parquet` objects in the table's
+    /// `_delta_log`. Lets a test assert the commit path does NOT checkpoint
+    /// (Phase 1) and that the out-of-band task DOES (Phase 2).
+    #[cfg(any(test, feature = "e2e"))]
+    pub async fn test_checkpoint_file_count(&self, project_id: &str, table_name: &str) -> Result<usize> {
+        use futures::StreamExt;
+        let table_ref = self.get_or_create_table(project_id, table_name).await?;
+        let store = { table_ref.read().await.log_store().object_store(None) };
+        let prefix = object_store::path::Path::from("_delta_log");
+        let mut n = 0;
+        let mut stream = store.list(Some(&prefix));
+        while let Some(item) = stream.next().await {
+            if item?.location.as_ref().contains(".checkpoint.parquet") {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Test-only: delete the first active parquet object of a table directly
+    /// from the store (no Delta commit), reproducing the commit-path deletion
+    /// bug so a test can then assert `reconcile_dangling_adds` heals the dangling
+    /// Add. Returns the deleted relative path.
+    #[cfg(any(test, feature = "e2e"))]
+    pub async fn test_delete_first_active_file(&self, project_id: &str, table_name: &str) -> Result<String> {
+        use object_store::ObjectStoreExt;
+        let table_ref = self.get_or_create_table(project_id, table_name).await?;
+        let guard = table_ref.read().await;
+        let snap = guard.snapshot()?;
+        let path = snap
+            .log_data()
+            .iter()
+            .next()
+            .map(|f| f.path().into_owned())
+            .ok_or_else(|| anyhow::anyhow!("no active files to delete"))?;
+        guard.log_store().object_store(None).delete(&object_store::path::Path::from(path.as_str())).await?;
+        Ok(path)
+    }
+
+    /// Flatten unified + custom project tables into one (name, handle) list.
+    async fn all_tables(&self) -> Vec<(String, Arc<RwLock<DeltaTable>>)> {
+        let mut out: Vec<(String, Arc<RwLock<DeltaTable>>)> = self.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+        out.extend(self.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
+        out
     }
 
     /// Get table statistics using the statistics extractor

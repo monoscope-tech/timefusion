@@ -88,6 +88,9 @@ counter_registry! {
     dml_coalesce_merges        => "timefusion.dml.coalesce_merges": "Delta merges executed by coalescer drains (each replaces N deferred statement-merges; compare with coalesce_enqueued for the batching ratio)",
     dml_coalesce_dropped       => "timefusion.dml.coalesce_dropped": "Coalesced DML groups dropped after exhausting drain retries — deferred Delta updates were LOST for rows already in Delta (buffer-resident rows are unaffected). PAGE if > 0",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
+    maintenance_checkpoint_failed => "timefusion.maintenance.checkpoint_failed": "Out-of-band checkpoint attempts that errored (e.g. R2 500 on the checkpoint PUT). Retried next tick; ingest is unaffected. WARN if sustained — checkpoints falling behind slows boot replay and blocks log cleanup",
+    maintenance_log_cleanup_failed => "timefusion.maintenance.log_cleanup_failed": "Out-of-band expired-log-cleanup attempts that errored. Retried next tick; the _delta_log grows until it succeeds. WARN if sustained (a growing log slows every commit's version LIST)",
+    reconcile_dangling_removed => "timefusion.maintenance.reconcile_dangling_removed": "Active Add entries whose parquet object was missing from the store and got Remove'd by the reconcile task. NONZERO means committed data was destroyed elsewhere (commit-path parquet deletion bug) — PAGE and investigate",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -403,5 +406,62 @@ pub fn record_dml_coalesce_dropped() {
 pub fn record_dedup_chunk_skipped() {
     if let Some(m) = METRICS.get() {
         m.dedup_chunk_skipped.add(1, &[]);
+    }
+}
+
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+/// Readable maintenance counters for the `timefusion_stats` view — the OTel
+/// counters above can't be read back in-process. Process-global const atomics
+/// (no init needed), incremented by the out-of-band checkpoint + reconcile
+/// tasks. `checkpoint_lag_versions` is the last observed max lag (a gauge), the
+/// rest are monotonic.
+#[derive(Default)]
+pub struct MaintenanceStats {
+    pub checkpoints_created:     AtomicU64,
+    pub checkpoint_failed:       AtomicU64,
+    pub log_files_cleaned:       AtomicU64,
+    pub log_cleanup_failed:      AtomicU64,
+    pub checkpoint_lag_versions: AtomicU64,
+    pub dangling_removed:        AtomicU64,
+    pub reconcile_failed:        AtomicU64,
+}
+
+static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
+    checkpoints_created:     AtomicU64::new(0),
+    checkpoint_failed:       AtomicU64::new(0),
+    log_files_cleaned:       AtomicU64::new(0),
+    log_cleanup_failed:      AtomicU64::new(0),
+    checkpoint_lag_versions: AtomicU64::new(0),
+    dangling_removed:        AtomicU64::new(0),
+    reconcile_failed:        AtomicU64::new(0),
+};
+
+pub fn maintenance_stats() -> &'static MaintenanceStats {
+    &MAINTENANCE_STATS
+}
+
+/// One out-of-band checkpoint failure (also mirrors to OTel for alerting).
+pub fn record_checkpoint_failed() {
+    MAINTENANCE_STATS.checkpoint_failed.fetch_add(1, Relaxed);
+    if let Some(m) = METRICS.get() {
+        m.maintenance_checkpoint_failed.add(1, &[]);
+    }
+}
+
+/// One out-of-band log-cleanup failure (mirrors to OTel).
+pub fn record_log_cleanup_failed() {
+    MAINTENANCE_STATS.log_cleanup_failed.fetch_add(1, Relaxed);
+    if let Some(m) = METRICS.get() {
+        m.maintenance_log_cleanup_failed.add(1, &[]);
+    }
+}
+
+/// `n` dangling Add entries Remove'd by the reconcile task (mirrors to OTel).
+/// Nonzero ⇒ committed data was destroyed elsewhere.
+pub fn record_dangling_removed(n: u64) {
+    MAINTENANCE_STATS.dangling_removed.fetch_add(n, Relaxed);
+    if let Some(m) = METRICS.get() {
+        m.reconcile_dangling_removed.add(n, &[]);
     }
 }
