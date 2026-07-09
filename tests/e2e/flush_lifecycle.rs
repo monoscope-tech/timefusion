@@ -57,3 +57,38 @@ async fn flush_completed_bucket_only() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// `FLUSH` over pgwire drains the whole MemBuffer (open bucket included) to
+/// Delta. Ops run it right before a planned restart so the stop grace never
+/// bounds the shutdown flush and restart replay is near-empty.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn flush_command_drains_membuffer() -> anyhow::Result<()> {
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let client = env.pg_client().await?;
+
+    insert_at(&client, "flush-cmd-1", FROZEN_START_MICROS).await?;
+    insert_at(&client, "flush-cmd-2", FROZEN_START_MICROS + 61 * 1_000_000).await?;
+    assert!(env.snapshot_stats().mem_total_rows >= 2);
+
+    // The wire tag is `FLUSH {total_rows}`; tokio-postgres exposes the tag's
+    // trailing count as the CommandComplete payload — assert on it so a
+    // regression garbling the tag or the flushed-row count fails here.
+    let flushed = client
+        .simple_query("FLUSH")
+        .await?
+        .into_iter()
+        .find_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::CommandComplete(n) => Some(n),
+            _ => None,
+        })
+        .expect("FLUSH must return a command tag");
+    assert_eq!(flushed, 2, "FLUSH tag must report the flushed row count");
+
+    let stats = env.snapshot_stats();
+    assert_eq!(stats.mem_total_rows, 0, "FLUSH left rows in MemBuffer: {stats:?}");
+    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
+    assert_eq!(count, 2, "rows lost across FLUSH — must be durable in Delta");
+
+    Ok(())
+}

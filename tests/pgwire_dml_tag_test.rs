@@ -23,7 +23,7 @@ mod pgwire_dml_tag {
         "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary)";
 
     struct TestServer {
-        port:     u16,
+        port: u16,
         shutdown: Arc<Notify>,
     }
 
@@ -55,7 +55,7 @@ mod pgwire_dml_tag {
                 };
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
-                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth, None, std::future::pending::<()>()) => {
+                    res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth, None, None, std::future::pending::<()>()) => {
                         if let Err(e) = res { eprintln!("server error: {e:?}"); }
                     }
                 }

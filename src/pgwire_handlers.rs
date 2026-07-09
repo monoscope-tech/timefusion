@@ -99,10 +99,10 @@ impl AuthSource for ConfigAuthSource {
 /// Custom handler factory that creates handlers with logging and auth
 pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
-    auth_config:     AuthConfig,
-    plan_cache:      Arc<PlanCacheHook>,
-    scan_metrics:    Option<Arc<crate::database::ScanMetrics>>,
-    db:              Option<Arc<Database>>,
+    auth_config: AuthConfig,
+    plan_cache: Arc<PlanCacheHook>,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
+    db: Option<Arc<Database>>,
 }
 
 impl LoggingHandlerFactory {
@@ -195,25 +195,25 @@ impl ErrorHandler for LoggingErrorHandler {
 
 /// Simple query handler with tracing
 pub struct LoggingSimpleQueryHandler {
-    inner:        DfSessionService,
+    inner: DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
-    db:           Option<Arc<Database>>,
+    db: Option<Arc<Database>>,
 }
 
 impl LoggingSimpleQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
         Self {
-            inner:        DfSessionService::new(session_context),
+            inner: DfSessionService::new(session_context),
             scan_metrics: None,
-            db:           None,
+            db: None,
         }
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
         Self {
-            inner:        DfSessionService::new_with_hooks(session_context, hooks),
+            inner: DfSessionService::new_with_hooks(session_context, hooks),
             scan_metrics: None,
-            db:           None,
+            db: None,
         }
     }
 
@@ -252,13 +252,57 @@ impl LoggingSimpleQueryHandler {
         info!("pgwire VACUUM {} retention={:?}: {deleted} files deleted", cmd.table, cmd.retention_hours);
         Ok(vec![Response::Execution(Tag::new(&format!("VACUUM {deleted}")))])
     }
+
+    /// Execute an intercepted `FLUSH` — drain the whole MemBuffer to Delta.
+    /// Ops pre-restart hook: run it right before a planned restart/deploy so
+    /// the stop grace never bounds the shutdown flush and the boot's WAL
+    /// replay is near-empty. Errors when any bucket fails so callers can
+    /// gate on it.
+    async fn run_flush(&self) -> PgWireResult<Vec<Response>> {
+        let layer = match self.db.as_ref().and_then(|d| d.buffered_layer()) {
+            Some(l) => l,
+            None => return Err(admin_err("FLUSH is not available on this server")),
+        };
+        // Misuse guard: FLUSH commits the open window per table (tiny parquet
+        // files + tantivy builds), so a looping client mints file-count
+        // explosion and contends flush_lock with routine flushes. Operator
+        // cadence is "once before a deploy" — enforce a floor between runs.
+        // Frozen-clock (test) harnesses are exempt: their cadence is
+        // script-driven and the frozen epoch resets between environments.
+        const FLUSH_MIN_INTERVAL_SECS: i64 = 10;
+        static LAST_FLUSH_MICROS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+        if !crate::clock::is_frozen() {
+            use std::sync::atomic::Ordering;
+            let now = chrono::Utc::now().timestamp_micros();
+            let since = now.saturating_sub(LAST_FLUSH_MICROS.load(Ordering::Acquire));
+            if since < FLUSH_MIN_INTERVAL_SECS * 1_000_000 {
+                return Err(admin_err(&format!(
+                    "FLUSH rate-limited: last ran {}s ago (min interval {FLUSH_MIN_INTERVAL_SECS}s)",
+                    since / 1_000_000
+                )));
+            }
+            LAST_FLUSH_MICROS.store(now, Ordering::Release);
+        }
+        let stats = layer.flush_all_now().await.map_err(|e| admin_err(&format!("FLUSH: {e}")))?;
+        info!(
+            "pgwire FLUSH: {} bucket(s) flushed ({} rows), {} failed",
+            stats.buckets_flushed, stats.total_rows, stats.buckets_failed
+        );
+        if stats.buckets_failed > 0 {
+            return Err(admin_err(&format!(
+                "FLUSH: {} bucket(s) failed to flush ({} flushed) — data stays buffered/WAL-durable",
+                stats.buckets_failed, stats.buckets_flushed
+            )));
+        }
+        Ok(vec![Response::Execution(Tag::new(&format!("FLUSH {}", stats.total_rows)))])
+    }
 }
 
 /// An intercepted `OPTIMIZE <table> WHERE date = 'YYYY-MM-DD'` admin command.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OptimizeCmd {
     pub table: String,
-    pub date:  chrono::NaiveDate,
+    pub date: chrono::NaiveDate,
 }
 
 fn admin_err(msg: &str) -> PgWireError {
@@ -311,7 +355,7 @@ pub(crate) fn parse_optimize(query: &str) -> Result<Option<OptimizeCmd>, String>
 /// An intercepted `VACUUM <table> [RETAIN <n> HOURS]` admin command.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct VacuumCmd {
-    pub table:           String,
+    pub table: String,
     /// `None` → use the configured default retention.
     pub retention_hours: Option<u64>,
 }
@@ -352,6 +396,12 @@ pub(crate) fn parse_vacuum(query: &str) -> Result<Option<VacuumCmd>, String> {
         table: table.to_string(),
         retention_hours,
     }))
+}
+
+/// Parse a bare `FLUSH` admin command (not a Postgres statement, so safe to
+/// intercept). No arguments on purpose: it drains the whole MemBuffer.
+pub(crate) fn parse_flush(query: &str) -> bool {
+    query.trim().trim_end_matches(';').trim().eq_ignore_ascii_case("flush")
 }
 
 /// Rewrites Postgres synonyms that DataFusion's SQL parser doesn't accept.
@@ -460,6 +510,11 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
             Err(msg) => return Err(admin_err(&msg)),
         }
 
+        // FLUSH — drain MemBuffer to Delta (pre-deploy hook).
+        if parse_flush(query) {
+            return self.run_flush().await;
+        }
+
         let span = tracing::Span::current();
         record_query_span(&span, query);
 
@@ -475,7 +530,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
 
 /// Extended query handler with tracing
 pub struct LoggingExtendedQueryHandler {
-    inner:        DfSessionService,
+    inner: DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
 }
 
@@ -489,14 +544,14 @@ impl LoggingExtendedQueryHandler {
 impl LoggingExtendedQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
         Self {
-            inner:        DfSessionService::new(session_context),
+            inner: DfSessionService::new(session_context),
             scan_metrics: None,
         }
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
         Self {
-            inner:        DfSessionService::new_with_hooks(session_context, hooks),
+            inner: DfSessionService::new_with_hooks(session_context, hooks),
             scan_metrics: None,
         }
     }
@@ -559,14 +614,18 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
     }
 }
 
-/// Start the server with custom handlers
+/// Start the server with custom handlers. `db` enables the admin commands
+/// (OPTIMIZE / VACUUM / FLUSH); without it they error as unavailable.
 pub async fn serve_with_logging(
     session_context: Arc<SessionContext>, options: &datafusion_postgres::ServerOptions, auth_config: AuthConfig,
-    scan_metrics: Option<Arc<crate::database::ScanMetrics>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>, db: Option<Arc<Database>>, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut factory = LoggingHandlerFactory::new(session_context, auth_config);
     if let Some(m) = scan_metrics {
         factory = factory.with_scan_metrics(m);
+    }
+    if let Some(db) = db {
+        factory = factory.with_database(db);
     }
     let handlers = Arc::new(factory);
     datafusion_postgres::serve_with_handlers(handlers, options, shutdown).await?;
@@ -594,7 +653,7 @@ pub async fn serve_with_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_optimize, parse_vacuum, rewrite_pg_synonyms};
+    use super::{parse_flush, parse_optimize, parse_vacuum, rewrite_pg_synonyms};
 
     #[test]
     fn optimize_parses_table_and_date() {
@@ -653,6 +712,16 @@ mod tests {
         // Don't false-match an identifier that merely starts with "vacuum".
         assert_eq!(parse_vacuum("SELECT vacuumed FROM t"), Ok(None));
         assert_eq!(parse_vacuum("vacuum_log"), Ok(None));
+    }
+
+    #[test]
+    fn flush_parses_bare_only() {
+        assert!(parse_flush("FLUSH"));
+        assert!(parse_flush("  flush ; "));
+        // Anything with arguments or a mere prefix match falls through.
+        assert!(!parse_flush("FLUSH t"));
+        assert!(!parse_flush("SELECT flushed FROM t"));
+        assert!(!parse_flush("flush_log"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ mod jsonb_oid {
     const JSON_OID: u32 = 114;
 
     struct Server {
-        port:     u16,
+        port: u16,
         shutdown: Arc<Notify>,
     }
 
@@ -59,7 +59,7 @@ mod jsonb_oid {
                 tokio::select! {
                     _ = sd.notified() => {}
                     _ = timefusion::pgwire_handlers::serve_with_logging(
-                        Arc::new(ctx), &opts, auth, None, std::future::pending::<()>()
+                        Arc::new(ctx), &opts, auth, None, None, std::future::pending::<()>()
                     ) => {}
                 }
             });

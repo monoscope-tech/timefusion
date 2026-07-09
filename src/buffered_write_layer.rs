@@ -105,72 +105,76 @@ fn quarantine_entry(quarantine_dir: &std::path::Path, entry: &WalEntry, kind: &s
 /// `snapshot_stats()` and rendered as rows by `timefusion.stats()`.
 #[derive(Debug, Clone)]
 pub struct StatsSnapshot {
-    pub mem_project_count:              usize,
-    pub mem_total_buckets:              usize,
-    pub mem_total_rows:                 usize,
-    pub mem_total_batches:              usize,
-    pub mem_estimated_bytes:            usize,
-    pub reserved_bytes:                 usize,
-    pub max_memory_bytes:               usize,
-    pub pressure_pct:                   u32,
-    pub wal_files:                      usize,
-    pub wal_disk_bytes:                 u64,
-    pub wal_shards_per_topic:           usize,
-    pub wal_known_topics:               usize,
-    pub bucket_duration_micros:         i64,
+    pub mem_project_count: usize,
+    pub mem_total_buckets: usize,
+    pub mem_total_rows: usize,
+    pub mem_total_batches: usize,
+    pub mem_estimated_bytes: usize,
+    /// WAL-replay DML entries consumed as no-ops (table had no buffered rows).
+    /// This replaced the quarantine file as the loss-class canary — treat
+    /// growth like a quarantine-count increase: check warn logs, re-drive.
+    pub mem_replay_dml_noops: u64,
+    pub reserved_bytes: usize,
+    pub max_memory_bytes: usize,
+    pub pressure_pct: u32,
+    pub wal_files: usize,
+    pub wal_disk_bytes: u64,
+    pub wal_shards_per_topic: usize,
+    pub wal_known_topics: usize,
+    pub bucket_duration_micros: i64,
     /// Oldest flushable MemBuffer bucket's flush-dwell in secs (`now - bucket
     /// creation time`), None when none past the open window. Measures how long
     /// a bucket has waited to flush — NOT its rows' event-time age — so
     /// backfill/late data can't false-trip it. Alert at > 2× `flush_interval_secs`.
-    pub oldest_bucket_age_secs:         Option<u64>,
+    pub oldest_bucket_age_secs: Option<u64>,
     /// Cumulative flush successes/failures since start. Mirror the OTel
     /// `timefusion.flush.completed`/`failed` counters for OTel-free tests.
-    pub flush_completed_total:          u64,
-    pub flush_failed_total:             u64,
+    pub flush_completed_total: u64,
+    pub flush_failed_total: u64,
     /// Inserts that hit the hard limit and applied backpressure (sync flush)
     /// instead of rejecting. Sustained growth = ingest outpacing flush.
-    pub backpressure_engaged_total:     u64,
+    pub backpressure_engaged_total: u64,
     /// Inserts rejected after backpressure failed to free memory. PAGE on any
     /// growth — data is safe in WAL but ingest is now dropping.
-    pub backpressure_rejected_total:    u64,
+    pub backpressure_rejected_total: u64,
     /// Open-bucket force-flush escalations (one busy window was itself the
     /// pressure). Sustained growth = windows too large for the budget.
     pub backpressure_force_flush_total: u64,
     /// Cumulative rows accepted vs drained to Delta. Both climbing with ingest
     /// faster = throughput wedge, not a stuck flush.
-    pub rows_ingested_total:            u64,
-    pub rows_flushed_total:             u64,
+    pub rows_ingested_total: u64,
+    pub rows_flushed_total: u64,
     /// MemBuffer bytes reclaimed by flushes. Flat while `pressure_pct=100` and
     /// flushes commit = memory is in buckets the flush path isn't reaching.
-    pub flush_freed_bytes_total:        u64,
+    pub flush_freed_bytes_total: u64,
     /// Real process RSS (Linux `/proc/self/statm`), None off-Linux. Gap vs
     /// `mem_buffer.estimated_bytes` reveals per-bucket estimate inflation.
-    pub process_rss_bytes:              Option<usize>,
+    pub process_rss_bytes: Option<usize>,
     /// Topics whose failed-commit holds could not be restored to MemBuffer —
     /// their rows exist ONLY in the WAL until a restart replays them, and
     /// each pins the WAL GC floor for its files. PAGE on any growth: the
     /// remedy is a scheduled restart before the pinned WAL fills the disk.
-    pub orphaned_topics:                usize,
+    pub orphaned_topics: usize,
     /// Age (secs) of the oldest orphan's GC-floor pin — how long WAL file GC
     /// has been (partially) suspended. None when no orphan carries a pin.
-    pub orphan_pin_age_secs:            Option<u64>,
+    pub orphan_pin_age_secs: Option<u64>,
 }
 
 #[derive(Debug, Default)]
 pub struct RecoveryStats {
-    pub entries_replayed:          u64,
-    pub batches_recovered:         u64,
-    pub oldest_entry_timestamp:    Option<i64>,
-    pub newest_entry_timestamp:    Option<i64>,
-    pub recovery_duration_ms:      u64,
+    pub entries_replayed: u64,
+    pub batches_recovered: u64,
+    pub oldest_entry_timestamp: Option<i64>,
+    pub newest_entry_timestamp: Option<i64>,
+    pub recovery_duration_ms: u64,
     pub corrupted_entries_skipped: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct FlushStats {
     pub buckets_flushed: u64,
-    pub buckets_failed:  u64,
-    pub total_rows:      u64,
+    pub buckets_failed: u64,
+    pub total_rows: u64,
 }
 
 /// MemBuffer bytes a flush reclaims — uses the same `estimate_batch_size` as
@@ -220,27 +224,27 @@ struct CoalescedGroup {
     /// the buffered-layer but reaches this code as `""`). Using `is_empty` as
     /// the sentinel previously let every subsequent bucket in such a group
     /// silently re-overwrite project_id/table_name.
-    key:                 Option<(String, String)>,
-    batches:             Vec<RecordBatch>,
-    row_count:           usize,
+    key: Option<(String, String)>,
+    batches: Vec<RecordBatch>,
+    row_count: usize,
     /// Per-shard min hold across all absorbed buckets — registered as the
     /// commit's in-flight cursor hold while it's airborne.
     wal_first_positions: Vec<Option<walrus_rust::WalPosition>>,
     /// The taken source buckets, kept whole so a failed commit can restore
     /// each one (rows + holds) to MemBuffer. Batches are Arc-backed, so this
     /// duplicates pointers, not data.
-    source_buckets:      Vec<crate::mem_buffer::FlushableBucket>,
+    source_buckets: Vec<crate::mem_buffer::FlushableBucket>,
     /// Min/max timestamp across absorbed buckets (Option so the derived Default's
     /// 0 can't corrupt the min). Carried onto the combined FlushableBucket.
-    min_timestamp:       Option<i64>,
-    max_timestamp:       Option<i64>,
+    min_timestamp: Option<i64>,
+    max_timestamp: Option<i64>,
     /// Min WAL GC floor across absorbed buckets (see
     /// `TimeBucket::first_wal_pin_micros`).
-    first_wal_pin:       Option<i64>,
+    first_wal_pin: Option<i64>,
 }
 
 struct CombinedBucket {
-    combined:       crate::mem_buffer::FlushableBucket,
+    combined: crate::mem_buffer::FlushableBucket,
     source_buckets: Vec<crate::mem_buffer::FlushableBucket>,
 }
 
@@ -314,36 +318,36 @@ pub type TantivyIndexCallback =
     Arc<dyn Fn(String, String, Vec<RecordBatch>, Vec<String>) -> futures::future::BoxFuture<'static, anyhow::Result<()>> + Send + Sync>;
 
 pub struct BufferedWriteLayer {
-    config:                         Arc<AppConfig>,
-    wal:                            Arc<WalManager>,
-    mem_buffer:                     Arc<MemBuffer>,
-    shutdown:                       CancellationToken,
-    delta_write_callback:           Option<DeltaWriteCallback>,
-    tantivy_index_callback:         Option<TantivyIndexCallback>,
-    background_tasks:               Mutex<Vec<JoinHandle<()>>>,
-    flush_lock:                     Mutex<()>,
+    config: Arc<AppConfig>,
+    wal: Arc<WalManager>,
+    mem_buffer: Arc<MemBuffer>,
+    shutdown: CancellationToken,
+    delta_write_callback: Option<DeltaWriteCallback>,
+    tantivy_index_callback: Option<TantivyIndexCallback>,
+    background_tasks: Mutex<Vec<JoinHandle<()>>>,
+    flush_lock: Mutex<()>,
     // Single-flights insert-path backpressure relief: only the writer that wins
     // this try_lock drives a relief flush; the rest wait for it to free RAM.
     // Without it, every blocked writer ran its own flush cycle (the ~20s p99
     // herd). Distinct from `flush_lock` so relief never blocks behind a routine
     // background flush already holding `flush_lock`.
-    relief_lock:                    Mutex<()>,
-    reserved_bytes:                 AtomicUsize, // Memory reserved for in-flight writes
-    pressure_notify:                Arc<Notify>, // Wakes flush task when pressure threshold crossed
+    relief_lock: Mutex<()>,
+    reserved_bytes: AtomicUsize,  // Memory reserved for in-flight writes
+    pressure_notify: Arc<Notify>, // Wakes flush task when pressure threshold crossed
     /// Notified at the end of every flush task iteration (success or failure).
     /// Test hook: lets E2E harnesses await actual completion of background work
     /// instead of racing wall-clock sleeps.
-    flush_tick_notify:              Arc<Notify>,
+    flush_tick_notify: Arc<Notify>,
     /// Notified at the end of every eviction task iteration.
-    eviction_tick_notify:           Arc<Notify>,
+    eviction_tick_notify: Arc<Notify>,
     /// Cumulative flush counters mirrored alongside OTel `record_flush`.
     /// OTel global metric state is opt-in (only initialized when telemetry is
     /// configured), so these atomics give the harness an in-process way to
     /// assert on what the global counters would be.
-    flush_completed_total:          AtomicU64,
-    flush_failed_total:             AtomicU64,
-    backpressure_engaged_total:     AtomicU64,
-    backpressure_rejected_total:    AtomicU64,
+    flush_completed_total: AtomicU64,
+    flush_failed_total: AtomicU64,
+    backpressure_engaged_total: AtomicU64,
+    backpressure_rejected_total: AtomicU64,
     backpressure_force_flush_total: AtomicU64,
     /// Cumulative rows accepted into MemBuffer (post-WAL) and rows drained to
     /// Delta. Diff two `timefusion_stats` scrapes to get ingest-rate vs
@@ -351,24 +355,24 @@ pub struct BufferedWriteLayer {
     /// `rows_flushed_total` while `pressure_pct=100`, the flush is succeeding
     /// but ingest is outpacing drain (the file-count-throttled-dedup wedge),
     /// distinct from a stuck flush (`flush_failed_total` climbing).
-    rows_ingested_total:            AtomicU64,
-    rows_flushed_total:             AtomicU64,
+    rows_ingested_total: AtomicU64,
+    rows_flushed_total: AtomicU64,
     /// Cumulative MemBuffer bytes (per `estimate_batch_size`) reclaimed by
     /// successful flushes. Pair with `pressure_pct`: if `pressure_pct=100` and
     /// this is flat while flushes commit, the drained buckets are near-empty —
     /// the memory lives in buckets the flush path isn't reaching (e.g. an open
     /// window needing force-flush). If it climbs in step with ingest, the drain
     /// is working and ingest is simply outpacing it.
-    flush_freed_bytes_total:        AtomicU64,
+    flush_freed_bytes_total: AtomicU64,
     // Required for WAL replay of UPDATE/DELETE whose SQL references UDFs.
-    function_registry:              Arc<crate::functions::FnRegistry>,
+    function_registry: Arc<crate::functions::FnRegistry>,
     /// Caps concurrent detached tantivy sidecar builds so a fast flush cycle
     /// (post-F4 — one build per (project, table) per cycle) can't fan out
     /// past S3 connection / memory limits when many tables flush together.
     /// FOLLOW-UP: handles aren't stored; graceful shutdown does not await
     /// in-flight tantivy uploads. Acceptable for now because the sidecar is
     /// best-effort and the index can be rebuilt from Delta on demand.
-    tantivy_spawn_sem:              Arc<tokio::sync::Semaphore>,
+    tantivy_spawn_sem: Arc<tokio::sync::Semaphore>,
     /// Per-(project, table) max row timestamp ever handed to a Delta commit
     /// this process lifetime, floored at `boot_micros`. Delta cannot hold
     /// rows newer than this, so a query whose lower time bound is above it
@@ -379,23 +383,23 @@ pub struct BufferedWriteLayer {
     /// visibility gap). Raised before the commit so a query can't race in
     /// between commit-visible and watermark-raise; a failed commit leaves it
     /// conservatively high.
-    delta_flushed_watermark:        dashmap::DashMap<crate::mem_buffer::TableKey, i64>,
+    delta_flushed_watermark: dashmap::DashMap<crate::mem_buffer::TableKey, i64>,
     /// Recovery-time floor for the watermark: anything committed by earlier
     /// process lifetimes has row timestamps at/below roughly this (event
     /// timestamps drive bucketing; far-future-skewed pre-boot rows are the
     /// accepted residual exposure, same as the old heuristic).
-    boot_micros:                    i64,
+    boot_micros: i64,
     /// WAL read-cursor holds for inserts whose entry is appended but whose
     /// MemBuffer bucket hasn't recorded its hold yet (the append→record
     /// window). Registered under the shard append lock BEFORE the entry
     /// exists — see `WalManager::append_batch` for the ordering argument.
     /// Keyed (project, table) → token → (shard, pre-append position).
-    pending_wal_holds:              dashmap::DashMap<(String, String), std::collections::HashMap<u64, (usize, walrus_rust::WalPosition)>>,
+    pending_wal_holds: dashmap::DashMap<(String, String), std::collections::HashMap<u64, (usize, walrus_rust::WalPosition)>>,
     /// Holds for buckets taken out of MemBuffer for an in-flight Delta
     /// commit: while airborne they're invisible to `MemBuffer::wal_holds`,
     /// but until the commit lands their WAL entries must still pin the
     /// cursor. Keyed (project, table) → token → per-shard holds.
-    inflight_flush_holds:           dashmap::DashMap<(String, String), std::collections::HashMap<u64, ShardHolds>>,
+    inflight_flush_holds: dashmap::DashMap<(String, String), std::collections::HashMap<u64, ShardHolds>>,
     /// Holds for buckets that could not be restored after a failed commit
     /// (evicted / incompatible schema): the rows exist only in the WAL, so
     /// the cursor must stay pinned until restart replays them. Kept apart
@@ -407,15 +411,15 @@ pub struct BufferedWriteLayer {
     /// rows exist only in the WAL until a restart replays them. Surfaced in
     /// `timefusion_stats` (orphaned_topics / orphan_pin_age) so an operator
     /// knows a restart is due before the pinned WAL fills the disk.
-    orphaned_wal_holds:             dashmap::DashMap<(String, String), (ShardHolds, i64)>,
+    orphaned_wal_holds: dashmap::DashMap<(String, String), (ShardHolds, i64)>,
     /// WAL GC floor legs for taken buckets while their commit is airborne:
     /// token → `first_wal_pin_micros`. Keeps `gc_wal_files` from deleting
     /// files their entries live in.
-    inflight_wal_pins:              dashmap::DashMap<u64, i64>,
-    wal_hold_seq:                   AtomicU64,
+    inflight_wal_pins: dashmap::DashMap<u64, i64>,
+    wal_hold_seq: AtomicU64,
     /// True while `recover_from_wal` runs. Suppresses cursor-snapshot writes
     /// from mid-replay relief flushes — see `write_post_flush_snapshot`.
-    recovery_active:                std::sync::atomic::AtomicBool,
+    recovery_active: std::sync::atomic::AtomicBool,
 }
 
 /// Per-shard WAL cursor holds (`None` = no hold on that shard).
@@ -534,6 +538,15 @@ impl BufferedWriteLayer {
 
     fn is_memory_pressure(&self) -> bool {
         self.effective_memory_bytes() >= self.max_memory_bytes()
+    }
+
+    /// Above the hard reservation ceiling (budget + headroom) — the point at
+    /// which live writers are rejected. WAL replay parks on this rather than
+    /// on `is_memory_pressure` so it can keep overlapping with an in-flight
+    /// relief drain instead of stopping at the first sign of pressure.
+    fn is_hard_memory_pressure(&self) -> bool {
+        let max = self.max_memory_bytes();
+        self.effective_memory_bytes() >= max.saturating_add(max / HARD_LIMIT_HEADROOM_DIVISOR)
     }
 
     /// Try to reserve memory atomically before a write.
@@ -839,7 +852,7 @@ impl BufferedWriteLayer {
     }
 
     #[instrument(skip(self))]
-    pub async fn recover_from_wal(&self) -> anyhow::Result<RecoveryStats> {
+    pub async fn recover_from_wal(self: &Arc<Self>) -> anyhow::Result<RecoveryStats> {
         let start = std::time::Instant::now();
         let corruption_threshold = self.config.buffer.wal_corruption_threshold();
 
@@ -1054,32 +1067,59 @@ impl BufferedWriteLayer {
         // Budget-bounded replay: replay bypasses the insert path's memory
         // reservation, so a backlog larger than the buffer budget used to
         // land wholesale in MemBuffer (prod 2026-07-08: 15.4GB into a 7.3GB
-        // budget → OOM → replay again → crash loop). Drain to Delta whenever
-        // pressure crosses the limit. If a relief attempt leaves pressure
-        // standing (S3 down ⇒ flushes failing), back off before retrying so
-        // a dead store degrades to the old over-budget replay instead of
-        // spinning the boot on failing flushes.
+        // budget → OOM → replay again → crash loop). Reliefs run CONCURRENTLY
+        // with replay (spawned, single-flight): the old inline drain-to-zero
+        // stopped replay for the whole S3 flush — ~140s of the 212s replay on
+        // the 2026-07-08 deploy. Replay only parks at the HARD ceiling while a
+        // drain is in flight; if no drain is running (S3 down ⇒ flushes
+        // failing), the entry-count gate paces re-spawn attempts and replay
+        // degrades to the old over-budget behavior instead of wedging the boot.
+        // Mid-replay flushes are safe by construction: watermarks are floored
+        // at P0 (guards above) and a replayed DML racing an airborne snapshot
+        // commit dirty-keeps the bucket (`finish_flushed_snapshot`).
         const RELIEF_BACKOFF_ENTRIES: u64 = 200;
         let mut relief_gate = 0u64;
         let mut replay_reliefs = 0u64;
+        let mut drain_task: Option<JoinHandle<()>> = None;
         let mut iter = self.wal.replay_iter().map_err(|e| anyhow::anyhow!("WAL replay iterator init failed: {}", e))?;
         while let Some(entry) = iter.next_entry() {
             process_entry(entry);
-            if iter.total >= relief_gate && self.is_memory_pressure() {
+            // Back off (entry-count gate) only when a completed drain LEFT
+            // pressure standing — that's the flushes-failing case. A drain
+            // that relieved pressure re-arms immediately.
+            if let Some(h) = drain_task.as_ref()
+                && h.is_finished()
+            {
+                drain_task = None;
+                relief_gate = if self.is_memory_pressure() { iter.total + RELIEF_BACKOFF_ENTRIES } else { 0 };
+            }
+            if drain_task.is_none() && iter.total >= relief_gate && self.is_memory_pressure() {
                 replay_reliefs += 1;
                 info!(
-                    "WAL replay: memory pressure at entry {} ({}MB buffered) — draining to Delta (relief #{})",
+                    "WAL replay: memory pressure at entry {} ({}MB buffered) — draining oldest buckets in background (relief #{})",
                     iter.total,
                     self.effective_memory_bytes() / (1024 * 1024),
                     replay_reliefs
                 );
-                self.relieve_memory_pressure().await;
-                relief_gate = if self.is_memory_pressure() { iter.total + RELIEF_BACKOFF_ENTRIES } else { 0 };
+                let this = Arc::clone(self);
+                drain_task = Some(tokio::spawn(async move { this.drain_replay_backlog().await }));
             }
+            while self.is_hard_memory_pressure() && drain_task.as_ref().is_some_and(|h| !h.is_finished()) {
+                let _ = tokio::time::timeout(Duration::from_millis(100), self.flush_tick_notify.notified()).await;
+            }
+        }
+        // The drain mutates the hold/orphan state the cursor parking below
+        // reads, and its airborne commit must land (or fail into a restore /
+        // orphan) before positions are parked — await it, don't abort it.
+        // Any residual over-budget tail (bounded by the backoff window) is
+        // drained post-boot by `drain_to_budget` in the background — never
+        // here, where it would block the PGWire listener.
+        if let Some(h) = drain_task.take() {
+            let _ = h.await;
         }
         let error_count = iter.errors;
         if replay_reliefs > 0 {
-            info!("WAL replay drained to budget {} time(s) during recovery", replay_reliefs);
+            info!("WAL replay ran {} concurrent relief drain(s) during recovery", replay_reliefs);
         }
 
         // Corruption threshold (0 = disabled): do NOT abort the boot when
@@ -1197,15 +1237,55 @@ impl BufferedWriteLayer {
         Ok(stats)
     }
 
+    /// Mid-replay pressure relief, spawned single-flight by `recover_from_wal`
+    /// to run concurrently with the replay loop (NOT cancel-aware — during
+    /// boot the layer's shutdown token cannot fire, and `recover_from_wal`
+    /// awaits this task for hold/parking correctness). Flushes the OLDEST
+    /// completed buckets in bucket-id chunks (oldest quartile per pass) until
+    /// usage is back under budget, escalating to the open window only if the
+    /// completed backlog alone can't relieve pressure. Oldest-first +
+    /// early-stop (vs the old drain-to-zero) keeps recently replayed rows in
+    /// MemBuffer so trailing WAL UPDATE/DELETE entries still find their
+    /// target rows; the <1% progress gate bounds it when flushes fail.
+    /// Replayed buckets are pinned at the pre-recovery cursor P0; flushing
+    /// them here releases those holds and lets the watermark advance past
+    /// the replayed backlog.
+    async fn drain_replay_backlog(&self) {
+        let mut prev = usize::MAX;
+        while self.is_memory_pressure() {
+            let current = MemBuffer::current_bucket_id();
+            let mut ids: Vec<i64> = self.mem_buffer.bucket_keys(|id| id < current).into_iter().map(|(_, _, id)| id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let Some(&cutoff) = ids.get(ids.len().saturating_sub(1) / 4) else { break };
+            if let Err(e) = self.flush_buckets_where(|id| id <= cutoff).await {
+                warn!("replay relief: flush failed: {}", e);
+                break;
+            }
+            // Wake a replay loop parked at the hard ceiling after every chunk.
+            self.flush_tick_notify.notify_waiters();
+            let now = self.effective_memory_bytes();
+            if now + now / 100 >= prev {
+                break; // <1% progress: flushes failing or nothing drainable.
+            }
+            prev = now;
+        }
+        if self.is_memory_pressure()
+            && let Err(e) = self.force_flush_current_buckets().await
+        {
+            warn!("replay relief: force-flush of open window failed: {}", e);
+        }
+        self.flush_tick_notify.notify_waiters();
+    }
+
     /// Flush completed buckets to Delta until memory is back under budget, then
     /// stop. Spawned as a background task after WAL replay: replay can leave the
     /// process well over the memory budget, but draining no longer blocks the
     /// PGWire listener — we serve while this runs (reads see MemBuffer unioned
     /// with Delta; new inserts flush-to-make-room via insert backpressure).
-    /// Bounded + progress-gated so a missing/failing Delta callback can't spin
-    /// forever, and cancel-aware so shutdown returns promptly. Replayed buckets
-    /// are pinned at the pre-recovery cursor P0; flushing them here releases
-    /// those holds and lets the watermark advance past the replayed backlog.
+    /// Bounded (64 iterations) + progress-gated so a missing/failing Delta
+    /// callback can't spin forever, and cancel-aware so shutdown returns
+    /// promptly.
     async fn drain_to_budget(&self) {
         if self.delta_write_callback.is_none() {
             return;
@@ -1429,15 +1509,25 @@ impl BufferedWriteLayer {
 
     #[instrument(skip(self))]
     async fn flush_completed_buckets(&self) -> anyhow::Result<()> {
+        let current_bucket = MemBuffer::current_bucket_id();
+        self.flush_buckets_where(move |id| id < current_bucket).await.map(|_| ())
+    }
+
+    /// Snapshot-flush every bucket whose id matches `pred`, coalesced into one
+    /// Delta commit per (project, table) and flushed `flush_parallelism`-wide,
+    /// largest table first (so a deadline-bounded caller cuts off the cheap
+    /// tail, not the expensive head). This is the one flush pipeline — the
+    /// periodic task (`pred = sealed buckets`), pressure relief, `FLUSH` over
+    /// pgwire, and the shutdown flush all route through it.
+    async fn flush_buckets_where(&self, pred: impl Fn(i64) -> bool) -> anyhow::Result<FlushStats> {
         // Acquire flush lock to prevent concurrent flushes (e.g., during shutdown)
         let _flush_guard = self.flush_lock.lock().await;
 
-        let current_bucket = MemBuffer::current_bucket_id();
-        // Group the sealed bucket keys per (project, table) FIRST: the
+        // Group the matching bucket keys per (project, table) FIRST: the
         // in-flight registration below must precede any snapshot of that
         // topic's buckets.
         let mut by_topic: std::collections::HashMap<(String, String), Vec<i64>> = std::collections::HashMap::new();
-        for (p, t, id) in self.mem_buffer.bucket_keys(|id| id < current_bucket) {
+        for (p, t, id) in self.mem_buffer.bucket_keys(&pred) {
             by_topic.entry((p, t)).or_default().push(id);
         }
 
@@ -1467,11 +1557,24 @@ impl BufferedWriteLayer {
         // spans all flushed time windows.
         let mut bucket_count = 0usize;
         let mut groups: Vec<(CombinedBucket, u64)> = Vec::with_capacity(by_topic.len());
+        let current_bucket = MemBuffer::current_bucket_id();
         for ((p, t), ids) in by_topic {
             let token = self.register_inflight_holds(&p, &t, Vec::new()); // airborne marker
             let mut group = CoalescedGroup::default();
             for id in ids {
                 if let Some(b) = self.mem_buffer.snapshot_bucket_for_flush(&p, &t, id) {
+                    // Snapshot of a not-yet-sealed bucket: exempt it from the
+                    // Delta-scan range exclusion up front (mirrors
+                    // flush_taken_bucket). Post-commit late arrivals re-narrow
+                    // the survivor's range over the committed rows, and once
+                    // the window seals the exclusion would mask them from
+                    // reads until the next drain (the 2026-06-11 gap shape).
+                    // Sealed buckets keep narrowing-only semantics — the
+                    // exemption must stay armed for the DML + airborne-commit
+                    // race documented on finish_flushed_snapshot.
+                    if id >= current_bucket {
+                        self.mem_buffer.mark_force_flushed(&p, &t, id);
+                    }
                     group.absorb(b);
                 }
             }
@@ -1491,8 +1594,9 @@ impl BufferedWriteLayer {
 
         if groups.is_empty() {
             debug!("No buckets to flush");
-            return Ok(());
+            return Ok(FlushStats::default());
         }
+        groups.sort_by_key(|(c, _)| std::cmp::Reverse(c.combined.row_count));
 
         debug!("Flushing {} bucket(s) → {} per-table commit(s)", bucket_count, groups.len());
 
@@ -1501,27 +1605,56 @@ impl BufferedWriteLayer {
         // inside `insert_records_batch`, so parallelism here = cross-table
         // concurrency.
         let parallelism = self.config.buffer.flush_parallelism();
-        let flush_results: Vec<_> = stream::iter(groups)
+        // Post-commit effects run INSIDE each group's future, not after a
+        // collect() barrier: the shutdown flush wraps this whole call in
+        // timeout_at and DROPS it on deadline — behind a barrier, every
+        // commit that had already landed lost its drain/hold-release/cursor
+        // advance and the next boot re-replayed the entire backlog as
+        // duplicates. `settle_flushed_group` is synchronous after the last
+        // await, so a drop can only lose groups still in flight.
+        let group_stats: Vec<(bool, FlushStats)> = stream::iter(groups)
             .map(|(combined, token)| async move {
                 let result = self.flush_bucket(&combined.combined).await;
-                (combined, token, result)
+                self.settle_flushed_group(combined, token, result)
             })
             .buffer_unordered(parallelism)
             .collect()
             .await;
 
-        // Process results: checkpoint WAL and drain MemBuffer for successful flushes.
-        //
-        // Counter semantics: `flush_completed_total`/`flush_failed_total` continue
-        // to count source bucket IDs (not coalesced groups). Pre-F4 each bucket
-        // was its own commit, so `count = buckets = commits`. Post-F4 it's
-        // `count = buckets ≠ commits`; the per-cycle commit count is
-        // `groups.len()` and is visible only in the `Flushing N → M commits`
-        // debug log. Dashboards thresholding on these counters keep their old
-        // numeric meaning (work units done), but a "commits per minute"
-        // dashboard derived from them now overstates real Delta commit rate.
         let mut any_ok = false;
-        for (combined, token, result) in flush_results {
+        let mut stats = FlushStats::default();
+        for (ok, s) in group_stats {
+            any_ok |= ok;
+            stats.buckets_flushed += s.buckets_flushed;
+            stats.buckets_failed += s.buckets_failed;
+            stats.total_rows += s.total_rows;
+        }
+        if any_ok {
+            self.write_post_flush_snapshot().await;
+        }
+
+        Ok(stats)
+    }
+
+    /// Apply one coalesced commit's post-flush effects — drain/restore,
+    /// hold release/orphaning, cursor advance, metrics. Deliberately
+    /// synchronous (no await): it runs inside the flush stream's per-group
+    /// future, and the deadline-bounded shutdown flush may drop that future
+    /// at any await point — everything here happens atomically once the
+    /// commit result is known.
+    ///
+    /// Counter semantics: `flush_completed_total`/`flush_failed_total` continue
+    /// to count source bucket IDs (not coalesced groups). Pre-F4 each bucket
+    /// was its own commit, so `count = buckets = commits`. Post-F4 it's
+    /// `count = buckets ≠ commits`; the per-cycle commit count is
+    /// `groups.len()` and is visible only in the `Flushing N → M commits`
+    /// debug log. Dashboards thresholding on these counters keep their old
+    /// numeric meaning (work units done), but a "commits per minute"
+    /// dashboard derived from them now overstates real Delta commit rate.
+    fn settle_flushed_group(&self, combined: CombinedBucket, token: u64, result: anyhow::Result<()>) -> (bool, FlushStats) {
+        let mut any_ok = false;
+        let mut stats = FlushStats::default();
+        {
             let CombinedBucket { combined, source_buckets } = combined;
             match result {
                 Ok(()) => {
@@ -1545,6 +1678,8 @@ impl BufferedWriteLayer {
                     self.rows_flushed_total.fetch_add(drained_rows, Ordering::Relaxed);
                     self.flush_freed_bytes_total.fetch_add(drained_bytes, Ordering::Relaxed);
                     self.flush_completed_total.fetch_add(drained.len() as u64, Ordering::Relaxed);
+                    stats.buckets_flushed += drained.len() as u64;
+                    stats.total_rows += drained_rows;
                     debug!(
                         "Flushed coalesced commit: project={}, table={}, buckets={} ({} drained), rows={}",
                         combined.project_id,
@@ -1580,6 +1715,7 @@ impl BufferedWriteLayer {
                     }
                     crate::metrics::record_flush(false);
                     self.flush_failed_total.fetch_add(source_buckets.len() as u64, Ordering::Relaxed);
+                    stats.buckets_failed += source_buckets.len() as u64;
                     error!(
                         "Failed to flush coalesced commit: project={}, table={}, buckets={:?}: {}",
                         combined.project_id,
@@ -1590,11 +1726,7 @@ impl BufferedWriteLayer {
                 }
             }
         }
-        if any_ok {
-            self.write_post_flush_snapshot().await;
-        }
-
-        Ok(())
+        (any_ok, stats)
     }
 
     /// Flush a bucket to Delta Lake via the configured callback.
@@ -1972,37 +2104,23 @@ impl BufferedWriteLayer {
             }
         }
 
-        // Best-effort flush of remaining buckets, bounded by flush_deadline so a
-        // slice is reserved for the snapshot. The whole loop is deadline-wrapped,
-        // so even a single flush stuck on a slow/unreachable Delta backend can't
-        // blow the grace — the future is dropped and unflushed buckets replay
-        // from the WAL on next boot.
-        match tokio::time::timeout_at(flush_deadline, self.flush_lock.lock()).await {
-            Ok(_flush_guard) => {
-                let keys = self.mem_buffer.bucket_keys(|_| true);
-                let total = keys.len();
-                let mut flushed = 0usize;
-                let done = tokio::time::timeout_at(flush_deadline, async {
-                    for (p, t, id) in keys {
-                        let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&p, &t, id) else {
-                            continue;
-                        };
-                        match self.flush_taken_bucket(&bucket).await {
-                            Ok(()) => flushed += 1,
-                            Err(e) => error!("Shutdown flush failed for bucket {}: {}", bucket.bucket_id, e),
-                        }
-                    }
-                })
-                .await;
-                match done {
-                    Ok(()) => info!("Shutdown flush: {}/{} buckets flushed; remainder (if any) replays from WAL", flushed, total),
-                    Err(_) => info!(
-                        "Shutdown flush deadline reached: {}/{} buckets flushed; remainder replays from WAL",
-                        flushed, total
-                    ),
-                }
-            }
-            Err(_) => warn!("Flush lock not acquired before deadline — skipping shutdown flush; WAL holds all data"),
+        // Best-effort flush of remaining buckets, bounded by flush_deadline so
+        // a slice is reserved for the snapshot. Coalesced + parallel via
+        // `flush_buckets_where` — the old sequential one-commit-per-bucket loop
+        // paid the fixed Delta-commit cost per bucket and flushed almost
+        // nothing of a multi-GB backlog inside the grace (2026-07-08 deploy:
+        // 6.8GB left behind → 212s of boot replay). Deadline-wrapped, so a
+        // flush stuck on a slow/unreachable Delta backend can't blow the grace
+        // — the future is dropped mid-flight (airborne holds stay registered,
+        // pinning the cursor) and unflushed buckets replay from the WAL on
+        // next boot.
+        match tokio::time::timeout_at(flush_deadline, self.flush_buckets_where(|_| true)).await {
+            Ok(Ok(stats)) => info!(
+                "Shutdown flush: {} bucket(s) flushed ({} rows), {} failed; remainder (if any) replays from WAL",
+                stats.buckets_flushed, stats.total_rows, stats.buckets_failed
+            ),
+            Ok(Err(e)) => warn!("Shutdown flush error: {} — WAL holds all data", e),
+            Err(_) => info!("Shutdown flush deadline reached; remainder replays from WAL"),
         }
 
         // ALWAYS write the clean-shutdown snapshot (even after a partial flush):
@@ -2044,33 +2162,16 @@ impl BufferedWriteLayer {
         f().await
     }
 
-    /// Force flush all buffered data to Delta immediately.
+    /// Force flush all buffered data to Delta immediately (coalesced, one
+    /// commit per table, `flush_parallelism`-wide).
     pub async fn flush_all_now(&self) -> anyhow::Result<FlushStats> {
-        let _flush_guard = self.flush_lock.lock().await;
-        let mut stats = FlushStats::default();
-        for (p, t, id) in self.mem_buffer.bucket_keys(|_| true) {
-            let Some(bucket) = self.mem_buffer.take_bucket_for_flush(&p, &t, id) else {
-                continue;
-            };
-            stats.total_rows += bucket.row_count as u64;
-            match self.flush_taken_bucket(&bucket).await {
-                Ok(()) => stats.buckets_flushed += 1,
-                Err(e) => {
-                    error!("flush_all_now: failed bucket {}: {}", bucket.bucket_id, e);
-                    stats.buckets_failed += 1;
-                }
-            }
-        }
-        if stats.buckets_flushed > 0 {
-            self.write_post_flush_snapshot().await;
-        }
-        Ok(stats)
+        self.flush_buckets_where(|_| true).await
     }
 
     /// Flush one taken bucket: force-flushed marking + in-flight hold
     /// registration + Delta commit + watermark advance on success, restore on
-    /// failure. Shared by `force_flush_current_buckets`, `flush_all_now`, and
-    /// the shutdown loop.
+    /// failure. Used by `force_flush_current_buckets` (take-based so a racing
+    /// DML can't dirty the flush).
     async fn flush_taken_bucket(&self, bucket: &FlushableBucket) -> anyhow::Result<()> {
         // A concurrent insert can revive the taken bucket between the take
         // and its remove_if; the revived bucket's range exclusion would then
@@ -2176,6 +2277,7 @@ impl BufferedWriteLayer {
             ((now - ts).max(0) / 1_000_000) as u64
         });
         StatsSnapshot {
+            mem_replay_dml_noops: mem.replay_dml_noops,
             mem_project_count: mem.project_count,
             mem_total_buckets: mem.total_buckets,
             mem_total_rows: mem.total_rows,
@@ -2499,7 +2601,7 @@ mod tests {
 
         // Second instance - recover from WAL
         {
-            let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+            let layer = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
             let stats = layer.recover_from_wal().await.unwrap();
             assert!(stats.entries_replayed > 0, "Expected entries to be replayed from WAL");
 
@@ -2539,7 +2641,7 @@ mod tests {
         let retention_micros = cfg.buffer.retention_mins() as i64 * 60 * 1_000_000;
         crate::clock::set_micros(chrono::Utc::now().timestamp_micros() + 2 * retention_micros);
 
-        let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        let layer = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
         let recovered = layer.recover_from_wal().await;
         crate::clock::unfreeze();
         let stats = recovered.unwrap();
@@ -2696,7 +2798,7 @@ mod tests {
         }
 
         {
-            let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+            let layer = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
             layer.recover_from_wal().await.unwrap();
             let ids = crate::test_utils::test_helpers::query_col_strings(&layer, &project, &table, "id");
             assert!(
@@ -2771,7 +2873,7 @@ mod tests {
         }
 
         {
-            let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+            let layer = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
             layer.recover_from_wal().await.unwrap();
             let ids = crate::test_utils::test_helpers::query_col_strings(&layer, &project, &table, "id");
             assert!(
@@ -2861,7 +2963,7 @@ mod tests {
         }
 
         for boot in 0..2 {
-            let layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+            let layer = Arc::new(crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
             let stats = layer
                 .recover_from_wal()
                 .await
@@ -2914,7 +3016,7 @@ mod tests {
         }
 
         {
-            let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+            let layer = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
             layer.recover_from_wal().await.unwrap();
             let results = layer.query(&project, &table, &[]).unwrap();
             let combined = arrow::compute::concat_batches(&results[0].schema(), &results).unwrap();
@@ -2963,7 +3065,7 @@ mod tests {
         }
 
         {
-            let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+            let layer = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
             layer.recover_from_wal().await.unwrap();
             let results = layer.query(&project, &table, &[]).unwrap();
             assert!(!results.is_empty(), "expected rows after WAL recovery");
@@ -3093,6 +3195,191 @@ mod tests {
         assert!(stats.orphan_pin_age_secs.unwrap_or(0) >= 3599, "orphan pin age must be surfaced");
     }
 
+    /// 2026-07-08 prod quarantine regression: replaying an UPDATE...FROM whose
+    /// table has no buffered rows (already flushed pre-shutdown, or drained
+    /// mid-replay by the budget relief) must consume the entry as a no-op —
+    /// pre-fix it parsed the predicate against an empty schema and quarantined
+    /// with "Schema error: No field named context___span_id".
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recovery_replays_dml_for_flushed_table_without_quarantine() {
+        use arrow::{
+            array::{Int64Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use datafusion::logical_expr::col;
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let wal_dir = cfg.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("u{}", test_id);
+        let table = format!("u{}", test_id);
+
+        let src_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("new_name", DataType::Utf8, false),
+            ])),
+            vec![Arc::new(Int64Array::from(vec![1i64])), Arc::new(StringArray::from(vec!["x"]))],
+        )
+        .unwrap();
+        let source = crate::dml::UpdateSource {
+            schema: src_batch.schema(),
+            batch: src_batch,
+            join_keys: vec![("id".to_string(), "id".to_string())],
+        };
+
+        {
+            let layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+            // Untracked table = the prod shape (rows already in Delta, nothing
+            // buffered): the live leg no-ops but the WAL entry is still written.
+            let pred = col("context___span_id").is_not_null();
+            let assigns = [("name".to_string(), col("new_name"))];
+            let n = layer.update_with_source(&project, &table, Some(&pred), &assigns, &source).unwrap();
+            assert_eq!(n, 0);
+        }
+
+        let layer = Arc::new(crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+        layer.recover_from_wal().await.expect("recovery must succeed");
+        let quarantined = std::fs::read_dir(cfg.core.wal_dir().join("quarantine")).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(quarantined, 0, "DML replay for a flushed/untracked table must no-op, not quarantine");
+    }
+
+    /// Code-review regression (2026-07-09): the deadline-bounded shutdown
+    /// flush used to collect() ALL commits behind a barrier before any
+    /// post-commit bookkeeping — a deadline drop then discarded the drain/
+    /// hold-release/cursor-advance of every commit that had already LANDED,
+    /// and the next boot re-replayed the whole backlog as duplicates. With
+    /// per-group settling inside the stream, a landed commit's bookkeeping
+    /// survives the drop; only in-flight groups are lost.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_deadline_preserves_landed_commits_bookkeeping() {
+        let dir = tempdir().unwrap();
+        let mut base = AppConfig::default();
+        base.core.timefusion_data_dir = dir.path().to_path_buf();
+        base.buffer.timefusion_stop_grace_secs = 1;
+        let cfg = Arc::new(base);
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let fast = format!("f{}", test_id);
+        let slow = format!("w{}", test_id);
+        let table = format!("t{}", test_id);
+
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        let slow_p = slow.clone();
+        layer.delta_write_callback = Some(Arc::new(move |p, _t, _b, _wm| {
+            let hang = p == slow_p;
+            Box::pin(async move {
+                if hang {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+                Ok(Vec::new())
+            })
+        }));
+        let layer = Arc::new(layer);
+
+        let old_ts = crate::clock::now_micros() - 2 * crate::mem_buffer::bucket_duration_micros();
+        // The fast table gets more rows so largest-first ordering flushes it
+        // first even at flush_parallelism = 1.
+        let mk = |id: &str, span: &str, p: &str| crate::test_utils::test_helpers::test_span_ts(id, span, p, old_ts);
+        let batch_fast = crate::test_utils::test_helpers::json_to_batch(vec![mk("a", "s1", &fast), mk("b", "s2", &fast)]).unwrap();
+        let batch_slow = crate::test_utils::test_helpers::json_to_batch(vec![mk("c", "s3", &slow)]).unwrap();
+        layer.insert(&fast, &table, vec![batch_fast]).await.unwrap();
+        layer.insert(&slow, &table, vec![batch_slow]).await.unwrap();
+
+        layer.shutdown().await.unwrap();
+
+        let stats = layer.snapshot_stats();
+        assert_eq!(
+            stats.mem_total_rows, 1,
+            "landed commit's buckets must drain despite the deadline drop; only the hung table's row may remain"
+        );
+    }
+
+    /// Code-review regression (2026-07-09, 2026-06-11 gap shape): flush_all_now
+    /// (the pgwire FLUSH backend) moved to the snapshot pipeline, which dropped
+    /// `mark_force_flushed` for open-window flushes — a late arrival surviving
+    /// the drain re-narrows the bucket's range over the committed rows, and
+    /// once the window seals the Delta-scan exclusion masks them from reads.
+    /// The open bucket must stay exempt for its whole surviving lifetime.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_all_now_exempts_surviving_open_bucket_from_exclusion() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let wal_dir = cfg.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("o{}", test_id);
+        let table = format!("o{}", test_id);
+
+        // Freeze the clock so the bucket stays open across the flush, then
+        // seals deterministically. Unfreeze even on panic — a leaked frozen
+        // clock breaks unrelated tests.
+        struct Unfreeze;
+        impl Drop for Unfreeze {
+            fn drop(&mut self) {
+                crate::clock::unfreeze();
+            }
+        }
+        let _uf = Unfreeze;
+        let t0 = chrono::Utc::now().timestamp_micros();
+        crate::clock::set_micros(t0);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (e2, g2) = (Arc::clone(&entered), Arc::clone(&gate));
+        let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| {
+            let (e, g) = (Arc::clone(&e2), Arc::clone(&g2));
+            Box::pin(async move {
+                e.notify_one();
+                g.notified().await;
+                Ok(Vec::new())
+            })
+        }));
+        let layer = Arc::new(layer);
+
+        let span = |id: &str, s: &str, ts: i64| crate::test_utils::test_helpers::test_span_ts(id, s, &project, ts);
+        layer
+            .insert(
+                &project,
+                &table,
+                vec![crate::test_utils::test_helpers::json_to_batch(vec![span("a", "s1", t0)]).unwrap()],
+            )
+            .await
+            .unwrap();
+
+        let l2 = Arc::clone(&layer);
+        let flush = tokio::spawn(async move { l2.flush_all_now().await });
+        entered.notified().await; // snapshot taken, commit airborne
+        // Late arrival into the SAME open window while the commit is airborne
+        // — it survives the drain and keeps the bucket alive.
+        layer
+            .insert(
+                &project,
+                &table,
+                vec![crate::test_utils::test_helpers::json_to_batch(vec![span("b", "s2", t0 + 1_000)]).unwrap()],
+            )
+            .await
+            .unwrap();
+        gate.notify_one();
+        flush.await.unwrap().unwrap();
+
+        // Seal the window: the surviving bucket is no longer `current`, so
+        // without the force-flushed exemption its range would now mask the
+        // committed Delta rows.
+        crate::clock::set_micros(t0 + 2 * crate::mem_buffer::bucket_duration_micros());
+        let ranges = layer.mem_buffer.get_bucket_ranges(&project, &table);
+        assert!(
+            ranges.is_empty(),
+            "force-flushed open bucket must stay exempt from the Delta-scan exclusion (it would mask the committed rows): {ranges:?}"
+        );
+    }
+
     /// 2026-07-08 review finding 2: a failed quarantine WRITE (disk full /
     /// blocked dir) means the WAL is the affected entry's only copy — replay
     /// must keep the rewind marker and bail regardless of the frame-error
@@ -3150,7 +3437,7 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut ro, 0o555);
         std::fs::set_permissions(&qdir, ro.clone()).unwrap();
 
-        let layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
+        let layer = Arc::new(crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
         let res = layer.recover_from_wal().await;
         // Restore perms before asserting so tempdir cleanup works either way.
         #[cfg(unix)]
@@ -3293,7 +3580,7 @@ mod tests {
         // Second instance: replay WAL into a fresh MemBuffer + verify the
         // UpdateWithSource entry reapplied.
         {
-            let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+            let layer = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
             let stats = layer.recover_from_wal().await.unwrap();
             assert!(
                 stats.entries_replayed >= 2,
@@ -3433,7 +3720,7 @@ mod tests {
         // Drop this layer; spin up a fresh one and recover. The open bucket's
         // WAL entry must still be there.
         drop(layer);
-        let layer2 = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        let layer2 = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
         let stats = layer2.recover_from_wal().await.unwrap();
         assert!(
             stats.entries_replayed >= 1,
@@ -3729,7 +4016,7 @@ mod tests {
             // Crash: drop without shutdown.
         }
 
-        let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        let layer = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
         layer.recover_from_wal().await.unwrap();
         let ids = crate::test_utils::test_helpers::query_col_strings(&layer, &project, &table, "id");
         assert!(
