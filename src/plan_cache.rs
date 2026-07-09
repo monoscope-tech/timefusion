@@ -329,10 +329,10 @@ pub fn global() -> Option<std::sync::Arc<PlanCacheHook>> {
 /// that just clears the cache once exceeded — cheap, correct, and never holds
 /// a lock across the await in `handle_simple_query`.
 pub struct PlanCacheHook {
-    cache:       dashmap::DashMap<String, LogicalPlan>,
-    capacity:    usize,
-    hits:        std::sync::atomic::AtomicU64,
-    misses:      std::sync::atomic::AtomicU64,
+    cache: dashmap::DashMap<String, LogicalPlan>,
+    capacity: usize,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
     /// Shape cache for LITERAL-bearing SELECTs (generated dashboard SQL that
     /// never repeats verbatim): keyed by the statement with every string
     /// literal replaced by `$N`, storing the pre-optimized placeholder plan +
@@ -340,20 +340,20 @@ pub struct PlanCacheHook {
     /// query's actual literals (cast to the inferred types) — skipping parse,
     /// analyze, AND optimize. `None` = negative entry: this shape failed to
     /// plan/parameterize once; don't retry it per query.
-    shapes:      dashmap::DashMap<String, Option<ShapeEntry>>,
+    shapes: dashmap::DashMap<String, Option<ShapeEntry>>,
     /// Canonical texts we served a pre-optimized substituted plan for, so
     /// `was_pre_optimized` can tell the handler to skip `state.optimize()`.
     /// Literal-bearing texts are one-shot (next dashboard refresh has new
     /// literals), so recency semantics with a soft cap are enough — a false
     /// `false` after eviction merely re-optimizes an optimized plan.
-    served:      dashmap::DashMap<String, ()>,
-    shape_hits:  std::sync::atomic::AtomicU64,
+    served: dashmap::DashMap<String, ()>,
+    shape_hits: std::sync::atomic::AtomicU64,
     shape_skips: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
 struct ShapeEntry {
-    plan:        LogicalPlan,
+    plan: LogicalPlan,
     /// Inferred DataType per `$N` (index 0 = `$1`); substituted literals are
     /// cast to these so the plan's expression types stay exact.
     param_types: Vec<Option<datafusion::arrow::datatypes::DataType>>,
@@ -428,13 +428,13 @@ impl Default for PlanCacheHook {
 impl PlanCacheHook {
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache:       dashmap::DashMap::new(),
-            capacity:    capacity.max(1),
-            hits:        std::sync::atomic::AtomicU64::new(0),
-            misses:      std::sync::atomic::AtomicU64::new(0),
-            shapes:      dashmap::DashMap::new(),
-            served:      dashmap::DashMap::new(),
-            shape_hits:  std::sync::atomic::AtomicU64::new(0),
+            cache: dashmap::DashMap::new(),
+            capacity: capacity.max(1),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+            shapes: dashmap::DashMap::new(),
+            served: dashmap::DashMap::new(),
+            shape_hits: std::sync::atomic::AtomicU64::new(0),
             shape_skips: std::sync::atomic::AtomicU64::new(0),
         }
     }

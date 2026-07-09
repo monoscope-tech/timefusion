@@ -336,14 +336,14 @@ pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextM
     match sf.args.len() {
         2 => Some(TextMatchPred {
             column: col,
-            query:  utf8_lit(&sf.args[1])?,
+            query: utf8_lit(&sf.args[1])?,
         }),
         3 => {
             let value = utf8_lit(&sf.args[1])?; // still a placeholder pre-substitution → opaque
             let kind = utf8_lit(&sf.args[2])?;
             Some(TextMatchPred {
                 column: col,
-                query:  classify_deferred(&kind, &value)?,
+                query: classify_deferred(&kind, &value)?,
             })
         }
         _ => None,
@@ -353,7 +353,7 @@ pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextM
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextMatchPred {
     pub column: String,
-    pub query:  String,
+    pub query: String,
 }
 
 /// Boolean structure of the routable `text_match` predicates in a filter
@@ -394,7 +394,7 @@ impl PredNode {
 /// non-superset and silently drop that branch's rows (2026-06-16 dashboard
 /// bug: `(kind='server' OR name='...')` returned 0 from Delta).
 struct NodeRes {
-    node:     Option<PredNode>,
+    node: Option<PredNode>,
     complete: bool,
 }
 
@@ -424,7 +424,7 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
     if let Some(p) = extract_text_match(e) {
         return NodeRes {
-            node:     Some(PredNode::Leaf(p)),
+            node: Some(PredNode::Leaf(p)),
             complete: true,
         };
     }
@@ -465,20 +465,14 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
                         }
                     }
                     NodeRes {
-                        node:     Some(PredNode::Or(kids)),
+                        node: Some(PredNode::Or(kids)),
                         complete: true,
                     }
                 }
-                _ => NodeRes {
-                    node:     None,
-                    complete: false,
-                },
+                _ => NodeRes { node: None, complete: false },
             }
         }
-        _ => NodeRes {
-            node:     None,
-            complete: false,
-        },
+        _ => NodeRes { node: None, complete: false },
     }
 }
 

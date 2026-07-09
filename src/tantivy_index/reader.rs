@@ -22,11 +22,11 @@ use crate::tantivy_index::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hit {
     pub timestamp_micros: i64,
-    pub id:               String,
+    pub id: String,
     /// Row offset within the covered parquet file, when the index carries the
     /// `_row_ordinal` fast field. Only meaningful for read-back-built indexes
     /// (`ManifestEntry.ordinals_valid`) — see schema.rs.
-    pub row_ordinal:      Option<u64>,
+    pub row_ordinal: Option<u64>,
 }
 
 /// Outcome of compiling predicates against a concrete index's schema.
@@ -127,8 +127,8 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
                 if id_col.ord_to_str(ord, &mut id_buf).map_err(|e| anyhow!("fast _id read: {e}"))? {
                     hits.push(Hit {
                         timestamp_micros: ts,
-                        id:               id_buf.clone(),
-                        row_ordinal:      ord_col.as_ref().and_then(|c| c.first(addr.doc_id)),
+                        id: id_buf.clone(),
+                        row_ordinal: ord_col.as_ref().and_then(|c| c.first(addr.doc_id)),
                     });
                     continue;
                 }

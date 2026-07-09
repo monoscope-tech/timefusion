@@ -61,12 +61,12 @@ type DeltaProviderCache = dashmap::DashMap<(String, String), (u64, Arc<DeltaProv
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanShape {
-    skipped_delta:    bool,
-    has_mem:          bool,
-    has_delta:        bool,
+    skipped_delta: bool,
+    has_mem: bool,
+    has_delta: bool,
     fast_resolve_hit: Option<bool>,
     /// Read-side dedup skip engaged (all window partitions sweep-verified clean).
-    skip_dedup:       bool,
+    skip_dedup: bool,
 }
 
 /// Counters surfaced via `timefusion_stats` for production debugging. Cheap to
@@ -75,13 +75,13 @@ struct ScanShape {
 /// compute without sorting.
 #[derive(Debug, Default)]
 pub struct ScanMetrics {
-    pub scans_total:              std::sync::atomic::AtomicU64,
-    pub scans_skipped_delta:      std::sync::atomic::AtomicU64,
-    pub scans_mem_only:           std::sync::atomic::AtomicU64,
-    pub scans_delta_only:         std::sync::atomic::AtomicU64,
-    pub scans_mem_plus_delta:     std::sync::atomic::AtomicU64,
-    pub fast_resolve_hits:        std::sync::atomic::AtomicU64,
-    pub fast_resolve_misses:      std::sync::atomic::AtomicU64,
+    pub scans_total: std::sync::atomic::AtomicU64,
+    pub scans_skipped_delta: std::sync::atomic::AtomicU64,
+    pub scans_mem_only: std::sync::atomic::AtomicU64,
+    pub scans_delta_only: std::sync::atomic::AtomicU64,
+    pub scans_mem_plus_delta: std::sync::atomic::AtomicU64,
+    pub fast_resolve_hits: std::sync::atomic::AtomicU64,
+    pub fast_resolve_misses: std::sync::atomic::AtomicU64,
     /// Delta TableProvider cache: hit = cached cell at the current snapshot
     /// version; miss = either no entry, or an entry at a stale version that
     /// had to be replaced. Operators tracking the cold-start vs steady-state
@@ -89,8 +89,8 @@ pub struct ScanMetrics {
     /// (project, table), this should stay high; a low ratio in prod means
     /// version is churning faster than expected (e.g. very aggressive
     /// compaction) and the cache isn't paying for itself.
-    pub provider_cache_hits:      std::sync::atomic::AtomicU64,
-    pub provider_cache_misses:    std::sync::atomic::AtomicU64,
+    pub provider_cache_hits: std::sync::atomic::AtomicU64,
+    pub provider_cache_misses: std::sync::atomic::AtomicU64,
     /// Provider builds that started against a version that was already
     /// stale by the time the build finished — the DashMap entry got
     /// replaced under us (a flush bumped the version) and the rebuilt
@@ -104,15 +104,15 @@ pub struct ScanMetrics {
     /// in a single bucket via `usize::leading_zeros` math. Bucket i holds
     /// scans whose duration_us fits in `[1<<i, 1<<(i+1))`. 32 buckets covers
     /// 1us through ~1.2 hours.
-    pub scan_latency_buckets:     [std::sync::atomic::AtomicU64; 32],
+    pub scan_latency_buckets: [std::sync::atomic::AtomicU64; 32],
     /// End-to-end pgwire query latency histogram (same bucket scheme as
     /// `scan_latency_buckets`). Recorded by `LoggingSimpleHandler` and
     /// `LoggingExtendedQueryHandler` around the `DfSessionService::do_query`
     /// call — the FULL server-side path from "harness received our query"
     /// through "result encoded back to client". Compare to scan p95/p99 to
     /// see how much of the user-visible tail is outside the scan call.
-    pub pgwire_total:             std::sync::atomic::AtomicU64,
-    pub pgwire_latency_buckets:   [std::sync::atomic::AtomicU64; 32],
+    pub pgwire_total: std::sync::atomic::AtomicU64,
+    pub pgwire_latency_buckets: [std::sync::atomic::AtomicU64; 32],
 }
 
 impl ScanMetrics {
@@ -671,15 +671,15 @@ fn window_dates(lo: i64, hi: i64) -> Option<Vec<chrono::NaiveDate>> {
 /// drops rows, unlike optimize's data-preserving `data_change: false`).
 fn remove_for_add(add: &deltalake::kernel::Add) -> deltalake::kernel::Remove {
     deltalake::kernel::Remove {
-        path:                       add.path.clone(),
-        data_change:                true,
-        deletion_timestamp:         Some(Utc::now().timestamp_millis()),
-        size:                       Some(add.size),
-        extended_file_metadata:     Some(true),
-        partition_values:           Some(add.partition_values.clone()),
-        tags:                       add.tags.clone(),
-        deletion_vector:            add.deletion_vector.clone(),
-        base_row_id:                add.base_row_id,
+        path: add.path.clone(),
+        data_change: true,
+        deletion_timestamp: Some(Utc::now().timestamp_millis()),
+        size: Some(add.size),
+        extended_file_metadata: Some(true),
+        partition_values: Some(add.partition_values.clone()),
+        tags: add.tags.clone(),
+        deletion_vector: add.deletion_vector.clone(),
+        base_row_id: add.base_row_id,
         default_row_commit_version: add.default_row_commit_version,
     }
 }
@@ -883,22 +883,22 @@ const COMPRESSION_TIER_KEY: &str = "timefusion.compression_tier";
 
 #[derive(Clone, Serialize, Deserialize, sqlx::FromRow, derive_more::Debug)]
 struct StorageConfig {
-    project_id:           String,
-    table_name:           String,
-    s3_bucket:            String,
-    s3_prefix:            String,
-    s3_region:            String,
+    project_id: String,
+    table_name: String,
+    s3_bucket: String,
+    s3_prefix: String,
+    s3_region: String,
     /// Skipped on serialize so credentials never leak through serde-based dumps
     /// (debug endpoints, metrics serialization, etc.). sqlx::FromRow bypasses
     /// serde so DB-row loading is unaffected. `#[debug("[redacted]")]` keeps
     /// them out of `{:?}` log lines.
     #[serde(serialize_with = "redact_str")]
     #[debug("[redacted]")]
-    s3_access_key_id:     String,
+    s3_access_key_id: String,
     #[serde(serialize_with = "redact_str")]
     #[debug("[redacted]")]
     s3_secret_access_key: String,
-    s3_endpoint:          Option<String>,
+    s3_endpoint: Option<String>,
 }
 
 fn redact_str<S: serde::Serializer>(_: &str, ser: S) -> std::result::Result<S::Ok, S::Error> {
@@ -907,16 +907,16 @@ fn redact_str<S: serde::Serializer>(_: &str, ser: S) -> std::result::Result<S::O
 
 #[derive(Debug, Clone)]
 pub struct Database {
-    config:                          Arc<AppConfig>,
+    config: Arc<AppConfig>,
     /// One RuntimeEnv (and thus one memory pool) shared by every session
     /// context, across `Database` clones. Per-context pools each granted the
     /// full `memory_limit × fraction` budget, so N contexts oversubscribed
     /// the cgroup N×; the pool only enforces a global cap if it's global.
-    runtime_env:                     Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
-    unified_tables:                  UnifiedTables,
+    unified_tables: UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
-    custom_project_tables:           CustomProjectTables,
+    custom_project_tables: CustomProjectTables,
     /// Lock-free per-(project,table) cache of resolved Delta table refs. The
     /// inner `Arc<RwLock<DeltaTable>>` is the same object held in
     /// `unified_tables`/`custom_project_tables`, so update_state on the slow
@@ -939,7 +939,7 @@ pub struct Database {
     /// — entries for tables dropped at runtime persist until process
     /// restart. Watch `scan.fast_resolve_cache_entries` in
     /// `timefusion_stats` for unbounded growth.
-    fast_resolve_cache:              dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
+    fast_resolve_cache: dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
     /// Per-(project,table) sticky bit: "Delta may hold matching files."
     /// Two seed paths so the bit is always at least as conservative as truth
     /// — never falsely `false`:
@@ -966,7 +966,7 @@ pub struct Database {
     /// (incorrect — would lose visibility between clones) or removing the
     /// derive (invasive). The extra heap allocation per tenant pair is a
     /// few bytes and well off the hot path.
-    delta_has_files:                 dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
+    delta_has_files: dashmap::DashMap<(String, String), Arc<std::sync::atomic::AtomicBool>>,
     /// Per-(project,table) cached Delta-side `TableProvider` along with the
     /// snapshot version it was built against. Steady-state (post-flush)
     /// queries that have to UNION mem + delta were rebuilding the provider
@@ -992,35 +992,35 @@ pub struct Database {
     /// churning create/drop pattern, expose `scan.provider_cache_entries`
     /// in `timefusion_stats` (already wired) for alerting, and add a
     /// TTL sweep here when it ever becomes a real problem.
-    delta_provider_cache:            DeltaProviderCache,
+    delta_provider_cache: DeltaProviderCache,
     /// Per-process scan-path counters. Read by `timefusion_stats` so operators
     /// can see — in prod — whether the in-memory shortcut is being taken,
     /// what the resolve cache hit rate looks like, and how the latency
     /// distribution shifts under real load. Counters are cumulative since
     /// process start; deltas are useful for rate analysis.
-    pub scan_metrics:                Arc<ScanMetrics>,
-    batch_queue:                     Option<Arc<crate::batch_queue::BatchQueue>>,
-    maintenance_shutdown:            Arc<CancellationToken>,
+    pub scan_metrics: Arc<ScanMetrics>,
+    batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    maintenance_shutdown: Arc<CancellationToken>,
     /// One-shot guard for `preload_tables` — main.rs and bootstrap.rs are
     /// disjoint entry points today, but a second call must not double the
     /// boot-time S3 warm burst.
-    preload_started:                 Arc<std::sync::atomic::AtomicBool>,
-    config_pool:                     Option<PgPool>,
-    storage_configs:                 Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
+    preload_started: Arc<std::sync::atomic::AtomicBool>,
+    config_pool: Option<PgPool>,
+    storage_configs: Arc<RwLock<HashMap<(String, String), StorageConfig>>>,
     /// Monotonic deadline (nanos since process start) for when the next
     /// storage-configs refresh from the config DB is allowed. Capped at 30s
     /// so a hot SQL path doesn't hit PG on every statement.
     storage_configs_next_refresh_ns: Arc<std::sync::atomic::AtomicU64>,
-    default_s3_bucket:               Option<String>,
-    default_s3_prefix:               Option<String>,
-    default_s3_endpoint:             Option<String>,
-    object_store_cache:              Option<Arc<SharedFoyerCache>>,
-    statistics_extractor:            Arc<DeltaStatisticsExtractor>,
-    last_written_versions:           Arc<RwLock<HashMap<(String, String), u64>>>,
+    default_s3_bucket: Option<String>,
+    default_s3_prefix: Option<String>,
+    default_s3_endpoint: Option<String>,
+    object_store_cache: Option<Arc<SharedFoyerCache>>,
+    statistics_extractor: Arc<DeltaStatisticsExtractor>,
+    last_written_versions: Arc<RwLock<HashMap<(String, String), u64>>>,
     /// Delta snapshot version at last dedup sweep, per scheduler key. Skips
     /// the sweep when the version hasn't moved (no commits → no new dupes).
     /// Same unbounded-growth caveat as `last_written_versions`.
-    last_dedup_versions:             Arc<RwLock<HashMap<String, u64>>>,
+    last_dedup_versions: Arc<RwLock<HashMap<String, u64>>>,
     /// (project, table, date) → fingerprint (hash of the partition's sorted
     /// live file set) captured when a dedup sweep pass found ZERO duplicates
     /// and the file set was unchanged across the pass. A query whose window
@@ -1029,23 +1029,23 @@ pub struct Database {
     /// suppression) can be skipped (`timefusion_read_dedup_skip_swept`).
     /// Any commit touching the partition changes its file set → mismatch →
     /// dedup stays on until the next clean sweep pass.
-    dedup_clean_fp:                  Arc<dashmap::DashMap<(String, String, String), u64>>,
+    dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), u64>>,
     /// Exponential failure backoff per (table, project, date) dedup target:
     /// (attempts, earliest next try). Without it a failing partition re-runs
     /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
     /// pacing. Cleared on success; in-memory only (a restart retries once).
-    dedup_backoff:                   Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
+    dedup_backoff: Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
     /// Skip-if-busy gate for the light-optimize/dedup job: a tick that
     /// outlives the 5-minute cron interval (observed 5m45s in prod) must not
     /// stack a second sweep on top — concurrent sweeps churn each other's
     /// target files into re-plan storms and multiply peak memory.
-    light_optimize_gate:             Arc<tokio::sync::Mutex<()>>,
+    light_optimize_gate: Arc<tokio::sync::Mutex<()>>,
     /// Caps concurrent heavy maintenance rewrites (dedup / optimize /
     /// recompress) that materialize Arrow. Their footprint is invisible to the
     /// DataFusion memory pool (a `SELECT * … collect()` doesn't reserve through
     /// it), so aggregate concurrency — not the pool — is the real bound against
     /// the cgroup OOM (prod 2026-07-04). Permits = `timefusion_maintenance_rewrite_concurrency`.
-    maintenance_rewrite_sem:         Arc<tokio::sync::Semaphore>,
+    maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Serializes in-process Delta commits (flush appends vs dedup
     /// replace_where). delta-kernel's OCC checker cannot evaluate the
     /// bare-string timestamp predicate replace_where commits carry (errors
@@ -1053,19 +1053,19 @@ pub struct Database {
     /// any concurrent append aborts — every attempt, forever, on a busy
     /// table. With commits serialized the rebase sees no newer versions and
     /// skips the checker entirely.
-    delta_commit_lock:               Arc<tokio::sync::Mutex<()>>,
+    delta_commit_lock: Arc<tokio::sync::Mutex<()>>,
     /// Per-table serialization for in-process DML (see `dml_lock`): concurrent
     /// merges on the same table would OCC-conflict and redo full parquet
     /// rewrites, so they queue here — without touching the table's RwLock,
     /// which stays free for readers and insert commits.
-    dml_locks:                       DmlLocks,
+    dml_locks: DmlLocks,
     /// Last time each table's snapshot was persisted to disk (keyed by table
     /// url). `persist_snapshot` throttles on this: the on-disk snapshot is only
     /// a boot-recovery seed (restore V, replay commits > V), so rewriting the
     /// whole 5k-file state on *every* commit is wasted CPU (13% in the
     /// 2026-07-05 profile, serde_json + zstd). A slightly stale snapshot just
     /// makes boot replay a few more (sub-second) commits.
-    snapshot_persist_gate:           Arc<dashmap::DashMap<String, std::time::Instant>>,
+    snapshot_persist_gate: Arc<dashmap::DashMap<String, std::time::Instant>>,
     /// Late-binding shared cell: boot must create the pgwire SessionContext
     /// (whose FunctionRegistry the WAL replay needs) BEFORE the layer exists,
     /// so the layer is published through a OnceLock shared across all clones —
@@ -1073,20 +1073,20 @@ pub struct Database {
     /// `Option<Arc<_>>` here silently left pre-layer clones without the mem
     /// leg: pgwire UPDATEs skipped the buffer and lost updates to unflushed
     /// rows.
-    buffered_layer:                  Arc<std::sync::OnceLock<Arc<crate::buffered_write_layer::BufferedWriteLayer>>>,
+    buffered_layer: Arc<std::sync::OnceLock<Arc<crate::buffered_write_layer::BufferedWriteLayer>>>,
     /// Per-clone override for `query_delta_only`: hides the shared layer so
     /// scans bypass the in-memory buffer.
-    bypass_buffer:                   bool,
+    bypass_buffer: bool,
     /// Late-binding shared cells like `buffered_layer`: attached by `with_*`
     /// builders after boot has already cloned Database into sessions/planners,
     /// so a plain Option would leave those clones silently service-less.
-    tantivy_search:                  Arc<std::sync::OnceLock<Arc<crate::tantivy_index::search::TantivySearchService>>>,
-    tantivy_indexer:                 Arc<std::sync::OnceLock<Arc<crate::tantivy_index::service::TantivyIndexService>>>,
+    tantivy_search: Arc<std::sync::OnceLock<Arc<crate::tantivy_index::search::TantivySearchService>>>,
+    tantivy_indexer: Arc<std::sync::OnceLock<Arc<crate::tantivy_index::service::TantivyIndexService>>>,
     /// Deferred-DML coalescer (see `dml_coalescer`) — populated by
     /// `start_dml_coalescer` when `TIMEFUSION_DML_COALESCE_SECS > 0`. Same
     /// late-binding shared-cell pattern as `buffered_layer`: the DML planner
     /// clones Database before boot wiring finishes.
-    dml_coalescer:                   Arc<std::sync::OnceLock<Arc<crate::dml_coalescer::DmlCoalescer>>>,
+    dml_coalescer: Arc<std::sync::OnceLock<Arc<crate::dml_coalescer::DmlCoalescer>>>,
     /// Per-table, per-date set of live file URIs as of the last successful full
     /// (z-order) optimize. delta-rs's ZOrder planner has no idempotence guard —
     /// it rewrites every file in the window on every run, even sealed days that
@@ -1095,7 +1095,7 @@ pub struct Database {
     /// `optimize_table` skip a sealed partition whose file set is unchanged.
     /// Keyed by table storage URL (unique per physical table). In-memory only:
     /// a restart re-z-orders each partition once, which is harmless.
-    zorder_filesets:                 ZOrderFilesets,
+    zorder_filesets: ZOrderFilesets,
 }
 
 impl Database {
@@ -2957,12 +2957,12 @@ impl Database {
 
         // Configure retry with exponential backoff for transient network errors
         let retry_config = RetryConfig {
-            max_retries:   5,
+            max_retries: 5,
             retry_timeout: Duration::from_secs(180),
-            backoff:       BackoffConfig {
+            backoff: BackoffConfig {
                 init_backoff: Duration::from_millis(100),
-                max_backoff:  Duration::from_secs(15),
-                base:         2.0,
+                max_backoff: Duration::from_secs(15),
+                base: 2.0,
             },
         };
 
@@ -4607,9 +4607,9 @@ impl Database {
                 }
                 let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
                 let op = DeltaOperation::Write {
-                    mode:         deltalake::protocol::SaveMode::Overwrite,
+                    mode: deltalake::protocol::SaveMode::Overwrite,
                     partition_by: (!schema.partitions.is_empty()).then(|| schema.partitions.clone()),
-                    predicate:    None,
+                    predicate: None,
                 };
                 let commit_res =
                     deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
@@ -5135,9 +5135,9 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     let sort_cols: Vec<SortColumn> = sort_idx
         .iter()
         .map(|(i, sc)| SortColumn {
-            values:  combined.column(*i).clone(),
+            values: combined.column(*i).clone(),
             options: Some(SortOptions {
-                descending:  sc.descending,
+                descending: sc.descending,
                 nulls_first: sc.nulls_first,
             }),
         })
@@ -5261,10 +5261,10 @@ fn build_writer_properties(
 #[derive(Debug, Clone)]
 pub struct ProjectRoutingTable {
     default_project: String,
-    database:        Arc<Database>,
-    schema:          SchemaRef,
-    _batch_queue:    Option<Arc<crate::batch_queue::BatchQueue>>,
-    table_name:      String,
+    database: Arc<Database>,
+    schema: SchemaRef,
+    _batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
+    table_name: String,
 }
 
 impl ProjectRoutingTable {
@@ -6101,8 +6101,8 @@ impl TableProvider for ProjectRoutingTable {
                     } else {
                         crate::metrics::record_tantivy_prefilter_used();
                         tantivy_id_filter = Some(Expr::InList(datafusion::logical_expr::expr::InList {
-                            expr:    Box::new(datafusion::logical_expr::col("id")),
-                            list:    ids.into_iter().map(lit).collect(),
+                            expr: Box::new(datafusion::logical_expr::col("id")),
+                            list: ids.into_iter().map(lit).collect(),
                             negated: false,
                         }));
                         // File pruning is only sound once every gate above
@@ -6321,18 +6321,18 @@ impl TableProvider for ProjectRoutingTable {
         for (start, end) in &mem_ranges {
             // NOT (ts >= start AND ts < end)  ≡  (ts < start) OR (ts >= end)
             let below = Expr::BinaryExpr(BinaryExpr {
-                left:  ts_col(),
-                op:    Operator::Lt,
+                left: ts_col(),
+                op: Operator::Lt,
                 right: ts_lit(*start),
             });
             let at_or_above = Expr::BinaryExpr(BinaryExpr {
-                left:  ts_col(),
-                op:    Operator::GtEq,
+                left: ts_col(),
+                op: Operator::GtEq,
                 right: ts_lit(*end),
             });
             delta_filters.push(Expr::BinaryExpr(BinaryExpr {
-                left:  Box::new(below),
-                op:    Operator::Or,
+                left: Box::new(below),
+                op: Operator::Or,
                 right: Box::new(at_or_above),
             }));
         }
@@ -6405,11 +6405,11 @@ mod writer_properties_tests {
 
     fn field(name: &str, dt: &str) -> FieldDef {
         FieldDef {
-            name:         name.into(),
-            data_type:    dt.into(),
-            nullable:     true,
-            tantivy:      None,
-            dictionary:   None,
+            name: name.into(),
+            data_type: dt.into(),
+            nullable: true,
+            tantivy: None,
+            dictionary: None,
             bloom_filter: false,
         }
     }
@@ -6421,8 +6421,8 @@ mod writer_properties_tests {
             sorting_columns: sort
                 .into_iter()
                 .map(|n| SortingColumnDef {
-                    name:        n.into(),
-                    descending:  false,
+                    name: n.into(),
+                    descending: false,
                     nulls_first: false,
                 })
                 .collect(),
@@ -7586,14 +7586,14 @@ mod tests {
             db.storage_configs.write().await.insert(
                 (pb.clone(), table.clone()),
                 StorageConfig {
-                    project_id:           pb.clone(),
-                    table_name:           table.clone(),
-                    s3_bucket:            "timefusion-tests".to_string(),
-                    s3_prefix:            format!("custom-{prefix}"),
-                    s3_region:            "us-east-1".to_string(),
-                    s3_access_key_id:     "minioadmin".to_string(),
+                    project_id: pb.clone(),
+                    table_name: table.clone(),
+                    s3_bucket: "timefusion-tests".to_string(),
+                    s3_prefix: format!("custom-{prefix}"),
+                    s3_region: "us-east-1".to_string(),
+                    s3_access_key_id: "minioadmin".to_string(),
                     s3_secret_access_key: "minioadmin".to_string(),
-                    s3_endpoint:          Some("http://127.0.0.1:9000".to_string()),
+                    s3_endpoint: Some("http://127.0.0.1:9000".to_string()),
                 },
             );
 

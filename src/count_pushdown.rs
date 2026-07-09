@@ -116,8 +116,8 @@ fn split_conjunction(e: &Expr, out: &mut Vec<Expr>) {
 struct CountQuery {
     table_name: String,
     project_id: String,
-    lo:         i64,
-    hi:         i64,
+    lo: i64,
+    hi: i64,
 }
 
 /// Match the COUNT(*) shape and extract the (table, project, window).
@@ -224,8 +224,8 @@ fn match_count_plan(plan: &LogicalPlan) -> Option<CountQuery> {
     Some(CountQuery {
         table_name: scan.table_name.table().to_string(),
         project_id: project_id?,
-        lo:         lo?,
-        hi:         hi?,
+        lo: lo?,
+        hi: hi?,
     })
 }
 

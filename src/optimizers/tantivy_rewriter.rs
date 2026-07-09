@@ -177,7 +177,7 @@ fn match_indexed_in_list(expr: &Expr, indexed_columns: &HashMap<String, &'static
         .map(|e| match e {
             Expr::Literal(s, _) => extract_utf8_string(s).filter(|v| !v.is_empty() && v.chars().all(is_eq_term_safe)).map(Route::Ready),
             Expr::Placeholder(_) => Some(Route::Deferred {
-                rhs:  e.clone(),
+                rhs: e.clone(),
                 kind: "eq".to_string(),
             }),
             _ => None,
@@ -235,7 +235,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
                 Expr::Placeholder(_) => Some((
                     name,
                     Route::Deferred {
-                        rhs:  rhs.clone(),
+                        rhs: rhs.clone(),
                         kind: "eq".to_string(),
                     },
                 )),
@@ -277,7 +277,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
                 Expr::Placeholder(_) if escape_char.is_none() => Some((
                     c_name(c),
                     Route::Deferred {
-                        rhs:  r.as_ref().clone(),
+                        rhs: r.as_ref().clone(),
                         kind: format!("{}:{tok}", if *case_insensitive { "ilike" } else { "like" }),
                     },
                 )),
@@ -569,10 +569,10 @@ mod tests {
         // miss case variants; skip the rewrite.
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), RAW_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated:          false,
-            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern:          Box::new(lit("foo")),
-            escape_char:      None,
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("foo")),
+            escape_char: None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols, true), None);
@@ -582,10 +582,10 @@ mod tests {
     fn match_ilike_substring_works_on_ngram3() {
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated:          false,
-            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern:          Box::new(lit("%foo%")),
-            escape_char:      None,
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("%foo%")),
+            escape_char: None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols, true), Some(("c".into(), Route::Ready("foo".into()))));

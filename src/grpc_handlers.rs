@@ -39,7 +39,7 @@ use pb::{
 };
 
 pub struct IngestService {
-    db:    Arc<Database>,
+    db: Arc<Database>,
     token: Option<String>,
 }
 
