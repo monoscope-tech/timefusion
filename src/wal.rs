@@ -77,30 +77,43 @@ fn snap_to_pos((block_id, offset): SnapPos) -> WalPosition {
 /// `clean_shutdown` flag alone won't catch out-of-band commits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorSnapshot {
-    pub version:           u32,
+    pub version: u32,
     /// Wall-clock micros (`clock::now_micros`) at write time. Informational
     /// only — surfaced in the boot log so operators can spot a stale
     /// snapshot, but not enforced as a max-age gate.
     pub written_at_micros: i64,
-    pub shards_per_topic:  usize,
+    pub shards_per_topic: usize,
     /// True only when written by the graceful-shutdown path. Boot uses this
     /// flag to decide whether the Delta verifier can be skipped entirely.
     /// NOT a drain claim — shutdown writes it even after a partial/timed-out
     /// flush (the WAL holds the remainder); see `drained` for that.
-    pub clean_shutdown:    bool,
+    pub clean_shutdown: bool,
     /// True only when the shutdown flush left NOTHING un-flushed (no
     /// MemBuffer buckets, no airborne or orphaned holds). Sole authorizer of
     /// the pure-mtime boot WAL GC — with un-flushed data the old files may
     /// BE the backlog. `#[serde(default)]`: snapshots from older builds parse
     /// as drained=false, which just skips the boot sweep (safe direction).
     #[serde(default)]
-    pub drained:           bool,
+    pub drained: bool,
     /// `"project_id:table_name"` → per-shard cursor (None = never written).
-    pub entries:           std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
+    pub entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
 }
 
 /// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
-const MAX_BATCH_SIZE: usize = 100 * 1024 * 1024;
+/// Hard cap on a single WAL entry's batch payload (1GiB) — the replay
+/// acceptance bound, guarding against unbounded allocation from a corrupted
+/// entry, and the limit for unsplittable payloads (UPDATE...FROM sources,
+/// single oversized rows). Ceiling is walrus's `MAX_ALLOC` (1GiB/block,
+/// vendor/walrus-rust config.rs): entries can't physically exceed it, so
+/// don't raise this without touching the vendored WAL engine.
+const MAX_BATCH_SIZE: usize = 1024 * 1024 * 1024;
+/// Append-side split target for INSERT batches — purely a replay-memory and
+/// blast-radius knob, invisible to clients and to Delta (flush re-coalesces
+/// per table into one commit regardless of WAL chunking). Each WAL entry is
+/// read + Arrow-decoded whole during recovery inside the buffer budget, and a
+/// corrupted entry quarantines whole — so keep the unit small even though
+/// acceptance goes up to `MAX_BATCH_SIZE`.
+const WAL_SPLIT_TARGET: usize = 100 * 1024 * 1024;
 /// Fsync schedule interval in milliseconds - balances durability with performance
 const FSYNC_SCHEDULE_MS: u64 = 200;
 
@@ -132,11 +145,11 @@ impl TryFrom<u8> for WalOperation {
 #[derive(Debug, Encode, Decode)]
 pub struct WalEntry {
     pub timestamp_micros: i64,
-    pub project_id:       String,
-    pub table_name:       String,
-    pub operation:        WalOperation,
+    pub project_id: String,
+    pub table_name: String,
+    pub operation: WalOperation,
     #[bincode(with_serde)]
-    pub data:             Vec<u8>,
+    pub data: Vec<u8>,
 }
 
 impl WalEntry {
@@ -159,7 +172,7 @@ pub struct DeletePayload {
 #[derive(Debug, Encode, Decode)]
 pub struct UpdatePayload {
     pub predicate_sql: Option<String>,
-    pub assignments:   Vec<(String, String)>,
+    pub assignments: Vec<(String, String)>,
 }
 
 /// `UPDATE ... FROM` source side, persisted alongside the predicate +
@@ -176,8 +189,8 @@ pub struct SerializedSource {
 #[derive(Debug, Encode, Decode)]
 pub struct UpdateWithSourcePayload {
     pub predicate_sql: Option<String>,
-    pub assignments:   Vec<(String, String)>,
-    pub source:        SerializedSource,
+    pub assignments: Vec<(String, String)>,
+    pub source: SerializedSource,
 }
 
 /// Number of walrus shards per logical (project_id, table_name) topic.
@@ -199,15 +212,15 @@ const WAL_SHARDS_PER_TOPIC_DEFAULT: usize = 4;
 const WAL_APPEND_LOCK_STRIPES: usize = 256;
 
 pub struct WalManager {
-    wal:              Walrus,
-    data_dir:         PathBuf,
+    wal: Walrus,
+    data_dir: PathBuf,
     /// Logical topic strings ("{project_id}:{table_name}") — one entry per
     /// (project, table). Each maps to `shards_per_topic` walrus collections.
-    known_topics:     DashSet<String>,
+    known_topics: DashSet<String>,
     /// Per-topic round-robin counter chooses which shard the next batch is
     /// appended to. Topic-scoped (rather than global) so we don't penalize
     /// the cold-cache miss for an idle topic.
-    shard_counter:    dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
+    shard_counter: dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
     shards_per_topic: usize,
     /// Per-collection append serialization. Walrus rejects *concurrent* appends
     /// to one collection with "another batch write already in progress".
@@ -216,11 +229,11 @@ pub struct WalManager {
     /// a shard. These striped locks make colliders QUEUE (briefly — an append is
     /// an in-memory write; fsync is decoupled) instead of erroring the insert,
     /// which would dead-letter the row. Striped by `walrus_key` hash.
-    append_locks:     Vec<std::sync::Mutex<()>>,
+    append_locks: Vec<std::sync::Mutex<()>>,
     /// Fsync the shard before returning from single-entry (DML) appends —
     /// see `BufferConfig::timefusion_wal_ack_fsync`. Batched INSERT appends
     /// are always flushed before return by walrus's `batch_write`.
-    ack_fsync:        bool,
+    ack_fsync: bool,
 }
 
 impl WalManager {
@@ -304,7 +317,7 @@ impl WalManager {
         match std::fs::read_to_string(&stamp_path) {
             Ok(s) => {
                 let on_disk: u8 = s.trim().parse().map_err(|_| WalError::UnsupportedVersion {
-                    version:  0,
+                    version: 0,
                     expected: WAL_VERSION,
                 })?;
                 if on_disk != WAL_VERSION {
@@ -314,7 +327,7 @@ impl WalManager {
                         on_disk, WAL_VERSION, data_dir
                     );
                     return Err(WalError::UnsupportedVersion {
-                        version:  on_disk,
+                        version: on_disk,
                         expected: WAL_VERSION,
                     });
                 }
@@ -327,7 +340,7 @@ impl WalManager {
                     data_dir, WAL_VERSION
                 );
                 Err(WalError::UnsupportedVersion {
-                    version:  0,
+                    version: 0,
                     expected: WAL_VERSION,
                 })
             }
@@ -450,14 +463,7 @@ impl WalManager {
     /// Returns the shard the entry was appended to.
     #[instrument(skip(self, batch), fields(project_id, table_name, rows))]
     pub fn append(&self, project_id: &str, table_name: &str, batch: &RecordBatch) -> Result<usize, WalError> {
-        let topic = Self::make_topic(project_id, table_name);
-        let shard = self.pick_shard(&topic);
-        let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
-        let entry = WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?);
-        self.locked_append(&walrus_key, &entry, |_| {})?;
-        self.persist_topic(&topic);
-        debug!("WAL append INSERT: topic={}, shard={}, rows={}", topic, shard, batch.num_rows());
-        Ok(shard)
+        self.append_batch(project_id, table_name, std::slice::from_ref(batch), |_, _| {}).map(|(shard, _)| shard)
     }
 
     /// Returns `(shard, pre_append_position)` — every batch becomes one walrus
@@ -477,10 +483,12 @@ impl WalManager {
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
-        let payloads: Vec<Vec<u8>> = batches
-            .iter()
-            .map(|batch| serialize_wal_entry(&WalEntry::new(project_id, table_name, WalOperation::Insert, serialize_record_batch(batch)?)))
-            .collect::<Result<_, _>>()?;
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(batches.len());
+        for batch in batches {
+            for data in split_to_wal_payloads(batch, WAL_SPLIT_TARGET, MAX_BATCH_SIZE)? {
+                payloads.push(serialize_wal_entry(&WalEntry::new(project_id, table_name, WalOperation::Insert, data))?);
+            }
+        }
 
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         let pre_pos;
@@ -529,7 +537,7 @@ impl WalManager {
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let payload = UpdatePayload {
             predicate_sql: predicate_sql.map(String::from),
-            assignments:   assignments.to_vec(),
+            assignments: assignments.to_vec(),
         };
         let entry = WalEntry::new(project_id, table_name, WalOperation::Update, bincode::encode_to_vec(&payload, BINCODE_CONFIG)?);
         self.locked_append(&walrus_key, &entry, |pre| on_pre_append(shard, pre))?;
@@ -553,13 +561,24 @@ impl WalManager {
         &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], source: &SerializedSource,
         on_pre_append: impl FnOnce(usize, Option<WalPosition>),
     ) -> Result<usize, WalError> {
+        // The replay-side deserializer rejects over-cap source batches, so an
+        // acked oversized entry would be silently dropped at the next boot —
+        // fail the append instead so the client sees the error. (INSERTs are
+        // split transparently; a JOIN source can't be split without changing
+        // update semantics for non-unique keys.)
+        if source.batch_ipc.len() > MAX_BATCH_SIZE {
+            return Err(WalError::BatchTooLarge {
+                size: source.batch_ipc.len(),
+                max: MAX_BATCH_SIZE,
+            });
+        }
         let topic = Self::make_topic(project_id, table_name);
         let shard = self.pick_shard(&topic);
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let payload = UpdateWithSourcePayload {
             predicate_sql: predicate_sql.map(String::from),
-            assignments:   assignments.to_vec(),
-            source:        source.clone(),
+            assignments: assignments.to_vec(),
+            source: source.clone(),
         };
         let entry = WalEntry::new(
             project_id,
@@ -653,14 +672,14 @@ impl WalManager {
     /// parks the cursor back afterwards via `set_positions_allow_rewind`.
     pub fn replay_iter(&self) -> Result<WalReplayIter<'_>, WalError> {
         Ok(WalReplayIter {
-            wal:        self,
-            topics:     self.list_topics()?,
-            topic_idx:  0,
-            heap:       std::collections::BinaryHeap::new(),
+            wal: self,
+            topics: self.list_topics()?,
+            topic_idx: 0,
+            heap: std::collections::BinaryHeap::new(),
             shard_keys: Vec::new(),
-            pending:    Vec::new(),
-            total:      0,
-            errors:     0,
+            pending: Vec::new(),
+            total: 0,
+            errors: 0,
         })
     }
 
@@ -1077,11 +1096,116 @@ pub(crate) fn serialize_record_batch(batch: &RecordBatch) -> Result<Vec<u8>, Wal
     Ok(buf)
 }
 
+/// Serialize `batch` into one or more independently-replayable IPC payloads:
+/// each within `target` bytes where row-boundary splitting allows, never over
+/// `hard_max` (the replay acceptance bound — appending past it would ack a
+/// write the next boot silently drops; 2026-07-08: a 121MB INSERT quarantined
+/// as `insert_corrupt`). Splits linearly: one serialize sizes the batch, the
+/// chunk count is derived from it, and each row-chunk is compacted (so sliced
+/// view/offset buffers are privatized and the IPC size actually shrinks) and
+/// serialized exactly once — the parent's IPC bytes are dropped before the
+/// chunks serialize, keeping the transient footprint (which the insert path's
+/// reservation does NOT cover) near ~2x the batch's IPC size. A single row
+/// over `target` passes through whole (inserts are row-independent, so every
+/// chunk is a complete self-contained IPC stream); a single row over
+/// `hard_max` can't be stored — explicit error, surfaced at append time.
+fn split_to_wal_payloads(batch: &RecordBatch, target: usize, hard_max: usize) -> Result<Vec<Vec<u8>>, WalError> {
+    let data = serialize_record_batch(batch)?;
+    if data.len() <= target {
+        return Ok(vec![data]);
+    }
+    if batch.num_rows() <= 1 {
+        return if data.len() <= hard_max {
+            Ok(vec![data])
+        } else {
+            Err(WalError::BatchTooLarge {
+                size: data.len(),
+                max: hard_max,
+            })
+        };
+    }
+    // Row-slicing can't shrink dictionary columns (every IPC stream carries
+    // the full dictionary, and compact_batch has no Dictionary arm), so
+    // flatten them to their value types first — otherwise the split
+    // degenerates toward one near-full-size entry per row. Flattening
+    // replicates values per row, so re-measure: the chunk math and the
+    // shrink-bail below must use the size that will actually be sliced.
+    let (batch, parent_len) = match flatten_dictionary_columns(batch)? {
+        Some(flat) => {
+            let len = serialize_record_batch(&flat)?.len();
+            (flat, len)
+        }
+        None => (batch.clone(), data.len()),
+    };
+    drop(data);
+    // +1 chunk of headroom absorbs row-size skew without a second pass.
+    let chunks = parent_len.div_ceil(target) + 1;
+    let rows_per = batch.num_rows().div_ceil(chunks).max(1);
+    let mut out = Vec::with_capacity(chunks);
+    let mut start = 0;
+    while start < batch.num_rows() {
+        let len = rows_per.min(batch.num_rows() - start);
+        let chunk = crate::mem_buffer::compact_batch(batch.slice(start, len));
+        let chunk_data = serialize_record_batch(&chunk)?;
+        if chunk_data.len() <= target || len <= 1 {
+            if chunk_data.len() > hard_max {
+                return Err(WalError::BatchTooLarge {
+                    size: chunk_data.len(),
+                    max: hard_max,
+                });
+            }
+            out.push(chunk_data);
+        } else if chunk_data.len().saturating_mul(3) >= parent_len.saturating_mul(2) {
+            // The chunk barely shrank despite holding a fraction of the rows:
+            // some payload is shared across rows and row-slicing can't divide
+            // it. Bail explicitly rather than recurse toward a per-row
+            // explosion of near-full-size entries.
+            return Err(WalError::BatchTooLarge {
+                size: chunk_data.len(),
+                max: target,
+            });
+        } else {
+            // Skewed rows left this chunk over target — re-split just it.
+            drop(chunk_data);
+            out.extend(split_to_wal_payloads(&chunk, target, hard_max)?);
+        }
+        start += len;
+    }
+    Ok(out)
+}
+
+/// Cast top-level dictionary columns to their value types (`None` when the
+/// batch has no dictionary columns). Dictionary batches reach the WAL only
+/// via gRPC ingest (client-supplied Arrow IPC is forwarded with no schema
+/// coercion), and their shared dictionary defeats row-boundary splitting —
+/// see `split_to_wal_payloads`.
+fn flatten_dictionary_columns(batch: &RecordBatch) -> Result<Option<RecordBatch>, WalError> {
+    use arrow::datatypes::{DataType, Field};
+    if !batch.schema().fields().iter().any(|f| matches!(f.data_type(), DataType::Dictionary(_, _))) {
+        return Ok(None);
+    }
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut cols = Vec::with_capacity(batch.num_columns());
+    for (f, c) in batch.schema().fields().iter().zip(batch.columns()) {
+        match f.data_type() {
+            DataType::Dictionary(_, value_type) => {
+                cols.push(arrow::compute::cast(c, value_type)?);
+                fields.push(Field::new(f.name(), (**value_type).clone(), f.is_nullable()));
+            }
+            _ => {
+                cols.push(c.clone());
+                fields.push((**f).clone());
+            }
+        }
+    }
+    Ok(Some(RecordBatch::try_new(std::sync::Arc::new(arrow::datatypes::Schema::new(fields)), cols)?))
+}
+
 pub(crate) fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalError> {
     if data.len() > MAX_BATCH_SIZE {
         return Err(WalError::BatchTooLarge {
             size: data.len(),
-            max:  MAX_BATCH_SIZE,
+            max: MAX_BATCH_SIZE,
         });
     }
     let mut reader = StreamReader::try_new(std::io::Cursor::new(data), None)?;
@@ -1106,13 +1230,13 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
 
     if data[0..4] != WAL_MAGIC {
         return Err(WalError::UnsupportedVersion {
-            version:  data[0],
+            version: data[0],
             expected: WAL_VERSION,
         });
     }
     if data.len() < 6 || data[4] != WAL_VERSION {
         return Err(WalError::UnsupportedVersion {
-            version:  data[4],
+            version: data[4],
             expected: WAL_VERSION,
         });
     }
@@ -1134,14 +1258,14 @@ pub fn decode_payload<T: Decode<()>>(data: &[u8]) -> Result<T, WalError> {
 /// most one in-flight entry per shard is alive at a time → replay memory is
 /// O(shards_per_topic), not O(total entries).
 pub struct WalReplayIter<'a> {
-    wal:        &'a WalManager,
-    topics:     Vec<String>,
-    topic_idx:  usize,
-    heap:       std::collections::BinaryHeap<std::cmp::Reverse<(i64, usize)>>,
+    wal: &'a WalManager,
+    topics: Vec<String>,
+    topic_idx: usize,
+    heap: std::collections::BinaryHeap<std::cmp::Reverse<(i64, usize)>>,
     shard_keys: Vec<String>,
-    pending:    Vec<Option<WalEntry>>,
+    pending: Vec<Option<WalEntry>>,
     /// Entries yielded so far.
-    pub total:  u64,
+    pub total: u64,
     /// Corrupt/unreadable entries skipped so far.
     pub errors: usize,
 }
@@ -1432,10 +1556,10 @@ mod tests {
     fn test_wal_entry_serialization() {
         let entry = WalEntry {
             timestamp_micros: 1234567890,
-            project_id:       "project-123".to_string(),
-            table_name:       "test_table".to_string(),
-            operation:        WalOperation::Insert,
-            data:             vec![1, 2, 3, 4, 5],
+            project_id: "project-123".to_string(),
+            table_name: "test_table".to_string(),
+            operation: WalOperation::Insert,
+            data: vec![1, 2, 3, 4, 5],
         };
         let serialized = serialize_wal_entry(&entry).unwrap();
         let deserialized = deserialize_wal_entry(&serialized).unwrap();
@@ -1459,6 +1583,131 @@ mod tests {
         let serialized_none = bincode::encode_to_vec(&payload_none, BINCODE_CONFIG).unwrap();
         let deserialized_none = decode_payload::<DeletePayload>(&serialized_none).unwrap();
         assert_eq!(payload_none.predicate_sql, deserialized_none.predicate_sql);
+    }
+
+    /// 2026-07-08 prod incident: a 121MB acked INSERT sat in the WAL until the
+    /// next boot, where replay's `deserialize_record_batch` size cap rejected
+    /// it → quarantined → the acked write silently dropped. The cap must be
+    /// enforced at APPEND time (by splitting), so every acked entry is
+    /// replayable by construction.
+    #[serial_test::serial]
+    #[test]
+    fn oversized_insert_append_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(dir.path());
+        let table = format!("big_{}", uuid::Uuid::new_v4().simple());
+        let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 2).unwrap();
+
+        // ~112MB of string payload (35k rows × 3.2KB) — over WAL_SPLIT_TARGET,
+        // mirroring the prod 121MB / 39k-row entry.
+        let n_rows = 35_000;
+        let strs: Vec<String> = (0..n_rows).map(|i| format!("{i:0>3200}")).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)])),
+            vec![Arc::new(arrow::array::StringArray::from(strs.iter().map(|s| s.as_str()).collect::<Vec<_>>()))],
+        )
+        .unwrap();
+
+        wal.append_batch("proj", &table, std::slice::from_ref(&batch), |_, _| {}).unwrap();
+
+        let (entries, errors) = wal.read_entries_raw("proj", &table, None, true).unwrap();
+        assert_eq!(errors, 0);
+        let mut rows = 0usize;
+        for e in &entries {
+            let b = deserialize_record_batch(&e.data).expect("every acked WAL entry must be replayable (within the size cap)");
+            rows += b.num_rows();
+        }
+        assert_eq!(rows, n_rows, "no acked rows may be lost across the WAL round-trip");
+        assert!(entries.len() > 1, "an over-cap batch must have been split into multiple entries");
+    }
+
+    /// The splitter's contract at small scale: multi-row batches split to
+    /// payloads within `target`, rows preserved in order; a single row over
+    /// `target` but under `hard_max` passes through whole (unsplittable but
+    /// replayable); a single row over `hard_max` is an explicit error.
+    #[test]
+    fn split_to_wal_payloads_bounds_every_entry() {
+        use arrow::array::Array;
+        let make = |strs: Vec<String>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("body", DataType::Utf8, false)])),
+                vec![Arc::new(arrow::array::StringArray::from(strs.iter().map(|s| s.as_str()).collect::<Vec<_>>()))],
+            )
+            .unwrap()
+        };
+        let (target, hard_max) = (8 * 1024, 32 * 1024);
+        let batch = make((0..100).map(|i| format!("{i:0>200}")).collect());
+        let payloads = split_to_wal_payloads(&batch, target, hard_max).unwrap();
+        assert!(payloads.len() > 1);
+        let mut rows: Vec<String> = Vec::new();
+        for p in &payloads {
+            assert!(p.len() <= target, "payload {} bytes exceeds target {target}", p.len());
+            let b = deserialize_record_batch(p).unwrap();
+            let col = b.column(0).as_any().downcast_ref::<arrow::array::StringArray>().unwrap();
+            rows.extend((0..col.len()).map(|i| col.value(i).to_string()));
+        }
+        assert_eq!(rows, (0..100).map(|i| format!("{i:0>200}")).collect::<Vec<_>>(), "rows preserved in order");
+
+        let fat_row = make(vec!["x".repeat(16 * 1024)]);
+        let whole = split_to_wal_payloads(&fat_row, target, hard_max).unwrap();
+        assert_eq!(whole.len(), 1, "a single row between target and hard cap must pass through whole");
+        assert_eq!(deserialize_record_batch(&whole[0]).unwrap().num_rows(), 1);
+
+        let too_fat_row = make(vec!["x".repeat(64 * 1024)]);
+        assert!(
+            matches!(split_to_wal_payloads(&too_fat_row, target, hard_max), Err(WalError::BatchTooLarge { .. })),
+            "a single row over the hard cap must fail the append explicitly, not ack-then-drop"
+        );
+    }
+
+    /// Dictionary-encoded columns (reachable via gRPC ingest, which forwards
+    /// client Arrow IPC verbatim) defeat row-boundary splitting: every IPC
+    /// stream carries the full dictionary, so halving rows doesn't halve
+    /// bytes and the pre-fix splitter degenerated to one near-full-size
+    /// entry per row (a 39k-row batch with a 150MB dictionary → multi-TB
+    /// append attempt). The splitter must flatten dictionaries first and
+    /// still bound every payload.
+    #[test]
+    fn split_to_wal_payloads_flattens_dictionary_columns() {
+        use arrow::array::{Array, DictionaryArray, Int32Array, StringArray};
+        let values = StringArray::from((0..200).map(|i| format!("{i:0>2048}")).collect::<Vec<_>>());
+        let keys = Int32Array::from((0..1000).map(|i| i % 200).collect::<Vec<i32>>());
+        let dict = DictionaryArray::<arrow::datatypes::Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("body", dict.data_type().clone(), false)])),
+            vec![Arc::new(dict)],
+        )
+        .unwrap();
+
+        let (target, hard_max) = (64 * 1024, 1024 * 1024);
+        let payloads = split_to_wal_payloads(&batch, target, hard_max).expect("dictionary batch must split, not explode or bail");
+        assert!(payloads.len() > 1);
+        // Way fewer entries than rows — the pre-fix splitter emitted ~1 per row.
+        assert!(payloads.len() < 100, "split degenerated toward per-row entries: {} payloads", payloads.len());
+        let mut rows = 0usize;
+        for p in &payloads {
+            assert!(p.len() <= target, "payload {} bytes exceeds target {target}", p.len());
+            let b = deserialize_record_batch(p).unwrap();
+            rows += b.num_rows();
+        }
+        assert_eq!(rows, 1000, "no rows lost across the dictionary split");
+    }
+
+    /// UPDATE...FROM sources can't be split without changing join semantics —
+    /// an over-cap source must fail the append (client-visible) instead of
+    /// acking an entry the next boot's replay will reject.
+    #[serial_test::serial]
+    #[test]
+    fn append_update_with_source_rejects_oversized_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(dir.path());
+        let wal = WalManager::with_fsync_mode_and_shards(dir.path().to_path_buf(), crate::config::WalFsyncMode::None, 2).unwrap();
+        let source = SerializedSource {
+            join_keys: vec![("id".to_string(), "id".to_string())],
+            batch_ipc: vec![0u8; MAX_BATCH_SIZE + 1],
+        };
+        let res = wal.append_update_with_source("proj", "tbl", None, &[], &source, |_, _| {});
+        assert!(matches!(res, Err(WalError::BatchTooLarge { .. })));
     }
 
     /// Stability anchor: `walrus_topic_key` must produce the same bytes across
@@ -1874,7 +2123,7 @@ mod tests {
     fn test_update_payload_serialization() {
         let payload = UpdatePayload {
             predicate_sql: Some("id = 1".to_string()),
-            assignments:   vec![("name".to_string(), "'updated'".to_string())],
+            assignments: vec![("name".to_string(), "'updated'".to_string())],
         };
         let serialized = bincode::encode_to_vec(&payload, BINCODE_CONFIG).unwrap();
         let deserialized = decode_payload::<UpdatePayload>(&serialized).unwrap();

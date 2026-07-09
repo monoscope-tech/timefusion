@@ -168,7 +168,7 @@ pub type TableKey = (Arc<str>, Arc<str>);
 pub struct MemBuffer {
     /// Flattened structure: (project_id, table_name) → TableBuffer
     /// Reduces 3 hash lookups to 1 for table access.
-    tables:               DashMap<TableKey, Arc<TableBuffer>>,
+    tables: DashMap<TableKey, Arc<TableBuffer>>,
     /// Running approximation of in-memory bytes across all live buckets.
     /// Reported via `timefusion_stats` as `mem_buffer.estimated_bytes_approx`.
     ///
@@ -198,21 +198,21 @@ pub struct MemBuffer {
     /// decisions where a false-high reading would cause incorrect
     /// throttling. The `pressure_pct` reported on `buffered_layer` is
     /// what the flush task and the memory-reservation CAS actually use.
-    estimated_bytes:      AtomicUsize,
+    estimated_bytes: AtomicUsize,
     /// Mirrors `WalManager::shards_per_topic` so `FlushableBucket.wal_first_positions`
     /// is always sized correctly when snapshotted at seal time.
-    shards_per_topic:     usize,
+    shards_per_topic: usize,
     /// LRU cache of per-bucket tantivy indexes. Lives at the MemBuffer
     /// level (not on individual TimeBuckets) so the LRU has a global view
     /// for byte-budget eviction. Entries are dropped:
     /// - when `text_index_max_bytes` is exceeded (LRU-evict tail)
     /// - when the bucket receives an insert (cache_invalidate by key)
     /// - when the bucket drains/evicts (cache_invalidate by key)
-    text_index_cache:     parking_lot::Mutex<lru::LruCache<BucketCacheKey, Arc<crate::tantivy_index::mem_index::BucketTextIndex>>>,
+    text_index_cache: parking_lot::Mutex<lru::LruCache<BucketCacheKey, Arc<crate::tantivy_index::mem_index::BucketTextIndex>>>,
     /// Sum of `size_bytes` across cached entries. Kept in an atomic so the
     /// hot insert path can do a single load to check "over budget?" without
     /// taking the LRU mutex.
-    text_index_bytes:     AtomicUsize,
+    text_index_bytes: AtomicUsize,
     /// Soft budget for cached text indexes (bytes). When exceeded, LRU
     /// evictions drop oldest cached buckets until under. Auto-tuned from
     /// `buffer_max_memory_mb` at MemBuffer construction.
@@ -227,15 +227,20 @@ pub struct MemBuffer {
     /// TableBuffer/TimeBucket — so the mark survives empty-bucket reclaim in
     /// `take_bucket_for_flush` and bucket/table re-creation by later inserts.
     /// Pruned on drain and eviction.
-    force_flushed:        DashMap<TableKey, std::collections::HashSet<i64>>,
+    force_flushed: DashMap<TableKey, std::collections::HashSet<i64>>,
     /// GC-floor pins of buckets mid-take: `take_bucket_for_flush` removes a
     /// bucket (and its `first_wal_pin_micros`) from the tables map before the
     /// flush path registers its inflight pin; a GC sweep sampling the floor
     /// in that gap would miss the airborne bucket and could delete its
     /// backing WAL file. The pin parks here from before the removal until
     /// [`Self::release_taking_pin`]. Keyed by `taking_seq`.
-    taking_pins:          DashMap<u64, i64>,
-    taking_seq:           AtomicU64,
+    taking_pins: DashMap<u64, i64>,
+    taking_seq: AtomicU64,
+    /// WAL-replay DML entries consumed as no-ops because their table had no
+    /// buffered rows (already flushed / drained mid-replay). Surfaced in
+    /// `timefusion_stats` — this replaced the quarantine file that used to be
+    /// this loss-class's on-disk canary, so growth here is the re-drive signal.
+    replay_dml_noops: AtomicU64,
 }
 
 /// Cache key: (project_id, table_name, bucket_id). All three are cheap to
@@ -244,48 +249,48 @@ pub struct MemBuffer {
 pub type BucketCacheKey = (Arc<str>, Arc<str>, i64);
 
 pub struct TableBuffer {
-    buckets:    DashMap<i64, TimeBucket>,
-    schema:     SchemaRef, // Immutable after creation - no lock needed
+    buckets: DashMap<i64, TimeBucket>,
+    schema: SchemaRef, // Immutable after creation - no lock needed
     project_id: Arc<str>,
     table_name: Arc<str>,
 }
 
 pub struct TimeBucket {
-    batches:              Mutex<Vec<RecordBatch>>,
-    row_count:            AtomicUsize,
-    memory_bytes:         AtomicUsize,
-    min_timestamp:        AtomicI64,
-    max_timestamp:        AtomicI64,
+    batches: Mutex<Vec<RecordBatch>>,
+    row_count: AtomicUsize,
+    memory_bytes: AtomicUsize,
+    min_timestamp: AtomicI64,
+    max_timestamp: AtomicI64,
     /// Wall-clock micros (via `crate::clock`) when this bucket was created.
     /// Drives the flush-dwell staleness signal — how long the bucket has
     /// waited to flush — independent of its rows' event-time range, so
     /// backfilled/late data can't false-trip the "oldest bucket" alarm.
-    created_micros:       i64,
+    created_micros: i64,
     /// Per-shard walrus positions captured BEFORE this bucket's first WAL
     /// entry on each shard (min-merged). These are the bucket's read-cursor
     /// *holds*: while the bucket is unflushed, the cursor must not advance
     /// past `first_positions[shard]`, or a crash would replay past this
     /// bucket's acked entries and lose them (prod 2026-07-03).
-    wal_shard_state:      Mutex<WalShardState>,
+    wal_shard_state: Mutex<WalShardState>,
     /// While a flush snapshot is airborne, the first N batches are the
     /// snapshot's prefix: insert-time coalesce must not fold across this
     /// boundary or the post-commit prefix drain would remove late
     /// (unflushed) rows merged into a combined batch. 0 = no snapshot in
     /// flight.
-    flush_pinned_prefix:  AtomicUsize,
+    flush_pinned_prefix: AtomicUsize,
     /// Bumped by every in-place DML mutation of this bucket's batches (under
     /// the batches lock). A flush snapshot captures it; if it changed by
     /// commit time, the commit landed pre-DML row values and the prefix
     /// indices may have shifted (DELETE drops emptied batches), so
     /// `finish_flushed_snapshot` must NOT drain — the bucket re-flushes
     /// whole next cycle with the post-DML values.
-    mutation_gen:         AtomicU64,
+    mutation_gen: AtomicU64,
     /// Wall-clock micros of the newest WAL entry pinned on this bucket
     /// (WalEntry timestamps are append-time, so this is ARRIVAL time).
     /// Drives [`MemBuffer::reap_expired_empty_buckets`]'s grace period —
     /// see its doc for the (pair-netting) soundness argument; replay itself
     /// no longer filters by age.
-    last_wal_pin_micros:  AtomicI64,
+    last_wal_pin_micros: AtomicI64,
     /// Real-clock micros of the OLDEST WAL append this bucket's un-flushed
     /// data may depend on — the WAL GC floor: no WAL file whose mtime is at
     /// or after `min(first_wal_pin)` across live buckets may be deleted.
@@ -312,26 +317,26 @@ struct WalShardState {
 
 #[derive(Debug, Clone)]
 pub struct FlushableBucket {
-    pub project_id:           String,
-    pub table_name:           String,
-    pub bucket_id:            i64,
-    pub batches:              Vec<RecordBatch>,
-    pub row_count:            usize,
+    pub project_id: String,
+    pub table_name: String,
+    pub bucket_id: i64,
+    pub batches: Vec<RecordBatch>,
+    pub row_count: usize,
     /// Per-shard positions BEFORE this bucket's first WAL entry — the bucket's
     /// read-cursor holds. Registered as in-flight holds while the flush is
     /// airborne; restored to the bucket if the Delta commit fails.
-    pub wal_first_positions:  Vec<Option<walrus_rust::WalPosition>>,
+    pub wal_first_positions: Vec<Option<walrus_rust::WalPosition>>,
     /// `mutation_gen` at snapshot time (snapshot-flush path only). If the
     /// bucket's gen moved by commit time, a DML mutated it mid-flight: the
     /// commit landed pre-DML values, so `finish_flushed_snapshot` must keep
     /// the rows and re-flush instead of draining.
-    pub snapshot_gen:         u64,
+    pub snapshot_gen: u64,
     /// Actual min/max timestamp of the taken rows, captured before the source
     /// bucket's atomics were reset. `restore_taken_bucket` replays these so a
     /// restored bucket keeps its true time range (and stays visible to
     /// time-range pruning) rather than collapsing to the bucket's start.
-    pub min_timestamp:        i64,
-    pub max_timestamp:        i64,
+    pub min_timestamp: i64,
+    pub max_timestamp: i64,
     /// Source bucket's `first_wal_pin_micros` (WAL GC floor) — carried so an
     /// airborne take/commit keeps flooring the GC, and a failed commit's
     /// restore re-applies it.
@@ -339,23 +344,26 @@ pub struct FlushableBucket {
     /// Key of this take's entry in `MemBuffer::taking_pins`; the flush path
     /// releases it via [`MemBuffer::release_taking_pin`] once its own
     /// inflight pin is registered.
-    pub taking_pin_seq:       u64,
+    pub taking_pin_seq: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct MemBufferStats {
-    pub project_count:          usize,
-    pub total_buckets:          usize,
-    pub total_rows:             usize,
-    pub total_batches:          usize,
+    pub project_count: usize,
+    pub total_buckets: usize,
+    pub total_rows: usize,
+    pub total_batches: usize,
     pub estimated_memory_bytes: usize,
+    /// See `MemBuffer::replay_dml_noops` — growth means buffered DML was
+    /// consumed without applying; check the warn logs + consider a re-drive.
+    pub replay_dml_noops: u64,
     /// Creation wall-clock micros of the oldest non-empty bucket that is
     /// already flushable (`bucket_id < current`), or None. Used to derive
     /// `mem_buffer_oldest_bucket_age_seconds` (`now - this`) — a flush-DWELL
     /// staleness signal (alert if > 2× flush interval). Deliberately NOT the
     /// rows' event-time min: backfilled/late data has a fresh creation time, so
     /// it can't false-trip the alarm while flush is healthy.
-    pub oldest_bucket_micros:   Option<i64>,
+    pub oldest_bucket_micros: Option<i64>,
 }
 
 /// Per-batch fixed overhead: RecordBatch struct, schema Arc bump, ArrayData
@@ -605,7 +613,7 @@ fn parse_sql_predicate(sql: &str, schema: &DFSchema, registry: Option<&FnRegistr
 }
 
 struct RegistryContextProvider<'a> {
-    registry:      Option<&'a FnRegistry>,
+    registry: Option<&'a FnRegistry>,
     expr_planners: Vec<Arc<dyn datafusion::logical_expr::planner::ExprPlanner>>,
 }
 
@@ -791,6 +799,7 @@ impl MemBuffer {
             force_flushed: DashMap::new(),
             taking_pins: DashMap::new(),
             taking_seq: AtomicU64::new(0),
+            replay_dml_noops: AtomicU64::new(0),
         }
     }
 
@@ -2205,6 +2214,9 @@ impl MemBuffer {
     /// Parses the SQL WHERE clause and delegates to delete().
     #[instrument(skip(self, registry), fields(project_id, table_name))]
     pub fn delete_by_sql(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, registry: Option<&FnRegistry>) -> DFResult<u64> {
+        if self.replay_dml_noop(project_id, table_name, "DELETE") {
+            return Ok(0);
+        }
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
         self.delete(project_id, table_name, predicate.as_ref(), None)
@@ -2221,6 +2233,9 @@ impl MemBuffer {
         &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], join_keys: &[(String, String)],
         source_batch: RecordBatch, registry: Option<&FnRegistry>,
     ) -> DFResult<u64> {
+        if self.replay_dml_noop(project_id, table_name, "UPDATE...FROM") {
+            return Ok(0);
+        }
         let target_df_schema = self.df_schema_for(project_id, table_name)?;
 
         // Build the widened DFSchema the assignment SQL was originally parsed
@@ -2240,8 +2255,8 @@ impl MemBuffer {
             .collect::<DFResult<Vec<_>>>()?;
 
         let source = crate::dml::UpdateSource {
-            schema:    source_batch.schema(),
-            batch:     source_batch,
+            schema: source_batch.schema(),
+            batch: source_batch,
             join_keys: join_keys.to_vec(),
         };
         self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source, None)
@@ -2253,6 +2268,9 @@ impl MemBuffer {
     pub fn update_by_sql(
         &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], registry: Option<&FnRegistry>,
     ) -> DFResult<u64> {
+        if self.replay_dml_noop(project_id, table_name, "UPDATE") {
+            return Ok(0);
+        }
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
         let parsed_assignments: Vec<(String, Expr)> = assignments
@@ -2260,6 +2278,23 @@ impl MemBuffer {
             .map(|(col, val_sql)| parse_sql_predicate(val_sql, &df_schema, registry).map(|expr| (col.clone(), expr)))
             .collect::<DFResult<Vec<_>>>()?;
         self.update(project_id, table_name, predicate.as_ref(), &parsed_assignments, None)
+    }
+
+    /// Replay-path guard: DML for a table with no buffered rows is a no-op —
+    /// its rows were already flushed (or drained mid-replay by the budget
+    /// relief), so the buffer has nothing to mutate. Parsing would otherwise
+    /// hit `DFSchema::empty()` and quarantine the entry with a bogus schema
+    /// error (2026-07-08: "No field named context___span_id"). The warn is the
+    /// operator signal that un-flushed enrichment for this window, if any,
+    /// needs a monoscope re-drive — the Delta leg of the original DML covered
+    /// only rows below the flush watermark at the time it ran.
+    fn replay_dml_noop(&self, project_id: &str, table_name: &str, op: &str) -> bool {
+        let untracked = self.get_table(project_id, table_name).is_none();
+        if untracked {
+            self.replay_dml_noops.fetch_add(1, Ordering::Relaxed);
+            warn!("{op} replay: no buffered table {project_id}.{table_name} — nothing to mutate, consuming as no-op");
+        }
+        untracked
     }
 
     /// DFSchema of the in-memory table, or `DFSchema::empty()` if it isn't
@@ -2301,6 +2336,7 @@ impl MemBuffer {
             total_buckets,
             total_rows,
             total_batches,
+            replay_dml_noops: self.replay_dml_noops.load(Ordering::Relaxed),
             // Authoritative — see `estimated_memory_bytes()` for why we don't
             // trust the `estimated_bytes` AtomicUsize cache.
             estimated_memory_bytes: self.estimated_memory_bytes(),
@@ -2462,16 +2498,16 @@ impl TableBuffer {
 impl TimeBucket {
     fn new() -> Self {
         Self {
-            batches:              Mutex::new(Vec::new()),
-            row_count:            AtomicUsize::new(0),
-            memory_bytes:         AtomicUsize::new(0),
-            min_timestamp:        AtomicI64::new(i64::MAX),
-            max_timestamp:        AtomicI64::new(i64::MIN),
-            created_micros:       crate::clock::now_micros(),
-            wal_shard_state:      Mutex::new(WalShardState::default()),
-            flush_pinned_prefix:  AtomicUsize::new(0),
-            mutation_gen:         AtomicU64::new(0),
-            last_wal_pin_micros:  AtomicI64::new(crate::clock::now_micros()),
+            batches: Mutex::new(Vec::new()),
+            row_count: AtomicUsize::new(0),
+            memory_bytes: AtomicUsize::new(0),
+            min_timestamp: AtomicI64::new(i64::MAX),
+            max_timestamp: AtomicI64::new(i64::MIN),
+            created_micros: crate::clock::now_micros(),
+            wal_shard_state: Mutex::new(WalShardState::default()),
+            flush_pinned_prefix: AtomicUsize::new(0),
+            mutation_gen: AtomicU64::new(0),
+            last_wal_pin_micros: AtomicI64::new(crate::clock::now_micros()),
             first_wal_pin_micros: AtomicI64::new(i64::MAX),
         }
     }
@@ -2936,7 +2972,7 @@ mod tests {
 
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query:  "auth".into(),
+            query: "auth".into(),
         }];
         let got = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).expect("search");
         let ids = got.expect("indexed table produces Some");
@@ -2954,7 +2990,7 @@ mod tests {
 
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query:  "test".into(),
+            query: "test".into(),
         }];
         let got = buffer.search_text_match("p1", "table1", &preds).expect("search");
         assert!(got.is_none(), "unindexed table should return None, got {:?}", got);
@@ -2971,7 +3007,7 @@ mod tests {
         buffer.insert("p1", "otel_logs_and_spans", batch1, ts).unwrap();
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query:  "beta".into(),
+            query: "beta".into(),
         }];
         let initial = buffer.search_text_match("p1", "otel_logs_and_spans", &preds).unwrap().unwrap();
         assert!(initial.is_empty(), "no 'beta' row inserted yet");
@@ -3002,7 +3038,7 @@ mod tests {
 
         let preds = vec![crate::tantivy_index::udf::TextMatchPred {
             column: "name".into(),
-            query:  "alpha".into(),
+            query: "alpha".into(),
         }];
         let node = crate::tantivy_index::udf::PredNode::from_preds(&preds);
         let parts = buffer.query_partitioned_with_text_match("p1", "otel_logs_and_spans", &[], node.as_ref()).unwrap();
@@ -3490,6 +3526,46 @@ mod tests {
         }
         assert_eq!(got.get(&1), Some(&vec!["h1".to_string(), "newtag".to_string()]), "matched row appends the tag");
         assert_eq!(got.get(&2), Some(&vec!["h2".to_string()]), "unmatched row unchanged");
+    }
+
+    /// WAL-replay regression (2026-07-08 prod quarantine): DML replayed for a
+    /// table with NO buffered rows — drained mid-replay by the budget relief
+    /// flush, or never re-inserted because its rows were already in Delta —
+    /// parsed the predicate against `DFSchema::empty()` and quarantined with
+    /// "Schema error: No field named context___span_id. Did you mean
+    /// 'source__span_id'?". Nothing buffered ⇒ nothing to mutate ⇒ no-op,
+    /// exactly like the live-path `update_with_source` on an untracked table.
+    #[test]
+    fn dml_by_sql_on_untracked_table_noops_instead_of_schema_error() {
+        let buffer = MemBuffer::new();
+        let src = id_source();
+        let assigns = [(
+            "hashes".to_string(),
+            "array_concat(CASE WHEN hashes IS NOT NULL THEN hashes ELSE [] END, [source__new_name])".to_string(),
+        )];
+        let keys = [("id".to_string(), "id".to_string())];
+        let n = buffer
+            .update_with_source_by_sql(
+                "p",
+                "t",
+                Some("context___span_id IS NOT NULL AND context___trace_id IS NOT NULL"),
+                &assigns,
+                &keys,
+                src.batch,
+                None,
+            )
+            .expect("UPDATE...FROM replay on an untracked table must no-op, not schema-error");
+        assert_eq!(n, 0);
+        assert_eq!(
+            buffer.update_by_sql("p", "t", Some("id > 0"), &[("name".to_string(), "'x'".to_string())], None).unwrap(),
+            0,
+            "plain UPDATE replay must no-op on an untracked table"
+        );
+        assert_eq!(
+            buffer.delete_by_sql("p", "t", Some("id > 0"), None).unwrap(),
+            0,
+            "DELETE replay must no-op on an untracked table"
+        );
     }
 
     fn test_table_df_schema() -> DFSchema {

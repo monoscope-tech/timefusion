@@ -34,10 +34,10 @@ use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, err
 pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 
 pub struct StatsTableProvider {
-    layer:        Option<Arc<BufferedWriteLayer>>,
+    layer: Option<Arc<BufferedWriteLayer>>,
     scan_metrics: Option<Arc<ScanMetrics>>,
-    cache_sizes:  Option<CacheSizeSnapshot>,
-    schema:       SchemaRef,
+    cache_sizes: Option<CacheSizeSnapshot>,
+    schema: SchemaRef,
 }
 
 impl std::fmt::Debug for StatsTableProvider {
@@ -83,6 +83,10 @@ impl StatsTableProvider {
             rows.push(("mem_buffer", "total_buckets".into(), s.mem_total_buckets.to_string()));
             rows.push(("mem_buffer", "total_rows".into(), s.mem_total_rows.to_string()));
             rows.push(("mem_buffer", "total_batches".into(), s.mem_total_batches.to_string()));
+            // Replay DML consumed without applying (table already flushed) —
+            // the quarantine dir no longer captures this loss class; monitor
+            // this like a quarantine count (growth ⇒ check logs + re-drive).
+            rows.push(("mem_buffer", "replay_dml_noops_total".into(), s.mem_replay_dml_noops.to_string()));
             // Suffix `_approx` because the in-bucket coalesce path overwrites
             // `memory_bytes` to the post-concat size, but the MemBuffer-level
             // running total only adds the pre-concat new_size at insert time
