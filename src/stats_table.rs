@@ -180,12 +180,6 @@ impl StatsTableProvider {
             rows.push(("plan_cache", "hits".into(), hits.to_string()));
             rows.push(("plan_cache", "misses".into(), misses.to_string()));
             rows.push(("plan_cache", "hit_pct".into(), format!("{:.1}", hit_pct)));
-            let (fp_hits, fp_fall) = pc.fast_path_counters();
-            let fp_total = fp_hits + fp_fall;
-            let fp_pct = if fp_total > 0 { fp_hits as f64 * 100.0 / fp_total as f64 } else { 0.0 };
-            rows.push(("plan_cache", "fast_path_hits".into(), fp_hits.to_string()));
-            rows.push(("plan_cache", "fast_path_fallthrough".into(), fp_fall.to_string()));
-            rows.push(("plan_cache", "fast_path_hit_pct".into(), format!("{:.1}", fp_pct)));
         }
 
         if let Some(m) = &self.scan_metrics {
