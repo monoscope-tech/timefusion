@@ -11,7 +11,7 @@ use std::{
 use io_uring;
 use rkyv::{AlignedVec, Deserialize};
 
-use super::{ReadConsistency, Walrus, allocator::BlockStateTracker, reader::ColReaderInfo};
+use super::{ReadConsistency, Walrus, allocator::BlockStateTracker, position::WalPosition, reader::ColReaderInfo};
 #[cfg(target_os = "linux")]
 use crate::wal::config::USE_FD_BACKEND;
 use crate::wal::{
@@ -20,7 +20,20 @@ use crate::wal::{
 };
 
 impl Walrus {
+    /// Read the next entry, discarding its position. Thin wrapper over
+    /// [`Self::read_next_with_position`] for callers that don't need the
+    /// entry's WAL position (the common case).
     pub fn read_next(&self, col_name: &str, checkpoint: bool) -> io::Result<Option<Entry>> {
+        Ok(self.read_next_with_position(col_name, checkpoint)?.map(|(entry, _)| entry))
+    }
+
+    /// Like [`Self::read_next`] but also returns the [`WalPosition`] of the
+    /// returned entry — the position *before* it was consumed, i.e. setting the
+    /// read cursor back to it via [`Self::set_persisted_read_position`] would
+    /// re-read exactly this entry. Used by WAL replay to pin buffered data at
+    /// its real WAL position so a crash mid-replay can resume rather than
+    /// re-read the whole log.
+    pub fn read_next_with_position(&self, col_name: &str, checkpoint: bool) -> io::Result<Option<(Entry, WalPosition)>> {
         const TAIL_FLAG: u64 = 1u64 << 63;
         let info_arc = if let Some(arc) = {
             let map = self.reader.data.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "reader map read lock poisoned"))?;
@@ -167,7 +180,8 @@ impl Walrus {
                             consumed,
                             new_off
                         );
-                        return Ok(Some(entry));
+                        // Position of THIS entry = the read head before advancing.
+                        return Ok(Some((entry, WalPosition { block_id: block.id, offset: off })));
                     }
                     Err(_) => {
                         debug_print!("[reader] read_next: read error col={}, block_id={}, offset={}", col_name, block.id, off);
@@ -293,7 +307,8 @@ impl Walrus {
                             consumed,
                             new_off
                         );
-                        return Ok(Some(entry));
+                        // Position of THIS entry = the tail read head before advancing.
+                        return Ok(Some((entry, WalPosition { block_id: active_block.id, offset: tail_off })));
                     }
                     Err(_) => {
                         debug_print!(
