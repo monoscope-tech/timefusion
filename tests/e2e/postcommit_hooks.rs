@@ -1,5 +1,5 @@
-//! Post-commit hook resilience (2026-07-09 incident). delta-rs runs checkpoint
-//! + expired-log cleanup in a post-commit hook AFTER `N.json` is durably
+//! Post-commit hook resilience (2026-07-09 incident). delta-rs runs checkpoint +
+//! expired-log cleanup in a post-commit hook AFTER `N.json` is durably
 //! written; an R2 500 there surfaced as a commit error that the flush path
 //! misread as "commit never landed" → it deleted the parquet the landed commit
 //! referenced (14 dangling Adds). These tests pin the four fixes:
