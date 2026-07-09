@@ -67,14 +67,16 @@ fn plan_str(plan: &LogicalPlan) -> String {
 }
 
 #[tokio::test]
-async fn rewriter_skips_exact_eq_on_indexed_column() -> Result<()> {
+async fn routes_exact_eq_on_raw_indexed_column() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
-    // Exact `=` is NOT accelerated via tantivy (bloom filters / stats handle
-    // it, and the tantivy id-prefilter breaks under OR — 2026-06-16). `level`
-    // is indexed (raw) yet `level = 'ERROR'` must produce no text_match.
+    // route_equality (config default ON — config.rs) accelerates exact `=` on a
+    // raw-tokenized indexed column via the tantivy id-prefilter (invariant #1;
+    // OR-safety handled by collect_text_match_tree's completeness gate). `level`
+    // is raw-indexed, so `level = 'ERROR'` gets an ADDITIVE text_match — the
+    // original `=` is retained as the post-filter backstop.
     let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level = 'ERROR'").await?;
     let s = plan_str(&plan);
-    assert!(!s.contains("text_match"), "expected NO text_match for exact = on indexed col, got:\n{}", s);
+    assert!(s.contains("text_match"), "expected additive text_match for exact = on a raw-indexed col, got:\n{}", s);
     Ok(())
 }
 
@@ -106,8 +108,10 @@ async fn rewriter_leaves_unsupported_like_patterns_alone() -> Result<()> {
 #[tokio::test]
 async fn rewriter_skips_non_indexed_columns() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
-    // `id` is NOT indexed in the prod schema (tantivy: null).
-    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND id = 'abc'").await?;
+    // `resource___service___name` has no tantivy config in the prod schema, so
+    // `=` on it must not route (invariant #3). (`id`/`status_code` are now
+    // raw-indexed, so they're no longer valid non-indexed examples.)
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND resource___service___name = 'abc'").await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match on non-indexed col, got:\n{}", s);
     Ok(())
