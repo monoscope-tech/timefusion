@@ -34,10 +34,10 @@ use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, err
 pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 
 pub struct StatsTableProvider {
-    layer: Option<Arc<BufferedWriteLayer>>,
+    layer:        Option<Arc<BufferedWriteLayer>>,
     scan_metrics: Option<Arc<ScanMetrics>>,
-    cache_sizes: Option<CacheSizeSnapshot>,
-    schema: SchemaRef,
+    cache_sizes:  Option<CacheSizeSnapshot>,
+    schema:       SchemaRef,
 }
 
 impl std::fmt::Debug for StatsTableProvider {

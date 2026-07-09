@@ -72,7 +72,7 @@ pub(crate) fn table_time_column(table_name: &str) -> &'static str {
 /// One extracted `time_col CMP literal` conjunct.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TimeBound {
-    pub value: ScalarValue,
+    pub value:     ScalarValue,
     pub inclusive: bool,
 }
 
@@ -84,8 +84,8 @@ pub(crate) struct TimeBound {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecomposedPredicate {
     pub residual: Vec<Expr>,
-    pub lower: Option<TimeBound>,
-    pub upper: Option<TimeBound>,
+    pub lower:    Option<TimeBound>,
+    pub upper:    Option<TimeBound>,
 }
 
 impl DecomposedPredicate {
@@ -148,7 +148,7 @@ fn widen_bound(a: TimeBound, b: &TimeBound, lower: bool) -> TimeBound {
     match a.value.partial_cmp(&b.value) {
         Some(std::cmp::Ordering::Equal) => TimeBound {
             inclusive: a.inclusive || b.inclusive,
-            value: a.value,
+            value:     a.value,
         },
         Some(ord) if (ord == std::cmp::Ordering::Less) == lower => a,
         Some(_) => b.clone(),
@@ -238,7 +238,10 @@ fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> Clamp
         None => d.lower.is_some(), // only add a bound when a time window exists at all
     };
     if tighter {
-        d.upper = Some(TimeBound { value: wm, inclusive: true });
+        d.upper = Some(TimeBound {
+            value:     wm,
+            inclusive: true,
+        });
         ClampAction::Clamped
     } else {
         ClampAction::Unchanged
@@ -287,22 +290,22 @@ fn split_rounds(batch: &RecordBatch, key_indices: &[usize]) -> Result<Vec<Record
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GroupKey {
-    project_id: String,
-    table_name: String,
+    project_id:  String,
+    table_name:  String,
     fingerprint: u64,
 }
 
 struct PendingGroup {
-    join_keys: Vec<(String, String)>,
+    join_keys:   Vec<(String, String)>,
     assignments: Vec<(String, Expr)>,
-    predicate: DecomposedPredicate,
-    time_col: &'static str,
-    schema: SchemaRef,
-    batches: Vec<RecordBatch>,
+    predicate:   DecomposedPredicate,
+    time_col:    &'static str,
+    schema:      SchemaRef,
+    batches:     Vec<RecordBatch>,
     /// Freshest enqueuing statement's session — keeps the drain's function
     /// registry identical to what the synchronous merge would have used.
-    session: Arc<dyn Session>,
-    attempts: u32,
+    session:     Arc<dyn Session>,
+    attempts:    u32,
 }
 
 /// Hash of everything that must match exactly for two statements to share
@@ -328,11 +331,11 @@ fn shape_fingerprint(join_keys: &[(String, String)], assignments: &[(String, Exp
 /// `TIMEFUSION_DML_COALESCE_SECS > 0`.
 pub struct DmlCoalescer {
     interval_secs: u64,
-    groups: std::sync::Mutex<HashMap<GroupKey, PendingGroup>>,
-    queued_rows: AtomicUsize,
-    drain_notify: Notify,
+    groups:        std::sync::Mutex<HashMap<GroupKey, PendingGroup>>,
+    queued_rows:   AtomicUsize,
+    drain_notify:  Notify,
     /// Serializes drains (timer vs shutdown vs test-triggered).
-    drain_lock: tokio::sync::Mutex<()>,
+    drain_lock:    tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for DmlCoalescer {
@@ -349,10 +352,10 @@ impl DmlCoalescer {
     pub fn new(interval_secs: u64) -> Self {
         Self {
             interval_secs: interval_secs.max(1),
-            groups: std::sync::Mutex::new(HashMap::new()),
-            queued_rows: AtomicUsize::new(0),
-            drain_notify: Notify::new(),
-            drain_lock: tokio::sync::Mutex::new(()),
+            groups:        std::sync::Mutex::new(HashMap::new()),
+            queued_rows:   AtomicUsize::new(0),
+            drain_notify:  Notify::new(),
+            drain_lock:    tokio::sync::Mutex::new(()),
         }
     }
 
@@ -364,8 +367,8 @@ impl DmlCoalescer {
         let time_col = table_time_column(table_name);
         let decomposed = DecomposedPredicate::decompose(predicate, time_col);
         let key = GroupKey {
-            project_id: project_id.to_string(),
-            table_name: table_name.to_string(),
+            project_id:  project_id.to_string(),
+            table_name:  table_name.to_string(),
             fingerprint: shape_fingerprint(&source.join_keys, assignments, &decomposed.residual, &source.schema),
         };
         let rows = source.batch.num_rows();
@@ -454,8 +457,8 @@ impl DmlCoalescer {
             let mut failed = None;
             for round in rounds {
                 let source = UpdateSource {
-                    batch: round,
-                    schema: group.schema.clone(),
+                    batch:     round,
+                    schema:    group.schema.clone(),
                     join_keys: group.join_keys.clone(),
                 };
                 match crate::dml::perform_delta_merge_update(
@@ -572,14 +575,14 @@ mod tests {
         assert_eq!(
             d.lower,
             Some(TimeBound {
-                value: ts(100),
+                value:     ts(100),
                 inclusive: true,
             })
         );
         assert_eq!(
             d.upper,
             Some(TimeBound {
-                value: ts(200),
+                value:     ts(200),
                 inclusive: false,
             })
         );
@@ -628,7 +631,7 @@ mod tests {
                 assert_eq!(
                     d.upper,
                     Some(TimeBound {
-                        value: ts(500),
+                        value:     ts(500),
                         inclusive: true,
                     })
                 );

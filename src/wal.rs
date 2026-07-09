@@ -77,26 +77,26 @@ fn snap_to_pos((block_id, offset): SnapPos) -> WalPosition {
 /// `clean_shutdown` flag alone won't catch out-of-band commits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CursorSnapshot {
-    pub version: u32,
+    pub version:           u32,
     /// Wall-clock micros (`clock::now_micros`) at write time. Informational
     /// only — surfaced in the boot log so operators can spot a stale
     /// snapshot, but not enforced as a max-age gate.
     pub written_at_micros: i64,
-    pub shards_per_topic: usize,
+    pub shards_per_topic:  usize,
     /// True only when written by the graceful-shutdown path. Boot uses this
     /// flag to decide whether the Delta verifier can be skipped entirely.
     /// NOT a drain claim — shutdown writes it even after a partial/timed-out
     /// flush (the WAL holds the remainder); see `drained` for that.
-    pub clean_shutdown: bool,
+    pub clean_shutdown:    bool,
     /// True only when the shutdown flush left NOTHING un-flushed (no
     /// MemBuffer buckets, no airborne or orphaned holds). Sole authorizer of
     /// the pure-mtime boot WAL GC — with un-flushed data the old files may
     /// BE the backlog. `#[serde(default)]`: snapshots from older builds parse
     /// as drained=false, which just skips the boot sweep (safe direction).
     #[serde(default)]
-    pub drained: bool,
+    pub drained:           bool,
     /// `"project_id:table_name"` → per-shard cursor (None = never written).
-    pub entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
+    pub entries:           std::collections::BTreeMap<String, Vec<Option<SnapPos>>>,
 }
 
 /// Maximum size for a single record batch (100MB) - prevents unbounded memory allocation from malicious/corrupted WAL
@@ -145,11 +145,11 @@ impl TryFrom<u8> for WalOperation {
 #[derive(Debug, Encode, Decode)]
 pub struct WalEntry {
     pub timestamp_micros: i64,
-    pub project_id: String,
-    pub table_name: String,
-    pub operation: WalOperation,
+    pub project_id:       String,
+    pub table_name:       String,
+    pub operation:        WalOperation,
     #[bincode(with_serde)]
-    pub data: Vec<u8>,
+    pub data:             Vec<u8>,
 }
 
 impl WalEntry {
@@ -172,7 +172,7 @@ pub struct DeletePayload {
 #[derive(Debug, Encode, Decode)]
 pub struct UpdatePayload {
     pub predicate_sql: Option<String>,
-    pub assignments: Vec<(String, String)>,
+    pub assignments:   Vec<(String, String)>,
 }
 
 /// `UPDATE ... FROM` source side, persisted alongside the predicate +
@@ -189,8 +189,8 @@ pub struct SerializedSource {
 #[derive(Debug, Encode, Decode)]
 pub struct UpdateWithSourcePayload {
     pub predicate_sql: Option<String>,
-    pub assignments: Vec<(String, String)>,
-    pub source: SerializedSource,
+    pub assignments:   Vec<(String, String)>,
+    pub source:        SerializedSource,
 }
 
 /// Number of walrus shards per logical (project_id, table_name) topic.
@@ -212,15 +212,15 @@ const WAL_SHARDS_PER_TOPIC_DEFAULT: usize = 4;
 const WAL_APPEND_LOCK_STRIPES: usize = 256;
 
 pub struct WalManager {
-    wal: Walrus,
-    data_dir: PathBuf,
+    wal:              Walrus,
+    data_dir:         PathBuf,
     /// Logical topic strings ("{project_id}:{table_name}") — one entry per
     /// (project, table). Each maps to `shards_per_topic` walrus collections.
-    known_topics: DashSet<String>,
+    known_topics:     DashSet<String>,
     /// Per-topic round-robin counter chooses which shard the next batch is
     /// appended to. Topic-scoped (rather than global) so we don't penalize
     /// the cold-cache miss for an idle topic.
-    shard_counter: dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
+    shard_counter:    dashmap::DashMap<String, std::sync::atomic::AtomicU64>,
     shards_per_topic: usize,
     /// Per-collection append serialization. Walrus rejects *concurrent* appends
     /// to one collection with "another batch write already in progress".
@@ -229,11 +229,11 @@ pub struct WalManager {
     /// a shard. These striped locks make colliders QUEUE (briefly — an append is
     /// an in-memory write; fsync is decoupled) instead of erroring the insert,
     /// which would dead-letter the row. Striped by `walrus_key` hash.
-    append_locks: Vec<std::sync::Mutex<()>>,
+    append_locks:     Vec<std::sync::Mutex<()>>,
     /// Fsync the shard before returning from single-entry (DML) appends —
     /// see `BufferConfig::timefusion_wal_ack_fsync`. Batched INSERT appends
     /// are always flushed before return by walrus's `batch_write`.
-    ack_fsync: bool,
+    ack_fsync:        bool,
 }
 
 impl WalManager {
@@ -317,7 +317,7 @@ impl WalManager {
         match std::fs::read_to_string(&stamp_path) {
             Ok(s) => {
                 let on_disk: u8 = s.trim().parse().map_err(|_| WalError::UnsupportedVersion {
-                    version: 0,
+                    version:  0,
                     expected: WAL_VERSION,
                 })?;
                 if on_disk != WAL_VERSION {
@@ -327,7 +327,7 @@ impl WalManager {
                         on_disk, WAL_VERSION, data_dir
                     );
                     return Err(WalError::UnsupportedVersion {
-                        version: on_disk,
+                        version:  on_disk,
                         expected: WAL_VERSION,
                     });
                 }
@@ -340,7 +340,7 @@ impl WalManager {
                     data_dir, WAL_VERSION
                 );
                 Err(WalError::UnsupportedVersion {
-                    version: 0,
+                    version:  0,
                     expected: WAL_VERSION,
                 })
             }
@@ -537,7 +537,7 @@ impl WalManager {
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let payload = UpdatePayload {
             predicate_sql: predicate_sql.map(String::from),
-            assignments: assignments.to_vec(),
+            assignments:   assignments.to_vec(),
         };
         let entry = WalEntry::new(project_id, table_name, WalOperation::Update, bincode::encode_to_vec(&payload, BINCODE_CONFIG)?);
         self.locked_append(&walrus_key, &entry, |pre| on_pre_append(shard, pre))?;
@@ -569,7 +569,7 @@ impl WalManager {
         if source.batch_ipc.len() > MAX_BATCH_SIZE {
             return Err(WalError::BatchTooLarge {
                 size: source.batch_ipc.len(),
-                max: MAX_BATCH_SIZE,
+                max:  MAX_BATCH_SIZE,
             });
         }
         let topic = Self::make_topic(project_id, table_name);
@@ -577,8 +577,8 @@ impl WalManager {
         let walrus_key = Self::walrus_topic_key(project_id, table_name, shard);
         let payload = UpdateWithSourcePayload {
             predicate_sql: predicate_sql.map(String::from),
-            assignments: assignments.to_vec(),
-            source: source.clone(),
+            assignments:   assignments.to_vec(),
+            source:        source.clone(),
         };
         let entry = WalEntry::new(
             project_id,
@@ -672,14 +672,14 @@ impl WalManager {
     /// parks the cursor back afterwards via `set_positions_allow_rewind`.
     pub fn replay_iter(&self) -> Result<WalReplayIter<'_>, WalError> {
         Ok(WalReplayIter {
-            wal: self,
-            topics: self.list_topics()?,
-            topic_idx: 0,
-            heap: std::collections::BinaryHeap::new(),
+            wal:        self,
+            topics:     self.list_topics()?,
+            topic_idx:  0,
+            heap:       std::collections::BinaryHeap::new(),
             shard_keys: Vec::new(),
-            pending: Vec::new(),
-            total: 0,
-            errors: 0,
+            pending:    Vec::new(),
+            total:      0,
+            errors:     0,
         })
     }
 
@@ -1120,7 +1120,7 @@ fn split_to_wal_payloads(batch: &RecordBatch, target: usize, hard_max: usize) ->
         } else {
             Err(WalError::BatchTooLarge {
                 size: data.len(),
-                max: hard_max,
+                max:  hard_max,
             })
         };
     }
@@ -1151,7 +1151,7 @@ fn split_to_wal_payloads(batch: &RecordBatch, target: usize, hard_max: usize) ->
             if chunk_data.len() > hard_max {
                 return Err(WalError::BatchTooLarge {
                     size: chunk_data.len(),
-                    max: hard_max,
+                    max:  hard_max,
                 });
             }
             out.push(chunk_data);
@@ -1162,7 +1162,7 @@ fn split_to_wal_payloads(batch: &RecordBatch, target: usize, hard_max: usize) ->
             // explosion of near-full-size entries.
             return Err(WalError::BatchTooLarge {
                 size: chunk_data.len(),
-                max: target,
+                max:  target,
             });
         } else {
             // Skewed rows left this chunk over target — re-split just it.
@@ -1205,7 +1205,7 @@ pub(crate) fn deserialize_record_batch(data: &[u8]) -> Result<RecordBatch, WalEr
     if data.len() > MAX_BATCH_SIZE {
         return Err(WalError::BatchTooLarge {
             size: data.len(),
-            max: MAX_BATCH_SIZE,
+            max:  MAX_BATCH_SIZE,
         });
     }
     let mut reader = StreamReader::try_new(std::io::Cursor::new(data), None)?;
@@ -1230,13 +1230,13 @@ fn deserialize_wal_entry(data: &[u8]) -> Result<WalEntry, WalError> {
 
     if data[0..4] != WAL_MAGIC {
         return Err(WalError::UnsupportedVersion {
-            version: data[0],
+            version:  data[0],
             expected: WAL_VERSION,
         });
     }
     if data.len() < 6 || data[4] != WAL_VERSION {
         return Err(WalError::UnsupportedVersion {
-            version: data[4],
+            version:  data[4],
             expected: WAL_VERSION,
         });
     }
@@ -1258,14 +1258,14 @@ pub fn decode_payload<T: Decode<()>>(data: &[u8]) -> Result<T, WalError> {
 /// most one in-flight entry per shard is alive at a time → replay memory is
 /// O(shards_per_topic), not O(total entries).
 pub struct WalReplayIter<'a> {
-    wal: &'a WalManager,
-    topics: Vec<String>,
-    topic_idx: usize,
-    heap: std::collections::BinaryHeap<std::cmp::Reverse<(i64, usize)>>,
+    wal:        &'a WalManager,
+    topics:     Vec<String>,
+    topic_idx:  usize,
+    heap:       std::collections::BinaryHeap<std::cmp::Reverse<(i64, usize)>>,
     shard_keys: Vec<String>,
-    pending: Vec<Option<WalEntry>>,
+    pending:    Vec<Option<WalEntry>>,
     /// Entries yielded so far.
-    pub total: u64,
+    pub total:  u64,
     /// Corrupt/unreadable entries skipped so far.
     pub errors: usize,
 }
@@ -1556,10 +1556,10 @@ mod tests {
     fn test_wal_entry_serialization() {
         let entry = WalEntry {
             timestamp_micros: 1234567890,
-            project_id: "project-123".to_string(),
-            table_name: "test_table".to_string(),
-            operation: WalOperation::Insert,
-            data: vec![1, 2, 3, 4, 5],
+            project_id:       "project-123".to_string(),
+            table_name:       "test_table".to_string(),
+            operation:        WalOperation::Insert,
+            data:             vec![1, 2, 3, 4, 5],
         };
         let serialized = serialize_wal_entry(&entry).unwrap();
         let deserialized = deserialize_wal_entry(&serialized).unwrap();
@@ -2123,7 +2123,7 @@ mod tests {
     fn test_update_payload_serialization() {
         let payload = UpdatePayload {
             predicate_sql: Some("id = 1".to_string()),
-            assignments: vec![("name".to_string(), "'updated'".to_string())],
+            assignments:   vec![("name".to_string(), "'updated'".to_string())],
         };
         let serialized = bincode::encode_to_vec(&payload, BINCODE_CONFIG).unwrap();
         let deserialized = decode_payload::<UpdatePayload>(&serialized).unwrap();

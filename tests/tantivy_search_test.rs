@@ -25,51 +25,51 @@ use timefusion::{
 fn level_error_node() -> timefusion::tantivy_index::udf::PredNode {
     timefusion::tantivy_index::udf::PredNode::Leaf(TextMatchPred {
         column: "level".into(),
-        query: "ERROR".into(),
+        query:  "ERROR".into(),
     })
 }
 
 #[allow(dead_code)]
 fn schema_with(level_indexed: bool) -> TableSchema {
     TableSchema {
-        table_name: "logs".into(),
-        partitions: vec![],
+        table_name:      "logs".into(),
+        partitions:      vec![],
         sorting_columns: vec![SortingColumnDef {
-            name: "timestamp".into(),
-            descending: false,
+            name:        "timestamp".into(),
+            descending:  false,
             nulls_first: false,
         }],
         z_order_columns: vec![],
-        time_column: None,
-        dedup_keys: vec![],
-        dedup_tiebreak: None,
-        fields: vec![
+        time_column:     None,
+        dedup_keys:      vec![],
+        dedup_tiebreak:  None,
+        fields:          vec![
             FieldDef {
-                name: "timestamp".into(),
-                data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(),
-                nullable: false,
-                tantivy: None,
-                dictionary: None,
+                name:         "timestamp".into(),
+                data_type:    "Timestamp(Microsecond, Some(\"UTC\"))".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
                 bloom_filter: false,
             },
             FieldDef {
-                name: "id".into(),
-                data_type: "Utf8".into(),
-                nullable: false,
-                tantivy: None,
-                dictionary: None,
+                name:         "id".into(),
+                data_type:    "Utf8".into(),
+                nullable:     false,
+                tantivy:      None,
+                dictionary:   None,
                 bloom_filter: false,
             },
             FieldDef {
-                name: "level".into(),
-                data_type: "Utf8".into(),
-                nullable: true,
-                tantivy: level_indexed.then(|| TantivyFieldConfig {
-                    indexed: true,
+                name:         "level".into(),
+                data_type:    "Utf8".into(),
+                nullable:     true,
+                tantivy:      level_indexed.then(|| TantivyFieldConfig {
+                    indexed:   true,
                     tokenizer: Some("raw".into()),
-                    flatten: None,
+                    flatten:   None,
                 }),
-                dictionary: None,
+                dictionary:   None,
                 bloom_filter: false,
             },
         ],
@@ -151,11 +151,11 @@ async fn multi_pred_and_is_single_pass_and_conjunctive() {
     let preds = vec![
         TextMatchPred {
             column: "level".into(),
-            query: "ERROR".into(),
+            query:  "ERROR".into(),
         },
         TextMatchPred {
             column: "id".into(),
-            query: "c".into(),
+            query:  "c".into(),
         },
     ];
     let node = timefusion::tantivy_index::udf::PredNode::from_preds(&preds).expect("non-empty");
@@ -246,15 +246,15 @@ async fn search_falls_back_when_manifest_entry_marked_failed() {
         "p1",
         "bucket-bad",
         ManifestEntry {
-            index: None,
-            rows: 0,
-            built_at: chrono::Utc::now(),
-            schema_version: manifest::SCHEMA_VERSION,
+            index:                None,
+            rows:                 0,
+            built_at:             chrono::Utc::now(),
+            schema_version:       manifest::SCHEMA_VERSION,
             min_timestamp_micros: None,
             max_timestamp_micros: None,
-            error: Some("simulated build failure".into()),
-            covered_files: vec![],
-            ordinals_valid: false,
+            error:                Some("simulated build failure".into()),
+            covered_files:        vec![],
+            ordinals_valid:       false,
         },
     )
     .await

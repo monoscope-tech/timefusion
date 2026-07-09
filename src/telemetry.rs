@@ -124,7 +124,7 @@ pub fn capped_preview_fn(batch: &arrow::record_batch::RecordBatch) -> Result<Str
     /// `fmt::Write` that stops accepting bytes after `left` is exhausted; the
     /// resulting `fmt::Error` aborts the value's `Display` mid-render.
     struct Capped<'a> {
-        buf: &'a mut String,
+        buf:  &'a mut String,
         left: usize,
     }
     impl std::fmt::Write for Capped<'_> {
@@ -143,7 +143,7 @@ pub fn capped_preview_fn(batch: &arrow::record_batch::RecordBatch) -> Result<Str
         for (formatter, field) in formatters.iter().zip(batch.schema().fields()) {
             let _ = write!(out, "{}=", field.name());
             let mut w = Capped {
-                buf: &mut out,
+                buf:  &mut out,
                 left: PREVIEW_CELL_CAP,
             };
             if write!(w, "{}", formatter.value(row)).is_err() {

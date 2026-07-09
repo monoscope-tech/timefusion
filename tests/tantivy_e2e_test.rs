@@ -516,7 +516,7 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
             &p,
             &timefusion::tantivy_index::udf::PredNode::Leaf(timefusion::tantivy_index::udf::TextMatchPred {
                 column: "id".into(),
-                query: uid.into(),
+                query:  uid.into(),
             }),
             1000,
             None,

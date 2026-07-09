@@ -41,10 +41,10 @@ const SEARCH_CONCURRENCY: usize = 8;
 
 #[derive(Debug)]
 pub struct SearchResult {
-    pub hits: Vec<Hit>,
+    pub hits:               Vec<Hit>,
     /// Sum of `rows` across all manifest entries that were queried. Lets the
     /// caller compute hit_count / indexed_rows for the selectivity cutoff.
-    pub indexed_rows: u64,
+    pub indexed_rows:       u64,
     /// Union of `covered_files` (parquet URIs) over every **successful**
     /// manifest entry (index present, no build error), regardless of the
     /// time-prune window. The read-side coverage gate intersects this with the
@@ -53,19 +53,19 @@ pub struct SearchResult {
     /// so the caller skips the prefilter (full scan). Collected over ALL
     /// successful entries (not just opened ones) because a time-pruned entry
     /// still legitimately covers its file — its rows are simply out of window.
-    pub covered_files: std::collections::HashSet<String>,
+    pub covered_files:      std::collections::HashSet<String>,
     /// Parquet URIs whose covering index was queried and returned ZERO hits,
     /// minus any URI also covered by an entry that hit, was unqueried, or
     /// lacked a field. With the coverage gate passed, these files provably
     /// contain no matching rows — the scan can skip them entirely
     /// (file-level pruning), a strictly stronger cut than the id IN-list.
-    pub zero_hit_files: std::collections::HashSet<String>,
+    pub zero_hit_files:     std::collections::HashSet<String>,
     /// Per-parquet-URI matching row ordinals, for entries that (a) cover
     /// exactly one file and (b) were built in parquet row order
     /// (`ordinals_valid`). Feeds the scan's per-file `ParquetAccessPlan`
     /// (row-selection pushdown) — files absent here simply scan normally
     /// under the id IN-list, so this can only narrow, never drop.
-    pub row_selections: std::collections::HashMap<String, Vec<u64>>,
+    pub row_selections:     std::collections::HashMap<String, Vec<u64>>,
     /// True if any **in-window** index (one that wasn't time-pruned) lacks a
     /// queried field. `covered_files` is field-independent (an entry covers its
     /// file for all of the current schema's indexed columns), so it can't catch
@@ -79,13 +79,13 @@ pub struct SearchResult {
 #[derive(Debug)]
 pub struct TantivySearchService {
     pub object_store: Arc<dyn ObjectStore>,
-    pub cache_root: PathBuf,
-    readers: parking_lot::Mutex<lru::LruCache<String, (Index, IndexReader)>>,
+    pub cache_root:   PathBuf,
+    readers:          parking_lot::Mutex<lru::LruCache<String, (Index, IndexReader)>>,
     /// TTL cache of parsed manifests, keyed (table, project). Per-service
     /// (not global) so distinct object stores never cross-contaminate.
-    manifests: dashmap::DashMap<(String, String), (std::time::Instant, Arc<manifest::Manifest>)>,
+    manifests:        dashmap::DashMap<(String, String), (std::time::Instant, Arc<manifest::Manifest>)>,
     /// Cold `open_index` calls — observability for the reader cache.
-    pub index_opens: std::sync::atomic::AtomicU64,
+    pub index_opens:  std::sync::atomic::AtomicU64,
 }
 
 impl TantivySearchService {
@@ -103,7 +103,7 @@ impl TantivySearchService {
     pub async fn search(&self, table: &str, project_id: &str, field: &str, query_str: &str) -> Result<Option<Vec<Hit>>> {
         let node = PredNode::Leaf(TextMatchPred {
             column: field.to_string(),
-            query: query_str.to_string(),
+            query:  query_str.to_string(),
         });
         Ok(self.search_with_stats(table, project_id, &node, usize::MAX, None).await?.map(|r| r.hits))
     }
