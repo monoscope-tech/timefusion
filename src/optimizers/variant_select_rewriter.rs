@@ -196,11 +196,14 @@ fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<datafusion::logical_exp
         // …)` error_text. The outer cast is kept so the result stays real text
         // (pg OID 25) rather than variant_to_json's jsonb-tagged output (OID 3802) —
         // an explicit `::text` must describe as text over the wire.
-        Expr::Cast(Cast { expr, field }) if is_text_type(field.data_type()) && is_variant_expr(&expr, schema) => {
-            Ok(Transformed::yes(Expr::Cast(Cast { expr: Box::new(wrap(*expr)), field })))
-        }
+        Expr::Cast(Cast { expr, field }) if is_text_type(field.data_type()) && is_variant_expr(&expr, schema) => Ok(Transformed::yes(Expr::Cast(Cast {
+            expr: Box::new(wrap(*expr)),
+            field,
+        }))),
         // Comparison / regex where a Variant operand faces text.
-        Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_text_comparison_op(op) && (is_variant_expr(&left, schema) || is_variant_expr(&right, schema)) => {
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if is_text_comparison_op(op) && (is_variant_expr(&left, schema) || is_variant_expr(&right, schema)) =>
+        {
             let left = if is_variant_expr(&left, schema) { Box::new(wrap(*left)) } else { left };
             let right = if is_variant_expr(&right, schema) { Box::new(wrap(*right)) } else { right };
             Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr { left, op, right })))
@@ -231,10 +234,27 @@ fn is_text_type(dt: &datafusion::arrow::datatypes::DataType) -> bool {
 }
 
 fn is_text_comparison_op(op: Operator) -> bool {
-    use Operator::{Eq, Gt, GtEq, ILikeMatch, IsDistinctFrom, IsNotDistinctFrom, LikeMatch, Lt, LtEq, NotEq, NotILikeMatch, NotLikeMatch, RegexIMatch, RegexMatch, RegexNotIMatch, RegexNotMatch};
+    use Operator::{
+        Eq, Gt, GtEq, ILikeMatch, IsDistinctFrom, IsNotDistinctFrom, LikeMatch, Lt, LtEq, NotEq, NotILikeMatch, NotLikeMatch, RegexIMatch, RegexMatch,
+        RegexNotIMatch, RegexNotMatch,
+    };
     matches!(
         op,
-        Eq | NotEq | Lt | LtEq | Gt | GtEq | IsDistinctFrom | IsNotDistinctFrom | RegexMatch | RegexIMatch | RegexNotMatch | RegexNotIMatch | LikeMatch | ILikeMatch | NotLikeMatch | NotILikeMatch
+        Eq | NotEq
+            | Lt
+            | LtEq
+            | Gt
+            | GtEq
+            | IsDistinctFrom
+            | IsNotDistinctFrom
+            | RegexMatch
+            | RegexIMatch
+            | RegexNotMatch
+            | RegexNotIMatch
+            | LikeMatch
+            | ILikeMatch
+            | NotLikeMatch
+            | NotILikeMatch
     )
 }
 
