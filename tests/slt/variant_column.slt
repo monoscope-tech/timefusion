@@ -64,3 +64,84 @@ query T
 SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND (body->>'message')='hello'
 ----
 vc_1
+
+# --- Value-position predicates on a Variant column: the bare column (not a
+# --- `->`/`->>` accessor) against text broke on DF54 two ways —
+# --- (1) planning: `Struct op Utf8` couldn't coerce → coerce_variant_value_positions
+# ---     lowers the Variant side via variant_to_json (== Postgres jsonb::text);
+# --- (2) execution: `body LIKE` is tantivy-routed to `… AND text_match(body,…)`,
+# ---     and text_match's row-eval never-matched Variant input → 0 rows. Now
+# ---     text_match decodes the Variant to JSON text. Both are exercised here
+# ---     with the queries the app actually emits. ---
+
+# bare equality against the canonical JSON text (identical to `SELECT body` output)
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body = '{"message":"hello","nested":{"k":"v"}}'
+----
+vc_1
+
+# bare `body LIKE` — the app's free-text log search. Substring reaches into the
+# serialized JSON. Tantivy-routed + text_match row-eval over the mem-buffer row.
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body LIKE '%hello%'
+----
+vc_1
+
+# bare `body ILIKE`, case-insensitive
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body ILIKE '%HELLO%'
+----
+vc_1
+
+# NOT LIKE (not tantivy-routed → pure coercion path)
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body NOT LIKE '%zzz%'
+----
+vc_1
+
+# CAST(body AS text) in a projection — previously returned an empty string
+query T
+SELECT body::text FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND id='vc_1'
+----
+{"message":"hello","nested":{"k":"v"}}
+
+# monoscope's actual error_text expr: COALESCE(NULLIF(status_message,''), NULLIF(body::text,''))
+# — status_message is NULL here, so it falls through to body::text
+query T
+SELECT COALESCE(NULLIF(status_message, ''), NULLIF(body::text, '')) FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND id='vc_1'
+----
+{"message":"hello","nested":{"k":"v"}}
+
+# --- Text log stored as a Variant scalar string (some logs are plain text, not
+# --- JSON objects). Must round-trip and be comparable by text. ---
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, kind, resource___service___name,
+    status_code, level, duration, summary, body
+) VALUES
+    ('variant_col_test', TIMESTAMP '2024-01-15T10:05:00Z', 'vc_2', ARRAY['h']::VARCHAR[], DATE '2024-01-15',
+     'test', 'SERVER', 'svc', 'OK', 'INFO', 1000000, ARRAY['s'], '"request completed"')
+
+query T
+SELECT body FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND id='vc_2'
+----
+"request completed"
+
+# bare LIKE search matches through the JSON quotes of a scalar-string log
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body LIKE '%request completed%'
+----
+vc_2
+
+# equality uses the canonical (quoted) JSON form, consistent with the wire
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body = '"request completed"'
+----
+vc_2
+
+# IN-list of JSON-text values (ngram3 column → not tantivy-routed, exercises coercion)
+query T
+SELECT id FROM otel_logs_and_spans WHERE project_id='variant_col_test' AND body IN ('"request completed"', '"other"')
+----
+vc_2

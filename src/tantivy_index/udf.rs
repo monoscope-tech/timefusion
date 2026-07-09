@@ -302,8 +302,17 @@ fn string_extractor(arr: &ArrayRef) -> Box<dyn Fn(usize) -> Option<String> + '_>
             let a = arr.as_any().downcast_ref::<StringViewArray>().unwrap();
             Box::new(move |i| if a.is_null(i) { None } else { Some(a.value(i).to_string()) })
         }
-        // Variant or anything else — degrade to never-match (tantivy still works
-        // on the indexed side; mem-buffer post-filter would need json eval here).
+        // Variant Struct{metadata,value}: render each row to canonical JSON text
+        // via the SAME serializer the tantivy index and the LIKE-coercion path
+        // use (`builder::variant_to_text`), so text_match's row-eval agrees
+        // byte-for-byte with them and stays a superset of the real predicate.
+        // Without this, predicates on Variant columns (e.g. `body LIKE '%x%'`,
+        // rewritten to `… AND text_match(body,'x')`) silently never match.
+        // Decoded lazily per row (only when the closure is called).
+        DataType::Struct(_) if crate::schema_loader::is_variant_type(arr.data_type()) => {
+            Box::new(move |i| crate::tantivy_index::builder::variant_to_text(arr, i, false).ok().flatten())
+        }
+        // Anything else — degrade to never-match.
         _ => Box::new(|_| None),
     }
 }

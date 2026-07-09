@@ -191,7 +191,10 @@ fn list_to_text(arr: &ListArray, row: usize) -> Result<Option<String>> {
     Ok(Some(parts.join(" ")))
 }
 
-fn variant_to_text(col: &ArrayRef, row: usize, kv: bool) -> Result<Option<String>> {
+/// Render one Variant row to text. `kv=false` → canonical JSON (the same
+/// `parquet_variant_json` serializer used everywhere: the wire, the coercion
+/// path, and `text_match`'s row-eval), so all three agree byte-for-byte.
+pub(crate) fn variant_to_text(col: &ArrayRef, row: usize, kv: bool) -> Result<Option<String>> {
     let struct_arr = col.as_any().downcast_ref::<StructArray>().context("variant should be StructArray")?;
     if struct_arr.is_null(row) {
         return Ok(None);

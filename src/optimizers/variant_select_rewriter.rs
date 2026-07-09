@@ -32,7 +32,10 @@ use datafusion::{
         tree_node::{Transformed, TreeNode},
     },
     config::ConfigOptions,
-    logical_expr::{Expr, ExprSchemable, LogicalPlan, Projection, TableScan, expr::ScalarFunction},
+    logical_expr::{
+        Expr, ExprSchemable, LogicalPlan, Operator, Projection, TableScan,
+        expr::{BinaryExpr, Cast, InList, ScalarFunction},
+    },
     optimizer::AnalyzerRule,
 };
 use tracing::{debug, warn};
@@ -64,10 +67,19 @@ impl AnalyzerRule for VariantSelectRewriter {
         // stale Utf8View type from a parent's cached schema and skips
         // wrapping (e.g. `ORDER BY x LIMIT n` introduces an outer
         // Projection over a Sort whose schema must be re-derived).
+        //
+        // Restoring the Variant type re-breaks any expression that had the
+        // (previously Utf8View) column in a scalar-text position, so before the
+        // recompute we run `coerce_variant_value_positions` on each node to lower
+        // those Variant operands back to text via `variant_to_json`. Order
+        // matters: the child scan is patched first (transform_up is bottom-up),
+        // so a parent Filter/Projection sees Variant-typed input columns and can
+        // coerce its predicates before recompute type-checks them.
         let patched = plan
             .transform_up(|node| {
                 let patched = patch_table_scan(node)?.data;
-                Ok(Transformed::yes(patched.recompute_schema()?))
+                let coerced = coerce_variant_value_positions(patched)?;
+                Ok(Transformed::yes(coerced.recompute_schema()?))
             })?
             .data;
         // Pass 2: wrap Variant-typed projections at the topmost SELECT
@@ -132,6 +144,98 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
         projected_schema: new_df,
         ..scan
     })))
+}
+
+/// Value-position Variant → text coercion.
+///
+/// `patch_table_scan` restores the real Variant `Struct{Binary,Binary}` type on
+/// the scan, which then propagates up. Any expression that had a Variant column
+/// in a *scalar-text* position — a comparison/regex against a string, a
+/// `LIKE`/`ILIKE`/`SIMILAR TO`, a `CAST(… AS text)`, or `IN (str, …)` — now
+/// faces DataFusion with `Struct op Utf8`, which DF54 cannot coerce: bare
+/// `body = 'x'` and `body LIKE …` error out, and `CAST(body AS text)` in a
+/// projection silently yields empty strings. We lower the Variant side to
+/// canonical JSON text via `variant_to_json` — exactly Postgres `jsonb::text`
+/// semantics (scalar strings stay quoted, composites serialize), identical to
+/// what the wire already returns for a bare `SELECT body`. The `->`/`->>`
+/// accessors keep their own lowering (`VariantAwareExprPlanner`) and are not
+/// touched here.
+fn coerce_variant_value_positions(plan: LogicalPlan) -> Result<LogicalPlan> {
+    let inputs = plan.inputs();
+    if inputs.is_empty() {
+        return Ok(plan); // leaf (TableScan / Values) — no input columns to coerce against
+    }
+    // Merge every input schema so column refs in this node's exprs resolve to
+    // their (now Variant-restored) types. Single input for Filter/Projection;
+    // multiple for joins whose ON clause may touch a Variant column.
+    let mut schema = DFSchema::empty();
+    for input in &inputs {
+        schema.merge(input.schema().as_ref());
+    }
+    // Fast path: no Variant column in scope → nothing to coerce.
+    if !schema.fields().iter().any(|f| is_variant_type(f.data_type())) {
+        return Ok(plan);
+    }
+    let to_json = Arc::new(datafusion::logical_expr::ScalarUDF::from(VariantToJsonExtUdf::default()));
+    plan.map_expressions(|expr| expr.transform_up(|e| coerce_expr(e, &schema, &to_json))).map(|t| t.data)
+}
+
+/// Bottom-up rewrite of a single expression: wrap any Variant operand that sits
+/// in a scalar-text position with `variant_to_json`. Idempotent — an
+/// already-wrapped operand types as `Utf8` and `is_variant_expr` returns false.
+fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<datafusion::logical_expr::ScalarUDF>) -> Result<Transformed<Expr>> {
+    let wrap = |x: Expr| {
+        Expr::ScalarFunction(ScalarFunction {
+            func: to_json.clone(),
+            args: vec![x],
+        })
+    };
+    match e {
+        // CAST(variant AS text) → CAST(variant_to_json(variant) AS <same text type>).
+        // Covers monoscope's `body::text` and its `COALESCE(NULLIF(body::text, ''),
+        // …)` error_text. The outer cast is kept so the result stays real text
+        // (pg OID 25) rather than variant_to_json's jsonb-tagged output (OID 3802) —
+        // an explicit `::text` must describe as text over the wire.
+        Expr::Cast(Cast { expr, field }) if is_text_type(field.data_type()) && is_variant_expr(&expr, schema) => {
+            Ok(Transformed::yes(Expr::Cast(Cast { expr: Box::new(wrap(*expr)), field })))
+        }
+        // Comparison / regex where a Variant operand faces text.
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_text_comparison_op(op) && (is_variant_expr(&left, schema) || is_variant_expr(&right, schema)) => {
+            let left = if is_variant_expr(&left, schema) { Box::new(wrap(*left)) } else { left };
+            let right = if is_variant_expr(&right, schema) { Box::new(wrap(*right)) } else { right };
+            Ok(Transformed::yes(Expr::BinaryExpr(BinaryExpr { left, op, right })))
+        }
+        // LIKE / ILIKE / NOT LIKE / NOT ILIKE.
+        Expr::Like(mut like) if is_variant_expr(&like.expr, schema) => {
+            like.expr = Box::new(wrap(*like.expr));
+            Ok(Transformed::yes(Expr::Like(like)))
+        }
+        // SIMILAR TO.
+        Expr::SimilarTo(mut like) if is_variant_expr(&like.expr, schema) => {
+            like.expr = Box::new(wrap(*like.expr));
+            Ok(Transformed::yes(Expr::SimilarTo(like)))
+        }
+        // IN (str, …).
+        Expr::InList(InList { expr, list, negated }) if is_variant_expr(&expr, schema) => Ok(Transformed::yes(Expr::InList(InList {
+            expr: Box::new(wrap(*expr)),
+            list,
+            negated,
+        }))),
+        other => Ok(Transformed::no(other)),
+    }
+}
+
+fn is_text_type(dt: &datafusion::arrow::datatypes::DataType) -> bool {
+    use datafusion::arrow::datatypes::DataType::{LargeUtf8, Utf8, Utf8View};
+    matches!(dt, Utf8 | Utf8View | LargeUtf8)
+}
+
+fn is_text_comparison_op(op: Operator) -> bool {
+    use Operator::{Eq, Gt, GtEq, ILikeMatch, IsDistinctFrom, IsNotDistinctFrom, LikeMatch, Lt, LtEq, NotEq, NotILikeMatch, NotLikeMatch, RegexIMatch, RegexMatch, RegexNotIMatch, RegexNotMatch};
+    matches!(
+        op,
+        Eq | NotEq | Lt | LtEq | Gt | GtEq | IsDistinctFrom | IsNotDistinctFrom | RegexMatch | RegexIMatch | RegexNotMatch | RegexNotIMatch | LikeMatch | ILikeMatch | NotLikeMatch | NotILikeMatch
+    )
 }
 
 /// Peel Sort / Limit / Distinct / SubqueryAlias from the root and wrap
