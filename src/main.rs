@@ -161,10 +161,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
             let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
             let storage_opts = cfg.aws.build_storage_options(None);
             let obj_store = db.create_object_store(&storage_uri, &storage_opts).await?;
-            let svc = Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(
-                obj_store.clone(),
-                Arc::new(cfg.tantivy.clone()),
-            ));
+            let svc = Arc::new(timefusion::tantivy_index::service::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
             layer = layer.with_tantivy_indexer(svc.clone().callback());
             let cache_root = cfg.core.timefusion_data_dir.clone();
             let search = Arc::new(timefusion::tantivy_index::search::TantivySearchService::new(obj_store, cache_root));
@@ -217,10 +214,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     } else {
         false
     };
-    info!(
-        "bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}",
-        t_snap.elapsed().as_millis()
-    );
+    info!("bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}", t_snap.elapsed().as_millis());
     if skip_delta_scan {
         info!("Skipping Delta-derived cursor reconciliation (cursor snapshot is clean)");
     } else {
@@ -242,11 +236,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     // Recover from WAL on startup
     let t_wal = std::time::Instant::now();
     let recovery_stats = buffered_layer.recover_from_wal().await?;
-    info!(
-        "bootstrap.phase=wal_replay entries={} elapsed_ms={}",
-        recovery_stats.entries_replayed,
-        t_wal.elapsed().as_millis()
-    );
+    info!("bootstrap.phase=wal_replay entries={} elapsed_ms={}", recovery_stats.entries_replayed, t_wal.elapsed().as_millis());
 
     // Start background tasks (flush and eviction)
     buffered_layer.start_background_tasks().await;
@@ -324,9 +314,7 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 None
             }
             _ => {
-                return Err(anyhow::anyhow!(
-                    "GRPC_TOKEN is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open ingest for local dev)"
-                ));
+                return Err(anyhow::anyhow!("GRPC_TOKEN is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open ingest for local dev)"));
             }
         }
     };

@@ -21,9 +21,7 @@ static FROZEN_NOW: AtomicI64 = AtomicI64::new(WALL_SENTINEL);
 
 pub fn init_from_env() {
     if let Ok(s) = std::env::var("TIMEFUSION_FROZEN_TIME") {
-        let t = chrono::DateTime::parse_from_rfc3339(&s)
-            .unwrap_or_else(|e| panic!("TIMEFUSION_FROZEN_TIME must be RFC3339 ({s:?}): {e}"))
-            .timestamp_micros();
+        let t = chrono::DateTime::parse_from_rfc3339(&s).unwrap_or_else(|e| panic!("TIMEFUSION_FROZEN_TIME must be RFC3339 ({s:?}): {e}")).timestamp_micros();
         FROZEN_NOW.store(t, Ordering::Release);
         tracing::warn!(
             frozen_at = %chrono::DateTime::from_timestamp_micros(t).unwrap(),

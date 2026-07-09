@@ -69,12 +69,7 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
     shared_cache.log_stats().await;
 
     // Both reads should be fast since they hit cache
-    assert!(
-        cached_read_time <= first_read_time * 2,
-        "Cached reads should be consistently fast. First: {:?}, Cached: {:?}",
-        first_read_time,
-        cached_read_time
-    );
+    assert!(cached_read_time <= first_read_time * 2, "Cached reads should be consistently fast. First: {:?}, Cached: {:?}", first_read_time, cached_read_time);
 
     // Verify cache stats - all reads should hit cache since we cache on write
     let stats = shared_cache.get_stats().await;
@@ -269,16 +264,8 @@ async fn test_parquet_metadata_cache_performance() -> Result<()> {
     let cold_inner_gets = cold_stats.metadata.inner_gets - initial_stats.metadata.inner_gets;
     let data_fetched = cold_inner_gets as usize * metadata_size;
     let data_saved = file_count * file_size - data_fetched;
-    println!(
-        "Data fetched: {}MB (instead of {}MB)",
-        data_fetched / 1024 / 1024,
-        file_count * file_size / 1024 / 1024
-    );
-    println!(
-        "Data saved: {}MB ({:.1}% reduction)",
-        data_saved / 1024 / 1024,
-        (data_saved as f64 / (file_count * file_size) as f64) * 100.0
-    );
+    println!("Data fetched: {}MB (instead of {}MB)", data_fetched / 1024 / 1024, file_count * file_size / 1024 / 1024);
+    println!("Data saved: {}MB ({:.1}% reduction)", data_saved / 1024 / 1024, (data_saved as f64 / (file_count * file_size) as f64) * 100.0);
 
     // Verify correctness
     assert_eq!(final_stats.metadata.hits - cold_stats.metadata.hits, file_count as u64);

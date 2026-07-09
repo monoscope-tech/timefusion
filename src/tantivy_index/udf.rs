@@ -343,17 +343,11 @@ pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextM
         _ => return None,
     };
     match sf.args.len() {
-        2 => Some(TextMatchPred {
-            column: col,
-            query:  utf8_lit(&sf.args[1])?,
-        }),
+        2 => Some(TextMatchPred { column: col, query: utf8_lit(&sf.args[1])? }),
         3 => {
             let value = utf8_lit(&sf.args[1])?; // still a placeholder pre-substitution → opaque
             let kind = utf8_lit(&sf.args[2])?;
-            Some(TextMatchPred {
-                column: col,
-                query:  classify_deferred(&kind, &value)?,
-            })
+            Some(TextMatchPred { column: col, query: classify_deferred(&kind, &value)? })
         }
         _ => None,
     }
@@ -362,7 +356,7 @@ pub fn extract_text_match(expr: &datafusion::logical_expr::Expr) -> Option<TextM
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextMatchPred {
     pub column: String,
-    pub query:  String,
+    pub query: String,
 }
 
 /// Boolean structure of the routable `text_match` predicates in a filter
@@ -403,7 +397,7 @@ impl PredNode {
 /// non-superset and silently drop that branch's rows (2026-06-16 dashboard
 /// bug: `(kind='server' OR name='...')` returned 0 from Delta).
 struct NodeRes {
-    node:     Option<PredNode>,
+    node: Option<PredNode>,
     complete: bool,
 }
 
@@ -432,17 +426,10 @@ pub fn collect_text_match_tree(filters: &[datafusion::logical_expr::Expr]) -> Op
 fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
     if let Some(p) = extract_text_match(e) {
-        return NodeRes {
-            node:     Some(PredNode::Leaf(p)),
-            complete: true,
-        };
+        return NodeRes { node: Some(PredNode::Leaf(p)), complete: true };
     }
     match e {
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op: Operator::And,
-            right,
-        }) => {
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
             let (a, b) = (expr_node(left), expr_node(right));
             let mut kids: Vec<PredNode> = Vec::new();
             for n in [a.node, b.node].into_iter().flatten() {
@@ -457,10 +444,7 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
                 1 => Some(kids.into_iter().next().expect("len 1")),
                 _ => Some(PredNode::And(kids)),
             };
-            NodeRes {
-                node,
-                complete: a.complete || b.complete,
-            }
+            NodeRes { node, complete: a.complete || b.complete }
         }
         Expr::BinaryExpr(BinaryExpr { left, op: Operator::Or, right }) => {
             let (a, b) = (expr_node(left), expr_node(right));
@@ -473,21 +457,12 @@ fn expr_node(e: &datafusion::logical_expr::Expr) -> NodeRes {
                             other => kids.push(other),
                         }
                     }
-                    NodeRes {
-                        node:     Some(PredNode::Or(kids)),
-                        complete: true,
-                    }
+                    NodeRes { node: Some(PredNode::Or(kids)), complete: true }
                 }
-                _ => NodeRes {
-                    node:     None,
-                    complete: false,
-                },
+                _ => NodeRes { node: None, complete: false },
             }
         }
-        _ => NodeRes {
-            node:     None,
-            complete: false,
-        },
+        _ => NodeRes { node: None, complete: false },
     }
 }
 

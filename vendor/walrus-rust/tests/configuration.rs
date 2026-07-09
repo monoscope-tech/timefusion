@@ -332,11 +332,7 @@ fn test_log_file_deletion_with_fast_fsync() {
     }
 
     if files_after_read.len() < files_after_writes.len() {
-        test_println!(
-            "SUCCESS: File deletion occurred! {} -> {} files",
-            files_after_writes.len(),
-            files_after_read.len()
-        );
+        test_println!("SUCCESS: File deletion occurred! {} -> {} files", files_after_writes.len(), files_after_read.len());
     } else {
         test_println!("INFO: Files still present, deletion may require more time or different conditions");
     }
@@ -476,10 +472,7 @@ fn key_based_instances_use_isolated_directories() {
         .collect();
     dir_names.sort();
 
-    assert!(
-        dir_names.contains(&sanitize_key(&analytics_key)),
-        "expected analytics namespace directory to exist"
-    );
+    assert!(dir_names.contains(&sanitize_key(&analytics_key)), "expected analytics namespace directory to exist");
     assert!(dir_names.contains(&sanitize_key(&tx_key)), "expected transactions namespace directory to exist");
 }
 

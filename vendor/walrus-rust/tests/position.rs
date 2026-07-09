@@ -31,12 +31,7 @@ fn current_position_advances_with_writes() {
 
     wal.append_for_topic(topic, b"second").unwrap();
     let p2 = wal.current_position(topic).unwrap();
-    assert!(
-        (p2.block_id, p2.offset) > (p1.block_id, p1.offset),
-        "position should be monotonically increasing across appends; p1={:?} p2={:?}",
-        p1,
-        p2
-    );
+    assert!((p2.block_id, p2.offset) > (p1.block_id, p1.offset), "position should be monotonically increasing across appends; p1={:?} p2={:?}", p1, p2);
 }
 
 #[test]
@@ -168,11 +163,7 @@ fn set_checkpointed_true_is_idempotent_per_block() {
     let after_second = Walrus::block_file_checkpoint_state(sealed_block_id).unwrap().0;
 
     assert!(after_first >= 1, "first fast-forward must checkpoint the sealed block");
-    assert_eq!(
-        after_first, after_second,
-        "second fast-forward must not double-increment (after_first={}, after_second={})",
-        after_first, after_second
-    );
+    assert_eq!(after_first, after_second, "second fast-forward must not double-increment (after_first={}, after_second={})", after_first, after_second);
 }
 
 #[test]

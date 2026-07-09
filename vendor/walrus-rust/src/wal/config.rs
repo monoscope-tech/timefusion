@@ -46,10 +46,7 @@ pub(crate) const MAX_BATCH_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB total
 static LAST_MILLIS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn now_millis_str() -> String {
-    let system_ms = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_millis();
+    let system_ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_else(|_| std::time::Duration::from_secs(0)).as_millis();
 
     let mut observed = LAST_MILLIS.load(Ordering::Relaxed);
     loop {

@@ -284,18 +284,14 @@ mod test_dml_operations {
 
         // Update multiple columns at once
         info!("Executing multi-column UPDATE query");
-        let df = ctx
-            .sql("UPDATE otel_logs_and_spans SET duration = 999, level = 'WARN' WHERE project_id = 'test_project' AND name = 'Alice'")
-            .await?;
+        let df = ctx.sql("UPDATE otel_logs_and_spans SET duration = 999, level = 'WARN' WHERE project_id = 'test_project' AND name = 'Alice'").await?;
         let result = df.collect().await?;
 
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
         assert_eq!(rows_updated, 1, "Expected 1 row to be updated");
 
         // Verify both columns were updated
-        let df = ctx
-            .sql("SELECT name, duration, level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Alice'")
-            .await?;
+        let df = ctx.sql("SELECT name, duration, level FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Alice'").await?;
         let results = df.collect().await?;
 
         assert_eq!(results.len(), 1);
@@ -432,17 +428,10 @@ mod test_dml_operations {
 
     /// Helper: select `duration` for `name` in `test_project`, ordered by name.
     async fn duration_by_name(ctx: &datafusion::prelude::SessionContext, name: &str) -> Result<i64> {
-        let q = format!(
-            "SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = '{}'",
-            name
-        );
+        let q = format!("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = '{}'", name);
         let df = ctx.sql(&q).await?;
         let results = df.collect().await?;
-        assert!(
-            !results.is_empty() && results[0].num_rows() == 1,
-            "duration_by_name: expected 1 row for {}",
-            name
-        );
+        assert!(!results.is_empty() && results[0].num_rows() == 1, "duration_by_name: expected 1 row for {}", name);
         Ok(results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0))
     }
 
@@ -671,10 +660,7 @@ mod test_dml_operations {
         let df = ctx.sql("UPDATE otel_logs_and_spans SET duration = 500 WHERE project_id = 'test_project' AND name = 'Bob'").await?;
         let result = df.collect().await?;
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
-        assert_eq!(
-            rows_updated, 1,
-            "UPDATE must reach buffer rows through a session created before the layer was attached"
-        );
+        assert_eq!(rows_updated, 1, "UPDATE must reach buffer rows through a session created before the layer was attached");
         assert_eq!(duration_by_name(&ctx, "Bob").await?, 500);
         Ok(())
     }
@@ -730,20 +716,14 @@ mod test_dml_operations {
 
         // Give the UPDATE time to get into its Delta merge.
         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        assert!(
-            !update_handle.is_finished(),
-            "UPDATE finished too fast to observe concurrency — grow FILES/ROWS_PER_FILE"
-        );
+        assert!(!update_handle.is_finished(), "UPDATE finished too fast to observe concurrency — grow FILES/ROWS_PER_FILE");
 
         // Reader mid-UPDATE.
         let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
         assert_eq!(count as usize, FILES * ROWS_PER_FILE);
-        assert!(
-            !update_handle.is_finished(),
-            "SELECT should complete while the UPDATE is still merging — reader was convoyed behind the DML write lock"
-        );
+        assert!(!update_handle.is_finished(), "SELECT should complete while the UPDATE is still merging — reader was convoyed behind the DML write lock");
 
         // Writer mid-UPDATE (direct Delta insert commits + swaps the handle).
         let extra = timefusion::test_utils::test_helpers::json_to_batch(vec![serde_json::json!({
@@ -752,10 +732,7 @@ mod test_dml_operations {
             "duration": 1, "date": now.date_naive().to_string(), "hashes": [], "summary": []
         })])?;
         db.insert_records_batch("test_project", "otel_logs_and_spans", vec![extra], true, None).await?;
-        assert!(
-            !update_handle.is_finished(),
-            "insert should complete while the UPDATE is still merging — writer was convoyed behind the DML write lock"
-        );
+        assert!(!update_handle.is_finished(), "insert should complete while the UPDATE is still merging — writer was convoyed behind the DML write lock");
 
         let result = update_handle.await??;
         let rows_updated = result[0].column(0).as_primitive::<arrow::datatypes::UInt64Type>().value(0);
@@ -766,11 +743,7 @@ mod test_dml_operations {
         let df = ctx.sql("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'test_project'").await?;
         let results = df.collect().await?;
         let final_count = results[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
-        assert_eq!(
-            final_count as usize,
-            FILES * ROWS_PER_FILE + 1,
-            "concurrent insert's row lost across the DML swap"
-        );
+        assert_eq!(final_count as usize, FILES * ROWS_PER_FILE + 1, "concurrent insert's row lost across the DML swap");
         Ok(())
     }
 
@@ -909,14 +882,8 @@ mod test_dml_operations {
 
         // Flush → Delta must hold the POST-update value.
         layer.flush_all_now().await?;
-        let delta = db
-            .query_delta_only("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'")
-            .await?;
-        assert_eq!(
-            delta[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0),
-            4242,
-            "flush persisted the post-DML value"
-        );
+        let delta = db.query_delta_only("SELECT duration FROM otel_logs_and_spans WHERE project_id = 'test_project' AND name = 'Bob'").await?;
+        assert_eq!(delta[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0), 4242, "flush persisted the post-DML value");
         Ok(())
     }
 }

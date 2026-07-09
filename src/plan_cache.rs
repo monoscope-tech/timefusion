@@ -124,13 +124,7 @@ fn fold_literal_casts(plan: LogicalPlan) -> datafusion::error::Result<LogicalPla
 async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionContext) -> datafusion::error::Result<Option<u64>> {
     use datafusion::logical_expr::dml::DmlStatement;
 
-    let LogicalPlan::Dml(DmlStatement {
-        table_name,
-        op: WriteOp::Insert(_),
-        input,
-        ..
-    }) = plan
-    else {
+    let LogicalPlan::Dml(DmlStatement { table_name, op: WriteOp::Insert(_), input, .. }) = plan else {
         return Ok(None);
     };
 
@@ -229,11 +223,7 @@ async fn try_fast_path_insert(plan: &LogicalPlan, session_context: &SessionConte
         // Values column declares (e.g. all-NULL columns come back as Null).
         // Cast back to target so the downstream MemBuffer schema check sees
         // exactly what the table expects.
-        let arr = if arr.data_type() == target_ty {
-            arr
-        } else {
-            datafusion::arrow::compute::cast(&arr, target_ty).map_err(arrow_err)?
-        };
+        let arr = if arr.data_type() == target_ty { arr } else { datafusion::arrow::compute::cast(&arr, target_ty).map_err(arrow_err)? };
         values_columns.push(arr);
     }
 
@@ -294,11 +284,8 @@ async fn dml_completion(df: datafusion::dataframe::DataFrame) -> PgWireResult<Op
         _ => return Ok(None),
     };
     let batches = df.collect().await.map_err(|e| PgWireError::ApiError(Box::new(e)))?;
-    let rows = batches
-        .first()
-        .and_then(|b| b.column_by_name("count"))
-        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-        .map_or(0, |a| a.value(0) as usize);
+    let rows =
+        batches.first().and_then(|b| b.column_by_name("count")).and_then(|c| c.as_any().downcast_ref::<UInt64Array>()).map_or(0, |a| a.value(0) as usize);
     Ok(Some(Response::Execution(tag.with_rows(rows))))
 }
 
@@ -329,10 +316,10 @@ pub fn global() -> Option<std::sync::Arc<PlanCacheHook>> {
 /// that just clears the cache once exceeded — cheap, correct, and never holds
 /// a lock across the await in `handle_simple_query`.
 pub struct PlanCacheHook {
-    cache:       dashmap::DashMap<String, LogicalPlan>,
-    capacity:    usize,
-    hits:        std::sync::atomic::AtomicU64,
-    misses:      std::sync::atomic::AtomicU64,
+    cache: dashmap::DashMap<String, LogicalPlan>,
+    capacity: usize,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
     /// Shape cache for LITERAL-bearing SELECTs (generated dashboard SQL that
     /// never repeats verbatim): keyed by the statement with every string
     /// literal replaced by `$N`, storing the pre-optimized placeholder plan +
@@ -340,20 +327,20 @@ pub struct PlanCacheHook {
     /// query's actual literals (cast to the inferred types) — skipping parse,
     /// analyze, AND optimize. `None` = negative entry: this shape failed to
     /// plan/parameterize once; don't retry it per query.
-    shapes:      dashmap::DashMap<String, Option<ShapeEntry>>,
+    shapes: dashmap::DashMap<String, Option<ShapeEntry>>,
     /// Canonical texts we served a pre-optimized substituted plan for, so
     /// `was_pre_optimized` can tell the handler to skip `state.optimize()`.
     /// Literal-bearing texts are one-shot (next dashboard refresh has new
     /// literals), so recency semantics with a soft cap are enough — a false
     /// `false` after eviction merely re-optimizes an optimized plan.
-    served:      dashmap::DashMap<String, ()>,
-    shape_hits:  std::sync::atomic::AtomicU64,
+    served: dashmap::DashMap<String, ()>,
+    shape_hits: std::sync::atomic::AtomicU64,
     shape_skips: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
 struct ShapeEntry {
-    plan:        LogicalPlan,
+    plan: LogicalPlan,
     /// Inferred DataType per `$N` (index 0 = `$1`); substituted literals are
     /// cast to these so the plan's expression types stay exact.
     param_types: Vec<Option<datafusion::arrow::datatypes::DataType>>,
@@ -428,13 +415,13 @@ impl Default for PlanCacheHook {
 impl PlanCacheHook {
     pub fn new(capacity: usize) -> Self {
         Self {
-            cache:       dashmap::DashMap::new(),
-            capacity:    capacity.max(1),
-            hits:        std::sync::atomic::AtomicU64::new(0),
-            misses:      std::sync::atomic::AtomicU64::new(0),
-            shapes:      dashmap::DashMap::new(),
-            served:      dashmap::DashMap::new(),
-            shape_hits:  std::sync::atomic::AtomicU64::new(0),
+            cache: dashmap::DashMap::new(),
+            capacity: capacity.max(1),
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+            shapes: dashmap::DashMap::new(),
+            served: dashmap::DashMap::new(),
+            shape_hits: std::sync::atomic::AtomicU64::new(0),
             shape_skips: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -502,11 +489,7 @@ impl PlanCacheHook {
                 None => v,
             })
             .collect();
-        let plan = entry
-            .plan
-            .clone()
-            .replace_params_with_values(&ParamValues::List(cast_values.into_iter().map(Into::into).collect()))
-            .ok()?;
+        let plan = entry.plan.clone().replace_params_with_values(&ParamValues::List(cast_values.into_iter().map(Into::into).collect())).ok()?;
         let plan = fold_literal_casts(plan).ok()?;
         self.shape_hits.fetch_add(1, Relaxed);
         // Mark so `was_pre_optimized` lets the handler skip state.optimize().
@@ -521,10 +504,7 @@ impl PlanCacheHook {
     /// `Statement::to_string()` avoids serializing the AST on every Parse
     /// message regardless of cacheability.
     fn kind_is_cacheable(stmt: &Statement) -> bool {
-        matches!(
-            stmt,
-            Statement::Insert(_) | Statement::Query(_) | Statement::Update { .. } | Statement::Delete(_)
-        )
+        matches!(stmt, Statement::Insert(_) | Statement::Query(_) | Statement::Update { .. } | Statement::Delete(_))
     }
 
     /// Only cache statements with at least one placeholder. Without a
@@ -749,11 +729,7 @@ mod tests {
         let text = param.to_string();
         assert!(text.contains("$1") && text.contains("$2"), "strings become placeholders: {text}");
         assert!(text.contains("= 5") && text.contains("LIMIT 100"), "numbers stay inline: {text}");
-        assert_eq!(
-            values,
-            vec![ScalarValue::Utf8(Some("p1".into())), ScalarValue::Utf8(Some("2026-07-01".into()))],
-            "values extracted in walk order"
-        );
+        assert_eq!(values, vec![ScalarValue::Utf8(Some("p1".into())), ScalarValue::Utf8(Some("2026-07-01".into()))], "values extracted in walk order");
         // Same shape with different literals → identical shape key.
         let stmt2 = parse("SELECT id FROM t WHERE project_id = 'p2' AND ts > '2026-07-04' AND n = 5 LIMIT 100");
         let (param2, _) = parameterize_statement(&stmt2).unwrap();
@@ -776,9 +752,7 @@ mod tests {
         ] {
             assert!(contains_plan_time_folded_fn(&parse(sql)), "{sql}");
         }
-        assert!(!contains_plan_time_folded_fn(&parse(
-            "SELECT id FROM t WHERE project_id = 'p' AND ts > '2026-07-01'"
-        )));
+        assert!(!contains_plan_time_folded_fn(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > '2026-07-01'")));
         // A column merely NAMED now must not disqualify.
         assert!(!contains_plan_time_folded_fn(&parse("SELECT now FROM t WHERE project_id = 'p'")));
     }

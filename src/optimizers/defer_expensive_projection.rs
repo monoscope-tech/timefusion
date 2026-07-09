@@ -56,12 +56,8 @@ impl OptimizerRule for DeferExpensiveProjection {
 
         // Projection-output column → underlying (unaliased) expr, for inlining
         // sort keys that reference projection outputs.
-        let out_map: std::collections::HashMap<Column, Expr> = proj
-            .schema
-            .iter()
-            .zip(proj.expr.iter())
-            .map(|((q, f), e)| (Column::new(q.cloned(), f.name()), e.clone().unalias()))
-            .collect();
+        let out_map: std::collections::HashMap<Column, Expr> =
+            proj.schema.iter().zip(proj.expr.iter()).map(|((q, f), e)| (Column::new(q.cloned(), f.name()), e.clone().unalias())).collect();
         let new_sort_exprs = sort
             .expr
             .iter()
@@ -97,20 +93,11 @@ impl OptimizerRule for DeferExpensiveProjection {
         }
 
         let min_proj = Projection::try_new(needed.into_iter().map(Expr::Column).collect(), Arc::clone(&proj.input))?;
-        let new_sort = LogicalPlan::Sort(Sort {
-            expr:  new_sort_exprs,
-            input: Arc::new(LogicalPlan::Projection(min_proj)),
-            fetch: sort.fetch,
-        });
+        let new_sort = LogicalPlan::Sort(Sort { expr: new_sort_exprs, input: Arc::new(LogicalPlan::Projection(min_proj)), fetch: sort.fetch });
         // Rebuild the original projection above the TopK, aliasing each expr
         // to its original (qualifier, name) so the parent plan's column
         // references and the root schema are unchanged.
-        let rebuilt = proj
-            .schema
-            .iter()
-            .zip(proj.expr.iter())
-            .map(|((q, f), e)| e.clone().unalias().alias_qualified(q.cloned(), f.name()))
-            .collect();
+        let rebuilt = proj.schema.iter().zip(proj.expr.iter()).map(|((q, f), e)| e.clone().unalias().alias_qualified(q.cloned(), f.name())).collect();
         let hoisted = Projection::try_new_with_schema(rebuilt, Arc::new(new_sort), Arc::clone(&proj.schema))?;
         Ok(Transformed::yes(LogicalPlan::Projection(hoisted)))
     }
@@ -141,10 +128,7 @@ mod tests {
         ctx.register_table("t", Arc::new(MemTable::try_new(schema, vec![vec![]]).unwrap())).unwrap();
         let df = ctx.sql(sql).await.unwrap();
         let logical = format!("{}", df.clone().into_optimized_plan().unwrap().display_indent());
-        let physical = format!(
-            "{}",
-            datafusion::physical_plan::displayable(df.create_physical_plan().await.unwrap().as_ref()).indent(false)
-        );
+        let physical = format!("{}", datafusion::physical_plan::displayable(df.create_physical_plan().await.unwrap().as_ref()).indent(false));
         (logical, physical)
     }
 
@@ -171,10 +155,7 @@ mod tests {
         // projection back below SortExec (it can only do so when the sort key
         // survives the projection as a raw column, which it doesn't here).
         let p_sort = phys.find("SortExec").expect(&phys);
-        assert!(
-            phys.find("concat").expect(&phys) < p_sort,
-            "physical plan must keep concat above SortExec:\n{phys}"
-        );
+        assert!(phys.find("concat").expect(&phys) < p_sort, "physical plan must keep concat above SortExec:\n{phys}");
         assert!(phys.contains("TopK"), "SortExec must run as TopK:\n{phys}");
     }
 

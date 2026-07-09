@@ -97,11 +97,8 @@ fn sort_batch(batch: &RecordBatch, by: &[&str]) -> RecordBatch {
     let cols: Vec<SortColumn> = by
         .iter()
         .map(|name| SortColumn {
-            values:  batch.column(batch.schema().index_of(name).unwrap()).clone(),
-            options: Some(SortOptions {
-                descending:  false,
-                nulls_first: false,
-            }),
+            values: batch.column(batch.schema().index_of(name).unwrap()).clone(),
+            options: Some(SortOptions { descending: false, nulls_first: false }),
         })
         .collect();
     let indices = lexsort_to_indices(&cols, None).unwrap();
@@ -186,10 +183,7 @@ async fn main() {
     let ts_lit = |t: i64| format!("TIMESTAMP '1970-01-01 00:00:00 UTC' + INTERVAL '{} microseconds'", t);
 
     let queries: Vec<(&str, String)> = vec![
-        (
-            "Q1_point_lookup",
-            format!("SELECT id FROM t WHERE timestamp = {} AND id = '{}'", ts_lit(target_ts), target_id),
-        ),
+        ("Q1_point_lookup", format!("SELECT id FROM t WHERE timestamp = {} AND id = '{}'", ts_lit(target_ts), target_id)),
         (
             "Q2_service_in_time",
             format!(
@@ -199,18 +193,8 @@ async fn main() {
                 target_svc
             ),
         ),
-        (
-            "Q3_time_range",
-            format!(
-                "SELECT count(*) FROM t WHERE timestamp >= {} AND timestamp <= {}",
-                ts_lit(win_start),
-                ts_lit(win_end)
-            ),
-        ),
-        (
-            "Q4_service_only",
-            format!("SELECT count(*) FROM t WHERE resource___service___name = '{}'", target_svc),
-        ),
+        ("Q3_time_range", format!("SELECT count(*) FROM t WHERE timestamp >= {} AND timestamp <= {}", ts_lit(win_start), ts_lit(win_end))),
+        ("Q4_service_only", format!("SELECT count(*) FROM t WHERE resource___service___name = '{}'", target_svc)),
     ];
 
     println!("\nTimings (ms, mean over 30 iters; rows = result row count):");

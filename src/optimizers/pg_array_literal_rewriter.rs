@@ -68,25 +68,17 @@ const AUDITED_DATAFUSION_VERSION: &str = "54.0.0";
 // stable — assert!(a == b) won't compile in a const block.
 const _: () = {
     let (a, b) = (datafusion::DATAFUSION_VERSION.as_bytes(), AUDITED_DATAFUSION_VERSION.as_bytes());
-    assert!(
-        a.len() == b.len(),
-        "DataFusion bumped: re-audit PgCoalesceUdf's ScalarUDFImpl forwarding, then update AUDITED_DATAFUSION_VERSION"
-    );
+    assert!(a.len() == b.len(), "DataFusion bumped: re-audit PgCoalesceUdf's ScalarUDFImpl forwarding, then update AUDITED_DATAFUSION_VERSION");
     let mut i = 0;
     while i < a.len() {
-        assert!(
-            a[i] == b[i],
-            "DataFusion bumped: re-audit PgCoalesceUdf's ScalarUDFImpl forwarding, then update AUDITED_DATAFUSION_VERSION"
-        );
+        assert!(a[i] == b[i], "DataFusion bumped: re-audit PgCoalesceUdf's ScalarUDFImpl forwarding, then update AUDITED_DATAFUSION_VERSION");
         i += 1;
     }
 };
 
 impl Default for PgCoalesceUdf {
     fn default() -> Self {
-        Self {
-            inner: datafusion::functions::core::coalesce(),
-        }
+        Self { inner: datafusion::functions::core::coalesce() }
     }
 }
 
@@ -129,20 +121,10 @@ impl datafusion::logical_expr::ScalarUDFImpl for PgCoalesceUdf {
             // (coalesce(utf8_list, int_list, '{}')) the retried coercion below
             // fails on the second list and the original error surfaces — no
             // silent mis-typing, just a planner-time error like today.
-            let list_t = arg_types
-                .iter()
-                .find(|t| matches!(t, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..)))
-                .ok_or(e)?
-                .clone();
+            let list_t = arg_types.iter().find(|t| matches!(t, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..))).ok_or(e)?.clone();
             let patched: Vec<DataType> = arg_types
                 .iter()
-                .map(|t| {
-                    if matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8) {
-                        list_t.clone()
-                    } else {
-                        t.clone()
-                    }
-                })
+                .map(|t| if matches!(t, DataType::Utf8 | DataType::Utf8View | DataType::LargeUtf8) { list_t.clone() } else { t.clone() })
                 .collect();
             self.inner.coerce_types(&patched)
         })
@@ -289,11 +271,7 @@ fn finish_elem(cur: &mut String, was_quoted: &mut bool) -> Option<String> {
     let raw = std::mem::take(cur);
     let quoted = std::mem::take(was_quoted);
     let trimmed = raw.trim();
-    if !quoted && trimmed.eq_ignore_ascii_case("null") {
-        None
-    } else {
-        Some(if quoted { raw } else { trimmed.to_string() })
-    }
+    if !quoted && trimmed.eq_ignore_ascii_case("null") { None } else { Some(if quoted { raw } else { trimmed.to_string() }) }
 }
 
 #[cfg(test)]
@@ -356,11 +334,7 @@ mod tests {
     #[tokio::test]
     async fn coalesce_string_column_with_list_errors() {
         let ctx = ctx_with_rule();
-        let err = expect_plan_error(
-            &ctx,
-            "SELECT COALESCE(v, l) FROM (SELECT CAST('x' AS VARCHAR) AS v, CAST(NULL AS VARCHAR[]) AS l)",
-        )
-        .await;
+        let err = expect_plan_error(&ctx, "SELECT COALESCE(v, l) FROM (SELECT CAST('x' AS VARCHAR) AS v, CAST(NULL AS VARCHAR[]) AS l)").await;
         assert!(err.contains("cannot be matched"), "{err}");
     }
 
@@ -383,11 +357,7 @@ mod tests {
                 logical_plan::builder::{LogicalPlanBuilder, LogicalTableSource},
             },
         };
-        let schema = Schema::new(vec![Field::new(
-            "hashes",
-            DataType::List(Field::new("item", DataType::Utf8, true).into()),
-            true,
-        )]);
+        let schema = Schema::new(vec![Field::new("hashes", DataType::List(Field::new("item", DataType::Utf8, true).into()), true)]);
         let coalesce = Expr::ScalarFunction(ScalarFunction::new_udf(datafusion::functions::core::coalesce(), vec![col("hashes"), lit("{}")]));
         let scan = LogicalPlanBuilder::scan_with_filters("t", Arc::new(LogicalTableSource::new(schema.into())), None, vec![coalesce.eq(col("hashes"))])
             .unwrap()
@@ -396,14 +366,8 @@ mod tests {
         let analyzed = PgArrayLiteralRewriter.analyze(scan, &ConfigOptions::default()).unwrap();
         let LogicalPlan::TableScan(ts) = analyzed else { panic!("expected TableScan") };
         let Expr::BinaryExpr(be) = &ts.filters[0] else { panic!("expected eq filter") };
-        let Expr::ScalarFunction(f) = be.left.as_ref() else {
-            panic!("expected coalesce")
-        };
-        assert!(
-            matches!(f.args[1], Expr::Literal(ScalarValue::List(_), _)),
-            "array literal in TableScan filter not rewritten: {:?}",
-            f.args[1]
-        );
+        let Expr::ScalarFunction(f) = be.left.as_ref() else { panic!("expected coalesce") };
+        assert!(matches!(f.args[1], Expr::Literal(ScalarValue::List(_), _)), "array literal in TableScan filter not rewritten: {:?}", f.args[1]);
     }
 
     #[test]

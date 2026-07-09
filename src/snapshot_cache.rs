@@ -108,15 +108,10 @@ mod tests {
 
         // A metadata commit through the high-level ops API exercises the same
         // CommitBuilder post-commit hook the flush path uses.
-        table = table
-            .set_tbl_properties()
-            .with_properties(std::collections::HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())]))
-            .await?;
+        table =
+            table.set_tbl_properties().with_properties(std::collections::HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())])).await?;
         assert_eq!(table.version(), Some(1));
-        assert!(
-            table.state.as_ref().unwrap().has_materialized_files(),
-            "post-commit state must stay materialized; if false, every flush full-scans"
-        );
+        assert!(table.state.as_ref().unwrap().has_materialized_files(), "post-commit state must stay materialized; if false, every flush full-scans");
         Ok(())
     }
 
@@ -131,20 +126,14 @@ mod tests {
         let url = Url::parse("memory:///full_load")?;
         let t = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).build()?;
         let created = t.create().with_columns(get_default_schema().columns().unwrap_or_default()).await?;
-        created
-            .set_tbl_properties()
-            .with_properties(std::collections::HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())]))
-            .await?;
+        created.set_tbl_properties().with_properties(std::collections::HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())])).await?;
 
         let mut loaded = DeltaTableBuilder::from_url(url.clone())?.with_storage_backend(mem.clone(), url.clone()).load().await?;
         let materialized_on_load = loaded.state.as_ref().unwrap().has_materialized_files();
         // Tier A must leave the state materialized regardless of how it loaded.
         let log_store = loaded.log_store();
         loaded.state.as_mut().unwrap().ensure_materialized_files(log_store.as_ref()).await?;
-        assert!(
-            loaded.state.as_ref().unwrap().has_materialized_files(),
-            "ensure_materialized_files must materialize after a full load"
-        );
+        assert!(loaded.state.as_ref().unwrap().has_materialized_files(), "ensure_materialized_files must materialize after a full load");
         eprintln!("FULL_LOAD_MATERIALIZED_ON_LOAD={materialized_on_load}");
         Ok(())
     }
@@ -164,10 +153,8 @@ mod tests {
         store(dir.path(), url.as_str(), table.state.as_ref().unwrap());
 
         // External commit after the persist — restore must catch up to it.
-        let _v1 = table
-            .set_tbl_properties()
-            .with_properties(std::collections::HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())]))
-            .await?;
+        let _v1 =
+            table.set_tbl_properties().with_properties(std::collections::HashMap::from([("delta.checkpointInterval".to_string(), "50".to_string())])).await?;
 
         let state = load(dir.path(), url.as_str()).expect("persisted snapshot loads");
         assert_eq!(state.version(), 0);
@@ -181,23 +168,14 @@ mod tests {
         // across updates — otherwise post-commit updates fall back to a full
         // checkpoint replay (the 2-8s/flush prod cost). Guard the whole chain:
         // ensure (idempotent) → update (incremental) → reconcile rebuild.
-        assert!(
-            restored.state.as_ref().unwrap().has_materialized_files(),
-            "restored snapshot must come back materialized"
-        );
+        assert!(restored.state.as_ref().unwrap().has_materialized_files(), "restored snapshot must come back materialized");
         let log_store = restored.log_store();
         restored.state.as_mut().unwrap().ensure_materialized_files(log_store.as_ref()).await?;
         restored.update_state().await?;
-        assert!(
-            restored.state.as_ref().unwrap().has_materialized_files(),
-            "materialization must survive update (stays incremental)"
-        );
+        assert!(restored.state.as_ref().unwrap().has_materialized_files(), "materialization must survive update (stays incremental)");
         let log_store = restored.log_store();
         restored.state.as_mut().unwrap().rematerialize_files(log_store.as_ref()).await?;
-        assert!(
-            restored.state.as_ref().unwrap().has_materialized_files(),
-            "rematerialize_files keeps the file list materialized"
-        );
+        assert!(restored.state.as_ref().unwrap().has_materialized_files(), "rematerialize_files keeps the file list materialized");
 
         // Wrong table url (or hash collision) must miss, not mis-restore.
         assert!(load(dir.path(), "memory:///other_tbl").is_none());

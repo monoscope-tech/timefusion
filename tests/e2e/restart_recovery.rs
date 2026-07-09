@@ -27,13 +27,11 @@ async fn flushed_rows_survive_restart() -> anyhow::Result<()> {
     env.restart().await?;
 
     let client = env.pg_client().await?;
-    let count: i64 = tokio::time::timeout(
-        Duration::from_secs(10),
-        client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("post-restart SELECT timed out"))??
-    .get(0);
+    let count: i64 =
+        tokio::time::timeout(Duration::from_secs(10), client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]))
+            .await
+            .map_err(|_| anyhow::anyhow!("post-restart SELECT timed out"))??
+            .get(0);
     assert_eq!(count, 5, "flushed rows lost across restart");
     Ok(())
 }
@@ -75,10 +73,7 @@ async fn unflushed_rows_replayed_from_wal() -> anyhow::Result<()> {
     env.restart().await?;
 
     let stats = env.snapshot_stats();
-    assert!(
-        stats.mem_total_rows >= 3,
-        "WAL replay did not restore rows into MemBuffer; post-restart stats={stats:?}"
-    );
+    assert!(stats.mem_total_rows >= 3, "WAL replay did not restore rows into MemBuffer; post-restart stats={stats:?}");
 
     let client = env.pg_client().await?;
     let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);
@@ -130,10 +125,6 @@ async fn cold_start_under_five_seconds() -> anyhow::Result<()> {
     // 5s is the loose initial bar — prod is currently >1min so any honest
     // local reproduction will fail this until we cut the dominant phase.
     // Per-phase timing is logged from bootstrap.rs; grep for `bootstrap.phase=`.
-    assert!(
-        restart_elapsed < Duration::from_secs(5),
-        "cold-start regression: re-bootstrap took {:?} (target <5s)",
-        restart_elapsed
-    );
+    assert!(restart_elapsed < Duration::from_secs(5), "cold-start regression: re-bootstrap took {:?} (target <5s)", restart_elapsed);
     Ok(())
 }

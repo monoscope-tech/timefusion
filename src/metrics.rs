@@ -187,36 +187,16 @@ pub fn init_metrics(
         }};
     }
 
-    layer_gauge!(
-        "timefusion.mem_buffer.pressure_pct",
-        "MemBuffer memory pressure as percentage of max",
-        |s| s.pressure_pct as u64
-    );
-    layer_gauge!(
-        "timefusion.mem_buffer.estimated_bytes",
-        "MemBuffer estimated heap residency in bytes",
-        |s| s.mem_estimated_bytes as u64
-    );
-    layer_gauge!(
-        "timefusion.mem_buffer.rows",
-        "Total rows in MemBuffer across all projects/tables",
-        |s| s.mem_total_rows as u64
-    );
+    layer_gauge!("timefusion.mem_buffer.pressure_pct", "MemBuffer memory pressure as percentage of max", |s| s.pressure_pct as u64);
+    layer_gauge!("timefusion.mem_buffer.estimated_bytes", "MemBuffer estimated heap residency in bytes", |s| s.mem_estimated_bytes as u64);
+    layer_gauge!("timefusion.mem_buffer.rows", "Total rows in MemBuffer across all projects/tables", |s| s.mem_total_rows as u64);
     // Ingest vs drain: rate() these two and compare. Ingested climbing faster
     // than flushed (while pressure_pct=100, flush_failed flat) = ingest
     // outpacing a working drain, not a stuck flush. Counters (not gauges) so
     // rate() handles the restart-to-0 reset. `ingested` includes WAL-recovered
     // rows so the pair stays comparable after a restart (see snapshot_stats).
-    layer_counter!(
-        "timefusion.mem_buffer.rows_ingested_total",
-        "Cumulative rows accepted into MemBuffer (incl. WAL recovery)",
-        |s| s.rows_ingested_total
-    );
-    layer_counter!(
-        "timefusion.mem_buffer.rows_flushed_total",
-        "Cumulative rows drained from MemBuffer to Delta",
-        |s| s.rows_flushed_total
-    );
+    layer_counter!("timefusion.mem_buffer.rows_ingested_total", "Cumulative rows accepted into MemBuffer (incl. WAL recovery)", |s| s.rows_ingested_total);
+    layer_counter!("timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
     layer_gauge!("timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
     layer_gauge!("timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
 
@@ -235,11 +215,7 @@ pub fn init_metrics(
                 // (more meaningful than wall clock — ingest may have stopped).
                 // Fall back to wall clock if no MemBuffer reference exists.
                 let now_micros = if let Some(layer) = bl_for_lag.upgrade() {
-                    layer
-                        .snapshot_stats()
-                        .oldest_bucket_age_secs
-                        .map(|_| crate::clock::now_micros())
-                        .unwrap_or_else(crate::clock::now_micros)
+                    layer.snapshot_stats().oldest_bucket_age_secs.map(|_| crate::clock::now_micros()).unwrap_or_else(crate::clock::now_micros)
                 } else {
                     crate::clock::now_micros()
                 };
@@ -258,10 +234,7 @@ pub fn init_metrics(
     // until shutdown anyway. Avoids stashing a handle the caller must own.
     let _ = Arc::new(provider);
 
-    info!(
-        "OpenTelemetry metrics initialized (OTLP -> {}, interval=30s)",
-        config.otel_exporter_otlp_endpoint
-    );
+    info!("OpenTelemetry metrics initialized (OTLP -> {}, interval=30s)", config.otel_exporter_otlp_endpoint);
     Ok(())
 }
 
@@ -418,23 +391,23 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 /// rest are monotonic.
 #[derive(Default)]
 pub struct MaintenanceStats {
-    pub checkpoints_created:     AtomicU64,
-    pub checkpoint_failed:       AtomicU64,
-    pub log_files_cleaned:       AtomicU64,
-    pub log_cleanup_failed:      AtomicU64,
+    pub checkpoints_created: AtomicU64,
+    pub checkpoint_failed: AtomicU64,
+    pub log_files_cleaned: AtomicU64,
+    pub log_cleanup_failed: AtomicU64,
     pub checkpoint_lag_versions: AtomicU64,
-    pub dangling_removed:        AtomicU64,
-    pub reconcile_failed:        AtomicU64,
+    pub dangling_removed: AtomicU64,
+    pub reconcile_failed: AtomicU64,
 }
 
 static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
-    checkpoints_created:     AtomicU64::new(0),
-    checkpoint_failed:       AtomicU64::new(0),
-    log_files_cleaned:       AtomicU64::new(0),
-    log_cleanup_failed:      AtomicU64::new(0),
+    checkpoints_created: AtomicU64::new(0),
+    checkpoint_failed: AtomicU64::new(0),
+    log_files_cleaned: AtomicU64::new(0),
+    log_cleanup_failed: AtomicU64::new(0),
     checkpoint_lag_versions: AtomicU64::new(0),
-    dangling_removed:        AtomicU64::new(0),
-    reconcile_failed:        AtomicU64::new(0),
+    dangling_removed: AtomicU64::new(0),
+    reconcile_failed: AtomicU64::new(0),
 };
 
 pub fn maintenance_stats() -> &'static MaintenanceStats {

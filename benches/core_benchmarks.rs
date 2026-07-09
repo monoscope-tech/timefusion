@@ -110,16 +110,10 @@ fn insert_sql(project_id: &str, n: usize) -> String {
     let values: Vec<String> = (0..n)
         .map(|i| {
             let ts = now_ts();
-            format!(
-                "('{}', '{}', TIMESTAMP '{}', 'id_{i}', 'bench_span', 'INFO', ARRAY[]::varchar[], ARRAY['summary'])",
-                project_id, date, ts
-            )
+            format!("('{}', '{}', TIMESTAMP '{}', 'id_{i}', 'bench_span', 'INFO', ARRAY[]::varchar[], ARRAY['summary'])", project_id, date, ts)
         })
         .collect();
-    format!(
-        "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, level, hashes, summary) VALUES {}",
-        values.join(", ")
-    )
+    format!("INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, level, hashes, summary) VALUES {}", values.join(", "))
 }
 
 // =============================================================================
@@ -215,10 +209,7 @@ fn bench_reads(c: &mut Criterion) {
     });
 
     group.bench_function("sql_select_filter_level", |b| {
-        let (ctx, sql) = (
-            ctx.clone(),
-            format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{pid}' AND level = 'ERROR'"),
-        );
+        let (ctx, sql) = (ctx.clone(), format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{pid}' AND level = 'ERROR'"));
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }
@@ -238,10 +229,7 @@ fn bench_reads(c: &mut Criterion) {
     });
 
     group.bench_function("sql_select_aggregation", |b| {
-        let (ctx, sql) = (
-            ctx.clone(),
-            format!("SELECT level, COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{pid}' GROUP BY level"),
-        );
+        let (ctx, sql) = (ctx.clone(), format!("SELECT level, COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{pid}' GROUP BY level"));
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }
@@ -308,10 +296,7 @@ fn bench_s3_reads(c: &mut Criterion) {
     });
 
     group.bench_function("s3_select_filter", |b| {
-        let (ctx, sql) = (
-            ctx.clone(),
-            format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{pid}' AND level = 'INFO'"),
-        );
+        let (ctx, sql) = (ctx.clone(), format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{pid}' AND level = 'INFO'"));
         b.to_async(&rt).iter(|| {
             let (ctx, sql) = (ctx.clone(), sql.clone());
             async move { ctx.sql(&sql).await.unwrap().collect().await.unwrap() }

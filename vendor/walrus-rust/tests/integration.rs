@@ -349,13 +349,7 @@ fn integration_memory_pressure_test() {
         assert_eq!(entry.data.len(), large_entry_size);
 
         for (i, &byte) in entry.data.iter().enumerate() {
-            assert_eq!(
-                byte,
-                ((topic_id + i) % 256) as u8,
-                "Memory pressure test failed at topic {} byte {}",
-                topic_id,
-                i
-            );
+            assert_eq!(byte, ((topic_id + i) % 256) as u8, "Memory pressure test failed at topic {} byte {}", topic_id, i);
         }
     }
 }
@@ -385,13 +379,7 @@ fn integration_file_rollover_stress() {
         assert_eq!(entry.data.len(), entry_size);
 
         for (i, &byte) in entry.data.iter().enumerate() {
-            assert_eq!(
-                byte,
-                ((entry_id * 1000 + i) % 256) as u8,
-                "File rollover validation failed at entry {} byte {}",
-                entry_id,
-                i
-            );
+            assert_eq!(byte, ((entry_id * 1000 + i) % 256) as u8, "File rollover validation failed at entry {} byte {}", entry_id, i);
         }
     }
 }
@@ -495,13 +483,7 @@ fn integration_mixed_size_stress() {
         assert_eq!(entry.data.len(), base_size);
 
         for (j, &byte) in entry.data.iter().enumerate() {
-            assert_eq!(
-                byte,
-                ((i * 1000 + j) % 256) as u8,
-                "Mixed size validation failed at size {} byte {}",
-                base_size,
-                j
-            );
+            assert_eq!(byte, ((i * 1000 + j) % 256) as u8, "Mixed size validation failed at size {} byte {}", base_size, j);
         }
     }
 }

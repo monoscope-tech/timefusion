@@ -25,56 +25,37 @@ use timefusion::{
 
 fn table() -> TableSchema {
     TableSchema {
-        table_name:      "bench".into(),
-        partitions:      vec![],
-        sorting_columns: vec![SortingColumnDef {
-            name:        "timestamp".into(),
-            descending:  false,
-            nulls_first: false,
-        }],
+        table_name: "bench".into(),
+        partitions: vec![],
+        sorting_columns: vec![SortingColumnDef { name: "timestamp".into(), descending: false, nulls_first: false }],
         z_order_columns: vec![],
-        time_column:     None,
-        dedup_keys:      vec![],
-        dedup_tiebreak:  None,
-        fields:          vec![
+        time_column: None,
+        dedup_keys: vec![],
+        dedup_tiebreak: None,
+        fields: vec![
             FieldDef {
-                name:         "timestamp".into(),
-                data_type:    "Timestamp(Microsecond, Some(\"UTC\"))".into(),
-                nullable:     false,
-                tantivy:      None,
-                dictionary:   None,
+                name: "timestamp".into(),
+                data_type: "Timestamp(Microsecond, Some(\"UTC\"))".into(),
+                nullable: false,
+                tantivy: None,
+                dictionary: None,
+                bloom_filter: false,
+            },
+            FieldDef { name: "id".into(), data_type: "Utf8".into(), nullable: false, tantivy: None, dictionary: None, bloom_filter: false },
+            FieldDef {
+                name: "level".into(),
+                data_type: "Utf8".into(),
+                nullable: true,
+                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None }),
+                dictionary: None,
                 bloom_filter: false,
             },
             FieldDef {
-                name:         "id".into(),
-                data_type:    "Utf8".into(),
-                nullable:     false,
-                tantivy:      None,
-                dictionary:   None,
-                bloom_filter: false,
-            },
-            FieldDef {
-                name:         "level".into(),
-                data_type:    "Utf8".into(),
-                nullable:     true,
-                tantivy:      Some(TantivyFieldConfig {
-                    indexed:   true,
-                    tokenizer: Some("raw".into()),
-                    flatten:   None,
-                }),
-                dictionary:   None,
-                bloom_filter: false,
-            },
-            FieldDef {
-                name:         "message".into(),
-                data_type:    "Utf8".into(),
-                nullable:     true,
-                tantivy:      Some(TantivyFieldConfig {
-                    indexed:   true,
-                    tokenizer: Some("default".into()),
-                    flatten:   None,
-                }),
-                dictionary:   None,
+                name: "message".into(),
+                data_type: "Utf8".into(),
+                nullable: true,
+                tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: Some("default".into()), flatten: None }),
+                dictionary: None,
                 bloom_filter: false,
             },
         ],
@@ -87,9 +68,7 @@ fn synthetic_batch(n: usize) -> RecordBatch {
     let ts: ArrayRef = Arc::new(TimestampMicrosecondArray::from((0..n as i64).map(|i| 1_000_000 + i * 1000).collect::<Vec<_>>()).with_timezone("UTC"));
     let id: ArrayRef = Arc::new(StringArray::from((0..n).map(|i| format!("id-{i}")).collect::<Vec<_>>()));
     let level: ArrayRef = Arc::new(StringArray::from((0..n).map(|i| levels[i % levels.len()]).collect::<Vec<_>>()));
-    let msg: ArrayRef = Arc::new(StringArray::from(
-        (0..n).map(|i| format!("{} {}", words[i % words.len()], words[(i + 3) % words.len()])).collect::<Vec<_>>(),
-    ));
+    let msg: ArrayRef = Arc::new(StringArray::from((0..n).map(|i| format!("{} {}", words[i % words.len()], words[(i + 3) % words.len()])).collect::<Vec<_>>()));
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
         Field::new("id", DataType::Utf8, false),
@@ -133,12 +112,7 @@ fn bench_size_ratio(c: &mut Criterion) {
     let b = synthetic_batch(n);
     let (blob, stats) = store::build_and_pack(&table, std::slice::from_ref(&b), 19).unwrap();
     let bytes_per_row = blob.len() as f64 / stats.rows as f64;
-    println!(
-        "tantivy index size: {} bytes for {} rows ({:.2} bytes/row)",
-        blob.len(),
-        stats.rows,
-        bytes_per_row
-    );
+    println!("tantivy index size: {} bytes for {} rows ({:.2} bytes/row)", blob.len(), stats.rows, bytes_per_row);
     c.bench_function("tantivy_pack_100k_zstd_19", |bench| {
         bench.iter(|| {
             let _ = store::build_and_pack(&table, std::slice::from_ref(&b), 19).unwrap();
@@ -173,10 +147,7 @@ fn make_app_cfg(test_id: &str, _tantivy_enabled: bool) -> Arc<AppConfig> {
     c.core.timefusion_table_prefix = format!("tantivy-bench-{test_id}");
     c.core.timefusion_data_dir = PathBuf::from(format!("/tmp/timefusion-tantivy-bench-{test_id}"));
     c.cache.timefusion_foyer_disabled = true;
-    c.tantivy = TantivyConfig {
-        timefusion_tantivy_compression_level: 3,
-        ..Default::default()
-    };
+    c.tantivy = TantivyConfig { timefusion_tantivy_compression_level: 3, ..Default::default() };
     Arc::new(c)
 }
 

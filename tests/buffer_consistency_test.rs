@@ -64,11 +64,7 @@ async fn test_insert_query(mode: BufferMode) -> Result<()> {
     let batch = json_to_batch(records)?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
-    let result = ctx
-        .sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
-        .await?
-        .collect()
-        .await?;
+    let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
 
     let count = result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
     assert_eq!(count, 10, "Expected 10 rows");
@@ -87,11 +83,7 @@ async fn test_select_columns(mode: BufferMode) -> Result<()> {
     let batch = json_to_batch(vec![test_span("test1", "my_span", &project_id)])?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
-    let result = ctx
-        .sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
-        .await?
-        .collect()
-        .await?;
+    let result = ctx.sql(&format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
 
     assert_eq!(result[0].num_rows(), 1);
     assert_eq!(get_str(result[0].column(0).as_ref(), 0), "test1");
@@ -112,22 +104,9 @@ async fn test_update(mode: BufferMode) -> Result<()> {
     let batch = json_to_batch(records)?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
-    ctx.sql(&format!(
-        "UPDATE otel_logs_and_spans SET duration = 999 WHERE project_id = '{}' AND name = 'name_1'",
-        project_id
-    ))
-    .await?
-    .collect()
-    .await?;
+    ctx.sql(&format!("UPDATE otel_logs_and_spans SET duration = 999 WHERE project_id = '{}' AND name = 'name_1'", project_id)).await?.collect().await?;
 
-    let result = ctx
-        .sql(&format!(
-            "SELECT name, duration FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY name",
-            project_id
-        ))
-        .await?
-        .collect()
-        .await?;
+    let result = ctx.sql(&format!("SELECT name, duration FROM otel_logs_and_spans WHERE project_id = '{}' ORDER BY name", project_id)).await?.collect().await?;
 
     let batch = &result[0];
     for i in 0..batch.num_rows() {
@@ -153,19 +132,9 @@ async fn test_delete(mode: BufferMode) -> Result<()> {
     let batch = json_to_batch(records)?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
-    ctx.sql(&format!(
-        "DELETE FROM otel_logs_and_spans WHERE project_id = '{}' AND name = 'name_2'",
-        project_id
-    ))
-    .await?
-    .collect()
-    .await?;
+    ctx.sql(&format!("DELETE FROM otel_logs_and_spans WHERE project_id = '{}' AND name = 'name_2'", project_id)).await?.collect().await?;
 
-    let result = ctx
-        .sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
-        .await?
-        .collect()
-        .await?;
+    let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
 
     let count = result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
     assert_eq!(count, 4, "Expected 4 rows after delete");
@@ -186,10 +155,7 @@ async fn test_aggregations(mode: BufferMode) -> Result<()> {
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
 
     let result = ctx
-        .sql(&format!(
-            "SELECT COUNT(*) as cnt, SUM(duration) as total, AVG(duration) as avg_dur FROM otel_logs_and_spans WHERE project_id = '{}'",
-            project_id
-        ))
+        .sql(&format!("SELECT COUNT(*) as cnt, SUM(duration) as total, AVG(duration) as avg_dur FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
         .await?
         .collect()
         .await?;
@@ -246,11 +212,7 @@ async fn test_partial_flush_union() -> Result<()> {
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch2], false, None).await?;
 
     // Query should return all 100 rows (50 from Delta + 50 from buffer)
-    let result = ctx
-        .sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
-        .await?
-        .collect()
-        .await?;
+    let result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
 
     let count = result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
     assert_eq!(count, 100, "Expected 100 rows from union of buffer + Delta");
@@ -288,9 +250,7 @@ async fn test_delta_only_query() -> Result<()> {
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch2], false, None).await?;
 
     // Delta-only query should return only Delta data (30 rows)
-    let delta_result = db
-        .query_delta_only(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
-        .await?;
+    let delta_result = db.query_delta_only(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?;
 
     let delta_count = delta_result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
     assert_eq!(delta_count, 30, "Delta-only should return 30 rows from Delta");
@@ -298,11 +258,7 @@ async fn test_delta_only_query() -> Result<()> {
     // Normal query should return all 50 (30 from Delta + 20 from buffer)
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
-    let full_result = ctx
-        .sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id))
-        .await?
-        .collect()
-        .await?;
+    let full_result = ctx.sql(&format!("SELECT COUNT(*) as cnt FROM otel_logs_and_spans WHERE project_id = '{}'", project_id)).await?.collect().await?;
 
     let full_count = full_result[0].column(0).as_primitive::<datafusion::arrow::datatypes::Int64Type>().value(0);
     assert_eq!(full_count, 50, "Full query should return all 50 rows");

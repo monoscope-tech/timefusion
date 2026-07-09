@@ -148,11 +148,7 @@ async fn test_checkpoint_invalidation_on_commit() -> anyhow::Result<()> {
     assert_eq!(data4, new_checkpoint_data, "Should get new checkpoint data after invalidation");
     let stats7 = cache.get_stats().await;
     // Should be a hit because invalidate_checkpoint_cache now immediately refreshes the cache
-    assert_eq!(
-        stats7.main.hits - stats6.main.hits,
-        1,
-        "Should hit cache after invalidation (cache was refreshed)"
-    );
+    assert_eq!(stats7.main.hits - stats6.main.hits, 1, "Should hit cache after invalidation (cache was refreshed)");
 
     // Cleanup
     cache.shutdown().await?;

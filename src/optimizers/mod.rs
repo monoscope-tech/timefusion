@@ -121,11 +121,7 @@ pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
             (Expr::Column(col), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(col)) if col.name == "project_id" => extract_utf8_string(v),
             _ => None,
         },
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op: Operator::And,
-            right,
-        }) => extract_project_id_from_expr(left).or_else(|| extract_project_id_from_expr(right)),
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => extract_project_id_from_expr(left).or_else(|| extract_project_id_from_expr(right)),
         _ => None,
     }
 }
@@ -150,11 +146,7 @@ impl ProjectIdPushdown {
                 (Expr::Column(col), Expr::Literal(_, _)) | (Expr::Literal(_, _), Expr::Column(col))
                 if col.name == "project_id"
             ),
-            Expr::BinaryExpr(BinaryExpr {
-                left,
-                op: Operator::And,
-                right,
-            }) => Self::contains_project_id(left) || Self::contains_project_id(right),
+            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => Self::contains_project_id(left) || Self::contains_project_id(right),
             _ => false,
         }
     }

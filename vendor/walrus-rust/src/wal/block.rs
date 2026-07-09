@@ -15,32 +15,27 @@ pub struct Entry {
 #[derive(Archive, Deserialize, Serialize, Debug)]
 #[archive(check_bytes)]
 pub(crate) struct Metadata {
-    pub(crate) read_size:        usize,
-    pub(crate) owned_by:         String,
+    pub(crate) read_size: usize,
+    pub(crate) owned_by: String,
     pub(crate) next_block_start: u64,
-    pub(crate) checksum:         u64,
+    pub(crate) checksum: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct Block {
-    pub(crate) id:        u64,
+    pub(crate) id: u64,
     pub(crate) file_path: String,
-    pub(crate) offset:    u64,
-    pub(crate) limit:     u64,
-    pub(crate) mmap:      Arc<SharedMmap>,
-    pub(crate) used:      u64,
+    pub(crate) offset: u64,
+    pub(crate) limit: u64,
+    pub(crate) mmap: Arc<SharedMmap>,
+    pub(crate) used: u64,
 }
 
 impl Block {
     pub(crate) fn write(&self, in_block_offset: u64, data: &[u8], owned_by: &str, next_block_start: u64) -> std::io::Result<()> {
         debug_assert!(in_block_offset + (data.len() as u64 + PREFIX_META_SIZE as u64) <= self.limit);
 
-        let new_meta = Metadata {
-            read_size: data.len(),
-            owned_by: owned_by.to_string(),
-            next_block_start,
-            checksum: checksum64(data),
-        };
+        let new_meta = Metadata { read_size: data.len(), owned_by: owned_by.to_string(), next_block_start, checksum: checksum64(data) };
 
         let meta_bytes =
             rkyv::to_bytes::<_, 256>(&new_meta).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("serialize metadata failed: {:?}", e)))?;
@@ -74,10 +69,7 @@ impl Block {
         let meta_len = (meta_buffer[0] as usize) | ((meta_buffer[1] as usize) << 8);
 
         if meta_len == 0 || meta_len > PREFIX_META_SIZE - 2 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid metadata length: {}", meta_len),
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid metadata length: {}", meta_len)));
         }
 
         // Deserialize only the actual metadata bytes (skip the 2-byte length prefix)
@@ -88,9 +80,8 @@ impl Block {
         // We bounded `meta_len` to PREFIX_META_SIZE and copy into an `AlignedVec`,
         // which satisfies alignment requirements of rkyv.
         let archived = unsafe { rkyv::archived_root::<Metadata>(&aligned[..]) };
-        let meta: Metadata = archived
-            .deserialize(&mut rkyv::Infallible)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to deserialize metadata"))?;
+        let meta: Metadata =
+            archived.deserialize(&mut rkyv::Infallible).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to deserialize metadata"))?;
         let actual_entry_size = meta.read_size;
 
         // Read the actual data
@@ -101,16 +92,8 @@ impl Block {
         // Verify checksum
         let expected = meta.checksum;
         if checksum64(&ret_buffer) != expected {
-            debug_print!(
-                "[reader] checksum mismatch; skipping corrupted entry at offset={} in file={}, block_id={}",
-                in_block_offset,
-                self.file_path,
-                self.id
-            );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "checksum mismatch, data corruption detected",
-            ));
+            debug_print!("[reader] checksum mismatch; skipping corrupted entry at offset={} in file={}, block_id={}", in_block_offset, self.file_path, self.id);
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "checksum mismatch, data corruption detected"));
         }
 
         let consumed = PREFIX_META_SIZE + actual_entry_size;

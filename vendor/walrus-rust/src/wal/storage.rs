@@ -17,7 +17,7 @@ use crate::wal::config::{FsyncSchedule, USE_FD_BACKEND};
 #[derive(Debug)]
 pub(crate) struct FdBackend {
     file: std::fs::File,
-    len:  usize,
+    len: usize,
 }
 
 impl FdBackend {
@@ -134,7 +134,7 @@ fn create_storage_impl(path: &str) -> std::io::Result<StorageImpl> {
 
 #[derive(Debug)]
 pub(crate) struct SharedMmap {
-    storage:         StorageImpl,
+    storage: StorageImpl,
     last_touched_at: AtomicU64,
 }
 
@@ -150,14 +150,8 @@ impl SharedMmap {
     pub(crate) fn new(path: &str) -> std::io::Result<Arc<Self>> {
         let storage = create_storage_impl(path)?;
 
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-            .as_millis() as u64;
-        Ok(Arc::new(Self {
-            storage,
-            last_touched_at: AtomicU64::new(now_ms),
-        }))
+        let now_ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_else(|_| std::time::Duration::from_secs(0)).as_millis() as u64;
+        Ok(Arc::new(Self { storage, last_touched_at: AtomicU64::new(now_ms) }))
     }
 
     pub(crate) fn write(&self, offset: usize, data: &[u8]) {
@@ -167,10 +161,7 @@ impl SharedMmap {
 
         self.storage.write(offset, data);
 
-        let now_ms = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-            .as_millis() as u64;
+        let now_ms = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_else(|_| std::time::Duration::from_secs(0)).as_millis() as u64;
         self.last_touched_at.store(now_ms, Ordering::Relaxed);
     }
 

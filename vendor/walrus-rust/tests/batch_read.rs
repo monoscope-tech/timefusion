@@ -149,24 +149,12 @@ fn test_batch_read_respects_entry_cap() {
     let first_read = wal.batch_read_for_topic("entry_cap", usize::MAX, true).expect("batch read should succeed");
     assert_eq!(first_read.len(), LIMIT, "batch read should stop at entry cap");
     assert_eq!(first_read.first().unwrap().data, b"entry_0000", "first batch entry mismatch");
-    assert_eq!(
-        first_read.last().unwrap().data,
-        format!("entry_{:04}", LIMIT - 1).as_bytes(),
-        "last batch entry mismatch"
-    );
+    assert_eq!(first_read.last().unwrap().data, format!("entry_{:04}", LIMIT - 1).as_bytes(), "last batch entry mismatch");
 
     let second_read = wal.batch_read_for_topic("entry_cap", usize::MAX, true).expect("second batch read should succeed");
     assert_eq!(second_read.len(), LIMIT, "second batch read should return the remaining entries");
-    assert_eq!(
-        second_read.first().unwrap().data,
-        format!("entry_{:04}", LIMIT).as_bytes(),
-        "first entry of second batch mismatch"
-    );
-    assert_eq!(
-        second_read.last().unwrap().data,
-        format!("entry_{:04}", LIMIT * 2 - 1).as_bytes(),
-        "last entry of second batch mismatch"
-    );
+    assert_eq!(second_read.first().unwrap().data, format!("entry_{:04}", LIMIT).as_bytes(), "first entry of second batch mismatch");
+    assert_eq!(second_read.last().unwrap().data, format!("entry_{:04}", LIMIT * 2 - 1).as_bytes(), "last entry of second batch mismatch");
 
     let third_read = wal.batch_read_for_topic("entry_cap", usize::MAX, true).expect("third batch read should succeed");
     assert!(third_read.is_empty(), "no entries should remain after consuming two batches");
@@ -301,13 +289,7 @@ fn test_concurrent_batch_reads_same_topic() {
                         total_read += batch.len();
                         batch_count += 1;
                         if batch_count % 10 == 0 {
-                            test_println!(
-                                "Reader {} batch {}: read {} entries, total: {}",
-                                reader_id,
-                                batch_count,
-                                batch.len(),
-                                total_read
-                            );
+                            test_println!("Reader {} batch {}: read {} entries, total: {}", reader_id, batch_count, batch.len(), total_read);
                         }
                     }
                     Err(e) => {
@@ -360,14 +342,7 @@ fn test_batch_read_mixed_entry_sizes() {
 
         for (local_idx, entry) in batch.iter().enumerate() {
             let global_idx = total_entries + local_idx;
-            assert_eq!(
-                entry.data.len(),
-                sizes[global_idx],
-                "Entry {} size mismatch: expected {}, got {}",
-                global_idx,
-                sizes[global_idx],
-                entry.data.len()
-            );
+            assert_eq!(entry.data.len(), sizes[global_idx], "Entry {} size mismatch: expected {}, got {}", global_idx, sizes[global_idx], entry.data.len());
             assert_eq!(entry.data[0], global_idx as u8, "Entry {} pattern mismatch", global_idx);
             _total_bytes += entry.data.len();
         }
@@ -401,12 +376,7 @@ fn test_batch_read_recovery_mid_read() {
         let mut batch_count = 0;
         while read_so_far < 20 {
             let batch = wal.batch_read_for_topic("recovery", 300, true).unwrap();
-            test_println!(
-                "Batch {}: read {} entries, total so far: {}",
-                batch_count,
-                batch.len(),
-                read_so_far + batch.len()
-            );
+            test_println!("Batch {}: read {} entries, total so far: {}", batch_count, batch.len(), read_so_far + batch.len());
 
             if batch.is_empty() {
                 test_println!("WARNING: Got empty batch, breaking early");
@@ -430,13 +400,7 @@ fn test_batch_read_recovery_mid_read() {
         test_println!("Recovery read: got {} entries", remaining.len());
 
         let expected_remaining = 50 - read_before_crash;
-        assert_eq!(
-            remaining.len(),
-            expected_remaining,
-            "Should read remaining {} entries after recovery, got {}",
-            expected_remaining,
-            remaining.len()
-        );
+        assert_eq!(remaining.len(), expected_remaining, "Should read remaining {} entries after recovery, got {}", expected_remaining, remaining.len());
 
         for (i, entry) in remaining.iter().enumerate() {
             let expected = format!("recovery_{:04}", read_before_crash + i);
@@ -527,11 +491,7 @@ fn test_batch_read_at_least_once_duplicates() {
 
         let last = &all_entries[all_entries.len() - 1];
         let expected_last = b"alo_0024";
-        test_println!(
-            "Checking last entry: expected '{}', got '{}'",
-            String::from_utf8_lossy(expected_last),
-            String::from_utf8_lossy(&last.data)
-        );
+        test_println!("Checking last entry: expected '{}', got '{}'", String::from_utf8_lossy(expected_last), String::from_utf8_lossy(&last.data));
         assert_eq!(last.data, expected_last, "Last entry should be alo_0024");
     }
 
@@ -560,11 +520,8 @@ fn test_batch_read_with_zeroed_headers() {
     {
         use std::os::unix::fs::FileExt;
 
-        let wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
-            .collect();
+        let wal_files: Vec<_> =
+            std::fs::read_dir(current_wal_dir()).unwrap().filter_map(|e| e.ok()).filter(|e| !e.path().to_str().unwrap().ends_with("_index.db")).collect();
 
         if !wal_files.is_empty() {
             let file_path = wal_files[0].path();
@@ -589,11 +546,7 @@ fn test_batch_read_with_zeroed_headers() {
             all_entries.extend(batch);
         }
 
-        assert!(
-            all_entries.len() < 20,
-            "Should stop reading at zeroed header, got {} entries",
-            all_entries.len()
-        );
+        assert!(all_entries.len() < 20, "Should stop reading at zeroed header, got {} entries", all_entries.len());
         assert!(all_entries.len() >= 5, "Should have read at least some entries before zeroed header");
     }
 

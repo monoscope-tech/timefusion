@@ -27,14 +27,14 @@ pub enum ReadConsistency {
 }
 
 pub struct Walrus {
-    pub(super) allocator:         Arc<BlockAllocator>,
-    pub(super) reader:            Arc<Reader>,
-    pub(super) writers:           RwLock<HashMap<String, Arc<Writer>>>,
-    pub(super) fsync_tx:          Arc<mpsc::Sender<String>>,
+    pub(super) allocator: Arc<BlockAllocator>,
+    pub(super) reader: Arc<Reader>,
+    pub(super) writers: RwLock<HashMap<String, Arc<Writer>>>,
+    pub(super) fsync_tx: Arc<mpsc::Sender<String>>,
     pub(super) read_offset_index: Arc<RwLock<WalIndex>>,
-    pub(super) read_consistency:  ReadConsistency,
-    pub(super) fsync_schedule:    FsyncSchedule,
-    pub(super) paths:             Arc<WalPathManager>,
+    pub(super) read_consistency: ReadConsistency,
+    pub(super) fsync_schedule: FsyncSchedule,
+    pub(super) paths: Arc<WalPathManager>,
 }
 
 impl Walrus {
@@ -106,14 +106,8 @@ impl Walrus {
         // SAFETY: The returned block will be held by this writer only
         // and appended/sealed before being exposed to readers.
         let initial_block = unsafe { self.allocator.get_next_available_block()? };
-        let writer = Arc::new(Writer::new(
-            self.allocator.clone(),
-            initial_block,
-            self.reader.clone(),
-            col_name.to_string(),
-            self.fsync_tx.clone(),
-            self.fsync_schedule,
-        ));
+        let writer =
+            Arc::new(Writer::new(self.allocator.clone(), initial_block, self.reader.clone(), col_name.to_string(), self.fsync_tx.clone(), self.fsync_schedule));
         map.insert(col_name.to_string(), writer.clone());
         Ok(writer)
     }
@@ -200,12 +194,12 @@ impl Walrus {
 
                 // scan entries to compute used
                 let block_stub = Block {
-                    id:        next_block_id as u64,
+                    id: next_block_id as u64,
                     file_path: file_path.clone(),
-                    offset:    block_offset,
-                    limit:     DEFAULT_BLOCK_SIZE,
-                    mmap:      mmap.clone(),
-                    used:      0,
+                    offset: block_offset,
+                    limit: DEFAULT_BLOCK_SIZE,
+                    mmap: mmap.clone(),
+                    used: 0,
                 };
                 let mut in_block_off: u64 = 0;
                 loop {
@@ -224,26 +218,14 @@ impl Walrus {
                     break;
                 }
 
-                let block = Block {
-                    id: next_block_id as u64,
-                    file_path: file_path.clone(),
-                    offset: block_offset,
-                    limit: DEFAULT_BLOCK_SIZE,
-                    mmap: mmap.clone(),
-                    used,
-                };
+                let block =
+                    Block { id: next_block_id as u64, file_path: file_path.clone(), offset: block_offset, limit: DEFAULT_BLOCK_SIZE, mmap: mmap.clone(), used };
                 // register and append
                 BlockStateTracker::register_block(next_block_id, file_path);
                 FileStateTracker::add_block_to_file_state(file_path);
                 if !col_name.is_empty() {
                     let _ = self.reader.append_block_to_chain(&col_name, block.clone());
-                    debug_print!(
-                        "[recovery] appended block: file={}, block_id={}, used={}, col={}",
-                        file_path,
-                        block.id,
-                        block.used,
-                        col_name
-                    );
+                    debug_print!("[recovery] appended block: file={}, block_id={}, used={}, col={}", file_path, block.id, block.used, col_name);
                 }
                 next_block_id += 1;
                 block_offset += DEFAULT_BLOCK_SIZE;

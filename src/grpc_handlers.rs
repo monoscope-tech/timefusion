@@ -39,7 +39,7 @@ use pb::{
 };
 
 pub struct IngestService {
-    db:    Arc<Database>,
+    db: Arc<Database>,
     token: Option<String>,
 }
 
@@ -157,23 +157,13 @@ async fn process_one(db: &Database, msg: WriteBatch) -> WriteAck {
 
     match result {
         Ok(0) => ack_err(seq, pressure, "empty arrow ipc payload"),
-        Ok(_) => WriteAck {
-            seq,
-            status: AckStatus::Ok as i32,
-            mem_pressure_pct: pressure,
-            error: String::new(),
-        },
+        Ok(_) => WriteAck { seq, status: AckStatus::Ok as i32, mem_pressure_pct: pressure, error: String::new() },
         Err(e) => ack_err(seq, pressure, &format!("decode/insert: {e:#}")),
     }
 }
 
 fn ack_err(seq: u64, pressure: u32, err: &str) -> WriteAck {
-    WriteAck {
-        seq,
-        status: AckStatus::Reject as i32,
-        mem_pressure_pct: pressure,
-        error: err.into(),
-    }
+    WriteAck { seq, status: AckStatus::Reject as i32, mem_pressure_pct: pressure, error: err.into() }
 }
 
 /// Constant-time bearer-token check. When `expected` is `None`, auth is open.
@@ -187,11 +177,7 @@ fn verify_bearer(expected: Option<&str>, got: Option<&str>) -> Result<(), Status
     };
     let e = Sha256::digest(expected.as_bytes());
     let g = Sha256::digest(got.as_bytes());
-    if bool::from(e.ct_eq(&g)) {
-        Ok(())
-    } else {
-        Err(Status::unauthenticated("invalid or missing bearer token"))
-    }
+    if bool::from(e.ct_eq(&g)) { Ok(()) } else { Err(Status::unauthenticated("invalid or missing bearer token")) }
 }
 
 #[cfg(test)]

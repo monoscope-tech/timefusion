@@ -62,11 +62,7 @@ pub async fn read_parquet_batches(store: Arc<dyn ObjectStore>, parquet_rel: &str
     let path = ObjPath::from(parquet_rel);
     let meta = store.head(&path).await.with_context(|| format!("head {parquet_rel}"))?;
     let reader = ParquetObjectReader::new(store, path).with_file_size(meta.size);
-    let stream = ParquetRecordBatchStreamBuilder::new(reader)
-        .await
-        .context("parquet stream builder")?
-        .build()
-        .context("build parquet stream")?;
+    let stream = ParquetRecordBatchStreamBuilder::new(reader).await.context("parquet stream builder")?.build().context("build parquet stream")?;
     stream.try_collect::<Vec<_>>().await.context("collect parquet batches")
 }
 
@@ -162,10 +158,7 @@ mod tests {
         let table = "otel_logs_and_spans";
         let rel = "project_id=abc-123/date=2026-06-30/part-00000-deadbeef-c000.zstd.parquet";
         let blob = index_path_for_parquet(table, rel).to_string();
-        assert_eq!(
-            blob,
-            "indexes/otel_logs_and_spans/v1/project_id=abc-123/date=2026-06-30/part-00000-deadbeef-c000.zstd.tantivy.tar.zst"
-        );
+        assert_eq!(blob, "indexes/otel_logs_and_spans/v1/project_id=abc-123/date=2026-06-30/part-00000-deadbeef-c000.zstd.tantivy.tar.zst");
         // inverse recovers the exact parquet rel path
         assert_eq!(index_to_parquet_rel(table, &blob).as_deref(), Some(rel));
         // a blob for a different table / a non-blob path is not ours

@@ -67,9 +67,7 @@ pub fn decrypt_or_passthrough(value: &str) -> Result<String> {
         bail!("encrypted secret payload too short");
     }
     let (nonce, ct) = bytes.split_at(NONCE_LEN);
-    let pt = c
-        .decrypt(Nonce::from_slice(nonce), ct)
-        .map_err(|e| anyhow!("AES-GCM decrypt failed (key mismatch or tampered ciphertext): {e}"))?;
+    let pt = c.decrypt(Nonce::from_slice(nonce), ct).map_err(|e| anyhow!("AES-GCM decrypt failed (key mismatch or tampered ciphertext): {e}"))?;
     String::from_utf8(pt).context("decrypted secret is not valid UTF-8")
 }
 

@@ -99,12 +99,7 @@ fn classify_conjunct(e: &Expr) -> Option<Conjunct> {
 
 /// Split a predicate into conjuncts (`AND` tree flatten).
 fn split_conjunction(e: &Expr, out: &mut Vec<Expr>) {
-    if let Expr::BinaryExpr(BinaryExpr {
-        left,
-        op: Operator::And,
-        right,
-    }) = e
-    {
+    if let Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) = e {
         split_conjunction(left, out);
         split_conjunction(right, out);
     } else {
@@ -116,8 +111,8 @@ fn split_conjunction(e: &Expr, out: &mut Vec<Expr>) {
 struct CountQuery {
     table_name: String,
     project_id: String,
-    lo:         i64,
-    hi:         i64,
+    lo: i64,
+    hi: i64,
 }
 
 /// Match the COUNT(*) shape and extract the (table, project, window).
@@ -221,12 +216,7 @@ fn match_count_plan(plan: &LogicalPlan) -> Option<CountQuery> {
             _ => return None,
         }
     }
-    Some(CountQuery {
-        table_name: scan.table_name.table().to_string(),
-        project_id: project_id?,
-        lo:         lo?,
-        hi:         hi?,
-    })
+    Some(CountQuery { table_name: scan.table_name.table().to_string(), project_id: project_id?, lo: lo?, hi: hi? })
 }
 
 /// Pure summing logic over per-file `(min_ts, max_ts, num_records)` stats:
@@ -293,10 +283,7 @@ pub async fn try_count_pushdown(plan: &LogicalPlan, database: &Arc<Database>) ->
         total
     };
 
-    debug!(
-        "count_pushdown: answered {}/{} [{}, {}] = {} from add-action stats",
-        q.project_id, q.table_name, q.lo, q.hi, total
-    );
+    debug!("count_pushdown: answered {}/{} [{}, {}] = {} from add-action stats", q.project_id, q.table_name, q.lo, q.hi, total);
     crate::metrics::record_count_pushdown_used();
     // Single-row result matching the plan's output schema (count is Int64).
     let out_schema: datafusion::arrow::datatypes::SchemaRef = Arc::new(plan.schema().as_arrow().clone());
@@ -339,13 +326,7 @@ fn sum_from_actions(actions: &RecordBatch, q: &CountQuery) -> Option<u64> {
     let max_ts = ts_micros_col(actions, "stats.maxValues.timestamp")?;
     let rows = (0..actions.num_rows())
         .filter(|&i| pid.is_valid(i) && pid.value(i) == q.project_id)
-        .map(|i| {
-            (
-                min_ts.is_valid(i).then(|| min_ts.value(i)),
-                max_ts.is_valid(i).then(|| max_ts.value(i)),
-                records.is_valid(i).then(|| records.value(i)),
-            )
-        })
+        .map(|i| (min_ts.is_valid(i).then(|| min_ts.value(i)), max_ts.is_valid(i).then(|| max_ts.value(i)), records.is_valid(i).then(|| records.value(i))))
         .collect::<Vec<_>>();
     sum_fully_contained(rows, q.lo, q.hi)
 }

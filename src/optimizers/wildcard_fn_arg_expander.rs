@@ -81,10 +81,7 @@ fn expand_in_expr(expr: Expr, input_schemas: &[Arc<datafusion::common::DFSchema>
 
     let mut new_args: Vec<Expr> = Vec::with_capacity(args.len());
     for arg in args {
-        let Expr::Wildcard {
-            qualifier: Some(qualifier), ..
-        } = &arg
-        else {
+        let Expr::Wildcard { qualifier: Some(qualifier), .. } = &arg else {
             new_args.push(arg);
             continue;
         };

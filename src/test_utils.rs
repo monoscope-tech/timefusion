@@ -2,10 +2,7 @@
 /// Uses try_init() so multiple calls are safe.
 pub fn init_test_logging() {
     use tracing_subscriber::EnvFilter;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-        .with_test_writer()
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap())).with_test_writer().try_init();
 }
 
 pub mod test_helpers {
@@ -28,16 +25,13 @@ pub mod test_helpers {
     }
 
     pub struct TestConfigBuilder {
-        test_name:   String,
+        test_name: String,
         buffer_mode: BufferMode,
     }
 
     impl TestConfigBuilder {
         pub fn new(test_name: &str) -> Self {
-            Self {
-                test_name:   test_name.to_string(),
-                buffer_mode: BufferMode::Enabled,
-            }
+            Self { test_name: test_name.to_string(), buffer_mode: BufferMode::Enabled }
         }
 
         pub fn with_buffer_mode(mut self, mode: BufferMode) -> Self {
@@ -88,10 +82,7 @@ pub mod test_helpers {
         // no panic path can leave HELD stuck and poison later callers with a
         // misleading "already held" assert.
         let prev = std::env::var_os("WALRUS_DATA_DIR");
-        assert!(
-            !HELD.swap(true, Ordering::Acquire),
-            "walrus_env_guard already held by another test — add #[serial] to the caller"
-        );
+        assert!(!HELD.swap(true, Ordering::Acquire), "walrus_env_guard already held by another test — add #[serial] to the caller");
         let guard = scopeguard::guard(prev, |prev| {
             match prev {
                 Some(v) => unsafe { std::env::set_var("WALRUS_DATA_DIR", v) },
@@ -114,10 +105,7 @@ pub mod test_helpers {
         };
         let guard = table_ref.read().await;
         let batch = guard.snapshot()?.add_actions_table(true)?;
-        let arr = batch
-            .column_by_name("num_records")
-            .ok_or_else(|| anyhow::anyhow!("add_actions_table missing num_records"))?
-            .as_primitive::<Int64Type>();
+        let arr = batch.column_by_name("num_records").ok_or_else(|| anyhow::anyhow!("add_actions_table missing num_records"))?.as_primitive::<Int64Type>();
         Ok((0..arr.len()).filter(|&i| !arr.is_null(i)).map(|i| arr.value(i)).sum())
     }
 
@@ -175,13 +163,7 @@ pub mod test_helpers {
             .columns()
             .iter()
             .zip(target_schema.fields())
-            .map(|(col, field)| {
-                if col.data_type() != field.data_type() {
-                    cast(col, field.data_type()).unwrap_or_else(|_| col.clone())
-                } else {
-                    col.clone()
-                }
-            })
+            .map(|(col, field)| if col.data_type() != field.data_type() { cast(col, field.data_type()).unwrap_or_else(|_| col.clone()) } else { col.clone() })
             .collect();
 
         Ok(RecordBatch::try_new(target_schema, columns)?)
@@ -205,10 +187,7 @@ pub mod test_helpers {
     /// Like `test_span` but with an explicit timestamp, for tests that need
     /// rows to land in a specific MemBuffer bucket.
     pub fn test_span_ts(id: &str, name: &str, project_id: &str, ts_micros: i64) -> Value {
-        let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros)
-            .unwrap_or_else(chrono::Utc::now)
-            .date_naive()
-            .to_string();
+        let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts_micros).unwrap_or_else(chrono::Utc::now).date_naive().to_string();
         json!({
             "timestamp": ts_micros,
             "id": id,

@@ -21,7 +21,7 @@ mod jsonb_oid {
     const JSON_OID: u32 = 114;
 
     struct Server {
-        port:     u16,
+        port: u16,
         shutdown: Arc<Notify>,
     }
 
@@ -52,10 +52,7 @@ mod jsonb_oid {
                 let mut ctx = db_clone.clone().create_session_context();
                 db_clone.setup_session_context(&mut ctx).unwrap();
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
-                let auth = timefusion::pgwire_handlers::AuthConfig {
-                    username: "postgres".into(),
-                    password: Some("postgres".into()),
-                };
+                let auth = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
                 tokio::select! {
                     _ = sd.notified() => {}
                     _ = timefusion::pgwire_handlers::serve_with_logging(
@@ -104,11 +101,7 @@ mod jsonb_oid {
         // tokio-postgres `prepare` round-trips RowDescription; column type OID
         // is what hasql / strict drivers inspect.
         let stmt = client.prepare("SELECT jsonb_build_array(1, 'a', true) AS j").await?;
-        assert_eq!(
-            stmt.columns()[0].type_().oid(),
-            JSONB_OID,
-            "jsonb_build_array must surface PG jsonb OID, not text"
-        );
+        assert_eq!(stmt.columns()[0].type_().oid(), JSONB_OID, "jsonb_build_array must surface PG jsonb OID, not text");
 
         // Binary decode via serde_json::Value (tokio-postgres uses binary by default).
         let row = client.query_one("SELECT jsonb_build_array(1, 'a', true) AS j", &[]).await?;
@@ -153,14 +146,8 @@ mod jsonb_oid {
             .await?;
 
         // Mirrors monoscope's logItemDetails query shape: bare Variant column in projection.
-        let stmt = client
-            .prepare("SELECT context FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'jsonb-oid-row' LIMIT 1")
-            .await?;
-        assert_eq!(
-            stmt.columns()[0].type_().oid(),
-            JSONB_OID,
-            "bare Variant column must surface jsonb OID, not text"
-        );
+        let stmt = client.prepare("SELECT context FROM otel_logs_and_spans WHERE project_id = 'test_project' AND id = 'jsonb-oid-row' LIMIT 1").await?;
+        assert_eq!(stmt.columns()[0].type_().oid(), JSONB_OID, "bare Variant column must surface jsonb OID, not text");
 
         // Binary decode (tokio-postgres uses binary format, same as hasql) —
         // exercises the 0x01 jsonb version-byte path with real row data.

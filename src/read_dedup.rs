@@ -75,15 +75,15 @@ fn remap_ordering(
 
 #[derive(Debug)]
 pub struct DedupExec {
-    input:             Arc<dyn ExecutionPlan>,
-    keys:              Vec<String>,
+    input: Arc<dyn ExecutionPlan>,
+    keys: Vec<String>,
     /// Indices of the key columns within `input.schema()`.
-    key_idxs:          Vec<usize>,
+    key_idxs: Vec<usize>,
     /// Indices into `input.schema()` to emit after dedup, restoring the
     /// originally-requested projection. `None` = emit the input schema as-is.
     output_projection: Option<Vec<usize>>,
-    schema:            SchemaRef,
-    properties:        Arc<PlanProperties>,
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
 }
 
 impl DedupExec {
@@ -112,14 +112,7 @@ impl DedupExec {
             input.properties().emission_type,
             input.properties().boundedness,
         ));
-        Ok(Self {
-            input,
-            keys,
-            key_idxs,
-            output_projection,
-            schema,
-            properties,
-        })
+        Ok(Self { input, keys, key_idxs, output_projection, schema, properties })
     }
 }
 
@@ -156,11 +149,7 @@ impl ExecutionPlan for DedupExec {
     }
 
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(DedupExec::new(
-            children[0].clone(),
-            self.keys.clone(),
-            self.output_projection.clone(),
-        )?))
+        Ok(Arc::new(DedupExec::new(children[0].clone(), self.keys.clone(), self.output_projection.clone())?))
     }
 
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
@@ -179,13 +168,7 @@ impl ExecutionPlan for DedupExec {
         // (`input`) and the `seen` set, so nothing is re-cloned per poll. `seen`
         // holds only the encoded key rows — never the payload — but it does grow
         // for the whole stream lifetime, O(distinct keys) over the scan.
-        let state = (
-            input,
-            converter,
-            HashSet::<OwnedRow>::new(),
-            self.key_idxs.clone(),
-            self.output_projection.clone(),
-        );
+        let state = (input, converter, HashSet::<OwnedRow>::new(), self.key_idxs.clone(), self.output_projection.clone());
         let stream = futures::stream::unfold(state, |(mut input, converter, mut seen, key_idxs, output_projection)| async move {
             loop {
                 match input.next().await {

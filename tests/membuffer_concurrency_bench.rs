@@ -37,11 +37,7 @@ fn batch(schema: Arc<Schema>, base_ts: i64, n: usize) -> RecordBatch {
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     RecordBatch::try_new(
         schema,
-        vec![
-            Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")),
-            Arc::new(Int64Array::from(ids)),
-            Arc::new(StringViewArray::from(name_refs)),
-        ],
+        vec![Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("UTC")), Arc::new(Int64Array::from(ids)), Arc::new(StringViewArray::from(name_refs))],
     )
     .unwrap()
 }
@@ -79,11 +75,7 @@ fn concurrent_insert_query_bench() {
         let schema = schema.clone();
         let inserts = inserts.clone();
         let pid = format!("proj-{p:04}");
-        let per_batch_sleep = if writer_rate > 0.0 {
-            Duration::from_secs_f64(batch_size as f64 / writer_rate)
-        } else {
-            Duration::ZERO
-        };
+        let per_batch_sleep = if writer_rate > 0.0 { Duration::from_secs_f64(batch_size as f64 / writer_rate) } else { Duration::ZERO };
         writer_handles.push(std::thread::spawn(move || {
             let mut next = Instant::now();
             let mut i: i64 = 0;
@@ -146,10 +138,6 @@ fn concurrent_insert_query_bench() {
     let p99 = percentile(&latencies, 0.99) as f64 / 1000.0;
     let max = latencies.last().copied().unwrap_or(0) as f64 / 1000.0;
     let ins = inserts.load(Ordering::Relaxed);
-    println!(
-        "inserts={ins} ({:.0}/s)  reads={n} ({:.0}/s)",
-        ins as f64 / duration_s as f64,
-        n as f64 / duration_s as f64
-    );
+    println!("inserts={ins} ({:.0}/s)  reads={n} ({:.0}/s)", ins as f64 / duration_s as f64, n as f64 / duration_s as f64);
     println!("read lat: p50={p50:.2}ms  p95={p95:.2}ms  p99={p99:.2}ms  max={max:.2}ms");
 }

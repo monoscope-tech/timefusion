@@ -52,9 +52,9 @@ pub const ROW_ORDINAL_FIELD: &str = "_row_ordinal";
 
 /// Result of building a tantivy schema for a table.
 pub struct BuiltSchema {
-    pub schema:      Schema,
-    pub timestamp:   Field,
-    pub id:          Field,
+    pub schema: Schema,
+    pub timestamp: Field,
+    pub id: Field,
     pub row_ordinal: Field,
     /// Map of source-column-name → tantivy field. Only contains user columns
     /// that were `indexed: true` in YAML. Variants/lists are included here.
@@ -63,7 +63,7 @@ pub struct BuiltSchema {
 
 #[derive(Debug, Clone)]
 pub struct UserField {
-    pub field:  Field,
+    pub field: Field,
     pub source: FieldDef,
 }
 
@@ -86,13 +86,7 @@ pub fn build_for_table(table: &TableSchema) -> BuiltSchema {
         let f = b.add_text_field(&fd.name, opts);
         user_fields.insert(fd.name.clone(), UserField { field: f, source: fd.clone() });
     }
-    BuiltSchema {
-        schema: b.build(),
-        timestamp,
-        id,
-        row_ordinal,
-        user_fields,
-    }
+    BuiltSchema { schema: b.build(), timestamp, id, row_ordinal, user_fields }
 }
 
 fn raw_id_options() -> TextOptions {
@@ -167,11 +161,7 @@ pub fn register_tokenizers(index: &Index) {
     // "default" stays as tantivy's built-in (SimpleTokenizer + LowerCaser),
     // but re-register explicitly so behavior is pinned even if upstream
     // changes the default chain.
-    let default = TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(RemoveLongFilter::limit(256))
-        .filter(LowerCaser)
-        .filter(AsciiFoldingFilter)
-        .build();
+    let default = TextAnalyzer::builder(SimpleTokenizer::default()).filter(RemoveLongFilter::limit(256)).filter(LowerCaser).filter(AsciiFoldingFilter).build();
     index.tokenizers().register(DEFAULT_TOKENIZER, default);
 }
 

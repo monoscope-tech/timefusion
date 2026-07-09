@@ -64,11 +64,7 @@ async fn test_partition_column_ordering() -> Result<()> {
     db.insert_records_batch("partition_project", "otel_logs_and_spans", vec![batch], true, None).await?;
 
     // Query and verify partition columns (project_id, date) are present and filterable
-    let result = ctx
-        .sql("SELECT project_id, date, id FROM otel_logs_and_spans WHERE project_id = 'partition_project'")
-        .await?
-        .collect()
-        .await?;
+    let result = ctx.sql("SELECT project_id, date, id FROM otel_logs_and_spans WHERE project_id = 'partition_project'").await?.collect().await?;
 
     assert_eq!(result[0].num_rows(), 1);
     assert_eq!(get_str(result[0].column(0).as_ref(), 0), "partition_project");

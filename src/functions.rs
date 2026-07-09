@@ -112,19 +112,10 @@ impl ExprPlanner for VariantAwareExprPlanner {
         let variant_get_udf = ScalarUDF::from(VariantGetExtUdf::default());
         let path_literal = Expr::Literal(ScalarValue::Utf8(Some(full_path.clone())), None);
         let get_args = vec![base_expr.clone(), path_literal];
-        let variant_leaf = Expr::ScalarFunction(ScalarFunction {
-            func: Arc::new(variant_get_udf),
-            args: get_args,
-        });
+        let variant_leaf = Expr::ScalarFunction(ScalarFunction { func: Arc::new(variant_get_udf), args: get_args });
         let result = if is_long_arrow {
-            let to_json = Expr::ScalarFunction(ScalarFunction {
-                func: Arc::new(ScalarUDF::from(VariantToJsonExtUdf::default())),
-                args: vec![variant_leaf],
-            });
-            Expr::ScalarFunction(ScalarFunction {
-                func: Arc::new(ScalarUDF::from(JsonToPgTextUdf::default())),
-                args: vec![to_json],
-            })
+            let to_json = Expr::ScalarFunction(ScalarFunction { func: Arc::new(ScalarUDF::from(VariantToJsonExtUdf::default())), args: vec![variant_leaf] });
+            Expr::ScalarFunction(ScalarFunction { func: Arc::new(ScalarUDF::from(JsonToPgTextUdf::default())), args: vec![to_json] })
         } else {
             variant_leaf
         };
@@ -258,9 +249,7 @@ struct JsonToPgTextUdf {
 
 impl Default for JsonToPgTextUdf {
     fn default() -> Self {
-        Self {
-            signature: Signature::uniform(1, vec![DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8], Volatility::Immutable),
-        }
+        Self { signature: Signature::uniform(1, vec![DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8], Volatility::Immutable) }
     }
 }
 
@@ -278,10 +267,7 @@ impl ScalarUDFImpl for JsonToPgTextUdf {
         // Cast once to Utf8 — collapses Utf8/Utf8View/LargeUtf8 to a single
         // concrete shape, single pass over rows.
         let utf8 = cast(&arr, &DataType::Utf8).map_err(arrow_err)?;
-        let strs = utf8
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution("json_to_pg_text: cast to Utf8 failed".into()))?;
+        let strs = utf8.as_any().downcast_ref::<StringArray>().ok_or_else(|| DataFusionError::Execution("json_to_pg_text: cast to Utf8 failed".into()))?;
         let mut b = datafusion::arrow::array::StringBuilder::with_capacity(strs.len(), strs.value_data().len());
         for i in 0..strs.len() {
             if strs.is_null(i) {
@@ -503,19 +489,15 @@ fn create_set_clock_udf() -> ScalarUDF {
             ColumnarValue::Array(a) => a.clone(),
             ColumnarValue::Scalar(s) => s.to_array()?,
         };
-        let s = arr
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| DataFusionError::Execution("timefusion_set_clock expects Utf8".into()))?;
+        let s = arr.as_any().downcast_ref::<StringArray>().ok_or_else(|| DataFusionError::Execution("timefusion_set_clock expects Utf8".into()))?;
         let mut b = Int64Array::builder(s.len());
         for i in 0..s.len() {
             if s.is_null(i) {
                 b.append_null();
                 continue;
             }
-            let t = chrono::DateTime::parse_from_rfc3339(s.value(i))
-                .map_err(|e| DataFusionError::Execution(format!("invalid rfc3339: {e}")))?
-                .timestamp_micros();
+            let t =
+                chrono::DateTime::parse_from_rfc3339(s.value(i)).map_err(|e| DataFusionError::Execution(format!("invalid rfc3339: {e}")))?.timestamp_micros();
             b.append_value(crate::clock::set_micros(t));
         }
         Ok(ColumnarValue::Array(Arc::new(b.finish())))
@@ -531,10 +513,7 @@ fn create_advance_clock_udf() -> ScalarUDF {
             ColumnarValue::Array(a) => a.clone(),
             ColumnarValue::Scalar(s) => s.to_array()?,
         };
-        let d = arr
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| DataFusionError::Execution("timefusion_advance_clock expects Int64".into()))?;
+        let d = arr.as_any().downcast_ref::<Int64Array>().ok_or_else(|| DataFusionError::Execution("timefusion_advance_clock expects Int64".into()))?;
         let mut b = Int64Array::builder(d.len());
         for i in 0..d.len() {
             if d.is_null(i) {
@@ -565,9 +544,7 @@ struct ToCharUDF {
 
 impl ToCharUDF {
     fn new() -> Self {
-        Self {
-            signature: Signature::any(2, Volatility::Immutable),
-        }
+        Self { signature: Signature::any(2, Volatility::Immutable) }
     }
 }
 
@@ -581,9 +558,7 @@ impl ScalarUDFImpl for ToCharUDF {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let args = args.args;
         if args.len() != 2 {
-            return Err(DataFusionError::Execution(
-                "to_char requires exactly 2 arguments: timestamp and format string".to_string(),
-            ));
+            return Err(DataFusionError::Execution("to_char requires exactly 2 arguments: timestamp and format string".to_string()));
         }
 
         // Extract timestamp array
@@ -820,9 +795,7 @@ struct AtTimeZoneUDF {
 
 impl AtTimeZoneUDF {
     fn new() -> Self {
-        Self {
-            signature: Signature::any(2, Volatility::Immutable),
-        }
+        Self { signature: Signature::any(2, Volatility::Immutable) }
     }
 }
 
@@ -839,9 +812,7 @@ impl ScalarUDFImpl for AtTimeZoneUDF {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         let args = args.args;
         if args.len() != 2 {
-            return Err(DataFusionError::Execution(
-                "AT TIME ZONE requires exactly 2 arguments: timestamp and timezone".to_string(),
-            ));
+            return Err(DataFusionError::Execution("AT TIME ZONE requires exactly 2 arguments: timestamp and timezone".to_string()));
         }
 
         // Extract timestamp array
@@ -930,27 +901,18 @@ fn create_jsonb_array_elements_udf() -> ScalarUDF {
         not_impl_err!("jsonb_array_elements is not yet fully implemented - requires table function support")
     });
 
-    create_udf(
-        "jsonb_array_elements",
-        vec![DataType::Utf8View],
-        DataType::Utf8View,
-        Volatility::Immutable,
-        jsonb_array_elements_fn,
-    )
+    create_udf("jsonb_array_elements", vec![DataType::Utf8View], DataType::Utf8View, Volatility::Immutable, jsonb_array_elements_fn)
 }
 
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct JsonBuildArrayUDF {
     signature: Signature,
-    aliases:   Vec<String>,
+    aliases: Vec<String>,
 }
 
 impl JsonBuildArrayUDF {
     fn new() -> Self {
-        Self {
-            signature: Signature::variadic_any(Volatility::Immutable),
-            aliases:   vec![],
-        }
+        Self { signature: Signature::variadic_any(Volatility::Immutable), aliases: vec![] }
     }
 }
 
@@ -999,15 +961,12 @@ impl ScalarUDFImpl for JsonBuildArrayUDF {
 #[derive(Debug, Hash, Eq, PartialEq)]
 struct ToJsonUDF {
     signature: Signature,
-    aliases:   Vec<String>,
+    aliases: Vec<String>,
 }
 
 impl ToJsonUDF {
     fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
-            aliases:   vec![],
-        }
+        Self { signature: Signature::any(1, Volatility::Immutable), aliases: vec![] }
     }
 }
 
@@ -1094,9 +1053,7 @@ struct ExtractEpochUDF {
 
 impl ExtractEpochUDF {
     fn new() -> Self {
-        Self {
-            signature: Signature::any(1, Volatility::Immutable),
-        }
+        Self { signature: Signature::any(1, Volatility::Immutable) }
     }
 }
 
@@ -1154,10 +1111,7 @@ impl ScalarUDFImpl for ExtractEpochUDF {
 /// `values` as `json!(value)`, mapping nulls to `JsonValue::Null`.
 macro_rules! push_json_primitive {
     ($array:expr, $values:expr, $ty:ty, $tyname:literal) => {{
-        let arr = $array
-            .as_any()
-            .downcast_ref::<$ty>()
-            .ok_or_else(|| DataFusionError::Execution(concat!("Failed to downcast to ", $tyname).to_string()))?;
+        let arr = $array.as_any().downcast_ref::<$ty>().ok_or_else(|| DataFusionError::Execution(concat!("Failed to downcast to ", $tyname).to_string()))?;
         for i in 0..arr.len() {
             if arr.is_null(i) {
                 $values.push(JsonValue::Null);
@@ -1258,9 +1212,7 @@ fn push_list_json<O: datafusion::arrow::array::OffsetSizeTrait>(array: &ArrayRef
 fn create_time_bucket_udf() -> ScalarUDF {
     let time_bucket_fn: ScalarFunctionImplementation = Arc::new(move |args: &[ColumnarValue]| -> datafusion::error::Result<ColumnarValue> {
         if args.len() != 2 {
-            return Err(DataFusionError::Execution(
-                "time_bucket requires exactly 2 arguments: interval and timestamp".to_string(),
-            ));
+            return Err(DataFusionError::Execution("time_bucket requires exactly 2 arguments: interval and timestamp".to_string()));
         }
 
         // Extract interval string
@@ -1318,9 +1270,7 @@ fn parse_interval_to_micros(interval_str: &str) -> datafusion::error::Result<i64
             (value, unit_str.to_lowercase())
         }
         _ => {
-            return Err(DataFusionError::Execution(
-                "Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string(),
-            ));
+            return Err(DataFusionError::Execution("Invalid interval format. Expected format: 'N unit' (e.g., '5 minutes' or '5m')".to_string()));
         }
     };
 
@@ -1443,10 +1393,8 @@ impl Accumulator for PercentileAccumulator {
         }
 
         let array = &values[0];
-        let float_array = array
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .ok_or_else(|| DataFusionError::Execution("percentile_agg expects Float64 values".to_string()))?;
+        let float_array =
+            array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| DataFusionError::Execution("percentile_agg expects Float64 values".to_string()))?;
 
         for i in 0..float_array.len() {
             if !float_array.is_null(i) {
@@ -1480,10 +1428,8 @@ impl Accumulator for PercentileAccumulator {
         }
 
         let array = &states[0];
-        let binary_array = array
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| DataFusionError::Execution("Expected binary array for merge".to_string()))?;
+        let binary_array =
+            array.as_any().downcast_ref::<BinaryArray>().ok_or_else(|| DataFusionError::Execution("Expected binary array for merge".to_string()))?;
 
         for i in 0..binary_array.len() {
             if !binary_array.is_null(i) {
@@ -1512,9 +1458,7 @@ struct ApproxPercentileUDF {
 
 impl ApproxPercentileUDF {
     fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::Exact(vec![DataType::Float64, DataType::Binary]), Volatility::Immutable),
-        }
+        Self { signature: Signature::new(TypeSignature::Exact(vec![DataType::Float64, DataType::Binary]), Volatility::Immutable) }
     }
 }
 
@@ -1527,9 +1471,7 @@ impl ScalarUDFImpl for ApproxPercentileUDF {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         if args.args.len() != 2 {
-            return Err(DataFusionError::Execution(
-                "approx_percentile requires exactly 2 arguments: percentile and t-digest".to_string(),
-            ));
+            return Err(DataFusionError::Execution("approx_percentile requires exactly 2 arguments: percentile and t-digest".to_string()));
         }
 
         // Determine the result size based on the digest array (which comes from GROUP BY)
@@ -1620,9 +1562,7 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> datafusion::error::Result<ColumnarValue> {
         if args.args.len() != 2 {
-            return Err(DataFusionError::Execution(
-                "jsonb_path_exists requires exactly 2 arguments: json/variant and jsonpath".to_string(),
-            ));
+            return Err(DataFusionError::Execution("jsonb_path_exists requires exactly 2 arguments: json/variant and jsonpath".to_string()));
         }
 
         let json_array = match &args.args[0] {
@@ -1661,10 +1601,7 @@ fn variant_to_serde_json(variant: &parquet_variant::Variant, depth: usize) -> Re
     use parquet_variant::Variant;
 
     if depth > MAX_VARIANT_DEPTH {
-        return Err(DataFusionError::Execution(format!(
-            "Variant nesting depth exceeds limit of {}",
-            MAX_VARIANT_DEPTH
-        )));
+        return Err(DataFusionError::Execution(format!("Variant nesting depth exceeds limit of {}", MAX_VARIANT_DEPTH)));
     }
 
     Ok(match variant {
@@ -1719,10 +1656,7 @@ impl<'a> BinaryAccessor<'a> {
         } else if let Some(a) = col.as_any().downcast_ref::<datafusion::arrow::array::BinaryViewArray>() {
             Ok(Self::View(a))
         } else {
-            Err(DataFusionError::Execution(format!(
-                "Variant {field} column is not Binary or BinaryView (got {:?})",
-                col.data_type()
-            )))
+            Err(DataFusionError::Execution(format!("Variant {field} column is not Binary or BinaryView (got {:?})", col.data_type())))
         }
     }
 
@@ -1759,16 +1693,9 @@ fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &serde_json_path::J
     // and runs serde_json_path. Avoided when the path is simple.
     use datafusion::arrow::array::StructArray;
     use parquet_variant::Variant;
-    let struct_array = array
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| DataFusionError::Execution("Expected Variant struct array".to_string()))?;
-    let metadata_col = struct_array
-        .column_by_name("metadata")
-        .ok_or_else(|| DataFusionError::Execution("Variant missing metadata column".to_string()))?;
-    let value_col = struct_array
-        .column_by_name("value")
-        .ok_or_else(|| DataFusionError::Execution("Variant missing value column".to_string()))?;
+    let struct_array = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| DataFusionError::Execution("Expected Variant struct array".to_string()))?;
+    let metadata_col = struct_array.column_by_name("metadata").ok_or_else(|| DataFusionError::Execution("Variant missing metadata column".to_string()))?;
+    let value_col = struct_array.column_by_name("value").ok_or_else(|| DataFusionError::Execution("Variant missing value column".to_string()))?;
     let metadata_binary = BinaryAccessor::try_new(metadata_col, "metadata")?;
     let value_binary = BinaryAccessor::try_new(value_col, "value")?;
     let mut builder = BooleanArray::builder(struct_array.len());
@@ -1864,9 +1791,7 @@ fn evaluate_jsonpath_on_json_string(array: &ArrayRef, json_path: &serde_json_pat
             }
         }
     } else {
-        return Err(DataFusionError::Execution(
-            "jsonb_path_exists requires JSON string or Variant input".to_string(),
-        ));
+        return Err(DataFusionError::Execution("jsonb_path_exists requires JSON string or Variant input".to_string()));
     }
 
     Ok(Arc::new(builder.finish()))
@@ -1966,10 +1891,7 @@ mod tests {
         assert_eq!(col.value(0), r#"["{\"a\":1}","[1,2]","plain","123"]"#);
         // Independent of serialisation format: every element must be a JSON *string*.
         let parsed: serde_json::Value = serde_json::from_str(col.value(0)).unwrap();
-        assert!(
-            parsed.as_array().unwrap().iter().all(serde_json::Value::is_string),
-            "elements must stay strings: {parsed}"
-        );
+        assert!(parsed.as_array().unwrap().iter().all(serde_json::Value::is_string), "elements must stay strings: {parsed}");
         // Top-level Utf8 scalars keep the JSON sniff: Variant/Utf8 columns holding
         // JSON (attributes, events, links) rely on it to surface as real JSON.
         let sql = r#"SELECT to_jsonb('{"a":1}') AS s"#;
@@ -2020,21 +1942,15 @@ mod tests {
         let nums: ArrayRef = Arc::new(Int64Array::from_iter_values(0..n as i64));
         let scalar = ColumnarValue::Scalar(datafusion::scalar::ScalarValue::Utf8(Some("tag".into())));
         let args = ScalarFunctionArgs {
-            args:           vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
-            arg_fields:     vec![],
-            number_rows:    n,
-            return_field:   Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
+            args: vec![scalar, ColumnarValue::Array(ids), ColumnarValue::Array(nums)],
+            arg_fields: vec![],
+            number_rows: n,
+            return_field: Arc::new(datafusion::arrow::datatypes::Field::new("", DataType::Utf8View, true)),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
         let start = std::time::Instant::now();
-        let ColumnarValue::Array(out) = JsonBuildArrayUDF::new().invoke_with_args(args).unwrap() else {
-            panic!("expected array output")
-        };
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "quadratic regression: took {:?}",
-            start.elapsed()
-        );
+        let ColumnarValue::Array(out) = JsonBuildArrayUDF::new().invoke_with_args(args).unwrap() else { panic!("expected array output") };
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "quadratic regression: took {:?}", start.elapsed());
         let out = out.as_any().downcast_ref::<datafusion::arrow::array::StringViewArray>().unwrap();
         assert_eq!(out.len(), n);
         assert_eq!(out.value(7), r#"["tag","id-7",7]"#);

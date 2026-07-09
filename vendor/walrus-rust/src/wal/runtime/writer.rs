@@ -25,13 +25,13 @@ use crate::wal::{
 };
 
 pub(super) struct Writer {
-    allocator:        Arc<BlockAllocator>,
-    current_block:    Mutex<Block>,
-    reader:           Arc<Reader>,
-    col:              String,
-    publisher:        Arc<mpsc::Sender<String>>,
-    current_offset:   Mutex<u64>,
-    fsync_schedule:   FsyncSchedule,
+    allocator: Arc<BlockAllocator>,
+    current_block: Mutex<Block>,
+    reader: Arc<Reader>,
+    col: String,
+    publisher: Arc<mpsc::Sender<String>>,
+    current_offset: Mutex<u64>,
+    fsync_schedule: FsyncSchedule,
     is_batch_writing: AtomicBool,
 }
 
@@ -63,14 +63,7 @@ impl Writer {
 
         let need = (PREFIX_META_SIZE as u64) + (data.len() as u64);
         if *cur + need > block.limit {
-            debug_print!(
-                "[writer] sealing: col={}, block_id={}, used={}, need={}, limit={}",
-                self.col,
-                block.id,
-                *cur,
-                need,
-                block.limit
-            );
+            debug_print!("[writer] sealing: col={}, block_id={}, used={}, need={}, limit={}", self.col, block.id, *cur, need, block.limit);
             FileStateTracker::set_block_unlocked(block.id as usize);
             let mut sealed = block.clone();
             sealed.used = *cur;
@@ -88,14 +81,7 @@ impl Writer {
         }
         let next_block_start = block.offset + block.limit; // simplistic for now
         block.write(*cur, data, &self.col, next_block_start)?;
-        debug_print!(
-            "[writer] wrote: col={}, block_id={}, offset_before={}, bytes={}, offset_after={}",
-            self.col,
-            block.id,
-            *cur,
-            need,
-            *cur + need
-        );
+        debug_print!("[writer] wrote: col={}, block_id={}, offset_before={}, bytes={}, offset_after={}", self.col, block.id, *cur, need, *cur + need);
         *cur += need;
 
         // Handle fsync based on schedule
@@ -132,10 +118,7 @@ impl Writer {
 
         // Phase 0: Validate batch size
         if batch.len() > MAX_BATCH_ENTRIES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("batch exceeds {} entry limit", MAX_BATCH_ENTRIES),
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("batch exceeds {} entry limit", MAX_BATCH_ENTRIES)));
         }
 
         let total_bytes: u64 = batch.iter().map(|data| (PREFIX_META_SIZE as u64) + (data.len() as u64)).sum();
@@ -162,10 +145,7 @@ impl Writer {
         let mut block = self.current_block.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_block lock poisoned"))?;
         let mut cur_offset = self.current_offset.lock().map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "current_offset lock poisoned"))?;
 
-        let mut revert_info = BatchRevertInfo {
-            original_offset:     *cur_offset,
-            allocated_block_ids: Vec::new(),
-        };
+        let mut revert_info = BatchRevertInfo { original_offset: *cur_offset, allocated_block_ids: Vec::new() };
 
         // Build write plan: (Block, in_block_offset, batch_index)
         let mut write_plan: Vec<(Block, u64, usize)> = Vec::new();
@@ -186,13 +166,7 @@ impl Writer {
                 batch_idx += 1;
             } else {
                 // Need to seal and allocate new block
-                debug_print!(
-                    "[batch] sealing block_id={}, used={}, need={}, limit={}",
-                    block.id,
-                    planning_offset,
-                    need,
-                    block.limit
-                );
+                debug_print!("[batch] sealing block_id={}, used={}, need={}, limit={}", block.id, planning_offset, need, block.limit);
                 FileStateTracker::set_block_unlocked(block.id as usize);
                 let mut sealed = block.clone();
                 sealed.used = planning_offset;
@@ -210,11 +184,7 @@ impl Writer {
             }
         }
 
-        debug_print!(
-            "[batch] planning complete: {} write operations across {} blocks",
-            write_plan.len(),
-            revert_info.allocated_block_ids.len() + 1
-        );
+        debug_print!("[batch] planning complete: {} write operations across {} blocks", write_plan.len(), revert_info.allocated_block_ids.len() + 1);
 
         // Phase 2 & 3: io_uring preparation and submission (FD backend only)
         #[cfg(target_os = "linux")]
@@ -267,12 +237,7 @@ impl Writer {
         // NOW update the writer's offset to make data visible to readers
         *cur_offset = planning_offset;
 
-        debug_print!(
-            "[batch] SUCCESS (mmap): wrote {} entries, {} bytes to topic={}",
-            batch.len(),
-            total_bytes,
-            self.col
-        );
+        debug_print!("[batch] SUCCESS (mmap): wrote {} entries, {} bytes to topic={}", batch.len(), total_bytes, self.col);
         Ok(())
     }
 
@@ -290,12 +255,7 @@ impl Writer {
             let next_block_start = blk.offset + blk.limit;
 
             // Prepare metadata
-            let new_meta = Metadata {
-                read_size: data.len(),
-                owned_by: self.col.to_string(),
-                next_block_start,
-                checksum: checksum64(data),
-            };
+            let new_meta = Metadata { read_size: data.len(), owned_by: self.col.to_string(), next_block_start, checksum: checksum64(data) };
 
             let meta_bytes = rkyv::to_bytes::<_, 256>(&new_meta)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("serialize metadata failed: {:?}", e)))?;
@@ -323,17 +283,12 @@ impl Writer {
                 return Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "batch writes require FD backend"));
             };
 
-            let write_op = io_uring::opcode::Write::new(fd, combined.as_ptr(), combined.len() as u32)
-                .offset(file_offset)
-                .build()
-                .user_data(*data_idx as u64);
+            let write_op = io_uring::opcode::Write::new(fd, combined.as_ptr(), combined.len() as u32).offset(file_offset).build().user_data(*data_idx as u64);
 
             buffers.push(combined);
 
             unsafe {
-                ring.submission()
-                    .push(&write_op)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring push failed: {}", e)))?;
+                ring.submission().push(&write_op).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("io_uring push failed: {}", e)))?;
             }
         }
 
@@ -355,12 +310,7 @@ impl Writer {
                             break;
                         } else if (result as usize) != expected_bytes {
                             all_success = false;
-                            debug_print!(
-                                "[batch] short write for entry {}: wrote {} bytes, expected {}",
-                                data_idx,
-                                result,
-                                expected_bytes
-                            );
+                            debug_print!("[batch] short write for entry {}: wrote {} bytes, expected {}", data_idx, result, expected_bytes);
                             break;
                         }
                     }
@@ -429,7 +379,7 @@ impl Writer {
 }
 
 struct BatchRevertInfo {
-    original_offset:     u64,
+    original_offset: u64,
     allocated_block_ids: Vec<u64>,
 }
 

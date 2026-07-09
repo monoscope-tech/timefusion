@@ -56,10 +56,7 @@ async fn insert_select_unnest_coerces_text_to_variant() -> anyhow::Result<()> {
     // over a Variant extraction, which hits an unrelated aggregate-schema path).
     let cnt: i64 = client.query_one("SELECT COUNT(*)::bigint FROM otel_logs_and_spans WHERE project_id=$1", &[&pid]).await?.get(0);
     assert_eq!(cnt, n as i64, "all rows inserted via unnest");
-    let msg: String = client
-        .query_one("SELECT body ->> 'msg' FROM otel_logs_and_spans WHERE project_id=$1 AND id='id-0'", &[&pid])
-        .await?
-        .get(0);
+    let msg: String = client.query_one("SELECT body ->> 'msg' FROM otel_logs_and_spans WHERE project_id=$1 AND id='id-0'", &[&pid]).await?.get(0);
     assert_eq!(msg, "hello-0", "body coerced to queryable Variant in MemBuffer");
 
     // summary reconstructed with the comma-containing element intact.
@@ -70,13 +67,8 @@ async fn insert_select_unnest_coerces_text_to_variant() -> anyhow::Result<()> {
     clock::set_micros(FROZEN_START_MICROS + 10 * 60 * 1_000_000);
     env.force_flush().await?;
     env.force_evict().await?;
-    let n_hit: i64 = client
-        .query_one(
-            "SELECT COUNT(*)::bigint FROM otel_logs_and_spans WHERE project_id=$1 AND body ->> 'msg' = 'hello-1'",
-            &[&pid],
-        )
-        .await?
-        .get(0);
+    let n_hit: i64 =
+        client.query_one("SELECT COUNT(*)::bigint FROM otel_logs_and_spans WHERE project_id=$1 AND body ->> 'msg' = 'hello-1'", &[&pid]).await?.get(0);
     assert_eq!(n_hit, 1, "Variant predicate holds from Delta after flush");
     Ok(())
 }

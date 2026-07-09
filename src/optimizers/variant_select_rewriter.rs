@@ -140,10 +140,7 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
     let mut zipped: Vec<(Option<datafusion::sql::TableReference>, Arc<Field>)> = qualifiers.into_iter().zip(patched_arrow.fields().iter().cloned()).collect();
     let new_df: DFSchemaRef = Arc::new(DFSchema::new_with_metadata(std::mem::take(&mut zipped), patched_arrow.metadata().clone())?);
     debug!(target: "variant_select_rewriter", "patched TableScan({}) schema → Variant", scan.table_name);
-    Ok(Transformed::yes(LogicalPlan::TableScan(TableScan {
-        projected_schema: new_df,
-        ..scan
-    })))
+    Ok(Transformed::yes(LogicalPlan::TableScan(TableScan { projected_schema: new_df, ..scan })))
 }
 
 /// Value-position Variant → text coercion.
@@ -184,22 +181,16 @@ fn coerce_variant_value_positions(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// in a scalar-text position with `variant_to_json`. Idempotent — an
 /// already-wrapped operand types as `Utf8` and `is_variant_expr` returns false.
 fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<datafusion::logical_expr::ScalarUDF>) -> Result<Transformed<Expr>> {
-    let wrap = |x: Expr| {
-        Expr::ScalarFunction(ScalarFunction {
-            func: to_json.clone(),
-            args: vec![x],
-        })
-    };
+    let wrap = |x: Expr| Expr::ScalarFunction(ScalarFunction { func: to_json.clone(), args: vec![x] });
     match e {
         // CAST(variant AS text) → CAST(variant_to_json(variant) AS <same text type>).
         // Covers monoscope's `body::text` and its `COALESCE(NULLIF(body::text, ''),
         // …)` error_text. The outer cast is kept so the result stays real text
         // (pg OID 25) rather than variant_to_json's jsonb-tagged output (OID 3802) —
         // an explicit `::text` must describe as text over the wire.
-        Expr::Cast(Cast { expr, field }) if is_text_type(field.data_type()) && is_variant_expr(&expr, schema) => Ok(Transformed::yes(Expr::Cast(Cast {
-            expr: Box::new(wrap(*expr)),
-            field,
-        }))),
+        Expr::Cast(Cast { expr, field }) if is_text_type(field.data_type()) && is_variant_expr(&expr, schema) => {
+            Ok(Transformed::yes(Expr::Cast(Cast { expr: Box::new(wrap(*expr)), field })))
+        }
         // Comparison / regex where a Variant operand faces text.
         Expr::BinaryExpr(BinaryExpr { left, op, right })
             if is_text_comparison_op(op) && (is_variant_expr(&left, schema) || is_variant_expr(&right, schema)) =>
@@ -219,11 +210,9 @@ fn coerce_expr(e: Expr, schema: &DFSchema, to_json: &Arc<datafusion::logical_exp
             Ok(Transformed::yes(Expr::SimilarTo(like)))
         }
         // IN (str, …).
-        Expr::InList(InList { expr, list, negated }) if is_variant_expr(&expr, schema) => Ok(Transformed::yes(Expr::InList(InList {
-            expr: Box::new(wrap(*expr)),
-            list,
-            negated,
-        }))),
+        Expr::InList(InList { expr, list, negated }) if is_variant_expr(&expr, schema) => {
+            Ok(Transformed::yes(Expr::InList(InList { expr: Box::new(wrap(*expr)), list, negated })))
+        }
         other => Ok(Transformed::no(other)),
     }
 }
@@ -352,11 +341,7 @@ fn add_root_variant_projection(plan: LogicalPlan) -> Result<LogicalPlan> {
         .iter()
         .map(|(qualifier, field)| {
             let col = Expr::Column(datafusion::common::Column::new(qualifier.cloned(), field.name().clone()));
-            if is_variant_type(field.data_type()) {
-                wrap_with_variant_to_json(&col, &variant_to_json).alias(field.name())
-            } else {
-                col
-            }
+            if is_variant_type(field.data_type()) { wrap_with_variant_to_json(&col, &variant_to_json).alias(field.name()) } else { col }
         })
         .collect();
     debug!(
@@ -408,10 +393,7 @@ fn wrap_with_variant_to_json(expr: &Expr, udf: &Arc<datafusion::logical_expr::Sc
         Expr::Alias(a) => (a.expr.as_ref().clone(), Some(a.name.clone())),
         _ => (expr.clone(), None),
     };
-    let wrapped = Expr::ScalarFunction(ScalarFunction {
-        func: udf.clone(),
-        args: vec![inner],
-    });
+    let wrapped = Expr::ScalarFunction(ScalarFunction { func: udf.clone(), args: vec![inner] });
     match alias {
         Some(name) => wrapped.alias(name),
         None => wrapped,
@@ -447,10 +429,7 @@ mod peel_tests {
     fn variant_projection() -> LogicalPlan {
         let schema = Schema::new(vec![variant_field("v")]);
         let df = Arc::new(DFSchema::try_from(schema).unwrap());
-        let empty = LogicalPlan::EmptyRelation(EmptyRelation {
-            produce_one_row: false,
-            schema:          df,
-        });
+        let empty = LogicalPlan::EmptyRelation(EmptyRelation { produce_one_row: false, schema: df });
         LogicalPlanBuilder::from(empty).project(vec![col("v")]).unwrap().build().unwrap()
     }
 

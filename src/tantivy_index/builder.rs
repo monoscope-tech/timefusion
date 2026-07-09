@@ -37,8 +37,8 @@ pub const WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexBuildStats {
-    pub rows:                 u64,
-    pub batches:              u32,
+    pub rows: u64,
+    pub batches: u32,
     pub min_timestamp_micros: Option<i64>,
     pub max_timestamp_micros: Option<i64>,
 }
@@ -81,19 +81,15 @@ fn index_batch(built: &BuiltSchema, writer: &mut IndexWriter, batch: &RecordBatc
 
     // Pre-resolve user-field columns once per batch.
     struct UserCol<'a> {
-        field:  tantivy::schema::Field,
+        field: tantivy::schema::Field,
         column: &'a ArrayRef,
-        kind:   ColKind,
+        kind: ColKind,
     }
     let mut user_cols: Vec<UserCol> = Vec::new();
     for (name, uf) in &built.user_fields {
         let Ok(idx) = schema.index_of(name) else { continue };
         let kind = ColKind::detect(batch.column(idx).data_type(), uf.source.tantivy.as_ref().and_then(|t| t.flatten.as_deref()))?;
-        user_cols.push(UserCol {
-            field: uf.field,
-            column: batch.column(idx),
-            kind,
-        });
+        user_cols.push(UserCol { field: uf.field, column: batch.column(idx), kind });
     }
 
     for row in 0..batch.num_rows() {

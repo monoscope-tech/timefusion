@@ -22,19 +22,13 @@ async fn pgwire_query_returns_response() -> anyhow::Result<()> {
         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
     );
 
-    tokio::time::timeout(
-        QUERY_RESPONSE_BUDGET,
-        client.execute(&insert, &[&"e2e_project", &"smoke-1", &"smoke", &"OK", &"hi", &"INFO", &vec!["s"]]),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("INSERT did not return within {QUERY_RESPONSE_BUDGET:?}"))??;
+    tokio::time::timeout(QUERY_RESPONSE_BUDGET, client.execute(&insert, &[&"e2e_project", &"smoke-1", &"smoke", &"OK", &"hi", &"INFO", &vec!["s"]]))
+        .await
+        .map_err(|_| anyhow::anyhow!("INSERT did not return within {QUERY_RESPONSE_BUDGET:?}"))??;
 
     let count: i64 = tokio::time::timeout(
         QUERY_RESPONSE_BUDGET,
-        client.query_one(
-            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-            &[&"e2e_project", &"smoke-1"],
-        ),
+        client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"e2e_project", &"smoke-1"]),
     )
     .await
     .map_err(|_| anyhow::anyhow!("SELECT did not return within {QUERY_RESPONSE_BUDGET:?}"))??

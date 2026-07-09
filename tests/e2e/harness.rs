@@ -25,30 +25,30 @@ pub const FROZEN_START_MICROS: i64 = 1_900_000_000_000_000; // ~2030-03-15
 
 #[derive(Clone)]
 pub struct E2eEnvBuilder {
-    bucket_duration_secs:   u64,
-    flush_interval_secs:    u64,
+    bucket_duration_secs: u64,
+    flush_interval_secs: u64,
     eviction_interval_secs: u64,
-    retention_mins:         u64,
-    foyer_disabled:         bool,
-    flush_immediately:      bool,
-    max_memory_mb:          usize,
-    frozen_at_micros:       i64,
-    checkpoint_interval:    u64,
+    retention_mins: u64,
+    foyer_disabled: bool,
+    flush_immediately: bool,
+    max_memory_mb: usize,
+    frozen_at_micros: i64,
+    checkpoint_interval: u64,
 }
 
 impl Default for E2eEnvBuilder {
     fn default() -> Self {
         Self {
             // Aggressive defaults for fast deterministic tests.
-            bucket_duration_secs:   60,
-            flush_interval_secs:    1,
+            bucket_duration_secs: 60,
+            flush_interval_secs: 1,
             eviction_interval_secs: 1,
-            retention_mins:         5,
-            foyer_disabled:         false,
-            flush_immediately:      false,
-            max_memory_mb:          256,
-            frozen_at_micros:       FROZEN_START_MICROS,
-            checkpoint_interval:    10,
+            retention_mins: 5,
+            foyer_disabled: false,
+            flush_immediately: false,
+            max_memory_mb: 256,
+            frozen_at_micros: FROZEN_START_MICROS,
+            checkpoint_interval: 10,
         }
     }
 }
@@ -171,12 +171,7 @@ impl E2eEnvBuilder {
 
         // Spawn pgwire server. Shutdown via Notify (same as integration_test).
         let pg_shutdown = Arc::new(Notify::new());
-        spawn_pgwire(
-            Arc::clone(&bootstrapped.session_ctx),
-            Arc::clone(&bootstrapped.db),
-            pg_port,
-            Arc::clone(&pg_shutdown),
-        );
+        spawn_pgwire(Arc::clone(&bootstrapped.session_ctx), Arc::clone(&bootstrapped.db), pg_port, Arc::clone(&pg_shutdown));
         wait_for_pg(pg_port).await.context("pgwire never came up")?;
 
         Ok(E2eEnv {
@@ -196,15 +191,15 @@ impl E2eEnvBuilder {
 
 pub struct E2eEnv {
     /// None when running against an external MinIO (TIMEFUSION_TEST_S3_ENDPOINT).
-    _minio:       Option<ContainerAsync<MinIO>>,
+    _minio: Option<ContainerAsync<MinIO>>,
     pub data_dir: PathBuf,
-    pub pg_port:  u16,
-    pub bucket:   String,
-    endpoint:     String,
-    test_id:      String,
-    wal_dir:      PathBuf,
-    builder:      E2eEnvBuilder,
-    pg_shutdown:  Arc<Notify>,
+    pub pg_port: u16,
+    pub bucket: String,
+    endpoint: String,
+    test_id: String,
+    wal_dir: PathBuf,
+    builder: E2eEnvBuilder,
+    pg_shutdown: Arc<Notify>,
     bootstrapped: Option<Bootstrapped>,
 }
 
@@ -267,12 +262,7 @@ impl E2eEnv {
         bootstrapped.db.get_or_create_table("e2e_project", "otel_logs_and_spans").await.context("pre-warm table")?;
 
         self.pg_shutdown = Arc::new(Notify::new());
-        spawn_pgwire(
-            Arc::clone(&bootstrapped.session_ctx),
-            Arc::clone(&bootstrapped.db),
-            pg_port,
-            Arc::clone(&self.pg_shutdown),
-        );
+        spawn_pgwire(Arc::clone(&bootstrapped.session_ctx), Arc::clone(&bootstrapped.db), pg_port, Arc::clone(&self.pg_shutdown));
         wait_for_pg(pg_port).await.context("pgwire never came up after restart")?;
 
         self.pg_port = pg_port;
@@ -305,17 +295,13 @@ impl E2eEnv {
     /// flush (otherwise the notify can fire before we register interest).
     pub async fn await_next_flush(&self, timeout: Duration) -> Result<()> {
         let notify = self.buffered_layer().flush_tick_notify();
-        tokio::time::timeout(timeout, notify.notified())
-            .await
-            .map_err(|_| anyhow::anyhow!("flush tick did not fire within {:?}", timeout))?;
+        tokio::time::timeout(timeout, notify.notified()).await.map_err(|_| anyhow::anyhow!("flush tick did not fire within {:?}", timeout))?;
         Ok(())
     }
 
     pub async fn await_next_eviction(&self, timeout: Duration) -> Result<()> {
         let notify = self.buffered_layer().eviction_tick_notify();
-        tokio::time::timeout(timeout, notify.notified())
-            .await
-            .map_err(|_| anyhow::anyhow!("eviction tick did not fire within {:?}", timeout))?;
+        tokio::time::timeout(timeout, notify.notified()).await.map_err(|_| anyhow::anyhow!("eviction tick did not fire within {:?}", timeout))?;
         Ok(())
     }
 
@@ -350,19 +336,19 @@ impl Drop for E2eEnv {
 // ---------------------------------------------------------------------------
 
 struct BuildCfgArgs<'a> {
-    endpoint:               &'a str,
-    bucket:                 &'a str,
-    data_dir:               PathBuf,
-    pg_port:                u16,
-    bucket_duration_secs:   u64,
-    flush_interval_secs:    u64,
+    endpoint: &'a str,
+    bucket: &'a str,
+    data_dir: PathBuf,
+    pg_port: u16,
+    bucket_duration_secs: u64,
+    flush_interval_secs: u64,
     eviction_interval_secs: u64,
-    retention_mins:         u64,
-    foyer_disabled:         bool,
-    flush_immediately:      bool,
-    max_memory_mb:          usize,
-    checkpoint_interval:    u64,
-    test_id:                &'a str,
+    retention_mins: u64,
+    foyer_disabled: bool,
+    flush_immediately: bool,
+    max_memory_mb: usize,
+    checkpoint_interval: u64,
+    test_id: &'a str,
 }
 
 fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
@@ -414,10 +400,7 @@ async fn create_bucket(endpoint: &str, bucket: &str) -> Result<()> {
 fn spawn_pgwire(session_ctx: Arc<datafusion::execution::context::SessionContext>, db: Arc<timefusion::database::Database>, port: u16, shutdown: Arc<Notify>) {
     tokio::spawn(async move {
         let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
-        let auth = timefusion::pgwire_handlers::AuthConfig {
-            username: "postgres".into(),
-            password: Some("postgres".into()),
-        };
+        let auth = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
         tokio::select! {
             _ = shutdown.notified() => {},
             res = timefusion::pgwire_handlers::serve_with_logging(session_ctx, &opts, auth, None, Some(db), std::future::pending::<()>()) => {

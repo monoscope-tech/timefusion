@@ -52,9 +52,7 @@ async fn stalled_listener() -> (u16, Arc<Notify>) {
 /// Fire N concurrent TCP connect attempts at the given port, with a per-connect
 /// timeout. Returns (successes, refused_count, timeout_count, other_errors).
 async fn burst_connect(port: u16, n: usize, connect_timeout: Duration) -> (usize, usize, usize, Vec<String>) {
-    let handles: Vec<_> = (0..n)
-        .map(|_| tokio::spawn(async move { timeout(connect_timeout, TcpStream::connect(("127.0.0.1", port))).await }))
-        .collect();
+    let handles: Vec<_> = (0..n).map(|_| tokio::spawn(async move { timeout(connect_timeout, TcpStream::connect(("127.0.0.1", port))).await })).collect();
 
     let mut ok = 0;
     let mut refused = 0;
@@ -125,10 +123,7 @@ async fn listen_backlog_overflows_at_128_when_accept_stalls() {
     //    ECONNREFUSED — the same error class monoscope's Hasql logs print.
     //    On macOS and stock Linux, failures appear as connect timeouts.
     //    Both indicate the same root cause: kernel-level backlog overflow.
-    eprintln!(
-        "Mechanism reproduced: {} of {BURST} connects failed (refused={refused}, timed_out={timed_out}).",
-        failed
-    );
+    eprintln!("Mechanism reproduced: {} of {BURST} connects failed (refused={refused}, timed_out={timed_out}).", failed);
     if cfg!(target_os = "linux") && refused > 0 {
         eprintln!("ECONNREFUSED observed -> host has tcp_abort_on_overflow=1, matches prod.");
     } else if refused == 0 && timed_out > 0 {
@@ -172,10 +167,7 @@ async fn larger_backlog_eliminates_overflow_under_same_burst() {
     let (ok, refused, timed_out, other) = burst_connect(port, BURST, Duration::from_millis(500)).await;
     release.notify_one();
 
-    eprintln!(
-        "explicit-backlog={BACKLOG} burst={BURST} ok={ok} refused={refused} timed_out={timed_out} other={}",
-        other.len()
-    );
+    eprintln!("explicit-backlog={BACKLOG} burst={BURST} ok={ok} refused={refused} timed_out={timed_out} other={}", other.len());
 
     // CRITICAL FINDING: this assertion may fail even after the app-level fix
     // because the OS clamps the requested backlog to `somaxconn`:
@@ -334,8 +326,5 @@ async fn no_overflow_when_acceptor_drains_promptly() {
 
     eprintln!("fast-acceptor burst: ok={ok} refused={refused} timed_out={timed_out} other={}", other.len());
     // With a tight accept loop draining the queue, all 300 should land.
-    assert_eq!(
-        ok, BURST,
-        "fast acceptor should drain all {BURST} connects (got ok={ok}, refused={refused}, timed_out={timed_out})"
-    );
+    assert_eq!(ok, BURST, "fast acceptor should drain all {BURST} connects (got ok={ok}, refused={refused}, timed_out={timed_out})");
 }

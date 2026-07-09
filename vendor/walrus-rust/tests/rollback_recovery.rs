@@ -41,11 +41,8 @@ fn test_zeroed_header_stops_block_scanning() {
     }
 
     {
-        let wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
-            .collect();
+        let wal_files: Vec<_> =
+            std::fs::read_dir(current_wal_dir()).unwrap().filter_map(|e| e.ok()).filter(|e| !e.path().to_str().unwrap().ends_with("_index.db")).collect();
 
         assert_eq!(wal_files.len(), 1, "Should have exactly one WAL file");
 
@@ -221,11 +218,8 @@ fn test_recovery_preserves_data_before_zeroed_headers() {
     }
 
     {
-        let wal_files: Vec<_> = std::fs::read_dir(current_wal_dir())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| !e.path().to_str().unwrap().ends_with("_index.db"))
-            .collect();
+        let wal_files: Vec<_> =
+            std::fs::read_dir(current_wal_dir()).unwrap().filter_map(|e| e.ok()).filter(|e| !e.path().to_str().unwrap().ends_with("_index.db")).collect();
 
         assert_eq!(wal_files.len(), 1, "Should have exactly one WAL file");
 

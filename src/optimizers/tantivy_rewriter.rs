@@ -156,12 +156,7 @@ fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>, all
 /// scan-time classification. `NOT IN` is never routed.
 fn match_indexed_in_list(expr: &Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Option<(String, Vec<Route>)> {
     use datafusion::logical_expr::expr::InList;
-    let Expr::InList(InList {
-        expr: col,
-        list,
-        negated: false,
-    }) = expr
-    else {
+    let Expr::InList(InList { expr: col, list, negated: false }) = expr else {
         return None;
     };
     if !allow_eq || list.is_empty() || list.len() > MAX_ROUTED_IN_LIST {
@@ -176,10 +171,7 @@ fn match_indexed_in_list(expr: &Expr, indexed_columns: &HashMap<String, &'static
         .iter()
         .map(|e| match e {
             Expr::Literal(s, _) => extract_utf8_string(s).filter(|v| !v.is_empty() && v.chars().all(is_eq_term_safe)).map(Route::Ready),
-            Expr::Placeholder(_) => Some(Route::Deferred {
-                rhs:  e.clone(),
-                kind: "eq".to_string(),
-            }),
+            Expr::Placeholder(_) => Some(Route::Deferred { rhs: e.clone(), kind: "eq".to_string() }),
             _ => None,
         })
         .collect();
@@ -232,23 +224,11 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
                 // Prepared-statement path: value unknown until Bind. Route
                 // with a deferred tag so plans cached with placeholders keep
                 // the prefilter (classified at scan time post-substitution).
-                Expr::Placeholder(_) => Some((
-                    name,
-                    Route::Deferred {
-                        rhs:  rhs.clone(),
-                        kind: "eq".to_string(),
-                    },
-                )),
+                Expr::Placeholder(_) => Some((name, Route::Deferred { rhs: rhs.clone(), kind: "eq".to_string() })),
                 _ => None,
             }
         }
-        Expr::Like(Like {
-            negated: false,
-            expr: l,
-            pattern: r,
-            escape_char,
-            case_insensitive,
-        }) => {
+        Expr::Like(Like { negated: false, expr: l, pattern: r, escape_char, case_insensitive }) => {
             let Expr::Column(c) = l.as_ref() else { return None };
             let tok = *indexed_columns.get(&c_name(c))?;
             // ILIKE on raw (case-sensitive single token) is not accelerable
@@ -274,13 +254,9 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
                 }
                 // Pattern arrives at Bind: defer classification. Custom escape
                 // chars aren't carried in the tag — don't route them.
-                Expr::Placeholder(_) if escape_char.is_none() => Some((
-                    c_name(c),
-                    Route::Deferred {
-                        rhs:  r.as_ref().clone(),
-                        kind: format!("{}:{tok}", if *case_insensitive { "ilike" } else { "like" }),
-                    },
-                )),
+                Expr::Placeholder(_) if escape_char.is_none() => {
+                    Some((c_name(c), Route::Deferred { rhs: r.as_ref().clone(), kind: format!("{}:{tok}", if *case_insensitive { "ilike" } else { "like" }) }))
+                }
                 _ => None,
             }
         }
@@ -435,11 +411,7 @@ mod tests {
     }
 
     fn eq(col: &str, val: &str) -> Expr {
-        Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(Expr::Column(datafusion::common::Column::new_unqualified(col))),
-            Operator::Eq,
-            Box::new(lit(val)),
-        ))
+        Expr::BinaryExpr(BinaryExpr::new(Box::new(Expr::Column(datafusion::common::Column::new_unqualified(col))), Operator::Eq, Box::new(lit(val))))
     }
 
     #[test]
@@ -480,19 +452,12 @@ mod tests {
         // left to the plain `=` (correctness over acceleration).
         let cols: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER)]);
         assert_eq!(match_indexed_predicate(&eq("tid", "a:b"), &cols, true), None, "colon is query syntax");
-        assert_eq!(
-            match_indexed_predicate(&eq("tid", "foo bar"), &cols, true),
-            None,
-            "space → AND-split can't match one raw token"
-        );
+        assert_eq!(match_indexed_predicate(&eq("tid", "foo bar"), &cols, true), None, "space → AND-split can't match one raw token");
         assert_eq!(match_indexed_predicate(&eq("tid", "a.b"), &cols, true), None, "dot conservatively excluded");
         assert_eq!(match_indexed_predicate(&eq("tid", ""), &cols, true), None, "empty");
         // A dashed UUID IS allowed — the embedded `-` survives (e2e-proven).
         let uid = "0fee13b9-ac71-5c55-acd1-109542595054";
-        assert_eq!(
-            match_indexed_predicate(&eq("tid", uid), &cols, true),
-            Some(("tid".into(), Route::Ready(uid.into())))
-        );
+        assert_eq!(match_indexed_predicate(&eq("tid", uid), &cols, true), Some(("tid".into(), Route::Ready(uid.into()))));
     }
 
     #[test]
@@ -516,11 +481,7 @@ mod tests {
         let cols_partial: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER)]);
         let or_pred = Expr::BinaryExpr(BinaryExpr::new(Box::new(eq("tid", "x")), Operator::Or, Box::new(eq("unindexed", "y"))));
         let rewritten = or_pred.transform_down(|e| rewrite_expr(e, &cols_partial, true)).unwrap().data;
-        assert_eq!(
-            collect_text_match_tree(&[rewritten]),
-            None,
-            "an OR with an unroutable branch must not seed the prefilter"
-        );
+        assert_eq!(collect_text_match_tree(&[rewritten]), None, "an OR with an unroutable branch must not seed the prefilter");
 
         let and_pred = Expr::BinaryExpr(BinaryExpr::new(Box::new(eq("tid", "x")), Operator::And, Box::new(lit(true))));
         let rewritten = and_pred.transform_down(|e| rewrite_expr(e, &cols, true)).unwrap().data;
@@ -569,10 +530,10 @@ mod tests {
         // miss case variants; skip the rewrite.
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), RAW_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated:          false,
-            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern:          Box::new(lit("foo")),
-            escape_char:      None,
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("foo")),
+            escape_char: None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols, true), None);
@@ -582,10 +543,10 @@ mod tests {
     fn match_ilike_substring_works_on_ngram3() {
         let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
         let e = Expr::Like(Like {
-            negated:          false,
-            expr:             Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
-            pattern:          Box::new(lit("%foo%")),
-            escape_char:      None,
+            negated: false,
+            expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
+            pattern: Box::new(lit("%foo%")),
+            escape_char: None,
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols, true), Some(("c".into(), Route::Ready("foo".into()))));

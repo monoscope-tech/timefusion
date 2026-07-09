@@ -31,8 +31,8 @@ use crate::{
 /// Owns the object store + tantivy config and produces a callback.
 #[derive(Debug)]
 pub struct TantivyIndexService {
-    pub object_store:      Arc<dyn ObjectStore>,
-    pub config:            Arc<TantivyConfig>,
+    pub object_store: Arc<dyn ObjectStore>,
+    pub config: Arc<TantivyConfig>,
     /// Max `max_timestamp_micros` across every index this process has
     /// successfully published. Feeds the `index_lag_seconds` gauge. Loaded
     /// from manifests on first observation (lazy) and updated after each
@@ -42,11 +42,7 @@ pub struct TantivyIndexService {
 
 impl TantivyIndexService {
     pub fn new(object_store: Arc<dyn ObjectStore>, config: Arc<TantivyConfig>) -> Self {
-        Self {
-            object_store,
-            config,
-            newest_indexed_micros: AtomicI64::new(i64::MIN),
-        }
+        Self { object_store, config, newest_indexed_micros: AtomicI64::new(i64::MIN) }
     }
 
     /// Newest indexed timestamp seen so far (microseconds). `None` if the
@@ -143,15 +139,15 @@ impl TantivyIndexService {
             Ok(v) => v,
             Err(e) => {
                 let entry = ManifestEntry {
-                    index:                None,
-                    rows:                 0,
-                    built_at:             Utc::now(),
-                    schema_version:       manifest::SCHEMA_VERSION,
+                    index: None,
+                    rows: 0,
+                    built_at: Utc::now(),
+                    schema_version: manifest::SCHEMA_VERSION,
                     min_timestamp_micros: None,
                     max_timestamp_micros: None,
-                    error:                Some(format!("build failed: {e}")),
-                    covered_files:        covered_files.clone(),
-                    ordinals_valid:       false,
+                    error: Some(format!("build failed: {e}")),
+                    covered_files: covered_files.clone(),
+                    ordinals_valid: false,
                 };
                 let _ = manifest::upsert(self.object_store.as_ref(), table_name, project_id, manifest_key, entry).await;
                 warn!("tantivy build failed for {project_id}/{table_name}: {e}");
@@ -244,8 +240,8 @@ impl TantivyIndexService {
 
 #[derive(Debug, Default, Clone)]
 pub struct GcReport {
-    pub kept:               usize,
-    pub entries_removed:    usize,
-    pub blobs_deleted:      usize,
+    pub kept: usize,
+    pub entries_removed: usize,
+    pub blobs_deleted: usize,
     pub blob_delete_errors: usize,
 }

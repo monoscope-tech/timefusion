@@ -45,12 +45,12 @@ impl Walrus {
             map.entry(col_name.to_string())
                 .or_insert_with(|| {
                     Arc::new(RwLock::new(ColReaderInfo {
-                        chain:               Vec::new(),
-                        cur_block_idx:       0,
-                        cur_block_offset:    0,
+                        chain: Vec::new(),
+                        cur_block_idx: 0,
+                        cur_block_offset: 0,
                         reads_since_persist: 0,
-                        tail_block_id:       0,
-                        tail_offset:         0,
+                        tail_block_id: 0,
+                        tail_offset: 0,
                         hydrated_from_index: false,
                     }))
                 })
@@ -136,13 +136,7 @@ impl Walrus {
                 let block = info.chain[idx].clone();
 
                 if off >= block.used {
-                    debug_print!(
-                        "[reader] read_next: advance block col={}, block_id={}, offset={}, used={}",
-                        col_name,
-                        block.id,
-                        off,
-                        block.used
-                    );
+                    debug_print!("[reader] read_next: advance block col={}, block_id={}, offset={}, used={}", col_name, block.id, off, block.used);
                     BlockStateTracker::set_checkpointed_true(block.id as usize);
                     info.cur_block_idx += 1;
                     info.cur_block_offset = 0;
@@ -156,11 +150,7 @@ impl Walrus {
                         let mut maybe_persist = None;
                         if checkpoint {
                             info.cur_block_offset = new_off;
-                            maybe_persist = if self.should_persist(&mut info, false) {
-                                Some((info.cur_block_idx as u64, new_off))
-                            } else {
-                                None
-                            };
+                            maybe_persist = if self.should_persist(&mut info, false) { Some((info.cur_block_idx as u64, new_off)) } else { None };
                         }
 
                         // Drop the column lock before touching the index to avoid lock inversion
@@ -173,21 +163,9 @@ impl Walrus {
                             }
                         }
 
-                        debug_print!(
-                            "[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}",
-                            col_name,
-                            block.id,
-                            consumed,
-                            new_off
-                        );
+                        debug_print!("[reader] read_next: OK col={}, block_id={}, consumed={}, new_offset={}", col_name, block.id, consumed, new_off);
                         // Position of THIS entry = the read head before advancing.
-                        return Ok(Some((
-                            entry,
-                            WalPosition {
-                                block_id: block.id,
-                                offset:   off,
-                            },
-                        )));
+                        return Ok(Some((entry, WalPosition { block_id: block.id, offset: off })));
                     }
                     Err(_) => {
                         debug_print!("[reader] read_next: read error col={}, block_id={}, offset={}", col_name, block.id, off);
@@ -291,11 +269,7 @@ impl Walrus {
                         if checkpoint {
                             info.tail_block_id = active_block.id;
                             info.tail_offset = new_off;
-                            maybe_persist = if self.should_persist(&mut info, false) {
-                                Some((tail_block_id | TAIL_FLAG, new_off))
-                            } else {
-                                None
-                            };
+                            maybe_persist = if self.should_persist(&mut info, false) { Some((tail_block_id | TAIL_FLAG, new_off)) } else { None };
                         }
                         drop(info);
                         if checkpoint {
@@ -314,32 +288,15 @@ impl Walrus {
                             new_off
                         );
                         // Position of THIS entry = the tail read head before advancing.
-                        return Ok(Some((
-                            entry,
-                            WalPosition {
-                                block_id: active_block.id,
-                                offset:   tail_off,
-                            },
-                        )));
+                        return Ok(Some((entry, WalPosition { block_id: active_block.id, offset: tail_off })));
                     }
                     Err(_) => {
-                        debug_print!(
-                            "[reader] read_next: tail read error col={}, block_id={}, offset={}",
-                            col_name,
-                            active_block.id,
-                            tail_off
-                        );
+                        debug_print!("[reader] read_next: tail read error col={}, block_id={}, offset={}", col_name, active_block.id, tail_off);
                         return Ok(None);
                     }
                 }
             } else {
-                debug_print!(
-                    "[reader] read_next: tail caught up col={}, block_id={}, off={}, written={}",
-                    col_name,
-                    active_block.id,
-                    tail_off,
-                    written
-                );
+                debug_print!("[reader] read_next: tail caught up col={}, block_id={}, off={}, written={}", col_name, active_block.id, tail_off, written);
                 return Ok(None);
             }
         }
@@ -369,10 +326,10 @@ impl Walrus {
     pub fn batch_read_for_topic(&self, col_name: &str, max_bytes: usize, checkpoint: bool) -> io::Result<Vec<Entry>> {
         // Helper struct for read planning
         struct ReadPlan {
-            blk:       Block,
-            start:     u64,
-            end:       u64,
-            is_tail:   bool,
+            blk: Block,
+            start: u64,
+            end: u64,
+            is_tail: bool,
             chain_idx: Option<usize>,
         }
 
@@ -401,12 +358,12 @@ impl Walrus {
             map.entry(col_name.to_string())
                 .or_insert_with(|| {
                     Arc::new(RwLock::new(ColReaderInfo {
-                        chain:               Vec::new(),
-                        cur_block_idx:       0,
-                        cur_block_offset:    0,
+                        chain: Vec::new(),
+                        cur_block_idx: 0,
+                        cur_block_offset: 0,
                         reads_since_persist: 0,
-                        tail_block_id:       0,
-                        tail_offset:         0,
+                        tail_block_id: 0,
+                        tail_offset: 0,
                         hydrated_from_index: false,
                     }))
                 })
@@ -475,13 +432,7 @@ impl Walrus {
 
             let end = block.used.min(cur_off + (max_bytes - planned_bytes) as u64);
             if end > cur_off {
-                plan.push(ReadPlan {
-                    blk: block.clone(),
-                    start: cur_off,
-                    end,
-                    is_tail: false,
-                    chain_idx: Some(cur_idx),
-                });
+                plan.push(ReadPlan { blk: block.clone(), start: cur_off, end, is_tail: false, chain_idx: Some(cur_idx) });
                 planned_bytes += (end - cur_off) as usize;
             }
             cur_idx += 1;
@@ -495,13 +446,7 @@ impl Walrus {
                 let tail_start = if info.tail_block_id == active_block.id { info.tail_offset } else { 0 };
                 if tail_start < written {
                     let end = written; // read up to current writer offset
-                    plan.push(ReadPlan {
-                        blk: active_block.clone(),
-                        start: tail_start,
-                        end,
-                        is_tail: true,
-                        chain_idx: None,
-                    });
+                    plan.push(ReadPlan { blk: active_block.clone(), start: tail_start, end, is_tail: true, chain_idx: None });
                 }
             }
         }
@@ -538,10 +483,7 @@ impl Walrus {
                 let fd = if let Some(fd_backend) = read_plan.blk.mmap.storage().as_fd() {
                     io_uring::types::Fd(fd_backend.file().as_raw_fd())
                 } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "batch reads require FD backend when io_uring is enabled",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::Unsupported, "batch reads require FD backend when io_uring is enabled"));
                 };
 
                 let read_op = io_uring::opcode::Read::new(fd, buffer.as_mut_ptr(), size as u32).offset(file_offset).build().user_data(plan_idx as u64);
@@ -549,9 +491,7 @@ impl Walrus {
                 temp_buffers[plan_idx] = buffer;
 
                 unsafe {
-                    ring.submission()
-                        .push(&read_op)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("io_uring push failed: {}", e)))?;
+                    ring.submission().push(&read_op).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("io_uring push failed: {}", e)))?;
                 }
             }
 
@@ -706,17 +646,11 @@ impl Walrus {
                         info.cur_block_offset = 0;
                         info.tail_block_id = final_tail_block_id;
                         info.tail_offset = final_tail_offset;
-                        target = PersistTarget::Tail {
-                            blk_id: final_tail_block_id,
-                            off:    final_tail_offset,
-                        };
+                        target = PersistTarget::Tail { blk_id: final_tail_block_id, off: final_tail_offset };
                     } else {
                         info.cur_block_idx = final_block_idx;
                         info.cur_block_offset = final_block_offset;
-                        target = PersistTarget::Sealed {
-                            idx: final_block_idx as u64,
-                            off: final_block_offset,
-                        };
+                        target = PersistTarget::Sealed { idx: final_block_idx as u64, off: final_block_offset };
                     }
                 }
                 drop(info);

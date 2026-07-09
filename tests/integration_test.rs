@@ -12,8 +12,8 @@ mod integration {
     use uuid::Uuid;
 
     struct TestServer {
-        port:     u16,
-        test_id:  String,
+        port: u16,
+        test_id: String,
         shutdown: Arc<Notify>,
     }
 
@@ -42,10 +42,7 @@ mod integration {
                 db_clone.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
-                let auth_config = timefusion::pgwire_handlers::AuthConfig {
-                    username: "postgres".into(),
-                    password: Some("postgres".into()),
-                };
+                let auth_config = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
 
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
@@ -110,35 +107,16 @@ mod integration {
 
         // Insert and verify single record
         client
-            .execute(
-                &insert,
-                &[
-                    &"test_project",
-                    &server.test_id,
-                    &"test_span_name",
-                    &"OK",
-                    &"Test integration",
-                    &"INFO",
-                    &vec!["Integration test summary"],
-                ],
-            )
+            .execute(&insert, &[&"test_project", &server.test_id, &"test_span_name", &"OK", &"Test integration", &"INFO", &vec!["Integration test summary"]])
             .await?;
 
-        let count: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-                &[&"test_project", &server.test_id],
-            )
-            .await?
-            .get(0);
+        let count: i64 =
+            client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &server.test_id]).await?.get(0);
         assert_eq!(count, 1);
 
         // Verify field values
         let row = client
-            .query_one(
-                "SELECT name, status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-                &[&"test_project", &server.test_id],
-            )
+            .query_one("SELECT name, status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &server.test_id])
             .await?;
         assert_eq!(row.get::<_, String>(0), "test_span_name");
         assert_eq!(row.get::<_, String>(1), "OK");
@@ -169,12 +147,7 @@ mod integration {
         // typed columns. VariantSelectRewriter already serializes Variant columns
         // to JSON at the root projection, so `SELECT *` would also work end-to-end;
         // this assertion just doesn't need every field.
-        let row = client
-            .query_one(
-                "SELECT id, name, status_code, level FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1",
-                &[&"test_project"],
-            )
-            .await?;
+        let row = client.query_one("SELECT id, name, status_code, level FROM otel_logs_and_spans WHERE project_id = $1 LIMIT 1", &[&"test_project"]).await?;
         assert_eq!(row.columns().len(), 4);
 
         Ok(())
@@ -189,27 +162,14 @@ mod integration {
 
         // Insert test data
         let span_id = Uuid::new_v4().to_string();
-        client
-            .execute(
-                &insert,
-                &[&"test_project", &span_id, &"original_name", &"OK", &"Original message", &"INFO", &vec!["Original summary"]],
-            )
-            .await?;
+        client.execute(&insert, &[&"test_project", &span_id, &"original_name", &"OK", &"Original message", &"INFO", &vec!["Original summary"]]).await?;
 
         // Test single field update
         client
-            .execute(
-                "UPDATE otel_logs_and_spans SET status_message = $1 WHERE project_id = $2 AND id = $3",
-                &[&"Updated message", &"test_project", &span_id],
-            )
+            .execute("UPDATE otel_logs_and_spans SET status_message = $1 WHERE project_id = $2 AND id = $3", &[&"Updated message", &"test_project", &span_id])
             .await?;
 
-        let row = client
-            .query_one(
-                "SELECT status_message FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-                &[&"test_project", &span_id],
-            )
-            .await?;
+        let row = client.query_one("SELECT status_message FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?;
         assert_eq!(row.get::<_, String>(0), "Updated message");
 
         // Test multiple field update
@@ -220,38 +180,23 @@ mod integration {
             )
             .await?;
 
-        let row = client
-            .query_one(
-                "SELECT status_code, level FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-                &[&"test_project", &span_id],
-            )
-            .await?;
+        let row =
+            client.query_one("SELECT status_code, level FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?;
         assert_eq!(row.get::<_, String>(0), "ERROR");
         assert_eq!(row.get::<_, String>(1), "ERROR");
 
         // Test conditional update
         for i in 0..3 {
             let status = if i % 2 == 0 { "OK" } else { "ERROR" };
-            client
-                .execute(
-                    &insert,
-                    &[&"test_project", &format!("update_test_{}", i), &"test", &status, &"Message", &"INFO", &vec!["Summary"]],
-                )
-                .await?;
+            client.execute(&insert, &[&"test_project", &format!("update_test_{}", i), &"test", &status, &"Message", &"INFO", &vec!["Summary"]]).await?;
         }
 
         client
-            .execute(
-                "UPDATE otel_logs_and_spans SET status_code = $1 WHERE project_id = $2 AND status_code = $3",
-                &[&"SUCCESS", &"test_project", &"OK"],
-            )
+            .execute("UPDATE otel_logs_and_spans SET status_code = $1 WHERE project_id = $2 AND status_code = $3", &[&"SUCCESS", &"test_project", &"OK"])
             .await?;
 
         let count: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2",
-                &[&"test_project", &"SUCCESS"],
-            )
+            .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2", &[&"test_project", &"SUCCESS"])
             .await?
             .get(0);
         assert_eq!(count, 2);
@@ -268,39 +213,19 @@ mod integration {
 
         // Insert test data
         let span_id = Uuid::new_v4().to_string();
-        client
-            .execute(
-                &insert,
-                &[&"test_project", &span_id, &"to_delete", &"OK", &"Message", &"INFO", &vec!["Summary"]],
-            )
-            .await?;
+        client.execute(&insert, &[&"test_project", &span_id, &"to_delete", &"OK", &"Message", &"INFO", &vec!["Summary"]]).await?;
 
         // Verify insertion
-        let count: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-                &[&"test_project", &span_id],
-            )
-            .await?
-            .get(0);
+        let count: i64 =
+            client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?.get(0);
         assert_eq!(count, 1);
 
         // Delete the record
-        client
-            .execute(
-                "DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-                &[&"test_project", &span_id],
-            )
-            .await?;
+        client.execute("DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?;
 
         // Verify deletion
-        let count: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-                &[&"test_project", &span_id],
-            )
-            .await?
-            .get(0);
+        let count: i64 =
+            client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?.get(0);
         assert_eq!(count, 0);
 
         // Test conditional delete
@@ -310,29 +235,14 @@ mod integration {
                 1 => "ERROR",
                 _ => "WARNING",
             };
-            client
-                .execute(
-                    &insert,
-                    &[&"test_project", &format!("delete_test_{}", i), &"test", &status, &"Message", &"INFO", &vec!["Summary"]],
-                )
-                .await?;
+            client.execute(&insert, &[&"test_project", &format!("delete_test_{}", i), &"test", &status, &"Message", &"INFO", &vec!["Summary"]]).await?;
         }
 
         // Delete all ERROR records
-        client
-            .execute(
-                "DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2",
-                &[&"test_project", &"ERROR"],
-            )
-            .await?;
+        client.execute("DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2", &[&"test_project", &"ERROR"]).await?;
 
-        let error_count: i64 = client
-            .query_one(
-                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2",
-                &[&"test_project", &"ERROR"],
-            )
-            .await?
-            .get(0);
+        let error_count: i64 =
+            client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = $2", &[&"test_project", &"ERROR"]).await?.get(0);
         assert_eq!(error_count, 0);
 
         let total_count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"test_project"]).await?.get(0);
@@ -377,12 +287,7 @@ mod integration {
         // Bare projection: hits wrap_root_projection's Projection arm directly.
         // Bare Variant columns surface as jsonb (OID 3802), decoded binary as serde_json::Value
         // (see jsonb_oid_test::bare_variant_column_returns_jsonb_oid for the wire contract).
-        let row = client
-            .query_one(
-                "SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
-                &[&"test_project", &span_id],
-            )
-            .await?;
+        let row = client.query_one("SELECT attributes FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &span_id]).await?;
         let parsed: serde_json::Value = row.get(0);
         assert_eq!(parsed["http"]["method"], "GET");
         assert_eq!(parsed["user"], "alice");

@@ -33,10 +33,7 @@ pub struct AuthConfig {
 
 impl Default for AuthConfig {
     fn default() -> Self {
-        Self {
-            username: "postgres".into(),
-            password: None,
-        }
+        Self { username: "postgres".into(), password: None }
     }
 }
 
@@ -49,18 +46,12 @@ impl AuthConfig {
     pub fn from_core(core: &crate::config::CoreConfig) -> anyhow::Result<Self> {
         let allow_insecure = crate::config::is_insecure_auth_allowed();
         match (&core.pgwire_password, allow_insecure) {
-            (Some(p), _) if !p.is_empty() => Ok(Self {
-                username: core.pgwire_user.clone(),
-                password: Some(p.clone()),
-            }),
+            (Some(p), _) if !p.is_empty() => Ok(Self { username: core.pgwire_user.clone(), password: Some(p.clone()) }),
             (_, true) => {
                 tracing::warn!(
                     "PGWIRE_PASSWORD unset and TIMEFUSION_ALLOW_INSECURE_AUTH=true — pgwire endpoint accepts any password. Acceptable for local dev ONLY; never in production."
                 );
-                Ok(Self {
-                    username: core.pgwire_user.clone(),
-                    password: None,
-                })
+                Ok(Self { username: core.pgwire_user.clone(), password: None })
             }
             _ => anyhow::bail!("PGWIRE_PASSWORD is required (set TIMEFUSION_ALLOW_INSECURE_AUTH=true to opt into open auth for local dev)"),
         }
@@ -99,23 +90,17 @@ impl AuthSource for ConfigAuthSource {
 /// Custom handler factory that creates handlers with logging and auth
 pub struct LoggingHandlerFactory {
     session_context: Arc<SessionContext>,
-    auth_config:     AuthConfig,
-    plan_cache:      Arc<PlanCacheHook>,
-    scan_metrics:    Option<Arc<crate::database::ScanMetrics>>,
-    db:              Option<Arc<Database>>,
+    auth_config: AuthConfig,
+    plan_cache: Arc<PlanCacheHook>,
+    scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
+    db: Option<Arc<Database>>,
 }
 
 impl LoggingHandlerFactory {
     pub fn new(session_context: Arc<SessionContext>, auth_config: AuthConfig) -> Self {
         let plan_cache = Arc::new(PlanCacheHook::default());
         crate::plan_cache::set_global(plan_cache.clone());
-        Self {
-            session_context,
-            auth_config,
-            plan_cache,
-            scan_metrics: None,
-            db: None,
-        }
+        Self { session_context, auth_config, plan_cache, scan_metrics: None, db: None }
     }
 
     pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
@@ -164,10 +149,7 @@ impl PgWireServerHandlers for LoggingHandlerFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(CleartextPasswordAuthStartupHandler::new(
-            ConfigAuthSource::new(self.auth_config.clone()),
-            DefaultServerParameterProvider::default(),
-        ))
+        Arc::new(CleartextPasswordAuthStartupHandler::new(ConfigAuthSource::new(self.auth_config.clone()), DefaultServerParameterProvider::default()))
     }
 
     fn error_handler(&self) -> Arc<impl ErrorHandler> {
@@ -195,26 +177,18 @@ impl ErrorHandler for LoggingErrorHandler {
 
 /// Simple query handler with tracing
 pub struct LoggingSimpleQueryHandler {
-    inner:        DfSessionService,
+    inner: DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
-    db:           Option<Arc<Database>>,
+    db: Option<Arc<Database>>,
 }
 
 impl LoggingSimpleQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
-        Self {
-            inner:        DfSessionService::new(session_context),
-            scan_metrics: None,
-            db:           None,
-        }
+        Self { inner: DfSessionService::new(session_context), scan_metrics: None, db: None }
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
-        Self {
-            inner:        DfSessionService::new_with_hooks(session_context, hooks),
-            scan_metrics: None,
-            db:           None,
-        }
+        Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics: None, db: None }
     }
 
     pub fn with_scan_metrics(mut self, m: Arc<crate::database::ScanMetrics>) -> Self {
@@ -233,10 +207,7 @@ impl LoggingSimpleQueryHandler {
             Some(d) => d,
             None => return Err(admin_err("OPTIMIZE is not available on this server")),
         };
-        let table_ref = db
-            .get_or_create_unified_table(&cmd.table)
-            .await
-            .map_err(|e| admin_err(&format!("OPTIMIZE: open table '{}': {e}", cmd.table)))?;
+        let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(&format!("OPTIMIZE: open table '{}': {e}", cmd.table)))?;
         let (removed, added) = db.compact_date(&table_ref, &cmd.table, cmd.date).await.map_err(|e| admin_err(&e.to_string()))?;
         info!("pgwire OPTIMIZE {} date={}: {removed} removed, {added} added", cmd.table, cmd.date);
         Ok(vec![Response::Execution(Tag::new(&format!("OPTIMIZE {removed} {added}")))])
@@ -276,18 +247,12 @@ impl LoggingSimpleQueryHandler {
             let now = chrono::Utc::now().timestamp_micros();
             let since = now.saturating_sub(LAST_FLUSH_MICROS.load(Ordering::Acquire));
             if since < FLUSH_MIN_INTERVAL_SECS * 1_000_000 {
-                return Err(admin_err(&format!(
-                    "FLUSH rate-limited: last ran {}s ago (min interval {FLUSH_MIN_INTERVAL_SECS}s)",
-                    since / 1_000_000
-                )));
+                return Err(admin_err(&format!("FLUSH rate-limited: last ran {}s ago (min interval {FLUSH_MIN_INTERVAL_SECS}s)", since / 1_000_000)));
             }
             LAST_FLUSH_MICROS.store(now, Ordering::Release);
         }
         let stats = layer.flush_all_now().await.map_err(|e| admin_err(&format!("FLUSH: {e}")))?;
-        info!(
-            "pgwire FLUSH: {} bucket(s) flushed ({} rows), {} failed",
-            stats.buckets_flushed, stats.total_rows, stats.buckets_failed
-        );
+        info!("pgwire FLUSH: {} bucket(s) flushed ({} rows), {} failed", stats.buckets_flushed, stats.total_rows, stats.buckets_failed);
         if stats.buckets_failed > 0 {
             return Err(admin_err(&format!(
                 "FLUSH: {} bucket(s) failed to flush ({} flushed) — data stays buffered/WAL-durable",
@@ -302,7 +267,7 @@ impl LoggingSimpleQueryHandler {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct OptimizeCmd {
     pub table: String,
-    pub date:  chrono::NaiveDate,
+    pub date: chrono::NaiveDate,
 }
 
 fn admin_err(msg: &str) -> PgWireError {
@@ -338,24 +303,15 @@ pub(crate) fn parse_optimize(query: &str) -> Result<Option<OptimizeCmd>, String>
     if !cond.to_ascii_lowercase().starts_with("date") {
         return Err("OPTIMIZE only supports a single `date` filter".to_string());
     }
-    let val = cond[4..]
-        .trim()
-        .strip_prefix('=')
-        .ok_or("expected: date = 'YYYY-MM-DD'")?
-        .trim()
-        .trim_matches(|c| c == '\'' || c == '"')
-        .trim();
+    let val = cond[4..].trim().strip_prefix('=').ok_or("expected: date = 'YYYY-MM-DD'")?.trim().trim_matches(|c| c == '\'' || c == '"').trim();
     let date = val.parse::<chrono::NaiveDate>().map_err(|_| format!("invalid date '{val}', expected YYYY-MM-DD"))?;
-    Ok(Some(OptimizeCmd {
-        table: table.to_string(),
-        date,
-    }))
+    Ok(Some(OptimizeCmd { table: table.to_string(), date }))
 }
 
 /// An intercepted `VACUUM <table> [RETAIN <n> HOURS]` admin command.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct VacuumCmd {
-    pub table:           String,
+    pub table: String,
     /// `None` → use the configured default retention.
     pub retention_hours: Option<u64>,
 }
@@ -392,10 +348,7 @@ pub(crate) fn parse_vacuum(query: &str) -> Result<Option<VacuumCmd>, String> {
         let num = after.strip_suffix("hours").or_else(|| after.strip_suffix("hour")).unwrap_or(&after).trim();
         Some(num.parse::<u64>().map_err(|_| format!("VACUUM {table}: invalid retention '{after}', expected `RETAIN <n> HOURS`"))?)
     };
-    Ok(Some(VacuumCmd {
-        table: table.to_string(),
-        retention_hours,
-    }))
+    Ok(Some(VacuumCmd { table: table.to_string(), retention_hours }))
 }
 
 /// Parse a bare `FLUSH` admin command (not a Postgres statement, so safe to
@@ -530,7 +483,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
 
 /// Extended query handler with tracing
 pub struct LoggingExtendedQueryHandler {
-    inner:        DfSessionService,
+    inner: DfSessionService,
     scan_metrics: Option<Arc<crate::database::ScanMetrics>>,
 }
 
@@ -543,17 +496,11 @@ impl LoggingExtendedQueryHandler {
 
 impl LoggingExtendedQueryHandler {
     pub fn new(session_context: Arc<SessionContext>) -> Self {
-        Self {
-            inner:        DfSessionService::new(session_context),
-            scan_metrics: None,
-        }
+        Self { inner: DfSessionService::new(session_context), scan_metrics: None }
     }
 
     pub fn new_with_hooks(session_context: Arc<SessionContext>, hooks: Vec<Arc<dyn QueryHook>>) -> Self {
-        Self {
-            inner:        DfSessionService::new_with_hooks(session_context, hooks),
-            scan_metrics: None,
-        }
+        Self { inner: DfSessionService::new_with_hooks(session_context, hooks), scan_metrics: None }
     }
 }
 
@@ -604,9 +551,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
 
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
-        let result = <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows)
-            .instrument(execute_span)
-            .await;
+        let result = <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span).await;
         if let Some(m) = &self.scan_metrics {
             m.record_pgwire_query(t0.elapsed().as_micros() as u64);
         }
@@ -661,10 +606,7 @@ mod tests {
         assert_eq!(cmd.table, "otel_logs_and_spans");
         assert_eq!(cmd.date, "2026-06-19".parse().unwrap());
         // Case / spacing / quote / trailing-semicolon tolerance.
-        assert_eq!(
-            parse_optimize("optimize t where DATE='2026-01-02';").unwrap().unwrap().date,
-            "2026-01-02".parse().unwrap()
-        );
+        assert_eq!(parse_optimize("optimize t where DATE='2026-01-02';").unwrap().unwrap().date, "2026-01-02".parse().unwrap());
         assert_eq!(parse_optimize("  OPTIMIZE  t  WHERE  date  =  \"2026-01-02\"  ").unwrap().unwrap().table, "t");
     }
 

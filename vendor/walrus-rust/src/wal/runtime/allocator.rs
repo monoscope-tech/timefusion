@@ -17,29 +17,17 @@ use crate::wal::{
 
 pub(super) struct BlockAllocator {
     next_block: UnsafeCell<Block>,
-    lock:       AtomicBool,
-    paths:      Arc<WalPathManager>,
+    lock: AtomicBool,
+    paths: Arc<WalPathManager>,
 }
 
 impl BlockAllocator {
     pub(super) fn new(paths: Arc<WalPathManager>) -> std::io::Result<Self> {
         let file1 = paths.create_new_file()?;
         let mmap: Arc<SharedMmap> = SharedMmapKeeper::get_mmap_arc(&file1)?;
-        debug_print!(
-            "[alloc] init: created file={}, max_file_size={}B, block_size={}B",
-            file1,
-            MAX_FILE_SIZE,
-            DEFAULT_BLOCK_SIZE
-        );
+        debug_print!("[alloc] init: created file={}, max_file_size={}B, block_size={}B", file1, MAX_FILE_SIZE, DEFAULT_BLOCK_SIZE);
         Ok(BlockAllocator {
-            next_block: UnsafeCell::new(Block {
-                id: 1,
-                offset: 0,
-                limit: DEFAULT_BLOCK_SIZE,
-                file_path: file1,
-                mmap,
-                used: 0,
-            }),
+            next_block: UnsafeCell::new(Block { id: 1, offset: 0, limit: DEFAULT_BLOCK_SIZE, file_path: file1, mmap, used: 0 }),
             lock: AtomicBool::new(false),
             paths,
         })
@@ -75,13 +63,7 @@ impl BlockAllocator {
         data.offset += DEFAULT_BLOCK_SIZE;
         data.id += 1;
         self.unlock();
-        debug_print!(
-            "[alloc] handout: block_id={}, file={}, offset={}, limit={}",
-            ret.id,
-            ret.file_path,
-            ret.offset,
-            ret.limit
-        );
+        debug_print!("[alloc] handout: block_id={}, file={}, offset={}, limit={}", ret.id, ret.file_path, ret.offset, ret.limit);
         Ok(ret)
     }
 
@@ -90,10 +72,7 @@ impl BlockAllocator {
     /// internal spin lock provides exclusive access to mutate allocator state.
     pub(super) unsafe fn alloc_block(&self, want_bytes: u64) -> std::io::Result<Block> {
         if want_bytes == 0 || want_bytes > MAX_ALLOC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invalid allocation size, a single entry can't be more than 1gb",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid allocation size, a single entry can't be more than 1gb"));
         }
         let alloc_units = (want_bytes + DEFAULT_BLOCK_SIZE - 1) / DEFAULT_BLOCK_SIZE;
         let alloc_size = alloc_units * DEFAULT_BLOCK_SIZE;
@@ -112,14 +91,7 @@ impl BlockAllocator {
             FileStateTracker::set_fully_allocated(prev_block_file_path);
             debug_print!("[alloc] file rollover for sized alloc -> {}", data.file_path);
         }
-        let ret = Block {
-            id:        data.id,
-            file_path: data.file_path.clone(),
-            offset:    data.offset,
-            limit:     alloc_size,
-            mmap:      data.mmap.clone(),
-            used:      0,
-        };
+        let ret = Block { id: data.id, file_path: data.file_path.clone(), offset: data.offset, limit: alloc_size, mmap: data.mmap.clone(), used: 0 };
         // register the new block before handing it out
         BlockStateTracker::register_block(ret.id as usize, &ret.file_path);
         FileStateTracker::register_file_if_absent(&ret.file_path);
@@ -128,13 +100,7 @@ impl BlockAllocator {
         data.offset += alloc_size;
         data.id += 1;
         self.unlock();
-        debug_print!(
-            "[alloc] handout(sized): block_id={}, file={}, offset={}, limit={}",
-            ret.id,
-            ret.file_path,
-            ret.offset,
-            ret.limit
-        );
+        debug_print!("[alloc] handout(sized): block_id={}, file={}, offset={}, limit={}", ret.id, ret.file_path, ret.offset, ret.limit);
         Ok(ret)
     }
 
@@ -175,7 +141,7 @@ pub(super) fn flush_check(file_path: String) {
 
 struct BlockState {
     is_checkpointed: AtomicBool,
-    file_path:       String,
+    file_path: String,
 }
 
 pub(super) struct BlockStateTracker {}
@@ -189,10 +155,7 @@ impl BlockStateTracker {
     pub(super) fn register_block(block_id: usize, file_path: &str) {
         let map = Self::map();
         if let Ok(mut w) = map.write() {
-            w.entry(block_id).or_insert_with(|| BlockState {
-                is_checkpointed: AtomicBool::new(false),
-                file_path:       file_path.to_string(),
-            });
+            w.entry(block_id).or_insert_with(|| BlockState { is_checkpointed: AtomicBool::new(false), file_path: file_path.to_string() });
         }
     }
 
@@ -241,10 +204,10 @@ impl BlockStateTracker {
 }
 
 struct FileState {
-    locked_block_ctr:     AtomicU16,
+    locked_block_ctr: AtomicU16,
     checkpoint_block_ctr: AtomicU16,
-    total_blocks:         AtomicU16,
-    is_fully_allocated:   AtomicBool,
+    total_blocks: AtomicU16,
+    is_fully_allocated: AtomicBool,
 }
 
 pub(super) struct FileStateTracker {}
@@ -259,10 +222,10 @@ impl FileStateTracker {
         let map = Self::map();
         let mut w = map.write().expect("file state map write lock poisoned");
         w.entry(file_path.to_string()).or_insert_with(|| FileState {
-            locked_block_ctr:     AtomicU16::new(0),
+            locked_block_ctr: AtomicU16::new(0),
             checkpoint_block_ctr: AtomicU16::new(0),
-            total_blocks:         AtomicU16::new(0),
-            is_fully_allocated:   AtomicBool::new(false),
+            total_blocks: AtomicU16::new(0),
+            is_fully_allocated: AtomicBool::new(false),
         });
     }
 

@@ -35,20 +35,17 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install nightly + stable toolchains
-        run: |
-          rustup toolchain install nightly --component rustfmt
-          rustup toolchain install stable --component clippy
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --component rustfmt,clippy
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - uses: Swatinem/rust-cache@v2
 
-      # rustfmt.toml uses nightly-only options — must invoke +nightly explicitly
-      # so it matches the CI fmt-check job.
+      # rustfmt.toml is stable-only; plain `cargo fmt` matches the CI fmt-check.
       - name: Run cargo fmt
-        run: cargo +nightly fmt --all
+        run: cargo fmt --all
 
       - name: Run cargo clippy --fix
         # --allow-dirty because fmt may have already produced uncommitted changes.
@@ -63,7 +60,7 @@ jobs:
             echo "clippy --fix failed (likely couldn't auto-fix every warning); reverting clippy hunks only"
             # Re-apply fmt result on top of HEAD without clippy's partial changes.
             git checkout -- .
-            cargo +nightly fmt --all
+            cargo fmt --all
           fi
           exit 0
 

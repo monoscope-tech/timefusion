@@ -170,11 +170,7 @@ async fn wait_for_manifest_entries(store: &dyn object_store::ObjectStore, projec
         }
         // Err (not the short manifest) on expiry — the caller's assert would
         // otherwise fire with a confusing entry-count mismatch.
-        anyhow::ensure!(
-            std::time::Instant::now() <= deadline,
-            "manifest for {project} stuck at {} entries after 30s, want {want}",
-            m.entries.len()
-        );
+        anyhow::ensure!(std::time::Instant::now() <= deadline, "manifest for {project} stuck at {} entries after 30s, want {want}", m.entries.len());
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
@@ -220,11 +216,7 @@ async fn membuffer_only_level_eq_falls_back_correctly() -> Result<()> {
     let (db2, ctx2, _) = build_db(&format!("{id}-mem-off"), false).await?;
     let p = unique_project();
 
-    let rows = vec![
-        ("x1", "service-a", "operation completed"),
-        ("x2", "service-a", "operation failed"),
-        ("x3", "service-b", "request timeout"),
-    ];
+    let rows = vec![("x1", "service-a", "operation completed"), ("x2", "service-a", "operation failed"), ("x3", "service-b", "request timeout")];
     db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
     db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -498,10 +490,7 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
     let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND id = '{uid}'");
     let r_on = collect_ids(&ctx, &q).await?;
     let r_off = collect_ids(&ctx2, &q).await?;
-    assert_eq!(
-        r_on, r_off,
-        "exact `id=` on a dashed UUID must match baseline (QueryParser must not eat the `-`)"
-    );
+    assert_eq!(r_on, r_off, "exact `id=` on a dashed UUID must match baseline (QueryParser must not eat the `-`)");
     assert_eq!(r_on, vec![uid.to_string()]);
 
     // DECISIVE: query the tantivy search service directly so the result can't
@@ -514,24 +503,15 @@ async fn flushed_eq_on_uuid_id_with_dashes_matches_baseline() -> Result<()> {
         .search_with_stats(
             TABLE,
             &p,
-            &timefusion::tantivy_index::udf::PredNode::Leaf(timefusion::tantivy_index::udf::TextMatchPred {
-                column: "id".into(),
-                query:  uid.into(),
-            }),
+            &timefusion::tantivy_index::udf::PredNode::Leaf(timefusion::tantivy_index::udf::TextMatchPred { column: "id".into(), query: uid.into() }),
             1000,
             None,
         )
         .await?
         .map(|r| r.hits.into_iter().map(|h| h.id).collect())
         .unwrap_or_default();
-    assert!(
-        hits.contains(&uid.to_string()),
-        "tantivy exact search on `id` must return the dashed UUID, not fall back; got {hits:?}"
-    );
-    assert!(
-        !hits.contains(&"11111111-2222-3333-4444-555555555555".to_string()),
-        "must not over-match other ids; got {hits:?}"
-    );
+    assert!(hits.contains(&uid.to_string()), "tantivy exact search on `id` must return the dashed UUID, not fall back; got {hits:?}");
+    assert!(!hits.contains(&"11111111-2222-3333-4444-555555555555".to_string()), "must not over-match other ids; got {hits:?}");
     Ok(())
 }
 

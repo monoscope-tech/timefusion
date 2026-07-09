@@ -23,7 +23,7 @@ mod pgwire_dml_tag {
         "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, name, status_code, status_message, level, hashes, summary)";
 
     struct TestServer {
-        port:     u16,
+        port: u16,
         shutdown: Arc<Notify>,
     }
 
@@ -49,10 +49,7 @@ mod pgwire_dml_tag {
                 let mut ctx = db_clone.clone().create_session_context();
                 db_clone.setup_session_context(&mut ctx).expect("setup ctx");
                 let opts = ServerOptions::new().with_port(port).with_host("127.0.0.1".to_string());
-                let auth = timefusion::pgwire_handlers::AuthConfig {
-                    username: "postgres".into(),
-                    password: Some("postgres".into()),
-                };
+                let auth = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
                     res = timefusion::pgwire_handlers::serve_with_logging(Arc::new(ctx), &opts, auth, None, None, std::future::pending::<()>()) => {
@@ -105,14 +102,8 @@ mod pgwire_dml_tag {
         let client = server.client().await?;
 
         let cases: &[(&str, String)] = &[
-            (
-                "INSERT",
-                format!("{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, $3, $4, $5, $6, ARRAY[]::text[], $7)"),
-            ),
-            (
-                "UPDATE",
-                "UPDATE otel_logs_and_spans SET status_message = $1 WHERE project_id = $2 AND id = $3".into(),
-            ),
+            ("INSERT", format!("{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, $3, $4, $5, $6, ARRAY[]::text[], $7)")),
+            ("UPDATE", "UPDATE otel_logs_and_spans SET status_message = $1 WHERE project_id = $2 AND id = $3".into()),
             ("DELETE", "DELETE FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2".into()),
             // Variant column path — exercises VariantInsertRewriter, monoscope's actual prod path.
             (
@@ -125,11 +116,7 @@ mod pgwire_dml_tag {
 
         for (label, sql) in cases {
             let stmt = client.prepare(sql).await?;
-            assert!(
-                stmt.columns().is_empty(),
-                "{label}: expected NoData, got {:?}",
-                stmt.columns().iter().map(|c| c.name()).collect::<Vec<_>>(),
-            );
+            assert!(stmt.columns().is_empty(), "{label}: expected NoData, got {:?}", stmt.columns().iter().map(|c| c.name()).collect::<Vec<_>>(),);
         }
         Ok(())
     }
@@ -146,9 +133,7 @@ mod pgwire_dml_tag {
         let n = client.execute(&sql, &[&"test_project", &id]).await?;
         assert_eq!(n, 1);
 
-        let row = client
-            .query_one("SELECT id FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &id])
-            .await?;
+        let row = client.query_one("SELECT id FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"test_project", &id]).await?;
         assert_eq!(row.get::<_, String>(0), id);
         Ok(())
     }
@@ -165,11 +150,8 @@ mod pgwire_dml_tag {
         let url = format!("postgres://postgres:postgres@localhost:{}/postgres", server.port);
         let mut conn = sqlx::postgres::PgConnection::connect(&url).await?;
 
-        let describe = conn
-            .describe(&format!(
-                "{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])"
-            ))
-            .await?;
+        let describe =
+            conn.describe(&format!("{SPAN_INSERT_COLS} VALUES ($1, CURRENT_DATE, NOW(), $2, 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])")).await?;
         assert!(
             describe.columns.is_empty(),
             "sqlx::describe must report no columns for INSERT without RETURNING; got {:?}",
@@ -191,14 +173,8 @@ mod pgwire_dml_tag {
         let id = Uuid::new_v4().to_string();
         let sql = format!("{SPAN_INSERT_COLS} VALUES ('test_project', CURRENT_DATE, NOW(), '{id}', 'n', 'OK', 'm', 'INFO', ARRAY[]::text[], ARRAY['s'])");
         let msgs = client.simple_query(&sql).await?;
-        assert!(
-            !msgs.iter().any(|m| matches!(m, SimpleQueryMessage::Row(_))),
-            "INSERT must not emit DataRow messages"
-        );
-        assert!(
-            msgs.iter().any(|m| matches!(m, SimpleQueryMessage::CommandComplete(_))),
-            "expected CommandComplete"
-        );
+        assert!(!msgs.iter().any(|m| matches!(m, SimpleQueryMessage::Row(_))), "INSERT must not emit DataRow messages");
+        assert!(msgs.iter().any(|m| matches!(m, SimpleQueryMessage::CommandComplete(_))), "expected CommandComplete");
         Ok(())
     }
 

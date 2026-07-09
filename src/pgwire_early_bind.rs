@@ -109,10 +109,7 @@ async fn handle_one(mut sock: TcpStream, response: &[u8]) -> io::Result<()> {
 async fn drain_body(sock: &mut TcpStream, remaining: Option<u64>) -> io::Result<()> {
     let n = remaining.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "startup length below 8-byte header"))?;
     if n > MAX_STARTUP_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("startup body {n} exceeds {MAX_STARTUP_BYTES}-byte cap"),
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("startup body {n} exceeds {MAX_STARTUP_BYTES}-byte cap")));
     }
     tokio::io::copy(&mut sock.take(n), &mut tokio::io::sink()).await?;
     Ok(())

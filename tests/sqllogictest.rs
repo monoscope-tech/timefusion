@@ -153,11 +153,7 @@ mod sqllogictest_tests {
             }
             frac_part.truncate(dscale);
             let sign_prefix = if sign == 0x4000 { "-" } else { "" };
-            Ok(PgNumeric(if dscale == 0 {
-                format!("{sign_prefix}{int_part}")
-            } else {
-                format!("{sign_prefix}{int_part}.{frac_part}")
-            }))
+            Ok(PgNumeric(if dscale == 0 { format!("{sign_prefix}{int_part}") } else { format!("{sign_prefix}{int_part}.{frac_part}") }))
         }
         fn accepts(ty: &tokio_postgres::types::Type) -> bool {
             ty.name() == "numeric"
@@ -202,18 +198,13 @@ mod sqllogictest_tests {
                         .try_get::<_, Option<chrono::NaiveDateTime>>(i)
                         .map(|v| v.map(|x| x.to_string()).unwrap_or_else(|| "NULL".to_string()))
                         .unwrap_or_else(|_| {
-                            row.try_get::<_, Option<String>>(i)
-                                .map(|v| v.unwrap_or_else(|| "NULL".to_string()))
-                                .unwrap_or_else(|_| "[timestamp]".to_string())
+                            row.try_get::<_, Option<String>>(i).map(|v| v.unwrap_or_else(|| "NULL".to_string())).unwrap_or_else(|_| "[timestamp]".to_string())
                         }),
                     "json" | "jsonb" => row
                         .try_get::<_, Option<serde_json::Value>>(i)
                         .map(|v| v.map(|j| j.to_string()).unwrap_or_else(|| "NULL".to_string()))
                         .unwrap_or_else(|_| format!("error:{type_name}")),
-                    _ => row
-                        .try_get::<_, Option<String>>(i)
-                        .map(|v| v.unwrap_or_else(|| "NULL".to_string()))
-                        .unwrap_or_else(|_| type_name.to_string()),
+                    _ => row.try_get::<_, Option<String>>(i).map(|v| v.unwrap_or_else(|| "NULL".to_string())).unwrap_or_else(|_| type_name.to_string()),
                 }
             })
             .collect()
@@ -270,10 +261,7 @@ mod sqllogictest_tests {
             db.setup_session_context(&mut session_context).expect("Failed to setup session context");
 
             let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
-            let auth_config = timefusion::pgwire_handlers::AuthConfig {
-                username: "postgres".into(),
-                password: Some("postgres".into()),
-            };
+            let auth_config = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
 
             // Wait for shutdown signal or server termination
             tokio::select! {

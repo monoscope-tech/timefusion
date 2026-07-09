@@ -6,13 +6,13 @@ use crate::wal::paths::WalPathManager;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub struct BlockPos {
-    pub cur_block_idx:    u64,
+    pub cur_block_idx: u64,
     pub cur_block_offset: u64,
 }
 
 pub struct WalIndex {
     store: HashMap<String, BlockPos>,
-    path:  String,
+    path: String,
 }
 
 impl WalIndex {
@@ -39,20 +39,11 @@ impl WalIndex {
             })
             .unwrap_or_default();
 
-        Ok(Self {
-            store,
-            path: path.to_string_lossy().into_owned(),
-        })
+        Ok(Self { store, path: path.to_string_lossy().into_owned() })
     }
 
     pub fn set(&mut self, key: String, idx: u64, offset: u64) -> std::io::Result<()> {
-        self.store.insert(
-            key,
-            BlockPos {
-                cur_block_idx:    idx,
-                cur_block_offset: offset,
-            },
-        );
+        self.store.insert(key, BlockPos { cur_block_idx: idx, cur_block_offset: offset });
         self.persist()
     }
 

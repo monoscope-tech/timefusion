@@ -72,7 +72,7 @@ pub(crate) fn table_time_column(table_name: &str) -> &'static str {
 /// One extracted `time_col CMP literal` conjunct.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TimeBound {
-    pub value:     ScalarValue,
+    pub value: ScalarValue,
     pub inclusive: bool,
 }
 
@@ -84,8 +84,8 @@ pub(crate) struct TimeBound {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DecomposedPredicate {
     pub residual: Vec<Expr>,
-    pub lower:    Option<TimeBound>,
-    pub upper:    Option<TimeBound>,
+    pub lower: Option<TimeBound>,
+    pub upper: Option<TimeBound>,
 }
 
 impl DecomposedPredicate {
@@ -111,11 +111,7 @@ impl DecomposedPredicate {
                 (false, true) => Operator::LtEq,
                 (false, false) => Operator::Lt,
             };
-            Expr::BinaryExpr(BinaryExpr {
-                left: Box::new(datafusion::prelude::col(time_col)),
-                op,
-                right: Box::new(lit(b.value.clone())),
-            })
+            Expr::BinaryExpr(BinaryExpr { left: Box::new(datafusion::prelude::col(time_col)), op, right: Box::new(lit(b.value.clone())) })
         };
         self.residual
             .iter()
@@ -146,10 +142,7 @@ impl DecomposedPredicate {
 /// fingerprint makes this near-impossible, but never tighten on uncertainty.
 fn widen_bound(a: TimeBound, b: &TimeBound, lower: bool) -> TimeBound {
     match a.value.partial_cmp(&b.value) {
-        Some(std::cmp::Ordering::Equal) => TimeBound {
-            inclusive: a.inclusive || b.inclusive,
-            value:     a.value,
-        },
+        Some(std::cmp::Ordering::Equal) => TimeBound { inclusive: a.inclusive || b.inclusive, value: a.value },
         Some(ord) if (ord == std::cmp::Ordering::Less) == lower => a,
         Some(_) => b.clone(),
         None => TimeBound { inclusive: true, ..a },
@@ -238,10 +231,7 @@ fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> Clamp
         None => d.lower.is_some(), // only add a bound when a time window exists at all
     };
     if tighter {
-        d.upper = Some(TimeBound {
-            value:     wm,
-            inclusive: true,
-        });
+        d.upper = Some(TimeBound { value: wm, inclusive: true });
         ClampAction::Clamped
     } else {
         ClampAction::Unchanged
@@ -290,22 +280,22 @@ fn split_rounds(batch: &RecordBatch, key_indices: &[usize]) -> Result<Vec<Record
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GroupKey {
-    project_id:  String,
-    table_name:  String,
+    project_id: String,
+    table_name: String,
     fingerprint: u64,
 }
 
 struct PendingGroup {
-    join_keys:   Vec<(String, String)>,
+    join_keys: Vec<(String, String)>,
     assignments: Vec<(String, Expr)>,
-    predicate:   DecomposedPredicate,
-    time_col:    &'static str,
-    schema:      SchemaRef,
-    batches:     Vec<RecordBatch>,
+    predicate: DecomposedPredicate,
+    time_col: &'static str,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
     /// Freshest enqueuing statement's session — keeps the drain's function
     /// registry identical to what the synchronous merge would have used.
-    session:     Arc<dyn Session>,
-    attempts:    u32,
+    session: Arc<dyn Session>,
+    attempts: u32,
 }
 
 /// Hash of everything that must match exactly for two statements to share
@@ -331,11 +321,11 @@ fn shape_fingerprint(join_keys: &[(String, String)], assignments: &[(String, Exp
 /// `TIMEFUSION_DML_COALESCE_SECS > 0`.
 pub struct DmlCoalescer {
     interval_secs: u64,
-    groups:        std::sync::Mutex<HashMap<GroupKey, PendingGroup>>,
-    queued_rows:   AtomicUsize,
-    drain_notify:  Notify,
+    groups: std::sync::Mutex<HashMap<GroupKey, PendingGroup>>,
+    queued_rows: AtomicUsize,
+    drain_notify: Notify,
     /// Serializes drains (timer vs shutdown vs test-triggered).
-    drain_lock:    tokio::sync::Mutex<()>,
+    drain_lock: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for DmlCoalescer {
@@ -352,10 +342,10 @@ impl DmlCoalescer {
     pub fn new(interval_secs: u64) -> Self {
         Self {
             interval_secs: interval_secs.max(1),
-            groups:        std::sync::Mutex::new(HashMap::new()),
-            queued_rows:   AtomicUsize::new(0),
-            drain_notify:  Notify::new(),
-            drain_lock:    tokio::sync::Mutex::new(()),
+            groups: std::sync::Mutex::new(HashMap::new()),
+            queued_rows: AtomicUsize::new(0),
+            drain_notify: Notify::new(),
+            drain_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -367,8 +357,8 @@ impl DmlCoalescer {
         let time_col = table_time_column(table_name);
         let decomposed = DecomposedPredicate::decompose(predicate, time_col);
         let key = GroupKey {
-            project_id:  project_id.to_string(),
-            table_name:  table_name.to_string(),
+            project_id: project_id.to_string(),
+            table_name: table_name.to_string(),
             fingerprint: shape_fingerprint(&source.join_keys, assignments, &decomposed.residual, &source.schema),
         };
         let rows = source.batch.num_rows();
@@ -418,10 +408,7 @@ impl DmlCoalescer {
                 match clamp_decomposed(&mut group.predicate, wm) {
                     ClampAction::Skip => {
                         crate::metrics::record_dml_delta_leg_skipped();
-                        debug!(
-                            "dml coalesce: skipping {}/{} group — window entirely above flush watermark",
-                            key.project_id, key.table_name
-                        );
+                        debug!("dml coalesce: skipping {}/{} group — window entirely above flush watermark", key.project_id, key.table_name);
                         continue;
                     }
                     ClampAction::Unchanged | ClampAction::Clamped => {}
@@ -456,11 +443,7 @@ impl DmlCoalescer {
             let predicate = group.predicate.reconstruct(group.time_col);
             let mut failed = None;
             for round in rounds {
-                let source = UpdateSource {
-                    batch:     round,
-                    schema:    group.schema.clone(),
-                    join_keys: group.join_keys.clone(),
-                };
+                let source = UpdateSource { batch: round, schema: group.schema.clone(), join_keys: group.join_keys.clone() };
                 match crate::dml::perform_delta_merge_update(
                     db,
                     &key.table_name,
@@ -474,10 +457,7 @@ impl DmlCoalescer {
                 {
                     Ok(rows) => {
                         crate::metrics::record_dml_coalesce_merge();
-                        debug!(
-                            "dml coalesce: merged {statements} stmts for {}/{} — {rows} rows updated",
-                            key.project_id, key.table_name
-                        );
+                        debug!("dml coalesce: merged {statements} stmts for {}/{} — {rows} rows updated", key.project_id, key.table_name);
                     }
                     Err(e) => {
                         failed = Some(e);
@@ -572,20 +552,8 @@ mod tests {
     fn decompose_extracts_bounds_and_residual() {
         let pred = col("project_id").eq(lit("p1")).and(window(100, 200));
         let d = DecomposedPredicate::decompose(Some(&pred), "timestamp");
-        assert_eq!(
-            d.lower,
-            Some(TimeBound {
-                value:     ts(100),
-                inclusive: true,
-            })
-        );
-        assert_eq!(
-            d.upper,
-            Some(TimeBound {
-                value:     ts(200),
-                inclusive: false,
-            })
-        );
+        assert_eq!(d.lower, Some(TimeBound { value: ts(100), inclusive: true }));
+        assert_eq!(d.upper, Some(TimeBound { value: ts(200), inclusive: false }));
         assert_eq!(d.residual.len(), 1);
         // Round-trip preserves the conjunction (order may differ).
         let rebuilt = d.reconstruct("timestamp").unwrap();
@@ -628,13 +596,7 @@ mod tests {
         match clamp_to_watermark(Some(&pred), "timestamp", 500) {
             WatermarkClamp::Keep(Some(p)) => {
                 let d = DecomposedPredicate::decompose(Some(&p), "timestamp");
-                assert_eq!(
-                    d.upper,
-                    Some(TimeBound {
-                        value:     ts(500),
-                        inclusive: true,
-                    })
-                );
+                assert_eq!(d.upper, Some(TimeBound { value: ts(500), inclusive: true }));
                 assert_eq!(d.lower.unwrap().value, ts(100));
             }
             _ => panic!("expected clamped predicate"),
@@ -687,15 +649,9 @@ mod tests {
         let d1 = DecomposedPredicate::decompose(Some(&col("project_id").eq(lit("p1")).and(window(1, 2))), "timestamp");
         let d2 = DecomposedPredicate::decompose(Some(&window(5, 9).and(col("project_id").eq(lit("p1")))), "timestamp");
         // Same residual (order-insensitive), different windows → same group.
-        assert_eq!(
-            shape_fingerprint(&jk, &assign, &d1.residual, &schema),
-            shape_fingerprint(&jk, &assign, &d2.residual, &schema)
-        );
+        assert_eq!(shape_fingerprint(&jk, &assign, &d1.residual, &schema), shape_fingerprint(&jk, &assign, &d2.residual, &schema));
         // Different residual constant → different group.
         let d3 = DecomposedPredicate::decompose(Some(&col("project_id").eq(lit("p2")).and(window(1, 2))), "timestamp");
-        assert_ne!(
-            shape_fingerprint(&jk, &assign, &d1.residual, &schema),
-            shape_fingerprint(&jk, &assign, &d3.residual, &schema)
-        );
+        assert_ne!(shape_fingerprint(&jk, &assign, &d1.residual, &schema), shape_fingerprint(&jk, &assign, &d3.residual, &schema));
     }
 }

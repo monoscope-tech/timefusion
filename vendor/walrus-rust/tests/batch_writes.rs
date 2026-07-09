@@ -193,10 +193,7 @@ fn test_regular_write_blocked_during_batch() {
     batch_handle.join().unwrap();
     write_handle.join().unwrap();
 
-    assert!(
-        write_blocked.load(std::sync::atomic::Ordering::SeqCst),
-        "Regular write should have been blocked during batch"
-    );
+    assert!(write_blocked.load(std::sync::atomic::Ordering::SeqCst), "Regular write should have been blocked during batch");
 
     cleanup_test_env();
 }

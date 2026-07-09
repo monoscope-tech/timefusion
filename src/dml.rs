@@ -65,8 +65,8 @@ fn delta_session_from(session: &SessionState) -> Arc<dyn Session> {
 /// expects those refs to resolve against `schema`.
 #[derive(Clone)]
 pub struct UpdateSource {
-    pub batch:     RecordBatch,
-    pub schema:    SchemaRef,
+    pub batch: RecordBatch,
+    pub schema: SchemaRef,
     /// `(target_col, source_col)` pairs. Names refer to bare column names;
     /// table qualifiers are stripped during extraction.
     pub join_keys: Vec<(String, String)>,
@@ -76,9 +76,9 @@ pub struct UpdateSource {
 /// source plan when the input contained a `Join` (i.e. `UPDATE ... FROM`).
 /// Materialization runs asynchronously in [`DmlQueryPlanner::create_physical_plan`].
 pub struct DmlInfo {
-    pub table_name:  String,
-    pub project_id:  String,
-    pub predicate:   Option<Expr>,
+    pub table_name: String,
+    pub project_id: String,
+    pub predicate: Option<Expr>,
     pub assignments: Option<Vec<(String, Expr)>>,
     /// Source plan + join keys when the input contained a `Join`. Materialized
     /// into [`UpdateSource`] before the physical [`DmlExec`] is constructed.
@@ -87,7 +87,7 @@ pub struct DmlInfo {
 
 #[derive(Clone)]
 pub struct UpdateSourcePlan {
-    pub plan:      LogicalPlan,
+    pub plan: LogicalPlan,
     pub join_keys: Vec<(String, String)>,
 }
 
@@ -95,17 +95,14 @@ pub struct UpdateSourcePlan {
 #[derive(derive_more::Debug)]
 pub struct DmlQueryPlanner {
     #[debug(skip)]
-    planner:  DefaultPhysicalPlanner,
+    planner: DefaultPhysicalPlanner,
     #[debug(skip)]
     database: Arc<Database>,
 }
 
 impl DmlQueryPlanner {
     pub fn new(database: Arc<Database>) -> Self {
-        Self {
-            planner: DefaultPhysicalPlanner::with_extension_planners(vec![]),
-            database,
-        }
+        Self { planner: DefaultPhysicalPlanner::with_extension_planners(vec![]), database }
     }
 }
 
@@ -144,11 +141,7 @@ impl QueryPlanner for DmlQueryPlanner {
                 // construction. Both backends (MemBuffer hash-join + Delta MergeBuilder)
                 // consume the materialized batch; replaying the source SQL at execution
                 // time would be non-deterministic if the source references mutable state.
-                let source = if let Some(sp) = info.source_plan {
-                    Some(materialize_source(&self.planner, session_state, sp).await?)
-                } else {
-                    None
-                };
+                let source = if let Some(sp) = info.source_plan { Some(materialize_source(&self.planner, session_state, sp).await?) } else { None };
 
                 let session = delta_session_from(session_state);
                 let exec = if is_update {
@@ -207,15 +200,10 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 // scans the target table. Detect which side is target; the other
                 // is the source to materialize.
                 if source_plan.is_some() {
-                    return Err(DataFusionError::NotImplemented(
-                        "UPDATE with multiple FROM sources (chained joins) is not supported".to_string(),
-                    ));
+                    return Err(DataFusionError::NotImplemented("UPDATE with multiple FROM sources (chained joins) is not supported".to_string()));
                 }
                 if join.join_type != JoinType::Inner {
-                    return Err(DataFusionError::NotImplemented(format!(
-                        "UPDATE ... FROM with {:?} join is not supported (only INNER)",
-                        join.join_type
-                    )));
+                    return Err(DataFusionError::NotImplemented(format!("UPDATE ... FROM with {:?} join is not supported (only INNER)", join.join_type)));
                 }
                 let (target_side, source_side, keys) = identify_target_side(join, table_name)?;
                 // DataFusion stores cross-side conditions (e.g. user wrote
@@ -227,17 +215,10 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 if let Some(jf) = &join.filter {
                     predicate = Some(match predicate.take() {
                         None => jf.clone(),
-                        Some(existing) => Expr::BinaryExpr(BinaryExpr {
-                            left:  Box::new(existing),
-                            op:    Operator::And,
-                            right: Box::new(jf.clone()),
-                        }),
+                        Some(existing) => Expr::BinaryExpr(BinaryExpr { left: Box::new(existing), op: Operator::And, right: Box::new(jf.clone()) }),
                     });
                 }
-                source_plan = Some(UpdateSourcePlan {
-                    plan:      source_side.clone(),
-                    join_keys: keys,
-                });
+                source_plan = Some(UpdateSourcePlan { plan: source_side.clone(), join_keys: keys });
                 current_plan = target_side;
             }
             LogicalPlan::SubqueryAlias(alias) => {
@@ -251,13 +232,10 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
                 predicate = predicate.or_else(|| {
                     (!scan.filters.is_empty())
                         .then(|| {
-                            scan.filters.iter().cloned().reduce(|acc, filter| {
-                                Expr::BinaryExpr(BinaryExpr {
-                                    left:  Box::new(acc),
-                                    op:    Operator::And,
-                                    right: Box::new(filter),
-                                })
-                            })
+                            scan.filters
+                                .iter()
+                                .cloned()
+                                .reduce(|acc, filter| Expr::BinaryExpr(BinaryExpr { left: Box::new(acc), op: Operator::And, right: Box::new(filter) }))
                         })
                         .flatten()
                 });
@@ -277,19 +255,10 @@ fn extract_dml_info(input: &LogicalPlan, table_name: &str, extract_assignments: 
     }
 
     if project_id.is_empty() {
-        return Err(DataFusionError::Plan(format!(
-            "{} requires a project_id filter in WHERE clause",
-            if extract_assignments { "UPDATE" } else { "DELETE" }
-        )));
+        return Err(DataFusionError::Plan(format!("{} requires a project_id filter in WHERE clause", if extract_assignments { "UPDATE" } else { "DELETE" })));
     }
 
-    Ok(DmlInfo {
-        table_name: table_name.to_string(),
-        project_id,
-        predicate,
-        assignments,
-        source_plan,
-    })
+    Ok(DmlInfo { table_name: table_name.to_string(), project_id, predicate, assignments, source_plan })
 }
 
 /// Walk a [`LogicalPlan`] tree until we hit a `TableScan`. Returns the matched
@@ -328,11 +297,7 @@ fn identify_target_side<'a>(join: &'a Join, target_table_name: &str) -> Result<(
         }
     };
 
-    let (target_side, source_side) = if target_is_left {
-        (join.left.as_ref(), join.right.as_ref())
-    } else {
-        (join.right.as_ref(), join.left.as_ref())
-    };
+    let (target_side, source_side) = if target_is_left { (join.left.as_ref(), join.right.as_ref()) } else { (join.right.as_ref(), join.left.as_ref()) };
 
     // `join.on` is Vec<(left_expr, right_expr)>. Flip if target was on the right.
     let join_keys: Result<Vec<(String, String)>> = join
@@ -397,11 +362,7 @@ async fn materialize_source(planner: &DefaultPhysicalPlanner, session_state: &Se
 
     let combined = concat_batches(&schema, &batches).map_err(arrow_err)?;
 
-    Ok(UpdateSource {
-        batch: combined,
-        schema,
-        join_keys: sp.join_keys,
-    })
+    Ok(UpdateSource { batch: combined, schema, join_keys: sp.join_keys })
 }
 
 /// Extract assignments from projection
@@ -470,25 +431,25 @@ fn inline_projection_aliases(proj: &datafusion::logical_expr::Projection, assign
 /// Unified DML execution plan
 #[derive(Clone, derive_more::Debug)]
 pub struct DmlExec {
-    op_type:        DmlOperation,
-    table_name:     String,
-    project_id:     String,
-    predicate:      Option<Expr>,
-    assignments:    Vec<(String, Expr)>,
+    op_type: DmlOperation,
+    table_name: String,
+    project_id: String,
+    predicate: Option<Expr>,
+    assignments: Vec<(String, Expr)>,
     /// Materialized source for `UPDATE ... FROM`. When `Some`, dispatch
     /// routes to [`perform_update_with_source`] / [`perform_delta_merge_update`].
     #[debug(skip)]
-    source:         Option<UpdateSource>,
+    source: Option<UpdateSource>,
     #[debug(skip)]
-    input:          Arc<dyn ExecutionPlan>,
+    input: Arc<dyn ExecutionPlan>,
     #[debug(skip)]
-    database:       Arc<Database>,
+    database: Arc<Database>,
     #[debug(skip)]
     buffered_layer: Option<Arc<BufferedWriteLayer>>,
     #[debug(skip)]
-    session:        Arc<dyn Session>,
+    session: Arc<dyn Session>,
     #[debug(skip)]
-    properties:     Arc<PlanProperties>,
+    properties: Arc<PlanProperties>,
 }
 
 #[derive(Debug, Clone, PartialEq, strum::Display, strum::AsRefStr)]
@@ -509,19 +470,7 @@ impl DmlExec {
             input.properties().emission_type,
             input.properties().boundedness,
         ));
-        Self {
-            op_type,
-            table_name,
-            project_id,
-            predicate: None,
-            assignments: vec![],
-            source: None,
-            input,
-            database,
-            buffered_layer: None,
-            session,
-            properties,
-        }
+        Self { op_type, table_name, project_id, predicate: None, assignments: vec![], source: None, input, database, buffered_layer: None, session, properties }
     }
 
     pub fn update(table_name: String, project_id: String, input: Arc<dyn ExecutionPlan>, database: Arc<Database>, session: Arc<dyn Session>) -> Self {
@@ -556,11 +505,7 @@ impl DisplayAs for DmlExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(f, "{}: table={}, project_id={}", self.name(), self.table_name, self.project_id)?;
                 if self.op_type == DmlOperation::Update && !self.assignments.is_empty() {
-                    write!(
-                        f,
-                        ", assignments=[{}]",
-                        self.assignments.iter().map(|(col, expr)| format!("{} = {}", col, expr)).collect::<Vec<_>>().join(", ")
-                    )?;
+                    write!(f, ", assignments=[{}]", self.assignments.iter().map(|(col, expr)| format!("{} = {}", col, expr)).collect::<Vec<_>>().join(", "))?;
                 }
                 if let Some(ref pred) = self.predicate {
                     write!(f, ", predicate={}", pred)?;
@@ -594,10 +539,7 @@ impl ExecutionPlan for DmlExec {
     }
 
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self {
-            input: children[0].clone(),
-            ..(*self).clone()
-        }))
+        Ok(Arc::new(Self { input: children[0].clone(), ..(*self).clone() }))
     }
 
     #[instrument(name = "dml.execute", skip_all, fields(operation = self.op_type.as_ref(), table.name = %self.table_name, project_id = %self.project_id, has_predicate = self.predicate.is_some(), rows.affected = Empty))]
@@ -623,18 +565,8 @@ impl ExecutionPlan for DmlExec {
         let future = async move {
             let result = match op_type {
                 DmlOperation::Update => {
-                    perform_update_with_buffer(
-                        &database,
-                        buffered_layer.as_ref(),
-                        &table_name,
-                        &project_id,
-                        predicate,
-                        assignments,
-                        source,
-                        session,
-                        &span,
-                    )
-                    .await
+                    perform_update_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, assignments, source, session, &span)
+                        .await
                 }
                 DmlOperation::Delete => {
                     perform_delete_with_buffer(&database, buffered_layer.as_ref(), &table_name, &project_id, predicate, session, &span).await
@@ -661,11 +593,11 @@ impl ExecutionPlan for DmlExec {
 }
 
 struct DmlContext<'a> {
-    database:       &'a Database,
+    database: &'a Database,
     buffered_layer: Option<&'a Arc<BufferedWriteLayer>>,
-    table_name:     &'a str,
-    project_id:     &'a str,
-    predicate:      Option<Expr>,
+    table_name: &'a str,
+    project_id: &'a str,
+    predicate: Option<Expr>,
 }
 
 impl<'a> DmlContext<'a> {
@@ -771,43 +703,31 @@ async fn perform_update_with_buffer(
         let coalescer = database.dml_coalescer().cloned();
         // `async move` must not take the Vec itself — the mem closure borrows it.
         let assignments = &assignments;
-        return DmlContext {
-            database,
-            buffered_layer,
-            table_name,
-            project_id,
-            predicate,
-        }
-        .execute(
-            |layer, pred| layer.update_with_source(project_id, table_name, pred, assignments, &src_for_mem),
-            |delta_pred| async move {
-                if let Some(coalescer) = coalescer {
-                    coalescer.enqueue(project_id, table_name, delta_pred.as_ref(), assignments, &src_for_delta, session);
-                    return Ok(0);
-                }
-                perform_delta_merge_update(database, table_name, project_id, delta_pred, assignments.clone(), src_for_delta, session)
-                    .instrument(update_span)
-                    .await
-            },
-        )
-        .await;
+        return DmlContext { database, buffered_layer, table_name, project_id, predicate }
+            .execute(
+                |layer, pred| layer.update_with_source(project_id, table_name, pred, assignments, &src_for_mem),
+                |delta_pred| async move {
+                    if let Some(coalescer) = coalescer {
+                        coalescer.enqueue(project_id, table_name, delta_pred.as_ref(), assignments, &src_for_delta, session);
+                        return Ok(0);
+                    }
+                    perform_delta_merge_update(database, table_name, project_id, delta_pred, assignments.clone(), src_for_delta, session)
+                        .instrument(update_span)
+                        .await
+                },
+            )
+            .await;
     }
 
     let update_span = tracing::trace_span!(parent: span, "delta.update");
     // The delta closure body is only constructed (and assignments only
     // cloned) when there is committed data. Mem path borrows `assignments`.
-    DmlContext {
-        database,
-        buffered_layer,
-        table_name,
-        project_id,
-        predicate,
-    }
-    .execute(
-        |layer, pred| layer.update(project_id, table_name, pred, &assignments),
-        |delta_pred| perform_delta_update(database, table_name, project_id, delta_pred, assignments.clone(), session).instrument(update_span),
-    )
-    .await
+    DmlContext { database, buffered_layer, table_name, project_id, predicate }
+        .execute(
+            |layer, pred| layer.update(project_id, table_name, pred, &assignments),
+            |delta_pred| perform_delta_update(database, table_name, project_id, delta_pred, assignments.clone(), session).instrument(update_span),
+        )
+        .await
 }
 
 async fn perform_delete_with_buffer(
@@ -818,18 +738,12 @@ async fn perform_delete_with_buffer(
     // The clamp applies to deletes too: rows above the flush watermark were
     // removed from the buffer by the mem leg and will never flush, so Delta
     // has nothing to do.
-    DmlContext {
-        database,
-        buffered_layer,
-        table_name,
-        project_id,
-        predicate,
-    }
-    .execute(
-        |layer, pred| layer.delete(project_id, table_name, pred),
-        |delta_pred| perform_delta_delete(database, table_name, project_id, delta_pred, session).instrument(delete_span),
-    )
-    .await
+    DmlContext { database, buffered_layer, table_name, project_id, predicate }
+        .execute(
+            |layer, pred| layer.delete(project_id, table_name, pred),
+            |delta_pred| perform_delta_delete(database, table_name, project_id, delta_pred, session).instrument(delete_span),
+        )
+        .await
 }
 
 /// Perform Delta UPDATE operation
@@ -864,10 +778,7 @@ pub async fn perform_delta_update(
                 builder = builder.with_update(column, convert_expr_to_delta(&value_expr)?);
             }
 
-            builder
-                .await
-                .map(|(table, metrics)| (table, metrics.num_updated_rows as u64))
-                .map_err(exec_err("Failed to execute Delta UPDATE"))
+            builder.await.map(|(table, metrics)| (table, metrics.num_updated_rows as u64)).map_err(exec_err("Failed to execute Delta UPDATE"))
         }
     })
     .await;
@@ -903,10 +814,7 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
                 builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
             }
 
-            builder
-                .await
-                .map(|(table, metrics)| (table, metrics.num_deleted_rows.unwrap_or(0) as u64))
-                .map_err(exec_err("Failed to execute Delta DELETE"))
+            builder.await.map(|(table, metrics)| (table, metrics.num_deleted_rows.unwrap_or(0) as u64)).map_err(exec_err("Failed to execute Delta DELETE"))
         }
     })
     .await;
@@ -945,9 +853,7 @@ where
     let mut attempt = 0;
     loop {
         // Refresh via clone-update-swap (write lock held for the swap only).
-        crate::database::refresh_table_snapshot(&table_lock, database.incremental_snapshot())
-            .await
-            .map_err(exec_err("Failed to refresh table state"))?;
+        crate::database::refresh_table_snapshot(&table_lock, database.incremental_snapshot()).await.map_err(exec_err("Failed to refresh table state"))?;
         let snapshot = { table_lock.read().await.clone() };
         let pre_version = snapshot.version();
         match operation(snapshot).await {
@@ -968,10 +874,7 @@ where
             Err(e) if attempt + 1 < DML_MAX_ATTEMPTS && crate::database::is_occ_conflict_err(&e.to_string()) => {
                 attempt += 1;
                 crate::metrics::record_dml_conflict();
-                warn!(
-                    "DML delta op conflict on {}/{}, retrying ({}/{}): {}",
-                    project_id, table_name, attempt, DML_MAX_ATTEMPTS, e
-                );
+                warn!("DML delta op conflict on {}/{}, retrying ({}/{}): {}", project_id, table_name, attempt, DML_MAX_ATTEMPTS, e);
                 tokio::time::sleep(crate::database::occ_backoff(attempt)).await;
             }
             Err(e) => return Err(e),
@@ -1035,26 +938,18 @@ fn build_join_predicate(
     use datafusion::prelude::col;
     let mut key_iter = join_keys.iter().map(|(t, s)| {
         Expr::BinaryExpr(BinaryExpr {
-            left:  Box::new(col(format!("{target_alias}.{t}"))),
-            op:    Operator::Eq,
+            left: Box::new(col(format!("{target_alias}.{t}"))),
+            op: Operator::Eq,
             right: Box::new(col(format!("{source_alias}.{s}"))),
         })
     });
     let mut acc = key_iter.next().ok_or_else(|| DataFusionError::Plan("UPDATE ... FROM requires at least one join key".to_string()))?;
     for next in key_iter {
-        acc = Expr::BinaryExpr(BinaryExpr {
-            left:  Box::new(acc),
-            op:    Operator::And,
-            right: Box::new(next),
-        });
+        acc = Expr::BinaryExpr(BinaryExpr { left: Box::new(acc), op: Operator::And, right: Box::new(next) });
     }
     if let Some(p) = extra {
         let p = requalify_for_merge(p.clone(), source_cols, source_alias, target_alias)?;
-        acc = Expr::BinaryExpr(BinaryExpr {
-            left:  Box::new(acc),
-            op:    Operator::And,
-            right: Box::new(p),
-        });
+        acc = Expr::BinaryExpr(BinaryExpr { left: Box::new(acc), op: Operator::And, right: Box::new(p) });
     }
     Ok(acc)
 }
@@ -1095,12 +990,7 @@ pub async fn perform_delta_merge_update(
     database: &Database, table_name: &str, project_id: &str, predicate: Option<Expr>, assignments: Vec<(String, Expr)>, source: UpdateSource,
     session: Arc<dyn Session>,
 ) -> Result<u64> {
-    info!(
-        "Performing Delta MERGE-UPDATE on table {} for project {} ({} source rows)",
-        table_name,
-        project_id,
-        source.batch.num_rows()
-    );
+    info!("Performing Delta MERGE-UPDATE on table {} for project {} ({} source rows)", table_name, project_id, source.batch.num_rows());
 
     let span = tracing::Span::current();
     let source_batch = source.batch.clone();

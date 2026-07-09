@@ -118,11 +118,8 @@ fn e2e_realistic_application_simulation() {
     let mut iteration = 0u64;
 
     while start_time.elapsed() < duration {
-        let log_entry = format!(
-            "{{\"timestamp\":{},\"user_id\":{},\"action\":\"page_view\",\"page\":\"/dashboard\"}}",
-            start_time.elapsed().as_millis(),
-            user_id
-        );
+        let log_entry =
+            format!("{{\"timestamp\":{},\"user_id\":{},\"action\":\"page_view\",\"page\":\"/dashboard\"}}", start_time.elapsed().as_millis(), user_id);
         let _ = wal.append_for_topic("user_activity", log_entry.as_bytes());
         user_id = (user_id + 1) % 10000;
 
@@ -239,13 +236,7 @@ fn e2e_recovery_and_persistence_marathon() {
 
         for entry_id in 0..entries_per_cycle {
             for (topic_idx, topic) in topics.iter().enumerate() {
-                let data = format!(
-                    "cycle_{}_entry_{}_topic_{}_data_{}",
-                    cycle,
-                    entry_id,
-                    topic_idx,
-                    "x".repeat((entry_id % 100) + 1)
-                );
+                let data = format!("cycle_{}_entry_{}_topic_{}_data_{}", cycle, entry_id, topic_idx, "x".repeat((entry_id % 100) + 1));
 
                 wal.append_for_topic(topic, data.as_bytes()).unwrap();
                 expected_data.get_mut(*topic).unwrap().push(data);
@@ -430,11 +421,8 @@ fn e2e_system_stress_and_stability() {
                     let expected_sizes = [10, 1_000, 25_000, 100_000, 500_000];
                     let size_valid = expected_sizes.contains(&entry.data.len());
 
-                    let content_valid = if entry.data.len() <= 1_000 {
-                        entry.data.iter().all(|&b| b == entry.data[0])
-                    } else {
-                        entry.data.iter().all(|&b| b == entry.data[0])
-                    };
+                    let content_valid =
+                        if entry.data.len() <= 1_000 { entry.data.iter().all(|&b| b == entry.data[0]) } else { entry.data.iter().all(|&b| b == entry.data[0]) };
 
                     if !size_valid || !content_valid {
                         read_validation_errors += 1;
@@ -469,17 +457,10 @@ fn e2e_system_stress_and_stability() {
     test_println!("  Write errors: {}", write_errors);
     test_println!("  Read errors: {}", read_errors);
     test_println!("  Read validation errors: {}", read_validation_errors);
-    test_println!(
-        "  Success rate: {:.2}%",
-        (successful_operations as f64 / (successful_operations + write_errors + read_errors) as f64) * 100.0
-    );
+    test_println!("  Success rate: {:.2}%", (successful_operations as f64 / (successful_operations + write_errors + read_errors) as f64) * 100.0);
     test_println!("  Operations/sec: {:.2}", successful_operations as f64 / elapsed.as_secs_f64());
 
-    assert!(
-        successful_operations > 200,
-        "Expected > 200 successful operations, got {}",
-        successful_operations
-    );
+    assert!(successful_operations > 200, "Expected > 200 successful operations, got {}", successful_operations);
 
     let total_ops = successful_operations + write_errors + read_errors;
     if total_ops > 0 {

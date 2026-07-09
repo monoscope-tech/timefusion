@@ -46,11 +46,6 @@ async fn second_read_after_flush_hits_foyer() -> anyhow::Result<()> {
     // cache layer is bypassed for body reads.
     let delta_hits = after.main.hits.saturating_sub(before.main.hits);
     let delta_inner = after.main.inner_gets.saturating_sub(before.main.inner_gets);
-    assert!(
-        delta_hits >= 1 || delta_inner == 0,
-        "second read went to S3 without hitting Foyer; before={:?} after={:?}",
-        before.main,
-        after.main
-    );
+    assert!(delta_hits >= 1 || delta_inner == 0, "second read went to S3 without hitting Foyer; before={:?} after={:?}", before.main, after.main);
     Ok(())
 }

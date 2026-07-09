@@ -118,11 +118,7 @@ async fn rewriter_skips_special_chars_in_literal() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // `+` is a tantivy QueryParser metachar. Conservative path: skip the
     // rewrite rather than misparse. Correctness preserved by retained LIKE.
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%foo+bar%'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%foo+bar%'").await?;
     let s = plan_str(&plan);
     assert!(!s.contains("text_match"), "expected NO text_match on metachar literal, got:\n{}", s);
     Ok(())
@@ -148,11 +144,7 @@ async fn rewriter_is_idempotent_under_replanning() -> Result<()> {
 async fn rewriter_handles_infix_like_on_ngram3_column() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
     // `status_message` uses ngram3 → `LIKE '%failed%'` is accelerable.
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%failed%'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%failed%'").await?;
     let s = plan_str(&plan);
     assert!(s.contains("text_match"), "expected text_match for %infix% on ngram3, got:\n{}", s);
     Ok(())
@@ -161,11 +153,7 @@ async fn rewriter_handles_infix_like_on_ngram3_column() -> Result<()> {
 #[tokio::test]
 async fn rewriter_handles_suffix_like_on_ngram3_column() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%failed'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message LIKE '%failed'").await?;
     let s = plan_str(&plan);
     assert!(s.contains("text_match"), "expected text_match for %suffix on ngram3, got:\n{}", s);
     Ok(())
@@ -174,11 +162,7 @@ async fn rewriter_handles_suffix_like_on_ngram3_column() -> Result<()> {
 #[tokio::test]
 async fn rewriter_handles_ilike_on_ngram3_column() -> Result<()> {
     let ctx = analyzer_only_ctx().await?;
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message ILIKE '%FAILED%'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND status_message ILIKE '%FAILED%'").await?;
     let s = plan_str(&plan);
     assert!(s.contains("text_match"), "expected text_match for ILIKE on ngram3, got:\n{}", s);
     Ok(())
@@ -224,11 +208,7 @@ async fn rewriter_handles_multiple_indexed_predicates() -> Result<()> {
     // filter pushdown duplicates each into the TableScan's partial_filters, so
     // the printed count is 2N; we assert both column-specific calls are present
     // rather than picking an exact count (less fragile across DataFusion versions).
-    let plan = analyze(
-        &ctx,
-        "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level LIKE 'ERR%' AND name LIKE 'svc%'",
-    )
-    .await?;
+    let plan = analyze(&ctx, "SELECT id FROM otel_logs_and_spans WHERE project_id = 'p' AND level LIKE 'ERR%' AND name LIKE 'svc%'").await?;
     let s = plan_str(&plan);
     assert!(s.contains("text_match(level"), "expected text_match on level, got:\n{}", s);
     assert!(s.contains("text_match(name"), "expected text_match on name, got:\n{}", s);
@@ -241,11 +221,7 @@ fn indexed_tables_auto_discovers_prod_schema() {
     // prod schemas that have `tantivy.indexed: true` columns.
     let cfg = TantivyConfig::default();
     let tables = cfg.indexed_tables();
-    assert!(
-        tables.iter().any(|t| t == "otel_logs_and_spans"),
-        "expected otel_logs_and_spans to be auto-discovered, got {:?}",
-        tables
-    );
+    assert!(tables.iter().any(|t| t == "otel_logs_and_spans"), "expected otel_logs_and_spans to be auto-discovered, got {:?}", tables);
 }
 
 #[test]

@@ -37,10 +37,7 @@ mod imp {
     pub fn start(data_dir: PathBuf) {
         let dir = profiles_dir(&data_dir);
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            warn!(
-                "profiling: cannot create {:?}: {} — CPU flamegraphs disabled, heap dumps still land at malloc_conf prof_prefix",
-                dir, e
-            );
+            warn!("profiling: cannot create {:?}: {} — CPU flamegraphs disabled, heap dumps still land at malloc_conf prof_prefix", dir, e);
         }
         info!("profiling: enabled (jemalloc heap auto-dump + rolling CPU flamegraph) → {:?}", dir);
         spawn_cpu_sampler(dir);

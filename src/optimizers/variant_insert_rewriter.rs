@@ -71,10 +71,10 @@ fn rewrite_insert_node(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
         if let Some(new_input) = new_input {
             let new_dml = LogicalPlan::Dml(DmlStatement {
-                op:            dml.op.clone(),
-                table_name:    dml.table_name.clone(),
-                target:        dml.target.clone(),
-                input:         Arc::new(new_input),
+                op: dml.op.clone(),
+                table_name: dml.table_name.clone(),
+                target: dml.target.clone(),
+                input: Arc::new(new_input),
                 output_schema: dml.output_schema.clone(),
             });
             return Ok(Transformed::yes(new_dml));
@@ -129,14 +129,7 @@ fn rewrite_values_for_variant(values: &Values, variant_indices: &std::collection
         })
         .collect();
 
-    if modified {
-        Ok(Some(LogicalPlan::Values(Values {
-            schema: values.schema.clone(),
-            values: new_rows,
-        })))
-    } else {
-        Ok(None)
-    }
+    if modified { Ok(Some(LogicalPlan::Values(Values { schema: values.schema.clone(), values: new_rows }))) } else { Ok(None) }
 }
 
 fn rewrite_projection_for_variant(proj: &Projection, variant_indices: &std::collections::HashSet<usize>) -> Result<Option<LogicalPlan>> {
@@ -157,11 +150,7 @@ fn rewrite_projection_for_variant(proj: &Projection, variant_indices: &std::coll
         })
         .collect();
 
-    if modified {
-        Ok(Some(LogicalPlan::Projection(Projection::try_new(new_exprs, proj.input.clone())?)))
-    } else {
-        Ok(None)
-    }
+    if modified { Ok(Some(LogicalPlan::Projection(Projection::try_new(new_exprs, proj.input.clone())?))) } else { Ok(None) }
 }
 
 fn is_utf8_expr(expr: &Expr) -> bool {
@@ -183,8 +172,5 @@ fn is_utf8_expr(expr: &Expr) -> bool {
 }
 
 fn wrap_with_json_to_variant(expr: &Expr, udf: &Arc<datafusion::logical_expr::ScalarUDF>) -> Expr {
-    Expr::ScalarFunction(ScalarFunction {
-        func: udf.clone(),
-        args: vec![expr.clone()],
-    })
+    Expr::ScalarFunction(ScalarFunction { func: udf.clone(), args: vec![expr.clone()] })
 }

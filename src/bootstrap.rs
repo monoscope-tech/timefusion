@@ -21,13 +21,13 @@ use crate::{
 
 /// Everything a serving process needs after bootstrap is done.
 pub struct Bootstrapped {
-    pub db:             Arc<Database>,
+    pub db: Arc<Database>,
     pub buffered_layer: Arc<BufferedWriteLayer>,
     /// The SessionContext used by the pgwire handlers — UDFs and table
     /// providers are already registered.
-    pub session_ctx:    Arc<SessionContext>,
+    pub session_ctx: Arc<SessionContext>,
     /// Cancel to signal shutdown to anything we spawned.
-    pub shutdown:       CancellationToken,
+    pub shutdown: CancellationToken,
 }
 
 /// Build the BufferedWriteLayer + Database wiring exactly as `main.rs` does,
@@ -45,8 +45,8 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     tracing::info!("bootstrap.phase=database_init elapsed_ms={}", t_db.elapsed().as_millis());
 
     let db_for_callback = db.clone();
-    let delta_write_callback: DeltaWriteCallback = Arc::new(
-        move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
+    let delta_write_callback: DeltaWriteCallback =
+        Arc::new(move |project_id: String, table_name: String, batches: Vec<RecordBatch>, wal_watermark: DeltaWatermark| {
             let db = db_for_callback.clone();
             Box::pin(async move {
                 // insert_records_batch warms the just-flushed files itself
@@ -54,8 +54,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
                 let added = db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await?;
                 Ok(added)
             })
-        },
-    );
+        });
 
     let mut session_context = Arc::new(db.clone()).create_session_context();
     db.setup_session_udfs(&mut session_context)?;
@@ -78,10 +77,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
             let storage_uri = format!("s3://{}/{}/tantivy", bucket, cfg.core.timefusion_table_prefix);
             let storage_opts = cfg.aws.build_storage_options(None);
             let obj_store = db.create_object_store(&storage_uri, &storage_opts).await?;
-            let svc = Arc::new(crate::tantivy_index::service::TantivyIndexService::new(
-                obj_store.clone(),
-                Arc::new(cfg.tantivy.clone()),
-            ));
+            let svc = Arc::new(crate::tantivy_index::service::TantivyIndexService::new(obj_store.clone(), Arc::new(cfg.tantivy.clone())));
             layer = layer.with_tantivy_indexer(svc.clone().callback());
             let cache_root = cfg.core.timefusion_data_dir.clone();
             let search = Arc::new(crate::tantivy_index::search::TantivySearchService::new(obj_store, cache_root));
@@ -101,22 +97,13 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     // without needing trace-level enabled.
     let wal_ref = buffered_layer.wal();
     let t_snap = std::time::Instant::now();
-    let skip_delta_scan = if let Some(snap) = wal_ref.load_cursor_snapshot() {
-        wal_ref.restore_cursor_snapshot(&snap).is_ok() && snap.clean_shutdown
-    } else {
-        false
-    };
-    tracing::info!(
-        "bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}",
-        t_snap.elapsed().as_millis()
-    );
+    let skip_delta_scan =
+        if let Some(snap) = wal_ref.load_cursor_snapshot() { wal_ref.restore_cursor_snapshot(&snap).is_ok() && snap.clean_shutdown } else { false };
+    tracing::info!("bootstrap.phase=cursor_snapshot skip_delta_scan={skip_delta_scan} elapsed_ms={}", t_snap.elapsed().as_millis());
     if !skip_delta_scan {
         let t_delta = std::time::Instant::now();
         let advanced = db.derive_wal_cursors_from_delta(wal_ref).await.unwrap_or(0);
-        tracing::info!(
-            "bootstrap.phase=delta_cursor_reconcile shards_advanced={advanced} elapsed_ms={}",
-            t_delta.elapsed().as_millis()
-        );
+        tracing::info!("bootstrap.phase=delta_cursor_reconcile shards_advanced={advanced} elapsed_ms={}", t_delta.elapsed().as_millis());
     }
 
     let t_wal = std::time::Instant::now();
@@ -136,10 +123,5 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db.spawn_tantivy_backfill();
     db.spawn_tantivy_prefetch();
 
-    Ok(Bootstrapped {
-        db,
-        buffered_layer,
-        session_ctx: Arc::new(session_context),
-        shutdown: CancellationToken::new(),
-    })
+    Ok(Bootstrapped { db, buffered_layer, session_ctx: Arc::new(session_context), shutdown: CancellationToken::new() })
 }

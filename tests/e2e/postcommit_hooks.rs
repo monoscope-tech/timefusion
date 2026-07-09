@@ -74,14 +74,8 @@ async fn probe_distinguishes_landed_from_not_landed() -> anyhow::Result<()> {
     insert_n(&env, 10).await?;
     env.force_flush().await?;
 
-    assert!(
-        env.db().test_probe_landed("e2e_project", "otel_logs_and_spans").await?,
-        "committed adds ⇒ Landed"
-    );
-    assert!(
-        env.db().test_probe_bogus_not_landed("e2e_project", "otel_logs_and_spans").await?,
-        "an add never written to the log ⇒ NotLanded"
-    );
+    assert!(env.db().test_probe_landed("e2e_project", "otel_logs_and_spans").await?, "committed adds ⇒ Landed");
+    assert!(env.db().test_probe_bogus_not_landed("e2e_project", "otel_logs_and_spans").await?, "an add never written to the log ⇒ NotLanded");
     Ok(())
 }
 
@@ -95,22 +89,12 @@ async fn out_of_band_checkpoint_runs() -> anyhow::Result<()> {
     let env = E2eEnv::builder().with_checkpoint_interval(1).start().await?;
     insert_n(&env, 5).await?;
     env.force_flush().await?;
-    assert_eq!(
-        env.db().test_checkpoint_file_count("e2e_project", "otel_logs_and_spans").await?,
-        0,
-        "no checkpoint yet"
-    );
+    assert_eq!(env.db().test_checkpoint_file_count("e2e_project", "otel_logs_and_spans").await?, 0, "no checkpoint yet");
 
     let before = maintenance_stats().checkpoints_created.load(Relaxed);
     env.db().run_checkpoint_maintenance().await;
-    assert!(
-        maintenance_stats().checkpoints_created.load(Relaxed) > before,
-        "checkpoint task ran no checkpoint"
-    );
-    assert!(
-        env.db().test_checkpoint_file_count("e2e_project", "otel_logs_and_spans").await? >= 1,
-        "out-of-band task must create a checkpoint file"
-    );
+    assert!(maintenance_stats().checkpoints_created.load(Relaxed) > before, "checkpoint task ran no checkpoint");
+    assert!(env.db().test_checkpoint_file_count("e2e_project", "otel_logs_and_spans").await? >= 1, "out-of-band task must create a checkpoint file");
     Ok(())
 }
 
@@ -128,10 +112,7 @@ async fn reconcile_removes_dangling_add() -> anyhow::Result<()> {
 
     let before = maintenance_stats().dangling_removed.load(Relaxed);
     env.db().run_reconcile_maintenance().await;
-    assert!(
-        maintenance_stats().dangling_removed.load(Relaxed) > before,
-        "reconcile did not Remove the dangling Add"
-    );
+    assert!(maintenance_stats().dangling_removed.load(Relaxed) > before, "reconcile did not Remove the dangling Add");
 
     // Table is consistent again: planning a Delta scan must not error on the
     // now-removed missing file.

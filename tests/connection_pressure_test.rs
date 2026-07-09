@@ -23,8 +23,8 @@ mod connection_pressure {
     use uuid::Uuid;
 
     struct PressureTestServer {
-        port:     u16,
-        test_id:  String,
+        port: u16,
+        test_id: String,
         shutdown: Arc<Notify>,
     }
 
@@ -51,10 +51,7 @@ mod connection_pressure {
                 db.setup_session_context(&mut ctx).expect("Failed to setup context");
 
                 let opts = ServerOptions::new().with_port(port).with_host("0.0.0.0".to_string());
-                let auth_config = timefusion::pgwire_handlers::AuthConfig {
-                    username: "postgres".into(),
-                    password: Some("postgres".into()),
-                };
+                let auth_config = timefusion::pgwire_handlers::AuthConfig { username: "postgres".into(), password: Some("postgres".into()) };
 
                 tokio::select! {
                     _ = shutdown_clone.notified() => {},
@@ -194,14 +191,8 @@ mod connection_pressure {
         println!("Successful operations: {}", successes);
         println!("Total errors: {}", errors);
         println!("Connection refused errors: {}", refused);
-        println!(
-            "Success rate: {:.2}%",
-            (successes as f64 / (CONCURRENT_CLIENTS * OPS_PER_CLIENT) as f64) * 100.0
-        );
-        println!(
-            "Connection refused rate: {:.2}%",
-            (refused as f64 / (CONCURRENT_CLIENTS * OPS_PER_CLIENT) as f64) * 100.0
-        );
+        println!("Success rate: {:.2}%", (successes as f64 / (CONCURRENT_CLIENTS * OPS_PER_CLIENT) as f64) * 100.0);
+        println!("Connection refused rate: {:.2}%", (refused as f64 / (CONCURRENT_CLIENTS * OPS_PER_CLIENT) as f64) * 100.0);
 
         // Verify that we actually reproduced issues under pressure
         assert!(errors > 0, "Expected to see some errors under pressure");

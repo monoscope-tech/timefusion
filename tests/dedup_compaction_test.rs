@@ -39,22 +39,14 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     // the Delta log stats (`delta_physical_row_count`), NOT a routed query —
     // the read-side DedupExec would otherwise mask the on-disk duplicate.
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
-    assert_eq!(
-        delta_physical_row_count(&table_ref).await?,
-        2,
-        "pre-dedup: cross-flush duplicate should exist as 2 physical rows in Delta"
-    );
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "pre-dedup: cross-flush duplicate should exist as 2 physical rows in Delta");
 
     // Verify there are at least two parquet files in the partition (proves the
     // two commits did not coalesce by accident).
     let date_str = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
     let part_marker = format!("project_id={}/date={}", project_id, date_str);
     let file_count_before = table_ref.read().await.get_file_uris()?.filter(|u| u.contains(&part_marker)).count();
-    assert!(
-        file_count_before >= 2,
-        "expected >=2 files in partition before dedup, got {}",
-        file_count_before
-    );
+    assert!(file_count_before >= 2, "expected >=2 files in partition before dedup, got {}", file_count_before);
 
     // Run the new dedup compaction on the partition.
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
@@ -62,11 +54,7 @@ async fn dedup_compaction_collapses_cross_flush_duplicates() -> Result<()> {
     assert_eq!((dropped, complete), (1, true), "expected exactly one duplicate row dropped in a complete pass");
 
     // After the sweep, the duplicate is physically gone (1 row on disk).
-    assert_eq!(
-        delta_physical_row_count(&table_ref).await?,
-        1,
-        "post-dedup: duplicate should be physically collapsed to a single row"
-    );
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 1, "post-dedup: duplicate should be physically collapsed to a single row");
 
     Ok(())
 }
@@ -95,10 +83,7 @@ async fn dup_across_flush_is_deduped_on_read() -> Result<()> {
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
 
-    let count_sql = format!(
-        "SELECT COUNT(*) AS cnt FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'dup_id'",
-        project_id
-    );
+    let count_sql = format!("SELECT COUNT(*) AS cnt FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'dup_id'", project_id);
     let res = ctx.sql(&count_sql).await?.collect().await?;
     assert_eq!(
         res[0].column(0).as_primitive::<Int64Type>().value(0),
@@ -109,10 +94,7 @@ async fn dup_across_flush_is_deduped_on_read() -> Result<()> {
     // Non-empty projection that omits the dedup keys: augmentation must still dedup.
     let name_sql = format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'dup_id'", project_id);
     let rows: usize = ctx.sql(&name_sql).await?.collect().await?.iter().map(|b| b.num_rows()).sum();
-    assert_eq!(
-        rows, 1,
-        "read-side dedup must still collapse when dedup keys are projected away (`SELECT name`)"
-    );
+    assert_eq!(rows, 1, "read-side dedup must still collapse when dedup keys are projected away (`SELECT name`)");
 
     Ok(())
 }
@@ -137,23 +119,9 @@ async fn limit_query_not_truncated_below_read_dedup() -> Result<()> {
     // physical rows that often are both "a", collapsing to a single deduped row;
     // the fix suppresses the scan limit so all 4 are read and dedup yields {a,b}.
     for _ in 0..3 {
-        db.insert_records_batch(
-            &project_id,
-            "otel_logs_and_spans",
-            vec![json_to_batch(vec![test_span_ts("a", "a", &project_id, ts)])?],
-            true,
-            None,
-        )
-        .await?;
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("a", "a", &project_id, ts)])?], true, None).await?;
     }
-    db.insert_records_batch(
-        &project_id,
-        "otel_logs_and_spans",
-        vec![json_to_batch(vec![test_span_ts("b", "b", &project_id, ts)])?],
-        true,
-        None,
-    )
-    .await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("b", "b", &project_id, ts)])?], true, None).await?;
 
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
@@ -179,11 +147,7 @@ async fn dedup_sweep_collapses_prior_day_partition() -> Result<()> {
 
     // Yesterday at noon UTC: always a prior-day `date=` partition and always
     // >2h sealed (≥12h ago regardless of wall-clock), so dedup will rewrite it.
-    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1))
-        .and_hms_opt(12, 0, 0)
-        .unwrap()
-        .and_utc()
-        .timestamp_micros();
+    let ts = (chrono::Utc::now().date_naive() - chrono::Duration::days(1)).and_hms_opt(12, 0, 0).unwrap().and_utc().timestamp_micros();
     let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)]) };
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
@@ -191,21 +155,13 @@ async fn dedup_sweep_collapses_prior_day_partition() -> Result<()> {
     // Physical row count (Delta log stats), so the read-side DedupExec doesn't
     // mask whether the *sweep* actually rewrote the on-disk duplicate.
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
-    assert_eq!(
-        delta_physical_row_count(&table_ref).await?,
-        2,
-        "pre-sweep: prior-day cross-flush duplicate should exist as 2 physical rows"
-    );
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "pre-sweep: prior-day cross-flush duplicate should exist as 2 physical rows");
 
     // The production entry point the scheduler calls. With today-only scope this
     // is a no-op for a yesterday partition; with the lookback window it collapses it.
     db.dedup_today_partitions(&table_ref, "otel_logs_and_spans", "otel_logs_and_spans").await?;
 
-    assert_eq!(
-        delta_physical_row_count(&table_ref).await?,
-        1,
-        "post-sweep: prior-day duplicate must be physically collapsed to a single row"
-    );
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 1, "post-sweep: prior-day duplicate must be physically collapsed to a single row");
     Ok(())
 }
 
@@ -269,11 +225,7 @@ async fn dedup_commits_despite_concurrent_appends() -> Result<()> {
 
     let count_sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{}' AND id = 'dup_id'", project_id);
     let post = db.query_delta_only(&count_sql).await?;
-    assert_eq!(
-        post[0].column(0).as_primitive::<Int64Type>().value(0),
-        1,
-        "post-dedup: dup_id row should be collapsed to 1"
-    );
+    assert_eq!(post[0].column(0).as_primitive::<Int64Type>().value(0), 1, "post-dedup: dup_id row should be collapsed to 1");
     Ok(())
 }
 
@@ -308,21 +260,12 @@ async fn optimize_preserves_all_partition_values() -> Result<()> {
 
     // Compacted files must keep the full (project_id, date) partition path…
     let date_str = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive().to_string();
-    let bad: Vec<String> = table_ref
-        .read()
-        .await
-        .get_file_uris()?
-        .filter(|u| u.contains(&format!("/date={date_str}")) && !u.contains("project_id="))
-        .collect();
+    let bad: Vec<String> = table_ref.read().await.get_file_uris()?.filter(|u| u.contains(&format!("/date={date_str}")) && !u.contains("project_id=")).collect();
     assert!(bad.is_empty(), "optimize dropped project_id partition from: {bad:?}");
 
     // …and project-scoped queries must still see every row.
     let post = db.query_delta_only(&count_sql).await?;
-    assert_eq!(
-        post[0].column(0).as_primitive::<Int64Type>().value(0),
-        6,
-        "post-optimize: project-scoped count must be unchanged"
-    );
+    assert_eq!(post[0].column(0).as_primitive::<Int64Type>().value(0), 6, "post-optimize: project-scoped count must be unchanged");
     Ok(())
 }
 
@@ -423,10 +366,6 @@ async fn dedup_skips_chunk_over_decoded_budget() -> Result<()> {
         (0, false),
         "over the decoded budget, dedup must SKIP (not materialize) — dupe persists AND the pass must not certify clean"
     );
-    assert_eq!(
-        delta_physical_row_count(&table_ref).await?,
-        2,
-        "skipped chunk must be left physically intact (no rewrite, no OOM risk)"
-    );
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "skipped chunk must be left physically intact (no rewrite, no OOM risk)");
     Ok(())
 }

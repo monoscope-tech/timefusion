@@ -41,11 +41,8 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     let telemetry_layer = if config.otel_traces_exporter.as_deref() == Some("none") {
         None
     } else {
-        let span_exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint(otlp_endpoint)
-            .with_timeout(Duration::from_secs(10))
-            .build()?;
+        let span_exporter =
+            opentelemetry_otlp::SpanExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(Duration::from_secs(10)).build()?;
         let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
             .with_batch_exporter(span_exporter)
             .with_sampler(Sampler::AlwaysOn)
@@ -61,11 +58,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     // from client-side error strings because TF only logged to stdout).
     // The bridge must not observe the exporter's own tracing output —
     // tonic/hyper events inside an export would recurse into another export.
-    let log_exporter = opentelemetry_otlp::LogExporter::builder()
-        .with_tonic()
-        .with_endpoint(otlp_endpoint)
-        .with_timeout(Duration::from_secs(10))
-        .build()?;
+    let log_exporter = opentelemetry_otlp::LogExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(Duration::from_secs(10)).build()?;
     let logger_provider = SdkLoggerProvider::builder().with_batch_exporter(log_exporter).with_resource(resource).build();
     let log_bridge =
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(tracing_subscriber::filter::filter_fn(|meta| {
@@ -83,13 +76,9 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     let subscriber = Registry::default().with(env_filter).with(telemetry_layer).with(log_bridge);
 
     if is_json {
-        subscriber
-            .with(tracing_subscriber::fmt::layer().json().with_target(true).with_thread_ids(true).with_thread_names(true))
-            .try_init()
+        subscriber.with(tracing_subscriber::fmt::layer().json().with_target(true).with_thread_ids(true).with_thread_names(true)).try_init()
     } else {
-        subscriber
-            .with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true).with_thread_names(true))
-            .try_init()
+        subscriber.with(tracing_subscriber::fmt::layer().with_target(true).with_thread_ids(true).with_thread_names(true)).try_init()
     }
     .map_err(|e| anyhow::anyhow!("Failed to set tracing subscriber: {}", e))?;
 
@@ -124,7 +113,7 @@ pub fn capped_preview_fn(batch: &arrow::record_batch::RecordBatch) -> Result<Str
     /// `fmt::Write` that stops accepting bytes after `left` is exhausted; the
     /// resulting `fmt::Error` aborts the value's `Display` mid-render.
     struct Capped<'a> {
-        buf:  &'a mut String,
+        buf: &'a mut String,
         left: usize,
     }
     impl std::fmt::Write for Capped<'_> {
@@ -142,10 +131,7 @@ pub fn capped_preview_fn(batch: &arrow::record_batch::RecordBatch) -> Result<Str
     for row in 0..batch.num_rows() {
         for (formatter, field) in formatters.iter().zip(batch.schema().fields()) {
             let _ = write!(out, "{}=", field.name());
-            let mut w = Capped {
-                buf:  &mut out,
-                left: PREVIEW_CELL_CAP,
-            };
+            let mut w = Capped { buf: &mut out, left: PREVIEW_CELL_CAP };
             if write!(w, "{}", formatter.value(row)).is_err() {
                 out.push('…');
             }

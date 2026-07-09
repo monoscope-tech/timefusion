@@ -40,7 +40,7 @@ use crate::{
 
 /// A built tantivy index covering all rows currently in a bucket.
 pub struct BucketTextIndex {
-    pub index:        Index,
+    pub index: Index,
     pub built_schema: Arc<BuiltSchema>,
     /// Row count at build time. The cache is valid while
     /// `bucket.row_count == indexed_rows`. When more rows arrive we
@@ -52,7 +52,7 @@ pub struct BucketTextIndex {
     /// snapshot's indexed-text bytes × 2 (rough overhead for trigram
     /// postings + skip lists); errs on the high side so the budget is
     /// conservative rather than blown.
-    pub size_bytes:   usize,
+    pub size_bytes: usize,
 }
 
 impl BucketTextIndex {
@@ -69,12 +69,7 @@ impl BucketTextIndex {
         let size_bytes = estimate_index_size(table, batches);
         let (index, built_schema, _stats) = builder::build_in_memory(table, batches).with_context(|| format!("build mem-index for {}", table.table_name))?;
         register_tokenizers(&index);
-        Ok(Some(Self {
-            index,
-            built_schema: Arc::new(built_schema),
-            indexed_rows: row_count,
-            size_bytes,
-        }))
+        Ok(Some(Self { index, built_schema: Arc::new(built_schema), indexed_rows: row_count, size_bytes }))
     }
 
     /// Run a `text_match`-style query against this index and return hits.

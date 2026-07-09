@@ -34,18 +34,15 @@ use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, err
 pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 
 pub struct StatsTableProvider {
-    layer:        Option<Arc<BufferedWriteLayer>>,
+    layer: Option<Arc<BufferedWriteLayer>>,
     scan_metrics: Option<Arc<ScanMetrics>>,
-    cache_sizes:  Option<CacheSizeSnapshot>,
-    schema:       SchemaRef,
+    cache_sizes: Option<CacheSizeSnapshot>,
+    schema: SchemaRef,
 }
 
 impl std::fmt::Debug for StatsTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StatsTableProvider")
-            .field("layer", &self.layer)
-            .field("scan_metrics", &self.scan_metrics)
-            .finish_non_exhaustive()
+        f.debug_struct("StatsTableProvider").field("layer", &self.layer).field("scan_metrics", &self.scan_metrics).finish_non_exhaustive()
     }
 }
 
@@ -56,12 +53,7 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self {
-            layer,
-            scan_metrics: None,
-            cache_sizes: None,
-            schema,
-        }
+        Self { layer, scan_metrics: None, cache_sizes: None, schema }
     }
 
     pub fn with_scan_metrics(mut self, m: Arc<ScanMetrics>) -> Self {
@@ -94,36 +86,16 @@ impl StatsTableProvider {
             // during coalesce-heavy bursts; the value is for capacity
             // alerting, not for billing.
             rows.push(("mem_buffer", "estimated_bytes_approx".into(), s.mem_estimated_bytes.to_string()));
-            rows.push((
-                "mem_buffer",
-                "estimated_mb_approx".into(),
-                format!("{:.1}", s.mem_estimated_bytes as f64 / (1024.0 * 1024.0)),
-            ));
+            rows.push(("mem_buffer", "estimated_mb_approx".into(), format!("{:.1}", s.mem_estimated_bytes as f64 / (1024.0 * 1024.0))));
             rows.push(("mem_buffer", "bucket_duration_micros".into(), s.bucket_duration_micros.to_string()));
-            rows.push((
-                "mem_buffer",
-                "oldest_bucket_age_secs".into(),
-                s.oldest_bucket_age_secs.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
-            ));
+            rows.push(("mem_buffer", "oldest_bucket_age_secs".into(), s.oldest_bucket_age_secs.map(|v| v.to_string()).unwrap_or_else(|| "null".into())));
             rows.push(("buffered_layer", "reserved_bytes".into(), s.reserved_bytes.to_string()));
             rows.push(("buffered_layer", "max_memory_bytes".into(), s.max_memory_bytes.to_string()));
-            rows.push((
-                "buffered_layer",
-                "max_memory_mb".into(),
-                format!("{:.1}", s.max_memory_bytes as f64 / (1024.0 * 1024.0)),
-            ));
+            rows.push(("buffered_layer", "max_memory_mb".into(), format!("{:.1}", s.max_memory_bytes as f64 / (1024.0 * 1024.0))));
             rows.push(("buffered_layer", "pressure_pct".into(), s.pressure_pct.to_string()));
             rows.push(("buffered_layer", "backpressure_engaged_total".into(), s.backpressure_engaged_total.to_string()));
-            rows.push((
-                "buffered_layer",
-                "backpressure_rejected_total".into(),
-                s.backpressure_rejected_total.to_string(),
-            ));
-            rows.push((
-                "buffered_layer",
-                "backpressure_force_flush_total".into(),
-                s.backpressure_force_flush_total.to_string(),
-            ));
+            rows.push(("buffered_layer", "backpressure_rejected_total".into(), s.backpressure_rejected_total.to_string()));
+            rows.push(("buffered_layer", "backpressure_force_flush_total".into(), s.backpressure_force_flush_total.to_string()));
             rows.push(("buffered_layer", "flush_completed_total".into(), s.flush_completed_total.to_string()));
             rows.push(("buffered_layer", "flush_failed_total".into(), s.flush_failed_total.to_string()));
             // Ingest-vs-drain: both climb in steady state. If ingested pulls
@@ -134,11 +106,7 @@ impl StatsTableProvider {
             // comparable after a restart).
             rows.push(("buffered_layer", "rows_ingested_total".into(), s.rows_ingested_total.to_string()));
             rows.push(("buffered_layer", "rows_flushed_total".into(), s.rows_flushed_total.to_string()));
-            rows.push((
-                "buffered_layer",
-                "rows_in_buffer_lag".into(),
-                s.rows_ingested_total.saturating_sub(s.rows_flushed_total).to_string(),
-            ));
+            rows.push(("buffered_layer", "rows_in_buffer_lag".into(), s.rows_ingested_total.saturating_sub(s.rows_flushed_total).to_string()));
             // Drain effectiveness: flat while pressure_pct=100 and flushes
             // commit ⇒ drained buckets are empty (memory is in buckets the
             // flush path isn't reaching, e.g. an open window needing force-flush).
@@ -146,11 +114,7 @@ impl StatsTableProvider {
             // Real RSS vs the estimate_batch_size charge. RSS far below
             // estimated_bytes_approx ⇒ per-bucket estimate is over-counting and
             // backpressure is tripping on phantom bytes, not real memory.
-            rows.push((
-                "buffered_layer",
-                "process_rss_bytes".into(),
-                s.process_rss_bytes.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
-            ));
+            rows.push(("buffered_layer", "process_rss_bytes".into(), s.process_rss_bytes.map(|v| v.to_string()).unwrap_or_else(|| "null".into())));
             rows.push((
                 "buffered_layer",
                 "process_rss_mb".into(),
@@ -159,11 +123,7 @@ impl StatsTableProvider {
             // Orphaned topics = failed-commit rows living ONLY in the WAL,
             // each pinning the WAL GC floor. PAGE on >0; remedy = restart.
             rows.push(("buffered_layer", "orphaned_topics".into(), s.orphaned_topics.to_string()));
-            rows.push((
-                "buffered_layer",
-                "orphan_pin_age_secs".into(),
-                s.orphan_pin_age_secs.map(|v| v.to_string()).unwrap_or_else(|| "null".into()),
-            ));
+            rows.push(("buffered_layer", "orphan_pin_age_secs".into(), s.orphan_pin_age_secs.map(|v| v.to_string()).unwrap_or_else(|| "null".into())));
             rows.push(("wal", "files".into(), s.wal_files.to_string()));
             rows.push(("wal", "disk_bytes".into(), s.wal_disk_bytes.to_string()));
             rows.push(("wal", "disk_mb".into(), format!("{:.1}", s.wal_disk_bytes as f64 / (1024.0 * 1024.0))));
@@ -183,11 +143,7 @@ impl StatsTableProvider {
             // Max version lag (current - last checkpointed) seen at the last
             // checkpoint tick. Should stay near checkpoint_interval; a large,
             // growing value means the checkpoint task is failing or wedged.
-            rows.push((
-                "maintenance",
-                "checkpoint_lag_versions".into(),
-                m.checkpoint_lag_versions.load(Relaxed).to_string(),
-            ));
+            rows.push(("maintenance", "checkpoint_lag_versions".into(), m.checkpoint_lag_versions.load(Relaxed).to_string()));
             // NONZERO = committed parquet was destroyed elsewhere (2026-07-09
             // commit-path deletion bug). PAGE and investigate.
             rows.push(("maintenance", "dangling_removed".into(), m.dangling_removed.load(Relaxed).to_string()));

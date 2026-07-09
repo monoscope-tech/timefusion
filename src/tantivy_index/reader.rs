@@ -22,11 +22,11 @@ use crate::tantivy_index::{
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hit {
     pub timestamp_micros: i64,
-    pub id:               String,
+    pub id: String,
     /// Row offset within the covered parquet file, when the index carries the
     /// `_row_ordinal` fast field. Only meaningful for read-back-built indexes
     /// (`ManifestEntry.ordinals_valid`) — see schema.rs.
-    pub row_ordinal:      Option<u64>,
+    pub row_ordinal: Option<u64>,
 }
 
 /// Outcome of compiling predicates against a concrete index's schema.
@@ -102,11 +102,7 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
     // Per-segment fast-field columns, resolved lazily on first hit in that
     // segment. `None` in the outer Option = not yet resolved; inner `None`
     // = this segment has no fast `_id` (pre-fast-field index) → doc store.
-    type FfCols = (
-        tantivy::columnar::Column<i64>,
-        tantivy::columnar::StrColumn,
-        Option<tantivy::columnar::Column<u64>>,
-    );
+    type FfCols = (tantivy::columnar::Column<i64>, tantivy::columnar::StrColumn, Option<tantivy::columnar::Column<u64>>);
     let mut ff_cols: Vec<Option<Option<FfCols>>> = vec![None; searcher.segment_readers().len()];
     let mut hits = Vec::with_capacity(top.len());
     let mut id_buf = String::new();
@@ -125,11 +121,7 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
             if let (Some(ts), Some(ord)) = (ts, ord) {
                 id_buf.clear();
                 if id_col.ord_to_str(ord, &mut id_buf).map_err(|e| anyhow!("fast _id read: {e}"))? {
-                    hits.push(Hit {
-                        timestamp_micros: ts,
-                        id:               id_buf.clone(),
-                        row_ordinal:      ord_col.as_ref().and_then(|c| c.first(addr.doc_id)),
-                    });
+                    hits.push(Hit { timestamp_micros: ts, id: id_buf.clone(), row_ordinal: ord_col.as_ref().and_then(|c| c.first(addr.doc_id)) });
                     continue;
                 }
             }
@@ -139,11 +131,7 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
         let doc: TantivyDocument = searcher.doc(addr).map_err(|e| anyhow!("doc fetch: {e}"))?;
         let ts = doc.get_first(ts_field).and_then(|v| v.as_i64()).ok_or_else(|| anyhow!("hit missing _timestamp"))?;
         let id = doc.get_first(id_field).and_then(|v| v.as_str()).map(|s| s.to_string()).ok_or_else(|| anyhow!("hit missing _id"))?;
-        hits.push(Hit {
-            timestamp_micros: ts,
-            id,
-            row_ordinal: None,
-        });
+        hits.push(Hit { timestamp_micros: ts, id, row_ordinal: None });
     }
     Ok(hits)
 }

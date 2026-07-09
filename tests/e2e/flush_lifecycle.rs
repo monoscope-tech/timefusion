@@ -14,11 +14,7 @@ use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 #[serial_test::serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn flush_completed_bucket_only() -> anyhow::Result<()> {
-    let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(60))
-        .with_retention(Duration::from_secs(60 * 60))
-        .start()
-        .await?;
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(60)).with_retention(Duration::from_secs(60 * 60)).start().await?;
     let client = env.pg_client().await?;
 
     let bucket_size_micros: i64 = 60 * 1_000_000;
@@ -46,10 +42,7 @@ async fn flush_completed_bucket_only() -> anyhow::Result<()> {
     assert_eq!(flushed, 1, "expected exactly one bucket flushed, got {flushed} (stats: {stats_after:?})");
 
     // Bucket B should still be in MemBuffer; bucket A drained.
-    assert_eq!(
-        stats_after.mem_total_rows, 1,
-        "expected bucket B's row to remain in MemBuffer, got {stats_after:?}"
-    );
+    assert_eq!(stats_after.mem_total_rows, 1, "expected bucket B's row to remain in MemBuffer, got {stats_after:?}");
 
     // Both rows must still be visible via union(MemBuffer, Delta).
     let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"]).await?.get(0);

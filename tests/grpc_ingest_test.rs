@@ -70,20 +70,8 @@ async fn grpc_write_round_trip() -> Result<()> {
     let mut client = make_client(IngestService::new(Arc::clone(&db), None)).await;
 
     let (tx, rx) = tokio::sync::mpsc::channel(4);
-    tx.send(WriteBatch {
-        seq:        1,
-        project_id: project_id.clone(),
-        table_name: table_name.clone(),
-        arrow_ipc:  payload.clone(),
-    })
-    .await?;
-    tx.send(WriteBatch {
-        seq: 2,
-        project_id: project_id.clone(),
-        table_name,
-        arrow_ipc: payload,
-    })
-    .await?;
+    tx.send(WriteBatch { seq: 1, project_id: project_id.clone(), table_name: table_name.clone(), arrow_ipc: payload.clone() }).await?;
+    tx.send(WriteBatch { seq: 2, project_id: project_id.clone(), table_name, arrow_ipc: payload }).await?;
     drop(tx);
 
     let mut acks = client.write(ReceiverStream::new(rx)).await?.into_inner();
@@ -112,13 +100,7 @@ async fn grpc_rejects_bad_payload() -> Result<()> {
 
     let mut client = make_client(IngestService::new(db, None)).await;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tx.send(WriteBatch {
-        seq:        7,
-        project_id: "p".into(),
-        table_name: "otel_traces_and_logs".into(),
-        arrow_ipc:  vec![0xde, 0xad],
-    })
-    .await?;
+    tx.send(WriteBatch { seq: 7, project_id: "p".into(), table_name: "otel_traces_and_logs".into(), arrow_ipc: vec![0xde, 0xad] }).await?;
     drop(tx);
 
     let mut acks = client.write(ReceiverStream::new(rx)).await?.into_inner();
@@ -139,13 +121,7 @@ async fn grpc_auth_rejects_missing_token() -> Result<()> {
 
     let mut client = make_client(IngestService::new(db, Some("s3cret".into()))).await;
     let (tx, rx) = tokio::sync::mpsc::channel(1);
-    tx.send(WriteBatch {
-        seq:        1,
-        project_id: "p".into(),
-        table_name: "otel_traces_and_logs".into(),
-        arrow_ipc:  vec![],
-    })
-    .await?;
+    tx.send(WriteBatch { seq: 1, project_id: "p".into(), table_name: "otel_traces_and_logs".into(), arrow_ipc: vec![] }).await?;
     drop(tx);
 
     let err = client.write(ReceiverStream::new(rx)).await.unwrap_err();

@@ -14,15 +14,15 @@ pub fn load_config_from_env() -> Result<AppConfig, envy::Error> {
     // Load each sub-config separately to avoid #[serde(flatten)] issues with envy
     // See: https://github.com/softprops/envy/issues/26
     Ok(AppConfig {
-        aws:         envy::from_env()?,
-        core:        envy::from_env()?,
-        buffer:      envy::from_env()?,
-        cache:       envy::from_env()?,
-        parquet:     envy::from_env()?,
+        aws: envy::from_env()?,
+        core: envy::from_env()?,
+        buffer: envy::from_env()?,
+        cache: envy::from_env()?,
+        parquet: envy::from_env()?,
         maintenance: envy::from_env()?,
-        memory:      envy::from_env()?,
-        telemetry:   envy::from_env()?,
-        tantivy:     envy::from_env()?,
+        memory: envy::from_env()?,
+        telemetry: envy::from_env()?,
+        tantivy: envy::from_env()?,
     })
 }
 
@@ -343,23 +343,23 @@ fn d_service_version() -> String {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     #[serde(flatten)]
-    pub aws:         AwsConfig,
+    pub aws: AwsConfig,
     #[serde(flatten)]
-    pub core:        CoreConfig,
+    pub core: CoreConfig,
     #[serde(flatten)]
-    pub buffer:      BufferConfig,
+    pub buffer: BufferConfig,
     #[serde(flatten)]
-    pub cache:       CacheConfig,
+    pub cache: CacheConfig,
     #[serde(flatten)]
-    pub parquet:     ParquetConfig,
+    pub parquet: ParquetConfig,
     #[serde(flatten)]
     pub maintenance: MaintenanceConfig,
     #[serde(flatten)]
-    pub memory:      MemoryConfig,
+    pub memory: MemoryConfig,
     #[serde(flatten)]
-    pub telemetry:   TelemetryConfig,
+    pub telemetry: TelemetryConfig,
     #[serde(flatten)]
-    pub tantivy:     TantivyConfig,
+    pub tantivy: TantivyConfig,
 }
 
 const_default!(d_tantivy_max_index_mb: u64 = 64);
@@ -378,18 +378,18 @@ const_default!(d_tantivy_prefilter_min_selectivity_pct: u32 = 50);
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TantivyConfig {
     #[serde(default = "d_tantivy_max_index_mb")]
-    pub timefusion_tantivy_max_index_size_mb:             u64,
+    pub timefusion_tantivy_max_index_size_mb: u64,
     #[serde(default = "d_tantivy_cache_disk_gb")]
-    pub timefusion_tantivy_cache_disk_gb:                 u64,
+    pub timefusion_tantivy_cache_disk_gb: u64,
     #[serde(default = "d_tantivy_zstd_level")]
-    pub timefusion_tantivy_compression_level:             i32,
+    pub timefusion_tantivy_compression_level: i32,
     #[serde(default = "d_tantivy_min_files")]
-    pub timefusion_tantivy_min_files_for_pushdown:        usize,
+    pub timefusion_tantivy_min_files_for_pushdown: usize,
     /// If a tantivy prefilter would produce more than this many hits, skip
     /// the `id IN (...)` pushdown entirely — the IN-list itself becomes the
     /// bottleneck above this point. Default 100k.
     #[serde(default = "d_tantivy_prefilter_max_hits")]
-    pub timefusion_tantivy_prefilter_max_hits:            usize,
+    pub timefusion_tantivy_prefilter_max_hits: usize,
     /// If a tantivy prefilter selects more than this percentage of the
     /// indexed rows, the pushdown isn't worth the round-trip; skip it and
     /// let Delta scan with the original predicate. Default 50 (%).
@@ -404,31 +404,31 @@ pub struct TantivyConfig {
     /// span lookup gap vs the indexed PG path.
     /// Default ON; set false to revert to bloom/stats-only equality pruning.
     #[serde(default = "d_true")]
-    pub timefusion_tantivy_route_equality:                bool,
+    pub timefusion_tantivy_route_equality: bool,
     /// Startup backfill: build partition-mirrored indexes for live parquet
     /// files no successful manifest entry covers (pre-tantivy history, failed
     /// builds, files landed while the feature was off). Oldest-first, bounded
     /// concurrency; each covered file widens the windows where the prefilter
     /// can engage. Off by default — reads every uncovered file back from S3.
     #[serde(default)]
-    pub timefusion_tantivy_backfill:                      bool,
+    pub timefusion_tantivy_backfill: bool,
     /// File-level scan pruning: when the prefilter engages, files whose
     /// covering index returned zero hits are excluded from the Delta scan
     /// entirely (needle queries read only the files that can match). Off
     /// switch for instant rollback to id-IN-list-only pruning.
     #[serde(default = "d_true")]
-    pub timefusion_tantivy_file_pruning:                  bool,
+    pub timefusion_tantivy_file_pruning: bool,
     /// Warm the local index cache with blobs whose data is at most this many
     /// days old, at startup (0 = off). Turns the cold-window download cliff
     /// into a background cost after restarts.
     #[serde(default)]
-    pub timefusion_tantivy_prefetch_days:                 u32,
+    pub timefusion_tantivy_prefetch_days: u32,
     /// Row-selection pushdown: when the prefilter engages, files whose index
     /// was built in parquet row order get a per-file ParquetAccessPlan so the
     /// reader decodes only matching row groups/rows. Off switch for instant
     /// rollback to id-IN-list-only filtering inside surviving files.
     #[serde(default = "d_true")]
-    pub timefusion_tantivy_row_selection:                 bool,
+    pub timefusion_tantivy_row_selection: bool,
 }
 
 impl TantivyConfig {
@@ -442,9 +442,7 @@ impl TantivyConfig {
                 .list_tables()
                 .into_iter()
                 .filter(|name| {
-                    crate::schema_loader::registry()
-                        .get(name)
-                        .is_some_and(|s| s.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)))
+                    crate::schema_loader::registry().get(name).is_some_and(|s| s.fields.iter().any(|f| f.tantivy.as_ref().is_some_and(|t| t.indexed)))
                 })
                 .collect()
         })
@@ -474,17 +472,17 @@ impl TantivyConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct AwsConfig {
     #[serde(default)]
-    pub aws_access_key_id:             Option<String>,
+    pub aws_access_key_id: Option<String>,
     #[serde(default)]
-    pub aws_secret_access_key:         Option<String>,
+    pub aws_secret_access_key: Option<String>,
     #[serde(default)]
-    pub aws_default_region:            Option<String>,
+    pub aws_default_region: Option<String>,
     #[serde(default = "d_s3_endpoint")]
-    pub aws_s3_endpoint:               String,
+    pub aws_s3_endpoint: String,
     #[serde(default)]
-    pub aws_s3_bucket:                 Option<String>,
+    pub aws_s3_bucket: Option<String>,
     #[serde(default)]
-    pub aws_allow_http:                Option<String>,
+    pub aws_allow_http: Option<String>,
     /// TCP/TLS connection-establishment bound passed to the object_store S3
     /// client (humantime format, e.g. "15s"). `Option` so the derived
     /// `AwsConfig::default()` stays valid (an empty string wouldn't parse);
@@ -547,25 +545,25 @@ impl AwsConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CoreConfig {
     #[serde(default = "d_data_dir")]
-    pub timefusion_data_dir:             PathBuf,
+    pub timefusion_data_dir: PathBuf,
     #[serde(default = "d_pgwire_port")]
-    pub pgwire_port:                     u16,
+    pub pgwire_port: u16,
     #[serde(default = "d_table_prefix")]
-    pub timefusion_table_prefix:         String,
+    pub timefusion_table_prefix: String,
     #[serde(default)]
-    pub timefusion_config_database_url:  Option<String>,
+    pub timefusion_config_database_url: Option<String>,
     #[serde(default = "d_true")]
-    pub enable_batch_queue:              bool,
+    pub enable_batch_queue: bool,
     #[serde(default = "d_batch_queue_capacity")]
     pub timefusion_batch_queue_capacity: usize,
     #[serde(default = "d_pgwire_user")]
-    pub pgwire_user:                     String,
+    pub pgwire_user: String,
     #[serde(default)]
-    pub pgwire_password:                 Option<String>,
+    pub pgwire_password: Option<String>,
     #[serde(default = "d_grpc_port")]
-    pub grpc_port:                       u16,
+    pub grpc_port: u16,
     #[serde(default)]
-    pub grpc_token:                      Option<String>,
+    pub grpc_token: Option<String>,
 }
 
 impl CoreConfig {
@@ -580,21 +578,21 @@ impl CoreConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct BufferConfig {
     #[serde(default = "d_flush_interval")]
-    pub timefusion_flush_interval_secs:       u64,
+    pub timefusion_flush_interval_secs: u64,
     #[serde(default = "d_retention_mins")]
-    pub timefusion_buffer_retention_mins:     u64,
+    pub timefusion_buffer_retention_mins: u64,
     #[serde(default = "d_eviction_interval")]
-    pub timefusion_eviction_interval_secs:    u64,
+    pub timefusion_eviction_interval_secs: u64,
     #[serde(default = "d_buffer_max_memory")]
-    pub timefusion_buffer_max_memory_mb:      usize,
+    pub timefusion_buffer_max_memory_mb: usize,
     #[serde(default = "d_stop_grace")]
-    pub timefusion_stop_grace_secs:           u64,
+    pub timefusion_stop_grace_secs: u64,
     #[serde(default = "d_wal_corruption_threshold")]
-    pub timefusion_wal_corruption_threshold:  usize,
+    pub timefusion_wal_corruption_threshold: usize,
     #[serde(default = "d_flush_parallelism")]
-    pub timefusion_flush_parallelism:         usize,
+    pub timefusion_flush_parallelism: usize,
     #[serde(default)]
-    pub timefusion_flush_immediately:         bool,
+    pub timefusion_flush_immediately: bool,
     /// EXPERIMENTAL (default OFF), parity plan Defect 1: when set, `insert()`
     /// admits over the memory hard limit instead of *rejecting* a write whose
     /// backpressure budget is exhausted — the WAL append is the durability
@@ -603,45 +601,45 @@ pub struct BufferConfig {
     /// flush throughput) before prod enable — over-budget admission trades a
     /// reject for unbounded growth if Delta flush can't keep up.
     #[serde(default)]
-    pub timefusion_wal_admit_decouple:        bool,
+    pub timefusion_wal_admit_decouple: bool,
     #[serde(default = "d_wal_fsync_ms")]
-    pub timefusion_wal_fsync_ms:              u64,
+    pub timefusion_wal_fsync_ms: u64,
     #[serde(default = "d_wal_fsync_mode")]
-    pub timefusion_wal_fsync_mode:            String,
+    pub timefusion_wal_fsync_mode: String,
     /// Fsync the WAL shard before acking DML appends (machine-crash
     /// durability). Batched INSERT appends are always flushed before ack by
     /// walrus's `batch_write`; only single-entry DML appends defer to the
     /// background fsync thread — this closes that window. Default off: an
     /// OOM/SIGKILL never loses mmap'd writes, only power loss does.
     #[serde(default)]
-    pub timefusion_wal_ack_fsync:             bool,
+    pub timefusion_wal_ack_fsync: bool,
     #[serde(default = "d_wal_max_files")]
-    pub timefusion_wal_max_file_count:        usize,
+    pub timefusion_wal_max_file_count: usize,
     #[serde(default = "d_bucket_duration_secs")]
-    pub timefusion_bucket_duration_secs:      u64,
+    pub timefusion_bucket_duration_secs: u64,
     #[serde(default = "d_pressure_flush_pct")]
-    pub timefusion_pressure_flush_pct:        u32,
+    pub timefusion_pressure_flush_pct: u32,
     #[serde(default = "d_write_backpressure_secs")]
-    pub timefusion_write_backpressure_secs:   u64,
+    pub timefusion_write_backpressure_secs: u64,
     /// See `d_dml_coalesce_secs` — drain interval for deferred UPDATE ... FROM
     /// Delta merges; 0 keeps the synchronous per-statement path.
     #[serde(default = "d_dml_coalesce_secs")]
-    pub timefusion_dml_coalesce_secs:         u64,
+    pub timefusion_dml_coalesce_secs: u64,
     #[serde(default = "d_flush_bucket_timeout_secs")]
     pub timefusion_flush_bucket_timeout_secs: u64,
     /// WAL shards per (project, table) topic. Higher = more append parallelism
     /// at the cost of O(shards) recovery memory and more file handles.
     #[serde(default = "d_wal_shards_per_topic")]
-    pub timefusion_wal_shards_per_topic:      usize,
+    pub timefusion_wal_shards_per_topic: usize,
     /// Max concurrent S3/R2 reads when reconciling per-table Delta watermarks
     /// at boot. Only used when the cursor snapshot is missing or stale.
     #[serde(default = "d_delta_scan_concurrency")]
-    pub timefusion_delta_scan_concurrency:    usize,
+    pub timefusion_delta_scan_concurrency: usize,
     /// Per-table Delta commit history depth scanned at boot. The cursor
     /// snapshot covers the bulk of the watermark; this only needs to catch
     /// a writer that committed after the last snapshot was written.
     #[serde(default = "d_delta_scan_depth")]
-    pub timefusion_delta_scan_depth:          usize,
+    pub timefusion_delta_scan_depth: usize,
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
@@ -738,33 +736,33 @@ impl BufferConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CacheConfig {
     #[serde(default = "d_foyer_memory_mb")]
-    pub timefusion_foyer_memory_mb:            usize,
+    pub timefusion_foyer_memory_mb: usize,
     #[serde(default)]
-    pub timefusion_foyer_disk_mb:              Option<usize>,
+    pub timefusion_foyer_disk_mb: Option<usize>,
     #[serde(default = "d_foyer_disk_gb")]
-    pub timefusion_foyer_disk_gb:              usize,
+    pub timefusion_foyer_disk_gb: usize,
     #[serde(default = "d_foyer_ttl")]
-    pub timefusion_foyer_ttl_seconds:          u64,
+    pub timefusion_foyer_ttl_seconds: u64,
     #[serde(default = "d_foyer_shards")]
-    pub timefusion_foyer_shards:               usize,
+    pub timefusion_foyer_shards: usize,
     #[serde(default = "d_foyer_file_size_mb")]
-    pub timefusion_foyer_file_size_mb:         usize,
+    pub timefusion_foyer_file_size_mb: usize,
     #[serde(default = "d_foyer_stats")]
-    pub timefusion_foyer_stats:                String,
+    pub timefusion_foyer_stats: String,
     #[serde(default = "d_metadata_size_hint")]
     pub timefusion_parquet_metadata_size_hint: usize,
     /// Memory limit (MB) for DataFusion's decoded parquet-metadata cache
     /// (`datafusion.runtime.metadata_cache_limit`). See `d_df_metadata_cache_mb`.
     #[serde(default = "d_df_metadata_cache_mb")]
-    pub timefusion_df_metadata_cache_mb:       usize,
+    pub timefusion_df_metadata_cache_mb: usize,
     #[serde(default = "d_metadata_memory_mb")]
-    pub timefusion_foyer_metadata_memory_mb:   usize,
+    pub timefusion_foyer_metadata_memory_mb: usize,
     #[serde(default)]
-    pub timefusion_foyer_metadata_disk_mb:     Option<usize>,
+    pub timefusion_foyer_metadata_disk_mb: Option<usize>,
     #[serde(default = "d_metadata_disk_gb")]
-    pub timefusion_foyer_metadata_disk_gb:     usize,
+    pub timefusion_foyer_metadata_disk_gb: usize,
     #[serde(default = "d_metadata_shards")]
-    pub timefusion_foyer_metadata_shards:      usize,
+    pub timefusion_foyer_metadata_shards: usize,
     /// Disk block size (MB) for the main data cache. The block is foyer's
     /// minimal eviction unit AND its size caps the largest entry that can land
     /// on disk — so it must be >= the largest file we want cached locally. This
@@ -780,27 +778,27 @@ pub struct CacheConfig {
     /// instances set `timefusion_warm_inline_max_mb` to cap this independently
     /// of the on-disk block size.
     #[serde(default = "d_foyer_block_size_mb")]
-    pub timefusion_foyer_block_size_mb:        usize,
+    pub timefusion_foyer_block_size_mb: usize,
     /// Entries larger than this (MB) are inserted disk-only (foyer
     /// `Location::OnDisk`) so warming a big compaction output doesn't evict the
     /// hot small-entry working set from L1 memory. Small entries keep the
     /// default L1+disk placement for fastest repeat reads. 0 = always use L1.
     #[serde(default = "d_l1_max_entry_mb")]
-    pub timefusion_foyer_l1_max_entry_mb:      usize,
+    pub timefusion_foyer_l1_max_entry_mb: usize,
     /// Don't admit writes whose `date=` partition is older than this many days
     /// (e.g. cold-tier recompress rewrites) — recent data stays local, old data
     /// is served from S3. 0 = no age limit. Pairs with the cache TTL, which
     /// governs how long an admitted entry survives before falling back to S3.
     #[serde(default = "d_cache_recent_days")]
-    pub timefusion_cache_recent_days:          usize,
+    pub timefusion_cache_recent_days: usize,
     /// Optional extra cap (MB) on the in-flight buffer used to warm the cache
     /// directly from a multipart write (so we don't re-download a file we just
     /// streamed to S3). Always bounded by the disk block size; 0 = bound only
     /// by the block size.
     #[serde(default = "d_warm_inline_max_mb")]
-    pub timefusion_warm_inline_max_mb:         usize,
+    pub timefusion_warm_inline_max_mb: usize,
     #[serde(default)]
-    pub timefusion_foyer_disabled:             bool,
+    pub timefusion_foyer_disabled: bool,
 }
 
 impl CacheConfig {
@@ -842,31 +840,31 @@ impl CacheConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ParquetConfig {
     #[serde(default = "d_page_rows")]
-    pub timefusion_page_row_count_limit:      usize,
+    pub timefusion_page_row_count_limit: usize,
     /// ZSTD level for hot writes (flush + today's light optimize). Default 3.
     /// Aliased by the legacy env name; lower = faster ingest.
     #[serde(default = "d_zstd_level", alias = "timefusion_zstd_level_hot")]
-    pub timefusion_zstd_compression_level:    i32,
+    pub timefusion_zstd_compression_level: i32,
     #[serde(default = "d_zstd_level_warm")]
-    pub timefusion_zstd_level_warm:           i32,
+    pub timefusion_zstd_level_warm: i32,
     #[serde(default = "d_zstd_level_cold")]
-    pub timefusion_zstd_level_cold:           i32,
+    pub timefusion_zstd_level_cold: i32,
     #[serde(default = "d_cold_cutoff_days")]
-    pub timefusion_cold_cutoff_days:          u64,
+    pub timefusion_cold_cutoff_days: u64,
     #[serde(default = "d_row_group_size")]
-    pub timefusion_max_row_group_size:        usize,
+    pub timefusion_max_row_group_size: usize,
     #[serde(default = "d_checkpoint_interval")]
-    pub timefusion_checkpoint_interval:       u64,
+    pub timefusion_checkpoint_interval: u64,
     #[serde(default = "d_optimize_target")]
-    pub timefusion_optimize_target_size:      i64,
+    pub timefusion_optimize_target_size: i64,
     #[serde(default = "d_cold_optimize_target")]
     pub timefusion_cold_optimize_target_size: i64,
     #[serde(default = "d_cold_optimize_after_days")]
-    pub timefusion_cold_optimize_after_days:  u64,
+    pub timefusion_cold_optimize_after_days: u64,
     #[serde(default = "d_stats_cache_size")]
-    pub timefusion_stats_cache_size:          usize,
+    pub timefusion_stats_cache_size: usize,
     #[serde(default)]
-    pub timefusion_bloom_filter_disabled:     bool,
+    pub timefusion_bloom_filter_disabled: bool,
 }
 
 impl ParquetConfig {
@@ -881,102 +879,102 @@ impl ParquetConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MaintenanceConfig {
     #[serde(default = "d_vacuum_retention")]
-    pub timefusion_vacuum_retention_hours:          u64,
+    pub timefusion_vacuum_retention_hours: u64,
     #[serde(default = "d_log_retention")]
-    pub timefusion_log_retention_hours:             u64,
+    pub timefusion_log_retention_hours: u64,
     #[serde(default = "d_optimize_window_hours")]
-    pub timefusion_optimize_window_hours:           u64,
+    pub timefusion_optimize_window_hours: u64,
     #[serde(default = "d_compact_min_files")]
-    pub timefusion_compact_min_files:               usize,
+    pub timefusion_compact_min_files: usize,
     #[serde(default = "d_light_optimize_target")]
-    pub timefusion_light_optimize_target_size:      i64,
+    pub timefusion_light_optimize_target_size: i64,
     /// Concurrent merge tasks per optimize run. delta-rs defaults to
     /// num_cpus (48 on prod), where each task holds decompressed batches
     /// plus a zstd writer buffer — 2026-06-11 this OOM-killed the process
     /// every optimize tick once small files accumulated.
     #[serde(default = "d_optimize_concurrency")]
-    pub timefusion_optimize_max_concurrent_tasks:   usize,
+    pub timefusion_optimize_max_concurrent_tasks: usize,
     #[serde(default = "d_light_schedule")]
-    pub timefusion_light_optimize_schedule:         String,
+    pub timefusion_light_optimize_schedule: String,
     #[serde(default = "d_optimize_schedule")]
-    pub timefusion_optimize_schedule:               String,
+    pub timefusion_optimize_schedule: String,
     #[serde(default = "d_consolidate_schedule")]
-    pub timefusion_consolidate_schedule:            String,
+    pub timefusion_consolidate_schedule: String,
     #[serde(default = "d_vacuum_schedule")]
-    pub timefusion_vacuum_schedule:                 String,
+    pub timefusion_vacuum_schedule: String,
     #[serde(default = "d_recompress_schedule")]
-    pub timefusion_recompress_schedule:             String,
+    pub timefusion_recompress_schedule: String,
     /// Out-of-band checkpoint + expired-log-cleanup schedule. See d_checkpoint_schedule.
     #[serde(default = "d_checkpoint_schedule")]
-    pub timefusion_checkpoint_schedule:             String,
+    pub timefusion_checkpoint_schedule: String,
     /// Dangling-Add reconcile schedule. See d_reconcile_schedule.
     #[serde(default = "d_reconcile_schedule")]
-    pub timefusion_reconcile_schedule:              String,
+    pub timefusion_reconcile_schedule: String,
     /// Proactively warm the Foyer cache for files written by a flush/optimize
     /// commit, so recent partitions dashboards read don't cold-start after
     /// every compaction. Footers are always warmed when enabled.
     #[serde(default = "d_true")]
-    pub timefusion_warm_after_compaction:           bool,
+    pub timefusion_warm_after_compaction: bool,
     /// In addition to footers, warm the full file contents into the main
     /// (full-file) cache. Off by default — footers carry most of the
     /// planning-latency win at a fraction of the bytes; enable for data-read
     /// warmth on the hottest partitions.
     #[serde(default)]
-    pub timefusion_warm_full_files:                 bool,
+    pub timefusion_warm_full_files: bool,
     /// Only warm files whose `date=` partition is within this many days of
     /// today. Bounds warming to the partitions dashboards actually query.
     /// 0 = no recency limit.
     #[serde(default = "d_warm_recency_days")]
-    pub timefusion_warm_recency_days:               u64,
+    pub timefusion_warm_recency_days: u64,
     /// Warm parquet footers for EVERY live file (not just recency-window
     /// ones). Footers are tens of KB each, but on tables with thousands of
     /// files the boot-time GET burst may matter on small instances — disable
     /// to fall back to recency-bounded footer warming.
     #[serde(default = "d_true")]
-    pub timefusion_warm_all_footers:                bool,
+    pub timefusion_warm_all_footers: bool,
     /// Max concurrent warm fetches per commit. Bounds the S3 GET burst a
     /// warm job adds right after a compaction.
     #[serde(default = "d_warm_concurrency")]
-    pub timefusion_warm_concurrency:                usize,
+    pub timefusion_warm_concurrency: usize,
     /// After a compaction commit, proactively evict the cached full-file bytes
     /// of the files it tombstoned (no longer in the live set), instead of
     /// waiting for VACUUM / TTL / LRU to reclaim them. Cheap (in-cache only, no
     /// S3) and keeps the cache from filling with dead compaction outputs.
     #[serde(default = "d_true")]
-    pub timefusion_evict_after_compaction:          bool,
+    pub timefusion_evict_after_compaction: bool,
     /// Advance the post-commit snapshot by appending only the files the commit
     /// added, instead of re-materializing the whole active file set (2-8s over
     /// 26k files every flush in prod). Produces an identical file set — a
     /// faster, equivalent replay, safe regardless of writer count. Off reverts
     /// to the full re-materialize per commit.
     #[serde(default = "d_true")]
-    pub timefusion_incremental_snapshot:            bool,
+    pub timefusion_incremental_snapshot: bool,
     /// Belt-and-suspenders for the above: every Nth commit per table, drop the
     /// materialized files and re-materialize from S3 truth, bounding any drift
     /// from an incremental-replay bug. 0 disables reconciliation.
     #[serde(default = "d_snapshot_reconcile")]
-    pub timefusion_snapshot_reconcile_commits:      u64,
+    pub timefusion_snapshot_reconcile_commits: u64,
     /// Days back (plus today) the dedup sweep scans. See `d_dedup_lookback_days`.
     #[serde(default = "d_dedup_lookback_days")]
-    pub timefusion_dedup_lookback_days:             u64,
+    pub timefusion_dedup_lookback_days: u64,
     /// Skip the read-side DedupExec (and restore per-scan LIMIT pushdown) for
     /// Delta-only queries whose every in-window (project, date) partition was
     /// verified duplicate-free by a sweep pass AND whose file set is unchanged
     /// since (fingerprint match). Off by default until COUNT parity is
     /// validated on prod-shaped data.
     #[serde(default)]
-    pub timefusion_read_dedup_skip_swept:           bool,
+    pub timefusion_read_dedup_skip_swept: bool,
     /// Answer gate-eligible `SELECT COUNT(*) ... WHERE project_id AND
     /// timestamp range` from Delta add-action stats (zero parquet IO). Only
     /// fires when the window is fully flushed, dedup-provably-clean, and
     /// every overlapping file lies entirely inside the window — otherwise
     /// the normal scan runs. See src/count_pushdown.rs.
     #[serde(default = "d_true")]
-    pub timefusion_count_pushdown:                  bool,
+    pub timefusion_count_pushdown: bool,
     /// Byte ceiling per dedup chunk rewrite, measured as COMPRESSED on-disk
     /// bytes (`sum(add.size)`). Cheap early-out. See `d_dedup_max_rewrite_bytes`.
     #[serde(default = "d_dedup_max_rewrite_bytes")]
-    pub timefusion_dedup_max_rewrite_bytes:         u64,
+    pub timefusion_dedup_max_rewrite_bytes: u64,
     /// Ceiling on the ESTIMATED DECODED (in-memory Arrow) footprint of a dedup
     /// chunk rewrite. The compressed budget above under-counts by 5-20× for
     /// wide Variant/JSON columns, and `SELECT * … collect()` Arrow buffers are
@@ -988,18 +986,18 @@ pub struct MaintenanceConfig {
     /// fat-fingered 0 can't make every chunk skip forever. See
     /// `d_dedup_max_decoded_bytes`.
     #[serde(default = "d_dedup_max_decoded_bytes")]
-    pub timefusion_dedup_max_decoded_bytes:         u64,
+    pub timefusion_dedup_max_decoded_bytes: u64,
     /// Compressed→decoded inflation factor used to estimate a dedup chunk's
     /// in-memory footprint when per-file `num_records` stats are unavailable.
     /// See `d_dedup_decode_inflation`.
     #[serde(default = "d_dedup_decode_inflation")]
-    pub timefusion_dedup_decode_inflation:          u64,
+    pub timefusion_dedup_decode_inflation: u64,
     /// Estimated decoded Arrow bytes per row, used with per-file `num_records`
     /// to size a dedup chunk's in-memory footprint. otel spans carry wide
     /// Variant/JSON bodies; 4 KiB is a conservative average. See
     /// `d_dedup_bytes_per_row`.
     #[serde(default = "d_dedup_bytes_per_row")]
-    pub timefusion_dedup_bytes_per_row:             u64,
+    pub timefusion_dedup_bytes_per_row: u64,
     /// Max concurrent heavy maintenance rewrites (dedup / optimize / recompress)
     /// that may materialize Arrow at once. 1 = strictly serial. Backstop for
     /// decoded-footprint mis-estimates: their Arrow memory is invisible to the
@@ -1036,22 +1034,22 @@ fn d_memory_pool() -> MemoryPoolKind {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
     #[serde(default = "d_mem_gb")]
-    pub timefusion_memory_limit_gb:              usize,
+    pub timefusion_memory_limit_gb: usize,
     #[serde(default = "d_mem_fraction")]
-    pub timefusion_memory_fraction:              f64,
+    pub timefusion_memory_fraction: f64,
     #[serde(default)]
     pub timefusion_sort_spill_reservation_bytes: Option<usize>,
     #[serde(default = "d_memory_pool")]
-    pub timefusion_memory_pool:                  MemoryPoolKind,
+    pub timefusion_memory_pool: MemoryPoolKind,
     #[serde(default = "d_true")]
-    pub timefusion_tracing_record_metrics:       bool,
+    pub timefusion_tracing_record_metrics: bool,
     /// DataFusion `target_partitions` for query + maintenance sessions. 0 =
     /// auto: `autotune::apply()` derives it from the container's CPU quota
     /// (num_cpus ignores the CFS quota, oversubscribing throttled containers).
     /// A non-zero env (`TIMEFUSION_QUERY_PARTITIONS`) wins. 0 also when unset in
     /// tests → sessions keep DataFusion's default.
     #[serde(default = "d_query_partitions")]
-    pub timefusion_query_partitions:             usize,
+    pub timefusion_query_partitions: usize,
 }
 
 impl MemoryConfig {
@@ -1065,14 +1063,14 @@ pub struct TelemetryConfig {
     #[serde(default = "d_otlp_endpoint")]
     pub otel_exporter_otlp_endpoint: String,
     #[serde(default = "d_service_name")]
-    pub otel_service_name:           String,
+    pub otel_service_name: String,
     #[serde(default = "d_service_version")]
-    pub otel_service_version:        String,
+    pub otel_service_version: String,
     #[serde(default)]
-    pub log_format:                  Option<String>,
+    pub log_format: Option<String>,
     /// Standard OTel var; `none` disables span export (logs/metrics unaffected).
     #[serde(default)]
-    pub otel_traces_exporter:        Option<String>,
+    pub otel_traces_exporter: Option<String>,
 }
 
 impl TelemetryConfig {
@@ -1100,10 +1098,7 @@ mod tests {
         assert_eq!(normalize_duration("150s".into()), "150s");
         assert_eq!(normalize_duration("3m".into()), "3m");
         assert_eq!(normalize_duration("".into()), "");
-        let aws = AwsConfig {
-            timefusion_s3_connect_timeout: Some("150".into()),
-            ..Default::default()
-        };
+        let aws = AwsConfig { timefusion_s3_connect_timeout: Some("150".into()), ..Default::default() };
         assert_eq!(aws.connect_timeout(), "150s");
     }
 

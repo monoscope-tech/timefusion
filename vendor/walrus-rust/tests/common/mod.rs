@@ -33,7 +33,7 @@ static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[derive(Default)]
 struct ThreadKeyState {
     active: Option<String>,
-    last:   Option<String>,
+    last: Option<String>,
 }
 
 thread_local! {
@@ -43,11 +43,7 @@ thread_local! {
 fn ensure_base_dir() -> PathBuf {
     BASE_DIR
         .get_or_init(|| {
-            let unique = format!(
-                "walrus-test-run-{}-{}",
-                std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
-            );
+            let unique = format!("walrus-test-run-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos());
             let dir = std::env::temp_dir().join(unique);
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("failed to create walrus test root");
@@ -61,12 +57,7 @@ fn ensure_base_dir() -> PathBuf {
 }
 
 fn next_namespace_key(counter: u64) -> String {
-    format!(
-        "test-key-{:x}-{:x}-{:x}",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(),
-        counter
-    )
+    format!("test-key-{:x}-{:x}-{:x}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos(), counter)
 }
 
 #[allow(dead_code)]

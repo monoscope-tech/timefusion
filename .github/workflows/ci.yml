@@ -22,16 +22,10 @@ jobs:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
-      # rustfmt.toml uses nightly-only options (wrap_comments, imports_granularity,
-      # group_imports, format_code_in_doc_comments, normalize_doc_attributes,
-      # empty_item_single_line, struct_field_align_threshold). Stable fmt
-      # silently drops them and reformats differently → CI mismatch.
-      # rust-toolchain.toml pins to stable, so install nightly *and* invoke it
-      # explicitly with `+nightly` so cargo doesn't fall back to the pinned channel.
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
-      - run: cargo +nightly fmt --all --check
+      # rustfmt.toml is stable-only, and rust-toolchain.toml pins the stable
+      # channel, so plain `cargo fmt` here uses the exact same rustfmt as every
+      # contributor's local checkout — deterministic, no local-vs-CI drift.
+      - run: cargo fmt --all --check
       # NOTE: a former step here grepped vendor/datafusion-postgres for the
       # `was_pre_optimized` optimize-skip patch. That crate is now a git dep
       # ([patch.crates-io] in Cargo.toml → apitoolkit/datafusion-postgres@timefusion-df54),
