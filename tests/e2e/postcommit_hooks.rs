@@ -3,13 +3,14 @@
 //! written; an R2 500 there surfaced as a commit error that the flush path
 //! misread as "commit never landed" → it deleted the parquet the landed commit
 //! referenced (14 dangling Adds). These tests pin the four fixes:
-//!   A. the commit path does NOT checkpoint (Phase 1) — so a checkpoint/log
-//!      endpoint being down can't fail a flush; checkpointing moved out-of-band.
-//!   B. the landed probe reports Landed for committed adds and NotLanded for
-//!      adds never written to the log (Phase 3) — it never false-"Landed"s a
-//!      failed commit (which would drain the bucket into deleted parquet).
-//!   C. the out-of-band checkpoint task DOES checkpoint (Phase 2).
-//!   D. reconcile Remove's an Add whose parquet was deleted (Phase 4).
+//!
+//! - A: the commit path does NOT checkpoint (Phase 1) — so a checkpoint/log
+//!   endpoint being down can't fail a flush; checkpointing moved out-of-band.
+//! - B: the landed probe reports Landed for committed adds and NotLanded for
+//!   adds never written to the log (Phase 3) — it never false-"Landed"s a
+//!   failed commit (which would drain the bucket into deleted parquet).
+//! - C: the out-of-band checkpoint task DOES checkpoint (Phase 2).
+//! - D: reconcile Remove's an Add whose parquet was deleted (Phase 4).
 
 use std::{sync::atomic::Ordering::Relaxed, time::Duration};
 
