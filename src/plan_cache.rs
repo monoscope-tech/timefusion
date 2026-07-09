@@ -397,6 +397,12 @@ fn parameterize_statement(stmt: &Statement) -> Option<(Statement, Vec<ScalarValu
     let _: ControlFlow<()> = visit_expressions_mut(&mut stmt, |e: &mut SqlExpr| {
         if let SqlExpr::Value(vs) = e
             && let Value::SingleQuotedString(s) = &vs.value
+            // PG array literals ('{}', '{a,b}') must stay inline: PgArrayLiteralRewriter
+            // rewrites them to typed list literals during analysis, and it only matches
+            // Expr::Literal — a `$N` placeholder slips past it and gets mis-cast to a
+            // single-element list (COALESCE(list_col, '{a,b}') → ['{a,b}'] instead of
+            // ['a','b']). Cheap to skip: array-literal COALESCE is not a hot cached path.
+            && !s.trim_start().starts_with('{')
         {
             values.push(ScalarValue::Utf8(Some(s.clone())));
             vs.value = Value::Placeholder(format!("${}", values.len()));
@@ -739,6 +745,19 @@ mod tests {
     #[test]
     fn parameterize_none_without_string_literals() {
         assert!(parameterize_statement(&parse("SELECT count(*) FROM t WHERE n = 5")).is_none());
+    }
+
+    #[test]
+    fn parameterize_keeps_pg_array_literals_inline() {
+        // Regression: parameterizing '{}'/'{a,b}' into a $N placeholder hides them
+        // from PgArrayLiteralRewriter (matches Expr::Literal only), so they got
+        // mis-cast to single-element lists (COALESCE(list_col, '{a,b}') → ['{a,b}']
+        // instead of ['a','b']; edge_cases.slt:172). Array literals must stay inline.
+        let stmt = parse("SELECT ARRAY_LENGTH(COALESCE(parent_id, '{a,b}')) FROM t WHERE project_id = 'p'");
+        let (param, values) = parameterize_statement(&stmt).expect("the 'p' literal still parameterizes");
+        let text = param.to_string();
+        assert!(text.contains("'{a,b}'"), "PG array literal stays inline: {text}");
+        assert_eq!(values, vec![ScalarValue::Utf8(Some("p".into()))], "only the non-array string is extracted");
     }
 
     #[test]
