@@ -420,12 +420,16 @@ pub struct BufferedWriteLayer {
     /// True while `recover_from_wal` runs. Suppresses cursor-snapshot writes
     /// from mid-replay relief flushes — see `write_post_flush_snapshot`.
     recovery_active:                std::sync::atomic::AtomicBool,
-    /// Per-topic, per-shard high-water of the last WAL entry `process_entry`
-    /// actually applied during replay. The safe watermark baseline while
-    /// `recovery_active` (see `compute_wal_watermark`) — bounds mid-replay
-    /// commits + the rewind marker below any prefetched-but-unapplied entry so
-    /// a crash can't skip them. Populated during replay, unused otherwise.
-    recovery_applied_ceiling:       dashmap::DashMap<(String, String), ShardHolds>,
+    /// Per-topic pre-recovery cursor (P0), set once at the start of
+    /// `recover_from_wal`. While `recovery_active`, `compute_wal_watermark`
+    /// floors its result here so a mid-replay Delta commit's watermark metadata
+    /// never claims coverage past P0 — a later boot's `derive_wal_cursors_from_delta`
+    /// could otherwise forward the cursor past un-flushed replayed entries. The
+    /// resumable rewind marker advances independently (see
+    /// `refresh_replay_rewind_marker`), so this floor doesn't freeze recovery.
+    /// Static (read-only during replay) → no per-entry cost, safe for the
+    /// concurrent relief drain to read. Empty outside recovery.
+    recovery_commit_floor:          dashmap::DashMap<(String, String), ShardHolds>,
     /// Test-only: bail out of `recover_from_wal` once this many relief drains
     /// have committed + advanced the rewind marker, simulating a crash
     /// mid-replay. `u64::MAX` = disabled.
@@ -496,7 +500,7 @@ impl BufferedWriteLayer {
             inflight_wal_pins: dashmap::DashMap::new(),
             wal_hold_seq: AtomicU64::new(0),
             recovery_active: std::sync::atomic::AtomicBool::new(false),
-            recovery_applied_ceiling: dashmap::DashMap::new(),
+            recovery_commit_floor: dashmap::DashMap::new(),
             #[cfg(test)]
             test_crash_after_reliefs: AtomicU64::new(u64::MAX),
         })
@@ -885,17 +889,21 @@ impl BufferedWriteLayer {
         // recover_from_wal error aborts the boot, so that's moot.
         self.recovery_active.store(true, Ordering::Relaxed);
 
-        // Resumable replay: while `recovery_active`, `compute_wal_watermark`
-        // caps its baseline at the durable READ cursor (not the WAL write
-        // tail), so mid-replay commits + the rewind marker can advance safely
-        // as buckets drain — a mid-replay crash re-replays only from the
-        // earliest still-un-drained entry, not the whole backlog. Each
-        // replayed bucket is pinned at its entry's REAL WAL position (surfaced
-        // by `next_entry`), so the watermark advances bucket-by-bucket as they
-        // flush. (Previously every bucket was floored at the pre-recovery
-        // cursor P0 for the whole replay, freezing progress until 100%
-        // complete — the "restart re-reads 13GB" amplification.)
-        let shards_per_topic = self.wal.shards_per_topic();
+        // Resumable replay. Two independent mechanisms:
+        //  1. Delta commit metadata stays conservative: floor compute_wal_watermark
+        //     at P0 for the whole replay (recovery_commit_floor) so a mid-replay
+        //     commit never records coverage a later Delta-derive could use to skip
+        //     un-flushed replayed entries.
+        //  2. The rewind marker advances: each replayed INSERT pins its bucket at
+        //     the entry's REAL WAL position; each replayed DML pins the buckets it
+        //     mutates; after every drain the marker is rewritten to the current
+        //     watermark (frontier of the in-progress topic + live holds), so a
+        //     mid-replay crash re-replays only the still-un-drained tail, not the
+        //     whole backlog. (Previously the marker was frozen at P0 for the whole
+        //     replay — the "restart re-reads 13GB" amplification.)
+        for ((p, t), holds) in p0.iter() {
+            self.recovery_commit_floor.insert((p.clone(), t.clone()), holds.clone());
+        }
 
         // Stream entries one at a time and replay directly into MemBuffer.
         // Bounded recovery memory: O(1) entries in flight rather than
@@ -917,12 +925,11 @@ impl BufferedWriteLayer {
         let (mut insert_decode_nanos, mut insert_apply_nanos, mut insert_bytes) = (0u128, 0u128, 0u64);
         let (mut delete_nanos, mut update_nanos) = (0u128, 0u128);
         let mem_buffer = &self.mem_buffer;
-        let applied_ceiling = &self.recovery_applied_ceiling;
 
         let quarantine_dir = self.wal.data_dir().join("quarantine");
         // Entries whose quarantine copy failed to persist still exist ONLY in
         // the WAL — recovery must not park past them / drop the marker.
-        let mut quarantine_failures = 0u64;
+        let quarantine_failures = AtomicU64::new(0u64);
         let registry_ref: Option<&crate::functions::FnRegistry> = Some(self.function_registry.as_ref());
         // No age cutoff: the persisted cursor (Delta-derived at boot,
         // watermark-advanced on flush) already bounds replay to un-flushed
@@ -931,18 +938,6 @@ impl BufferedWriteLayer {
         // longer than retention (2026-07-08 incident: crash-loop backlog aged
         // past the cutoff and the re-drive couldn't backfill).
         let mut process_entry = |entry: WalEntry, shard: usize, pos: walrus_rust::WalPosition| {
-            // Advance the per-shard applied ceiling first (every returned entry,
-            // insert or DML) — it's the safe watermark baseline during replay,
-            // capped below any prefetched-but-unapplied entry. Keyed by owned
-            // strings (DashMap needs owned keys) so a concurrent relief drain
-            // reads a consistent snapshot; a stale (lower) read only re-replays
-            // slightly more, never loses.
-            if shard < shards_per_topic {
-                let mut c = applied_ceiling
-                    .entry((entry.project_id.clone(), entry.table_name.clone()))
-                    .or_insert_with(|| vec![None; shards_per_topic]);
-                c[shard] = Some(c[shard].map_or(pos, |prev| prev.max(pos)));
-            }
             let entry_start = std::time::Instant::now();
             match entry.operation {
                 WalOperation::Insert => {
@@ -963,21 +958,16 @@ impl BufferedWriteLayer {
                                 Ok(()) => {
                                     entries_replayed += 1;
                                     recovered_rows += rows;
-                                    // Pin the bucket at this entry's REAL WAL position on
-                                    // its shard, so as buckets drain the watermark advances
-                                    // to the next un-drained entry (resumable replay). Only
-                                    // the entry's own shard slot is set; `record_wal_append`
+                                    // Pin the bucket at this entry's REAL WAL position on its
+                                    // shard, so as buckets drain the marker advances to the
+                                    // next un-drained entry (resumable replay). record_wal_append
                                     // keeps the per-shard min across the bucket's entries.
-                                    let mut holds = vec![None; shards_per_topic];
-                                    if shard < shards_per_topic {
-                                        holds[shard] = Some(pos);
-                                    }
-                                    mem_buffer.record_replay_holds(&entry.project_id, &entry.table_name, entry.timestamp_micros, &holds);
+                                    mem_buffer.record_replay_hold(&entry.project_id, &entry.table_name, entry.timestamp_micros, shard, pos);
                                 }
                                 Err(e) => {
                                     error!("WAL REPLAY FAILED: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
                                     if !quarantine_entry(&quarantine_dir, &entry, "insert_incompatible", &e.to_string()) {
-                                        quarantine_failures += 1;
+                                        quarantine_failures.fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
                             }
@@ -988,17 +978,17 @@ impl BufferedWriteLayer {
                                 entry.project_id, entry.table_name, e
                             );
                             if !quarantine_entry(&quarantine_dir, &entry, "insert_corrupt", &e.to_string()) {
-                                quarantine_failures += 1;
+                                quarantine_failures.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
                 }
                 WalOperation::Delete => match decode_payload::<DeletePayload>(&entry.data) {
                     Ok(payload) => {
-                        if let Err(e) = mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), registry_ref) {
+                        if let Err(e) = mem_buffer.delete_by_sql(&entry.project_id, &entry.table_name, payload.predicate_sql.as_deref(), registry_ref, Some((shard, pos))) {
                             error!("WAL REPLAY FAILED: DELETE for {}.{}: {}", entry.project_id, entry.table_name, e);
                             if !quarantine_entry(&quarantine_dir, &entry, "delete_replay_failed", &e.to_string()) {
-                                quarantine_failures += 1;
+                                quarantine_failures.fetch_add(1, Ordering::Relaxed);
                             }
                         } else {
                             deletes_replayed += 1;
@@ -1010,7 +1000,7 @@ impl BufferedWriteLayer {
                             entry.project_id, entry.table_name, e
                         );
                         if !quarantine_entry(&quarantine_dir, &entry, "delete_corrupt", &e.to_string()) {
-                            quarantine_failures += 1;
+                            quarantine_failures.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 },
@@ -1022,10 +1012,11 @@ impl BufferedWriteLayer {
                             payload.predicate_sql.as_deref(),
                             &payload.assignments,
                             registry_ref,
+                            Some((shard, pos)),
                         ) {
                             error!("WAL REPLAY FAILED: UPDATE for {}.{}: {}", entry.project_id, entry.table_name, e);
                             if !quarantine_entry(&quarantine_dir, &entry, "update_replay_failed", &e.to_string()) {
-                                quarantine_failures += 1;
+                                quarantine_failures.fetch_add(1, Ordering::Relaxed);
                             }
                         } else {
                             updates_replayed += 1;
@@ -1037,7 +1028,7 @@ impl BufferedWriteLayer {
                             entry.project_id, entry.table_name, e
                         );
                         if !quarantine_entry(&quarantine_dir, &entry, "update_corrupt", &e.to_string()) {
-                            quarantine_failures += 1;
+                            quarantine_failures.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 },
@@ -1052,10 +1043,11 @@ impl BufferedWriteLayer {
                                 &payload.source.join_keys,
                                 source_batch,
                                 registry_ref,
+                                Some((shard, pos)),
                             ) {
                                 error!("WAL REPLAY FAILED: UPDATE_WITH_SOURCE for {}.{}: {}", entry.project_id, entry.table_name, e);
                                 if !quarantine_entry(&quarantine_dir, &entry, "update_with_source_replay_failed", &e.to_string()) {
-                                    quarantine_failures += 1;
+                                    quarantine_failures.fetch_add(1, Ordering::Relaxed);
                                 }
                             } else {
                                 updates_replayed += 1;
@@ -1067,7 +1059,7 @@ impl BufferedWriteLayer {
                                 entry.project_id, entry.table_name, e
                             );
                             if !quarantine_entry(&quarantine_dir, &entry, "update_with_source_batch_corrupt", &e.to_string()) {
-                                quarantine_failures += 1;
+                                quarantine_failures.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     },
@@ -1077,7 +1069,7 @@ impl BufferedWriteLayer {
                             entry.project_id, entry.table_name, e
                         );
                         if !quarantine_entry(&quarantine_dir, &entry, "update_with_source_corrupt", &e.to_string()) {
-                            quarantine_failures += 1;
+                            quarantine_failures.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 },
@@ -1124,17 +1116,22 @@ impl BufferedWriteLayer {
                 relief_gate = if self.is_memory_pressure() { iter.total + RELIEF_BACKOFF_ENTRIES } else { 0 };
                 // A drain just durably committed its buckets to Delta and
                 // released their holds — advance the rewind marker to the new
-                // (higher) watermark so a crash from here resumes past the
-                // drained data instead of re-reading it.
-                self.refresh_replay_rewind_marker(&p0);
+                // watermark (in-progress topic's frontier + live holds) so a
+                // crash from here resumes past the drained data. Skip once any
+                // quarantine write has failed: that entry is WAL-only, so the
+                // marker must not advance past it (the frontier is monotonic, so
+                // freezing here keeps the marker at-or-below the failed entry;
+                // the end-of-replay bail then preserves it).
+                if quarantine_failures.load(Ordering::Relaxed) == 0 {
+                    let (cur_topic, frontier) = iter.frontier();
+                    self.refresh_replay_rewind_marker(&p0, cur_topic, frontier);
+                }
                 #[cfg(test)]
                 if replay_reliefs >= self.test_crash_after_reliefs.load(Ordering::Relaxed) {
                     // Simulated crash mid-replay: the marker is advanced and the
-                    // drained buckets are durable; leave the marker in place
-                    // (bail paths do) so the next boot resumes from it.
-                    if let Some(h) = drain_task.take() {
-                        let _ = h.await;
-                    }
+                    // drained buckets are durable; leave it in place (bail paths
+                    // do) so the next boot resumes from it. The just-finished
+                    // drain is already awaited (is_finished()).
                     anyhow::bail!("test: simulated crash mid-replay after {} relief(s)", replay_reliefs);
                 }
             }
@@ -1184,10 +1181,10 @@ impl BufferedWriteLayer {
         // entries were consumed). Bailing here is not the corrupt-prefix
         // crash-loop the threshold guards against: the rewind re-reads the
         // same prefix only until the operator frees disk.
-        if quarantine_failures > 0 {
+        if quarantine_failures.load(Ordering::Relaxed) > 0 {
             anyhow::bail!(
                 "{} quarantine write(s) failed during WAL replay — the WAL is those entries' only copy; keeping the rewind marker. Free disk / fix permissions on {:?} and restart",
-                quarantine_failures,
+                quarantine_failures.load(Ordering::Relaxed),
                 quarantine_dir
             );
         }
@@ -1228,7 +1225,7 @@ impl BufferedWriteLayer {
         // the on-disk snapshot is due a rewrite anyway — write the PARKED
         // positions now so it never carries the consumed-ahead replay cursor.
         self.recovery_active.store(false, Ordering::Relaxed);
-        self.recovery_applied_ceiling.clear();
+        self.recovery_commit_floor.clear();
         if replay_reliefs > 0 {
             self.write_post_flush_snapshot().await;
         }
@@ -1900,26 +1897,30 @@ impl BufferedWriteLayer {
     /// lock *before* appending, so the holds read below observes it.
     fn compute_wal_watermark(&self, project_id: &str, table_name: &str) -> ShardHolds {
         let shards = self.wal.shards_per_topic();
-        // Baseline. Normal operation: the WAL write tail — every appended entry
-        // belongs to a known bucket, so a released hold safely advances to the
-        // tail. During replay: the per-shard APPLIED ceiling instead (the last
-        // entry `process_entry` actually put in a bucket). NOT the write tail
-        // (points past un-read entries) and NOT the durable read cursor —
-        // walrus checkpoints on read and the k-way merge prefetches one entry
-        // per shard, so the read cursor sits ~shards entries ahead of what's
-        // been applied; falling back to it would let a drain that released all
-        // holds record a watermark past prefetched-but-unapplied entries and
-        // lose them. The applied ceiling is the true safe floor: everything ≤
-        // it with no live hold is in a flushed bucket. See `recover_from_wal`.
-        // Tail FIRST — see the ordering argument in the doc comment above.
-        let mut wm: ShardHolds = if self.recovery_active.load(Ordering::Relaxed) {
-            self.recovery_applied_ceiling
-                .get(&(project_id.to_string(), table_name.to_string()))
-                .map(|c| c.clone())
-                .unwrap_or_else(|| vec![None; shards])
-        } else {
-            (0..shards).map(|s| self.wal.current_position_for_shard(project_id, table_name, s).ok()).collect()
-        };
+        // Baseline: the WAL write tail — every appended entry belongs to a known
+        // bucket, so a released hold safely advances to the tail. Tail FIRST —
+        // see the ordering argument in the doc comment above.
+        let baseline: ShardHolds = (0..shards).map(|s| self.wal.current_position_for_shard(project_id, table_name, s).ok()).collect();
+        let mut wm = self.merge_holds_over_baseline(project_id, table_name, baseline);
+        // During replay, floor at the pre-recovery cursor P0: this result becomes
+        // a mid-replay Delta commit's watermark metadata, and a later boot's
+        // `derive_wal_cursors_from_delta` could otherwise forward the cursor past
+        // un-flushed replayed entries. The resumable rewind marker advances
+        // independently of this floor (see `refresh_replay_rewind_marker`).
+        if self.recovery_active.load(Ordering::Relaxed)
+            && let Some(floor) = self.recovery_commit_floor.get(&(project_id.to_string(), table_name.to_string()))
+        {
+            wm = merge_wal_holds(wm, floor.clone());
+        }
+        wm
+    }
+
+    /// Merge all live holds (pending appends, in-flight flushes, orphaned,
+    /// buffered buckets) into `baseline`, taking the per-shard min — the earliest
+    /// position still owned by unflushed data. Shared by `compute_wal_watermark`
+    /// (write-tail baseline) and `refresh_replay_rewind_marker` (frontier baseline).
+    fn merge_holds_over_baseline(&self, project_id: &str, table_name: &str, baseline: ShardHolds) -> ShardHolds {
+        let shards = self.wal.shards_per_topic();
         let key = (project_id.to_string(), table_name.to_string());
         let mut pending_holds: ShardHolds = vec![None; shards];
         if let Some(pending) = self.pending_wal_holds.get(&key) {
@@ -1927,7 +1928,7 @@ impl BufferedWriteLayer {
                 pending_holds[*shard] = Some(pending_holds[*shard].map_or(*pos, |p| p.min(*pos)));
             }
         }
-        wm = merge_wal_holds(wm, pending_holds);
+        let mut wm = merge_wal_holds(baseline, pending_holds);
         if let Some(inflight) = self.inflight_flush_holds.get(&key) {
             for holds in inflight.values() {
                 wm = merge_wal_holds(wm, holds.clone());
@@ -1953,14 +1954,37 @@ impl BufferedWriteLayer {
         }
     }
 
-    /// Rewrite the recovery rewind marker to the current per-topic watermark
-    /// (read-cursor-capped during replay). Called after a mid-replay drain
-    /// commits, so a crash resumes from the earliest still-un-drained entry
-    /// rather than the pre-recovery cursor. Best-effort: a failure only means a
-    /// crash re-replays a bit more; correctness (no lost entries) is unaffected.
-    fn refresh_replay_rewind_marker(&self, topics: &std::collections::HashMap<(String, String), Vec<Option<walrus_rust::WalPosition>>>) {
-        let positions: std::collections::HashMap<(String, String), ShardHolds> =
-            topics.keys().map(|(p, t)| ((p.clone(), t.clone()), self.compute_wal_watermark(p, t))).collect();
+    /// Rewrite the recovery rewind marker to the current per-topic watermark, so
+    /// a crash resumes from the earliest still-un-drained entry rather than the
+    /// pre-recovery cursor. Called after a mid-replay drain commits.
+    ///
+    /// Per-topic baseline (min'd with live holds, but NOT the commit floor, so it
+    /// advances freely):
+    /// - the in-progress topic (`cur_topic`): the iterator `frontier` — the next
+    ///   entry each shard will yield; everything before it is applied+covered.
+    ///   Exhausted shards fall back to the persisted read cursor (fully read).
+    /// - every other topic: its persisted read cursor. Not-yet-started topics
+    ///   keep their pre-recovery cursor (P0), so they are NOT rewound to ORIGIN;
+    ///   completed topics sit at their consumed tail.
+    ///
+    /// Best-effort: a failure only means a crash re-replays a bit more.
+    fn refresh_replay_rewind_marker(
+        &self, p0: &std::collections::HashMap<(String, String), ShardHolds>, cur_topic: Option<(String, String)>, frontier: ShardHolds,
+    ) {
+        let shards = self.wal.shards_per_topic();
+        let positions: std::collections::HashMap<(String, String), ShardHolds> = p0
+            .keys()
+            .map(|(p, t)| {
+                let read_cursor = self.wal.persisted_read_positions(p, t).unwrap_or_else(|_| vec![None; shards]);
+                let baseline = if cur_topic.as_ref().is_some_and(|(cp, ct)| cp == p && ct == t) {
+                    // Frontier for the in-progress topic; read cursor per exhausted shard.
+                    (0..shards).map(|s| frontier.get(s).copied().flatten().or_else(|| read_cursor.get(s).copied().flatten())).collect()
+                } else {
+                    read_cursor
+                };
+                ((p.clone(), t.clone()), self.merge_holds_over_baseline(p, t, baseline))
+            })
+            .collect();
         if let Err(e) = self.wal.write_recovery_rewind_marker_at(&positions) {
             warn!("failed to refresh replay rewind marker (a crash would re-replay more, no data loss): {}", e);
         }
@@ -2915,6 +2939,99 @@ mod tests {
             flushed_pre_crash,
             flushed3.load(Ordering::Relaxed),
             buffered,
+            TOTAL
+        );
+    }
+
+    /// Regression: resumable replay across MULTIPLE topics (2026-07-09 review,
+    /// finding "untouched topics rewound to ORIGIN"). The mid-replay marker
+    /// refresh rebuilds the marker for every topic; a topic the iterator hasn't
+    /// reached yet must keep its pre-recovery cursor, NOT be nulled to ORIGIN
+    /// (which would re-replay its entire history). Here two tenants share the WAL;
+    /// we crash after the first relief drain and assert the resume loses no rows
+    /// across BOTH and doesn't re-read the whole combined backlog.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumable_replay_multi_topic_no_loss_across_crash() {
+        let dir = tempdir().unwrap();
+        let cfg_big = create_test_config(dir.path().to_path_buf());
+        let wal_dir = cfg_big.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        // Two distinct tenants → two WAL topics replayed sequentially.
+        let tenants: Vec<(String, String)> = (0..2).map(|k| (format!("mt{test_id}{k}"), format!("mt{test_id}{k}"))).collect();
+
+        const PER_BUCKET: u64 = 32;
+        const PER_TENANT: u64 = 2 * PER_BUCKET;
+        const TOTAL: u64 = 2 * PER_TENANT;
+        let base = chrono::Utc::now().timestamp_micros();
+        let gap = 20 * 60 * 1_000_000i64;
+        let fat = "x".repeat(1024 * 1024);
+        {
+            let layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg_big)).unwrap();
+            for (project, table) in &tenants {
+                for (b, ts) in [base, base + gap].into_iter().enumerate() {
+                    for i in 0..PER_BUCKET {
+                        let mut span = crate::test_utils::test_helpers::test_span_ts(&format!("b{b}r{i}"), "n", project, ts + i as i64);
+                        span["summary"] = serde_json::json!([fat]);
+                        layer.insert(project, table, vec![json_to_batch(vec![span]).unwrap()]).await.unwrap();
+                    }
+                }
+            }
+        }
+
+        let mut cfg_small = AppConfig::default();
+        cfg_small.core.timefusion_data_dir = dir.path().to_path_buf();
+        cfg_small.buffer.timefusion_buffer_max_memory_mb = 64;
+        let cfg_small = Arc::new(cfg_small);
+        let counting_layer = |flushed: Arc<AtomicU64>| {
+            let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg_small)).unwrap();
+            layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _wm: DeltaWatermark| {
+                let flushed = flushed.clone();
+                Box::pin(async move {
+                    flushed.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
+                    Ok(Vec::new())
+                })
+            }));
+            layer
+        };
+
+        // Life 2: crash after the first relief drain — at that point the second
+        // tenant's topic has almost certainly not been reached yet.
+        let flushed2 = Arc::new(AtomicU64::new(0));
+        let layer2 = counting_layer(flushed2.clone());
+        layer2.test_crash_after_reliefs.store(1, Ordering::Relaxed);
+        let layer2 = Arc::new(layer2);
+        assert!(layer2.recover_from_wal().await.is_err(), "test hook should have crashed replay mid-run");
+        let flushed_pre = flushed2.load(Ordering::Relaxed);
+        drop(layer2);
+
+        // Life 3: resume.
+        let flushed3 = Arc::new(AtomicU64::new(0));
+        let layer3 = Arc::new(counting_layer(flushed3.clone()));
+        let stats = layer3.recover_from_wal().await.unwrap();
+        // No loss across both tenants.
+        let mut buffered = 0u64;
+        for (project, table) in &tenants {
+            buffered += layer3.query(project, table, &[]).unwrap().iter().map(|b| b.num_rows() as u64).sum::<u64>();
+        }
+        assert!(
+            flushed_pre + flushed3.load(Ordering::Relaxed) + buffered >= TOTAL,
+            "rows lost across multi-topic crash+resume: {}+{}+{} < {}",
+            flushed_pre,
+            flushed3.load(Ordering::Relaxed),
+            buffered,
+            TOTAL
+        );
+        // Resume must not re-read the whole combined backlog: if the untouched
+        // tenant were rewound to ORIGIN it would re-replay its full history on
+        // top of the crashed tenant's remainder, pushing entries_replayed well
+        // over TOTAL. A correct resume re-reads only the un-drained tail.
+        assert!(
+            stats.entries_replayed <= TOTAL,
+            "resume re-replayed more than the whole backlog ({} > {}) — a caught-up topic was rewound to ORIGIN",
+            stats.entries_replayed,
             TOTAL
         );
     }

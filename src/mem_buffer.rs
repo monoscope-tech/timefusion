@@ -296,7 +296,7 @@ pub struct TimeBucket {
     /// or after `min(first_wal_pin)` across live buckets may be deleted.
     /// Stamped `Utc::now()` on live inserts and DML pins (the append just
     /// happened); replay buckets are additionally floored at the entry's
-    /// original append time via [`MemBuffer::record_replay_holds`]. Event
+    /// original append time via [`MemBuffer::record_replay_hold`]. Event
     /// time is deliberately NOT used: a backfill of old events would drag
     /// the floor days back and suspend WAL GC for the backfill's duration.
     /// Deliberately real-clock (chrono, not `crate::clock`) — it is compared
@@ -966,7 +966,7 @@ impl MemBuffer {
     /// recorded atomically with the batch (under the bucket lock) so a
     /// concurrent take can never separate rows from their cursor hold. Pass
     /// None only when the entry needs no pin (WAL replay pins via
-    /// [`Self::record_replay_holds`] instead).
+    /// [`Self::record_replay_hold`] instead).
     pub fn insert_with_hold(
         &self, project_id: &str, table_name: &str, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>,
     ) -> anyhow::Result<()> {
@@ -982,22 +982,18 @@ impl MemBuffer {
         Ok(())
     }
 
-    /// Pin the bucket owning `timestamp_micros` at the given per-shard
-    /// positions (min-merge). Used by WAL recovery: replayed entries' exact
-    /// positions aren't observable, so every replay-created bucket is pinned
-    /// at the pre-recovery cursor `P0` for its whole topic — conservative
-    /// (re-replays flushed neighbors on a later crash; dedup collapses those)
-    /// but never lossy.
-    pub fn record_replay_holds(&self, project_id: &str, table_name: &str, timestamp_micros: i64, holds: &[Option<walrus_rust::WalPosition>]) {
+    /// Pin the bucket owning `timestamp_micros` at a replayed entry's REAL WAL
+    /// `(shard, pos)` (min-merge per shard). Used by WAL recovery so the rewind
+    /// marker can advance bucket-by-bucket as buckets drain (resumable replay)
+    /// instead of freezing at the pre-recovery cursor.
+    pub fn record_replay_hold(&self, project_id: &str, table_name: &str, timestamp_micros: i64, shard: usize, pos: walrus_rust::WalPosition) {
         let key = Self::make_key(project_id, table_name);
         let Some(table) = self.tables.get(&key) else {
             return;
         };
         let bucket_id = Self::compute_bucket_id(timestamp_micros);
         if let Some(bucket) = table.buckets.get(&bucket_id) {
-            for (shard, pos) in holds.iter().enumerate() {
-                bucket.record_wal_append(shard, *pos);
-            }
+            bucket.record_wal_append(shard, Some(pos));
             // GC floor at the entry's ORIGINAL append time (replay entry
             // timestamps are append-time): the backing file's mtime is that
             // old, so the insert path's now-stamp alone would let GC delete
@@ -2213,13 +2209,16 @@ impl MemBuffer {
     /// Delete rows using a SQL predicate string (for WAL recovery).
     /// Parses the SQL WHERE clause and delegates to delete().
     #[instrument(skip(self, registry), fields(project_id, table_name))]
-    pub fn delete_by_sql(&self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, registry: Option<&FnRegistry>) -> DFResult<u64> {
+    pub fn delete_by_sql(
+        &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, registry: Option<&FnRegistry>,
+        wal_hold: Option<(usize, walrus_rust::WalPosition)>,
+    ) -> DFResult<u64> {
         if self.replay_dml_noop(project_id, table_name, "DELETE") {
             return Ok(0);
         }
         let df_schema = self.df_schema_for(project_id, table_name)?;
         let predicate = predicate_sql.map(|s| parse_sql_predicate(s, &df_schema, registry)).transpose()?;
-        self.delete(project_id, table_name, predicate.as_ref(), None)
+        self.delete(project_id, table_name, predicate.as_ref(), wal_hold)
     }
 
     /// WAL replay path for `UPDATE ... FROM`. Reconstructs an
@@ -2231,7 +2230,7 @@ impl MemBuffer {
     #[allow(clippy::too_many_arguments)]
     pub fn update_with_source_by_sql(
         &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], join_keys: &[(String, String)],
-        source_batch: RecordBatch, registry: Option<&FnRegistry>,
+        source_batch: RecordBatch, registry: Option<&FnRegistry>, wal_hold: Option<(usize, walrus_rust::WalPosition)>,
     ) -> DFResult<u64> {
         if self.replay_dml_noop(project_id, table_name, "UPDATE...FROM") {
             return Ok(0);
@@ -2259,7 +2258,7 @@ impl MemBuffer {
             batch:     source_batch,
             join_keys: join_keys.to_vec(),
         };
-        self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source, None)
+        self.update_with_source(project_id, table_name, predicate.as_ref(), &parsed_assignments, &source, wal_hold)
     }
 
     /// Update rows using SQL strings (for WAL recovery).
@@ -2267,6 +2266,7 @@ impl MemBuffer {
     #[instrument(skip(self, assignments, registry), fields(project_id, table_name))]
     pub fn update_by_sql(
         &self, project_id: &str, table_name: &str, predicate_sql: Option<&str>, assignments: &[(String, String)], registry: Option<&FnRegistry>,
+        wal_hold: Option<(usize, walrus_rust::WalPosition)>,
     ) -> DFResult<u64> {
         if self.replay_dml_noop(project_id, table_name, "UPDATE") {
             return Ok(0);
@@ -2277,7 +2277,7 @@ impl MemBuffer {
             .iter()
             .map(|(col, val_sql)| parse_sql_predicate(val_sql, &df_schema, registry).map(|expr| (col.clone(), expr)))
             .collect::<DFResult<Vec<_>>>()?;
-        self.update(project_id, table_name, predicate.as_ref(), &parsed_assignments, None)
+        self.update(project_id, table_name, predicate.as_ref(), &parsed_assignments, wal_hold)
     }
 
     /// Replay-path guard: DML for a table with no buffered rows is a no-op —
@@ -2413,7 +2413,7 @@ impl TableBuffer {
             // present) was already stamped by record_wal_append above; only
             // replay inserts (no wal_hold) need it here, and they are
             // additionally floored at the entry's original append time in
-            // `record_replay_holds`.
+            // `record_replay_hold`.
             if wal_hold.is_none() {
                 bucket.first_wal_pin_micros.fetch_min(chrono::Utc::now().timestamp_micros(), Ordering::Relaxed);
             }
@@ -2690,9 +2690,9 @@ mod tests {
             floor > chrono::Utc::now().timestamp_micros() - hour,
             "backfill event time leaked into the GC floor: {floor} (≈10 days old)"
         );
-        // Replay counterpart: record_replay_holds floors at the entry's
+        // Replay counterpart: record_replay_hold floors at the entry's
         // ORIGINAL append time so the old backing file stays protected.
-        buffer.record_replay_holds("p1", "t1", ten_days_ago, &[None]);
+        buffer.record_replay_hold("p1", "t1", ten_days_ago, 0, walrus_rust::WalPosition::ORIGIN);
         assert_eq!(
             buffer.oldest_wal_append_micros(),
             Some(ten_days_ago),
@@ -3448,11 +3448,11 @@ mod tests {
         let keys = [("id".to_string(), "id".to_string())];
 
         // Table-qualified predicate (the pre-fix stored form) can't resolve.
-        let bad = buffer.update_with_source_by_sql("p", "t", Some("t.id > 0"), &assigns, &keys, src.batch.clone(), None);
+        let bad = buffer.update_with_source_by_sql("p", "t", Some("t.id > 0"), &assigns, &keys, src.batch.clone(), None, None);
         assert!(bad.is_err(), "table-qualified predicate must fail against the bare replay schema (bug repro)");
 
         // Bare predicate (the normalized stored form) parses and applies.
-        let n = buffer.update_with_source_by_sql("p", "t", Some("id > 0"), &assigns, &keys, src.batch, None).unwrap();
+        let n = buffer.update_with_source_by_sql("p", "t", Some("id > 0"), &assigns, &keys, src.batch, None, None).unwrap();
         assert_eq!(n, 2);
         let rows = collect_id_name(&buffer);
         assert_eq!(rows.get(&2).map(String::as_str), Some("B"));
@@ -3507,6 +3507,7 @@ mod tests {
                 &[("id".to_string(), "id".to_string())],
                 src_batch,
                 Some(crate::functions::function_registry().unwrap().as_ref()),
+                None,
             )
             .expect("normalized hashes UPDATE...FROM must parse AND apply");
         assert_eq!(n, 1, "only id=1 matches the source");
@@ -3553,19 +3554,43 @@ mod tests {
                 &keys,
                 src.batch,
                 None,
+                None,
             )
             .expect("UPDATE...FROM replay on an untracked table must no-op, not schema-error");
         assert_eq!(n, 0);
         assert_eq!(
-            buffer.update_by_sql("p", "t", Some("id > 0"), &[("name".to_string(), "'x'".to_string())], None).unwrap(),
+            buffer.update_by_sql("p", "t", Some("id > 0"), &[("name".to_string(), "'x'".to_string())], None, None).unwrap(),
             0,
             "plain UPDATE replay must no-op on an untracked table"
         );
         assert_eq!(
-            buffer.delete_by_sql("p", "t", Some("id > 0"), None).unwrap(),
+            buffer.delete_by_sql("p", "t", Some("id > 0"), None, None).unwrap(),
             0,
             "DELETE replay must no-op on an untracked table"
         );
+    }
+
+    /// Regression: resumable-replay DML hold (2026-07-09 review, "DML
+    /// resurrection"). A replayed DELETE/UPDATE must migrate its WAL `(shard,
+    /// pos)` onto the buckets it mutates (via `note_dml_mutation`), so the
+    /// resumable rewind marker can't advance past the DML while a mutated bucket
+    /// is still un-flushed — otherwise a mid-replay crash re-replays the INSERTs
+    /// but skips the DELETE, resurrecting deleted rows. Pre-fix, `delete_by_sql`
+    /// passed `None` and the mutated bucket carried no delete hold.
+    #[test]
+    fn replay_dml_migrates_wal_hold_onto_mutated_bucket() {
+        let buffer = MemBuffer::new();
+        let ts = chrono::Utc::now().timestamp_micros();
+        let ins = walrus_rust::WalPosition { block_id: 3, offset: 30 };
+        let del = walrus_rust::WalPosition { block_id: 5, offset: 50 };
+        buffer
+            .insert_with_hold("p", "t", create_multi_row_batch(vec![1, 2], vec!["a", "b"]), ts, Some((0, ins)))
+            .unwrap();
+        let deleted = buffer.delete_by_sql("p", "t", Some("id = 1"), None, Some((1, del))).unwrap();
+        assert_eq!(deleted, 1, "DELETE must match the row it targets");
+        let holds = buffer.wal_holds("p", "t", 4);
+        assert_eq!(holds[0], Some(ins), "insert hold must remain on the bucket");
+        assert_eq!(holds[1], Some(del), "DELETE's WAL hold must be migrated onto the mutated bucket (else the marker skips it on crash-resume)");
     }
 
     fn test_table_df_schema() -> DFSchema {
@@ -3650,12 +3675,13 @@ mod tests {
                 Some("upper(name) = 'B'"),
                 &[("name".into(), "'updated'".into())],
                 Some(reg.as_ref()),
+                None,
             )
             .expect("UDF-bearing UPDATE should replay with registry");
         assert_eq!(updated, 1);
 
         assert!(
-            buffer.update_by_sql("project1", "table1", Some("upper(name) = 'A'"), &[("name".into(), "'x'".into())], None).is_err(),
+            buffer.update_by_sql("project1", "table1", Some("upper(name) = 'A'"), &[("name".into(), "'x'".into())], None, None).is_err(),
             "without registry, UDF planning should fail rather than silently no-op"
         );
     }

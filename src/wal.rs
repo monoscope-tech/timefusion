@@ -678,6 +678,7 @@ impl WalManager {
             heap:       std::collections::BinaryHeap::new(),
             shard_keys: Vec::new(),
             pending:    Vec::new(),
+            cur_topic:  None,
             total:      0,
             errors:     0,
         })
@@ -921,9 +922,12 @@ impl WalManager {
     /// commits its buckets to Delta: advancing the marker means a subsequent
     /// crash re-replays only from the earliest still-un-drained entry instead
     /// of the pre-recovery cursor, removing the "restart re-reads the whole
-    /// backlog" amplification. `None` shards are omitted (left at whatever the
-    /// prior marker held), so a shard with no live hold never rewinds forward
-    /// past un-read entries. Durable (fsync) — same as the initial marker.
+    /// backlog" amplification. Full overwrite: `positions` MUST carry every
+    /// topic the initial marker held (the caller passes each topic's real
+    /// watermark, or its pre-recovery cursor for un-started topics, so nothing
+    /// is silently rewound to ORIGIN). A genuinely-None shard maps to ORIGIN on
+    /// apply, which is correct only when that shard has no covered data.
+    /// Durable (fsync) — same as the initial marker.
     pub fn write_recovery_rewind_marker_at(&self, positions: &std::collections::HashMap<(String, String), Vec<Option<WalPosition>>>) -> Result<(), WalError> {
         let entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>> = positions
             .iter()
@@ -1282,6 +1286,8 @@ pub struct WalReplayIter<'a> {
     heap:       std::collections::BinaryHeap<std::cmp::Reverse<(i64, usize)>>,
     shard_keys: Vec<String>,
     pending:    Vec<Option<(WalEntry, WalPosition)>>,
+    /// The (project, table) currently being drained (last topic primed).
+    cur_topic:  Option<(String, String)>,
     /// Entries yielded so far.
     pub total:  u64,
     /// Corrupt/unreadable entries skipped so far.
@@ -1289,6 +1295,18 @@ pub struct WalReplayIter<'a> {
 }
 
 impl WalReplayIter<'_> {
+    /// The topic currently being replayed and its per-shard *frontier* — the
+    /// position of the next entry each shard will yield (`None` = that shard is
+    /// exhausted). Everything strictly before `frontier[shard]` on that shard
+    /// has already been yielded AND processed; the entry AT `frontier[shard]`
+    /// (the prefetched `pending` entry) has not. This is the safe watermark
+    /// baseline for the in-progress topic: the walrus read cursor sits one
+    /// prefetched entry per shard *ahead* of it. `None` topic before the first
+    /// `next_entry`.
+    pub fn frontier(&self) -> (Option<(String, String)>, Vec<Option<WalPosition>>) {
+        (self.cur_topic.clone(), self.pending.iter().map(|p| p.as_ref().map(|(_, pos)| *pos)).collect())
+    }
+
     /// Yields `(entry, shard, position)` — `position` is the entry's WAL
     /// position on its `shard`, so recovery can pin the buffered bucket at its
     /// real WAL position (resumable replay) instead of a conservative floor.
@@ -1314,6 +1332,7 @@ impl WalReplayIter<'_> {
             };
             let shards = self.wal.shards_per_topic;
             self.shard_keys = (0..shards).map(|s| WalManager::walrus_topic_key(&project_id, &table_name, s)).collect();
+            self.cur_topic = Some((project_id.clone(), table_name.clone()));
             self.pending = (0..shards).map(|_| None).collect();
             for shard in 0..shards {
                 if let Some(next) = WalManager::next_from_shard(&self.wal.wal, &self.shard_keys[shard], true, &mut self.errors) {
