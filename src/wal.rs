@@ -685,11 +685,11 @@ impl WalManager {
 
     /// Read the next entry from a shard, skipping corrupted ones. Returns
     /// `None` at end of stream. Shared by `WalReplayIter`'s k-way merge.
-    fn next_from_shard(wal: &Walrus, key: &str, checkpoint: bool, errors: &mut usize) -> Option<WalEntry> {
+    fn next_from_shard(wal: &Walrus, key: &str, checkpoint: bool, errors: &mut usize) -> Option<(WalEntry, WalPosition)> {
         loop {
-            match wal.read_next(key, checkpoint) {
-                Ok(Some(d)) => match deserialize_wal_entry(&d.data) {
-                    Ok(entry) => return Some(entry),
+            match wal.read_next_with_position(key, checkpoint) {
+                Ok(Some((d, pos))) => match deserialize_wal_entry(&d.data) {
+                    Ok(entry) => return Some((entry, pos)),
                     Err(e @ WalError::UnsupportedVersion { .. }) => {
                         error!(
                             "WAL on-disk version mismatch on shard {} ({e}); IN-FLIGHT DATA WILL BE LOST. \
@@ -914,6 +914,24 @@ impl WalManager {
         // fsyncs cursor progress — match that durability (sync file + dir).
         write_atomic(&target, &bytes, true)?;
         Ok(p0)
+    }
+
+    /// Rewrite the rewind marker to `positions` (per-topic, per-shard) — the
+    /// current replay watermark. Called after a mid-replay drain durably
+    /// commits its buckets to Delta: advancing the marker means a subsequent
+    /// crash re-replays only from the earliest still-un-drained entry instead
+    /// of the pre-recovery cursor, removing the "restart re-reads the whole
+    /// backlog" amplification. `None` shards are omitted (left at whatever the
+    /// prior marker held), so a shard with no live hold never rewinds forward
+    /// past un-read entries. Durable (fsync) — same as the initial marker.
+    pub fn write_recovery_rewind_marker_at(&self, positions: &std::collections::HashMap<(String, String), Vec<Option<WalPosition>>>) -> Result<(), WalError> {
+        let entries: std::collections::BTreeMap<String, Vec<Option<SnapPos>>> = positions
+            .iter()
+            .map(|((p, t), shards)| (Self::make_topic(p, t), shards.iter().map(|s| s.map(pos_to_snap)).collect()))
+            .collect();
+        let bytes = serde_json::to_vec(&entries).map_err(|e| WalError::Internal(format!("rewind marker encode: {}", e)))?;
+        write_atomic(&self.recovery_rewind_path(), &bytes, true)?;
+        Ok(())
     }
 
     /// Apply a leftover rewind marker (see `write_recovery_rewind_marker`).
@@ -1263,7 +1281,7 @@ pub struct WalReplayIter<'a> {
     topic_idx:  usize,
     heap:       std::collections::BinaryHeap<std::cmp::Reverse<(i64, usize)>>,
     shard_keys: Vec<String>,
-    pending:    Vec<Option<WalEntry>>,
+    pending:    Vec<Option<(WalEntry, WalPosition)>>,
     /// Entries yielded so far.
     pub total:  u64,
     /// Corrupt/unreadable entries skipped so far.
@@ -1271,17 +1289,20 @@ pub struct WalReplayIter<'a> {
 }
 
 impl WalReplayIter<'_> {
-    pub fn next_entry(&mut self) -> Option<WalEntry> {
+    /// Yields `(entry, shard, position)` — `position` is the entry's WAL
+    /// position on its `shard`, so recovery can pin the buffered bucket at its
+    /// real WAL position (resumable replay) instead of a conservative floor.
+    pub fn next_entry(&mut self) -> Option<(WalEntry, usize, WalPosition)> {
         use std::cmp::Reverse;
         loop {
             if let Some(Reverse((_, shard))) = self.heap.pop() {
-                let entry = self.pending[shard].take().expect("heap and pending out of sync");
+                let (entry, pos) = self.pending[shard].take().expect("heap and pending out of sync");
                 self.total += 1;
                 if let Some(next) = WalManager::next_from_shard(&self.wal.wal, &self.shard_keys[shard], true, &mut self.errors) {
-                    self.heap.push(Reverse((next.timestamp_micros, shard)));
+                    self.heap.push(Reverse((next.0.timestamp_micros, shard)));
                     self.pending[shard] = Some(next);
                 }
-                return Some(entry);
+                return Some((entry, shard, pos));
             }
             // Current topic exhausted — prime the next parseable topic.
             let (project_id, table_name) = loop {
@@ -1295,9 +1316,9 @@ impl WalReplayIter<'_> {
             self.shard_keys = (0..shards).map(|s| WalManager::walrus_topic_key(&project_id, &table_name, s)).collect();
             self.pending = (0..shards).map(|_| None).collect();
             for shard in 0..shards {
-                if let Some(entry) = WalManager::next_from_shard(&self.wal.wal, &self.shard_keys[shard], true, &mut self.errors) {
-                    self.heap.push(Reverse((entry.timestamp_micros, shard)));
-                    self.pending[shard] = Some(entry);
+                if let Some(next) = WalManager::next_from_shard(&self.wal.wal, &self.shard_keys[shard], true, &mut self.errors) {
+                    self.heap.push(Reverse((next.0.timestamp_micros, shard)));
+                    self.pending[shard] = Some(next);
                 }
             }
         }

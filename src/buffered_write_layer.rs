@@ -420,6 +420,17 @@ pub struct BufferedWriteLayer {
     /// True while `recover_from_wal` runs. Suppresses cursor-snapshot writes
     /// from mid-replay relief flushes — see `write_post_flush_snapshot`.
     recovery_active:                std::sync::atomic::AtomicBool,
+    /// Per-topic, per-shard high-water of the last WAL entry `process_entry`
+    /// actually applied during replay. The safe watermark baseline while
+    /// `recovery_active` (see `compute_wal_watermark`) — bounds mid-replay
+    /// commits + the rewind marker below any prefetched-but-unapplied entry so
+    /// a crash can't skip them. Populated during replay, unused otherwise.
+    recovery_applied_ceiling:       dashmap::DashMap<(String, String), ShardHolds>,
+    /// Test-only: bail out of `recover_from_wal` once this many relief drains
+    /// have committed + advanced the rewind marker, simulating a crash
+    /// mid-replay. `u64::MAX` = disabled.
+    #[cfg(test)]
+    test_crash_after_reliefs:       AtomicU64,
 }
 
 /// Per-shard WAL cursor holds (`None` = no hold on that shard).
@@ -485,6 +496,9 @@ impl BufferedWriteLayer {
             inflight_wal_pins: dashmap::DashMap::new(),
             wal_hold_seq: AtomicU64::new(0),
             recovery_active: std::sync::atomic::AtomicBool::new(false),
+            recovery_applied_ceiling: dashmap::DashMap::new(),
+            #[cfg(test)]
+            test_crash_after_reliefs: AtomicU64::new(u64::MAX),
         })
     }
 
@@ -871,16 +885,17 @@ impl BufferedWriteLayer {
         // recover_from_wal error aborts the boot, so that's moot.
         self.recovery_active.store(true, Ordering::Relaxed);
 
-        // P0 replay guard: pin every topic's watermark at its pre-recovery
-        // cursor for the whole replay. A mid-replay drain can flush ALL of a
-        // topic's buckets; `compute_wal_watermark` would then fall back to
-        // the WAL write tail, and the Delta commit would record that tail as
-        // its watermark metadata — a later boot's
-        // `derive_wal_cursors_from_delta` would skip entries the commit never
-        // contained. Floored at P0, mid-replay commits are merely
-        // conservative (re-replay + dedup collapse the overlap).
-        let replay_guards: Vec<((String, String), u64)> =
-            p0.iter().map(|((p, t), holds)| ((p.clone(), t.clone()), self.register_inflight_holds(p, t, holds.clone()))).collect();
+        // Resumable replay: while `recovery_active`, `compute_wal_watermark`
+        // caps its baseline at the durable READ cursor (not the WAL write
+        // tail), so mid-replay commits + the rewind marker can advance safely
+        // as buckets drain — a mid-replay crash re-replays only from the
+        // earliest still-un-drained entry, not the whole backlog. Each
+        // replayed bucket is pinned at its entry's REAL WAL position (surfaced
+        // by `next_entry`), so the watermark advances bucket-by-bucket as they
+        // flush. (Previously every bucket was floored at the pre-recovery
+        // cursor P0 for the whole replay, freezing progress until 100%
+        // complete — the "restart re-reads 13GB" amplification.)
+        let shards_per_topic = self.wal.shards_per_topic();
 
         // Stream entries one at a time and replay directly into MemBuffer.
         // Bounded recovery memory: O(1) entries in flight rather than
@@ -902,6 +917,7 @@ impl BufferedWriteLayer {
         let (mut insert_decode_nanos, mut insert_apply_nanos, mut insert_bytes) = (0u128, 0u128, 0u64);
         let (mut delete_nanos, mut update_nanos) = (0u128, 0u128);
         let mem_buffer = &self.mem_buffer;
+        let applied_ceiling = &self.recovery_applied_ceiling;
 
         let quarantine_dir = self.wal.data_dir().join("quarantine");
         // Entries whose quarantine copy failed to persist still exist ONLY in
@@ -914,7 +930,19 @@ impl BufferedWriteLayer {
         // it dropped, permanently losing any acked write that sat un-flushed
         // longer than retention (2026-07-08 incident: crash-loop backlog aged
         // past the cutoff and the re-drive couldn't backfill).
-        let mut process_entry = |entry: WalEntry| {
+        let mut process_entry = |entry: WalEntry, shard: usize, pos: walrus_rust::WalPosition| {
+            // Advance the per-shard applied ceiling first (every returned entry,
+            // insert or DML) — it's the safe watermark baseline during replay,
+            // capped below any prefetched-but-unapplied entry. Keyed by owned
+            // strings (DashMap needs owned keys) so a concurrent relief drain
+            // reads a consistent snapshot; a stale (lower) read only re-replays
+            // slightly more, never loses.
+            if shard < shards_per_topic {
+                let mut c = applied_ceiling
+                    .entry((entry.project_id.clone(), entry.table_name.clone()))
+                    .or_insert_with(|| vec![None; shards_per_topic]);
+                c[shard] = Some(c[shard].map_or(pos, |prev| prev.max(pos)));
+            }
             let entry_start = std::time::Instant::now();
             match entry.operation {
                 WalOperation::Insert => {
@@ -935,14 +963,16 @@ impl BufferedWriteLayer {
                                 Ok(()) => {
                                     entries_replayed += 1;
                                     recovered_rows += rows;
-                                    // Pin the bucket at the pre-recovery cursor so the
-                                    // watermark can't pass this entry until it flushes.
-                                    // Borrowing find over the handful of topics avoids two
-                                    // String allocs per replayed row on the bloated-WAL boot
-                                    // path the team already optimizes.
-                                    if let Some((_, holds)) = p0.iter().find(|((p, t), _)| p == &entry.project_id && t == &entry.table_name) {
-                                        mem_buffer.record_replay_holds(&entry.project_id, &entry.table_name, entry.timestamp_micros, holds);
+                                    // Pin the bucket at this entry's REAL WAL position on
+                                    // its shard, so as buckets drain the watermark advances
+                                    // to the next un-drained entry (resumable replay). Only
+                                    // the entry's own shard slot is set; `record_wal_append`
+                                    // keeps the per-shard min across the bucket's entries.
+                                    let mut holds = vec![None; shards_per_topic];
+                                    if shard < shards_per_topic {
+                                        holds[shard] = Some(pos);
                                     }
+                                    mem_buffer.record_replay_holds(&entry.project_id, &entry.table_name, entry.timestamp_micros, &holds);
                                 }
                                 Err(e) => {
                                     error!("WAL REPLAY FAILED: incompatible INSERT for {}.{}: {}", entry.project_id, entry.table_name, e);
@@ -1082,8 +1112,8 @@ impl BufferedWriteLayer {
         let mut replay_reliefs = 0u64;
         let mut drain_task: Option<JoinHandle<()>> = None;
         let mut iter = self.wal.replay_iter().map_err(|e| anyhow::anyhow!("WAL replay iterator init failed: {}", e))?;
-        while let Some(entry) = iter.next_entry() {
-            process_entry(entry);
+        while let Some((entry, shard, pos)) = iter.next_entry() {
+            process_entry(entry, shard, pos);
             // Back off (entry-count gate) only when a completed drain LEFT
             // pressure standing — that's the flushes-failing case. A drain
             // that relieved pressure re-arms immediately.
@@ -1092,6 +1122,21 @@ impl BufferedWriteLayer {
             {
                 drain_task = None;
                 relief_gate = if self.is_memory_pressure() { iter.total + RELIEF_BACKOFF_ENTRIES } else { 0 };
+                // A drain just durably committed its buckets to Delta and
+                // released their holds — advance the rewind marker to the new
+                // (higher) watermark so a crash from here resumes past the
+                // drained data instead of re-reading it.
+                self.refresh_replay_rewind_marker(&p0);
+                #[cfg(test)]
+                if replay_reliefs >= self.test_crash_after_reliefs.load(Ordering::Relaxed) {
+                    // Simulated crash mid-replay: the marker is advanced and the
+                    // drained buckets are durable; leave the marker in place
+                    // (bail paths do) so the next boot resumes from it.
+                    if let Some(h) = drain_task.take() {
+                        let _ = h.await;
+                    }
+                    anyhow::bail!("test: simulated crash mid-replay after {} relief(s)", replay_reliefs);
+                }
             }
             if drain_task.is_none() && iter.total >= relief_gate && self.is_memory_pressure() {
                 replay_reliefs += 1;
@@ -1179,16 +1224,11 @@ impl BufferedWriteLayer {
         }
         self.wal.remove_recovery_rewind_marker();
 
-        // Cursor parked — drop the P0 guards. The release-side advance is a
-        // no-op (forward-only merge to the parked/consumed position).
-        for ((p, t), token) in replay_guards {
-            self.release_inflight_holds(&p, &t, token);
-        }
-
         // Snapshot writes are safe again, and if relief flushed mid-replay
         // the on-disk snapshot is due a rewrite anyway — write the PARKED
         // positions now so it never carries the consumed-ahead replay cursor.
         self.recovery_active.store(false, Ordering::Relaxed);
+        self.recovery_applied_ceiling.clear();
         if replay_reliefs > 0 {
             self.write_post_flush_snapshot().await;
         }
@@ -1860,8 +1900,26 @@ impl BufferedWriteLayer {
     /// lock *before* appending, so the holds read below observes it.
     fn compute_wal_watermark(&self, project_id: &str, table_name: &str) -> ShardHolds {
         let shards = self.wal.shards_per_topic();
+        // Baseline. Normal operation: the WAL write tail — every appended entry
+        // belongs to a known bucket, so a released hold safely advances to the
+        // tail. During replay: the per-shard APPLIED ceiling instead (the last
+        // entry `process_entry` actually put in a bucket). NOT the write tail
+        // (points past un-read entries) and NOT the durable read cursor —
+        // walrus checkpoints on read and the k-way merge prefetches one entry
+        // per shard, so the read cursor sits ~shards entries ahead of what's
+        // been applied; falling back to it would let a drain that released all
+        // holds record a watermark past prefetched-but-unapplied entries and
+        // lose them. The applied ceiling is the true safe floor: everything ≤
+        // it with no live hold is in a flushed bucket. See `recover_from_wal`.
         // Tail FIRST — see the ordering argument in the doc comment above.
-        let mut wm: ShardHolds = (0..shards).map(|s| self.wal.current_position_for_shard(project_id, table_name, s).ok()).collect();
+        let mut wm: ShardHolds = if self.recovery_active.load(Ordering::Relaxed) {
+            self.recovery_applied_ceiling
+                .get(&(project_id.to_string(), table_name.to_string()))
+                .map(|c| c.clone())
+                .unwrap_or_else(|| vec![None; shards])
+        } else {
+            (0..shards).map(|s| self.wal.current_position_for_shard(project_id, table_name, s).ok()).collect()
+        };
         let key = (project_id.to_string(), table_name.to_string());
         let mut pending_holds: ShardHolds = vec![None; shards];
         if let Some(pending) = self.pending_wal_holds.get(&key) {
@@ -1892,6 +1950,19 @@ impl BufferedWriteLayer {
                 "WAL watermark advance failed for {}.{} (cursor stays behind; replay+dedup cover it): {}",
                 project_id, table_name, e
             );
+        }
+    }
+
+    /// Rewrite the recovery rewind marker to the current per-topic watermark
+    /// (read-cursor-capped during replay). Called after a mid-replay drain
+    /// commits, so a crash resumes from the earliest still-un-drained entry
+    /// rather than the pre-recovery cursor. Best-effort: a failure only means a
+    /// crash re-replays a bit more; correctness (no lost entries) is unaffected.
+    fn refresh_replay_rewind_marker(&self, topics: &std::collections::HashMap<(String, String), Vec<Option<walrus_rust::WalPosition>>>) {
+        let positions: std::collections::HashMap<(String, String), ShardHolds> =
+            topics.keys().map(|(p, t)| ((p.clone(), t.clone()), self.compute_wal_watermark(p, t))).collect();
+        if let Err(e) = self.wal.write_recovery_rewind_marker_at(&positions) {
+            warn!("failed to refresh replay rewind marker (a crash would re-replay more, no data loss): {}", e);
         }
     }
 
@@ -2693,19 +2764,29 @@ mod tests {
 
         let flushed_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let flushes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let tail_claims = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (fr, fl, tc) = (flushed_rows.clone(), flushes.clone(), tail_claims.clone());
+        let unsafe_claims = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (fr, fl, tc) = (flushed_rows.clone(), flushes.clone(), unsafe_claims.clone());
         let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg_small)).unwrap();
-        layer.delta_write_callback = Some(Arc::new(move |_p, _t, batches: Vec<RecordBatch>, wm: DeltaWatermark| {
-            let (fr, fl, tc) = (fr.clone(), fl.clone(), tc.clone());
+        let wal_probe = Arc::clone(layer.wal());
+        layer.delta_write_callback = Some(Arc::new(move |p: String, t: String, batches: Vec<RecordBatch>, wm: DeltaWatermark| {
+            let (fr, fl, tc, wal_probe) = (fr.clone(), fl.clone(), tc.clone(), wal_probe.clone());
             Box::pin(async move {
                 fl.fetch_add(1, Ordering::Relaxed);
                 fr.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
-                // P0 is ORIGIN here (nothing flushed pre-crash): a commit
-                // claiming any real position would let the next boot's
-                // Delta-derive skip entries this commit never contained.
-                if wm.iter().flatten().any(|p| *p != walrus_rust::WalPosition::ORIGIN) {
-                    tc.fetch_add(1, Ordering::Relaxed);
+                // Resumable-replay invariant: a mid-replay commit's watermark
+                // may advance past P0 (ORIGIN here), but MUST NOT exceed the
+                // durable read cursor — everything ≤ the read cursor with no
+                // live hold is flushed, so a next-boot Delta-derive to that
+                // watermark can't skip an un-read entry. The read cursor only
+                // advances during replay, so reading it now (≥ its value when
+                // `wm` was computed) is a valid upper bound.
+                let read_cursor = wal_probe.persisted_read_positions(&p, &t).unwrap_or_default();
+                for (shard, claimed) in wm.iter().enumerate() {
+                    if let Some(claimed) = claimed
+                        && read_cursor.get(shard).copied().flatten().is_none_or(|rc| *claimed > rc)
+                    {
+                        tc.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Ok(Vec::new())
             })
@@ -2718,7 +2799,7 @@ mod tests {
             flushes.load(Ordering::Relaxed) > 0,
             "replay never drained to Delta despite exceeding the budget"
         );
-        assert_eq!(tail_claims.load(Ordering::Relaxed), 0, "mid-replay commit claimed a watermark beyond P0");
+        assert_eq!(unsafe_claims.load(Ordering::Relaxed), 0, "mid-replay commit claimed a watermark beyond the durable read cursor");
         // 2026-07-08 review finding: mid-replay relief flushes must not
         // persist consumed-ahead cursors. The post-recovery snapshot must
         // hold exactly the PARKED positions — anything ahead of them would
@@ -2746,6 +2827,96 @@ mod tests {
         );
         let remaining: u64 = layer.query(&project, &table, &[]).unwrap().iter().map(|b| b.num_rows() as u64).sum();
         assert_eq!(flushed_rows.load(Ordering::Relaxed) + remaining, ROWS, "rows lost across budget-bounded replay");
+    }
+
+    /// Regression: resumable WAL replay (2026-07-09 incident). A crash mid-replay
+    /// must re-replay only the still-un-drained tail, not the whole backlog. The
+    /// pre-fix behavior froze the rewind marker at the pre-recovery cursor P0 for
+    /// the entire replay, so every restart re-read every entry — a 13GB backlog
+    /// plus a deploy became an hour-long read outage (pgwire gates on replay
+    /// completion). Here we crash after the first relief drain commits and assert
+    /// the resumed boot skips the drained prefix while losing no rows.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resumable_replay_after_crash_skips_drained_prefix() {
+        let dir = tempdir().unwrap();
+        let cfg_big = create_test_config(dir.path().to_path_buf());
+        let wal_dir = cfg_big.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("rr{}", test_id);
+        let table = format!("rr{}", test_id);
+
+        // Two event-time buckets 20 min apart, inserted oldest-first so WAL order
+        // ≈ bucket order and the first relief drains the older bucket, letting
+        // the marker advance past it.
+        const PER_BUCKET: u64 = 48;
+        const TOTAL: u64 = 2 * PER_BUCKET;
+        let base = chrono::Utc::now().timestamp_micros();
+        let gap = 20 * 60 * 1_000_000i64;
+        let fat = "x".repeat(1024 * 1024); // ~1MB/row so the tight budget forces a relief
+        {
+            let layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg_big)).unwrap();
+            for (b, ts) in [base, base + gap].into_iter().enumerate() {
+                for i in 0..PER_BUCKET {
+                    let mut span = crate::test_utils::test_helpers::test_span_ts(&format!("b{b}r{i}"), "n", &project, ts + i as i64);
+                    span["summary"] = serde_json::json!([fat]);
+                    layer.insert(&project, &table, vec![json_to_batch(vec![span]).unwrap()]).await.unwrap();
+                }
+            }
+            // Crash without flushing: all rows live only in the WAL.
+        }
+
+        let mut cfg_small = AppConfig::default();
+        cfg_small.core.timefusion_data_dir = dir.path().to_path_buf();
+        cfg_small.buffer.timefusion_buffer_max_memory_mb = 64;
+        let cfg_small = Arc::new(cfg_small);
+        let counting_layer = |flushed: Arc<AtomicU64>| {
+            let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg_small)).unwrap();
+            layer.delta_write_callback = Some(Arc::new(move |_p: String, _t: String, batches: Vec<RecordBatch>, _wm: DeltaWatermark| {
+                let flushed = flushed.clone();
+                Box::pin(async move {
+                    flushed.fetch_add(batches.iter().map(|b| b.num_rows() as u64).sum::<u64>(), Ordering::Relaxed);
+                    Ok(Vec::new())
+                })
+            }));
+            layer
+        };
+
+        // Life 2: crash right after the first relief drain advances the marker.
+        let flushed2 = Arc::new(AtomicU64::new(0));
+        let layer2 = counting_layer(flushed2.clone());
+        layer2.test_crash_after_reliefs.store(1, Ordering::Relaxed);
+        let layer2 = Arc::new(layer2);
+        assert!(layer2.recover_from_wal().await.is_err(), "test hook should have crashed replay mid-run");
+        let flushed_pre_crash = flushed2.load(Ordering::Relaxed);
+        assert!(flushed_pre_crash > 0, "no bucket drained before the simulated crash");
+        drop(layer2);
+
+        // Life 3: resume. The marker (advanced past the drained bucket) must make
+        // recovery re-read only the un-drained remainder.
+        let flushed3 = Arc::new(AtomicU64::new(0));
+        let layer3 = Arc::new(counting_layer(flushed3.clone()));
+        let stats = layer3.recover_from_wal().await.unwrap();
+        assert!(
+            stats.entries_replayed < TOTAL,
+            "resume re-replayed the whole backlog ({} of {}) — rewind marker never advanced",
+            stats.entries_replayed,
+            TOTAL
+        );
+        // No acked-write loss: everything drained across both lives plus whatever
+        // is still buffered must cover every original row (overlap from any
+        // re-replayed tail only inflates the total, never drops a row).
+        let buffered: u64 = layer3.query(&project, &table, &[]).unwrap().iter().map(|b| b.num_rows() as u64).sum();
+        assert!(
+            flushed_pre_crash + flushed3.load(Ordering::Relaxed) + buffered >= TOTAL,
+            "rows lost across crash+resume: {}+{}+{} < {}",
+            flushed_pre_crash,
+            flushed3.load(Ordering::Relaxed),
+            buffered,
+            TOTAL
+        );
     }
 
     /// Regression: prod 2026-07-03 acked-write loss. The WAL cursor advance was
@@ -2968,7 +3139,15 @@ mod tests {
                 .recover_from_wal()
                 .await
                 .unwrap_or_else(|e| panic!("boot {boot} must survive over-threshold corruption (quarantined payloads), got: {e}"));
-            assert!(stats.corrupted_entries_skipped >= 1, "boot {boot}: corruption must be counted, got {stats:?}");
+            // Boot 0 reads the corrupt entry, counts it, and (resumable replay)
+            // advances past it: the corrupt-only shard carries no live bucket
+            // hold, so it parks at the consumed tail and a later boot need not
+            // re-read it. The crash-loop this guards against is gone either way;
+            // what must hold on BOTH boots is that recovery comes up and the
+            // healthy entry replays.
+            if boot == 0 {
+                assert!(stats.corrupted_entries_skipped >= 1, "boot 0: corruption must be counted, got {stats:?}");
+            }
             let rows: usize = layer.query(&project, &table, &[]).unwrap().iter().map(|b| b.num_rows()).sum();
             assert_eq!(rows, 3, "boot {boot}: healthy entries must still replay");
         }
