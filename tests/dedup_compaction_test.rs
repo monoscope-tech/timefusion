@@ -325,26 +325,80 @@ async fn dedup_rewrite_targets_only_duplicate_files() -> Result<()> {
     Ok(())
 }
 
-/// Regression (prod 2026-07-04, 89GB cgroup OOM crash-loop): the dedup budget
-/// measured COMPRESSED on-disk bytes (`sum(add.size)`), but the rewrite
-/// `SELECT * … collect()`s the chunk to Arrow at 5-20× — and those buffers are
-/// invisible to DataFusion's memory pool, so a compressed-under-budget chunk
-/// decoded past the cgroup and OOM-killed the process. dedup must instead skip
-/// (returning 0, leaving the physical dupe for read-side dedup) when the
-/// ESTIMATED DECODED footprint exceeds `timefusion_dedup_max_decoded_bytes`.
+/// Fix 3 (2026-07-09): a chunk whose estimated decoded footprint exceeds the
+/// budget must NOT be skipped (leaving the dupe forever — prod project dcad860a's
+/// 743 MB single-file chunks skipped every 5-min sweep). Instead the rewrite
+/// SHARDS by an md5 hash of the dedup keys so each pass stays under the budget,
+/// the duplicate is collapsed, AND every distinct row survives — no row lost to a
+/// shard, none duplicated across shards. Pre-fix this SKIPPED (dropped=0, all rows
+/// persist); the fix collapses exactly the duplicate.
 ///
-/// Pre-fix there was no decoded budget, so setting it low had no effect and
-/// dedup dropped the dupe (returned 1) — this test's `dropped == 0` assertion
-/// fails on old code.
+/// `bytes_per_row`/`inflation` are pinned so the estimate is deterministic: 5 rows
+/// × 1 MB × 2 = 10 MB est over a 5 MB budget ⇒ 2 shards; the largest key group
+/// (a×2 = 4 MB) stays under budget so it is shardable, not skipped.
 #[serial]
 #[tokio::test]
-async fn dedup_skips_chunk_over_decoded_budget() -> Result<()> {
-    let cfg = TestConfigBuilder::new("dedup_decoded_budget").with_buffer_mode(BufferMode::Enabled).build();
-    // Fresh Arc (refcount 1) → unwrap to set a 1-byte decoded ceiling. The
-    // compressed budget stays at its 2GiB default, so ONLY the new decoded
-    // guard can trip: proves the decoded estimate — not compressed size — gates.
+async fn dedup_shards_over_budget_and_preserves_rows() -> Result<()> {
+    let cfg = TestConfigBuilder::new("dedup_shard_preserve").with_buffer_mode(BufferMode::Enabled).build();
     let mut cfg = Arc::try_unwrap(cfg).expect("fresh config Arc");
-    cfg.maintenance.timefusion_dedup_max_decoded_bytes = 1;
+    cfg.maintenance.timefusion_dedup_bytes_per_row = 1_000_000;
+    cfg.maintenance.timefusion_dedup_decode_inflation = 1;
+    cfg.maintenance.timefusion_dedup_max_decoded_bytes = 5_000_000;
+    let cfg = Arc::new(cfg);
+
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Base timestamp 3h back (sealed). Distinct (id, ts) tuples hash to spread
+    // buckets; "a" is inserted twice at the SAME (id, ts) → same bucket → same shard.
+    let base = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let ins = |id: &str, ts: i64| -> Result<_> { json_to_batch(vec![test_span_ts(id, id, &project_id, ts)]) };
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![ins("a", base)?], true, None).await?; // dup 1
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![ins("a", base)?], true, None).await?; // dup 2
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![ins("b", base + 1)?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![ins("c", base + 2)?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![ins("d", base + 3)?], true, None).await?;
+
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 5, "pre-dedup: 5 physical rows (a×2, b, c, d)");
+
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(base).unwrap().date_naive();
+    let (dropped, complete) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
+    assert_eq!((dropped, complete), (1, true), "over budget, the sharded rewrite collapses exactly the one 'a' duplicate (not skip)");
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 4, "4 distinct rows survive across shards");
+
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let ids = ctx
+        .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project_id}' ORDER BY id"))
+        .await?
+        .collect()
+        .await?;
+    let got: Vec<String> = ids
+        .iter()
+        .flat_map(|b| {
+            let col = b.column(0);
+            (0..b.num_rows()).map(|i| timefusion::test_utils::test_helpers::array_get_str(col.as_ref(), i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(got, vec!["a", "b", "c", "d"], "every distinct id preserved exactly once");
+    Ok(())
+}
+
+/// Skew safety valve: sharding can't split a single key group (all copies hash to
+/// one bucket). If that one group alone exceeds the decoded budget, no shard count
+/// helps, so the chunk is SKIPPED (0, false) rather than materialized into an OOM —
+/// preserving the pre-fix safety. Here one key has 3 copies (3 × 1 MB × 2 = 6 MB)
+/// over a 4 MB budget, so it must skip and leave the rows physically intact.
+#[serial]
+#[tokio::test]
+async fn dedup_skips_single_hot_key_over_budget() -> Result<()> {
+    let cfg = TestConfigBuilder::new("dedup_hot_key").with_buffer_mode(BufferMode::Enabled).build();
+    let mut cfg = Arc::try_unwrap(cfg).expect("fresh config Arc");
+    cfg.maintenance.timefusion_dedup_bytes_per_row = 1_000_000;
+    cfg.maintenance.timefusion_dedup_decode_inflation = 1;
+    cfg.maintenance.timefusion_dedup_max_decoded_bytes = 4_000_000;
     let cfg = Arc::new(cfg);
 
     let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
@@ -352,20 +406,93 @@ async fn dedup_skips_chunk_over_decoded_budget() -> Result<()> {
     let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
 
     let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    let row = || -> Result<_> { json_to_batch(vec![test_span_ts("hot", "hot", &project_id, ts)]) };
+    for _ in 0..3 {
+        db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row()?], true, None).await?;
+    }
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 3, "pre-dedup: 3 copies of one key");
+
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
+    let (dropped, complete) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
+    assert_eq!((dropped, complete), (0, false), "an unshardable single key group over budget must skip, not certify clean");
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 3, "skipped chunk left physically intact (no rewrite, no OOM)");
+    Ok(())
+}
+
+/// Characterization (refutes the target-dup hypothesis): a duplicated *target*
+/// row does NOT break `UPDATE ... FROM`. One source row matching multiple target
+/// rows is allowed by delta-rs — it updates all of them (count=2 here). So the
+/// prod MERGE failure is NOT caused by the over-budget dedup skip leaving target
+/// duplicates; the cardinality violation is source-side (see the next test).
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn update_from_on_duplicated_target_updates_all_copies() -> Result<()> {
+    let cfg = TestConfigBuilder::new("update_dup_target").with_buffer_mode(BufferMode::Enabled).build();
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Two skip_queue inserts of the SAME (id, timestamp) → 2 physical target rows.
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
     let row = |name: &str| -> Result<_> { json_to_batch(vec![test_span_ts("dup_id", name, &project_id, ts)]) };
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("first")?], true, None).await?;
     db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![row("second")?], true, None).await?;
 
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
-    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "pre-dedup: 2 physical rows");
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "precondition: duplicate exists physically in Delta");
 
-    let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(ts).unwrap().date_naive();
-    let (dropped, complete) = db.dedup_partition(&table_ref, "otel_logs_and_spans", &project_id, date).await?;
-    assert_eq!(
-        (dropped, complete),
-        (0, false),
-        "over the decoded budget, dedup must SKIP (not materialize) — dupe persists AND the pass must not certify clean"
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let sql = format!(
+        "UPDATE otel_logs_and_spans SET name = u.name \
+         FROM (VALUES ('dup_id', 'enriched')) AS u(id, name) \
+         WHERE project_id = '{project_id}' AND otel_logs_and_spans.id = u.id"
     );
-    assert_eq!(delta_physical_row_count(&table_ref).await?, 2, "skipped chunk must be left physically intact (no rewrite, no OOM risk)");
+    let updated = ctx.sql(&sql).await?.collect().await?[0].column(0).as_primitive::<datafusion::arrow::datatypes::UInt64Type>().value(0);
+    assert_eq!(updated, 2, "one source row must update BOTH duplicate target rows — target dups do not fail the MERGE");
+    Ok(())
+}
+
+/// Reproduction (prod 2026-07-09 `dml coalesce: drain failed … MERGE matched a
+/// target row with multiple source rows`): the cardinality violation is
+/// SOURCE-side. When two source rows carry the same join key, they both match a
+/// single target row and delta-rs aborts the whole MERGE. This is what must be
+/// prevented on the write path (dedup the source last-write-wins before the
+/// MERGE) — target-storage dedup (Fix 1/2/3) does NOT address it.
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn update_from_fails_on_duplicate_source_keys() -> Result<()> {
+    let cfg = TestConfigBuilder::new("update_dup_source").with_buffer_mode(BufferMode::Enabled).build();
+    let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
+    let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // Single, clean target row for 'dup_id'.
+    let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("dup_id", "orig", &project_id, ts)])?], true, None).await?;
+    let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 1, "precondition: exactly one target row");
+
+    // Source with TWO rows for the same id → two source rows match one target row.
+    let mut ctx = Arc::clone(&db).create_session_context();
+    db.setup_session_context(&mut ctx)?;
+    let sql = format!(
+        "UPDATE otel_logs_and_spans SET name = u.name \
+         FROM (VALUES ('dup_id', 'a'), ('dup_id', 'b')) AS u(id, name) \
+         WHERE project_id = '{project_id}' AND otel_logs_and_spans.id = u.id"
+    );
+    let res = match ctx.sql(&sql).await {
+        Ok(df) => df.collect().await,
+        Err(e) => Err(e),
+    };
+
+    let err = res.expect_err("UPDATE ... FROM with duplicate source keys must fail — repro of the prod MERGE cardinality error");
+    let msg = err.to_string().to_lowercase();
+    assert!(
+        msg.contains("multiple source rows") || msg.contains("multiple rows") || msg.contains("cardinality"),
+        "expected a delta-rs MERGE cardinality error, got: {}",
+        err
+    );
     Ok(())
 }

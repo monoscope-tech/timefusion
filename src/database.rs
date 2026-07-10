@@ -4453,32 +4453,16 @@ impl Database {
                 tokio::time::sleep(occ_backoff(replan)).await;
                 continue;
             }
-            // 3. Budget guards — skip loudly rather than materialize a chunk
-            // that would blow the cgroup. Read-side dedup keeps queries correct
-            // while the duplicates persist.
-            //
-            // Two ceilings, because the two failure modes differ:
-            //  (a) compressed on-disk bytes (`sum(add.size)`) — cheap early-out
-            //      against a z-ordered whole-day file dragging the whole day in.
-            //  (b) ESTIMATED DECODED (Arrow) bytes — the one that actually
-            //      matters. A `SELECT * … collect()` decodes to Arrow at 5-20×
-            //      the compressed size for wide Variant/JSON columns, and those
-            //      buffers are NOT accounted by DataFusion's memory pool, so the
-            //      pool never errors — the process OOMs (prod 2026-07-04: a
-            //      ~1M-row chunk under the 2GiB compressed budget decoded past
-            //      the 85GiB cgroup). Per file we take the MAX of a row-count
-            //      estimate (`num_records × bytes_per_row`) and a
-            //      compressed-inflation estimate (`size × inflation`), ×2 for
-            //      the RowConverter's parallel keyed copy in dedup_batches.
-            //      Max, not either-or: biasing to over-estimate is the safe
-            //      direction for an OOM guard, and it closes the hole where a
-            //      file whose stats report `num_records=0` (delta-rs can leave
-            //      it unpopulated) would otherwise estimate ~0 and slip a large
-            //      decode past the guard. Over-estimating only defers physical
-            //      dedup (read-side dedup keeps queries correct); under-
-            //      estimating OOMs the process.
+            // 3. Decide the shard count. A dedup `SELECT * … collect()` decodes to
+            // Arrow at 5-20× compressed OUTSIDE the memory pool, so an over-budget
+            // chunk used to be skipped (dupe left forever). Instead we split the
+            // rewrite into K passes bucketed by an md5 hash of the dedup keys — every
+            // copy of a key hashes to one bucket (never split), and md5 (not `key % K`,
+            // which collides for ms-aligned values) spreads evenly and is NULL-safe.
+            // K = ceil(estimated decoded bytes / budget); the estimate is the
+            // row-count-vs-inflation MAX ×2 documented on the config fields.
             let rewrite_bytes: i64 = targets.iter().map(|a| a.size).sum();
-            let budget = self.config.maintenance.timefusion_dedup_max_rewrite_bytes;
+            let compressed_budget = self.config.maintenance.timefusion_dedup_max_rewrite_bytes;
             let inflation = self.config.maintenance.timefusion_dedup_decode_inflation.max(1);
             let decoded_budget = self.config.maintenance.timefusion_dedup_max_decoded_bytes;
             let bytes_per_row = self.config.maintenance.timefusion_dedup_bytes_per_row;
@@ -4491,71 +4475,111 @@ impl Database {
                 })
                 .sum::<u64>()
                 .saturating_mul(2); // RowConverter keyed copy in dedup_batches
-            // decoded_budget == 0 disables the decoded guard (idiomatic here —
-            // see pressure_flush_pct / corruption_threshold), so a fat-fingered
-            // 0 can't make every chunk skip forever; the compressed guard and
-            // the maintenance semaphore still apply.
-            let over_decoded = decoded_budget > 0 && est_decoded_bytes > decoded_budget;
-            if rewrite_bytes.max(0) as u64 > budget || over_decoded {
-                crate::metrics::record_dedup_chunk_skipped();
-                error!(
-                    "dedup rewrite SKIPPED (over budget): table={} chunk=[{}] files={} compressed_bytes={} compressed_budget={} est_decoded_bytes={} decoded_budget={} — duplicates persist (read-side dedup keeps queries correct) until compaction shrinks the file set",
-                    table_name,
-                    label,
-                    targets.len(),
-                    rewrite_bytes,
-                    budget,
-                    est_decoded_bytes,
-                    decoded_budget
-                );
-                return Ok((0, false));
-            }
-            // 4. Full row set of the target files: chunk-window rows to dedup
-            // plus out-of-window rows carried through verbatim. Bounded by the
-            // decoded-byte estimate above (the pool does NOT bound this collect)
-            // AND the maintenance-rewrite semaphore (only N heavy materializations
-            // in flight at once — the aggregate backstop for estimate error). The
-            // permit covers only the Arrow-heavy materialize+encode (collect →
-            // dedup → write → flush); it is dropped before the commit-retry loop
-            // so an OCC backoff can't hold the single permit hostage while no
-            // Arrow is in flight.
-            let rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
+            // budget == 0 disables that ceiling (→ 1 shard). K = the max either budget
+            // demands, clamped to the bucket count (shards partition the bucket space).
+            let shards_for = |est: u64, budget: u64| if budget > 0 { est.div_ceil(budget) } else { 1 };
+            let shards = shards_for(est_decoded_bytes, decoded_budget)
+                .max(shards_for(rewrite_bytes.max(0) as u64, compressed_budget))
+                .clamp(1, DEDUP_BUCKET_COUNT);
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
-            let rows_sql = format!("SELECT * FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list})");
-            let batches: Vec<RecordBatch> = ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
-            let before: usize = batches.iter().map(|b| b.num_rows()).sum();
+            // Bucket = first byte of md5 over the dedup keys (2 hex chars =
+            // DEDUP_BUCKET_COUNT buckets, evenly spread); chr(31) separates keys so
+            // distinct tuples can't collide. Also the GROUP BY for the skew probe below.
+            let keys_varchar = schema.dedup_keys.iter().map(|k| format!("CAST(\"{k}\" AS VARCHAR)")).collect::<Vec<_>>().join(", ");
+            let bucket_expr = format!("substr(md5(concat_ws(chr(31), {keys_varchar})), 1, 2)");
+
+            // Sharding can't split a single key group — all copies share one bucket.
+            // If the largest group alone would blow the budget, no shard count helps,
+            // so skip (preserving the pre-fix OOM-safety) rather than materialize it.
+            if shards > 1 && decoded_budget > 0 {
+                let max_group_sql =
+                    format!("SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})");
+                let max_group = ctx
+                    .sql(&max_group_sql)
+                    .await?
+                    .collect()
+                    .await?
+                    .first()
+                    .and_then(|b| b.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|a| a.value(0)))
+                    .unwrap_or(0);
+                if (max_group.max(0) as u64).saturating_mul(bytes_per_row).saturating_mul(2) > decoded_budget {
+                    crate::metrics::record_dedup_chunk_skipped();
+                    error!(
+                        "dedup rewrite SKIPPED (single key group of {} rows over decoded budget — unshardable): table={} chunk=[{}] files={} — duplicates persist until compaction shrinks the file set",
+                        max_group, table_name, label, targets.len()
+                    );
+                    return Ok((0, false));
+                }
+            }
+
+            // 4. Rewrite each shard independently: collect (bounded to ~one budget by
+            // the bucket range), dedup, stage its own parquet. The permit bounds
+            // concurrent Arrow materializations across the sweep; held for the loop
+            // only, dropped before the commit-retry loop (log write + OCC sleeps decode
+            // nothing). Out-of-window rows in the target files carry through verbatim
+            // (their keys are unique → no drop). On any per-shard error, already-staged
+            // parquet is cleaned before returning so a mid-loop failure leaks nothing.
+            let rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
+            let staging_table = { table_ref.read().await.clone() };
+            let stage_store = staging_table.log_store().object_store(None);
+            let (mut before, mut after) = (0usize, 0usize);
+            let mut adds: Vec<Action> = Vec::new();
+            let stage_result: anyhow::Result<()> = async {
+                for shard in 0..shards {
+                    let shard_pred = if shards > 1 {
+                        // Contiguous bucket range per shard (even ±1); string compare of
+                        // zero-padded lowercase hex == numeric order.
+                        let (lo, hi) = (shard * DEDUP_BUCKET_COUNT / shards, (shard + 1) * DEDUP_BUCKET_COUNT / shards);
+                        let mut p = format!(" AND {bucket_expr} >= '{lo:02x}'");
+                        if hi < DEDUP_BUCKET_COUNT {
+                            p.push_str(&format!(" AND {bucket_expr} < '{hi:02x}'"));
+                        }
+                        p
+                    } else {
+                        String::new()
+                    };
+                    let rows_sql = format!("SELECT * FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}){shard_pred}");
+                    let batches: Vec<RecordBatch> = ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
+                    let shard_before: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    if shard_before == 0 {
+                        continue;
+                    }
+                    before += shard_before;
+                    let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref())?;
+                    after += deduped.iter().map(|b| b.num_rows()).sum::<usize>();
+                    // Variant struct columns may still be BinaryView if the partition
+                    // mixes tiers — cast to Binary so the write accepts the schema.
+                    let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
+                    let (deduped, sorted) = sort_batches_by_schema(schema, deduped);
+                    let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
+                    let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
+                        .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
+                        .with_writer_properties(writer_properties);
+                    let target_schema = writer.arrow_schema();
+                    for b in &deduped {
+                        let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
+                        writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
+                    }
+                    adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add));
+                }
+                Ok(())
+            }
+            .await;
+            drop(rewrite_permit);
+            if let Err(e) = stage_result {
+                Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                return Err(e);
+            }
             if before == 0 {
                 return Ok((0, false));
             }
-            let deduped = crate::mem_buffer::dedup_batches(batches, &schema.dedup_keys, schema.dedup_tiebreak.as_deref())?;
-            let after: usize = deduped.iter().map(|b| b.num_rows()).sum();
             if before == after {
-                return Ok((0, true)); // probe false-positive: chunk verified duplicate-free
+                // Probe false-positive (a concurrent rewrite already deduped): discard
+                // the staged no-op copies, certify clean, commit nothing.
+                Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+                return Ok((0, true));
             }
             let dropped = (before - after) as u64;
-
-            // Variant struct columns may still be BinaryView if the partition
-            // mixes tiers — cast to Binary so the write accepts the schema.
-            let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-            let (deduped, sorted) = sort_batches_by_schema(schema, deduped);
-            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
-
-            // 5. Stage replacement parquet (no commit) — outside the lock,
-            // mirroring the flush staged-commit path.
-            let staging_table = { table_ref.read().await.clone() };
-            let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
-                .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
-                .with_writer_properties(writer_properties);
-            let target_schema = writer.arrow_schema();
-            for b in &deduped {
-                let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
-                writer.write(casted).await.map_err(|e| anyhow::anyhow!("dedup rewrite stage: {e}"))?;
-            }
-            let adds: Vec<Action> = writer.flush().await.map_err(|e| anyhow::anyhow!("dedup rewrite flush: {e}"))?.into_iter().map(Action::Add).collect();
-            // Arrow materialization done — release the permit before the
-            // commit-retry loop (log write + OCC backoff sleeps decode nothing).
-            drop(rewrite_permit);
-            let stage_store = staging_table.log_store().object_store(None);
             let removes: Vec<Action> = targets.iter().map(|a| Action::Remove(remove_for_add(a))).collect();
 
             // 6. Commit Remove+Add under the commit lock, verifying every
@@ -5246,6 +5270,12 @@ fn build_query_runtime_env(
 ///
 /// Footer honesty is tied to the returned bool — never assumed. A single batch
 /// skips the concat copy; an already-ordered batch skips the `take` copy.
+/// Number of md5-prefix buckets the sharded dedup rewrite hashes into — the first
+/// digest byte, i.e. 2 hex chars. Shard count is clamped to this: shards partition
+/// `[0, DEDUP_BUCKET_COUNT)` into contiguous ranges, so more shards than buckets
+/// would leave rows uncovered. Doubles as a runaway-shard-count backstop.
+const DEDUP_BUCKET_COUNT: u64 = 256;
+
 fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: Vec<RecordBatch>) -> (Vec<RecordBatch>, bool) {
     use arrow::compute::{SortColumn, SortOptions, concat_batches, lexsort_to_indices, take_record_batch};
     if batches.is_empty() || schema.sorting_columns.is_empty() {

@@ -841,6 +841,95 @@ mod test_dml_operations {
         Ok(())
     }
 
+    /// Decisive check for the prod 2026-07-09 MERGE cardinality failures: a SINGLE
+    /// `UPDATE ... FROM` whose source carries TWO rows for one join key (the
+    /// monoscope enrichment shape — a span with multiple hash tags unnests to
+    /// repeated (span_id, trace_id)). If the coalescer's `split_rounds` handles it,
+    /// the rows apply across rounds (last wins) and nothing is dropped; if not, the
+    /// MERGE aborts with the cardinality error and the update is lost.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalescer_splits_duplicate_source_keys_single_statement() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let mut cfg = (*create_test_config(&test_id)).clone();
+        cfg.buffer.timefusion_dml_coalesce_secs = 3600; // explicit drains only
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        db.start_dml_coalescer();
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        let now = chrono::Utc::now();
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(create_test_records(now))?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        // One statement, source has TWO rows for name='Bob' → duplicate join keys.
+        let sql = "UPDATE otel_logs_and_spans
+                     SET duration = u.d
+                     FROM (VALUES ('Bob', 500), ('Bob', 999)) AS u(name, d)
+                     WHERE project_id = 'test_project'
+                       AND otel_logs_and_spans.name = u.name";
+        ctx.sql(sql).await?.collect().await?;
+        db.dml_coalescer().expect("coalescer enabled").drain(&db).await;
+
+        // split_rounds must apply the dup-key rows across rounds (last wins → 999),
+        // NOT abort the MERGE and drop the update (which would leave Bob at 200).
+        assert_eq!(
+            duration_by_name(&ctx, "Bob").await?,
+            999,
+            "duplicate source keys in ONE statement must be split into rounds and applied, not dropped by a MERGE cardinality abort"
+        );
+        Ok(())
+    }
+
+    /// Two-join-key variant matching monoscope's enrichment UPDATE-2, which joins on
+    /// (context___span_id, context___trace_id). Source has two rows for the same
+    /// composite key (a span carrying two hash tags). If split_rounds keys on BOTH
+    /// columns it splits them into rounds; a gap here (e.g. under-keyed split) would
+    /// let both rows hit one target row → the prod MERGE cardinality abort.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalescer_splits_duplicate_composite_source_keys() -> Result<()> {
+        timefusion::test_utils::init_test_logging();
+        let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let mut cfg = (*create_test_config(&test_id)).clone();
+        cfg.buffer.timefusion_dml_coalesce_secs = 3600;
+        let db = Arc::new(Database::with_config(Arc::new(cfg)).await?);
+        db.start_dml_coalescer();
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        // One target span identified by (context___span_id, context___trace_id).
+        let now = chrono::Utc::now();
+        let rec = serde_json::json!({
+            "id": "sp1", "name": "orig", "project_id": "test_project",
+            "timestamp": now.timestamp_micros(), "date": now.date_naive().to_string(),
+            "context___span_id": "S1", "context___trace_id": "T1",
+            "hashes": [], "summary": []
+        });
+        let batch = timefusion::test_utils::test_helpers::json_to_batch(vec![rec])?;
+        db.insert_records_batch("test_project", "otel_logs_and_spans", vec![batch], true, None).await?;
+
+        // Source: two rows for the SAME (span_id, trace_id) — the multi-tag shape.
+        let sql = "UPDATE otel_logs_and_spans o
+                     SET name = u.nm
+                     FROM (VALUES ('S1','T1','a'), ('S1','T1','b')) AS u(sid, tid, nm)
+                     WHERE o.project_id = 'test_project'
+                       AND o.context___span_id = u.sid
+                       AND o.context___trace_id = u.tid";
+        ctx.sql(sql).await?.collect().await?;
+        db.dml_coalescer().expect("coalescer enabled").drain(&db).await;
+
+        let name = ctx
+            .sql("SELECT name FROM otel_logs_and_spans WHERE project_id='test_project' AND id='sp1'")
+            .await?
+            .collect()
+            .await?;
+        let got = get_str(name[0].column(name[0].schema().index_of("name")?).as_ref(), 0);
+        assert_eq!(got, "b", "composite dup-key source must split into rounds and apply (last wins), not be dropped by a cardinality abort");
+        Ok(())
+    }
+
     /// With a buffered layer, the mem leg updates buffer-resident rows
     /// synchronously and the flush persists the POST-DML values to Delta —
     /// the invariant that makes both the watermark clamp and coalescer

@@ -971,19 +971,21 @@ pub struct MaintenanceConfig {
     /// the normal scan runs. See src/count_pushdown.rs.
     #[serde(default = "d_true")]
     pub timefusion_count_pushdown: bool,
-    /// Byte ceiling per dedup chunk rewrite, measured as COMPRESSED on-disk
-    /// bytes (`sum(add.size)`). Cheap early-out. See `d_dedup_max_rewrite_bytes`.
+    /// Per-shard COMPRESSED-bytes target for a dedup chunk rewrite (`sum(add.size)`).
+    /// The rewrite is split into `ceil(compressed_bytes / this)` md5-bucketed passes
+    /// so each pass reads ~this much. 0 disables this ceiling's contribution to the
+    /// shard count. See `d_dedup_max_rewrite_bytes`.
     #[serde(default = "d_dedup_max_rewrite_bytes")]
     pub timefusion_dedup_max_rewrite_bytes: u64,
-    /// Ceiling on the ESTIMATED DECODED (in-memory Arrow) footprint of a dedup
-    /// chunk rewrite. The compressed budget above under-counts by 5-20× for
-    /// wide Variant/JSON columns, and `SELECT * … collect()` Arrow buffers are
-    /// NOT accounted by DataFusion's memory pool — so a compressed-under-budget
-    /// chunk decoded to tens of GB and OOM-killed the process (prod 2026-07-04,
-    /// 89GB cgroup kill). Over this ceiling the chunk is skipped (read-side
-    /// dedup keeps queries correct). 0 disables the decoded guard (the
-    /// compressed budget + maintenance semaphore still apply), so a
-    /// fat-fingered 0 can't make every chunk skip forever. See
+    /// Per-shard target on the ESTIMATED DECODED (in-memory Arrow) footprint of a
+    /// dedup chunk rewrite. Compressed bytes under-count by 5-20× for wide
+    /// Variant/JSON columns, and the `SELECT * … collect()` Arrow buffers are NOT
+    /// accounted by DataFusion's memory pool — so a compressed-under-budget chunk
+    /// once decoded to tens of GB and OOM-killed the process (prod 2026-07-04, 89GB
+    /// cgroup kill). The rewrite now SHARDS by an md5 hash of the dedup keys into
+    /// `ceil(est_decoded / this)` passes so each pass materializes ~this much; a
+    /// single key group that alone exceeds this is unshardable and skipped (read-side
+    /// dedup keeps queries correct). 0 → one shard for this ceiling. See
     /// `d_dedup_max_decoded_bytes`.
     #[serde(default = "d_dedup_max_decoded_bytes")]
     pub timefusion_dedup_max_decoded_bytes: u64,
