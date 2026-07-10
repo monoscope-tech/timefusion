@@ -4478,9 +4478,8 @@ impl Database {
             // budget == 0 disables that ceiling (→ 1 shard). K = the max either budget
             // demands, clamped to the bucket count (shards partition the bucket space).
             let shards_for = |est: u64, budget: u64| if budget > 0 { est.div_ceil(budget) } else { 1 };
-            let shards = shards_for(est_decoded_bytes, decoded_budget)
-                .max(shards_for(rewrite_bytes.max(0) as u64, compressed_budget))
-                .clamp(1, DEDUP_BUCKET_COUNT);
+            let shards =
+                shards_for(est_decoded_bytes, decoded_budget).max(shards_for(rewrite_bytes.max(0) as u64, compressed_budget)).clamp(1, DEDUP_BUCKET_COUNT);
             let in_list = file_ids.iter().map(|v| format!("'{}'", v.replace('\'', "''"))).collect::<Vec<_>>().join(", ");
             // Bucket = first byte of md5 over the dedup keys (2 hex chars =
             // DEDUP_BUCKET_COUNT buckets, evenly spread); chr(31) separates keys so
@@ -4492,8 +4491,9 @@ impl Database {
             // If the largest group alone would blow the budget, no shard count helps,
             // so skip (preserving the pre-fix OOM-safety) rather than materialize it.
             if shards > 1 && decoded_budget > 0 {
-                let max_group_sql =
-                    format!("SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})");
+                let max_group_sql = format!(
+                    "SELECT coalesce(max(c), 0) FROM (SELECT count(*) AS c FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}) GROUP BY {keys_varchar})"
+                );
                 let max_group = ctx
                     .sql(&max_group_sql)
                     .await?
@@ -4506,7 +4506,10 @@ impl Database {
                     crate::metrics::record_dedup_chunk_skipped();
                     error!(
                         "dedup rewrite SKIPPED (single key group of {} rows over decoded budget — unshardable): table={} chunk=[{}] files={} — duplicates persist until compaction shrinks the file set",
-                        max_group, table_name, label, targets.len()
+                        max_group,
+                        table_name,
+                        label,
+                        targets.len()
                     );
                     return Ok((0, false));
                 }
@@ -4539,7 +4542,8 @@ impl Database {
                         String::new()
                     };
                     let rows_sql = format!("SELECT * FROM {scan_name} WHERE {partition_filter} AND \"{DEDUP_FILE_COL}\" IN ({in_list}){shard_pred}");
-                    let batches: Vec<RecordBatch> = ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
+                    let batches: Vec<RecordBatch> =
+                        ctx.sql(&rows_sql).await?.collect().await?.into_iter().map(|b| drop_batch_column(b, DEDUP_FILE_COL)).collect();
                     let shard_before: usize = batches.iter().map(|b| b.num_rows()).sum();
                     if shard_before == 0 {
                         continue;

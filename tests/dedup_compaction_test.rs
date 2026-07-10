@@ -370,11 +370,7 @@ async fn dedup_shards_over_budget_and_preserves_rows() -> Result<()> {
 
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
-    let ids = ctx
-        .sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project_id}' ORDER BY id"))
-        .await?
-        .collect()
-        .await?;
+    let ids = ctx.sql(&format!("SELECT id FROM otel_logs_and_spans WHERE project_id = '{project_id}' ORDER BY id")).await?.collect().await?;
     let got: Vec<String> = ids
         .iter()
         .flat_map(|b| {
@@ -470,7 +466,8 @@ async fn update_from_fails_on_duplicate_source_keys() -> Result<()> {
 
     // Single, clean target row for 'dup_id'.
     let ts = (chrono::Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
-    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("dup_id", "orig", &project_id, ts)])?], true, None).await?;
+    db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![json_to_batch(vec![test_span_ts("dup_id", "orig", &project_id, ts)])?], true, None)
+        .await?;
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     assert_eq!(delta_physical_row_count(&table_ref).await?, 1, "precondition: exactly one target row");
 

@@ -920,11 +920,7 @@ mod test_dml_operations {
         ctx.sql(sql).await?.collect().await?;
         db.dml_coalescer().expect("coalescer enabled").drain(&db).await;
 
-        let name = ctx
-            .sql("SELECT name FROM otel_logs_and_spans WHERE project_id='test_project' AND id='sp1'")
-            .await?
-            .collect()
-            .await?;
+        let name = ctx.sql("SELECT name FROM otel_logs_and_spans WHERE project_id='test_project' AND id='sp1'").await?.collect().await?;
         let got = get_str(name[0].column(name[0].schema().index_of("name")?).as_ref(), 0);
         assert_eq!(got, "b", "composite dup-key source must split into rounds and apply (last wins), not be dropped by a cardinality abort");
         Ok(())
