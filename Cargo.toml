@@ -93,7 +93,11 @@ datafusion-variant = { git = "https://github.com/datafusion-contrib/datafusion-v
 parquet-variant-compute = "58.3"
 parquet-variant-json = "58.3"
 parquet-variant = "58.3"
-serde_json_path = "0.7"
+# PG-compatible SQL/JSON path engine (RisingWave). Parser is effectively
+# identical to Postgres's jsonpath parser — accepts/rejects the same grammar —
+# so jsonb_path_exists matches Timescale by construction. Replaces serde_json_path
+# (RFC 9535), which cannot parse the PG dialect (`? (@ ..)`, like_regex, etc.).
+sql-json-path = "0.1"
 base64 = "0.22"
 aes-gcm = "0.10"
 tonic = "0.14"

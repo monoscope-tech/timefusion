@@ -108,6 +108,58 @@ mod test_json_functions {
         Ok(())
     }
 
+    // Regression: task-jsonpath-pg-compat. Monoscope (src/Pkg/Parser/Expr.hs)
+    // emits Postgres SQL/JSON-path (`$[*] ? (@ == "x")`, dot-quoted members,
+    // `like_regex ... flag "i"`, `starts with`), which is NOT RFC 9535. The old
+    // serde_json_path engine couldn't parse it, so a log-pattern click returned
+    // an empty result set. We now use the sql-json-path crate (PG-parity parser)
+    // plus a TypePlanner that resolves the `::jsonpath` cast to Utf8.
+    #[tokio::test]
+    async fn test_jsonb_path_exists_pg_dialect() -> Result<()> {
+        let db = std::sync::Arc::new(Database::new().await?);
+        let mut ctx = db.clone().create_session_context();
+        db.setup_session_context(&mut ctx)?;
+
+        async fn eval(ctx: &datafusion::prelude::SessionContext, predicate: &str) -> Result<bool> {
+            let batch = &ctx.sql(&format!("SELECT {predicate} AS r")).await?.collect().await?[0];
+            Ok(batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::BooleanArray>().unwrap().value(0))
+        }
+
+        // #1 array membership / log-pattern filter — the dominant case.
+        assert!(
+            eval(&ctx, r#"jsonb_path_exists(json_to_variant('["pat:ed6bf5b6","other"]'), '$[*] ? (@ == "pat:ed6bf5b6")')"#).await?,
+            "present value must match"
+        );
+        assert!(!eval(&ctx, r#"jsonb_path_exists(json_to_variant('["other"]'), '$[*] ? (@ == "pat:ed6bf5b6")')"#).await?, "absent value must not match");
+        // #2 nested-field equality with a dot-quoted member on a JSON array.
+        assert!(
+            eval(&ctx, r#"jsonb_path_exists(json_to_variant('[{"error_type":"boom"}]'), '$[*]."error_type" ? (@ == "boom")')"#).await?,
+            "nested dot-quoted member equality must match"
+        );
+        // #3 like_regex + flag "i" — monoscope always appends `flag "i"`; RFC 9535 has no regex.
+        assert!(
+            eval(&ctx, r#"jsonb_path_exists(json_to_variant('{"msg":"ABCdef"}'), '$."msg" ? (@ like_regex "^abc.*" flag "i")')"#).await?,
+            "case-insensitive like_regex must match"
+        );
+        // #4 `starts with` operator.
+        assert!(
+            eval(&ctx, r#"jsonb_path_exists(json_to_variant('[{"path":"/api/x"}]'), '$[*]."path" ? (@ starts with "/api")')"#).await?,
+            "starts with must match"
+        );
+        // #5 the `::jsonpath` cast (TypePlanner → Utf8). This is what monoscope actually
+        // sends over the wire; SqlToRel would otherwise reject the unknown SQL type.
+        assert!(
+            eval(&ctx, r#"jsonb_path_exists(json_to_variant('["pat:ed6bf5b6"]'), '$[*] ? (@ == "pat:ed6bf5b6")'::jsonpath)"#).await?,
+            "::jsonpath cast must plan and match"
+        );
+        // #6 NULL input row → SQL NULL, not false. The simple-path fast lane must gate
+        // on the input's null buffer (regression: code-review found it returned false).
+        let batch = &ctx.sql(r#"SELECT jsonb_path_exists(json_to_variant(NULL), '$.a') AS r"#).await?.collect().await?[0];
+        assert!(batch.column(0).is_null(0), "NULL variant input must yield NULL, not false");
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_complex_query() -> Result<()> {
         // Initialize database

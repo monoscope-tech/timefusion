@@ -2064,6 +2064,9 @@ impl Database {
             // binding): sessions are created during boot before the layer
             // exists.
             .with_query_planner(Arc::new(DmlQueryPlanner::new(self.clone())))
+            // PG parity: resolve `'<path>'::jsonpath` casts to Utf8 so the path
+            // literal reaches jsonb_path_exists as text (covers simple + extended).
+            .with_type_planner(Arc::new(crate::functions::JsonPathTypePlanner))
             .build();
 
         SessionContext::new_with_state(session_state)

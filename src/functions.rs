@@ -9,16 +9,16 @@ use datafusion::{
             Array, ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray, StringViewArray, StringViewBuilder, TimestampMicrosecondArray,
             TimestampNanosecondArray,
         },
-        datatypes::{DataType, TimeUnit},
+        datatypes::{DataType, Field, FieldRef, TimeUnit},
     },
     common::{DFSchema, DataFusionError, ExprSchema, ScalarValue, not_impl_err},
     logical_expr::{
         Accumulator, AggregateUDF, ColumnarValue, Expr, ExprSchemable, ScalarFunctionArgs, ScalarFunctionImplementation, ScalarUDF, ScalarUDFImpl, Signature,
         TypeSignature, Volatility, create_udaf, create_udf,
         expr::{Alias, ScalarFunction},
-        planner::{ExprPlanner, PlannerResult, RawBinaryExpr},
+        planner::{ExprPlanner, PlannerResult, RawBinaryExpr, TypePlanner},
     },
-    sql::sqlparser::ast::BinaryOperator,
+    sql::sqlparser::ast::{BinaryOperator, DataType as SqlDataType},
 };
 use serde_json::{Value as JsonValue, json};
 use tdigests::TDigest;
@@ -63,6 +63,26 @@ macro_rules! scalar_udf_boilerplate {
 // ============================================================================
 // Variant-Aware Expression Planner
 // ============================================================================
+
+/// Resolves PG's `jsonpath` type (`'<path>'::jsonpath`) to Utf8 so the literal
+/// flows to `jsonb_path_exists` as text. DataFusion's SqlToRel otherwise rejects
+/// the unknown SQL type at plan time ("Unsupported SQL type jsonpath"), before
+/// the UDF runs. Registered via `with_type_planner`, so it covers both the
+/// simple- and extended-query paths (both route casts through
+/// `convert_data_type_to_field`), unlike a raw-SQL string rewrite.
+#[derive(Debug, Default)]
+pub struct JsonPathTypePlanner;
+
+impl TypePlanner for JsonPathTypePlanner {
+    fn plan_type_field(&self, sql_type: &SqlDataType) -> datafusion::error::Result<Option<FieldRef>> {
+        // Extend with more arms (or a name→DataType table) when a second PG cast type
+        // appears — `::jsonb`, `::regclass`, `::oid` would all hit the same wall.
+        Ok(match sql_type {
+            SqlDataType::Custom(name, _) if name.to_string().eq_ignore_ascii_case("jsonpath") => Some(Arc::new(Field::new("", DataType::Utf8, true))),
+            _ => None,
+        })
+    }
+}
 
 /// ExprPlanner that intercepts -> and ->> operators on Variant columns
 /// and rewrites them to efficient variant_get calls with flattened dot-paths.
@@ -1577,8 +1597,8 @@ impl ScalarUDFImpl for JsonbPathExistsUDF {
             }
         };
 
-        // Parse the JSONPath expression
-        let json_path = serde_json_path::JsonPath::parse(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {}", e)))?;
+        // Parse the JSONPath expression (PG SQL/JSON-path dialect)
+        let json_path = sql_json_path::JsonPath::new(&path_str).map_err(|e| DataFusionError::Execution(format!("Invalid JSONPath: {}", e)))?;
 
         // Process based on input type
         let result = if is_variant_type(json_array.data_type()) {
@@ -1669,28 +1689,50 @@ impl<'a> BinaryAccessor<'a> {
 }
 
 /// Evaluate JSONPath on a Variant (Struct) array
-fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &serde_json_path::JsonPath, raw_path: &str) -> datafusion::error::Result<ArrayRef> {
+fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &sql_json_path::JsonPath, raw_path: &str) -> datafusion::error::Result<ArrayRef> {
     // Fast path: simple `$.a.b.c[N].d` style paths translate cleanly to a
     // parquet_variant_compute::VariantPath and we can use the vectorized
     // `variant_get` kernel, which walks the Variant binary directly without
     // ever materializing the full JsonValue. Path existence = result is
     // non-null per row.
+    //
+    // Parity caveat: variant_get resolves like PG *strict* mode — it does NOT
+    // perform PG lax auto-unwrapping (`.a` on an array, `[i]` on a scalar). So
+    // for a filter-free path over an array-shaped-where-object-expected value
+    // this can yield a false negative vs. the PG (lax) engine used by the
+    // fallback below. Monoscope's queries are unaffected — they always carry a
+    // `? (...)` filter, which is not a simple path and takes the fallback. A
+    // lax-correct variant-native evaluator is the deferred Phase 3 fix.
     if let Some(variant_path) = simple_path_to_variant_path(raw_path) {
         use parquet_variant_compute::{GetOptions, variant_get};
         let opts = GetOptions::new_with_path(variant_path);
         let extracted = variant_get(array, opts).map_err(|e| DataFusionError::Execution(format!("variant_get failed: {e}")))?;
-        // Path exists ↔ extracted row is non-null. is_null/is_not_null arrays
-        // honor underlying null buffer cheaply (no per-row decode).
+        // A NULL input row → NULL (SQL semantics, matches the fallback path and PG);
+        // a present row → path exists ↔ extracted is non-null. `extracted.is_null(i)`
+        // alone can't tell the two apart, so gate on the input's null buffer.
         let mut builder = BooleanArray::builder(extracted.len());
         for i in 0..extracted.len() {
-            builder.append_value(!extracted.is_null(i));
+            if array.is_null(i) {
+                builder.append_null();
+            } else {
+                builder.append_value(!extracted.is_null(i));
+            }
         }
         return Ok(Arc::new(builder.finish()));
     }
 
-    // Fallback: complex JSONPath (filters, recursive descent, etc.) — fall
-    // back to the slow path that walks the Variant binary into a JsonValue
-    // and runs serde_json_path. Avoided when the path is simple.
+    // Fallback: complex JSONPath (filters, recursive descent, etc.) — walk the
+    // Variant binary into a JsonValue and run the PG jsonpath engine. Avoided
+    // when the path is simple (filter-free) via the variant_get fast lane above.
+    //
+    // Deferred optimization: evaluate the filter against the Variant binary
+    // directly (no per-row JsonValue). The clean route — impl sql_json_path's
+    // JsonRef over parquet_variant::Variant so the SAME engine (hence identical
+    // PG semantics) walks the binary — is blocked because Variant/VariantList/
+    // VariantObject are Clone, not the Copy that JsonRef requires. It also buys
+    // little for the dominant `$[*] ? (@ == x)` shape: the `[*]` prefix needs
+    // the whole (small) column anyway, so only a JsonValue alloc is saved.
+    // Revisit if a profile shows this materialization is a real hot spot.
     use datafusion::arrow::array::StructArray;
     use parquet_variant::Variant;
     let struct_array = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| DataFusionError::Execution("Expected Variant struct array".to_string()))?;
@@ -1706,7 +1748,8 @@ fn evaluate_jsonpath_on_variant(array: &ArrayRef, json_path: &serde_json_path::J
         }
         let variant = Variant::new(metadata_binary.value(i), value_binary.value(i));
         let json_value = variant_to_serde_json(&variant, 0)?;
-        builder.append_value(!json_path.query(&json_value).is_empty());
+        // Lax mode (PG default): a data-dependent eval error is an empty match, not a query failure.
+        builder.append_value(json_path.exists(&json_value).unwrap_or(false));
     }
     Ok(Arc::new(builder.finish()))
 }
@@ -1760,41 +1803,17 @@ fn simple_path_to_variant_path(raw: &str) -> Option<parquet_variant::VariantPath
 }
 
 /// Evaluate JSONPath on a JSON string array
-fn evaluate_jsonpath_on_json_string(array: &ArrayRef, json_path: &serde_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
-    let mut builder = BooleanArray::builder(array.len());
-
-    // Handle different string types
-    if let Some(string_array) = array.as_any().downcast_ref::<StringViewArray>() {
-        for i in 0..string_array.len() {
-            if string_array.is_null(i) {
-                builder.append_null();
-            } else {
-                let json_str = string_array.value(i);
-                let result = match serde_json::from_str::<JsonValue>(json_str) {
-                    Ok(json_value) => !json_path.query(&json_value).is_empty(),
-                    Err(_) => false, // Invalid JSON returns false
-                };
-                builder.append_value(result);
-            }
-        }
-    } else if let Some(string_array) = array.as_any().downcast_ref::<StringArray>() {
-        for i in 0..string_array.len() {
-            if string_array.is_null(i) {
-                builder.append_null();
-            } else {
-                let json_str = string_array.value(i);
-                let result = match serde_json::from_str::<JsonValue>(json_str) {
-                    Ok(json_value) => !json_path.query(&json_value).is_empty(),
-                    Err(_) => false,
-                };
-                builder.append_value(result);
-            }
-        }
+fn evaluate_jsonpath_on_json_string(array: &ArrayRef, json_path: &sql_json_path::JsonPath) -> datafusion::error::Result<ArrayRef> {
+    // Path exists per row; invalid JSON or a lax-mode eval error → false (PG parity).
+    let eval = |s: &str| serde_json::from_str::<JsonValue>(s).ok().and_then(|v| json_path.exists(&v).ok()).unwrap_or(false);
+    let iter: Box<dyn Iterator<Item = Option<&str>>> = if let Some(a) = array.as_any().downcast_ref::<StringViewArray>() {
+        Box::new(a.iter())
+    } else if let Some(a) = array.as_any().downcast_ref::<StringArray>() {
+        Box::new(a.iter())
     } else {
         return Err(DataFusionError::Execution("jsonb_path_exists requires JSON string or Variant input".to_string()));
-    }
-
-    Ok(Arc::new(builder.finish()))
+    };
+    Ok(Arc::new(iter.map(|opt| opt.map(eval)).collect::<BooleanArray>()))
 }
 
 #[cfg(test)]
