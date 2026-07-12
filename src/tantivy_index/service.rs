@@ -134,7 +134,14 @@ impl TantivyIndexService {
     ) -> Result<()> {
         let svc_table = schema_loader::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?.clone();
         let level = self.config.compression_level();
-        let pack_result = tokio::task::spawn_blocking(move || store::build_and_pack(&svc_table, &batches, level)).await.context("join build")?;
+        let pack_result = tokio::task::spawn_blocking(move || {
+            let (blob, stats) = store::build_and_pack(&svc_table, &batches, level)?;
+            // Guard against publishing a corrupt archive (see store::verify_blob).
+            store::verify_blob(&blob).context("verify packed blob")?;
+            Ok::<_, anyhow::Error>((blob, stats))
+        })
+        .await
+        .context("join build")?;
         let (blob, stats) = match pack_result {
             Ok(v) => v,
             Err(e) => {

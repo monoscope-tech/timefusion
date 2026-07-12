@@ -6189,7 +6189,7 @@ impl TableProvider for ProjectRoutingTable {
                     abort_reason = Some("delta_no_index_or_cap_exceeded");
                 }
                 Err(e) => {
-                    warn!("tantivy search failed for {}/{}: {} — falling back to full scan", project_id, self.table_name, e);
+                    warn!("tantivy search failed for {}/{}: {:#} — falling back to full scan", project_id, self.table_name, e);
                     crate::metrics::record_tantivy_prefilter_error();
                     abort_reason = Some("delta_error");
                 }

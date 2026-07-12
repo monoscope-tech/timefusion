@@ -1818,7 +1818,7 @@ impl BufferedWriteLayer {
                 };
                 if let Err(e) = cb(pid.clone(), tname.clone(), batches, added_files).await {
                     crate::metrics::record_tantivy_build_failure();
-                    warn!("Tantivy index build failed (non-fatal): project={}, table={}, bucket_id={}: {}", pid, tname, bid, e);
+                    warn!("Tantivy index build failed (non-fatal): project={}, table={}, bucket_id={}: {:#}", pid, tname, bid, e);
                 }
             });
         }

@@ -64,6 +64,13 @@ pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatc
         stats.batches += 1;
     }
     writer.commit().context("tantivy commit")?;
+    // Join background merge threads before returning: `commit()` schedules segment
+    // merges on tantivy's threadpool, and dropping the writer does NOT wait for them.
+    // If the caller then tars the index dir (`store::pack_dir`) while a merge is still
+    // GC-ing source segments, the archive captures vanished/half-rewritten files —
+    // surfacing as non-fatal `tar append` (build) / `tar unpack` (read) failures that
+    // silently disable the index. Waiting leaves the dir quiescent and fully merged.
+    writer.wait_merging_threads().context("wait merging threads")?;
     Ok(stats)
 }
 

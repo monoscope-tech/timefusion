@@ -117,6 +117,17 @@ pub fn unpack_to_dir(blob: &[u8], dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Round-trip a freshly packed blob (unpack + open) before publishing it, so a
+/// structurally-corrupt archive is never uploaded. Blob paths are immutable and
+/// reader-cached, so a poison blob would otherwise fail every future read until
+/// a manual reindex.
+pub fn verify_blob(blob: &[u8]) -> Result<()> {
+    let tmp = tempfile::tempdir().context("verify: tempdir")?;
+    unpack_to_dir(blob, tmp.path())?;
+    open_index(tmp.path())?;
+    Ok(())
+}
+
 /// Open an unpacked tantivy index for querying.
 pub fn open_index(dir: &Path) -> Result<Index> {
     use tantivy::directory::MmapDirectory;

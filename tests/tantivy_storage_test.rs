@@ -166,6 +166,22 @@ async fn build_index_for_file_reads_parquet_and_publishes_searchable_index() {
     assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["row-b"]);
 }
 
+#[test]
+fn verify_blob_accepts_built_index_and_rejects_corruption() {
+    // Guards the read-back gate added alongside the tantivy tar-race fix: a
+    // freshly built blob must round-trip (unpack + open), and a structurally
+    // corrupt blob must be rejected before it is ever published (a poison blob
+    // fails every future read on its immutable path). The merge-thread race
+    // that produced corrupt blobs is timing-dependent — the fix is the
+    // `wait_merging_threads()` join in `index_to_writer`; this pins the guard.
+    let (blob, _) = store::build_and_pack(&table(), &[batch()], 3).expect("build_and_pack");
+    store::verify_blob(&blob).expect("freshly built blob must verify");
+
+    // Truncating the blob yields an invalid tar.zst; verify must error, not panic.
+    assert!(store::verify_blob(&blob[..blob.len() / 2]).is_err(), "corrupt blob must be rejected");
+    assert!(store::verify_blob(b"not a tantivy archive").is_err(), "garbage blob must be rejected");
+}
+
 #[tokio::test]
 async fn manifest_load_default_when_missing() {
     let store_obj: Arc<dyn object_store::ObjectStore> = Arc::new(InMemory::new());
