@@ -502,13 +502,18 @@ fn build_optimize_session_state(
 ) -> datafusion::execution::session_state::SessionState {
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
     let mut cfg = SessionConfig::new().set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+    // Bound per-operator peak memory (bare SessionConfig::new() otherwise keeps
+    // DataFusion's larger default) and reserve a merge floor so the Z-order
+    // ExternalSorter can spill instead of erroring under memory pressure.
+    let _ = cfg.options_mut().set("datafusion.execution.batch_size", "8192");
+    let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "67108864");
     // Same CPU-quota cap as the query session (see autotune::apply); 0 = default.
     if target_partitions > 0 {
         cfg = cfg.with_target_partitions(target_partitions);
     }
-    // The shared pooled runtime (see `shared_runtime_env`): maintenance
-    // allocations count against the process-wide budget and FAIL as query
-    // errors instead of growing until the kernel OOM-kills the process.
+    // `runtime_env` is the dedicated bounded maintenance pool (see
+    // `maintenance_runtime_env`): allocations still fail as errors rather than
+    // OOM-killing the process, but are isolated from query pressure and can spill.
     SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build()
 }
 
@@ -931,6 +936,11 @@ pub struct Database {
     /// full `memory_limit × fraction` budget, so N contexts oversubscribed
     /// the cgroup N×; the pool only enforces a global cap if it's global.
     runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    /// Dedicated maintenance (optimize / dedup / recompress) `RuntimeEnv`: a
+    /// bounded FairSpill pool + on-disk spill dir, kept separate from the query
+    /// pool so a Z-order global sort can always reserve its merge floor and spill
+    /// instead of losing the race for the saturated shared Greedy pool.
+    maintenance_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
     unified_tables: UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
@@ -1387,6 +1397,7 @@ impl Database {
         let db = Self {
             config: cfg,
             runtime_env: Arc::new(std::sync::OnceLock::new()),
+            maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: dashmap::DashMap::new(),
@@ -3043,6 +3054,43 @@ impl Database {
             .clone()
     }
 
+    /// Dedicated `RuntimeEnv` for maintenance jobs (optimize/dedup/recompress).
+    /// Distinct from `shared_runtime_env` for two reasons the Z-order failures
+    /// exposed: (1) a **FairSpill** pool fences off spillable memory per consumer,
+    /// so the sort's `ExternalSorterMerge` can always reserve its floor and spill
+    /// — a Greedy pool saturated by concurrent queries starves the merge and it
+    /// errors with "Resources exhausted". (2) an **explicit on-disk spill dir**
+    /// under the data dir, so spills hit the 120 GB data volume rather than a
+    /// possibly RAM-backed container `/tmp` (spilling to RAM defeats the point).
+    /// The pool is bounded (still pooled → fails-as-error, never OOM-kills, per
+    /// the 2026-07-04 incident) and sized from the budget left over the query
+    /// pool so query + maintenance together stay within `memory_limit`.
+    fn maintenance_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+        use datafusion::execution::{
+            disk_manager::{DiskManagerBuilder, DiskManagerMode},
+            memory_pool::FairSpillPool,
+            runtime_env::RuntimeEnvBuilder,
+        };
+        self.maintenance_runtime_env
+            .get_or_init(|| {
+                let memory_limit_bytes = self.config.memory.memory_limit_bytes();
+                let query_pool = (memory_limit_bytes as f64 * self.config.memory.timefusion_memory_fraction) as usize;
+                // Budget headroom between the query pool and the hard limit, clamped to [1, 8] GiB.
+                let pool_size = memory_limit_bytes.saturating_sub(query_pool).clamp(1 << 30, 8 << 30);
+                let spill_dir = self.config.core.timefusion_data_dir.join("maintenance_spill");
+                let _ = std::fs::create_dir_all(&spill_dir);
+                let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir]));
+                Arc::new(
+                    RuntimeEnvBuilder::new()
+                        .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
+                        .with_disk_manager_builder(disk)
+                        .build()
+                        .expect("build maintenance runtime env"),
+                )
+            })
+            .clone()
+    }
+
     /// The DML serialization mutex for the PHYSICAL table backing
     /// `(project_id, table_name)`. Unified tables are one shared Delta table
     /// across all default projects, so their key drops the project — two
@@ -3773,7 +3821,7 @@ impl Database {
                 // Avoid the BinaryView read for Variant columns (same issue as
                 // optimize_table_light); delta-rs's internal session defaults to
                 // schema_force_view_types=true.
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
+                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
                 .await
         };
 
@@ -3985,7 +4033,7 @@ impl Database {
                 .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
                 .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
                 // Variant columns: same BinaryView-avoidance session as optimize_table.
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
+                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
                 .await;
             match result {
                 Ok((new_table, metrics)) => {
@@ -4140,7 +4188,7 @@ impl Database {
             .with_writer_properties(writer_properties)
             .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
             .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
+            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
             .await;
 
         match optimize_result {
@@ -4239,7 +4287,7 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("delta table provider: {e}"))?;
         let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
             self.config.memory.timefusion_query_partitions,
-            self.shared_runtime_env(),
+            self.maintenance_runtime_env(),
         ));
         let scan_name = "__dedup_src";
         ctx.register_table(scan_name, Arc::new(provider))?;
@@ -4414,7 +4462,7 @@ impl Database {
                 .map_err(|e| anyhow::anyhow!("dedup rewrite provider: {e}"))?;
             let ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
                 self.config.memory.timefusion_query_partitions,
-                self.shared_runtime_env(),
+                self.maintenance_runtime_env(),
             ));
             ctx.register_table(scan_name, Arc::new(provider))?;
 
@@ -4889,7 +4937,7 @@ impl Database {
                 // the optimize-internal Parquet read uses `schema_force_view_types=true`
                 // (delta-rs's default), it returns BinaryView and the rewrite blows up
                 // mid-scan with "Expected ... Binary, got ... BinaryView".
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.shared_runtime_env())))
+                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
                 .await;
             match optimize_result {
                 Ok((new_table, metrics)) => {
@@ -6723,6 +6771,19 @@ mod tests {
 
     use super::*;
     use crate::{config::AppConfig, test_utils::test_helpers::*};
+
+    /// The optimize/dedup session must carry a bounded batch size and a sort
+    /// spill reservation so the Z-order external sort spills instead of failing
+    /// with "Resources exhausted" (prod 2026-07-12). Guards the config half of
+    /// that fix; the dedicated maintenance pool + spill dir are covered by the
+    /// dedup_compaction integration tests.
+    #[test]
+    fn optimize_session_sets_batch_size_and_spill_reservation() {
+        let state = build_optimize_session_state(0, Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
+        let exec = &state.config().options().execution;
+        assert_eq!(exec.batch_size, 8192);
+        assert_eq!(exec.sort_spill_reservation_bytes, 67_108_864);
+    }
 
     /// The shared OCC classifier must treat every retryable delta-rs conflict as
     /// retryable — including `VersionAlreadyExists` ("already exists", which can
