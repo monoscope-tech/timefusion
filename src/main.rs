@@ -378,6 +378,12 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Stop maintenance first: an in-flight light-optimize/dedup sweep must bail
+    // before the buffered-layer flush, not compete with it and then outlive the
+    // Foyer cache (a running sweep hitting a closed cache previously hung
+    // shutdown until the orchestrator SIGKILLed us after the stop grace).
+    db_for_shutdown.cancel_maintenance();
+
     // Drain order matters:
     // 0. Stop PGWire from accepting new connections. Without this, the
     //    BufferedWriteLayer flush below races fresh inserts that pile back
