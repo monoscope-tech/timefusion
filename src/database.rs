@@ -507,10 +507,15 @@ fn build_optimize_session_state(
     // ExternalSorter can spill instead of erroring under memory pressure.
     let _ = cfg.options_mut().set("datafusion.execution.batch_size", "8192");
     let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "67108864");
-    // Same CPU-quota cap as the query session (see autotune::apply); 0 = default.
-    if target_partitions > 0 {
-        cfg = cfg.with_target_partitions(target_partitions);
-    }
+    // Cap maintenance parallelism hard. Each partition's ExternalSorter reserves
+    // sort_spill_reservation_bytes up-front from the bounded maintenance pool, so
+    // the query-derived count (≈ CPU cores) exhausts it before the Z-order sort can
+    // even start (prod 2026-07-12: ~46 sorters × 64 MB > the 4.8 GB pool). A few
+    // partitions keep reservations tiny and leave the pool free to spill to disk;
+    // background compaction doesn't need query-level fan-out.
+    const MAINTENANCE_MAX_PARTITIONS: usize = 4;
+    let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
+    cfg = cfg.with_target_partitions(parts);
     // `runtime_env` is the dedicated bounded maintenance pool (see
     // `maintenance_runtime_env`): allocations still fail as errors rather than
     // OOM-killing the process, but are isolated from query pressure and can spill.
@@ -1645,6 +1650,9 @@ impl Database {
                         // otherwise compact would rewrite the duplicates into
                         // a single file that we'd then have to rewrite again.
                         for (table_name, table) in db.unified_tables.read().await.iter() {
+                            if db.maintenance_shutdown.is_cancelled() {
+                                return;
+                            }
                             if let Err(e) = db.dedup_today_partitions(table, table_name, table_name).await {
                                 error!("Dedup sweep failed for unified table '{}': {}", table_name, e);
                             }
@@ -1655,6 +1663,9 @@ impl Database {
                         }
                         // Optimize custom project tables
                         for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                            if db.maintenance_shutdown.is_cancelled() {
+                                return;
+                            }
                             let key = format!("{}:{}", project_id, table_name);
                             if let Err(e) = db.dedup_today_partitions(table, table_name, &key).await {
                                 error!("Dedup sweep failed for custom project '{}' table '{}': {}", project_id, table_name, e);
@@ -1903,12 +1914,19 @@ impl Database {
         // Start the scheduler
         scheduler.start().await?;
 
-        // Handle shutdown
+        // On shutdown, stop the scheduler so no new ticks dispatch. In-flight
+        // ticks bail on their own `maintenance_shutdown` checkpoints (the
+        // light-optimize job and `dedup_today_partitions`). Move `scheduler`
+        // into the task — otherwise it drops when this fn returns and
+        // `shutdown()` is never called, leaving the scheduler running.
         let shutdown = self.maintenance_shutdown.clone();
+        let mut scheduler = scheduler;
         tokio::spawn(async move {
             shutdown.cancelled().await;
             info!("Shutting down maintenance scheduler");
-            // Note: scheduler will be dropped when this task ends
+            if let Err(e) = scheduler.shutdown().await {
+                warn!("maintenance scheduler shutdown error: {}", e);
+            }
         });
 
         Ok(self)
@@ -4805,6 +4823,12 @@ impl Database {
             let project_ids: std::collections::HashSet<String> =
                 if files_by_pid.is_empty() { std::iter::once("default".to_string()).collect() } else { files_by_pid.keys().cloned().collect() };
             for pid in &project_ids {
+                // Bail promptly on shutdown — a mid-sweep tick must not run
+                // against a closing Foyer cache and hang the graceful drain.
+                if self.maintenance_shutdown.is_cancelled() {
+                    debug!("dedup sweep: shutdown requested, aborting table={}", table_name);
+                    return Ok(());
+                }
                 let backoff_key = format!("{dedup_key}:{pid}:{date}");
                 if let Some(entry) = self.dedup_backoff.get(&backoff_key)
                     && std::time::Instant::now() < entry.value().1
@@ -5259,6 +5283,13 @@ impl Database {
     }
 
     /// Gracefully shutdown the database, including cache and maintenance tasks
+    /// Signal maintenance/background tasks (scheduler, dedup sweep, coalescer)
+    /// to stop. Idempotent; `shutdown()` also fires it. Called early in the
+    /// drain so an in-flight sweep bails before the buffered-layer flush.
+    pub fn cancel_maintenance(&self) {
+        self.maintenance_shutdown.cancel();
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down TimeFusion database...");
 
@@ -6783,6 +6814,16 @@ mod tests {
         let exec = &state.config().options().execution;
         assert_eq!(exec.batch_size, 8192);
         assert_eq!(exec.sort_spill_reservation_bytes, 67_108_864);
+        // Parallelism capped so per-partition spill reservations fit the bounded pool.
+        assert_eq!(exec.target_partitions, 4, "0 (all cores) must cap to the maintenance limit");
+        assert_eq!(
+            build_optimize_session_state(64, Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()))
+                .config()
+                .options()
+                .execution
+                .target_partitions,
+            4
+        );
     }
 
     /// The shared OCC classifier must treat every retryable delta-rs conflict as
