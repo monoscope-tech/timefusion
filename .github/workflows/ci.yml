@@ -41,7 +41,12 @@ jobs:
   build-test:
     name: Clippy & Test
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 25
+    # Warm-cache runs finish in ~13m, but a Cargo.lock change busts the
+    # rust-cache key and forces a full cold recompile, which alone can approach
+    # the old 25m cap and starve the (S3-integration-heavy) test run — the
+    # 2026-07-10/11 timeouts. 45m gives cold builds headroom without masking a
+    # hang (the suite always completes; there is no hanging test).
+    timeout-minutes: 45
     env:
       AWS_SDK_LOAD_CONFIG: "false"
       AWS_ENDPOINT_URL: http://127.0.0.1:9000
