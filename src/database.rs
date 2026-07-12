@@ -3826,7 +3826,10 @@ impl Database {
             table_clone
                 .optimize()
                 .with_filters(&partition_filters)
-                .with_type(if schema.z_order_columns.is_empty() {
+                .with_type(if !self.config.maintenance.timefusion_optimize_use_zorder || schema.z_order_columns.is_empty() {
+                    // Compact preserves the flush's timestamp sort (files are already
+                    // timestamp-ordered + time-bucketed) → tight row-group timestamp
+                    // stats for pruning, without Z-order's memory-heavy global sort.
                     deltalake::operations::optimize::OptimizeType::Compact
                 } else {
                     deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone())

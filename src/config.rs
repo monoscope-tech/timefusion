@@ -884,6 +884,17 @@ pub struct MaintenanceConfig {
     pub timefusion_log_retention_hours: u64,
     #[serde(default = "d_optimize_window_hours")]
     pub timefusion_optimize_window_hours: u64,
+    /// Use Z-order clustering for the periodic full OPTIMIZE (the 30-min,
+    /// window-wide job). Default OFF: Z-order runs a memory-heavy global sort
+    /// that exhausts the pool on large windows (prod 2026-07-12), and its
+    /// space-filling curve actually loosens timestamp locality. Plain Compact
+    /// bin-packs the flush's already-timestamp-sorted, time-bucketed files,
+    /// preserving tight per-row-group timestamp ranges — the dominant query
+    /// predicate — with no global sort. (The cold-tier recompress path keeps
+    /// Z-order independently: it relies on the full-file rewrite to recompress.)
+    /// Re-enable only once Z-order's memory footprint is bounded.
+    #[serde(default)]
+    pub timefusion_optimize_use_zorder: bool,
     #[serde(default = "d_compact_min_files")]
     pub timefusion_compact_min_files: usize,
     #[serde(default = "d_light_optimize_target")]
