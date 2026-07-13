@@ -349,6 +349,13 @@ impl DmlCoalescer {
         }
     }
 
+    /// Hold the drain serialization lock so a test can make any concurrent
+    /// `drain()` block on lock acquisition (exercises shutdown's deadline).
+    #[cfg(test)]
+    pub(crate) async fn lock_drain_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.drain_lock.lock().await
+    }
+
     /// Defer a statement's Delta merge. The caller has already applied the
     /// mem leg (and its WAL append) and verified committed data exists.
     pub fn enqueue(

@@ -434,11 +434,11 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
     sleep(Duration::from_millis(500)).await;
 
-    // Share the same absolute `deadline` as the buffered-layer flush above.
-    // The final foyer `close()` — the phase that overran in prod, blocking
-    // process exit and `wal.lock` release for minutes on a redeploy (issue
-    // #82) — is now bounded by it. (The earlier DML-drain phase inside
-    // `shutdown_by` is not yet deadline-bounded; fast on the common path.)
+    // Share the same absolute `deadline` as the buffered-layer flush above so
+    // the whole serial shutdown fits one stop-grace budget — every phase that
+    // can block on a slow Delta/S3 backend (DML drain, foyer `close()`) is
+    // bounded by it, so process exit and `wal.lock` release stay inside the
+    // orchestrator's SIGTERM→SIGKILL window (issue #82).
     if let Err(e) = db_for_shutdown.shutdown_by(deadline).await {
         error!("Error during database shutdown: {}", e);
     }

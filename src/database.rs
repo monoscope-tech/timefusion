@@ -5314,22 +5314,31 @@ impl Database {
         self.shutdown_by(tokio::time::Instant::now() + self.config.buffer.stop_grace()).await
     }
 
-    /// Graceful shutdown; `deadline` (the remainder of the process-wide stop
-    /// grace shared with `BufferedWriteLayer::shutdown_by`) bounds the foyer
-    /// `close()` — a rebuildable read cache whose flush-on-close overran for
-    /// minutes in prod, blocking process exit and `wal.lock` release (#82).
-    /// The DML-drain phase below is not itself deadline-bounded (fast on the
-    /// common path; bounding it safely needs the coalescer's WAL-replay
-    /// semantics worked through).
+    /// Graceful shutdown; every phase that can block on a slow/stuck Delta or
+    /// S3 backend — the DML-coalescer drain and the foyer `close()` (whose
+    /// flush-on-close overran for minutes in prod, stalling `wal.lock`
+    /// release, #82) — is bounded by `deadline`, the remainder of the
+    /// process-wide stop grace shared with `BufferedWriteLayer::shutdown_by`.
+    /// Un-drained deferred Delta legs are the coalescer's documented
+    /// crash-equivalent loss (mem-leg values survive in the WAL); foyer close
+    /// abandons only rebuildable cache warmth.
     pub async fn shutdown_by(&self, deadline: tokio::time::Instant) -> Result<()> {
         info!("Shutting down TimeFusion database...");
 
         // Flush deferred DML merges before anything is torn down. The drain
         // task also runs a final drain on cancellation, but doing it here
         // deterministically (drains are serialized + idempotent) means
-        // shutdown doesn't race the task's select loop.
-        if let Some(coalescer) = self.dml_coalescer() {
-            coalescer.drain(self).await;
+        // shutdown doesn't race the task's select loop. Bounded by `deadline`:
+        // an un-drained group's deferred Delta leg is the SAME accepted,
+        // WAL-surfaced loss a crash incurs (dml_coalescer durability contract —
+        // mem-leg rows are WAL-durable; only the Delta leg for rows already in
+        // Delta is at risk). Better than overrunning the stop grace on a
+        // slow/stuck Delta backend and being SIGKILLed mid-drain, which loses
+        // the same legs AND stalls wal.lock release (issue #82).
+        if let Some(coalescer) = self.dml_coalescer()
+            && tokio::time::timeout_at(deadline, coalescer.drain(self)).await.is_err()
+        {
+            warn!("DML coalescer drain exceeded shutdown deadline — un-drained deferred Delta legs lost (crash-equivalent; mem-leg values survive in WAL)");
         }
 
         // Cancel maintenance tasks
@@ -7157,6 +7166,23 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b), "default projects on a unified table must share one commit lock");
         assert!(!Arc::ptr_eq(&a, &c), "different tables must get independent commit locks");
         assert!(!Arc::ptr_eq(&a, &db.dml_lock("proj_a", "otel_logs_and_spans").await), "commit and DML locks must be distinct");
+        Ok(())
+    }
+
+    /// issue #82 follow-up: a slow/stuck coalescer drain (Delta commits on a
+    /// dead backend) must not overrun the stop grace. Holding the drain lock
+    /// makes `drain()` block on acquisition; `shutdown_by` must honor its
+    /// deadline and return rather than hang (which would keep wal.lock held
+    /// until the orchestrator SIGKILLs us).
+    #[tokio::test]
+    async fn shutdown_by_bounds_a_blocked_dml_drain() -> Result<()> {
+        let db = Database::with_config(create_test_config("shutdown-drain-bound")).await?;
+        let coalescer = Arc::new(crate::dml_coalescer::DmlCoalescer::new(600));
+        let _ = db.dml_coalescer.set(coalescer.clone());
+        let _held = coalescer.lock_drain_for_test().await; // drain() blocks on this
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), db.shutdown_by(deadline)).await;
+        assert!(res.is_ok(), "shutdown_by hung on a blocked drain instead of honoring the deadline");
         Ok(())
     }
 
