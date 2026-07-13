@@ -1360,10 +1360,13 @@ impl WalDirLock {
                 // silent hang. We still never steal — the orchestrator's
                 // stop-grace SIGKILL is what bounds a truly stuck predecessor.
                 Ok(false) => {
-                    if waits % 20 == 0 {
+                    if waits.is_multiple_of(20) {
                         let secs = waits / 2;
                         if waits >= 120 {
-                            error!("WAL dir {:?} still locked by another TimeFusion process after {secs}s — predecessor may be wedged (check for a stuck/duplicate instance)", path);
+                            error!(
+                                "WAL dir {:?} still locked by another TimeFusion process after {secs}s — predecessor may be wedged (check for a stuck/duplicate instance)",
+                                path
+                            );
                         } else {
                             warn!("WAL dir {:?} is locked by another TimeFusion process; waiting for it to exit before recovery", path);
                         }
