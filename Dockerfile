@@ -35,7 +35,8 @@ RUN mkdir -p src benches && \
     echo 'fn main() {}' > src/main.rs && \
     echo 'fn main() {}' > benches/core_benchmarks.rs && \
     echo 'fn main() {}' > benches/tantivy_benchmarks.rs && \
-    echo 'fn main() {}' > benches/sort_layout_benchmarks.rs
+    echo 'fn main() {}' > benches/sort_layout_benchmarks.rs && \
+    echo 'fn main() {}' > benches/dedup_benchmarks.rs
 RUN cargo chef prepare --recipe-path recipe.json
 
 ##############################
