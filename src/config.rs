@@ -112,7 +112,12 @@ const_default!(d_grpc_port: u16 = 50051);
 const_default!(d_table_prefix: String = "timefusion");
 const_default!(d_batch_queue_capacity: usize = 100_000_000);
 const_default!(d_pgwire_user: String = "postgres");
-const_default!(d_flush_interval: u64 = 300);
+// 60s (was 300s): a shorter flush interval bounds how much un-flushed WAL a
+// restart must replay — startup/redeploy downtime is dominated by WAL replay
+// (95.6s for 46,692 entries at 300s on 2026-07-13), and it scales ~linearly
+// with this interval. Trade-off: ~5x more Delta commits / small files (handled
+// by compaction/OPTIMIZE).
+const_default!(d_flush_interval: u64 = 60);
 const_default!(d_retention_mins: u64 = 70);
 const_default!(d_eviction_interval: u64 = 60);
 const_default!(d_buffer_max_memory: usize = 4096);
@@ -1119,7 +1124,7 @@ mod tests {
     fn test_default_config() {
         let config = AppConfig::default();
         assert_eq!(config.core.pgwire_port, 5432);
-        assert_eq!(config.buffer.timefusion_flush_interval_secs, 300);
+        assert_eq!(config.buffer.timefusion_flush_interval_secs, 60);
         assert_eq!(config.buffer.timefusion_bucket_duration_secs, 300);
         assert_eq!(config.cache.timefusion_foyer_memory_mb, 1024);
         assert_eq!(config.cache.timefusion_foyer_disk_gb, 500);
