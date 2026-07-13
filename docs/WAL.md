@@ -241,6 +241,26 @@ The `wal_corruption_threshold` config controls failure behavior:
 - `0`: Disabled (continue despite corruption)
 - `>0`: Fail if error_count >= threshold
 
+### Single-Writer Invariant & Directory Lock
+
+The WAL is **single-writer**. walrus tracks per-topic block/offset state and the read cursor *in-process only* — there is **no cross-process coordination** — and startup recovery is a **one-shot** read of the WAL tail as it stands when recovery begins (`recover_from_wal` runs once; the topic list is frozen when `replay_iter()` is constructed, and replay thereafter resumes from the persisted cursor *forward*, never re-scanning older-than-cursor entries).
+
+If two processes run against the same WAL directory at once — e.g. an old and a new container during an overlapping (start-first) redeploy that share one persistent WAL volume — the WAL **forks**: the newer process recovers only the prefix present at its start, while the older process's concurrent appends *after* that point are never replayed and are then trimmed by the cursor watermark / boot GC. Because those writes were already acked to the client, nothing errors and nothing reaches a dead-letter path — the result is **silent data loss**. (This is the failure mode observed on 2026-07-12.)
+
+To enforce the invariant at the OS level, startup acquires an exclusive advisory `flock` on `${TIMEFUSION_DATA_DIR}/wal/.timefusion_meta/wal.lock` (`WalDirLock`, `src/wal.rs`) **before any WAL access** — boot GC, recovery, or writes — and holds it for the whole process lifetime. A second process blocks (with backoff, logging `WAL dir ... is locked by another TimeFusion process`) until the first exits.
+
+Properties:
+
+- **No stale locks.** The lock lives on the open file descriptor, so the kernel releases it on *any* process death, including SIGKILL/OOM. A force-killed instance leaves nothing to clean up; the next process acquires immediately.
+- **Never steals, never times out.** A held lock means a *live* holder; barging in would recreate the two-writer fork. The wait is bounded in practice by the orchestrator's stop-grace SIGKILL, which guarantees a wedged predecessor is eventually killed and the lock freed.
+- **GC-safe.** The lock file lives in `.timefusion_meta/`, which `gc_wal_files` skips, so it is never deleted out from under a holder.
+- **Single-host only.** `flock` coordinates writers on one host; it does *not* coordinate across hosts on shared network storage. TimeFusion's WAL is a local/host path, which already pins the writer to one host.
+
+**Deploy implications:**
+
+- Keep readiness a **TCP check on the pgwire port**. The early-bind 57P03 responder binds the port *before* the lock is acquired, so readiness is decoupled from lock acquisition. A *start-first* rolling deploy then self-resolves: the new container passes readiness immediately (serving 57P03), the orchestrator stops the old one, the old releases the lock, and the new recovers the **complete** WAL. **Do not** add a deep readiness check that gates on WAL recovery — it would deadlock a start-first deploy (new can't become ready until it holds the lock; the orchestrator won't stop old until new is ready).
+- **stop-first, single-replica** deploys are recommended as *hardening* (not required for correctness): they avoid the brief window where both containers are bound and let the old instance finish flushing to Delta before the new one starts, minimizing replay work.
+
 ## Configuration
 
 | Environment Variable | Default | Description |

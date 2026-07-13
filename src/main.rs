@@ -97,6 +97,19 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     });
 
+    // Take exclusive ownership of the WAL directory before ANY WAL access (boot
+    // GC below, recovery, or writes). TimeFusion's WAL is single-writer with no
+    // cross-process coordination; two live processes on the same dir fork it —
+    // the newer one recovers only the prefix present at its start and orphans
+    // the older's concurrent appends (silent loss on an overlapping redeploy).
+    // Blocks until any previous process exits and releases the flock, serving
+    // 57P03 via the early-bind responder above meanwhile. Held for the whole
+    // process lifetime; released by the kernel even on SIGKILL. Under a
+    // start-first deploy this self-resolves (readiness is a TCP check the early
+    // responder already satisfies, so the orchestrator stops the old instance,
+    // which releases the lock); stop-first shortens the handoff but isn't required.
+    let _wal_dir_lock = timefusion::wal::WalDirLock::acquire(&cfg.core.wal_dir()).await?;
+
     // Initialize database with explicit config
     let t_db = std::time::Instant::now();
     let mut db = Database::with_config(Arc::clone(&cfg_arc)).await?;

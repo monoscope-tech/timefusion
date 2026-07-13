@@ -68,6 +68,13 @@ If you already have a Postgres client, you already have a TimeFusion client.
 - **Ingest:** besides pgwire `INSERT`, TimeFusion accepts gRPC streaming
   ingestion of Arrow IPC payloads (`GRPC_PORT`, default `50051`).
 
+> **Single-writer WAL.** Exactly one TimeFusion process may run against a given
+> WAL directory. Startup takes an exclusive `flock` on the WAL dir to enforce
+> this; a second process waits (serving `57P03`) until the first exits. Keep
+> the readiness probe a plain TCP check on the pgwire port so rolling deploys
+> hand off cleanly. See [`docs/WAL.md`](docs/WAL.md) and
+> [`RUNBOOK.md`](RUNBOOK.md) for deploy guidance.
+
 **Storage layout:** events are written to a Delta table such as
 `otel_logs_and_spans`, partitioned by `[project_id, date]`. Table schemas live
 in [`schemas/`](schemas/) and are loaded at startup.

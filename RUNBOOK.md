@@ -67,7 +67,10 @@ prints what was derived.
   explicit restore action.
 - If WAL on the dead host is recoverable, copy it to
   `${TIMEFUSION_DATA_DIR}/wal/` on the new host before startup. WAL
-  recovery on startup is idempotent.
+  recovery on startup is idempotent. Only ever run **one** instance
+  against a given WAL directory — the startup `flock` (see *WAL ownership
+  & rolling deploys*) enforces this; do not bypass it by pointing a second
+  live process at the same dir.
 
 ---
 
@@ -87,6 +90,40 @@ requests may see connection resets. Set `terminationGracePeriodSeconds`
 in your k8s pod spec to **at least** `TIMEFUSION_SHUTDOWN_TIMEOUT_SECS
 + flush_overhead` (rough rule: 60s default is enough for ≤4GB
 MemBuffer).
+
+---
+
+## WAL ownership & rolling deploys
+
+The WAL is **single-writer** — two processes on the same WAL directory
+at once will fork it and silently lose the older one's acked-but-unreplayed
+writes (see `docs/WAL.md` → *Single-Writer Invariant & Directory Lock*).
+Startup enforces this with an exclusive `flock` on
+`${TIMEFUSION_DATA_DIR}/wal/.timefusion_meta/wal.lock`, held for the
+process lifetime.
+
+- **Symptom of contention**: a starting instance logs `WAL dir ... is
+  locked by another TimeFusion process; waiting for it to exit before
+  recovery` every ~10s. This is expected during a deploy handoff — the new
+  instance is waiting for the old one to finish draining and exit. It
+  serves `57P03` ("starting up") meanwhile, which libpq/Hasql retry.
+- **No stale lock to clear**: the lock is tied to the open fd, so the
+  kernel releases it on any exit including SIGKILL/OOM. If a starting
+  instance waits indefinitely, the *previous* process is genuinely still
+  alive — find and stop it (`docker ps` on the host); never delete
+  `wal.lock` to "unstick" it (deleting it while a holder is live breaks
+  the mutual exclusion and re-enables the fork).
+- **Keep the readiness probe a `tcp_check`** on the pgwire port (see
+  *Liveness & readiness probes* above). Do **not** switch it to a deep
+  check that only passes after WAL recovery — that would deadlock a
+  start-first deploy (new can't pass readiness until it holds the lock;
+  the orchestrator won't stop old until new is ready). With the TCP probe,
+  start-first self-resolves.
+- **Recommended (hardening, not required)**: deploy **stop-first with a
+  single replica** so the old instance fully drains + flushes + writes its
+  clean-shutdown snapshot before releasing the lock, minimizing the new
+  instance's replay. Ensure the orchestrator stop-grace (e.g. Swarm
+  `StopGracePeriod`) ≥ `TIMEFUSION_SHUTDOWN_TIMEOUT_SECS`.
 
 ---
 

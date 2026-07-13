@@ -7,6 +7,7 @@ use arrow_ipc::{
 };
 use bincode::{Decode, Encode};
 use dashmap::DashSet;
+use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
@@ -1310,6 +1311,72 @@ fn read_cursor_snapshot(wal_dir: &std::path::Path) -> Option<CursorSnapshot> {
 /// stale claim must not authorize the NEXT boot's sweep. Dirty/undrained
 /// boot: skip — the floor-aware runtime sweep (first pass right after replay
 /// parks the cursors) reclaims instead.
+/// Process-lifetime exclusive lock on the WAL directory.
+///
+/// TimeFusion's WAL is single-writer: block/offset state is tracked in-process
+/// only (no cross-process coordination), and startup recovery is a one-shot
+/// read of the WAL tail as it stands when recovery begins. Two live processes
+/// sharing one WAL dir therefore *fork* it — the newer process recovers only
+/// the prefix present at its start, and the older process's concurrent appends
+/// after that point are never replayed (silent data loss on an overlapping
+/// rolling redeploy). This holds an OS advisory `flock` on
+/// `<wal_dir>/.timefusion_meta/wal.lock` so a second process must wait for the
+/// first to exit before it touches the WAL (GC, recovery, or writes).
+///
+/// The lock lives on the open file description, so the kernel releases it on
+/// process death — including SIGKILL/OOM — leaving no stale lock to clean up.
+/// We never steal or time out: a still-held lock means a still-live holder, and
+/// the orchestrator's stop-grace SIGKILL bounds how long the wait can last.
+/// (`.timefusion_meta` is skipped by `gc_wal_files`, so the lock file is never
+/// GC'd out from under a holder.)
+pub struct WalDirLock {
+    // Held for the process lifetime; the flock releases when this drops (or the
+    // process dies). Never read after construction — its liveness IS the lock.
+    _file: std::fs::File,
+}
+
+impl WalDirLock {
+    /// Acquire the exclusive WAL-dir lock, waiting with backoff until any other
+    /// TimeFusion process holding it exits. Async so the early-bind 57P03
+    /// responder keeps serving connections while we wait.
+    pub async fn acquire(wal_dir: &std::path::Path) -> Result<Self, WalError> {
+        let meta_dir = wal_dir.join(".timefusion_meta");
+        std::fs::create_dir_all(&meta_dir)?;
+        let path = meta_dir.join("wal.lock");
+        let file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&path)?;
+        let mut waits = 0u64;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(true) => {
+                    if waits > 0 {
+                        info!("WAL dir lock acquired after waiting for a previous process to exit");
+                    }
+                    return Ok(Self { _file: file });
+                }
+                // Ok(false) = another live TimeFusion process owns the WAL.
+                // Log every ~10s (20 × 500ms). A normal handoff clears in
+                // seconds; escalate to error past ~60s so a wedged predecessor
+                // (readiness stays TCP-green, masking the stall) is loud, not a
+                // silent hang. We still never steal — the orchestrator's
+                // stop-grace SIGKILL is what bounds a truly stuck predecessor.
+                Ok(false) => {
+                    if waits % 20 == 0 {
+                        let secs = waits / 2;
+                        if waits >= 120 {
+                            error!("WAL dir {:?} still locked by another TimeFusion process after {secs}s — predecessor may be wedged (check for a stuck/duplicate instance)", path);
+                        } else {
+                            warn!("WAL dir {:?} is locked by another TimeFusion process; waiting for it to exit before recovery", path);
+                        }
+                    }
+                    waits += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(WalError::Io(e)),
+            }
+        }
+    }
+}
+
 pub fn boot_wal_gc(wal_dir: &std::path::Path, max_age: std::time::Duration) {
     let t = std::time::Instant::now();
     let Some(mut snap) = read_cursor_snapshot(wal_dir).filter(|s| s.drained) else {
@@ -2024,6 +2091,19 @@ mod tests {
         let deserialized = decode_payload::<UpdatePayload>(&serialized).unwrap();
         assert_eq!(payload.predicate_sql, deserialized.predicate_sql);
         assert_eq!(payload.assignments, deserialized.assignments);
+    }
+
+    #[tokio::test]
+    async fn wal_dir_lock_is_exclusive_and_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = WalDirLock::acquire(tmp.path()).await.unwrap();
+        // A second opener of the same lock file cannot take it while the guard
+        // is held — this is the cross-process exclusion a redeploy relies on.
+        let other = std::fs::OpenOptions::new().read(true).write(true).open(tmp.path().join(".timefusion_meta/wal.lock")).unwrap();
+        assert!(!other.try_lock_exclusive().unwrap(), "second opener must not acquire the lock while the guard is held");
+        // Dropping the guard releases the lock (mirrors kernel release on exit).
+        drop(guard);
+        assert!(other.try_lock_exclusive().unwrap(), "lock must be acquirable after the holder drops");
     }
 
     #[test]
