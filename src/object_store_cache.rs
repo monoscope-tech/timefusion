@@ -353,15 +353,27 @@ impl SharedFoyerCache {
         self.metadata_stats.read().await.log();
     }
 
-    pub async fn shutdown(&self) -> anyhow::Result<()> {
+    /// Close the caches, bounded by `deadline`. Foyer's `close()` flushes
+    /// in-memory entries to disk; on a large cache / slow disk this can run for
+    /// minutes (prod 2026-07-13: 377MB → 8.5min), and because it blocks process
+    /// exit it also blocks `wal.lock` release, stalling the incoming instance of
+    /// a redeploy. The disk cache is a rebuildable READ cache, so abandoning an
+    /// in-progress flush loses only warmth, never durable data — prioritize
+    /// releasing the WAL lock over cache completeness.
+    pub async fn shutdown_by(&self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
         info!("Shutting down Foyer cache...");
         self.log_stats().await;
 
-        // Close the underlying caches
         info!("Closing Foyer caches...");
-        self.cache.close().await?;
-        self.metadata_cache.close().await?;
-
+        match tokio::time::timeout_at(deadline, async {
+            self.cache.close().await?;
+            self.metadata_cache.close().await
+        })
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => warn!("Foyer close exceeded shutdown deadline — abandoning disk-cache flush to release the WAL lock (cache warmth lost, no data loss)"),
+        }
         Ok(())
     }
 
@@ -1481,6 +1493,19 @@ mod tests {
         assert_eq!(after.metadata.inner_gets, before.metadata.inner_gets, "no inner fetch after warm");
 
         cache.shutdown().await?;
+        Ok(())
+    }
+
+    // Regression for issue #82: shutdown must never block past its deadline.
+    // The unbounded foyer close() stalled process exit (and wal.lock release)
+    // for ~8.5min on a redeploy. With an already-elapsed deadline, shutdown_by
+    // must abandon the flush and return promptly.
+    #[tokio::test]
+    async fn shutdown_by_respects_elapsed_deadline() -> anyhow::Result<()> {
+        let cache = SharedFoyerCache::new(FoyerCacheConfig::test_config("shutdown_deadline")).await?;
+        let start = tokio::time::Instant::now();
+        cache.shutdown_by(start).await?; // deadline already reached
+        assert!(start.elapsed() < Duration::from_secs(5), "shutdown_by must not block past its deadline");
         Ok(())
     }
 

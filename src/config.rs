@@ -133,7 +133,7 @@ const_default!(d_wal_shards_per_topic: usize = 4);
 const_default!(d_stop_grace: u64 = 50);
 const_default!(d_wal_corruption_threshold: usize = 10);
 // Concurrent staged flush commits. Parquet encode + S3 upload happen outside
-// the delta_commit_lock (see insert_records_batch staged path), so this scales
+// the per-table commit lock (see insert_records_batch staged path), so this scales
 // upload throughput directly — the dominant steady-state drain lever under
 // backfill. 8 doubles concurrency over the old 4 while bounding in-flight
 // encode memory; raise further (env) if CPU/R2 headroom allows.
@@ -620,6 +620,13 @@ pub struct BufferConfig {
     pub timefusion_wal_ack_fsync: bool,
     #[serde(default = "d_wal_max_files")]
     pub timefusion_wal_max_file_count: usize,
+    /// Force-flush backstop on total on-disk (unflushed) WAL bytes. Guards the
+    /// cursor-lag case the memory-pressure valve misses: a stuck /
+    /// persistently-retrying commit pins the WAL GC floor while buffer memory
+    /// frees post-commit, so the WAL bloats without tripping memory pressure —
+    /// inflating restart replay (issue #83). 0 = derive from the buffer budget.
+    #[serde(default)]
+    pub timefusion_wal_max_unflushed_mb: usize,
     #[serde(default = "d_bucket_duration_secs")]
     pub timefusion_bucket_duration_secs: u64,
     #[serde(default = "d_pressure_flush_pct")]
@@ -716,6 +723,15 @@ impl BufferConfig {
     }
     pub fn wal_max_file_count(&self) -> usize {
         self.timefusion_wal_max_file_count
+    }
+    /// Byte ceiling for the unflushed-WAL force-flush backstop, or `None` when
+    /// disabled (`TIMEFUSION_WAL_MAX_UNFLUSHED_MB` unset/0 — the default). Opt-in
+    /// because the always-on memory-pressure valve already drains the common
+    /// lagging-flush case; this guards the rarer stuck-cursor backlog. Set it to
+    /// bound restart replay by on-disk WAL size (e.g. 12000 for the 30GB-buffer
+    /// prod instance).
+    pub fn wal_max_unflushed_bytes(&self) -> Option<u64> {
+        (self.timefusion_wal_max_unflushed_mb > 0).then(|| (self.timefusion_wal_max_unflushed_mb as u64).saturating_mul(1024 * 1024))
     }
     pub fn bucket_duration_secs(&self) -> u64 {
         self.timefusion_bucket_duration_secs.max(1)
@@ -1155,5 +1171,16 @@ mod tests {
         config.cache.timefusion_foyer_disk_mb = Some(1024);
         assert_eq!(config.cache.memory_size_bytes(), 256 * 1024 * 1024);
         assert_eq!(config.cache.disk_size_bytes(), 1024 * 1024 * 1024);
+    }
+
+    // issue #83: the unflushed-WAL force-flush backstop is opt-in — disabled
+    // (None) unless an explicit MB ceiling is set.
+    #[test]
+    fn test_wal_max_unflushed_bytes_optin() {
+        let mut config = AppConfig::default();
+        config.buffer.timefusion_wal_max_unflushed_mb = 0;
+        assert_eq!(config.buffer.wal_max_unflushed_bytes(), None, "unset → disabled");
+        config.buffer.timefusion_wal_max_unflushed_mb = 8000;
+        assert_eq!(config.buffer.wal_max_unflushed_bytes(), Some(8000u64 * 1024 * 1024), "explicit ceiling");
     }
 }

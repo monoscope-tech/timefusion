@@ -1459,9 +1459,23 @@ impl BufferedWriteLayer {
             if trigger == "timer" {
                 info!("WAL stats: {} files, {}MB", file_count, total_bytes / (1024 * 1024));
             }
+            // Emergency drain if the WAL is over EITHER threshold: file count
+            // (many small shards) or unflushed bytes (cursor-lag backlog the
+            // memory-pressure valve misses — issue #83). flush_all_now advances
+            // the read cursor so WAL GC can reclaim the backlog, keeping
+            // restart replay bounded.
             let max_files = self.config.buffer.wal_max_file_count();
-            if max_files > 0 && file_count > max_files {
-                warn!("WAL file count {} exceeds threshold {}, triggering emergency flush", file_count, max_files);
+            let max_unflushed = self.config.buffer.wal_max_unflushed_bytes();
+            let files_over = max_files > 0 && file_count > max_files;
+            let bytes_over = max_unflushed.is_some_and(|max| total_bytes > max);
+            if files_over || bytes_over {
+                warn!(
+                    "WAL over threshold (files {}/{}, bytes {}MB/{}), triggering emergency flush",
+                    file_count,
+                    max_files,
+                    total_bytes / (1024 * 1024),
+                    max_unflushed.map_or_else(|| "off".to_string(), |m| format!("{}MB", m / (1024 * 1024)))
+                );
                 if let Err(e) = self.flush_all_now().await {
                     error!("Emergency WAL flush failed: {}", e);
                 }

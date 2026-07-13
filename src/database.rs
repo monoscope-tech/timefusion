@@ -1080,13 +1080,16 @@ pub struct Database {
     /// the cgroup OOM (prod 2026-07-04). Permits = `timefusion_maintenance_rewrite_concurrency`.
     maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Serializes in-process Delta commits (flush appends vs dedup
-    /// replace_where). delta-kernel's OCC checker cannot evaluate the
-    /// bare-string timestamp predicate replace_where commits carry (errors
-    /// "arrow_cast should have been simplified"), so a dedup commit racing
-    /// any concurrent append aborts — every attempt, forever, on a busy
-    /// table. With commits serialized the rebase sees no newer versions and
-    /// skips the checker entirely.
-    delta_commit_lock: Arc<tokio::sync::Mutex<()>>,
+    /// replace_where) PER PHYSICAL TABLE, keyed via `table_lock_key`.
+    /// delta-kernel's OCC checker cannot evaluate the bare-string timestamp
+    /// predicate replace_where commits carry (errors "arrow_cast should have
+    /// been simplified"), so a dedup commit racing any concurrent append to
+    /// the SAME log aborts — every attempt, forever, on a busy table.
+    /// Serializing per-log commits lets the rebase see no newer versions and
+    /// skip the checker. Formerly a process-wide mutex, which needlessly
+    /// serialized commits to *different* Delta logs and capped flush
+    /// throughput below `flush_parallelism` (issue #83).
+    commit_locks: DmlLocks,
     /// Per-table serialization for in-process DML (see `dml_lock`): concurrent
     /// merges on the same table would OCC-conflict and redo full parquet
     /// rewrites, so they queue here — without touching the table's RwLock,
@@ -1426,7 +1429,7 @@ impl Database {
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             light_optimize_gate: Arc::new(tokio::sync::Mutex::new(())),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
-            delta_commit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            commit_locks: Arc::new(dashmap::DashMap::new()),
             dml_locks: Arc::new(dashmap::DashMap::new()),
             snapshot_persist_gate: Arc::new(dashmap::DashMap::new()),
             buffered_layer: Arc::new(std::sync::OnceLock::new()),
@@ -2924,7 +2927,7 @@ impl Database {
         self.persist_snapshot(&new_table);
         {
             // Version-guarded swap so this is safe to call WITHOUT holding
-            // `delta_commit_lock`: a concurrent committer may have already
+            // the commit lock: a concurrent committer may have already
             // advanced `table_ref` past our just-committed version (its refresh
             // picks our commit up from the log), and a bare `*table = new_table`
             // would regress the handle. None < Some(_), so an unloaded handle
@@ -3116,13 +3119,23 @@ impl Database {
     /// concurrently, OCC-conflict at the shared Delta log, and redo full
     /// parquet rewrites (observed as sustained `dml.conflict` in prod).
     /// Custom-storage tables are physically isolated and keep the full key.
+    /// Physical-Delta-log lock key: collapses all default projects sharing a
+    /// unified table onto one key (empty project_id — not a valid id, so it
+    /// can't collide), while custom-storage tables keep per-project isolation.
+    /// Shared by `dml_lock` and `commit_lock` so both serialize at
+    /// physical-log granularity.
+    async fn table_lock_key(&self, project_id: &str, table_name: &str) -> (String, String) {
+        let project_key = if self.has_custom_storage(project_id, table_name).await { project_id.to_string() } else { String::new() };
+        (project_key, table_name.to_string())
+    }
+
     pub(crate) async fn dml_lock(&self, project_id: &str, table_name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let project_key = if self.has_custom_storage(project_id, table_name).await {
-            project_id.to_string()
-        } else {
-            String::new() // not a valid project_id, so it can't collide
-        };
-        self.dml_locks.entry((project_key, table_name.to_string())).or_default().clone()
+        self.dml_locks.entry(self.table_lock_key(project_id, table_name).await).or_default().clone()
+    }
+
+    /// Per-physical-table Delta commit lock (see `commit_locks`).
+    pub(crate) async fn commit_lock(&self, project_id: &str, table_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.commit_locks.entry(self.table_lock_key(project_id, table_name).await).or_default().clone()
     }
 
     /// Persist `table`'s post-commit snapshot locally (detached) so the next
@@ -3318,7 +3331,7 @@ impl Database {
         };
         let max_retries = 5;
         // STAGED COMMIT (fast path): encode parquet + upload to S3 OUTSIDE the
-        // global `delta_commit_lock`, then serialize only the tiny commit-log
+        // per-table commit lock, then serialize only the tiny commit-log
         // append. The old path held the lock across the whole `.write()`
         // (parquet encode + S3 upload + commit), serializing every tenant's
         // upload behind one mutex — the ~8-17 rows/s flush ceiling under heavy
@@ -3382,15 +3395,17 @@ impl Database {
             // reclaim them; abandoning them leaks files on S3 forever.
             let stage_store = staging_table.log_store().object_store(None);
 
+            let commit_lock = self.commit_lock(&project_id, &table_name).await;
             let mut retry_count = 0;
             loop {
                 // Refresh UNDER the lock (the merge path refreshes before locking).
-                // delta_commit_lock serializes all in-process commits, so
-                // refreshing here guarantees we build on the previous committer's
-                // version and never self-conflict; refresh is probe-cheap (a single
-                // GET that 404-short-circuits when already current), so the extra
-                // lock-hold is sub-millisecond on the common path.
-                let commit_guard = self.delta_commit_lock.lock().await;
+                // The per-table commit lock serializes all in-process commits to
+                // THIS log, so refreshing here guarantees we build on the previous
+                // committer's version and never self-conflict; refresh is
+                // probe-cheap (a single GET that 404-short-circuits when already
+                // current), so the extra lock-hold is sub-millisecond on the common
+                // path.
+                let commit_guard = commit_lock.lock().await;
                 // DIAG (commit-throughput profiling): time the serial commit phases
                 // (refresh + Delta log append) under the lock — these bound the
                 // process-wide commit rate. Remove once the flush bottleneck is found.
@@ -3476,13 +3491,14 @@ impl Database {
         // SCHEMA-EVOLUTION FALLBACK: locked WriteBuilder merge path. Holds the
         // commit lock across the whole write so the schema-metadata merge can't
         // race a concurrent commit. Rare (only when a batch adds a column).
+        let commit_lock = self.commit_lock(&project_id, &table_name).await;
         let mut retry_count = 0;
         let mut last_error = None;
         while retry_count < max_retries {
             if let Err(e) = refresh_table_snapshot(&table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
                 debug!("Failed to update table state before write (attempt {}): {}", retry_count + 1, e);
             }
-            let commit_guard = self.delta_commit_lock.lock().await;
+            let commit_guard = commit_lock.lock().await;
             let (table, pre_uris) = {
                 let guard = table_ref.read().await;
                 let pre: std::collections::HashSet<String> = guard.get_file_uris().map(|it| it.collect()).unwrap_or_default();
@@ -4413,7 +4429,7 @@ impl Database {
         let mut total_dropped = 0u64;
         let mut all_complete = !skipped_any;
         for (chunk_filter, label) in chunks {
-            let (dropped, complete) = self.dedup_rewrite_chunk(table_ref, table_name, schema, scan_name, &filter, &chunk_filter, &label).await?;
+            let (dropped, complete) = self.dedup_rewrite_chunk(table_ref, table_name, project_id, schema, scan_name, &filter, &chunk_filter, &label).await?;
             total_dropped += dropped;
             all_complete &= complete;
         }
@@ -4438,8 +4454,8 @@ impl Database {
     /// commit never touches.
     #[allow(clippy::too_many_arguments)]
     async fn dedup_rewrite_chunk(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, scan_name: &str, partition_filter: &str,
-        chunk_filter: &str, label: &str,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema_loader::TableSchema, scan_name: &str,
+        partition_filter: &str, chunk_filter: &str, label: &str,
     ) -> Result<(u64, bool)> {
         use deltalake::{
             kernel::{Action, transaction::TableReference},
@@ -4459,6 +4475,7 @@ impl Database {
         // dedup) can remove a target file mid-flight. Detected under the
         // commit lock; the chunk is re-planned from a fresh snapshot.
         const MAX_REPLANS: usize = 3;
+        let commit_lock = self.commit_lock(project_id, table_name).await;
         for replan in 0..MAX_REPLANS {
             // Scan and file-mapping MUST share one snapshot: the caller's ctx
             // is pinned at dedup_partition entry, and on the heavily-churned
@@ -4663,7 +4680,7 @@ impl Database {
             // one means a concurrent rewrite superseded our read → re-plan).
             const MAX_RETRIES: usize = 4;
             for attempt in 0..MAX_RETRIES {
-                let commit_guard = self.delta_commit_lock.lock().await;
+                let commit_guard = commit_lock.lock().await;
                 if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
                     debug!("dedup rewrite pre-commit refresh failed (attempt {}): {}", attempt + 1, e);
                 }
@@ -5294,6 +5311,17 @@ impl Database {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown_by(tokio::time::Instant::now() + self.config.buffer.stop_grace()).await
+    }
+
+    /// Graceful shutdown; `deadline` (the remainder of the process-wide stop
+    /// grace shared with `BufferedWriteLayer::shutdown_by`) bounds the foyer
+    /// `close()` — a rebuildable read cache whose flush-on-close overran for
+    /// minutes in prod, blocking process exit and `wal.lock` release (#82).
+    /// The DML-drain phase below is not itself deadline-bounded (fast on the
+    /// common path; bounding it safely needs the coalescer's WAL-replay
+    /// semantics worked through).
+    pub async fn shutdown_by(&self, deadline: tokio::time::Instant) -> Result<()> {
         info!("Shutting down TimeFusion database...");
 
         // Flush deferred DML merges before anything is torn down. The drain
@@ -5317,7 +5345,7 @@ impl Database {
         if let Some(ref cache) = self.object_store_cache {
             info!("Shutting down Foyer cache...");
             cache.log_stats().await;
-            cache.shutdown().await?;
+            cache.shutdown_by(deadline).await?;
         }
 
         // Close PostgreSQL connection pool if present
@@ -7112,6 +7140,23 @@ mod tests {
         let ctx1 = Arc::new(db.clone()).create_session_context();
         let ctx2 = Arc::new(db.clone()).create_session_context();
         assert!(Arc::ptr_eq(&ctx1.runtime_env(), &ctx2.runtime_env()), "contexts must share one RuntimeEnv/memory pool");
+        Ok(())
+    }
+
+    /// Regression for issue #83: the Delta commit lock must be per physical
+    /// table, not process-wide, or flush commits to independent tables
+    /// needlessly serialize and cap throughput. Two default projects share the
+    /// unified table's single log → one lock; different tables → independent
+    /// locks; commit and DML locks are distinct critical sections.
+    #[tokio::test]
+    async fn commit_lock_is_per_physical_table() -> Result<()> {
+        let db = Database::with_config(create_test_config("commit-lock-key")).await?;
+        let a = db.commit_lock("proj_a", "otel_logs_and_spans").await;
+        let b = db.commit_lock("proj_b", "otel_logs_and_spans").await;
+        let c = db.commit_lock("proj_a", "metrics").await;
+        assert!(Arc::ptr_eq(&a, &b), "default projects on a unified table must share one commit lock");
+        assert!(!Arc::ptr_eq(&a, &c), "different tables must get independent commit locks");
+        assert!(!Arc::ptr_eq(&a, &db.dml_lock("proj_a", "otel_logs_and_spans").await), "commit and DML locks must be distinct");
         Ok(())
     }
 

@@ -434,7 +434,12 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
     sleep(Duration::from_millis(500)).await;
 
-    if let Err(e) = db_for_shutdown.shutdown().await {
+    // Share the same absolute `deadline` as the buffered-layer flush above.
+    // The final foyer `close()` — the phase that overran in prod, blocking
+    // process exit and `wal.lock` release for minutes on a redeploy (issue
+    // #82) — is now bounded by it. (The earlier DML-drain phase inside
+    // `shutdown_by` is not yet deadline-bounded; fast on the common path.)
+    if let Err(e) = db_for_shutdown.shutdown_by(deadline).await {
         error!("Error during database shutdown: {}", e);
     }
 
