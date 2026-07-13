@@ -1343,7 +1343,7 @@ impl WalDirLock {
         let meta_dir = wal_dir.join(".timefusion_meta");
         std::fs::create_dir_all(&meta_dir)?;
         let path = meta_dir.join("wal.lock");
-        let file = std::fs::OpenOptions::new().create(true).read(true).write(true).open(&path)?;
+        let file = std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&path)?;
         let mut waits = 0u64;
         loop {
             match file.try_lock_exclusive() {
