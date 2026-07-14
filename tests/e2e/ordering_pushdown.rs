@@ -19,11 +19,7 @@ use super::harness::{E2eEnv, FROZEN_START_MICROS, insert_at};
 #[tokio::test(flavor = "multi_thread")]
 async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
     let bucket_secs = 60u64;
-    let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(bucket_secs))
-        .with_retention(Duration::from_secs(60 * 60))
-        .start()
-        .await?;
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
     let client = env.pg_client().await?;
 
     let sec = 1_000_000i64;
@@ -54,10 +50,7 @@ async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
         .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        plan.contains("SortPreservingMergeExec"),
-        "expected a streaming SortPreservingMergeExec (ordering pushdown fired); plan was:\n{plan}"
-    );
+    assert!(plan.contains("SortPreservingMergeExec"), "expected a streaming SortPreservingMergeExec (ordering pushdown fired); plan was:\n{plan}");
 
     // Correctness: true top-3 newest, strictly descending, drawn from MemBuffer.
     let rows = client.query(sql, &[]).await?;
@@ -81,11 +74,7 @@ async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<()> {
     let bucket_secs = 60u64;
-    let env = E2eEnv::builder()
-        .with_bucket_duration(Duration::from_secs(bucket_secs))
-        .with_retention(Duration::from_secs(60 * 60))
-        .start()
-        .await?;
+    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
     let client = env.pg_client().await?;
 
     let sec = 1_000_000i64;
@@ -116,10 +105,7 @@ async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<
         .map(|r| (0..r.len()).map(|c| r.try_get::<_, String>(c).unwrap_or_default()).collect::<Vec<_>>().join(" | "))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(
-        plan.contains("SortPreservingMergeExec"),
-        "optimized partition must still advertise DESC ordering (SortBy footer); plan was:\n{plan}"
-    );
+    assert!(plan.contains("SortPreservingMergeExec"), "optimized partition must still advertise DESC ordering (SortBy footer); plan was:\n{plan}");
 
     let rows = client.query(sql, &[]).await?;
     let ids: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();

@@ -81,10 +81,8 @@ fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<u
             return Ok(None);
         };
         let children = union.children();
-        let sat: Vec<bool> = children
-            .iter()
-            .map(|c| c.properties().equivalence_properties().ordering_satisfy(req_here.iter().cloned()))
-            .collect::<Result<Vec<_>>>()?;
+        let sat: Vec<bool> =
+            children.iter().map(|c| c.properties().equivalence_properties().ordering_satisfy(req_here.iter().cloned())).collect::<Result<Vec<_>>>()?;
         // Mixed union only: an ordered child to merge toward AND an unordered
         // child to fix. All-ordered needs nothing; none-ordered means the Delta
         // pushdown is off (mixed footers) — leave the blocking sort in place.
@@ -101,11 +99,10 @@ fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<u
     // Descend only through single-child, order-preserving operators so the
     // ordering we create actually propagates up to the sort.
     let children = plan.children();
-    if children.len() == 1 && plan.maintains_input_order().first() == Some(&true) {
-        if let Some(new_child) = order_union(children[0], req, fetch)? {
+    if children.len() == 1 && plan.maintains_input_order().first() == Some(&true)
+        && let Some(new_child) = order_union(children[0], req, fetch)? {
             return Ok(Some(Arc::clone(plan).with_new_children(vec![new_child])?));
         }
-    }
     Ok(None)
 }
 
@@ -153,6 +150,7 @@ impl PhysicalOptimizerRule for OrderedUnionForTopK {
 mod tests {
     use std::sync::Arc;
 
+    use datafusion::arrow::compute::SortOptions;
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit},
         common::config::ConfigOptions,
@@ -164,7 +162,6 @@ mod tests {
             union::UnionExec,
         },
     };
-    use datafusion::arrow::compute::SortOptions;
 
     use super::*;
 
@@ -176,8 +173,7 @@ mod tests {
     }
 
     fn ts_desc() -> LexOrdering {
-        LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new("timestamp", 0)), SortOptions { descending: true, nulls_first: true })])
-            .unwrap()
+        LexOrdering::new(vec![PhysicalSortExpr::new(Arc::new(Column::new("timestamp", 0)), SortOptions { descending: true, nulls_first: true })]).unwrap()
     }
 
     /// A leaf exec that lets the test declare whatever output ordering it wants,
@@ -218,9 +214,7 @@ mod tests {
         fn with_new_children(self: Arc<Self>, _c: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
             Ok(self)
         }
-        fn execute(
-            &self, _p: usize, _c: Arc<datafusion::execution::TaskContext>,
-        ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
+        fn execute(&self, _p: usize, _c: Arc<datafusion::execution::TaskContext>) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
             unimplemented!()
         }
     }
