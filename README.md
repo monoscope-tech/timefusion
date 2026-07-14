@@ -322,7 +322,22 @@ cargo test --test sqllogictest      # SQL logic tests
 cargo test --test integration_test  # write-path integration
 cargo test --test e2e               # end-to-end (Docker required)
 RUST_LOG=debug cargo test           # with debug logging
+
+make test-unit ARGS=<test_name>     # fast lib-only iteration (single leaf compile)
 ```
+
+**Faster local builds (macOS arm64):** `.cargo/config.toml` links with `ld64.lld`
+instead of the system linker, and `[profile.dev]` uses `debug = "line-tables-only"`
+— together these roughly halve the warm recompile of the large `database.rs` crate
+(~22s → ~12s). This requires `ld64.lld` on disk:
+
+```bash
+brew install llvm@15   # provides /opt/homebrew/opt/llvm@15/bin/ld64.lld
+```
+
+If it's missing the build fails with `invalid linker name`. Adjust the path in
+`.cargo/config.toml` for a different llvm version, or remove that file to fall
+back to the system linker.
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

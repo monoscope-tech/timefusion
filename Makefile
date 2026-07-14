@@ -1,8 +1,14 @@
-.PHONY: test test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
+.PHONY: test test-unit test-all test-ovh test-minio test-minio-all test-prod test-integration test-integration-minio test-e2e run-prod run-minio build-prod minio-start minio-stop minio-clean tf-start tf-stop
 
 # Default test (fast, excludes slow integration tests)
 test:
 	cargo test $${ARGS}
+
+# Fast lib-only iteration: single leaf compile (no redundant `cargo build`),
+# skips integration/e2e. Filter one test with ARGS, e.g.
+#   make test-unit ARGS=test_recompress_partition_skip_idempotency
+test-unit:
+	cargo test --lib $${ARGS}
 
 # Run all tests including slow integration tests
 test-all:

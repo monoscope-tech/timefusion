@@ -187,6 +187,11 @@ required-features = ["e2e"]
 # parallel codegen recovers most cross-crate inlining at ~3x faster link for
 # marginal runtime cost — the right tradeoff for a DB bottlenecked on IO/memory,
 # not inlined CPU. `strip = "symbols"` keeps the published image small.
+# Dev iteration: `line-tables-only` keeps backtraces resolvable but drops the
+# bulk of debuginfo, cutting codegen + link time on this large crate.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 16
