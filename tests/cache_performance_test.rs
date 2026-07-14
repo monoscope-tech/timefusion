@@ -93,7 +93,7 @@ async fn test_cache_performance_and_s3_bypass() -> Result<()> {
     assert_eq!(bytes[0][0], 9u8, "Should get updated data after invalidation");
 
     // Cleanup
-    shared_cache.shutdown().await?;
+    shared_cache.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(30)).await?;
 
     Ok(())
 }
@@ -144,7 +144,7 @@ async fn test_large_file_disk_caching() -> Result<()> {
     assert!(stats.main.hits > 0, "Should have cache hits");
 
     shared_cache.log_stats().await;
-    shared_cache.shutdown().await?;
+    shared_cache.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(30)).await?;
 
     Ok(())
 }
