@@ -528,8 +528,12 @@ fn build_optimize_session_state(
 /// independent of process start time — the same job fires at e.g. :00/:30 on
 /// every replica regardless of when it booted. Exits when `cancel` fires.
 /// Each fire runs on its own task; if it is still running at the next tick the
-/// tick is skipped (counted in `maintenance.cron_ticks_skipped`), so one wedged
-/// run can never freeze the schedule for good.
+/// tick is skipped (counted in `maintenance.cron_ticks_skipped`). A run that
+/// outlives `MAX_CONSECUTIVE_CRON_SKIPS` ticks is aborted as wedged and the job
+/// fires fresh — maintenance bodies are idempotent and an abort is
+/// crash-equivalent (Delta commits are atomic) — so one stuck S3/Delta call can
+/// never kill a job for the process lifetime. In-flight runs are also aborted
+/// on shutdown so they can't race the final flush.
 ///
 /// Replaces tokio-cron-scheduler, which silently stopped dispatching ticks in
 /// prod (2026-07-13: 0 optimize/checkpoint runs over 14h of uptime despite the
@@ -550,9 +554,12 @@ where
             return;
         }
     };
+    // A run still in flight after this many skipped ticks is aborted as wedged.
+    const MAX_CONSECUTIVE_CRON_SKIPS: u32 = 3;
     info!("{name} job scheduled with cron expression: {schedule}");
     tokio::spawn(async move {
-        let mut running = None;
+        let mut running: Option<tokio::task::JoinHandle<()>> = None;
+        let mut skips = 0u32;
         loop {
             let now = chrono::Utc::now();
             let dur = match cron.find_next_occurrence(&now, false) {
@@ -565,6 +572,10 @@ where
             };
             tokio::select! {
                 _ = cancel.cancelled() => {
+                    // Don't let an in-flight run race the shutdown flush.
+                    if let Some(h) = running {
+                        h.abort();
+                    }
                     info!("{name} job stopped (shutdown)");
                     return;
                 }
@@ -572,11 +583,17 @@ where
                     // Fire on a detached task so a wedged/overlong run can never
                     // freeze this loop; overlapping runs are skipped instead of
                     // piled up (maintenance jobs are periodic + idempotent).
-                    if running.as_ref().is_some_and(|h: &tokio::task::JoinHandle<()>| !h.is_finished()) {
-                        warn!("{name} job tick skipped: previous run still in progress");
+                    if running.as_ref().is_some_and(|h| !h.is_finished()) {
+                        skips += 1;
                         crate::metrics::maintenance_stats().cron_ticks_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        continue;
+                        if skips < MAX_CONSECUTIVE_CRON_SKIPS {
+                            warn!("{name} job tick skipped: previous run still in progress ({skips} consecutive)");
+                            continue;
+                        }
+                        warn!("{name} job run outlived {skips} ticks — aborting it as wedged and firing fresh");
+                        running.take().unwrap().abort();
                     }
+                    skips = 0;
                     crate::metrics::maintenance_stats().cron_ticks_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     running = Some(tokio::spawn(job()));
                 }
@@ -1097,13 +1114,15 @@ pub struct Database {
     pub scan_metrics: Arc<ScanMetrics>,
     batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
-    /// Cancels `maintenance_shutdown` when the LAST `Database` clone drops.
-    /// Database is Clone, so a per-value `impl Drop` cancelling the shared
-    /// token killed every cron job / the DML coalescer / dedup sweeps as soon
-    /// as ANY transient clone dropped (2026-07-14 prod outage: all maintenance
-    /// silently dead minutes after boot). The Arc'd DropGuard fires only once,
-    /// at true end-of-life.
-    _maintenance_cancel_guard: Arc<tokio_util::sync::DropGuard>,
+    /// Cancels `maintenance_shutdown` when the LAST guard-holding `Database`
+    /// clone drops. Database is Clone, so a per-value `impl Drop` cancelling
+    /// the shared token killed every cron job / the DML coalescer / dedup
+    /// sweeps as soon as ANY transient clone dropped (2026-07-14 prod outage:
+    /// all maintenance silently dead minutes after boot). `None` in clones
+    /// handed to long-lived background tasks (see `background_clone`) —
+    /// otherwise a task waiting on the token would hold its own kill-switch
+    /// alive and the guard could never fire.
+    _maintenance_cancel_guard: Option<Arc<tokio_util::sync::DropGuard>>,
     /// One-shot guard for `preload_tables` — main.rs and bootstrap.rs are
     /// disjoint entry points today, but a second call must not double the
     /// boot-time S3 warm burst.
@@ -1138,11 +1157,6 @@ pub struct Database {
     /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
     /// pacing. Cleared on success; in-memory only (a restart retries once).
     dedup_backoff: Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
-    /// Skip-if-busy gate for the light-optimize/dedup job: a tick that
-    /// outlives the 5-minute cron interval (observed 5m45s in prod) must not
-    /// stack a second sweep on top — concurrent sweeps churn each other's
-    /// target files into re-plan storms and multiply peak memory.
-    light_optimize_gate: Arc<tokio::sync::Mutex<()>>,
     /// Caps concurrent heavy maintenance rewrites (dedup / optimize /
     /// recompress) that materialize Arrow. Their footprint is invisible to the
     /// DataFusion memory pool (a `SELECT * … collect()` doesn't reserve through
@@ -1486,7 +1500,7 @@ impl Database {
             scan_metrics: Arc::new(ScanMetrics::default()),
             batch_queue: None,
             maintenance_shutdown: Arc::new(maintenance_shutdown),
-            _maintenance_cancel_guard: maintenance_cancel_guard,
+            _maintenance_cancel_guard: Some(maintenance_cancel_guard),
             preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_pool,
             storage_configs: Arc::new(RwLock::new(storage_configs)),
@@ -1500,7 +1514,6 @@ impl Database {
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp: Arc::new(dashmap::DashMap::new()),
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
-            light_optimize_gate: Arc::new(tokio::sync::Mutex::new(())),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             commit_locks: Arc::new(dashmap::DashMap::new()),
             dml_locks: Arc::new(dashmap::DashMap::new()),
@@ -1562,7 +1575,7 @@ impl Database {
         }
         let coalescer = Arc::new(crate::dml_coalescer::DmlCoalescer::new(secs));
         if self.dml_coalescer.set(coalescer.clone()).is_ok() {
-            tokio::spawn(coalescer.run(self.clone(), (*self.maintenance_shutdown).clone()));
+            tokio::spawn(coalescer.run(self.background_clone(), (*self.maintenance_shutdown).clone()));
         }
     }
 
@@ -1700,7 +1713,7 @@ impl Database {
 
     /// Start background maintenance schedulers for optimize and vacuum operations
     pub async fn start_maintenance_schedulers(self) -> Result<Self> {
-        let db = Arc::new(self.clone());
+        let db = Arc::new(self.background_clone());
         let cancel = self.maintenance_shutdown.clone();
 
         // Light optimize — dedup + bin-pack recent small files (every ~5 min).
@@ -1709,10 +1722,7 @@ impl Database {
             move || {
                 let db = db.clone();
                 async move {
-                    let Ok(_gate) = db.light_optimize_gate.try_lock() else {
-                        warn!("light optimize tick skipped: previous tick still running");
-                        return;
-                    };
+                    // Overlap protection lives in spawn_cron_job (skip-if-running).
                     info!("Running scheduled light optimize on recent small files");
                     // Dedup FIRST so the light compact bin-packs already-deduped files —
                     // otherwise compact would merge duplicates into one file we'd rewrite again.
@@ -5094,29 +5104,46 @@ impl Database {
         if lag < interval {
             return;
         }
-        match deltalake::checkpoints::create_checkpoint(&table, None).await {
-            Ok(()) => {
+        // Each store-heavy op is individually bounded so one wedged R2 call
+        // can't starve the rest of the sweep (and each timeout lands in the
+        // right failure counter). 600s is ~35x the largest observed catch-up
+        // (a 179k-version lag checkpointed in 17s, 2026-07-14); hitting it
+        // means a stuck backend, not a big table. Dropping the future
+        // mid-checkpoint is safe: the checkpoint PUT is atomic and retried
+        // next tick.
+        const CHECKPOINT_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+        match tokio::time::timeout(CHECKPOINT_OP_TIMEOUT, deltalake::checkpoints::create_checkpoint(&table, None)).await {
+            Ok(Ok(())) => {
                 self.checkpoint_versions.insert(url, version);
                 crate::metrics::maintenance_stats().checkpoints_created.fetch_add(1, Relaxed);
                 debug!("out-of-band checkpoint created for '{}' at v{}", table_name, version);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 crate::metrics::record_checkpoint_failed();
                 warn!("out-of-band checkpoint failed for '{}' at v{}: {} (retry next tick)", table_name, version, e);
                 return; // no fresh checkpoint boundary → skip cleanup this tick
             }
+            Err(_) => {
+                crate::metrics::record_checkpoint_failed();
+                warn!("out-of-band checkpoint for '{}' timed out after {CHECKPOINT_OP_TIMEOUT:?} (retry next tick)", table_name);
+                return;
+            }
         }
         // Log cleanup prunes only up to a checkpoint boundary, so run it after a
         // successful checkpoint. Uses the table's logRetentionDuration.
-        match deltalake::checkpoints::cleanup_metadata(&table, None).await {
-            Ok(n) if n > 0 => {
+        match tokio::time::timeout(CHECKPOINT_OP_TIMEOUT, deltalake::checkpoints::cleanup_metadata(&table, None)).await {
+            Ok(Ok(n)) if n > 0 => {
                 crate::metrics::maintenance_stats().log_files_cleaned.fetch_add(n as u64, Relaxed);
                 debug!("out-of-band log cleanup removed {} expired files for '{}'", n, table_name);
             }
-            Ok(_) => {}
-            Err(e) => {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
                 crate::metrics::record_log_cleanup_failed();
                 warn!("out-of-band log cleanup failed for '{}': {} (retry next tick)", table_name, e);
+            }
+            Err(_) => {
+                crate::metrics::record_log_cleanup_failed();
+                warn!("out-of-band log cleanup for '{}' timed out after {CHECKPOINT_OP_TIMEOUT:?} (retry next tick)", table_name);
             }
         }
     }
@@ -5158,15 +5185,7 @@ impl Database {
         // Reset the lag gauge so it reflects THIS tick's worst table.
         crate::metrics::maintenance_stats().checkpoint_lag_versions.store(0, std::sync::atomic::Ordering::Relaxed);
         for (name, table) in self.all_tables().await {
-            // Bound each table so one wedged store call can't starve the rest
-            // of the sweep — the cron-level skip guard would otherwise skip
-            // every future tick while this run hangs. 600s is ~35x the largest
-            // observed catch-up (179k-version lag checkpointed in 17s,
-            // 2026-07-14); hitting it means a stuck backend, not a big table.
-            if tokio::time::timeout(std::time::Duration::from_secs(600), self.checkpoint_and_cleanup_table(&table, &name)).await.is_err() {
-                crate::metrics::record_checkpoint_failed();
-                warn!("checkpoint maintenance for '{}' timed out after 600s — skipping to next table (retry next tick)", name);
-            }
+            self.checkpoint_and_cleanup_table(&table, &name).await;
         }
     }
 
@@ -5290,10 +5309,18 @@ impl Database {
     }
 
     /// True once maintenance/background tasks have been told to stop. Exposed
-    /// for tests and `timefusion_stats` — a `true` here on a live instance
-    /// means every cron job is dead (the 2026-07-14 outage signature).
+    /// for tests — a `true` here on a live instance means every cron job is
+    /// dead (the 2026-07-14 outage signature).
     pub fn is_maintenance_cancelled(&self) -> bool {
         self.maintenance_shutdown.is_cancelled()
+    }
+
+    /// Clone for long-lived background tasks (cron loops, DML coalescer):
+    /// omits the cancel guard so a task waiting on `maintenance_shutdown`
+    /// doesn't keep its own kill-switch alive (guard-holding clone captured by
+    /// the task → last-drop cancellation unreachable).
+    fn background_clone(&self) -> Self {
+        Self { _maintenance_cancel_guard: None, ..self.clone() }
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -6883,7 +6910,9 @@ mod tests {
         spawn_cron_job("hung-test", "* * * * * *", cancel.clone(), move || async move {
             std::future::pending::<()>().await; // never returns
         });
-        tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
+        // Generous window: needs >=2 wall-clock second boundaries even on a
+        // loaded CI runner where task startup and sleep wakeups slip.
+        tokio::time::sleep(std::time::Duration::from_millis(5200)).await;
         cancel.cancel();
         let skipped = crate::metrics::maintenance_stats().cron_ticks_skipped.load(Relaxed) - skipped_before;
         assert!(skipped >= 1, "later ticks must be skipped (loop alive) while the first run hangs, got {skipped} skips");

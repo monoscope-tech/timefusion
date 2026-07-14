@@ -315,9 +315,13 @@ mod integration {
     async fn database_clone_drop_keeps_maintenance_alive() -> Result<()> {
         let test_id = Uuid::new_v4().to_string();
         let cfg = minio_test_config(&test_id, &format!("/tmp/timefusion-{test_id}"));
-        let db = Database::with_config(cfg).await?;
+        // Schedulers running is the configuration the outage hit: their task
+        // closures must hold guard-less clones (background_clone), or the
+        // guard either fires early (old Drop bug) or can never fire (cycle).
+        let db = Database::with_config(cfg).await?.start_maintenance_schedulers().await?;
         drop(db.clone());
         assert!(!db.is_maintenance_cancelled(), "dropping a Database clone must not cancel the shared maintenance token");
+        db.cancel_maintenance();
         Ok(())
     }
 
