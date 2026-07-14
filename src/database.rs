@@ -522,6 +522,31 @@ fn build_optimize_session_state(
     SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build()
 }
 
+/// Session for delta-rs *write* execution (recompress's `replace_where`
+/// overwrite). Like `build_optimize_session_state` but built on
+/// `DeltaSessionConfig` and carrying delta-rs's `DeltaPlanner` — the write path
+/// wraps its input in a `MetricObserver` custom node that only that planner can
+/// convert to a physical plan. `schema_force_view_types=false` keeps Variant
+/// columns as `Binary` (not `BinaryView`) so delta_kernel's unshredded-variant
+/// schema check passes (same reason as `dml.rs::delta_session_from`).
+fn build_delta_write_session_state(
+    target_partitions: usize, runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+) -> datafusion::execution::session_state::SessionState {
+    use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
+    let cfg: SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
+    let mut cfg = cfg.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
+    let _ = cfg.options_mut().set("datafusion.execution.batch_size", "8192");
+    const MAINTENANCE_MAX_PARTITIONS: usize = 4;
+    let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
+    cfg = cfg.with_target_partitions(parts);
+    SessionStateBuilder::new()
+        .with_config(cfg)
+        .with_runtime_env(runtime_env)
+        .with_default_features()
+        .with_query_planner(deltalake::delta_datafusion::planner::DeltaPlanner::new())
+        .build()
+}
+
 /// Spawn a background task that runs `job` at each wall-clock occurrence of the
 /// cron `schedule` (croner, 6-field with seconds, UTC). Fire times are computed
 /// from the system clock via `find_next_occurrence`, so they are predictable and
@@ -2072,7 +2097,24 @@ impl Database {
             // Appended after DataFusion's defaults so push_down_limit has
             // already folded LIMIT into Sort.fetch — see the rule's docs.
             .with_optimizer_rule(Arc::new(crate::optimizers::DeferExpensiveProjection))
-            .with_physical_optimizer_rule(instrument_rule)
+            // Must run LAST: re-restores Variant scan types that
+            // optimize_projections reverts to Utf8View when it rebuilds each
+            // TableScan from the lying provider schema — see the rule's docs
+            // (fixes XX000 on `DISTINCT ON` over Variant columns).
+            .with_optimizer_rule(Arc::new(crate::optimizers::VariantScanSchemaRestore))
+            // Physical rules: start from DataFusion's defaults, splice our
+            // mem∪delta union-ordering rule in *before* EnforceDistribution so
+            // the built-in EnforceDistribution/EnforceSorting do the
+            // SortPreservingMerge insertion + redundant-sort removal for us
+            // (turns `ORDER BY timestamp DESC LIMIT n` into a streaming,
+            // early-terminating TopK). Tracing instrument rule stays last.
+            .with_physical_optimizer_rules({
+                let mut rules = datafusion::physical_optimizer::optimizer::PhysicalOptimizer::new().rules;
+                let pos = rules.iter().position(|r| r.name() == "EnforceDistribution").unwrap_or(0);
+                rules.insert(pos, Arc::new(crate::optimizers::OrderedUnionForTopK));
+                rules.push(instrument_rule);
+                rules
+            })
             // The planner resolves the buffered layer at plan time (late-
             // binding): sessions are created during boot before the layer
             // exists.
@@ -4183,38 +4225,61 @@ impl Database {
         info!("recompress: rewriting date={} table={} at zstd={} ({} files)", date_str, table_name, target_level, uris.len());
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        // declare_sorted=false: recompress rewrites via Z-order/Compact.
+        // declare_sorted=false: this rewrites via a bare `SELECT *` (file
+        // concatenation order), not a global sort, so the footer must not
+        // advertise the schema sort order.
         let writer_properties = self.create_writer_properties(schema, target_level, false);
-        let partition_filters = vec![PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
-        let table_clone = table_ref.read().await.clone();
+        // Force a full-partition rewrite at the new zstd tier via a streaming
+        // `replace_where` overwrite — NOT Z-order. delta-rs `Compact` skips
+        // files already ≥ target and drops single-file bins, so it can't lift
+        // an already-consolidated partition's tier; Z-order *can* force the
+        // rewrite but its space-filling curve scatters `timestamp` across row
+        // groups, wrecking the dominant time-range predicate's pruning. Instead
+        // we read the partition (`date = X`, all project_ids) and write it back
+        // with `SaveMode::Overwrite` + `replace_where`, which atomically
+        // Remove-tombstones the old files and Adds the recompressed ones
+        // (data_change semantics preserved). `with_input_plan` streams the scan
+        // through the writer (bounded by target_file_size) rather than
+        // materializing the whole partition, so peak memory matches a normal
+        // flush — unlike Z-order's global sort. The scan runs on the
+        // variant-safe maintenance session (no `variant_to_json` wrap), so
+        // Variant columns round-trip as raw Struct. Decoupling from
+        // `z_order_columns` lets the schema keep that list empty for queries.
+        let (snapshot, log_store, table_clone) = {
+            let table = table_ref.read().await;
+            (Arc::new(table.snapshot()?.snapshot().clone()), table.log_store(), table.clone())
+        };
         let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-        let optimize_result = table_clone
-            .optimize()
-            .with_filters(&partition_filters)
-            // Z-order rewrites every file in the partition (Compact only
-            // touches small files), which is exactly what we need to lift
-            // the partition's tier.
-            .with_type(if schema.z_order_columns.is_empty() {
-                deltalake::operations::optimize::OptimizeType::Compact
-            } else {
-                deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone())
-            })
-            .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
-            .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
+
+        let provider = deltalake::delta_datafusion::TableProviderBuilder::default()
+            .with_log_store(log_store)
+            .with_eager_snapshot(snapshot)
+            .build()
+            .await
+            .map_err(|e| anyhow::anyhow!("recompress scan provider: {e}"))?;
+        let session = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env());
+        let ctx = datafusion::prelude::SessionContext::new_with_state(session);
+        ctx.register_table("recompress_src", Arc::new(provider))?;
+        // Literal date is safe: `date_str` is a parsed `chrono::NaiveDate`.
+        let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'")).await?.into_optimized_plan()?;
+
+        let replace_pred = format!("date = '{date_str}'");
+        let write_result = table_clone
+            .write(Vec::<RecordBatch>::new())
+            .with_input_plan(input_plan)
+            .with_save_mode(deltalake::protocol::SaveMode::Overwrite)
+            .with_replace_where(replace_pred.as_str())
             .with_writer_properties(writer_properties)
-            .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
+            .with_target_file_size(std::num::NonZero::new(target_size as u64))
             .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-            .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
+            .with_session_state(Arc::new(ctx.state()))
             .await;
 
-        match optimize_result {
-            Ok((new_table, metrics)) => {
-                info!(
-                    "recompress: date={} table={} removed={} added={} considered={}",
-                    date_str, table_name, metrics.num_files_removed, metrics.num_files_added, metrics.total_considered_files
-                );
+        match write_result {
+            Ok(new_table) => {
+                info!("recompress: date={} table={} rewritten at zstd={} (was {} files)", date_str, table_name, target_level, pre_uris.len());
                 // Swap + warm-added/evict-removed like the other optimize
                 // paths. A bare swap left the rewritten cold-tier files
                 // un-warmed and the tombstoned ones cached — the next query
@@ -7428,14 +7493,26 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_recompress_partition_skip_idempotency() -> Result<()> {
         tokio::time::timeout(std::time::Duration::from_secs(180), async {
-            let (db, _ctx, prefix) = setup_test_database().await?;
+            let (db, ctx, prefix) = setup_test_database().await?;
             let project_id = format!("project_{}", prefix);
             let today = chrono::Utc::now().date_naive();
 
-            let batch = json_to_batch(vec![test_span("rc1", "span1", &project_id)])?;
-            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+            // Two rows across two commits → the partition holds >1 file, so the
+            // rewrite genuinely merges (not a trivial single-file no-op).
+            for (id, name) in [("rc1", "span1"), ("rc2", "span2")] {
+                let batch = json_to_batch(vec![test_span(id, name, &project_id)])?;
+                db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], true, None).await?;
+            }
 
             let table_ref = get_unified_delta_table(db.unified_tables(), "otel_logs_and_spans").await.expect("table created");
+
+            // Data-integrity baseline: the replace_where rewrite must preserve
+            // every row verbatim (guards data loss / corruption from the
+            // streaming overwrite path, not just that *some* rewrite happened).
+            let rows_sql = format!("SELECT id, name FROM otel_logs_and_spans WHERE project_id = '{project_id}' ORDER BY id");
+            let ids_before = ctx.sql(&rows_sql).await?.collect().await?;
+            let count_before: usize = ids_before.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(count_before, 2, "baseline must have both rows");
 
             // First recompress at tier 9 — must rewrite files.
             let files_before: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
@@ -7443,6 +7520,12 @@ mod tests {
             db.recompress_partition(&table_ref, "otel_logs_and_spans", today, 9).await?;
             let files_after: Vec<String> = table_ref.read().await.get_file_uris()?.collect();
             assert_ne!(files_before, files_after, "first recompress must rewrite files");
+
+            // Rows survive the rewrite unchanged.
+            let ids_after = ctx.sql(&rows_sql).await?.collect().await?;
+            let count_after: usize = ids_after.iter().map(|b| b.num_rows()).sum();
+            assert_eq!(count_after, 2, "recompress must preserve all rows");
+            assert_eq!(format!("{ids_before:?}"), format!("{ids_after:?}"), "recompress must preserve row contents verbatim");
 
             // Re-run at the same tier — footer probe must detect tier=9 and skip,
             // so the file set is unchanged. If skip is broken, this assertion

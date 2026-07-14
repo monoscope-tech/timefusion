@@ -75,16 +75,75 @@ impl AnalyzerRule for VariantSelectRewriter {
         // matters: the child scan is patched first (transform_up is bottom-up),
         // so a parent Filter/Projection sees Variant-typed input columns and can
         // coerce its predicates before recompute type-checks them.
-        let patched = plan
-            .transform_up(|node| {
-                let patched = patch_table_scan(node)?.data;
-                let coerced = coerce_variant_value_positions(patched)?;
-                Ok(Transformed::yes(coerced.recompute_schema()?))
-            })?
-            .data;
+        let patched = restore_variant_scan_types(plan)?.data;
         // Pass 2: wrap Variant-typed projections at the topmost SELECT
         // projection with variant_to_json for the wire.
         wrap_root_projection(patched)
+    }
+}
+
+/// Restore the real Variant `Struct{Binary,Binary}` type on every TableScan's
+/// `projected_schema` (see `patch_table_scan`), lower any Variant-in-text-
+/// position expr back to `variant_to_json`, and recompute cached schemas
+/// bottom-up so the restored type propagates. Returns `Transformed::yes` iff at
+/// least one scan was actually re-typed.
+///
+/// Shared by the analyzer (`VariantSelectRewriter` Pass 1) and by
+/// `VariantScanSchemaRestore`, the optimizer rule that re-applies it after
+/// DataFusion's `optimize_projections` rebuilds each TableScan from the lying
+/// `ProjectRoutingTable::schema()` and thereby reverts Variant → Utf8View.
+pub(crate) fn restore_variant_scan_types(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    let mut changed = false;
+    let out = plan
+        .transform_up(|node| {
+            let patched = patch_table_scan(node)?;
+            changed |= patched.transformed;
+            // Once a scan below us was restored to Variant, this node's exprs may
+            // face `Struct op Utf8`; coerce them and recompute the cached schema
+            // so the new type propagates. Subtrees with no restored scan below
+            // are left untouched (recompute is harmless but pointless there).
+            if changed {
+                let coerced = coerce_variant_value_positions(patched.data)?;
+                Ok(Transformed::yes(coerced.recompute_schema()?))
+            } else {
+                Ok(patched)
+            }
+        })?
+        .data;
+    Ok(if changed { Transformed::yes(out) } else { Transformed::no(out) })
+}
+
+/// Re-applies `restore_variant_scan_types` after DataFusion's built-in
+/// `optimize_projections` rebuilds each `TableScan` via `TableScan::try_new`,
+/// which re-derives `projected_schema` from the lying `ProjectRoutingTable::schema()`
+/// (Variant → Utf8View + `tf.pg_type=jsonb`) and so discards the analyzer's
+/// Pass-1 Variant patch. The physical scan always emits the real Variant
+/// struct, so the reverted logical scan disagrees with it. Most SELECTs never
+/// notice, but DataFusion's Aggregate physical planner asserts
+/// physical-input-schema == logical-input-schema — and `DISTINCT ON` lowers to
+/// an Aggregate over `first_value` — so `SELECT DISTINCT ON (k) *` touching a
+/// Variant column blew up with XX000 "Physical input schema should be the
+/// same…" (2026-07-14 monoscope fetchEventExamples). Registered last so it runs
+/// after `optimize_projections` in each optimizer pass.
+#[derive(Debug, Default)]
+pub struct VariantScanSchemaRestore;
+
+impl datafusion::optimizer::OptimizerRule for VariantScanSchemaRestore {
+    fn name(&self) -> &str {
+        "variant_scan_schema_restore"
+    }
+
+    fn supports_rewrite(&self) -> bool {
+        true
+    }
+
+    fn rewrite(&self, plan: LogicalPlan, _config: &dyn datafusion::optimizer::OptimizerConfig) -> Result<Transformed<LogicalPlan>> {
+        // DML input scans are handled by VariantInsertRewriter (Utf8 literals →
+        // json_to_variant); re-typing them here would mismatch the writer.
+        if matches!(plan, LogicalPlan::Dml(_)) {
+            return Ok(Transformed::no(plan));
+        }
+        restore_variant_scan_types(plan)
     }
 }
 
@@ -117,15 +176,27 @@ fn patch_table_scan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 
     let real = routing.real_schema();
     // Build a patched arrow Schema where every Utf8View column whose
-    // real-schema counterpart is Variant gets the Variant data type back
-    // (and the extension-name metadata). O(n) lookup via a name→field map.
+    // real-schema counterpart is Variant gets the Variant data type back.
+    // O(n) lookup via a name→field map.
+    //
+    // We restore only the Variant Struct{Binary,Binary} *type*, with EMPTY
+    // field metadata — NOT `Arc::clone(real_field)`, which would carry the
+    // `ARROW:extension:name = arrow.parquet.variant` marker. The physical scan
+    // (both MemBuffer and Delta paths) emits Variant fields with no metadata,
+    // and DataFusion's Aggregate physical planner asserts that the physical
+    // input schema equals the one derived from the logical input — including
+    // field metadata. Cloning the marked field made `DISTINCT ON` over a
+    // Variant column fail that assert with XX000 even once the data type
+    // matched. The extension marker is only needed on the write path
+    // (delta-rs / parquet-variant-compute); Variant detection at read time is
+    // structural (`is_variant_type`), so dropping it here is safe.
     let real_by_name: std::collections::HashMap<&str, &Arc<Field>> = real.fields().iter().map(|f| (f.name().as_str(), f)).collect();
     let mut patched_fields: Vec<Arc<Field>> = Vec::with_capacity(lying_schema.fields().len());
     let mut changed = false;
     for f in lying_schema.fields() {
         match real_by_name.get(f.name().as_str()) {
             Some(real_field) if is_variant_type(real_field.data_type()) => {
-                patched_fields.push(Arc::clone(real_field));
+                patched_fields.push(Arc::new(Field::new(f.name(), real_field.data_type().clone(), real_field.is_nullable())));
                 changed = true;
             }
             _ => patched_fields.push(f.clone()),

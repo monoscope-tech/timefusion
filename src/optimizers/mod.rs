@@ -1,4 +1,5 @@
 mod defer_expensive_projection;
+mod ordered_union_for_topk;
 pub mod pg_array_literal_rewriter;
 mod tantivy_rewriter;
 mod variant_insert_rewriter;
@@ -10,10 +11,11 @@ use datafusion::{
     scalar::ScalarValue,
 };
 pub use defer_expensive_projection::DeferExpensiveProjection;
+pub use ordered_union_for_topk::OrderedUnionForTopK;
 pub use pg_array_literal_rewriter::PgArrayLiteralRewriter;
 pub use tantivy_rewriter::TantivyPredicateRewriter;
 pub use variant_insert_rewriter::VariantInsertRewriter;
-pub use variant_select_rewriter::VariantSelectRewriter;
+pub use variant_select_rewriter::{VariantScanSchemaRestore, VariantSelectRewriter};
 pub use wildcard_fn_arg_expander::WildcardFnArgExpander;
 
 /// Extract the string from a Utf8/Utf8View/LargeUtf8 scalar literal.

@@ -36,14 +36,16 @@ sorting_columns:
   - name: status_code
     descending: false
     nulls_first: false
-# Z-ORDER interleaves bits across all listed columns, so file-level min/max
-# stats become useful for each. Three dimensions trade a small amount of
-# per-dimension tightness for cross-dimensional file pruning — worth it when
-# service_name is also a frequent predicate.
-z_order_columns:
-  - timestamp
-  - id
-  - resource___service___name
+# No Z-ORDER. This is a time-dominant append log where ~all queries filter by
+# `timestamp`; Z-order's space-filling curve interleaves timestamp bits across
+# files/row-groups, loosening exactly the locality those queries prune on (it
+# fights the timestamp-leading `sorting_columns` above). Point lookups on
+# `id`/`trace_id`/`span_id` are served by bloom filters + tantivy, and
+# `service_name` by the secondary sort column — none need Z-order. The hot
+# compaction paths already bin-pack with plain Compact; the cold recompress
+# path force-rewrites via a streaming `replace_where` overwrite (see
+# `recompress_partition`), so nothing depends on this list anymore.
+z_order_columns: []
 fields:
   - name: date
     data_type: Date32

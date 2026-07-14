@@ -1,0 +1,38 @@
+# Regression: `SELECT DISTINCT ON (k) *` over a table with Variant columns,
+# then an outer projection referencing a Variant column (`errors is not null`),
+# blew up with a DataFusion physical/logical schema mismatch:
+#   field data type at index N [errors]:
+#     (physical) Struct{metadata,value} arrow.parquet.variant
+#     vs (logical) Utf8View tf.pg_type=jsonb
+# The Variant TableScan patch did not survive the DISTINCT ON → Aggregate
+# rewrite, so the aggregate's logical schema kept the lying Utf8View type
+# while the physical child produced the real Variant struct.
+
+statement ok
+INSERT INTO otel_logs_and_spans (
+    project_id, timestamp, id, hashes, date,
+    name, kind, resource___service___name,
+    status_code, level, duration, summary,
+    context___trace_id, parent_id, errors
+) VALUES
+    ('distinct_variant', TIMESTAMP '2024-01-15T10:00:00Z', 'd_1', ARRAY['h']::VARCHAR[], DATE '2024-01-15',
+     'test', 'SERVER', 'svc', 'OK', 'INFO', 1000000, ARRAY['s'], 'trace_a', NULL, '{"err": "boom"}'),
+    ('distinct_variant', TIMESTAMP '2024-01-15T10:01:00Z', 'd_2', ARRAY['h']::VARCHAR[], DATE '2024-01-15',
+     'test', 'SERVER', 'svc', 'OK', 'INFO', 1000000, ARRAY['s'], 'trace_a', 'd_1', NULL),
+    ('distinct_variant', TIMESTAMP '2024-01-15T10:02:00Z', 'd_3', ARRAY['h']::VARCHAR[], DATE '2024-01-15',
+     'test', 'SERVER', 'svc', 'OK', 'INFO', 1000000, ARRAY['s'], 'trace_b', NULL, NULL)
+
+# The exact failing shape: DISTINCT ON (trace_id) * subquery, outer projection
+# with `errors is not null`.
+query TB
+SELECT context___trace_id, errors is not null
+FROM (
+    SELECT DISTINCT ON (context___trace_id) *
+    FROM otel_logs_and_spans
+    WHERE project_id='distinct_variant'
+    ORDER BY context___trace_id, parent_id ASC NULLS FIRST, timestamp ASC
+) sub
+ORDER BY context___trace_id ASC
+----
+trace_a true
+trace_b false
