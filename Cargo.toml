@@ -73,7 +73,10 @@ aws-config = { version = "1.6.0", features = ["behavior-version-latest"] }
 aws-types = "1.3.6"
 aws-sdk-s3 = "1.3.0"
 url = "2.5.4"
-tokio-cron-scheduler = "0.15"
+# Cron parsing only. We drive the wall-clock loop ourselves (see
+# spawn_cron_job) rather than tokio-cron-scheduler, which silently stopped
+# dispatching ticks in prod (2026-07-13: 0 maintenance runs over 14h uptime).
+croner = "3"
 object_store = "0.13.2"
 foyer = { version = "0.22.3", features = ["serde"] }
 ahash = "0.8"

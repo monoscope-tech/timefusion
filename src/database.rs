@@ -522,6 +522,51 @@ fn build_optimize_session_state(
     SessionStateBuilder::new().with_config(cfg).with_runtime_env(runtime_env).with_default_features().build()
 }
 
+/// Spawn a background task that runs `job` at each wall-clock occurrence of the
+/// cron `schedule` (croner, 6-field with seconds, UTC). Fire times are computed
+/// from the system clock via `find_next_occurrence`, so they are predictable and
+/// independent of process start time — the same job fires at e.g. :00/:30 on
+/// every replica regardless of when it booted. Exits when `cancel` fires.
+///
+/// Replaces tokio-cron-scheduler, which silently stopped dispatching ticks in
+/// prod (2026-07-13: 0 optimize/checkpoint runs over 14h of uptime despite the
+/// jobs being scheduled at boot). Driving the loop ourselves keeps it debuggable.
+fn spawn_cron_job<F, Fut>(name: &'static str, schedule: &str, cancel: Arc<CancellationToken>, job: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    if schedule.trim().is_empty() {
+        info!("{name} job scheduling skipped - empty schedule");
+        return;
+    }
+    let cron: croner::Cron = match schedule.parse() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("{name} job disabled - invalid cron '{schedule}': {e}");
+            return;
+        }
+    };
+    info!("{name} job scheduled with cron expression: {schedule}");
+    tokio::spawn(async move {
+        loop {
+            let now = chrono::Utc::now();
+            let dur = match cron.find_next_occurrence(&now, false) {
+                // Strictly-future (inclusive=false) next fire, so `dur` is always > 0.
+                Ok(next) => (next - now).to_std().unwrap_or(std::time::Duration::from_secs(1)),
+                Err(e) => {
+                    error!("{name} job stopped - no next occurrence: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(dur) => job().await,
+            }
+        }
+    });
+}
+
 /// Cast Variant struct columns (Struct{BinaryView,BinaryView}) to the
 /// Binary-backed form delta-kernel's `unshredded_variant()` requires on
 /// On-disk key for the WAL watermark stored in `commitInfo.info`. Constant so
@@ -1627,276 +1672,192 @@ impl Database {
 
     /// Start background maintenance schedulers for optimize and vacuum operations
     pub async fn start_maintenance_schedulers(self) -> Result<Self> {
-        use tokio_cron_scheduler::{Job, JobScheduler};
-
-        let scheduler = JobScheduler::new().await?;
         let db = Arc::new(self.clone());
+        let cancel = self.maintenance_shutdown.clone();
 
-        // Light optimize job - every 5 minutes for small recent files
-        let light_optimize_schedule = &self.config.maintenance.timefusion_light_optimize_schedule;
-
-        if !light_optimize_schedule.is_empty() {
-            info!("Light optimize job scheduled with cron expression: {}", light_optimize_schedule);
-
-            let light_optimize_job = Job::new_async(light_optimize_schedule, {
+        // Light optimize — dedup + bin-pack recent small files (every ~5 min).
+        spawn_cron_job("Light optimize", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
                 let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move {
-                        let Ok(_gate) = db.light_optimize_gate.try_lock() else {
-                            warn!("light optimize tick skipped: previous tick still running");
+                async move {
+                    let Ok(_gate) = db.light_optimize_gate.try_lock() else {
+                        warn!("light optimize tick skipped: previous tick still running");
+                        return;
+                    };
+                    info!("Running scheduled light optimize on recent small files");
+                    // Dedup FIRST so the light compact bin-packs already-deduped files —
+                    // otherwise compact would merge duplicates into one file we'd rewrite again.
+                    for (table_name, table) in db.unified_tables.read().await.iter() {
+                        if db.maintenance_shutdown.is_cancelled() {
                             return;
-                        };
-                        info!("Running scheduled light optimize on recent small files");
-                        // Optimize unified tables. Run dedup FIRST so the
-                        // light compact bin-packs already-deduped files —
-                        // otherwise compact would rewrite the duplicates into
-                        // a single file that we'd then have to rewrite again.
-                        for (table_name, table) in db.unified_tables.read().await.iter() {
-                            if db.maintenance_shutdown.is_cancelled() {
-                                return;
-                            }
-                            if let Err(e) = db.dedup_today_partitions(table, table_name, table_name).await {
-                                error!("Dedup sweep failed for unified table '{}': {}", table_name, e);
-                            }
-                            match db.optimize_table_light(table, table_name).await {
-                                Ok(_) => info!("Light optimize completed for unified table '{}'", table_name),
-                                Err(e) => error!("Light optimize failed for unified table '{}': {}", table_name, e),
-                            }
                         }
-                        // Optimize custom project tables
-                        for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                            if db.maintenance_shutdown.is_cancelled() {
-                                return;
-                            }
-                            let key = format!("{}:{}", project_id, table_name);
-                            if let Err(e) = db.dedup_today_partitions(table, table_name, &key).await {
-                                error!("Dedup sweep failed for custom project '{}' table '{}': {}", project_id, table_name, e);
-                            }
-                            match db.optimize_table_light(table, table_name).await {
-                                Ok(_) => info!("Light optimize completed for custom project '{}' table '{}'", project_id, table_name),
-                                Err(e) => error!("Light optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e),
-                            }
+                        if let Err(e) = db.dedup_today_partitions(table, table_name, table_name).await {
+                            error!("Dedup sweep failed for unified table '{}': {}", table_name, e);
                         }
-                    })
+                        match db.optimize_table_light(table, table_name).await {
+                            Ok(_) => info!("Light optimize completed for unified table '{}'", table_name),
+                            Err(e) => error!("Light optimize failed for unified table '{}': {}", table_name, e),
+                        }
+                    }
+                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                        if db.maintenance_shutdown.is_cancelled() {
+                            return;
+                        }
+                        let key = format!("{}:{}", project_id, table_name);
+                        if let Err(e) = db.dedup_today_partitions(table, table_name, &key).await {
+                            error!("Dedup sweep failed for custom project '{}' table '{}': {}", project_id, table_name, e);
+                        }
+                        match db.optimize_table_light(table, table_name).await {
+                            Ok(_) => info!("Light optimize completed for custom project '{}' table '{}'", project_id, table_name),
+                            Err(e) => error!("Light optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e),
+                        }
+                    }
                 }
-            })?;
+            }
+        });
 
-            scheduler.add(light_optimize_job).await?;
-        } else {
-            info!("Light optimize job scheduling skipped - empty schedule");
-        }
-
-        // Optimize job - configurable schedule (default: every 30mins)
-        let optimize_schedule = &self.config.maintenance.timefusion_optimize_schedule;
-
-        if !optimize_schedule.is_empty() {
-            info!("Optimize job scheduled with cron expression: {} (processes last 28 hours only)", optimize_schedule);
-
-            let optimize_job = Job::new_async(optimize_schedule, {
+        // Full optimize — window-wide compaction (every ~30 min; Compact, see optimize_table).
+        spawn_cron_job("Optimize", &self.config.maintenance.timefusion_optimize_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
                 let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move {
-                        info!("Running scheduled optimize on all tables");
-                        // Optimize unified tables
-                        for (table_name, table) in db.unified_tables.read().await.iter() {
-                            if let Err(e) = db.optimize_table(table, table_name, None).await {
-                                error!("Optimize failed for unified table '{}': {}", table_name, e);
-                            }
+                async move {
+                    info!("Running scheduled optimize on all tables");
+                    for (table_name, table) in db.unified_tables.read().await.iter() {
+                        if let Err(e) = db.optimize_table(table, table_name, None).await {
+                            error!("Optimize failed for unified table '{}': {}", table_name, e);
                         }
-                        // Optimize custom project tables
-                        for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                            if let Err(e) = db.optimize_table(table, table_name, None).await {
-                                error!("Optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e);
-                            }
+                    }
+                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                        if let Err(e) = db.optimize_table(table, table_name, None).await {
+                            error!("Optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e);
                         }
-                    })
+                    }
                 }
-            })?;
+            }
+        });
 
-            scheduler.add(optimize_job).await?;
-        } else {
-            info!("Optimize job scheduling skipped - empty schedule");
-        }
-
-        // Consolidate job - daily cold sweep that bin-packs sealed partitions
-        // (older than cold_optimize_after_days) to the 1GB cold target. Covers
-        // "previous days and further" beyond the 48h warm window; idempotent.
-        let consolidate_schedule = &self.config.maintenance.timefusion_consolidate_schedule;
-        if !consolidate_schedule.is_empty() {
-            info!("Consolidate job scheduled with cron expression: {}", consolidate_schedule);
-            let consolidate_job = Job::new_async(consolidate_schedule.as_str(), {
+        // Consolidate — daily cold sweep bin-packing sealed partitions (older than
+        // cold_optimize_after_days) to the 1GB cold target, beyond the 48h warm window.
+        spawn_cron_job("Consolidate", &self.config.maintenance.timefusion_consolidate_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
                 let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move {
-                        info!("Running scheduled cold consolidation on sealed partitions");
-                        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
-                            db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
-                        targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
-                        for (name, table) in &targets {
-                            if let Err(e) = db.consolidate_sealed_partitions(table, name).await {
-                                error!("Consolidate (cold tier) failed for '{}': {}", name, e);
-                            }
+                async move {
+                    info!("Running scheduled cold consolidation on sealed partitions");
+                    let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
+                        db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+                    targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
+                    for (name, table) in &targets {
+                        if let Err(e) = db.consolidate_sealed_partitions(table, name).await {
+                            error!("Consolidate (cold tier) failed for '{}': {}", name, e);
                         }
-                    })
+                    }
                 }
-            })?;
-            scheduler.add(consolidate_job).await?;
-        } else {
-            info!("Consolidate job scheduling skipped - empty schedule");
-        }
+            }
+        });
 
-        // Recompress job - daily tier upgrade for cold (14d+).
-        // Skips partitions whose probe file already advertises the target tier
-        // via Parquet footer metadata, so re-runs are cheap on stable data.
-        let recompress_schedule = self.config.maintenance.timefusion_recompress_schedule.clone();
+        // Recompress — daily tier upgrade for cold (14d+). Skips partitions whose
+        // probe file already advertises the target tier, so re-runs are cheap.
         let cold_cutoff = self.config.parquet.timefusion_cold_cutoff_days;
         let zstd_cold = self.config.parquet.timefusion_zstd_level_cold;
-
-        if !recompress_schedule.is_empty() {
-            info!("Recompress job scheduled: {} (warm→cold@{}d zstd={})", recompress_schedule, cold_cutoff, zstd_cold);
-            // Cold sweep upper bound — partitions older than this fall under
-            // vacuum; we don't need to keep extending the window indefinitely.
-            let cold_upper = (self.config.maintenance.timefusion_vacuum_retention_hours / 24).max(cold_cutoff + 60);
-
-            let recompress_job = Job::new_async(recompress_schedule.as_str(), {
-                let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move {
-                        info!("Running scheduled tier recompression");
-                        // Flatten unified + custom tables into one (name, table) list.
-                        let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
-                            db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
-                        targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
-                        for (name, table) in &targets {
-                            if let Err(e) = db.recompress_tier_window(table, name, cold_cutoff, cold_upper, zstd_cold).await {
-                                error!("Recompress (cold tier) failed for '{}': {}", name, e);
-                            }
-                        }
-                    })
-                }
-            })?;
-            scheduler.add(recompress_job).await?;
-        } else {
-            info!("Recompress job scheduling skipped - empty schedule");
-        }
-
-        // Vacuum job - configurable schedule (default: daily at 2AM)
-        let vacuum_schedule = &self.config.maintenance.timefusion_vacuum_schedule;
-        let vacuum_retention = self.config.maintenance.timefusion_vacuum_retention_hours;
-
-        if !vacuum_schedule.is_empty() {
-            info!("Vacuum job scheduled with cron expression: {}", vacuum_schedule);
-
-            let vacuum_job = Job::new_async(vacuum_schedule.as_str(), {
-                let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move {
-                        info!("Running scheduled vacuum on all tables");
-                        let retention_hours = vacuum_retention;
-
-                        // Vacuum unified tables
-                        for (table_name, table) in db.unified_tables.read().await.iter() {
-                            info!("Vacuuming unified table '{}' (retention: {}h)", table_name, retention_hours);
-                            db.vacuum_table(table, retention_hours).await;
-                        }
-                        // Vacuum custom project tables
-                        for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                            info!("Vacuuming custom project '{}' table '{}' (retention: {}h)", project_id, table_name, retention_hours);
-                            db.vacuum_table(table, retention_hours).await;
-                        }
-                    })
-                }
-            })?;
-
-            scheduler.add(vacuum_job).await?;
-        } else {
-            info!("Vacuum job scheduling skipped - empty schedule");
-        }
-
-        // Checkpoint + expired-log cleanup job — runs the post-commit hooks
-        // out-of-band (see base_commit_properties / the 2026-07-09 incident) so
-        // R2 500s on the checkpoint PUT or bulk log ?delete never fail a landed
-        // commit. Faster cadence than the ~1.5s commit rate keeps the log bounded.
-        let checkpoint_schedule = self.config.maintenance.timefusion_checkpoint_schedule.clone();
-        if !checkpoint_schedule.is_empty() {
-            info!("Checkpoint job scheduled with cron expression: {}", checkpoint_schedule);
-            let checkpoint_job = Job::new_async(checkpoint_schedule.as_str(), {
-                let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move { db.run_checkpoint_maintenance().await })
-                }
-            })?;
-            scheduler.add(checkpoint_job).await?;
-        } else {
-            info!("Checkpoint job scheduling skipped - empty schedule");
-        }
-
-        // Reconcile job — repair dangling Add entries (committed parquet deleted
-        // by a past commit-path failure) by Remove'ing them via filesystem_check.
-        let reconcile_schedule = self.config.maintenance.timefusion_reconcile_schedule.clone();
-        if !reconcile_schedule.is_empty() {
-            info!("Reconcile job scheduled with cron expression: {}", reconcile_schedule);
-            let reconcile_job = Job::new_async(reconcile_schedule.as_str(), {
-                let db = db.clone();
-                move |_, _| {
-                    let db = db.clone();
-                    Box::pin(async move { db.run_reconcile_maintenance().await })
-                }
-            })?;
-            scheduler.add(reconcile_job).await?;
-        } else {
-            info!("Reconcile job scheduling skipped - empty schedule");
-        }
-
-        // Cache stats job - every 5 minutes
-        let cache_stats_job = Job::new_async("0 */5 * * * *", {
+        // Cold sweep upper bound — older partitions fall under vacuum.
+        let cold_upper = (self.config.maintenance.timefusion_vacuum_retention_hours / 24).max(cold_cutoff + 60);
+        spawn_cron_job("Recompress", &self.config.maintenance.timefusion_recompress_schedule, cancel.clone(), {
             let db = db.clone();
-            move |_, _| {
+            move || {
                 let db = db.clone();
-                Box::pin(async move {
-                    // Log Foyer cache stats if available
+                async move {
+                    info!("Running scheduled tier recompression (warm→cold@{}d zstd={})", cold_cutoff, zstd_cold);
+                    let mut targets: Vec<(String, Arc<RwLock<DeltaTable>>)> =
+                        db.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
+                    targets.extend(db.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
+                    for (name, table) in &targets {
+                        if let Err(e) = db.recompress_tier_window(table, name, cold_cutoff, cold_upper, zstd_cold).await {
+                            error!("Recompress (cold tier) failed for '{}': {}", name, e);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Vacuum — expired-file removal (default: daily at 2AM).
+        let vacuum_retention = self.config.maintenance.timefusion_vacuum_retention_hours;
+        spawn_cron_job("Vacuum", &self.config.maintenance.timefusion_vacuum_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move {
+                    info!("Running scheduled vacuum on all tables");
+                    for (table_name, table) in db.unified_tables.read().await.iter() {
+                        info!("Vacuuming unified table '{}' (retention: {}h)", table_name, vacuum_retention);
+                        db.vacuum_table(table, vacuum_retention).await;
+                    }
+                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                        info!("Vacuuming custom project '{}' table '{}' (retention: {}h)", project_id, table_name, vacuum_retention);
+                        db.vacuum_table(table, vacuum_retention).await;
+                    }
+                }
+            }
+        });
+
+        // Checkpoint + expired-log cleanup — runs the post-commit hooks out-of-band
+        // (see the 2026-07-09 incident) so R2 500s on the checkpoint PUT / bulk log
+        // delete never fail a landed commit; faster cadence keeps the log bounded.
+        spawn_cron_job("Checkpoint", &self.config.maintenance.timefusion_checkpoint_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move { db.run_checkpoint_maintenance().await }
+            }
+        });
+
+        // Reconcile — repair dangling Add entries (committed parquet deleted by a
+        // past commit-path failure) by Remove'ing them via filesystem_check.
+        spawn_cron_job("Reconcile", &self.config.maintenance.timefusion_reconcile_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move { db.run_reconcile_maintenance().await }
+            }
+        });
+
+        // Cache stats — every 5 minutes.
+        spawn_cron_job("Cache stats", "0 */5 * * * *", cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move {
                     if let Some(ref cache) = db.object_store_cache {
                         cache.log_stats().await;
                     }
-
-                    // Log statistics cache stats
                     let (used, capacity) = db.statistics_extractor.get_cache_stats().await;
                     info!("Statistics cache: {}/{} entries used", used, capacity);
-                })
+                }
             }
-        })?;
+        });
 
-        scheduler.add(cache_stats_job).await?;
-
-        // Statistics refresh job - every 15 minutes
-        let stats_refresh_job = Job::new_async("0 */15 * * * *", {
+        // Statistics refresh — every 15 minutes.
+        spawn_cron_job("Statistics refresh", "0 */15 * * * *", cancel.clone(), {
             let db = db.clone();
-            move |_, _| {
+            move || {
                 let db = db.clone();
-                Box::pin(async move {
+                async move {
                     info!("Refreshing Delta Lake statistics cache");
                     db.statistics_extractor.clear_cache().await;
-
-                    // Pre-warm cache for unified tables
+                    // Pre-warm unified tables (empty project_id — they're shared).
                     for (table_name, table) in db.unified_tables.read().await.iter() {
                         let table = table.read().await;
                         let current_version = table.version().unwrap_or(0);
                         let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
                         let schema = schema_def.schema_ref();
-                        // Use empty string for project_id since unified tables are shared
                         if let Err(e) = db.statistics_extractor.extract_statistics(&table, "", table_name, &schema).await {
                             error!("Failed to refresh statistics for unified table '{}': {}", table_name, e);
                         } else {
                             debug!("Refreshed statistics for unified table '{}' (version {})", table_name, current_version);
                         }
                     }
-                    // Pre-warm cache for custom project tables
                     for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
                         let table = table.read().await;
                         let current_version = table.version().unwrap_or(0);
@@ -1908,30 +1869,12 @@ impl Database {
                             debug!("Refreshed statistics for {}:{} (version {})", project_id, table_name, current_version);
                         }
                     }
-                })
-            }
-        })?;
-
-        scheduler.add(stats_refresh_job).await?;
-
-        // Start the scheduler
-        scheduler.start().await?;
-
-        // On shutdown, stop the scheduler so no new ticks dispatch. In-flight
-        // ticks bail on their own `maintenance_shutdown` checkpoints (the
-        // light-optimize job and `dedup_today_partitions`). Move `scheduler`
-        // into the task — otherwise it drops when this fn returns and
-        // `shutdown()` is never called, leaving the scheduler running.
-        let shutdown = self.maintenance_shutdown.clone();
-        let mut scheduler = scheduler;
-        tokio::spawn(async move {
-            shutdown.cancelled().await;
-            info!("Shutting down maintenance scheduler");
-            if let Err(e) = scheduler.shutdown().await {
-                warn!("maintenance scheduler shutdown error: {}", e);
+                }
             }
         });
 
+        // Each spawn_cron_job task exits on its own when `maintenance_shutdown`
+        // fires (cancel_maintenance()), so no separate scheduler teardown is needed.
         Ok(self)
     }
 
@@ -6864,6 +6807,36 @@ mod tests {
                 .target_partitions,
             4
         );
+    }
+
+    /// spawn_cron_job must fire on the wall-clock schedule (regression: the
+    /// tokio-cron-scheduler it replaced silently stopped ticking in prod, 14h /
+    /// 0 runs) and stop firing once the maintenance cancel token is triggered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_cron_job_fires_on_schedule_then_stops_on_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(CancellationToken::new());
+        {
+            let count = count.clone();
+            // "* * * * * *" = every second (6-field, seconds).
+            spawn_cron_job("test", "* * * * * *", cancel.clone(), move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let fired = count.load(Ordering::SeqCst);
+        assert!(fired >= 2, "every-second cron should fire >=2x in 2.5s, got {fired}");
+
+        cancel.cancel();
+        // Allow an in-flight tick to settle, then confirm the count is frozen.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let after_cancel = count.load(Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert_eq!(count.load(Ordering::SeqCst), after_cancel, "no fires after cancel");
     }
 
     /// The shared OCC classifier must treat every retryable delta-rs conflict as
