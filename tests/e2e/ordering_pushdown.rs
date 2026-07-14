@@ -74,7 +74,12 @@ async fn order_by_ts_desc_limit_merges_mem_and_delta() -> anyhow::Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<()> {
     let bucket_secs = 60u64;
-    let env = E2eEnv::builder().with_bucket_duration(Duration::from_secs(bucket_secs)).with_retention(Duration::from_secs(60 * 60)).start().await?;
+    let env = E2eEnv::builder()
+        .with_bucket_duration(Duration::from_secs(bucket_secs))
+        .with_retention(Duration::from_secs(60 * 60))
+        .with_optimize_sort_by()
+        .start()
+        .await?;
     let client = env.pg_client().await?;
 
     let sec = 1_000_000i64;

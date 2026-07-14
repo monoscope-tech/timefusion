@@ -916,6 +916,19 @@ pub struct MaintenanceConfig {
     /// Re-enable only once Z-order's memory footprint is bounded.
     #[serde(default)]
     pub timefusion_optimize_use_zorder: bool,
+    /// Rewrite optimize/compact/recompress output as a global lexicographic sort
+    /// by the schema's `sorting_columns` (delta-rs `OptimizeType::SortBy`) with an
+    /// honest DESC footer, so the timestamp-ordering/LIMIT pushdown keeps firing
+    /// on optimized partitions. Default OFF: like Z-order, the whole-partition
+    /// global sort exhausts the bounded maintenance pool on the busy
+    /// otel_logs_and_spans table ("Not enough memory to continue external sort",
+    /// prod 2026-07-14), even with spilling. Plain Compact keeps maintenance
+    /// memory-safe; the pushdown still fires on MemBuffer + freshly-flushed
+    /// (not-yet-optimized) files, which is the hot path for "latest N" queries.
+    /// Re-enable once the maintenance sort has a bounded memory envelope
+    /// (dedicated pool / per-partition target sizing).
+    #[serde(default)]
+    pub timefusion_optimize_sort_by: bool,
     #[serde(default = "d_compact_min_files")]
     pub timefusion_compact_min_files: usize,
     #[serde(default = "d_light_optimize_target")]

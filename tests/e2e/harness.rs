@@ -34,6 +34,7 @@ pub struct E2eEnvBuilder {
     max_memory_mb: usize,
     frozen_at_micros: i64,
     checkpoint_interval: u64,
+    optimize_sort_by: bool,
 }
 
 impl Default for E2eEnvBuilder {
@@ -49,6 +50,7 @@ impl Default for E2eEnvBuilder {
             max_memory_mb: 256,
             frozen_at_micros: FROZEN_START_MICROS,
             checkpoint_interval: 10,
+            optimize_sort_by: false,
         }
     }
 }
@@ -92,6 +94,10 @@ impl E2eEnvBuilder {
     }
     pub fn with_checkpoint_interval(mut self, n: u64) -> Self {
         self.checkpoint_interval = n;
+        self
+    }
+    pub fn with_optimize_sort_by(mut self) -> Self {
+        self.optimize_sort_by = true;
         self
     }
 
@@ -161,6 +167,7 @@ impl E2eEnvBuilder {
             flush_immediately: self.flush_immediately,
             max_memory_mb: self.max_memory_mb,
             checkpoint_interval: self.checkpoint_interval,
+            optimize_sort_by: self.optimize_sort_by,
             test_id: &test_id,
         });
 
@@ -255,6 +262,7 @@ impl E2eEnv {
             flush_immediately: self.builder.flush_immediately,
             max_memory_mb: self.builder.max_memory_mb,
             checkpoint_interval: self.builder.checkpoint_interval,
+            optimize_sort_by: self.builder.optimize_sort_by,
             test_id: &self.test_id,
         });
 
@@ -348,6 +356,7 @@ struct BuildCfgArgs<'a> {
     flush_immediately: bool,
     max_memory_mb: usize,
     checkpoint_interval: u64,
+    optimize_sort_by: bool,
     test_id: &'a str,
 }
 
@@ -370,6 +379,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.buffer.timefusion_flush_immediately = args.flush_immediately;
     cfg.cache.timefusion_foyer_disabled = args.foyer_disabled;
     cfg.parquet.timefusion_checkpoint_interval = args.checkpoint_interval;
+    cfg.maintenance.timefusion_optimize_sort_by = args.optimize_sort_by;
     Arc::new(cfg)
 }
 

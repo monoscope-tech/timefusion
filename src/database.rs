@@ -3856,7 +3856,8 @@ impl Database {
         // declare_sorted=false → pushdown disabled within one cycle). Falls back
         // to ZOrder/Compact when Z-order is explicitly enabled or no sort order
         // is declared.
-        let (optimize_type, declare_sorted) = choose_optimize_type(schema, self.config.maintenance.timefusion_optimize_use_zorder);
+        let (optimize_type, declare_sorted) =
+            choose_optimize_type(schema, self.config.maintenance.timefusion_optimize_use_zorder, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
 
         // Same trade-off as optimize_table_light: best-effort, don't pause
@@ -4087,7 +4088,7 @@ impl Database {
             // SortBy: globally sort the partition by the schema keys and declare
             // it, so cold/consolidated partitions keep an honest DESC footer for
             // the ordering pushdown (plain Compact concatenates → declare false).
-            let (optimize_type, declare_sorted) = choose_optimize_type(schema, false);
+            let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
             let result = table_clone
                 .optimize()
@@ -4236,7 +4237,10 @@ impl Database {
         // honest DESC footer — a bare `SELECT *` concatenation would strip the
         // ordering that optimize/compact established. `declare_sorted` tracks
         // whether we actually sort (empty clause when no sort order declared).
-        let order_by = schema_order_by_clause(schema);
+        // Gated by timefusion_optimize_sort_by: a global ORDER BY sort of a cold
+        // partition can exhaust the bounded maintenance pool (same limit that
+        // disables SortBy for optimize). Off → bare SELECT * (no sort, declare false).
+        let order_by = if self.config.maintenance.timefusion_optimize_sort_by { schema_order_by_clause(schema) } else { String::new() };
         let declare_sorted = !order_by.is_empty();
         let writer_properties = self.create_writer_properties(schema, target_level, declare_sorted);
         let target_size = self.config.parquet.timefusion_optimize_target_size;
@@ -4986,8 +4990,9 @@ impl Database {
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         // SortBy the schema keys (declare_sorted=true) so the current partition's
-        // light-compacted files keep an honest DESC footer for the pushdown.
-        let (optimize_type, declare_sorted) = choose_optimize_type(schema, false);
+        // light-compacted files keep an honest DESC footer for the pushdown
+        // (only when timefusion_optimize_sort_by is on; else memory-safe Compact).
+        let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, declare_sorted);
 
         // Best-effort optimize: retry on OCC conflict but DO NOT hold the
@@ -5597,18 +5602,23 @@ fn schema_order_by_clause(schema: &crate::schema_loader::TableSchema) -> String 
     format!(" ORDER BY {cols}")
 }
 
-/// Pick the optimize strategy for a rewrite. Prefers `SortBy` the schema's
-/// (timestamp-DESC-first) sort keys so the output is globally sorted with an
-/// honest footer — keeping the ordering/limit pushdown alive on optimized
-/// partitions. Falls back to `ZOrder` only when explicitly enabled, else
-/// `Compact`. Returns `(optimize_type, declare_sorted)`.
-fn choose_optimize_type(schema: &crate::schema_loader::TableSchema, allow_zorder: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
+/// Pick the optimize strategy for a rewrite. With `allow_sort` (config
+/// `timefusion_optimize_sort_by`, default OFF) prefers `SortBy` the schema's
+/// (timestamp-DESC-first) keys so the output is globally sorted with an honest
+/// footer — keeping the ordering/limit pushdown alive on optimized partitions.
+/// `allow_zorder` selects Z-order. Both are memory-heavy global sorts that can
+/// exhaust the bounded maintenance pool on large partitions, so the safe
+/// default is `Compact` (bin-pack, no global sort). Returns
+/// `(optimize_type, declare_sorted)`.
+fn choose_optimize_type(
+    schema: &crate::schema_loader::TableSchema, allow_zorder: bool, allow_sort: bool,
+) -> (deltalake::operations::optimize::OptimizeType, bool) {
     use deltalake::operations::optimize::OptimizeType;
     if allow_zorder && !schema.z_order_columns.is_empty() {
         return (OptimizeType::ZOrder(schema.z_order_columns.clone()), false);
     }
     let sort_cols = schema_optimize_sort_columns(schema);
-    if sort_cols.is_empty() { (OptimizeType::Compact, false) } else { (OptimizeType::SortBy(sort_cols), true) }
+    if allow_sort && !sort_cols.is_empty() { (OptimizeType::SortBy(sort_cols), true) } else { (OptimizeType::Compact, false) }
 }
 
 /// Pure builder for parquet `WriterProperties` at a given compression tier.
