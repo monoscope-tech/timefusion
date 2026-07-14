@@ -99,10 +99,12 @@ fn order_union(plan: &Arc<dyn ExecutionPlan>, req: &LexOrdering, fetch: Option<u
     // Descend only through single-child, order-preserving operators so the
     // ordering we create actually propagates up to the sort.
     let children = plan.children();
-    if children.len() == 1 && plan.maintains_input_order().first() == Some(&true)
-        && let Some(new_child) = order_union(children[0], req, fetch)? {
-            return Ok(Some(Arc::clone(plan).with_new_children(vec![new_child])?));
-        }
+    if children.len() == 1
+        && plan.maintains_input_order().first() == Some(&true)
+        && let Some(new_child) = order_union(children[0], req, fetch)?
+    {
+        return Ok(Some(Arc::clone(plan).with_new_children(vec![new_child])?));
+    }
     Ok(None)
 }
 
@@ -184,7 +186,7 @@ mod tests {
     }
 
     impl MockLeaf {
-        fn new(schema: SchemaRef, ordering: Option<LexOrdering>) -> Arc<dyn ExecutionPlan> {
+        fn leaf(schema: SchemaRef, ordering: Option<LexOrdering>) -> Arc<dyn ExecutionPlan> {
             use datafusion::physical_expr::EquivalenceProperties;
             let eq = match ordering {
                 Some(o) => EquivalenceProperties::new_with_orderings(schema, [o]),
@@ -237,8 +239,8 @@ mod tests {
     fn wraps_unordered_mem_branch_of_fetching_sort() {
         let s = schema();
         let ord = ts_desc();
-        let mem = MockLeaf::new(s.clone(), None); // MemBuffer: no ordering
-        let delta = MockLeaf::new(s.clone(), Some(ord.clone())); // Delta: [ts DESC]
+        let mem = MockLeaf::leaf(s.clone(), None); // MemBuffer: no ordering
+        let delta = MockLeaf::leaf(s.clone(), Some(ord.clone())); // Delta: [ts DESC]
         let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![mem, delta]).unwrap();
         let top: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ord.clone(), union).with_fetch(Some(50)));
 
@@ -260,8 +262,8 @@ mod tests {
     fn ignores_sort_without_fetch() {
         let s = schema();
         let ord = ts_desc();
-        let mem = MockLeaf::new(s.clone(), None);
-        let delta = MockLeaf::new(s.clone(), Some(ord.clone()));
+        let mem = MockLeaf::leaf(s.clone(), None);
+        let delta = MockLeaf::leaf(s.clone(), Some(ord.clone()));
         let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![mem, delta]).unwrap();
         let top: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ord.clone(), union));
 
@@ -275,8 +277,8 @@ mod tests {
     fn ignores_union_with_no_ordered_child() {
         let s = schema();
         let ord = ts_desc();
-        let mem = MockLeaf::new(s.clone(), None);
-        let delta = MockLeaf::new(s.clone(), None);
+        let mem = MockLeaf::leaf(s.clone(), None);
+        let delta = MockLeaf::leaf(s.clone(), None);
         let union: Arc<dyn ExecutionPlan> = UnionExec::try_new(vec![mem, delta]).unwrap();
         let top: Arc<dyn ExecutionPlan> = Arc::new(SortExec::new(ord.clone(), union).with_fetch(Some(50)));
 

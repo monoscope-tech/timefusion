@@ -5004,6 +5004,7 @@ impl Database {
     /// Inner optimize loop. Caller is expected to hold the flush lock when
     /// a `BufferedWriteLayer` is active; the retry loop here remains as a
     /// safety net against bursts from `flush_all_now` or shutdown flushes.
+    #[allow(clippy::too_many_arguments)]
     async fn optimize_table_light_inner(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, today: chrono::NaiveDate, partition_filters: &[PartitionFilter], target_size: i64,
         writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType, start_time: std::time::Instant,

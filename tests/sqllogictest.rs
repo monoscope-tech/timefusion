@@ -244,6 +244,10 @@ mod sqllogictest_tests {
     /// Owns the MinIO instance for a test run. A locally-spawned `minio` binary
     /// is killed on drop; a Docker container is stopped by its own Drop; an
     /// externally-provided endpoint owns nothing.
+    // The `Container` variant is inherently large (owns the testcontainers
+    // handle); this guard is a single short-lived per-run value, so boxing
+    // would add indirection for no benefit. (clippy 1.91 large_enum_variant.)
+    #[allow(clippy::large_enum_variant)]
     enum MinioGuard {
         Process(std::process::Child),
         Container(#[allow(dead_code)] ContainerAsync<MinIO>),
