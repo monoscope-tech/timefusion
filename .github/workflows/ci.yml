@@ -53,6 +53,9 @@ jobs:
       AWS_REGION: us-east-1
       AWS_S3_BUCKET: timefusion-test
       AWS_S3_ENDPOINT: http://127.0.0.1:9000
+      # Reuse the MinIO started below; the sqllogictest harness skips its
+      # own testcontainers MinIO when this is set (avoids nested Docker).
+      TIMEFUSION_TEST_S3_ENDPOINT: http://127.0.0.1:9000
       AWS_ALLOW_HTTP: "true"
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin

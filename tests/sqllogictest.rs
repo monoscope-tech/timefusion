@@ -7,12 +7,14 @@ mod sqllogictest_tests {
         time::{Duration, Instant},
     };
 
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use async_trait::async_trait;
     use datafusion_postgres::ServerOptions;
     use dotenv::dotenv;
     use serial_test::serial;
     use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
+    use testcontainers::{ContainerAsync, runners::AsyncRunner};
+    use testcontainers_modules::minio::MinIO;
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{NoTls, Row};
@@ -239,9 +241,128 @@ mod sqllogictest_tests {
         Ok((client, handle))
     }
 
-    async fn start_test_server() -> Result<(Arc<Notify>, u16)> {
+    /// Owns the MinIO instance for a test run. A locally-spawned `minio` binary
+    /// is killed on drop; a Docker container is stopped by its own Drop; an
+    /// externally-provided endpoint owns nothing.
+    enum MinioGuard {
+        Process(std::process::Child),
+        Container(#[allow(dead_code)] ContainerAsync<MinIO>),
+        External,
+    }
+
+    impl Drop for MinioGuard {
+        fn drop(&mut self) {
+            if let MinioGuard::Process(child) = self {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    async fn port_open(addr: &str) -> bool {
+        tokio::net::TcpStream::connect(addr).await.is_ok()
+    }
+
+    /// Point the process at local MinIO so `Database::new()` never touches prod
+    /// object storage. Resolution order (local-first, Docker last):
+    ///   1. `TIMEFUSION_TEST_S3_ENDPOINT` if set (CI's MinIO, or any hand-run one).
+    ///   2. An already-running MinIO on 127.0.0.1:9000 (e.g. `make minio-start`).
+    ///   3. The local `minio` binary — spawned on :9000, killed when the test ends.
+    ///   4. Docker (testcontainers) — only when no `minio` binary is on PATH.
+    ///
+    /// So `cargo test --test sqllogictest` needs zero setup, and Docker is a
+    /// last resort rather than the default. Hitting non-local S3 is deliberately
+    /// hard: it requires exporting the real AWS_* creds *and*
+    /// `TIMEFUSION_TEST_S3_ENDPOINT` yourself.
+    async fn ensure_local_minio() -> Result<MinioGuard> {
+        const LOCAL: &str = "127.0.0.1:9000";
+        let (guard, endpoint) = if let Ok(ep) = std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
+            (MinioGuard::External, ep)
+        } else if port_open(LOCAL).await {
+            (MinioGuard::External, format!("http://{LOCAL}"))
+        } else if std::process::Command::new("minio").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+            let child = spawn_local_minio()?;
+            for _ in 0..100 {
+                if port_open(LOCAL).await {
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+            if !port_open(LOCAL).await {
+                return Err(anyhow::anyhow!("local `minio` binary never came up on {LOCAL}"));
+            }
+            (MinioGuard::Process(child), format!("http://{LOCAL}"))
+        } else {
+            let minio = MinIO::default().start().await.context("start MinIO container")?;
+            let host = minio.get_host().await.context("get MinIO host")?.to_string();
+            let port = minio.get_host_port_ipv4(9000).await.context("get MinIO port")?;
+            (MinioGuard::Container(minio), format!("http://{host}:{port}"))
+        };
+        let bucket = "timefusion-test";
+        unsafe {
+            std::env::set_var("AWS_S3_ENDPOINT", &endpoint);
+            std::env::set_var("AWS_ENDPOINT_URL", &endpoint);
+            std::env::set_var("AWS_S3_BUCKET", bucket);
+            std::env::set_var("AWS_ACCESS_KEY_ID", "minioadmin");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "minioadmin");
+            std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+            std::env::set_var("AWS_REGION", "us-east-1");
+            std::env::set_var("AWS_ALLOW_HTTP", "true");
+            std::env::set_var("AWS_S3_LOCKING_PROVIDER", "");
+            // Neutralize any prod DynamoDB locking leaking in from a stale .env.
+            std::env::remove_var("AWS_ENDPOINT_URL_DYNAMODB");
+        }
+        create_bucket(&endpoint, bucket).await?;
+        Ok(guard)
+    }
+
+    /// Spawn the local `minio` binary as a throwaway server on 127.0.0.1:9000.
+    fn spawn_local_minio() -> Result<std::process::Child> {
+        let data_dir = std::env::temp_dir().join("timefusion-slt-minio");
+        std::fs::create_dir_all(&data_dir).ok();
+        std::process::Command::new("minio")
+            .arg("server")
+            .arg(&data_dir)
+            .arg("--address")
+            .arg("127.0.0.1:9000")
+            .env("MINIO_ROOT_USER", "minioadmin")
+            .env("MINIO_ROOT_PASSWORD", "minioadmin")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("spawn local minio server")
+    }
+
+    /// Idempotent bucket create against MinIO (default creds minioadmin/minioadmin).
+    async fn create_bucket(endpoint: &str, bucket: &str) -> Result<()> {
+        use aws_sdk_s3::config::{Credentials, Region};
+        let creds = Credentials::new("minioadmin", "minioadmin", None, None, "slt");
+        let conf = aws_sdk_s3::config::Builder::new()
+            .endpoint_url(endpoint)
+            .credentials_provider(creds)
+            .region(Region::new("us-east-1"))
+            .force_path_style(true)
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .build();
+        match aws_sdk_s3::Client::from_conf(conf).create_bucket().bucket(bucket).send().await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let msg = format!("{e:?}");
+                if msg.contains("BucketAlreadyOwnedByYou") || msg.contains("BucketAlreadyExists") {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("create_bucket({bucket}) failed: {msg}"))
+                }
+            }
+        }
+    }
+
+    async fn start_test_server() -> Result<(Arc<Notify>, u16, MinioGuard)> {
         let test_id = Uuid::new_v4().to_string();
         dotenv().ok();
+
+        // Default all sqllogictests to local MinIO before Database::new() reads config.
+        let minio = ensure_local_minio().await?;
 
         // Use a unique port for each test run
         let port = 5433 + (std::process::id() % 100) as u16;
@@ -277,13 +398,14 @@ mod sqllogictest_tests {
         // Wait for server to be ready
         let _ = connect_with_retry(port, Duration::from_secs(5)).await?;
 
-        Ok((shutdown_signal, port))
+        Ok((shutdown_signal, port, minio))
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn run_sqllogictest() -> Result<()> {
-        let (shutdown_signal, port) = start_test_server().await?;
+        // `_minio` keeps the MinIO container alive for the whole test.
+        let (shutdown_signal, port, _minio) = start_test_server().await?;
 
         let _factory = || async move {
             let (client, _) = connect_with_retry(port, Duration::from_secs(3)).await?;
@@ -294,8 +416,9 @@ mod sqllogictest_tests {
         let test_dir = Path::new("tests/slt");
         let mut test_files = Vec::new();
 
-        // Check if a specific test file is requested via environment variable
-        let test_filter = std::env::var("SQLLOGICTEST_FILE").ok();
+        // Check if a specific test file is requested via environment variable.
+        // `SLT_FILTER` is a shorter alias for `SQLLOGICTEST_FILE`.
+        let test_filter = std::env::var("SQLLOGICTEST_FILE").or_else(|_| std::env::var("SLT_FILTER")).ok();
 
         // Pretty output mode
         let pretty_mode = std::env::var("SQLLOGICTEST_PRETTY").is_ok();
