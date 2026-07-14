@@ -5158,7 +5158,15 @@ impl Database {
         // Reset the lag gauge so it reflects THIS tick's worst table.
         crate::metrics::maintenance_stats().checkpoint_lag_versions.store(0, std::sync::atomic::Ordering::Relaxed);
         for (name, table) in self.all_tables().await {
-            self.checkpoint_and_cleanup_table(&table, &name).await;
+            // Bound each table so one wedged store call can't starve the rest
+            // of the sweep — the cron-level skip guard would otherwise skip
+            // every future tick while this run hangs. 600s is ~35x the largest
+            // observed catch-up (179k-version lag checkpointed in 17s,
+            // 2026-07-14); hitting it means a stuck backend, not a big table.
+            if tokio::time::timeout(std::time::Duration::from_secs(600), self.checkpoint_and_cleanup_table(&table, &name)).await.is_err() {
+                crate::metrics::record_checkpoint_failed();
+                warn!("checkpoint maintenance for '{}' timed out after 600s — skipping to next table (retry next tick)", name);
+            }
         }
     }
 
