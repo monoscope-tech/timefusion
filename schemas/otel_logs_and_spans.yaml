@@ -20,10 +20,19 @@ dedup_tiebreak: observed_timestamp
 # for any timestamp-bound query; sorting by service_name next clusters rows
 # of the same service together within each row group, so service_name filters
 # inside a time range prune at the page level.
+#
+# `timestamp` is sorted DESCENDING (newest-first): the dominant dashboard
+# pattern is `ORDER BY timestamp DESC LIMIT n`. With DESC-sorted files the
+# footer advertises `[timestamp DESC, …]`, so the parquet sort-order pushdown
+# (delta-rs fork) + `ordered_union_for_topk` turn that query into a streaming
+# TopK that reads the newest files/rows and stops, instead of a full blocking
+# sort over the window. `nulls_first: true` matches DataFusion's DESC default
+# so the advertised ordering satisfies the query even if a reader marks the
+# (never-null) column nullable. Secondary keys stay ASC as tiebreakers.
 sorting_columns:
   - name: timestamp
-    descending: false
-    nulls_first: false
+    descending: true
+    nulls_first: true
   - name: resource___service___name
     descending: false
     nulls_first: false

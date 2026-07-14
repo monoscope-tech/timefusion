@@ -167,10 +167,19 @@ impl TableSchema {
     }
 
     pub fn sorting_columns(&self) -> Vec<SortingColumn> {
+        // Parquet data files omit partition columns (they live in the path), so
+        // the `SortingColumn.column_idx` the footer records must be the column's
+        // position among the *non-partition* fields — the physical parquet leaf
+        // order the reader (`ordering_from_parquet_metadata`) indexes into. Using
+        // the raw fields-list index over-counts by every partition column that
+        // precedes a sort key (e.g. `date` at field 0), so the footer points at
+        // the wrong column and the sort-order pushdown silently never fires.
+        let partition_set: std::collections::HashSet<&str> = self.partitions.iter().map(|s| s.as_str()).collect();
+        let data_cols: Vec<&str> = self.fields.iter().map(|f| f.name.as_str()).filter(|n| !partition_set.contains(n)).collect();
         self.sorting_columns
             .iter()
             .filter_map(|col| {
-                self.fields.iter().position(|f| f.name == col.name).map(|idx| SortingColumn {
+                data_cols.iter().position(|n| *n == col.name).map(|idx| SortingColumn {
                     column_idx: idx as i32,
                     descending: col.descending,
                     nulls_first: col.nulls_first,
@@ -355,4 +364,33 @@ pub fn create_insert_compatible_schema(schema: &SchemaRef) -> SchemaRef {
         })
         .collect();
     Arc::new(Schema::new(new_fields))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression: parquet `SortingColumn.column_idx` must index the non-partition
+    // (physical parquet) columns, not the raw fields list. `date` is a partition
+    // at field index 0, so the raw index over-counts by 1 and the footer points
+    // at the wrong column — which made `ordering_from_parquet_metadata` resolve
+    // nothing and the timestamp-ordering pushdown silently never fire.
+    #[test]
+    fn sorting_columns_index_excludes_partitions() {
+        let schema = get_schema("otel_logs_and_spans").expect("otel schema registered");
+        let scs = schema.sorting_columns();
+        // Build the expected physical (non-partition) column order.
+        let partition_set: std::collections::HashSet<&str> = schema.partitions.iter().map(|s| s.as_str()).collect();
+        let data_cols: Vec<&str> = schema.fields.iter().map(|f| f.name.as_str()).filter(|n| !partition_set.contains(n)).collect();
+        // timestamp is the lead sort key and the first physical column → index 0.
+        assert_eq!(data_cols[0], "timestamp");
+        let ts = scs.first().expect("at least one sorting column");
+        assert_eq!(ts.column_idx, 0, "timestamp must map to physical parquet column 0, got {}", ts.column_idx);
+        assert!(ts.descending, "timestamp is sorted newest-first (DESC)");
+        // Every declared sort column resolves to its non-partition position.
+        for (sc, def) in scs.iter().zip(&schema.sorting_columns) {
+            let want = data_cols.iter().position(|n| *n == def.name).unwrap() as i32;
+            assert_eq!(sc.column_idx, want, "sort col `{}` column_idx mismatch", def.name);
+        }
+    }
 }

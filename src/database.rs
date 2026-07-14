@@ -536,6 +536,10 @@ fn build_delta_write_session_state(
     let cfg: SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
     let mut cfg = cfg.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
     let _ = cfg.options_mut().set("datafusion.execution.batch_size", "8192");
+    // Reserve a merge floor so a recompress `ORDER BY` (global sort of a cold
+    // partition) spills to disk instead of erroring under the bounded
+    // maintenance pool — same reason as `build_optimize_session_state`.
+    let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "67108864");
     const MAINTENANCE_MAX_PARTITIONS: usize = 4;
     let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
     cfg = cfg.with_target_partitions(parts);
@@ -3831,7 +3835,7 @@ impl Database {
         }
 
         info!(
-            "Starting optimize (z-order): table={} rewriting {} of {} window partitions, skipping {} unchanged (last {}h)",
+            "Starting optimize (sort): table={} rewriting {} of {} window partitions, skipping {} unchanged (last {}h)",
             table_name,
             kept_dates.len(),
             window_dates.len(),
@@ -3843,11 +3847,17 @@ impl Database {
             kept_dates.iter().filter_map(|d| PartitionFilter::try_from(("date", "=", d.to_string().as_str())).ok()).collect();
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        // Full Z-order optimize runs every 30 min over a 48h window — promote
-        // these rewrites to the "warm" tier so day-old data lands smaller on
-        // disk without slowing the hot flush path.
-        // declare_sorted=false: Z-order/Compact reorders rows, so the footer must not claim the schema sort order.
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, false);
+        // Full optimize runs every 30 min over a 48h window — promote these
+        // rewrites to the "warm" tier so day-old data lands smaller on disk
+        // without slowing the hot flush path.
+        // SortBy globally sorts by the schema's timestamp-DESC-first keys and
+        // declares the footer, so the ordering/limit pushdown keeps firing on
+        // the freshly-optimized current partition (Compact would concatenate →
+        // declare_sorted=false → pushdown disabled within one cycle). Falls back
+        // to ZOrder/Compact when Z-order is explicitly enabled or no sort order
+        // is declared.
+        let (optimize_type, declare_sorted) = choose_optimize_type(schema, self.config.maintenance.timefusion_optimize_use_zorder);
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
 
         // Same trade-off as optimize_table_light: best-effort, don't pause
         // flushes (see comment there). Z-order full optimize is daily-ish,
@@ -3865,14 +3875,7 @@ impl Database {
             table_clone
                 .optimize()
                 .with_filters(&partition_filters)
-                .with_type(if !self.config.maintenance.timefusion_optimize_use_zorder || schema.z_order_columns.is_empty() {
-                    // Compact preserves the flush's timestamp sort (files are already
-                    // timestamp-ordered + time-bucketed) → tight row-group timestamp
-                    // stats for pruning, without Z-order's memory-heavy global sort.
-                    deltalake::operations::optimize::OptimizeType::Compact
-                } else {
-                    deltalake::operations::optimize::OptimizeType::ZOrder(schema.z_order_columns.clone())
-                })
+                .with_type(optimize_type)
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
                 .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
                 .with_writer_properties(writer_properties)
@@ -4081,12 +4084,15 @@ impl Database {
             }
             let table_clone = { table_ref.read().await.clone() };
             let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-            // declare_sorted=false: Compact bin-packs across files, output isn't globally sorted.
-            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, false);
+            // SortBy: globally sort the partition by the schema keys and declare
+            // it, so cold/consolidated partitions keep an honest DESC footer for
+            // the ordering pushdown (plain Compact concatenates → declare false).
+            let (optimize_type, declare_sorted) = choose_optimize_type(schema, false);
+            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
             let result = table_clone
                 .optimize()
                 .with_filters(&partition_filters)
-                .with_type(deltalake::operations::optimize::OptimizeType::Compact)
+                .with_type(optimize_type)
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
                 .with_max_concurrent_tasks(max_concurrent)
                 .with_writer_properties(writer_properties)
@@ -4225,10 +4231,14 @@ impl Database {
         info!("recompress: rewriting date={} table={} at zstd={} ({} files)", date_str, table_name, target_level, uris.len());
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        // declare_sorted=false: this rewrites via a bare `SELECT *` (file
-        // concatenation order), not a global sort, so the footer must not
-        // advertise the schema sort order.
-        let writer_properties = self.create_writer_properties(schema, target_level, false);
+        // Sort the rewrite by the schema keys via an `ORDER BY` on the input
+        // plan and declare the footer, so a recompressed partition keeps an
+        // honest DESC footer — a bare `SELECT *` concatenation would strip the
+        // ordering that optimize/compact established. `declare_sorted` tracks
+        // whether we actually sort (empty clause when no sort order declared).
+        let order_by = schema_order_by_clause(schema);
+        let declare_sorted = !order_by.is_empty();
+        let writer_properties = self.create_writer_properties(schema, target_level, declare_sorted);
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
         // Force a full-partition rewrite at the new zstd tier via a streaming
@@ -4259,11 +4269,17 @@ impl Database {
             .build()
             .await
             .map_err(|e| anyhow::anyhow!("recompress scan provider: {e}"))?;
+        // Must be the delta *write* session (carries DeltaPlanner): the write
+        // wraps its input in a MetricObserver node only that planner can
+        // physically plan. It now also reserves sort-spill memory so the added
+        // ORDER BY spills rather than erroring on a large partition.
         let session = build_delta_write_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env());
         let ctx = datafusion::prelude::SessionContext::new_with_state(session);
         ctx.register_table("recompress_src", Arc::new(provider))?;
-        // Literal date is safe: `date_str` is a parsed `chrono::NaiveDate`.
-        let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'")).await?.into_optimized_plan()?;
+        // Literal date is safe: `date_str` is a parsed `chrono::NaiveDate`. The
+        // `order_by` clause (quoted identifiers) makes the rewrite globally
+        // sorted so `declare_sorted` above is honest.
+        let input_plan = ctx.sql(&format!("SELECT * FROM recompress_src WHERE date = '{date_str}'{order_by}")).await?.into_optimized_plan()?;
 
         let replace_pred = format!("date = '{date_str}'");
         let write_result = table_clone
@@ -4969,8 +4985,10 @@ impl Database {
         let partition_filters = vec![PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?];
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        // declare_sorted=false: light optimize Compacts (concatenates) files without re-sorting.
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, false);
+        // SortBy the schema keys (declare_sorted=true) so the current partition's
+        // light-compacted files keep an honest DESC footer for the pushdown.
+        let (optimize_type, declare_sorted) = choose_optimize_type(schema, false);
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, declare_sorted);
 
         // Best-effort optimize: retry on OCC conflict but DO NOT hold the
         // flush lock. Earlier we wrapped this in `with_flush_paused` to
@@ -4980,7 +4998,7 @@ impl Database {
         // buckets and a 10× drop in ingest throughput. Better to let
         // optimize fail loudly during heavy ingest; the next scheduler
         // tick (5 min later) usually catches a quiet enough window.
-        self.optimize_table_light_inner(table_ref, today, &partition_filters, target_size, &writer_properties, start_time).await
+        self.optimize_table_light_inner(table_ref, today, &partition_filters, target_size, &writer_properties, optimize_type, start_time).await
     }
 
     /// Inner optimize loop. Caller is expected to hold the flush lock when
@@ -4988,7 +5006,7 @@ impl Database {
     /// safety net against bursts from `flush_all_now` or shutdown flushes.
     async fn optimize_table_light_inner(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, today: chrono::NaiveDate, partition_filters: &[PartitionFilter], target_size: i64,
-        writer_properties: &WriterProperties, start_time: std::time::Instant,
+        writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType, start_time: std::time::Instant,
     ) -> Result<()> {
         const MAX_RETRIES: usize = 4;
         // Optimize rewrites (compaction) materialize Arrow like dedup — hold a
@@ -5014,7 +5032,8 @@ impl Database {
             let optimize_result = table_clone
                 .optimize()
                 .with_filters(partition_filters)
-                .with_type(deltalake::operations::optimize::OptimizeType::Compact)
+                // Cloned per attempt: the retry loop re-submits after OCC conflicts.
+                .with_type(optimize_type.clone())
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
                 .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
                 .with_writer_properties(writer_properties.clone())
@@ -5547,6 +5566,48 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
             (vec![combined], false)
         }
     }
+}
+
+/// delta-rs optimize `SortColumn` spec from the table's declared
+/// `sorting_columns`. Empty when the table declares none (caller falls back to
+/// `Compact`). Directions mirror the schema so the written order matches the
+/// footer the flush/dedup path already declares.
+fn schema_optimize_sort_columns(schema: &crate::schema_loader::TableSchema) -> Vec<deltalake::operations::optimize::SortColumn> {
+    schema
+        .sorting_columns
+        .iter()
+        .map(|c| deltalake::operations::optimize::SortColumn { column: c.name.clone(), descending: c.descending, nulls_first: c.nulls_first })
+        .collect()
+}
+
+/// SQL `ORDER BY` clause (leading space, quoted identifiers) matching the
+/// schema's sort order, for rewrite paths that stream through a `SELECT` rather
+/// than delta-rs optimize (recompress). Empty when no sort order is declared.
+fn schema_order_by_clause(schema: &crate::schema_loader::TableSchema) -> String {
+    if schema.sorting_columns.is_empty() {
+        return String::new();
+    }
+    let cols = schema
+        .sorting_columns
+        .iter()
+        .map(|c| format!("\"{}\" {}{}", c.name, if c.descending { "DESC" } else { "ASC" }, if c.nulls_first { " NULLS FIRST" } else { " NULLS LAST" }))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" ORDER BY {cols}")
+}
+
+/// Pick the optimize strategy for a rewrite. Prefers `SortBy` the schema's
+/// (timestamp-DESC-first) sort keys so the output is globally sorted with an
+/// honest footer — keeping the ordering/limit pushdown alive on optimized
+/// partitions. Falls back to `ZOrder` only when explicitly enabled, else
+/// `Compact`. Returns `(optimize_type, declare_sorted)`.
+fn choose_optimize_type(schema: &crate::schema_loader::TableSchema, allow_zorder: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
+    use deltalake::operations::optimize::OptimizeType;
+    if allow_zorder && !schema.z_order_columns.is_empty() {
+        return (OptimizeType::ZOrder(schema.z_order_columns.clone()), false);
+    }
+    let sort_cols = schema_optimize_sort_columns(schema);
+    if sort_cols.is_empty() { (OptimizeType::Compact, false) } else { (OptimizeType::SortBy(sort_cols), true) }
 }
 
 /// Pure builder for parquet `WriterProperties` at a given compression tier.

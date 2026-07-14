@@ -1,6 +1,20 @@
 # Parquet `sorting_columns` declared-vs-actual inconsistency on optimize/compact/recompress
 
-**Status:** investigation handoff — not yet fixed.
+**Status (2026-07-14): RESOLVED via Option B (sorted compaction).** After the
+timestamp-ordering pushdown landed, plain `Compact` (concatenation,
+`declare_sorted=false`) stripped the honest DESC footer from every rewritten
+partition — including today's, within one 30-min optimize cycle — which
+disabled the pushdown for any Delta-spanning query. Fix: a new delta-rs
+`OptimizeType::SortBy` (whole-partition lexicographic sort, mirrors Z-order's
+spilling global sort) now backs all rewrite paths, which pass `declare_sorted=true`:
+`optimize_table`, `compact_date_with` (consolidate), `optimize_table_light`,
+and `recompress_partition` (via an `ORDER BY` on its `replace_where` input plan).
+`choose_optimize_type` prefers `SortBy` the schema keys, falling back to
+`ZOrder` only when explicitly enabled, else `Compact`. So optimized partitions
+keep an honest, actually-sorted DESC footer and the pushdown fires on them.
+Regression test: e2e `ordering_pushdown::optimized_partition_still_advertises_desc_ordering`.
+
+**Original status:** investigation handoff — not yet fixed.
 **Date:** 2026-06-17.
 **Related work shipped same day:** the four point-lookup fixes (metadata-cache limit wiring,
 `target_partitions` from cgroup quota, per-column page stats, and **flush-path sort** —

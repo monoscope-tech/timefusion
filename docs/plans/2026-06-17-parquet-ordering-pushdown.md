@@ -1,6 +1,42 @@
 # Adding sort-order pushdown to the delta-rs "next" DeltaScan
 
-**Status:** implemented in the fork on branch `timefusion-variant-dml`
+**Status (2026-07-14): LANDED end-to-end.** The fork rev is bumped
+(`Cargo.toml` deltalake `rev = 277255865…`) and the pushdown fires for the
+dominant dashboard query. Three TF-side changes were needed on top of the fork:
+
+1. **DESC physical sort.** `schemas/otel_logs_and_spans.yaml` now sorts
+   `timestamp` **descending** (`nulls_first: true`). The dominant pattern is
+   `ORDER BY timestamp DESC LIMIT n`; an ASC footer can't satisfy a DESC limit,
+   so files are written newest-first and the footer advertises `[timestamp
+   DESC, …]`. Secondary keys stay ASC tiebreakers. (`timestamp` is non-nullable
+   so `options_compatible` ignores `nulls_first`; it's set to `true` anyway to
+   match DataFusion's DESC default if a reader ever marks the column nullable.)
+
+2. **`SortingColumn.column_idx` off-by-partition bug (pre-existing).**
+   `TableSchema::sorting_columns()` computed the footer's `column_idx` from the
+   raw fields list, but parquet data files omit partition columns (`date` is
+   field 0, `project_id` field 85). Every index was shifted, so
+   `ordering_from_parquet_metadata` resolved the wrong/absent columns and
+   returned `None` — the pushdown silently never fired even with honest footers.
+   Fixed to index the non-partition (physical parquet) columns. Regression test:
+   `schema_loader::tests::sorting_columns_index_excludes_partitions`.
+
+3. **MemBuffer∪Delta union was unordered.** `ProjectRoutingTable::scan` returns
+   `Union([mem, delta])`; the Delta branch now advertises ordering but the
+   `MemorySourceConfig` mem branch does not, so the union is unordered and the
+   blocking sort stays. New physical optimizer rule
+   `optimizers::OrderedUnionForTopK` (registered before `EnforceDistribution`)
+   sorts the unordered union branch(es) to match the ordered one *only* under a
+   fetching `Sort`/`SortPreservingMergeExec`, so the built-ins convert the plan
+   to a streaming `SortPreservingMergeExec` + fetch. Guards: fires only on a
+   *fetching* sort (never regresses counts/aggregations) and only on a *mixed*
+   union (no-op during the mixed-footer rollout). Tests:
+   `optimizers::ordered_union_for_topk::tests::*` and e2e
+   `ordering_pushdown::order_by_ts_desc_limit_merges_mem_and_delta`.
+
+---
+
+**Original status:** implemented in the fork on branch `timefusion-variant-dml`
 (commit `5daa461`, 2026-06-19) — verified: fork lib unit test
 `remap_ordering_keeps_satisfiable_prefix` passes; TF builds end-to-end against
 it via a local path patch. Remaining to land: push the fork commit and bump the
