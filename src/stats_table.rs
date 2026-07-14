@@ -148,6 +148,10 @@ impl StatsTableProvider {
             // commit-path deletion bug). PAGE and investigate.
             rows.push(("maintenance", "dangling_removed".into(), m.dangling_removed.load(Relaxed).to_string()));
             rows.push(("maintenance", "reconcile_failed".into(), m.reconcile_failed.load(Relaxed).to_string()));
+            // Fired frozen while uptime grows = scheduler dead (2026-07-14
+            // outage); skipped growing = a job body is wedged or overlong.
+            rows.push(("maintenance", "cron_ticks_fired".into(), m.cron_ticks_fired.load(Relaxed).to_string()));
+            rows.push(("maintenance", "cron_ticks_skipped".into(), m.cron_ticks_skipped.load(Relaxed).to_string()));
         }
 
         if let Some(pc) = crate::plan_cache::global() {

@@ -305,6 +305,22 @@ mod integration {
 
         Ok(())
     }
+    // Regression: 2026-07-14 prod outage — `impl Drop for Database` cancelled the
+    // SHARED maintenance_shutdown token on every clone drop (Database is Clone),
+    // silently killing all cron jobs (optimize/checkpoint/vacuum/...), the DML
+    // coalescer, and dedup sweeps minutes after boot. Only the LAST clone's drop
+    // may cancel it.
+    #[tokio::test]
+    #[serial]
+    async fn database_clone_drop_keeps_maintenance_alive() -> Result<()> {
+        let test_id = Uuid::new_v4().to_string();
+        let cfg = minio_test_config(&test_id, &format!("/tmp/timefusion-{test_id}"));
+        let db = Database::with_config(cfg).await?;
+        drop(db.clone());
+        assert!(!db.is_maintenance_cancelled(), "dropping a Database clone must not cancel the shared maintenance token");
+        Ok(())
+    }
+
     // The 2026-06-16 OR-on-indexed-column correctness bug is covered by the fast
     // `mem_buffer::tests::membuffer_or_equality_on_utf8view_keeps_all_matches`
     // unit test (raw MemBuffer) and the `or_utf8view_delta` e2e suite (full

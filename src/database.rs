@@ -527,6 +527,9 @@ fn build_optimize_session_state(
 /// from the system clock via `find_next_occurrence`, so they are predictable and
 /// independent of process start time — the same job fires at e.g. :00/:30 on
 /// every replica regardless of when it booted. Exits when `cancel` fires.
+/// Each fire runs on its own task; if it is still running at the next tick the
+/// tick is skipped (counted in `maintenance.cron_ticks_skipped`), so one wedged
+/// run can never freeze the schedule for good.
 ///
 /// Replaces tokio-cron-scheduler, which silently stopped dispatching ticks in
 /// prod (2026-07-13: 0 optimize/checkpoint runs over 14h of uptime despite the
@@ -549,6 +552,7 @@ where
     };
     info!("{name} job scheduled with cron expression: {schedule}");
     tokio::spawn(async move {
+        let mut running = None;
         loop {
             let now = chrono::Utc::now();
             let dur = match cron.find_next_occurrence(&now, false) {
@@ -560,8 +564,22 @@ where
                 }
             };
             tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(dur) => job().await,
+                _ = cancel.cancelled() => {
+                    info!("{name} job stopped (shutdown)");
+                    return;
+                }
+                _ = tokio::time::sleep(dur) => {
+                    // Fire on a detached task so a wedged/overlong run can never
+                    // freeze this loop; overlapping runs are skipped instead of
+                    // piled up (maintenance jobs are periodic + idempotent).
+                    if running.as_ref().is_some_and(|h: &tokio::task::JoinHandle<()>| !h.is_finished()) {
+                        warn!("{name} job tick skipped: previous run still in progress");
+                        crate::metrics::maintenance_stats().cron_ticks_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                    crate::metrics::maintenance_stats().cron_ticks_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    running = Some(tokio::spawn(job()));
+                }
             }
         }
     });
@@ -1079,6 +1097,13 @@ pub struct Database {
     pub scan_metrics: Arc<ScanMetrics>,
     batch_queue: Option<Arc<crate::batch_queue::BatchQueue>>,
     maintenance_shutdown: Arc<CancellationToken>,
+    /// Cancels `maintenance_shutdown` when the LAST `Database` clone drops.
+    /// Database is Clone, so a per-value `impl Drop` cancelling the shared
+    /// token killed every cron job / the DML coalescer / dedup sweeps as soon
+    /// as ANY transient clone dropped (2026-07-14 prod outage: all maintenance
+    /// silently dead minutes after boot). The Arc'd DropGuard fires only once,
+    /// at true end-of-life.
+    _maintenance_cancel_guard: Arc<tokio_util::sync::DropGuard>,
     /// One-shot guard for `preload_tables` — main.rs and bootstrap.rs are
     /// disjoint entry points today, but a second call must not double the
     /// boot-time S3 warm burst.
@@ -1447,6 +1472,8 @@ impl Database {
 
         // Captured before `cfg` is moved into the struct literal below.
         let maint_rewrite_permits = cfg.maintenance.timefusion_maintenance_rewrite_concurrency.max(1);
+        let maintenance_shutdown = CancellationToken::new();
+        let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
         let db = Self {
             config: cfg,
             runtime_env: Arc::new(std::sync::OnceLock::new()),
@@ -1458,7 +1485,8 @@ impl Database {
             delta_provider_cache: dashmap::DashMap::new(),
             scan_metrics: Arc::new(ScanMetrics::default()),
             batch_queue: None,
-            maintenance_shutdown: Arc::new(CancellationToken::new()),
+            maintenance_shutdown: Arc::new(maintenance_shutdown),
+            _maintenance_cancel_guard: maintenance_cancel_guard,
             preload_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_pool,
             storage_configs: Arc::new(RwLock::new(storage_configs)),
@@ -5253,6 +5281,13 @@ impl Database {
         self.maintenance_shutdown.cancel();
     }
 
+    /// True once maintenance/background tasks have been told to stop. Exposed
+    /// for tests and `timefusion_stats` — a `true` here on a live instance
+    /// means every cron job is dead (the 2026-07-14 outage signature).
+    pub fn is_maintenance_cancelled(&self) -> bool {
+        self.maintenance_shutdown.is_cancelled()
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         self.shutdown_by(tokio::time::Instant::now() + self.config.buffer.stop_grace()).await
     }
@@ -6526,16 +6561,6 @@ impl TableProvider for ProjectRoutingTable {
     }
 }
 
-impl Drop for Database {
-    fn drop(&mut self) {
-        // Cancel maintenance tasks immediately
-        self.maintenance_shutdown.cancel();
-
-        // Note: We can't do async cleanup in Drop, but cancelling the token
-        // will cause background tasks to stop, preventing the panic
-    }
-}
-
 #[cfg(test)]
 mod writer_properties_tests {
     use deltalake::datafusion::parquet::{
@@ -6837,6 +6862,23 @@ mod tests {
         let after_cancel = count.load(Ordering::SeqCst);
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert_eq!(count.load(Ordering::SeqCst), after_cancel, "no fires after cancel");
+    }
+
+    /// A wedged job body must not freeze the cron loop: later ticks are skipped
+    /// (not queued) and the skip counter grows, so the schedule survives and the
+    /// wedge is visible in `timefusion_stats`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_cron_job_skips_ticks_while_previous_run_hangs() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let cancel = Arc::new(CancellationToken::new());
+        let skipped_before = crate::metrics::maintenance_stats().cron_ticks_skipped.load(Relaxed);
+        spawn_cron_job("hung-test", "* * * * * *", cancel.clone(), move || async move {
+            std::future::pending::<()>().await; // never returns
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
+        cancel.cancel();
+        let skipped = crate::metrics::maintenance_stats().cron_ticks_skipped.load(Relaxed) - skipped_before;
+        assert!(skipped >= 1, "later ticks must be skipped (loop alive) while the first run hangs, got {skipped} skips");
     }
 
     /// The shared OCC classifier must treat every retryable delta-rs conflict as

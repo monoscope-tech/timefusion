@@ -398,6 +398,12 @@ pub struct MaintenanceStats {
     pub checkpoint_lag_versions: AtomicU64,
     pub dangling_removed: AtomicU64,
     pub reconcile_failed: AtomicU64,
+    /// Cron ticks skipped because the previous run of the same job was still
+    /// in flight. A steadily growing value = a wedged/overlong job body.
+    pub cron_ticks_skipped: AtomicU64,
+    /// Cron fires actually dispatched (all jobs). Frozen while uptime grows =
+    /// the scheduler is dead (2026-07-14 outage signature).
+    pub cron_ticks_fired: AtomicU64,
 }
 
 static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
@@ -408,6 +414,8 @@ static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     checkpoint_lag_versions: AtomicU64::new(0),
     dangling_removed: AtomicU64::new(0),
     reconcile_failed: AtomicU64::new(0),
+    cron_ticks_skipped: AtomicU64::new(0),
+    cron_ticks_fired: AtomicU64::new(0),
 };
 
 pub fn maintenance_stats() -> &'static MaintenanceStats {
