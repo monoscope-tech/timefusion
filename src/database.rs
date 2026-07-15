@@ -1322,6 +1322,18 @@ impl Database {
         build_writer_properties(&self.config.parquet, schema, zstd_level, declare_sorted)
     }
 
+    /// WriterProperties for the DML rewrite paths (`dml::perform_delta_{merge_update,
+    /// update,delete}`, used by monoscope's `UPDATE`/`DELETE`/`UPDATE ... FROM` +
+    /// the dml_coalescer). Standard zstd tier; `declare_sorted=false` because these
+    /// rewrite/reorder matched rows (no global sort). Without passing this, delta-rs's
+    /// Merge/Update/Delete builders fall back to their SNAPPY default, leaving
+    /// `.snappy.parquet` files that inflate storage/scan bytes and force the daily
+    /// recompress to rewrite them to zstd.
+    pub(crate) fn dml_writer_properties(&self, table_name: &str) -> WriterProperties {
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, false)
+    }
+
     /// Updates a DeltaTable and handles errors consistently
     async fn update_table(&self, table: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str) -> Result<()> {
         // Try to update with retries for eventual consistency

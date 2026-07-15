@@ -765,10 +765,13 @@ pub async fn perform_delta_update(
 
     let span = tracing::Span::current();
     // Clone captures per attempt: the operation may rerun after an OCC conflict.
+    // zstd tier for the rewrite: without it the UpdateBuilder writes SNAPPY.
+    let writer_properties = database.dml_writer_properties(table_name);
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
         let (predicate, assignments, session) = (predicate.clone(), assignments.clone(), session.clone());
+        let writer_properties = writer_properties.clone();
         async move {
-            let mut builder = delta_table.update().with_session_state(session);
+            let mut builder = delta_table.update().with_session_state(session).with_writer_properties(writer_properties);
 
             if let Some(pred) = predicate {
                 builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
@@ -805,10 +808,13 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
     info!("Performing Delta DELETE on table {} for project {}", table_name, project_id);
 
     let span = tracing::Span::current();
+    // zstd tier for the rewrite: without it the DeleteBuilder writes SNAPPY.
+    let writer_properties = database.dml_writer_properties(table_name);
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
         let (predicate, session) = (predicate.clone(), session.clone());
+        let writer_properties = writer_properties.clone();
         async move {
-            let mut builder = delta_table.delete().with_session_state(session);
+            let mut builder = delta_table.delete().with_session_state(session).with_writer_properties(writer_properties);
 
             if let Some(pred) = predicate {
                 builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
@@ -1002,11 +1008,16 @@ pub async fn perform_delta_merge_update(
     // `target` aliases.
     let assignments = requalify_assignments_for_merge(assignments, &source.schema, "source", "target")?;
 
+    // Our zstd tier for the rewrite: without it the MergeBuilder writes SNAPPY.
+    let writer_properties = database.dml_writer_properties(table_name);
+
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
         // RecordBatch clones are Arc-backed (cheap); needed since the
         // operation may rerun after an OCC conflict.
         let (source_batch, join_keys, source_cols) = (source_batch.clone(), join_keys.clone(), source_cols.clone());
         let (predicate, assignments, session) = (predicate.clone(), assignments.clone(), session.clone());
+        // Cloned per attempt (the closure reruns on OCC conflict).
+        let writer_properties = writer_properties.clone();
         async move {
             // Wrap the materialized source RecordBatch as a DataFrame. The
             // throwaway SessionContext only provides the DataFrame builder; merge
@@ -1021,6 +1032,7 @@ pub async fn perform_delta_merge_update(
                 .with_source_alias("source")
                 .with_target_alias("target")
                 .with_session_state(session)
+                .with_writer_properties(writer_properties)
                 .with_safe_cast(true);
 
             let merge = merge
