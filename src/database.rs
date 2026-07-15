@@ -3871,6 +3871,13 @@ impl Database {
         let (optimize_type, declare_sorted) =
             choose_optimize_type(schema, self.config.maintenance.timefusion_optimize_use_zorder, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
+        // SortBy over already-sorted files is a streaming SortPreservingMergeExec
+        // (bounded); only a partition's one-time transition sort of legacy
+        // pre-sort files blocks. Serialize the SortBy path (concurrency 1) so
+        // those transition sorts can't stack across the multi-partition window
+        // and exhaust the maintenance pool (2026-07-14 OOM). Compact/ZOrder keep
+        // the configured concurrency.
+        let optimize_concurrency = if declare_sorted { 1 } else { self.config.maintenance.timefusion_optimize_max_concurrent_tasks };
 
         // Same trade-off as optimize_table_light: best-effort, don't pause
         // flushes (see comment there). Z-order full optimize is daily-ish,
@@ -3890,7 +3897,7 @@ impl Database {
                 .with_filters(&partition_filters)
                 .with_type(optimize_type)
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
-                .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
+                .with_max_concurrent_tasks(optimize_concurrency)
                 .with_writer_properties(writer_properties)
                 .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
                 .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
@@ -4097,17 +4104,26 @@ impl Database {
             }
             let table_clone = { table_ref.read().await.clone() };
             let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-            // SortBy: globally sort the partition by the schema keys and declare
-            // it, so cold/consolidated partitions keep an honest DESC footer for
-            // the ordering pushdown (plain Compact concatenates → declare false).
+            // SortBy: sort the partition by the schema keys and declare it, so
+            // cold/consolidated partitions keep an honest DESC footer for the
+            // ordering pushdown (plain Compact concatenates → declare false).
+            // SortBy reads via the ordering-advertising DeltaScanNext: over
+            // already-sorted files `df.sort()` collapses to a streaming
+            // SortPreservingMergeExec (bounded k-way merge). The one exception
+            // is a partition still holding legacy pre-sort files — its first
+            // rewrite is a one-time blocking sort. Force concurrency 1 on the
+            // SortBy path so those transition sorts can't stack and exhaust the
+            // maintenance pool (the 2026-07-14 OOM multiplier); steady-state
+            // SortBy is cheap SPM, so serializing partitions costs little.
             let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
             let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
+            let sort_concurrency = if declare_sorted { 1 } else { max_concurrent };
             let result = table_clone
                 .optimize()
                 .with_filters(&partition_filters)
                 .with_type(optimize_type)
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
-                .with_max_concurrent_tasks(max_concurrent)
+                .with_max_concurrent_tasks(sort_concurrency)
                 .with_writer_properties(writer_properties)
                 .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
                 .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
@@ -5534,15 +5550,36 @@ fn sort_batches_by_schema(schema: &crate::schema_loader::TableSchema, batches: V
     if batches.iter().map(|b| b.get_array_memory_size()).sum::<usize>() > SORT_SKIP_BYTES {
         return (batches, false);
     }
-    let arrow_schema = batches[0].schema();
-    // Only sort a schema-homogeneous bucket. mem_buffer's `schemas_compatible`
-    // admits batches with extra nullable fields into one bucket; concatenating
-    // those would either abort the flush or silently drop the evolved column.
-    // Write such a bucket unsorted (sorted=false) and let the writer's
-    // SchemaMode::Merge union the columns losslessly, matching the old path.
-    if batches.iter().any(|b| b.schema() != arrow_schema) {
-        return (batches, false);
-    }
+    let first_schema = batches[0].schema();
+    // A schema-diverse bucket (mem_buffer's `schemas_compatible` admits batches
+    // that differ by an evolved nullable column) is unified to a common
+    // superset schema and every batch cast to it, so the bucket STILL flushes
+    // as one globally sorted file with an honest `sorting_columns` footer.
+    // Bailing here (the old behavior) left the file unsorted, and one unsorted
+    // file disables the delta-rs reader's all-or-nothing footer-ordering
+    // pushdown for the whole scan — degrading `ORDER BY <keys> LIMIT n` to a
+    // blocking full-window sort (top-N pushdown inert on prod, 2026-07-15).
+    // `try_merge` yields a lossless superset (missing/nullable fields unioned),
+    // and `cast_record_batch(add_missing=true)` fills absent columns with
+    // nulls; any incompatibility falls back to the old unsorted write.
+    let (arrow_schema, batches) = if batches.iter().all(|b| b.schema() == first_schema) {
+        (first_schema, batches)
+    } else {
+        let merged = match arrow_schema::Schema::try_merge(batches.iter().map(|b| b.schema().as_ref().clone())) {
+            Ok(m) => Arc::new(m),
+            Err(e) => {
+                warn!("sort_batches_by_schema: schema merge failed, writing unsorted: {e}");
+                return (batches, false);
+            }
+        };
+        match batches.iter().map(|b| deltalake::kernel::schema::cast_record_batch(b, merged.clone(), true, true)).collect::<Result<Vec<_>, _>>() {
+            Ok(normalized) => (merged, normalized),
+            Err(e) => {
+                warn!("sort_batches_by_schema: schema-unify cast failed, writing unsorted: {e}");
+                return (batches, false);
+            }
+        }
+    };
     let sort_idx: Vec<(usize, &crate::schema_loader::SortingColumnDef)> =
         schema.sorting_columns.iter().filter_map(|sc| arrow_schema.index_of(&sc.name).ok().map(|i| (i, sc))).collect();
     if sort_idx.is_empty() {
@@ -6776,6 +6813,51 @@ mod writer_properties_tests {
         }
     }
 
+    // Regression: a schema-diverse 10-min bucket (mem_buffer's
+    // `schemas_compatible` admits batches that differ by an evolved nullable
+    // column) must STILL flush as a globally sorted file with an honest parquet
+    // `sorting_columns` footer. Before the fix `sort_batches_by_schema` bailed
+    // (sorted=false) on any heterogeneous bucket, so the file carried no footer
+    // ordering — and one unsorted file disables the delta-rs reader's
+    // all-or-nothing footer-ordering pushdown for the whole scan, degrading
+    // `ORDER BY timestamp DESC LIMIT n` to a blocking full-window sort
+    // (observed inert on prod 2026-07-15; top-N pushdown never fired).
+    #[test]
+    fn heterogeneous_bucket_still_sorts_with_honest_footer() {
+        use arrow::array::{Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+        let mut sch = schema_with(vec![], vec!["timestamp"]);
+        sch.sorting_columns[0].descending = true;
+        sch.sorting_columns[0].nulls_first = true;
+
+        let ts = |v: Vec<i64>| Arc::new(TimestampMicrosecondArray::from(v).with_timezone("UTC"));
+        let ts_ty = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+
+        let schema_a = Arc::new(Schema::new(vec![Field::new("timestamp", ts_ty.clone(), false), Field::new("id", DataType::Utf8, false)]));
+        let batch_a = RecordBatch::try_new(schema_a, vec![ts(vec![100, 300]), Arc::new(StringArray::from(vec!["a", "c"]))]).unwrap();
+
+        // batch_b carries an extra nullable column absent from batch_a.
+        let schema_b = Arc::new(Schema::new(vec![
+            Field::new("timestamp", ts_ty, false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("extra", DataType::Int64, true),
+        ]));
+        let batch_b = RecordBatch::try_new(
+            schema_b,
+            vec![ts(vec![200, 400]), Arc::new(StringArray::from(vec!["b", "d"])), Arc::new(Int64Array::from(vec![Some(1), Some(2)]))],
+        )
+        .unwrap();
+
+        let (out, sorted) = sort_batches_by_schema(&sch, vec![batch_a, batch_b]);
+
+        assert!(sorted, "heterogeneous bucket must still be reported sorted so the footer is declared");
+        assert_eq!(out.len(), 1, "batches must be unified into one sorted file");
+        let got: Vec<i64> = out[0].column_by_name("timestamp").unwrap().as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().values().to_vec();
+        assert_eq!(got, vec![400, 300, 200, 100], "rows must be globally timestamp-DESC across the merged batches");
+        assert!(out[0].schema().column_with_name("extra").is_some(), "merged superset column must survive (no data loss)");
+    }
+
     #[test]
     fn uri_date_in_window_gates_on_partition_day() {
         let day = |y, m, d| chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
@@ -6967,10 +7049,13 @@ mod writer_properties_tests {
         assert_eq!(passthrough.len(), 2);
     }
 
-    // Regression for the review's headline finding: a bucket whose batches have
-    // evolved schemas (an extra nullable column on the 2nd batch, which
-    // mem_buffer's schemas_compatible admits) must NOT abort — concat fails, so
-    // we write unsorted and report sorted=false (footer stays honest).
+    // A bucket whose batches have evolved schemas (an extra nullable column on
+    // the 2nd batch, which mem_buffer's schemas_compatible admits) is unified
+    // to a superset schema and globally sorted — no abort, no data loss — so the
+    // flushed file gets an honest footer and stays eligible for the reader's
+    // ordering pushdown. (Previously this returned sorted=false; see
+    // `heterogeneous_bucket_still_sorts_with_honest_footer` for why that
+    // silently disabled top-N pushdown on prod.)
     #[test]
     fn sort_batches_tolerates_schema_evolution() {
         use arrow::array::{Int64Array, StringArray};
@@ -6981,8 +7066,11 @@ mod writer_properties_tests {
         let b2 =
             RecordBatch::try_new(s2, vec![std::sync::Arc::new(Int64Array::from(vec![3])), std::sync::Arc::new(StringArray::from(vec![Some("x")]))]).unwrap();
         let (out, sorted) = sort_batches_by_schema(&schema_with(vec![], vec!["timestamp"]), vec![b1, b2]);
-        assert!(!sorted, "mixed-schema bucket must report unsorted, not panic/abort");
-        assert_eq!(out.len(), 2, "original batches returned for the writer to merge");
+        assert!(sorted, "mixed-schema bucket is unified and sorted, not left unsorted");
+        assert_eq!(out.len(), 1, "batches unified into one sorted file");
+        let ts = out[0].column_by_name("timestamp").unwrap().as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(ts.values(), &[1, 2, 3], "globally sorted by the declared key across evolved batches");
+        assert!(out[0].schema().column_with_name("extra").is_some(), "evolved superset column survives (no data loss)");
     }
 }
 

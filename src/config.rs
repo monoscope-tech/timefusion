@@ -916,18 +916,30 @@ pub struct MaintenanceConfig {
     /// Re-enable only once Z-order's memory footprint is bounded.
     #[serde(default)]
     pub timefusion_optimize_use_zorder: bool,
-    /// Rewrite optimize/compact/recompress output as a global lexicographic sort
-    /// by the schema's `sorting_columns` (delta-rs `OptimizeType::SortBy`) with an
-    /// honest DESC footer, so the timestamp-ordering/LIMIT pushdown keeps firing
-    /// on optimized partitions. Default OFF: like Z-order, the whole-partition
-    /// global sort exhausts the bounded maintenance pool on the busy
-    /// otel_logs_and_spans table ("Not enough memory to continue external sort",
-    /// prod 2026-07-14), even with spilling. Plain Compact keeps maintenance
-    /// memory-safe; the pushdown still fires on MemBuffer + freshly-flushed
-    /// (not-yet-optimized) files, which is the hot path for "latest N" queries.
-    /// Re-enable once the maintenance sort has a bounded memory envelope
-    /// (dedicated pool / per-partition target sizing).
-    #[serde(default)]
+    /// Rewrite optimize/compact/recompress output sorted by the schema's
+    /// `sorting_columns` (delta-rs `OptimizeType::SortBy`) with an honest DESC
+    /// footer, so the timestamp-ordering/LIMIT pushdown keeps firing on
+    /// optimized/compacted partitions (not just fresh flush files). Default ON:
+    /// without it every rewrite path concatenates (`declare_sorted=false`),
+    /// strips the footer, and the reader's all-or-nothing ordering rule disables
+    /// the top-N pushdown for the whole partition within one compaction cycle.
+    ///
+    /// Memory: `SortBy` reads each partition through the ordering-advertising
+    /// `DeltaScanNext` and runs `df.sort()`. Once every file in the partition
+    /// carries an honest sorted footer (guaranteed by the flush path's
+    /// `sort_batches_by_schema` + prior SortBy rewrites), DataFusion elides the
+    /// blocking sort into a streaming `SortPreservingMergeExec` — a k-way merge
+    /// holding ~one batch per file, bounded regardless of partition size. The
+    /// 2026-07-14 OOM ("Not enough memory to continue external sort") was
+    /// `df.sort()` over *unsorted* inputs (the heterogeneous-flush-file bug,
+    /// since fixed) forcing a full-partition blocking sort. TRANSITION CAVEAT:
+    /// the first compaction of a partition still holding legacy unsorted files
+    /// is a one-time blocking sort (bounded by the maintenance FairSpillPool +
+    /// 64 MB reservation + disk spill, partitions capped at 4); after it the
+    /// partition is sorted and every later compaction is the streaming merge.
+    /// Set to `false` (plain Compact) only if a deployment can't afford even
+    /// that one-time transition sort.
+    #[serde(default = "d_true")]
     pub timefusion_optimize_sort_by: bool,
     #[serde(default = "d_compact_min_files")]
     pub timefusion_compact_min_files: usize,
