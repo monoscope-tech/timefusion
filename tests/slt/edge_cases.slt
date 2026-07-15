@@ -120,6 +120,30 @@ WHERE project_id = 'error_test' AND id = 'empty_hash_test'
 ----
 0
 
+# Array containment (@>) and overlap (&&). monoscope filters spans by pattern
+# hashes with both operators; PGOverlap (&&) errored as "Unsupported binary
+# operator" until it was rewritten to array_has_any.
+query I
+SELECT ARRAY_LENGTH(hashes) FROM otel_logs_and_spans
+WHERE project_id = 'error_test' AND id = 'hash_test1'
+  AND hashes @> ARRAY['hash1', 'hash2']::VARCHAR[]
+----
+3
+
+query I
+SELECT ARRAY_LENGTH(hashes) FROM otel_logs_and_spans
+WHERE project_id = 'error_test' AND id = 'hash_test1'
+  AND hashes && ARRAY['hash2', 'nope']::VARCHAR[]
+----
+3
+
+query I
+SELECT count(*) FROM otel_logs_and_spans
+WHERE project_id = 'error_test' AND id = 'hash_test1'
+  AND hashes && ARRAY['nope', 'nada']::VARCHAR[]
+----
+0
+
 # Test boundary conditions with duration
 statement ok
 INSERT INTO otel_logs_and_spans (

@@ -98,6 +98,17 @@ enum PathComponent {
 
 impl ExprPlanner for VariantAwareExprPlanner {
     fn plan_binary_op(&self, expr: RawBinaryExpr, schema: &DFSchema) -> datafusion::error::Result<PlannerResult<RawBinaryExpr>> {
+        // PG array overlap: `a && b` → array_has_any(a, b). DataFusion's
+        // NestedFunctionPlanner rewrites `@>`/`<@` but not `&&`, so it errored
+        // as "Unsupported binary operator: PGOverlap". Only rewrite when both
+        // sides are lists; anything else falls through unchanged.
+        if matches!(expr.op, BinaryOperator::PGOverlap)
+            && matches!(expr.left.get_type(schema)?, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..))
+            && matches!(expr.right.get_type(schema)?, DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(..))
+        {
+            return Ok(PlannerResult::Planned(datafusion::functions_nested::expr_fn::array_has_any(expr.left, expr.right)));
+        }
+
         let is_long_arrow = match &expr.op {
             BinaryOperator::Arrow => false,
             BinaryOperator::LongArrow => true,
