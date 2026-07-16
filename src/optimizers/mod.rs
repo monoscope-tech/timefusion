@@ -56,51 +56,134 @@ pub fn swap_comparison(op: &Operator) -> Operator {
 pub mod time_range_partition_pruner {
     use super::*;
 
-    /// Extract date from timestamp filter for partition pruning.
+    /// Extract date predicates from a timestamp filter for partition pruning.
     /// Accepts any timestamp unit — pgwire literals arrive as Microsecond, not Nanosecond,
     /// so missing units silently disabled date pruning for point lookups.
     ///
     /// `time_column` is the schema-declared time column name (e.g. `"timestamp"`,
     /// `"event_time"`). Non-matching columns are skipped — pruning only fires for
     /// the table's declared time column.
-    pub fn timestamp_to_date_filter(expr: &Expr, time_column: &str) -> Option<Expr> {
-        let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
-            return None;
+    pub fn timestamp_to_date_filters(expr: &Expr, time_column: &str) -> Vec<Expr> {
+        let date_filter = |expr: &Expr, op: Operator| {
+            let Expr::Literal(scalar, _) = expr else { return None };
+            let ts_nanos = match scalar {
+                ScalarValue::TimestampNanosecond(Some(ts), _) => *ts,
+                ScalarValue::TimestampMicrosecond(Some(ts), _) => ts.checked_mul(1_000)?,
+                ScalarValue::TimestampMillisecond(Some(ts), _) => ts.checked_mul(1_000_000)?,
+                ScalarValue::TimestampSecond(Some(ts), _) => ts.checked_mul(1_000_000_000)?,
+                _ => return None,
+            };
+            let date = chrono::DateTime::from_timestamp_nanos(ts_nanos).date_naive();
+            let days_since_epoch = (date.and_hms_opt(0, 0, 0)?.and_utc().timestamp() / 86400) as i32;
+            let date_lit = Expr::Literal(ScalarValue::Date32(Some(days_since_epoch)), None);
+            let date_col = Expr::Column(datafusion::common::Column::new_unqualified("date"));
+            let date_op = match op {
+                Operator::Gt | Operator::GtEq => Operator::GtEq,
+                Operator::Lt | Operator::LtEq => Operator::LtEq,
+                Operator::Eq => Operator::Eq,
+                _ => return None,
+            };
+            Some(Expr::BinaryExpr(BinaryExpr::new(Box::new(date_col), date_op, Box::new(date_lit))))
         };
-        // Match the time column on either side, through a Cast/TryCast (added by
-        // TypeCoercion when the bound's unit differs from the column's — e.g.
-        // `NOW() - INTERVAL` ns vs a µs column). Reversed operands flip the op.
-        let (lit_expr, op) = if is_col_through_cast(left.as_ref(), time_column) {
-            (right.as_ref(), *op)
-        } else if is_col_through_cast(right.as_ref(), time_column) {
-            (left.as_ref(), swap_comparison(op))
-        } else {
-            return None;
-        };
-        let op = &op;
-        let Expr::Literal(scalar, _) = lit_expr else { return None };
-        let ts_nanos: i64 = match scalar {
-            ScalarValue::TimestampNanosecond(Some(ts), _) => *ts,
-            ScalarValue::TimestampMicrosecond(Some(ts), _) => ts.checked_mul(1_000)?,
-            ScalarValue::TimestampMillisecond(Some(ts), _) => ts.checked_mul(1_000_000)?,
-            ScalarValue::TimestampSecond(Some(ts), _) => ts.checked_mul(1_000_000_000)?,
-            _ => return None,
-        };
-        let date = chrono::DateTime::from_timestamp_nanos(ts_nanos).date_naive();
-        let days_since_epoch = (date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp() / 86400) as i32;
-        let date_lit = Expr::Literal(ScalarValue::Date32(Some(days_since_epoch)), None);
-        let date_col = Expr::Column(datafusion::common::Column::new_unqualified("date"));
-        // Map timestamp comparisons to inclusive date bounds: a strict `timestamp > T`
-        // still admits rows on the same calendar day, so we widen `>` to `>=` and
-        // `<` to `<=`. Equality stays exact since `date` is derived from the
-        // timestamp at write time.
-        let date_op = match op {
-            Operator::Gt | Operator::GtEq => Operator::GtEq,
-            Operator::Lt | Operator::LtEq => Operator::LtEq,
-            Operator::Eq => Operator::Eq,
-            _ => return None,
-        };
-        Some(Expr::BinaryExpr(BinaryExpr::new(Box::new(date_col), date_op, Box::new(date_lit))))
+
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                let (lit_expr, op) = if is_col_through_cast(left.as_ref(), time_column) {
+                    (right.as_ref(), *op)
+                } else if is_col_through_cast(right.as_ref(), time_column) {
+                    (left.as_ref(), swap_comparison(op))
+                } else {
+                    return vec![];
+                };
+                date_filter(lit_expr, op).into_iter().collect()
+            }
+            Expr::Between(between) if !between.negated && is_col_through_cast(between.expr.as_ref(), time_column) => {
+                [date_filter(between.low.as_ref(), Operator::GtEq), date_filter(between.high.as_ref(), Operator::LtEq)].into_iter().flatten().collect()
+            }
+            _ => vec![],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::{
+        arrow::datatypes::{DataType, TimeUnit},
+        logical_expr::{
+            Between,
+            expr::{Cast, TryCast},
+        },
+    };
+
+    fn timestamp(micros: i64) -> Expr {
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(micros), Some("UTC".into())), None)
+    }
+
+    fn date_filters(expr: Expr) -> Vec<(Operator, i32)> {
+        time_range_partition_pruner::timestamp_to_date_filters(&expr, "timestamp")
+            .into_iter()
+            .map(|expr| match expr {
+                Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (*left, *right) {
+                    (Expr::Column(col), Expr::Literal(ScalarValue::Date32(Some(day)), _)) if col.name == "date" => (op, day),
+                    _ => panic!("unexpected date filter"),
+                },
+                _ => panic!("unexpected date filter"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn timestamp_between_derives_two_inclusive_date_bounds() {
+        let expr = Expr::Between(Between::new(
+            Box::new(Expr::Column(datafusion::common::Column::new_unqualified("timestamp"))),
+            false,
+            Box::new(timestamp(1_704_067_200_000_000)),
+            Box::new(timestamp(1_704_240_000_000_000)),
+        ));
+
+        assert_eq!(date_filters(expr), vec![(Operator::GtEq, 19_723), (Operator::LtEq, 19_725)]);
+    }
+
+    #[test]
+    fn timestamp_comparisons_support_units_casts_and_reversed_operands() {
+        let timestamp_col = Expr::Column(datafusion::common::Column::new_unqualified("timestamp"));
+        let cast_timestamp = Expr::Cast(Cast::new(Box::new(timestamp_col.clone()), DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))));
+        let try_cast_timestamp = Expr::TryCast(TryCast::new(Box::new(timestamp_col.clone()), DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))));
+        let start = 1_704_067_200_000_000i64;
+        let cases = [
+            (Expr::BinaryExpr(BinaryExpr::new(Box::new(timestamp_col.clone()), Operator::GtEq, Box::new(timestamp(start)))), Operator::GtEq),
+            (Expr::BinaryExpr(BinaryExpr::new(Box::new(timestamp(start)), Operator::LtEq, Box::new(timestamp_col.clone()))), Operator::GtEq),
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(cast_timestamp),
+                    Operator::Lt,
+                    Box::new(Expr::Literal(ScalarValue::TimestampNanosecond(Some(start * 1_000), Some("UTC".into())), None)),
+                )),
+                Operator::LtEq,
+            ),
+            (Expr::BinaryExpr(BinaryExpr::new(Box::new(try_cast_timestamp), Operator::Gt, Box::new(timestamp(start)))), Operator::GtEq),
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(timestamp_col.clone()),
+                    Operator::Eq,
+                    Box::new(Expr::Literal(ScalarValue::TimestampMillisecond(Some(start / 1_000), Some("UTC".into())), None)),
+                )),
+                Operator::Eq,
+            ),
+            (
+                Expr::BinaryExpr(BinaryExpr::new(
+                    Box::new(timestamp_col),
+                    Operator::Eq,
+                    Box::new(Expr::Literal(ScalarValue::TimestampSecond(Some(start / 1_000_000), Some("UTC".into())), None)),
+                )),
+                Operator::Eq,
+            ),
+        ];
+
+        for (expr, expected_op) in cases {
+            assert_eq!(date_filters(expr), vec![(expected_op, 19_723)]);
+        }
     }
 }
 

@@ -13,6 +13,7 @@ mod insert_unnest_variant;
 mod multi_tenant_isolation;
 mod or_utf8view_delta;
 mod ordering_pushdown;
+mod partition_pruning;
 mod postcommit_hooks;
 mod pressure_flush;
 mod restart_recovery;

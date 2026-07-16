@@ -5989,25 +5989,13 @@ impl ProjectRoutingTable {
         let time_column =
             crate::schema_loader::get_schema(&self.table_name).map(|s| s.time_column_name().to_string()).unwrap_or_else(|| "timestamp".to_string());
 
-        let mut optimized_filters = Vec::new();
-        let mut has_date_filter = false;
+        let mut optimized_filters = filters.to_vec();
 
-        // First, check if we already have a date filter to avoid duplicates
         for filter in filters {
-            if Self::is_date_filter(filter) {
-                has_date_filter = true;
-            }
-            optimized_filters.push(filter.clone());
-        }
-
-        // Only add date filters if we don't already have one
-        if !has_date_filter {
-            for filter in filters {
-                // Check if this is a timestamp filter that needs a date filter added
-                if let Some(date_filter) = time_range_partition_pruner::timestamp_to_date_filter(filter, &time_column) {
-                    optimized_filters.push(date_filter);
-                    debug!("Added date partition filter for {} on column {}", self.table_name, time_column);
-                }
+            let date_filters = time_range_partition_pruner::timestamp_to_date_filters(filter, &time_column);
+            if !date_filters.is_empty() {
+                debug!("Added {} date partition filter(s) for {} on column {}", date_filters.len(), self.table_name, time_column);
+                optimized_filters.extend(date_filters);
             }
         }
 
@@ -6017,16 +6005,6 @@ impl ProjectRoutingTable {
         }
 
         Ok(optimized_filters)
-    }
-
-    /// Check if an expression is a date filter
-    fn is_date_filter(expr: &Expr) -> bool {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, .. }) => {
-                matches!(left.as_ref(), Expr::Column(col) if col.name == "date")
-            }
-            _ => false,
-        }
     }
 
     /// Check if filters contain a project_id filter
