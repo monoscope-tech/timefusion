@@ -3010,7 +3010,7 @@ dependencies = [
 [[package]]
 name = "deltalake"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=6e4ff7d59ae067c95f8ed3b4464fcdcf3aa420ed#6e4ff7d59ae067c95f8ed3b4464fcdcf3aa420ed"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=2dcffd5a0c0bcc6f61c9eebf5967a040ddae7814#2dcffd5a0c0bcc6f61c9eebf5967a040ddae7814"
 dependencies = [
  "buoyant_kernel 0.24.0",
  "ctor",
@@ -3021,7 +3021,7 @@ dependencies = [
 [[package]]
 name = "deltalake-aws"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=6e4ff7d59ae067c95f8ed3b4464fcdcf3aa420ed#6e4ff7d59ae067c95f8ed3b4464fcdcf3aa420ed"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=2dcffd5a0c0bcc6f61c9eebf5967a040ddae7814#2dcffd5a0c0bcc6f61c9eebf5967a040ddae7814"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3044,7 +3044,7 @@ dependencies = [
 [[package]]
 name = "deltalake-core"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=6e4ff7d59ae067c95f8ed3b4464fcdcf3aa420ed#6e4ff7d59ae067c95f8ed3b4464fcdcf3aa420ed"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=2dcffd5a0c0bcc6f61c9eebf5967a040ddae7814#2dcffd5a0c0bcc6f61c9eebf5967a040ddae7814"
 dependencies = [
  "alloc-stdlib",
  "arrow",
@@ -3100,7 +3100,7 @@ dependencies = [
 [[package]]
 name = "deltalake-derive"
 version = "1.0.0"
-source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=6e4ff7d59ae067c95f8ed3b4464fcdcf3aa420ed#6e4ff7d59ae067c95f8ed3b4464fcdcf3aa420ed"
+source = "git+https://github.com/tonyalaribe/delta-rs-timefusion.git?rev=2dcffd5a0c0bcc6f61c9eebf5967a040ddae7814#2dcffd5a0c0bcc6f61c9eebf5967a040ddae7814"
 dependencies = [
  "convert_case 0.9.0",
  "itertools 0.14.0",

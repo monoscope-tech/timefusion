@@ -1767,30 +1767,22 @@ impl Database {
                     info!("Running scheduled light optimize on recent small files");
                     // Dedup FIRST so the light compact bin-packs already-deduped files —
                     // otherwise compact would merge duplicates into one file we'd rewrite again.
+                    // Each table runs under its own timeout: spawn_cron_job's wedge abort
+                    // kills the WHOLE closure, so without a per-table bound a slow first
+                    // table (the busy unified one) starves every table after it — they'd
+                    // never get compacted at all.
                     for (table_name, table) in db.unified_tables.read().await.iter() {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
-                        if let Err(e) = db.dedup_today_partitions(table, table_name, table_name).await {
-                            error!("Dedup sweep failed for unified table '{}': {}", table_name, e);
-                        }
-                        match db.optimize_table_light(table, table_name).await {
-                            Ok(_) => info!("Light optimize completed for unified table '{}'", table_name),
-                            Err(e) => error!("Light optimize failed for unified table '{}': {}", table_name, e),
-                        }
+                        db.run_light_maintenance_for_table(table, table_name, table_name, &format!("unified table '{table_name}'")).await;
                     }
                     for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
-                        let key = format!("{}:{}", project_id, table_name);
-                        if let Err(e) = db.dedup_today_partitions(table, table_name, &key).await {
-                            error!("Dedup sweep failed for custom project '{}' table '{}': {}", project_id, table_name, e);
-                        }
-                        match db.optimize_table_light(table, table_name).await {
-                            Ok(_) => info!("Light optimize completed for custom project '{}' table '{}'", project_id, table_name),
-                            Err(e) => error!("Light optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e),
-                        }
+                        let key = format!("{project_id}:{table_name}");
+                        db.run_light_maintenance_for_table(table, table_name, &key, &format!("custom project '{project_id}' table '{table_name}'")).await;
                     }
                 }
             }
@@ -5009,6 +5001,26 @@ impl Database {
             info!("dedup sweep: table={} key={} total_dropped={}", table_name, dedup_key, total_dropped);
         }
         Ok(())
+    }
+
+    /// One table's light maintenance (dedup then bin-pack), bounded by a
+    /// per-table timeout so a single slow/wedged table can't consume the whole
+    /// tick and starve the tables after it (the cron-level wedge abort kills the
+    /// entire run mid-table). A timed-out table just resumes next tick.
+    async fn run_light_maintenance_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
+        const PER_TABLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(180);
+        let work = async {
+            if let Err(e) = self.dedup_today_partitions(table, table_name, dedup_key).await {
+                error!("Dedup sweep failed for {label}: {e}");
+            }
+            match self.optimize_table_light(table, table_name).await {
+                Ok(_) => info!("Light optimize completed for {label}"),
+                Err(e) => error!("Light optimize failed for {label}: {e}"),
+            }
+        };
+        if tokio::time::timeout(PER_TABLE_TIMEOUT, work).await.is_err() {
+            warn!("Light maintenance for {label} exceeded {PER_TABLE_TIMEOUT:?}; skipping to next table (resumes next tick)");
+        }
     }
 
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
