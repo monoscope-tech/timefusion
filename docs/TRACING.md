@@ -98,6 +98,47 @@ The JSON-formatted logs can be:
 }
 ```
 
+## Slow-query diagnosis recipe
+
+PGWire emits `pgwire.slow_statement` for every successful or failed statement
+that takes at least one second. The event includes:
+
+- `query.fingerprint`: SHA-256 of the complete normalized query shape;
+- `query.template`: lower-cased SQL with literals and comments replaced by `?`,
+  capped at 512 characters for logs. The fingerprint is computed before that
+  cap, so long statements do not collapse into the same query identity;
+- `query.class`, up to three `query.tables`, optional literal `project.id`,
+  `protocol`, `duration_us`, and `success`.
+
+The `postgres.query.*` trace span's `query.text` uses the same template. Raw
+SQL must not be sent to normal logs or metrics: it may contain customer data,
+credentials, or unbounded bulk values.
+
+### Investigation workflow
+
+1. Aggregate slow-statement events by `query.fingerprint`; rank first by total
+   time consumed (`count × average duration`), then by p99 and count. Use
+   `query.template` to identify the predicate, join, sort, grouping, and limit
+   shape behind each fingerprint.
+2. Narrow the candidate with `query.tables`, `project.id`, and `protocol`.
+   Treat project IDs as log dimensions, not metric labels, to avoid
+   high-cardinality metrics.
+3. Compare the time window with `timefusion_stats` PGWire and scan percentiles,
+   buffer/WAL state, flush/checkpoint logs, and object-store cache signals.
+   A normal scan tail with a slow PGWire tail points to planning, response
+   encoding, client backpressure, or maintenance contention; a Delta-only scan
+   tail points to Delta metadata, file fan-out, pruning, or object-store work.
+4. Inspect the physical-plan trace for the specific fingerprint before changing
+   storage layout or cache settings. Apply the narrowest measured fix: improve
+   partition predicates, reduce result size, compact affected files, correct
+   pruning, or isolate maintenance contention.
+5. Verify the same fingerprint's count, p99, and total time after the change.
+   Do not use broad production scans as a diagnostic shortcut.
+
+If a normalized template is insufficient, capture raw SQL only through a
+separate, access-controlled, sampled diagnostic sink with an explicit retention
+policy. Do not enable raw SQL in the standard tracing/log pipeline.
+
 ## Performance Impact
 
 DataFusion-tracing is designed to have minimal overhead:

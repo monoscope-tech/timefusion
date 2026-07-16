@@ -1,4 +1,7 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    sync::{Arc, LazyLock},
+};
 
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
@@ -20,6 +23,8 @@ use datafusion_postgres::{
     },
 };
 use futures::Sink;
+use regex::Regex;
+use sha2::{Digest, Sha256};
 use tracing::{Instrument, error, field::Empty, info, instrument};
 
 use crate::{database::Database, plan_cache::PlanCacheHook};
@@ -401,24 +406,32 @@ fn classify_query(query: &str) -> (&'static str, &'static str) {
     }
 }
 
-fn sanitize_query(query: &str, operation: &str) -> String {
-    const MAX_LEN: usize = 120;
-    let lower = query.to_lowercase();
-    match operation {
-        "INSERT" => {
-            let table_end = lower.find('(').or_else(|| lower.find("values")).unwrap_or(lower.len());
-            let table_part = query[..table_end].trim_end();
-            format!("{} (...) VALUES ...", table_part)
-        }
-        "UPDATE" => lower.find(" set ").map(|i| format!("{} SET ...", &query[..i])).unwrap_or_else(|| query.into()),
-        _ => {
-            if query.len() > MAX_LEN {
-                format!("{}...", &query[..MAX_LEN])
-            } else {
-                query.into()
-            }
-        }
-    }
+/// Redact literal values and comments so the result can safely be indexed and
+/// used as a stable query fingerprint.
+fn normalized_query(query: &str) -> String {
+    static BLOCK_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)/\*.*?\*/").unwrap());
+    static LINE_COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"--[^\r\n]*").unwrap());
+    static DOLLAR_STRING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)\$[A-Za-z_0-9]*\$.*?\$[A-Za-z_0-9]*\$").unwrap());
+    static STRING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)(?:e|u&)?'(?:''|[^'])*'").unwrap());
+    static NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\b").unwrap());
+    static WHITESPACE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
+
+    let query = BLOCK_COMMENT.replace_all(query, " ");
+    let query = LINE_COMMENT.replace_all(&query, " ");
+    let query = DOLLAR_STRING.replace_all(&query, "?");
+    let query = STRING.replace_all(&query, "?");
+    let query = NUMBER.replace_all(&query, "?");
+    WHITESPACE.replace_all(&query, " ").trim().to_ascii_lowercase()
+}
+
+fn query_template(query: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let query = normalized_query(query);
+    if query.chars().count() <= MAX_CHARS { query } else { format!("{}...", query.chars().take(MAX_CHARS).collect::<String>()) }
+}
+
+fn query_fingerprint(query: &str) -> String {
+    format!("{:x}", Sha256::digest(normalized_query(query).as_bytes()))
 }
 
 /// Classify `query` and stamp the standard query/db tracing fields onto `span`.
@@ -427,7 +440,44 @@ fn record_query_span(span: &tracing::Span, query: &str) {
     span.record("query.type", query_type);
     span.record("query.operation", operation);
     span.record("db.operation", operation);
-    span.record("query.text", sanitize_query(query, operation).as_str());
+    span.record("query.text", query_template(query));
+}
+
+/// Emit one bounded event for statements slow enough to affect the tail. Table
+/// and project dimensions are extracted only for diagnosis; raw SQL is never
+/// included in this event.
+fn record_statement_latency(metrics: Option<&crate::database::ScanMetrics>, query: &str, protocol: &'static str, duration_us: u64, success: bool) {
+    if let Some(metrics) = metrics {
+        metrics.record_pgwire_query(duration_us);
+    }
+    const SLOW_QUERY_US: u64 = 1_000_000;
+    if duration_us < SLOW_QUERY_US {
+        return;
+    }
+
+    let (_, operation) = classify_query(query);
+    let template = query_template(query);
+    let (tables, project_id) = query_dimensions(query);
+    info!(
+        event = "pgwire.slow_statement",
+        query.class = operation,
+        query.fingerprint = %query_fingerprint(query),
+        query.template = %template,
+        query.tables = %tables,
+        project.id = %project_id,
+        protocol,
+        duration_us,
+        success,
+        "slow PostgreSQL statement"
+    );
+}
+
+fn query_dimensions(query: &str) -> (String, String) {
+    static TABLES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\b(?:from|join|into|update|table)\s+([\w.\"]+)"#).unwrap());
+    static PROJECT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)\bproject_id\s*=\s*'([^']{1,128})'"#).unwrap());
+    let tables = TABLES.captures_iter(query).filter_map(|captures| captures.get(1).map(|m| m.as_str())).take(3).collect::<Vec<_>>().join(",");
+    let project_id = PROJECT.captures(query).and_then(|captures| captures.get(1)).map_or("", |m| m.as_str()).to_string();
+    (tables, project_id)
 }
 
 #[async_trait]
@@ -474,9 +524,7 @@ impl SimpleQueryHandler for LoggingSimpleQueryHandler {
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
         let result = <DfSessionService as SimpleQueryHandler>::do_query(&self.inner, client, query).instrument(execute_span).await;
-        if let Some(m) = &self.scan_metrics {
-            m.record_pgwire_query(t0.elapsed().as_micros() as u64);
-        }
+        record_statement_latency(self.scan_metrics.as_deref(), query, "simple", t0.elapsed().as_micros() as u64, result.is_ok());
         result
     }
 }
@@ -552,9 +600,7 @@ impl ExtendedQueryHandler for LoggingExtendedQueryHandler {
         let execute_span = tracing::trace_span!(parent: &span, "datafusion.execute");
         let t0 = std::time::Instant::now();
         let result = <DfSessionService as ExtendedQueryHandler>::do_query(&self.inner, client, portal, max_rows).instrument(execute_span).await;
-        if let Some(m) = &self.scan_metrics {
-            m.record_pgwire_query(t0.elapsed().as_micros() as u64);
-        }
+        record_statement_latency(self.scan_metrics.as_deref(), query, "extended", t0.elapsed().as_micros() as u64, result.is_ok());
         result
     }
 }
@@ -598,7 +644,7 @@ pub async fn serve_with_listener(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_flush, parse_optimize, parse_vacuum, rewrite_pg_synonyms};
+    use super::{parse_flush, parse_optimize, parse_vacuum, query_dimensions, query_fingerprint, query_template, rewrite_pg_synonyms};
 
     #[test]
     fn optimize_parses_table_and_date() {
@@ -664,6 +710,26 @@ mod tests {
         assert!(!parse_flush("FLUSH t"));
         assert!(!parse_flush("SELECT flushed FROM t"));
         assert!(!parse_flush("flush_log"));
+    }
+
+    #[test]
+    fn slow_query_dimensions_are_bounded_and_sql_free() {
+        let (tables, project_id) = query_dimensions("SELECT * FROM logs JOIN traces ON true WHERE project_id = 'project-123' AND body = 'secret'");
+        assert_eq!(tables, "logs,traces");
+        assert_eq!(project_id, "project-123");
+        assert!(!tables.contains("secret"));
+    }
+
+    #[test]
+    fn query_template_redacts_literals_and_has_a_stable_fingerprint() {
+        let first = "SELECT * FROM logs WHERE project_id = 'project-123' AND body = 'secret' AND n = 42 -- do not log";
+        let second = "select * from logs where project_id = 'project-456' and body = 'other' and n = 7";
+        let first_template = query_template(first);
+        assert_eq!(first_template, "select * from logs where project_id = ? and body = ? and n = ?");
+        assert_eq!(first_template, query_template(second));
+        assert_eq!(query_fingerprint(first), query_fingerprint(second));
+        assert!(!first_template.contains("secret"));
+        assert!(!first_template.contains("project-123"));
     }
 
     #[test]
