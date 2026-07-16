@@ -83,12 +83,18 @@ async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<
     let client = env.pg_client().await?;
 
     let sec = 1_000_000i64;
-    // 9 rows, 20s apart → span ~3 buckets → ~3 flush files for compaction to merge.
-    for i in 0..9 {
-        insert_at(&client, &format!("d-{i}"), FROZEN_START_MICROS + i * 20 * sec).await?;
+    // 9 rows across 3 buckets, flushed one bucket at a time → 3 distinct Delta
+    // files for SortBy to actually merge. A single force_flush coalesces all
+    // completed buckets into one file, which the incremental SortBy correctly
+    // skips as a no-op (single-file bin) — leaving nothing to test.
+    for b in 0..3i64 {
+        for i in 0..3i64 {
+            let idx = b * 3 + i;
+            insert_at(&client, &format!("d-{idx}"), FROZEN_START_MICROS + idx * 20 * sec).await?;
+        }
+        env.advance(Duration::from_secs(bucket_secs * 2));
+        env.force_flush().await?;
     }
-    env.advance(Duration::from_secs(bucket_secs * 6));
-    env.force_flush().await?;
 
     // Compact the partition → SortBy rewrite (globally sorted, honest DESC footer).
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap().date_naive();
