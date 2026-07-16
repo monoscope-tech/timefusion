@@ -3807,7 +3807,7 @@ impl Database {
         // Pre-state file set, used to derive the files this optimize *adds*
         // (to warm) and *removes* (to evict) — see warm/evict_cache_for_uris.
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
-        let pre_uris: std::collections::HashSet<String> = if track_files { all_uris.iter().cloned().collect() } else { Default::default() };
+        let mut pre_uris: std::collections::HashSet<String> = if track_files { all_uris.iter().cloned().collect() } else { Default::default() };
 
         let target_size = self.config.parquet.timefusion_optimize_target_size;
 
@@ -3871,9 +3871,9 @@ impl Database {
         // the configured concurrency.
         let optimize_concurrency = if declare_sorted { 1 } else { self.config.maintenance.timefusion_optimize_max_concurrent_tasks };
 
-        // Same trade-off as optimize_table_light: best-effort, don't pause
-        // flushes (see comment there). Z-order full optimize is daily-ish,
-        // so an occasional OCC failure is fine.
+        // Best-effort: retry bounded OCC conflicts against a fresh snapshot,
+        // but never pause flushes (see optimize_table_light). This preserves
+        // ingestion latency and prevents maintenance from running unbounded.
         //
         // Hold a maintenance-rewrite permit across the .optimize() — this is
         // the HEAVIEST rewrite (full-window ZOrder/Compact materializing a
@@ -3882,22 +3882,51 @@ impl Database {
         // reproduce the cgroup OOM the cap exists to prevent (prod 2026-07-04).
         // Scoped to the optimize call so the post-commit warm/evict bookkeeping
         // below runs without the permit.
-        let optimize_result = {
-            let _rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
-            table_clone
-                .optimize()
-                .with_filters(&partition_filters)
-                .with_type(optimize_type)
-                .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
-                .with_max_concurrent_tasks(optimize_concurrency)
-                .with_writer_properties(writer_properties)
-                .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
-                .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                // Avoid the BinaryView read for Variant columns (same issue as
-                // optimize_table_light); delta-rs's internal session defaults to
-                // schema_force_view_types=true.
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
-                .await
+        const MAX_RETRIES: usize = 4;
+        let optimize_result: Result<_> = {
+            let mut attempt = 0;
+            loop {
+                if attempt > 0 {
+                    tokio::time::sleep(occ_backoff(attempt - 1)).await;
+                    if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
+                        break Err(anyhow::anyhow!("optimize refresh before retry failed: {e}"));
+                    }
+                }
+                let table_clone = { table_ref.read().await.clone() };
+                if track_files {
+                    pre_uris = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                }
+                let result = {
+                    let _rewrite_permit =
+                        self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
+                    table_clone
+                        .optimize()
+                        .with_filters(&partition_filters)
+                        .with_type(optimize_type.clone())
+                        .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
+                        .with_max_concurrent_tasks(optimize_concurrency)
+                        .with_writer_properties(writer_properties.clone())
+                        .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
+                        .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                        // Avoid the BinaryView read for Variant columns (same issue as
+                        // optimize_table_light); delta-rs's internal session defaults to
+                        // schema_force_view_types=true.
+                        .with_session_state(Arc::new(build_optimize_session_state(
+                            self.config.memory.timefusion_query_partitions,
+                            self.maintenance_runtime_env(),
+                        )))
+                        .await
+                };
+                match result {
+                    Ok(result) => break Ok(result),
+                    Err(e) if is_occ_conflict_err(&e.to_string()) && attempt + 1 < MAX_RETRIES => {
+                        crate::metrics::record_optimize_conflict();
+                        attempt += 1;
+                        warn!("Optimize OCC conflict for table={} (attempt {}/{}), refreshing + retrying: {}", table_name, attempt, MAX_RETRIES, e);
+                    }
+                    Err(e) => break Err(e.into()),
+                }
+            }
         };
 
         match optimize_result {
@@ -4031,6 +4060,21 @@ impl Database {
             }
         }
         out
+    }
+
+    /// Project IDs with live files in one hot `(project_id, date)` partition.
+    /// A light optimize must use both partition predicates: filtering by `date`
+    /// alone conflicts with every project's append to the active day.
+    fn hot_project_ids(uris: &[String], date: chrono::NaiveDate) -> Vec<String> {
+        let date_marker = format!("/date={date}/");
+        uris.iter()
+            .filter(|uri| uri.contains(&date_marker))
+            .filter_map(|uri| uri.split('/').find_map(|segment| segment.strip_prefix("project_id=")))
+            .filter(|project_id| !project_id.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
     }
 
     /// Partition-ownership boundary between the warm (30-min Z-order) and cold
@@ -5038,9 +5082,12 @@ impl Database {
     }
 
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
-        let start_time = std::time::Instant::now();
         let today = Utc::now().date_naive();
-        let partition_filters = vec![PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?];
+        let project_ids = {
+            let table = table_ref.read().await;
+            let uris: Vec<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+            Self::hot_project_ids(&uris, today)
+        };
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         // SortBy the schema keys (declare_sorted=true) so the current partition's
@@ -5057,7 +5104,31 @@ impl Database {
         // buckets and a 10× drop in ingest throughput. Better to let
         // optimize fail loudly during heavy ingest; the next scheduler
         // tick (5 min later) usually catches a quiet enough window.
-        self.optimize_table_light_inner(table_ref, today, &partition_filters, target_size, &writer_properties, optimize_type, start_time).await
+        let mut failed = 0;
+        for project_id in project_ids {
+            let partition_filters = vec![
+                PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
+                PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?,
+            ];
+            if let Err(e) = self
+                .optimize_table_light_inner(
+                    table_ref,
+                    today,
+                    &project_id,
+                    &partition_filters,
+                    target_size,
+                    &writer_properties,
+                    optimize_type.clone(),
+                    std::time::Instant::now(),
+                )
+                .await
+            {
+                failed += 1;
+                warn!("Light optimize failed for project={} date={}: {}", project_id, today, e);
+            }
+        }
+        anyhow::ensure!(failed == 0, "Light optimize failed for {failed} hot partition(s)");
+        Ok(())
     }
 
     /// Inner optimize loop. Caller is expected to hold the flush lock when
@@ -5065,7 +5136,7 @@ impl Database {
     /// safety net against bursts from `flush_all_now` or shutdown flushes.
     #[allow(clippy::too_many_arguments)]
     async fn optimize_table_light_inner(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, today: chrono::NaiveDate, partition_filters: &[PartitionFilter], target_size: i64,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, today: chrono::NaiveDate, project_id: &str, partition_filters: &[PartitionFilter], target_size: i64,
         writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType, start_time: std::time::Instant,
     ) -> Result<()> {
         const MAX_RETRIES: usize = 4;
@@ -5085,7 +5156,7 @@ impl Database {
             let pre_uris: std::collections::HashSet<String> =
                 if track_files { table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default() } else { Default::default() };
             if attempt == 0 {
-                info!("Light optimizing files from date: {}", today);
+                info!("Light optimizing project={} date={}", project_id, today);
             } else {
                 debug!("Light optimize retry {}/{} after OCC conflict", attempt + 1, MAX_RETRIES);
             }
@@ -5112,14 +5183,20 @@ impl Database {
                 Ok((new_table, metrics)) => {
                     let min_files = self.config.maintenance.timefusion_compact_min_files;
                     if metrics.total_considered_files < min_files {
-                        debug!("Skipping light optimization commit: {} files < min threshold {}", metrics.total_considered_files, min_files);
+                        debug!(
+                            "Skipping light optimization commit for project={} date={}: {} files < min threshold {}",
+                            project_id, today, metrics.total_considered_files, min_files
+                        );
                         return Ok(());
                     }
                     let duration = start_time.elapsed();
                     info!(
-                        "Light optimization completed in {:?} (attempt {}): {} files removed, {} files added",
+                        "Light optimization completed for project={} date={} in {:?} (attempt {}): {} files considered, {} removed, {} added",
+                        project_id,
+                        today,
                         duration,
                         attempt + 1,
+                        metrics.total_considered_files,
                         metrics.num_files_removed,
                         metrics.num_files_added
                     );
@@ -7395,6 +7472,19 @@ mod tests {
         let d2 = chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap();
         let sets = Database::filesets_for_dates(&uris, &[d2]);
         assert!(sets[&d2].is_empty());
+    }
+
+    #[test]
+    fn hot_project_ids_are_limited_to_the_requested_date() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+        let uris = vec![
+            "s3://b/t/project_id=alpha/date=2026-07-16/a.parquet".to_string(),
+            "s3://b/t/project_id=beta/date=2026-07-16/b.parquet".to_string(),
+            "s3://b/t/project_id=alpha/date=2026-07-16/c.parquet".to_string(),
+            "s3://b/t/project_id=old/date=2026-07-15/d.parquet".to_string(),
+            "s3://b/t/date=2026-07-16/e.parquet".to_string(),
+        ];
+        assert_eq!(Database::hot_project_ids(&uris, date), vec!["alpha", "beta"]);
     }
 
     /// Two identical file sets compare equal (→ partition skipped); adding a
