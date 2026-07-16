@@ -114,6 +114,12 @@ The `postgres.query.*` trace span's `query.text` uses the same template. Raw
 SQL must not be sent to normal logs or metrics: it may contain customer data,
 credentials, or unbounded bulk values.
 
+For an `UPDATE … FROM` that has a synchronous phase over one second,
+`dml.slow_phase` records the inherited query span plus `phase`, `duration_us`,
+and the relevant source-planning/execution or MemBuffer/flush-wait dimensions.
+This distinguishes expensive source materialization from contention before
+changing DML or storage behavior.
+
 ### Investigation workflow
 
 1. Aggregate slow-statement events by `query.fingerprint`; rank first by total

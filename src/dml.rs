@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use datafusion::{
@@ -30,6 +30,7 @@ use crate::{
 /// Hard cap on the number of source rows we'll materialize for an `UPDATE ... FROM`.
 /// Beyond this we error rather than blowing memory; the caller must page or pre-aggregate.
 const MAX_UPDATE_SOURCE_ROWS: usize = 1_000_000;
+const SLOW_DML_PHASE_US: u64 = 1_000_000;
 
 /// Build a clean SessionState with config + runtime from the given session but with
 /// delta-rs's DeltaPlanner instead of our custom DmlQueryPlanner.
@@ -337,7 +338,9 @@ fn expr_to_bare_col(expr: &Expr) -> Option<String> {
 /// the source plan as a regular DataFusion query and concatenating the streamed
 /// batches. Errors if the source exceeds [`MAX_UPDATE_SOURCE_ROWS`].
 async fn materialize_source(planner: &DefaultPhysicalPlanner, session_state: &SessionState, sp: UpdateSourcePlan) -> Result<UpdateSource> {
+    let started = Instant::now();
     let phys = planner.create_physical_plan(&sp.plan, session_state).await?;
+    let planning_us = started.elapsed().as_micros() as u64;
     let schema = phys.schema();
     let task_ctx = Arc::new(TaskContext::from(session_state));
 
@@ -361,6 +364,18 @@ async fn materialize_source(planner: &DefaultPhysicalPlanner, session_state: &Se
     }
 
     let combined = concat_batches(&schema, &batches).map_err(arrow_err)?;
+    let duration_us = started.elapsed().as_micros() as u64;
+    if duration_us >= SLOW_DML_PHASE_US {
+        info!(
+            event = "dml.slow_phase",
+            phase = "update_source_materialization",
+            planning_us,
+            execution_us = duration_us.saturating_sub(planning_us),
+            duration_us,
+            source_rows = total_rows,
+            "slow DML phase"
+        );
+    }
 
     Ok(UpdateSource { batch: combined, schema, join_keys: sp.join_keys })
 }
@@ -617,7 +632,20 @@ impl<'a> DmlContext<'a> {
         let has_uncommitted = self.buffered_layer.is_some_and(|l| l.has_table(self.project_id, self.table_name));
 
         if let Some(layer) = self.buffered_layer.filter(|_| has_uncommitted) {
+            let started = Instant::now();
             total_rows += mem_op(layer, self.predicate.as_ref())?;
+            let duration_us = started.elapsed().as_micros() as u64;
+            if duration_us >= SLOW_DML_PHASE_US {
+                info!(
+                    event = "dml.slow_phase",
+                    phase = "mem_buffer_mutation",
+                    table.name = self.table_name,
+                    project_id = self.project_id,
+                    duration_us,
+                    rows = total_rows,
+                    "slow DML phase"
+                );
+            }
         }
         debug!(
             "DML mem leg for {}/{}: layer_present={} table_in_buffer={} mem_rows={}",
@@ -636,7 +664,19 @@ impl<'a> DmlContext<'a> {
         // has_committed check below see a table whose first-ever commit was
         // airborne when this statement arrived.
         if let Some(layer) = self.buffered_layer {
+            let started = Instant::now();
             layer.await_inflight_flushes(self.project_id, self.table_name).await;
+            let duration_us = started.elapsed().as_micros() as u64;
+            if duration_us >= SLOW_DML_PHASE_US {
+                info!(
+                    event = "dml.slow_phase",
+                    phase = "await_inflight_flush",
+                    table.name = self.table_name,
+                    project_id = self.project_id,
+                    duration_us,
+                    "slow DML phase"
+                );
+            }
         }
 
         // Check if there's committed data: either in custom project tables or unified tables.
@@ -864,6 +904,9 @@ where
         let pre_version = snapshot.version();
         match operation(snapshot).await {
             Ok((new_table, rows_affected)) => {
+                if attempt > 0 {
+                    crate::metrics::record_dml_retry_success();
+                }
                 // A merge matching zero rows commits nothing — same table back,
                 // version unchanged: skip persist + swap entirely.
                 if new_table.version() > pre_version {
@@ -883,7 +926,12 @@ where
                 warn!("DML delta op conflict on {}/{}, retrying ({}/{}): {}", project_id, table_name, attempt, DML_MAX_ATTEMPTS, e);
                 tokio::time::sleep(crate::database::occ_backoff(attempt)).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                if attempt + 1 == DML_MAX_ATTEMPTS && crate::database::is_occ_conflict_err(&e.to_string()) {
+                    crate::metrics::record_dml_retry_exhausted();
+                }
+                return Err(e);
+            }
         }
     }
 }
