@@ -196,11 +196,11 @@ WHERE project_id = 'prod-api-001'
   AND 'trace_124' = ANY(hashes)
   AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00';
 
--- Requests and p95 latency, bucketed into 5-minute windows
-SELECT time_bucket(INTERVAL '5 minutes', timestamp) AS bucket,
+-- Requests and approximate p95 latency, bucketed into 5-minute windows (Timescale Toolkit-compatible)
+SELECT time_bucket('5 minutes', timestamp) AS bucket,
        COUNT(*) AS requests,
        AVG(duration / 1000000)::INT AS avg_duration_ms,
-       PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration / 1000000) AS p95_duration_ms
+       approx_percentile(0.95, percentile_agg(CAST(duration / 1000000 AS DOUBLE))) AS p95_duration_ms
 FROM otel_logs_and_spans
 WHERE project_id = 'prod-api-001'
   AND timestamp >= '2025-01-17 14:00:00' AND timestamp < '2025-01-17 15:00:00'

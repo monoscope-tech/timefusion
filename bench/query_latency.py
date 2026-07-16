@@ -78,13 +78,13 @@ WHERE timestamp BETWEEN %s AND %s AND project_id = %s AND id = %s LIMIT 1"""
 Q_COUNT = """SELECT count(*) FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s"""
 
 Q_UNION_PCT = """
-SELECT 'p50' AS pct, approx_percentile_cont(duration, 0.50) AS v FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s
+SELECT 'p50' AS pct, approx_percentile(0.50, percentile_agg(CAST(duration AS DOUBLE))) AS v FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s
 UNION ALL
-SELECT 'p75', approx_percentile_cont(duration, 0.75) FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s
+SELECT 'p75', approx_percentile(0.75, percentile_agg(CAST(duration AS DOUBLE))) FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s
 UNION ALL
-SELECT 'p90', approx_percentile_cont(duration, 0.90) FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s
+SELECT 'p90', approx_percentile(0.90, percentile_agg(CAST(duration AS DOUBLE))) FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s
 UNION ALL
-SELECT 'p95', approx_percentile_cont(duration, 0.95) FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s"""
+SELECT 'p95', approx_percentile(0.95, percentile_agg(CAST(duration AS DOUBLE))) FROM otel_logs_and_spans WHERE project_id = %s AND timestamp >= %s"""
 
 
 def seed_scale():

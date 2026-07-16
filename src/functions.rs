@@ -1372,36 +1372,73 @@ fn create_percentile_agg_udaf() -> AggregateUDF {
     )
 }
 
-/// Wrapper for TDigest with accumulated values
+/// Wrapper for the bounded, mergeable t-digest state exchanged between partial
+/// and final aggregates. Its binary representation contains centroids, never
+/// the raw input values.
+const TDIGEST_MAX_CENTROIDS: usize = 200;
+
 #[derive(Debug, Clone)]
 struct TDigestWrapper {
-    values: Vec<f64>,
+    digest: Option<TDigest>,
 }
 
 impl TDigestWrapper {
     fn new() -> Self {
-        Self { values: Vec::new() }
+        Self { digest: None }
     }
 
-    fn insert(&mut self, value: f64) {
-        self.values.push(value);
+    fn insert_batch(&mut self, mut values: Vec<f64>) {
+        values.retain(|value| value.is_finite());
+        if values.is_empty() {
+            return;
+        }
+        let mut digest = TDigest::from_values(values);
+        digest.compress(TDIGEST_MAX_CENTROIDS);
+        self.merge_digest(digest);
     }
 
     fn merge(&mut self, other: &TDigestWrapper) {
-        self.values.extend(&other.values);
+        if let Some(digest) = other.digest.clone() {
+            self.merge_digest(digest);
+        }
+    }
+
+    fn merge_digest(&mut self, digest: TDigest) {
+        let mut digest = match self.digest.take() {
+            Some(current) => current.merge(&digest),
+            None => digest,
+        };
+        digest.compress(TDIGEST_MAX_CENTROIDS);
+        self.digest = Some(digest);
     }
 
     fn to_digest(&self) -> Option<TDigest> {
-        if self.values.is_empty() { None } else { Some(TDigest::from_values(self.values.clone())) }
+        self.digest.clone()
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        bincode::encode_to_vec(&self.values, bincode::config::standard()).unwrap_or_else(|_| Vec::new())
+        let centroids: Vec<(f64, f64)> =
+            self.digest.as_ref().map(|digest| digest.centroids().iter().map(|centroid| (centroid.mean, centroid.weight)).collect()).unwrap_or_default();
+        bincode::encode_to_vec(centroids, bincode::config::standard()).unwrap_or_default()
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        let values: Vec<f64> = bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|e| format!("Failed to deserialize: {}", e))?.0;
-        Ok(Self { values })
+        let centroids: Vec<(f64, f64)> = bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|e| format!("Failed to deserialize: {e}"))?.0;
+        let centroids: Vec<tdigests::Centroid> = centroids
+            .into_iter()
+            .filter(|(mean, weight)| mean.is_finite() && *weight > 0.0)
+            .map(|(mean, weight)| tdigests::Centroid::new(mean, weight))
+            .collect();
+        if centroids.is_empty() {
+            return Ok(Self::new());
+        }
+        let mut digest = TDigest::from_centroids(centroids);
+        digest.compress(TDIGEST_MAX_CENTROIDS);
+        Ok(Self { digest: Some(digest) })
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.digest.as_ref().map_or(0, |digest| digest.centroids().len() * std::mem::size_of::<tdigests::Centroid>())
     }
 }
 
@@ -1427,13 +1464,7 @@ impl Accumulator for PercentileAccumulator {
         let float_array =
             array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| DataFusionError::Execution("percentile_agg expects Float64 values".to_string()))?;
 
-        for i in 0..float_array.len() {
-            if !float_array.is_null(i) {
-                let value = float_array.value(i);
-                self.digest.insert(value);
-            }
-        }
-
+        self.digest.insert_batch((0..float_array.len()).filter(|&i| !float_array.is_null(i)).map(|i| float_array.value(i)).collect());
         Ok(())
     }
 
@@ -1444,8 +1475,7 @@ impl Accumulator for PercentileAccumulator {
     }
 
     fn size(&self) -> usize {
-        // Estimate size based on values vector
-        std::mem::size_of::<TDigestWrapper>() + self.digest.values.len() * std::mem::size_of::<f64>()
+        self.digest.size()
     }
 
     fn state(&mut self) -> datafusion::error::Result<Vec<ScalarValue>> {
@@ -1832,6 +1862,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn percentile_agg_state_is_bounded() {
+        let mut digest = TDigestWrapper::new();
+        digest.insert_batch((0..100_000).map(|value| value as f64).collect());
+        assert!(digest.to_bytes().len() < 10_000, "percentile state must not grow with input rows");
+    }
+
+    #[test]
+    fn percentile_agg_merge_preserves_tail_estimate() {
+        let mut left = TDigestWrapper::new();
+        let mut right = TDigestWrapper::new();
+        left.insert_batch((0..50_000).map(|value| value as f64).collect());
+        right.insert_batch((50_000..100_000).map(|value| value as f64).collect());
+        left.merge(&right);
+
+        assert!(left.to_bytes().len() < 10_000);
+        assert!((left.to_digest().unwrap().estimate_quantile(0.95) - 95_000.0).abs() < 1_000.0);
+    }
+
+    #[test]
     fn test_parse_pg_format() {
         // Helper: assert the parse collapses to a single Chrono part with the given spec.
         let chrono_only = |fmt: &str, expected: &str| {
@@ -1994,8 +2043,7 @@ mod tests {
 
         // Test with values
         let mut wrapper_with_values = TDigestWrapper::new();
-        wrapper_with_values.insert(10.0);
-        wrapper_with_values.insert(20.0);
+        wrapper_with_values.insert_batch(vec![10.0, 20.0]);
         assert!(wrapper_with_values.to_digest().is_some());
     }
 
