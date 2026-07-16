@@ -1438,7 +1438,7 @@ impl TDigestWrapper {
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of::<Self>() + self.digest.as_ref().map_or(0, |digest| digest.centroids().len() * std::mem::size_of::<tdigests::Centroid>())
+        std::mem::size_of::<Self>() + self.digest.as_ref().map_or(0, |digest| std::mem::size_of_val(digest.centroids()))
     }
 }
 

@@ -257,6 +257,23 @@ impl StatsTableProvider {
     }
 }
 
+#[async_trait]
+impl TableProvider for StatsTableProvider {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        // Build a fresh batch on every scan — counters move, we want point-in-time.
+        let batch = self.snapshot_batch()?;
+        let mem = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
+        mem.scan(state, projection, filters, limit).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,22 +293,5 @@ mod tests {
         assert!(rows.contains(&("maintenance", "light_optimize_timed_out_total")));
         assert!(rows.contains(&("parquet", "metadata_cache_hits")));
         assert!(rows.contains(&("parquet", "bytes_read")));
-    }
-}
-
-#[async_trait]
-impl TableProvider for StatsTableProvider {
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-    fn table_type(&self) -> TableType {
-        TableType::View
-    }
-
-    async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Build a fresh batch on every scan — counters move, we want point-in-time.
-        let batch = self.snapshot_batch()?;
-        let mem = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
-        mem.scan(state, projection, filters, limit).await
     }
 }

@@ -965,7 +965,7 @@ impl FoyerObjectStoreCache {
                         if !value.is_expired(self.config.ttl) && e <= value.data.len() {
                             self.update_metadata_stats(|st| {
                                 st.hits += 1;
-                                st.bytes_served += (range.end - range.start) as u64;
+                                st.bytes_served += range.end - range.start;
                             })
                             .await;
                             span.record("cache_hit", true);
