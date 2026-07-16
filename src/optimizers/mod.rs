@@ -105,6 +105,56 @@ pub mod time_range_partition_pruner {
     }
 }
 
+/// Utilities for checking project_id filters
+/// Extract the literal `project_id` value from an expression tree.
+///
+/// Walks the same shapes `ProjectIdPushdown::contains_project_id` recognises:
+/// `project_id = 'x'` (either arg order, Utf8 / Utf8View) and through `AND`
+/// parents. Returns the first match. Used by both the SELECT-side router
+/// (`ProjectRoutingTable`) and DML extractor (`extract_dml_info` in
+/// `dml.rs`); keep them in sync by always going through this function.
+///
+/// `NOT` is intentionally not walked into: `NOT project_id = 'x'` excludes
+/// that project rather than selecting it, so returning it as the routing
+/// target would route to the wrong tenant. Matching the conservative
+/// `contains_project_id` shape ensures both helpers agree.
+pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => match (left.as_ref(), right.as_ref()) {
+            (Expr::Column(col), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(col)) if col.name == "project_id" => extract_utf8_string(v),
+            _ => None,
+        },
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => extract_project_id_from_expr(left).or_else(|| extract_project_id_from_expr(right)),
+        _ => None,
+    }
+}
+
+pub struct ProjectIdPushdown;
+
+impl ProjectIdPushdown {
+    pub fn has_project_id_filter(filters: &[Expr]) -> bool {
+        filters.iter().any(Self::contains_project_id)
+    }
+
+    /// Conservative: recognises `project_id = 'x'` (either argument order) and
+    /// AND-conjuncts that include one. **OR** is intentionally NOT handled —
+    /// `WHERE project_id = 'a' OR project_id = 'b'` is rare in practice and
+    /// reporting "no project_id filter" for it keeps the multi-tenant guard
+    /// strict (the query then errors out instead of silently scanning all
+    /// projects). Extend here if cross-project OR becomes a real workload.
+    pub fn contains_project_id(expr: &Expr) -> bool {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => matches!(
+                (left.as_ref(), right.as_ref()),
+                (Expr::Column(col), Expr::Literal(_, _)) | (Expr::Literal(_, _), Expr::Column(col))
+                if col.name == "project_id"
+            ),
+            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => Self::contains_project_id(left) || Self::contains_project_id(right),
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,56 +233,6 @@ mod tests {
 
         for (expr, expected_op) in cases {
             assert_eq!(date_filters(expr), vec![(expected_op, 19_723)]);
-        }
-    }
-}
-
-/// Utilities for checking project_id filters
-/// Extract the literal `project_id` value from an expression tree.
-///
-/// Walks the same shapes `ProjectIdPushdown::contains_project_id` recognises:
-/// `project_id = 'x'` (either arg order, Utf8 / Utf8View) and through `AND`
-/// parents. Returns the first match. Used by both the SELECT-side router
-/// (`ProjectRoutingTable`) and DML extractor (`extract_dml_info` in
-/// `dml.rs`); keep them in sync by always going through this function.
-///
-/// `NOT` is intentionally not walked into: `NOT project_id = 'x'` excludes
-/// that project rather than selecting it, so returning it as the routing
-/// target would route to the wrong tenant. Matching the conservative
-/// `contains_project_id` shape ensures both helpers agree.
-pub fn extract_project_id_from_expr(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => match (left.as_ref(), right.as_ref()) {
-            (Expr::Column(col), Expr::Literal(v, _)) | (Expr::Literal(v, _), Expr::Column(col)) if col.name == "project_id" => extract_utf8_string(v),
-            _ => None,
-        },
-        Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => extract_project_id_from_expr(left).or_else(|| extract_project_id_from_expr(right)),
-        _ => None,
-    }
-}
-
-pub struct ProjectIdPushdown;
-
-impl ProjectIdPushdown {
-    pub fn has_project_id_filter(filters: &[Expr]) -> bool {
-        filters.iter().any(Self::contains_project_id)
-    }
-
-    /// Conservative: recognises `project_id = 'x'` (either argument order) and
-    /// AND-conjuncts that include one. **OR** is intentionally NOT handled —
-    /// `WHERE project_id = 'a' OR project_id = 'b'` is rare in practice and
-    /// reporting "no project_id filter" for it keeps the multi-tenant guard
-    /// strict (the query then errors out instead of silently scanning all
-    /// projects). Extend here if cross-project OR becomes a real workload.
-    pub fn contains_project_id(expr: &Expr) -> bool {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op: Operator::Eq, right }) => matches!(
-                (left.as_ref(), right.as_ref()),
-                (Expr::Column(col), Expr::Literal(_, _)) | (Expr::Literal(_, _), Expr::Column(col))
-                if col.name == "project_id"
-            ),
-            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => Self::contains_project_id(left) || Self::contains_project_id(right),
-            _ => false,
         }
     }
 }
