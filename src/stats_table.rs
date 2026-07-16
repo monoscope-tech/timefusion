@@ -24,7 +24,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 
-use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, errors::arrow_err};
+use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, errors::arrow_err, object_store_cache::CombinedCacheStats};
 
 /// Snapshot of the size of the resolve/provider caches at scan time.
 /// Reported as `scan.fast_resolve_cache_entries` and
@@ -32,11 +32,13 @@ use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, err
 /// growth (documented on each cache's field) before it shows up as
 /// memory pressure in long-running processes.
 pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
+pub type FoyerStatsSnapshot = Arc<dyn Fn() -> CombinedCacheStats + Send + Sync>;
 
 pub struct StatsTableProvider {
     layer: Option<Arc<BufferedWriteLayer>>,
     scan_metrics: Option<Arc<ScanMetrics>>,
     cache_sizes: Option<CacheSizeSnapshot>,
+    foyer_stats: Option<FoyerStatsSnapshot>,
     schema: SchemaRef,
 }
 
@@ -53,7 +55,7 @@ impl StatsTableProvider {
             Field::new("key", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, false),
         ]));
-        Self { layer, scan_metrics: None, cache_sizes: None, schema }
+        Self { layer, scan_metrics: None, cache_sizes: None, foyer_stats: None, schema }
     }
 
     pub fn with_scan_metrics(mut self, m: Arc<ScanMetrics>) -> Self {
@@ -63,6 +65,11 @@ impl StatsTableProvider {
 
     pub fn with_cache_sizes(mut self, f: CacheSizeSnapshot) -> Self {
         self.cache_sizes = Some(f);
+        self
+    }
+
+    pub fn with_foyer_stats(mut self, f: FoyerStatsSnapshot) -> Self {
+        self.foyer_stats = Some(f);
         self
     }
 
@@ -200,6 +207,30 @@ impl StatsTableProvider {
             rows.push(("pgwire", "lat_p999_us_approx".into(), m.pgwire_percentile_us(0.999).to_string()));
         }
 
+        if let Some(snap) = &self.foyer_stats {
+            let s = snap();
+            for (component, stats) in [("foyer", s.main), ("foyer_metadata", s.metadata)] {
+                rows.push((component, "hits".into(), stats.hits.to_string()));
+                rows.push((component, "misses".into(), stats.misses.to_string()));
+                rows.push((component, "bytes_served".into(), stats.bytes_served.to_string()));
+                rows.push((component, "inner_bytes_read".into(), stats.inner_bytes_read.to_string()));
+                rows.push((component, "ttl_expirations".into(), stats.ttl_expirations.to_string()));
+                rows.push((component, "inner_gets".into(), stats.inner_gets.to_string()));
+            }
+        }
+
+        {
+            let s = deltalake::delta_datafusion::parquet_metrics::snapshot();
+            rows.push(("parquet", "metadata_cache_hits".into(), s.metadata_cache_hits.to_string()));
+            rows.push(("parquet", "metadata_cache_misses".into(), s.metadata_cache_misses.to_string()));
+            rows.push(("parquet", "bytes_read".into(), s.bytes_read.to_string()));
+            rows.push(("parquet", "read_time_us".into(), s.read_time_us.to_string()));
+            rows.push(("parquet", "scans".into(), s.scans.to_string()));
+            rows.push(("parquet", "files_planned".into(), s.files_planned.to_string()));
+            rows.push(("parquet", "bytes_planned".into(), s.bytes_planned.to_string()));
+            rows.push(("parquet", "selected_row_groups".into(), s.selected_row_groups.to_string()));
+        }
+
         if let Some(snap) = &self.cache_sizes {
             // Mirror the field-level doc: these caches don't evict; size
             // tracks unique (project, table) pairs since process start.
@@ -214,6 +245,28 @@ impl StatsTableProvider {
 
         let cols: Vec<ArrayRef> = vec![Arc::new(StringArray::from(components)), Arc::new(StringArray::from(keys)), Arc::new(StringArray::from(values))];
         RecordBatch::try_new(Arc::clone(&self.schema), cols).map_err(arrow_err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::StringArray;
+
+    #[test]
+    fn exposes_dml_retry_outcomes() {
+        let batch = StatsTableProvider::new(None).snapshot_batch().unwrap();
+        let components = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let keys = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let rows: Vec<_> = (0..batch.num_rows()).map(|i| (components.value(i), keys.value(i))).collect();
+
+        assert!(rows.contains(&("dml", "occ_conflicts_total")));
+        assert!(rows.contains(&("dml", "retry_successes_total")));
+        assert!(rows.contains(&("dml", "retry_exhausted_total")));
+        assert!(rows.contains(&("maintenance", "dedup_timed_out_total")));
+        assert!(rows.contains(&("maintenance", "light_optimize_timed_out_total")));
+        assert!(rows.contains(&("parquet", "metadata_cache_hits")));
+        assert!(rows.contains(&("parquet", "bytes_read")));
     }
 }
 

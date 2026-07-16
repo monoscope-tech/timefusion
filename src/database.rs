@@ -2230,12 +2230,15 @@ impl Database {
         let fr_handle = self.fast_resolve_cache.clone();
         let dp_handle = self.delta_provider_cache.clone();
         let cache_sizes: crate::stats_table::CacheSizeSnapshot = Arc::new(move || (fr_handle.len(), dp_handle.len()));
+        let foyer = self.object_store_cache.clone();
+        let foyer_stats: crate::stats_table::FoyerStatsSnapshot = Arc::new(move || foyer.as_ref().map_or_else(Default::default, |cache| cache.try_get_stats()));
         ctx.register_table(
             "timefusion_stats",
             Arc::new(
                 crate::stats_table::StatsTableProvider::new(self.buffered_layer().cloned())
                     .with_scan_metrics(self.scan_metrics.clone())
-                    .with_cache_sizes(cache_sizes),
+                    .with_cache_sizes(cache_sizes)
+                    .with_foyer_stats(foyer_stats),
             ),
         )?;
 
@@ -6574,6 +6577,10 @@ impl TableProvider for ProjectRoutingTable {
             scan.has_projection = projection.is_some(),
             scan.uses_mem_buffer = false,
             scan.skipped_delta = false,
+            parquet.files = Empty,
+            parquet.bytes = Empty,
+            parquet.file_ids = Empty,
+            parquet.selected_row_groups = Empty,
         )
     )]
     async fn scan(&self, state: &dyn Session, projection: Option<&Vec<usize>>, filters: &[Expr], limit: Option<usize>) -> DFResult<Arc<dyn ExecutionPlan>> {

@@ -220,6 +220,8 @@ impl FoyerCacheConfig {
 pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
+    pub bytes_served: u64,
+    pub inner_bytes_read: u64,
     pub ttl_expirations: u64,
     pub inner_gets: u64,
     pub inner_puts: u64,
@@ -236,8 +238,8 @@ impl CacheStats {
     fn log(&self) {
         let hit_rate = if self.hits + self.misses > 0 { (self.hits as f64 / (self.hits + self.misses) as f64) * 100.0 } else { 0.0 };
         info!(
-            "Foyer cache stats - Hit rate: {:.2}%, Hits: {}, Misses: {}, TTL expirations: {}, Inner gets: {}, Inner puts: {}",
-            hit_rate, self.hits, self.misses, self.ttl_expirations, self.inner_gets, self.inner_puts
+            "Foyer cache stats - Hit rate: {:.2}%, Hits: {}, Misses: {}, Bytes served: {}, Inner bytes read: {}, TTL expirations: {}, Inner gets: {}, Inner puts: {}",
+            hit_rate, self.hits, self.misses, self.bytes_served, self.inner_bytes_read, self.ttl_expirations, self.inner_gets, self.inner_puts
         );
     }
 }
@@ -344,6 +346,13 @@ impl SharedFoyerCache {
 
     pub async fn get_stats(&self) -> CombinedCacheStats {
         CombinedCacheStats { main: self.stats.read().await.clone(), metadata: self.metadata_stats.read().await.clone() }
+    }
+
+    pub fn try_get_stats(&self) -> CombinedCacheStats {
+        CombinedCacheStats {
+            main: self.stats.try_read().map(|s| s.clone()).unwrap_or_default(),
+            metadata: self.metadata_stats.try_read().map(|s| s.clone()).unwrap_or_default(),
+        }
     }
 
     pub async fn log_stats(&self) {
@@ -682,6 +691,13 @@ impl FoyerObjectStoreCache {
         CombinedCacheStats { main: self.stats.read().await.clone(), metadata: self.metadata_stats.read().await.clone() }
     }
 
+    pub fn try_get_stats(&self) -> CombinedCacheStats {
+        CombinedCacheStats {
+            main: self.stats.try_read().map(|s| s.clone()).unwrap_or_default(),
+            metadata: self.metadata_stats.try_read().map(|s| s.clone()).unwrap_or_default(),
+        }
+    }
+
     pub async fn reset_stats(&self) {
         *self.stats.write().await = CacheStats::default();
         *self.metadata_stats.write().await = CacheStats::default();
@@ -726,7 +742,11 @@ impl FoyerObjectStoreCache {
 
             // Special handling for _last_checkpoint: stale-while-revalidate
             if Self::is_last_checkpoint(location) && !value.is_expired(ttl) {
-                self.update_stats(|s| s.hits += 1).await;
+                self.update_stats(|s| {
+                    s.hits += 1;
+                    s.bytes_served += value.data.len() as u64;
+                })
+                .await;
                 span.record("cache_hit", true);
 
                 // Check if older than 5 seconds
@@ -775,7 +795,11 @@ impl FoyerObjectStoreCache {
                 self.cache.remove(&cache_key);
                 debug!("Foyer cache EXPIRED for: {} (TTL: {}s, age: {}ms)", location, ttl.as_secs(), current_millis().saturating_sub(value.timestamp_millis));
             } else {
-                self.update_stats(|s| s.hits += 1).await;
+                self.update_stats(|s| {
+                    s.hits += 1;
+                    s.bytes_served += value.data.len() as u64;
+                })
+                .await;
                 span.record("cache_hit", true);
                 let is_parquet = is_parquet_file(location);
                 debug!(
@@ -821,6 +845,7 @@ impl FoyerObjectStoreCache {
             }
         };
 
+        self.update_stats(|s| s.inner_bytes_read += data.len() as u64).await;
         self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()));
         Ok(Self::make_get_result(Bytes::from(data), result.meta))
     }
@@ -848,7 +873,11 @@ impl FoyerObjectStoreCache {
             let value = entry.value();
             let ttl = self.get_ttl_for_path(location);
             if !value.is_expired(ttl) && range.end <= value.data.len() as u64 {
-                self.update_stats(|s| s.hits += 1).await;
+                self.update_stats(|s| {
+                    s.hits += 1;
+                    s.bytes_served += range.end - range.start;
+                })
+                .await;
                 span.record("cache_hit", true);
                 debug!(
                     "Foyer cache HIT (full file) for range: {} (range: {}..{}, size: {} bytes, parquet={}, age={}ms)",
@@ -875,7 +904,11 @@ impl FoyerObjectStoreCache {
             if let Ok(Some(entry)) = self.metadata_cache.get(&range_cache_key).await {
                 let value = entry.value();
                 if !value.is_expired(self.config.ttl) {
-                    self.update_metadata_stats(|s| s.hits += 1).await;
+                    self.update_metadata_stats(|s| {
+                        s.hits += 1;
+                        s.bytes_served += value.data.len() as u64;
+                    })
+                    .await;
                     span.record("cache_hit", true);
                     span.record("is_metadata", true);
                     debug!(
@@ -930,7 +963,11 @@ impl FoyerObjectStoreCache {
                         let value = entry.value();
                         let (s, e) = ((range.start - candidate) as usize, (range.end - candidate) as usize);
                         if !value.is_expired(self.config.ttl) && e <= value.data.len() {
-                            self.update_metadata_stats(|st| st.hits += 1).await;
+                            self.update_metadata_stats(|st| {
+                                st.hits += 1;
+                                st.bytes_served += (range.end - range.start) as u64;
+                            })
+                            .await;
                             span.record("cache_hit", true);
                             span.record("is_metadata", true);
                             // Distinct from the exact-key HIT log above so cache-key
@@ -973,6 +1010,7 @@ impl FoyerObjectStoreCache {
                     duration.as_millis()
                 );
 
+                self.update_metadata_stats(|s| s.inner_bytes_read += data.len() as u64).await;
                 // Cache the metadata range in the metadata cache
                 let range_meta = ObjectMeta {
                     location: location.clone(),
@@ -1037,6 +1075,7 @@ impl FoyerObjectStoreCache {
             is_parquet
         );
 
+        self.update_stats(|s| s.inner_bytes_read += result.len() as u64).await;
         Ok(result)
     }
 
@@ -1581,6 +1620,8 @@ mod tests {
         assert_eq!(stats.main.inner_gets, 0); // Still no fetch - served from cache
         assert_eq!(stats.main.hits, 2); // Two cache hits total
         assert_eq!(stats.main.misses, 0);
+        assert_eq!(stats.main.bytes_served, (data.len() * 2) as u64);
+        assert_eq!(cache.try_get_stats().main.bytes_served, stats.main.bytes_served);
 
         cache.delete(&path).await?;
 
