@@ -83,6 +83,8 @@ counter_registry! {
     optimize_conflict          => "timefusion.optimize.conflict": "Optimize/compaction commits that hit an OCC conflict (a concurrent txn touched a file the merge read). Retried — but a sustained nonzero rate means optimize is losing commit races to dedup/flush. WARN if rate() stays > 0 across several ticks",
     optimize_failed            => "timefusion.optimize.failed": "Optimize/compaction runs that ultimately errored or gave up after exhausting retries. The partition stays fragmented until a later run succeeds, so small files pile up silently. PAGE if > 0 sustained",
     dml_conflict               => "timefusion.dml.conflict": "DML (UPDATE/DELETE) Delta operations that lost an OCC race to a concurrent commit and were retried on a fresh snapshot. Sustained rate > 0 means UPDATE churn is racing flush commits",
+    dml_retry_success           => "timefusion.dml.retry_success": "DML Delta operations that succeeded after at least one OCC retry",
+    dml_retry_exhausted         => "timefusion.dml.retry_exhausted": "DML Delta operations that exhausted the OCC retry budget and failed",
     dml_delta_leg_skipped      => "timefusion.dml.delta_leg_skipped": "DML Delta legs skipped because the predicate's time window lies entirely above the flush watermark — the matched rows are buffer-only, so the flush persists their post-DML values and the Delta merge would scan+commit for nothing",
     dml_coalesce_enqueued      => "timefusion.dml.coalesce_enqueued": "UPDATE ... FROM statements whose Delta leg was deferred into the coalescer queue",
     dml_coalesce_merges        => "timefusion.dml.coalesce_merges": "Delta merges executed by coalescer drains (each replaces N deferred statement-merges; compare with coalesce_enqueued for the batching ratio)",
@@ -342,8 +344,23 @@ pub fn record_optimize_failed() {
 
 /// One DML Delta operation OCC conflict (retried on a fresh snapshot).
 pub fn record_dml_conflict() {
+    DML_STATS.occ_conflicts.fetch_add(1, Relaxed);
     if let Some(m) = METRICS.get() {
         m.dml_conflict.add(1, &[]);
+    }
+}
+
+pub fn record_dml_retry_success() {
+    DML_STATS.retry_successes.fetch_add(1, Relaxed);
+    if let Some(m) = METRICS.get() {
+        m.dml_retry_success.add(1, &[]);
+    }
+}
+
+pub fn record_dml_retry_exhausted() {
+    DML_STATS.retry_exhausted.fetch_add(1, Relaxed);
+    if let Some(m) = METRICS.get() {
+        m.dml_retry_exhausted.add(1, &[]);
     }
 }
 
@@ -384,6 +401,18 @@ pub fn record_dedup_chunk_skipped() {
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+pub struct DmlStats {
+    pub occ_conflicts: AtomicU64,
+    pub retry_successes: AtomicU64,
+    pub retry_exhausted: AtomicU64,
+}
+
+static DML_STATS: DmlStats = DmlStats { occ_conflicts: AtomicU64::new(0), retry_successes: AtomicU64::new(0), retry_exhausted: AtomicU64::new(0) };
+
+pub fn dml_stats() -> &'static DmlStats {
+    &DML_STATS
+}
+
 /// Readable maintenance counters for the `timefusion_stats` view — the OTel
 /// counters above can't be read back in-process. Process-global const atomics
 /// (no init needed), incremented by the out-of-band checkpoint + reconcile
@@ -398,6 +427,10 @@ pub struct MaintenanceStats {
     pub checkpoint_lag_versions: AtomicU64,
     pub dangling_removed: AtomicU64,
     pub reconcile_failed: AtomicU64,
+    pub dedup_timed_out: AtomicU64,
+    pub dedup_failed: AtomicU64,
+    pub light_optimize_timed_out: AtomicU64,
+    pub light_optimize_failed: AtomicU64,
     /// Cron ticks skipped because the previous run of the same job was still
     /// in flight. A steadily growing value = a wedged/overlong job body.
     pub cron_ticks_skipped: AtomicU64,
@@ -414,6 +447,10 @@ static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     checkpoint_lag_versions: AtomicU64::new(0),
     dangling_removed: AtomicU64::new(0),
     reconcile_failed: AtomicU64::new(0),
+    dedup_timed_out: AtomicU64::new(0),
+    dedup_failed: AtomicU64::new(0),
+    light_optimize_timed_out: AtomicU64::new(0),
+    light_optimize_failed: AtomicU64::new(0),
     cron_ticks_skipped: AtomicU64::new(0),
     cron_ticks_fired: AtomicU64::new(0),
 };

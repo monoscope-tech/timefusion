@@ -142,6 +142,11 @@ impl StatsTableProvider {
 
         {
             use std::sync::atomic::Ordering::Relaxed;
+            let d = crate::metrics::dml_stats();
+            rows.push(("dml", "occ_conflicts_total".into(), d.occ_conflicts.load(Relaxed).to_string()));
+            rows.push(("dml", "retry_successes_total".into(), d.retry_successes.load(Relaxed).to_string()));
+            rows.push(("dml", "retry_exhausted_total".into(), d.retry_exhausted.load(Relaxed).to_string()));
+
             let m = crate::metrics::maintenance_stats();
             rows.push(("maintenance", "checkpoints_created".into(), m.checkpoints_created.load(Relaxed).to_string()));
             rows.push(("maintenance", "checkpoint_failed".into(), m.checkpoint_failed.load(Relaxed).to_string()));
@@ -155,6 +160,10 @@ impl StatsTableProvider {
             // commit-path deletion bug). PAGE and investigate.
             rows.push(("maintenance", "dangling_removed".into(), m.dangling_removed.load(Relaxed).to_string()));
             rows.push(("maintenance", "reconcile_failed".into(), m.reconcile_failed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dedup_timed_out_total".into(), m.dedup_timed_out.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dedup_failed_total".into(), m.dedup_failed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "light_optimize_timed_out_total".into(), m.light_optimize_timed_out.load(Relaxed).to_string()));
+            rows.push(("maintenance", "light_optimize_failed_total".into(), m.light_optimize_failed.load(Relaxed).to_string()));
             // Fired frozen while uptime grows = scheduler dead (2026-07-14
             // outage); skipped growing = a job body is wedged or overlong.
             rows.push(("maintenance", "cron_ticks_fired".into(), m.cron_ticks_fired.load(Relaxed).to_string()));
