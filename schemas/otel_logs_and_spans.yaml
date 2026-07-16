@@ -7,8 +7,8 @@ partitions:
 # covers dupes inside one 10-min bucket; cross-bucket dupes need the
 # read-side row_number() rewrite.
 dedup_keys:
-  - id
   - timestamp
+  - id
 # Tie-breaker when rows share (id, timestamp): keep the one with the greatest
 # observed_timestamp. The enrichment worker re-emits the enriched row with a
 # fresh observed_timestamp (parity plan Defect 3), so it wins over the base row.
