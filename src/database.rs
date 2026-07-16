@@ -4935,6 +4935,18 @@ impl Database {
                     debug!("dedup sweep: shutdown requested, aborting table={}", table_name);
                     return Ok(());
                 }
+                // Incremental skip: a partition already certified clean whose live
+                // file set is unchanged since that pass can't have gained dupes —
+                // they only arrive in NEW files. Skip the whole-partition probe,
+                // keeping the sweep O(partitions-changed). The version guard above
+                // only fires when the WHOLE table is unchanged, which never holds
+                // under continuous ingest; this per-partition check does (sealed
+                // lookback days, and today between flushes).
+                let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
+                let cur_files = files_by_pid.get(pid).cloned().unwrap_or_default();
+                if !cur_files.is_empty() && self.dedup_clean_fp.get(&fp_key).map(|e| *e.value()) == Some(partition_file_fp(cur_files.clone())) {
+                    continue;
+                }
                 let backoff_key = format!("{dedup_key}:{pid}:{date}");
                 if let Some(entry) = self.dedup_backoff.get(&backoff_key)
                     && std::time::Instant::now() < entry.value().1
@@ -4954,8 +4966,7 @@ impl Database {
                         // Any concurrent commit (flush/compaction) changes
                         // the set → don't mark; a >0 pass marks nothing (the
                         // NEXT 0-drop pass confirms the rewrite held).
-                        let fp_key = (pid.clone(), table_name.to_string(), date.to_string());
-                        let pre = files_by_pid.get(pid).cloned().unwrap_or_default();
+                        let pre = cur_files;
                         let post = {
                             let table = table_ref.read().await;
                             Self::partition_files_by_pid(&table, &date_marker)?.remove(pid).unwrap_or_default()
@@ -4976,7 +4987,7 @@ impl Database {
                         let attempts = self.dedup_backoff.get(&backoff_key).map_or(0, |e| e.value().0) + 1;
                         let delay = std::time::Duration::from_secs((600u64 << (attempts.min(7) - 1)).min(21_600));
                         self.dedup_backoff.insert(backoff_key, (attempts, std::time::Instant::now() + delay));
-                        self.dedup_clean_fp.remove(&(pid.clone(), table_name.to_string(), date.to_string()));
+                        self.dedup_clean_fp.remove(&fp_key);
                         warn!(
                             "dedup sweep: project={} date={} table={} failed (attempt {}, next retry in {}s): {}",
                             pid,
@@ -5008,18 +5019,21 @@ impl Database {
     /// tick and starve the tables after it (the cron-level wedge abort kills the
     /// entire run mid-table). A timed-out table just resumes next tick.
     async fn run_light_maintenance_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
-        const PER_TABLE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(180);
-        let work = async {
-            if let Err(e) = self.dedup_today_partitions(table, table_name, dedup_key).await {
-                error!("Dedup sweep failed for {label}: {e}");
-            }
-            match self.optimize_table_light(table, table_name).await {
-                Ok(_) => info!("Light optimize completed for {label}"),
-                Err(e) => error!("Light optimize failed for {label}: {e}"),
-            }
-        };
-        if tokio::time::timeout(PER_TABLE_TIMEOUT, work).await.is_err() {
-            warn!("Light maintenance for {label} exceeded {PER_TABLE_TIMEOUT:?}; skipping to next table (resumes next tick)");
+        // Separate budgets so a slow dedup can't consume the tick and starve the
+        // compaction (the whole point of this pass). If dedup overruns we still
+        // run optimize — compaction shrinks the file count that makes the next
+        // dedup probe cheaper, so the two converge instead of dedup blocking.
+        const DEDUP_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(90);
+        const OPTIMIZE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(180);
+        match tokio::time::timeout(DEDUP_TIMEOUT, self.dedup_today_partitions(table, table_name, dedup_key)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => error!("Dedup sweep failed for {label}: {e}"),
+            Err(_) => warn!("Dedup sweep for {label} exceeded {DEDUP_TIMEOUT:?}; proceeding to optimize (resumes next tick)"),
+        }
+        match tokio::time::timeout(OPTIMIZE_TIMEOUT, self.optimize_table_light(table, table_name)).await {
+            Ok(Ok(())) => info!("Light optimize completed for {label}"),
+            Ok(Err(e)) => error!("Light optimize failed for {label}: {e}"),
+            Err(_) => warn!("Light optimize for {label} exceeded {OPTIMIZE_TIMEOUT:?}; skipping to next table (resumes next tick)"),
         }
     }
 
