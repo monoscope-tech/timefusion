@@ -941,6 +941,66 @@ fn normalize_timestamp_tz(batch: RecordBatch) -> DFResult<RecordBatch> {
     RecordBatch::try_new(new_schema, new_cols).map_err(arrow_err)
 }
 
+/// `date` is a physical UTC partition key, never caller-owned data. Rebuild it
+/// from `timestamp` before every shared write path so timestamp pruning cannot
+/// hide rows that arrived with a stale or malformed client-provided date.
+fn derive_date_partition(batch: RecordBatch) -> DFResult<RecordBatch> {
+    use arrow::array::{Date32Array, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray};
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
+
+    let schema = batch.schema();
+    let (Ok(date_idx), Ok(timestamp_idx)) = (schema.index_of("date"), schema.index_of("timestamp")) else { return Ok(batch) };
+    if !matches!(schema.field(date_idx).data_type(), DataType::Date32) {
+        return Err(DataFusionError::Execution("date partition column must be Date32".to_string()));
+    }
+    let timestamp = batch.column(timestamp_idx);
+    let fail = |message| DataFusionError::Execution(format!("timestamp-to-date partition conversion failed: {message}"));
+    let micros = |row| -> DFResult<Option<i64>> {
+        if timestamp.is_null(row) {
+            return Ok(None);
+        }
+        let value = match schema.field(timestamp_idx).data_type() {
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                timestamp.as_any().downcast_ref::<TimestampNanosecondArray>().ok_or_else(|| fail("nanosecond downcast"))?.value(row).div_euclid(1_000)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                timestamp.as_any().downcast_ref::<TimestampMicrosecondArray>().ok_or_else(|| fail("microsecond downcast"))?.value(row)
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => timestamp
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .ok_or_else(|| fail("millisecond downcast"))?
+                .value(row)
+                .checked_mul(1_000)
+                .ok_or_else(|| fail("millisecond overflow"))?,
+            DataType::Timestamp(TimeUnit::Second, _) => timestamp
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .ok_or_else(|| fail("second downcast"))?
+                .value(row)
+                .checked_mul(1_000_000)
+                .ok_or_else(|| fail("second overflow"))?,
+            _ => return Err(fail("timestamp column is not a timestamp")),
+        };
+        Ok(Some(value))
+    };
+    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let dates = (0..batch.num_rows())
+        .map(|row| {
+            micros(row)?
+                .map(|micros| {
+                    chrono::DateTime::from_timestamp_micros(micros)
+                        .ok_or_else(|| fail("invalid timestamp"))
+                        .map(|ts| ts.date_naive().signed_duration_since(epoch).num_days() as i32)
+                })
+                .transpose()
+        })
+        .collect::<DFResult<Vec<_>>>()?;
+    let mut columns = batch.columns().to_vec();
+    columns[date_idx] = Arc::new(Date32Array::from(dates));
+    RecordBatch::try_new(schema, columns).map_err(arrow_err)
+}
+
 fn convert_variant_columns(batch: RecordBatch, target_schema: &SchemaRef) -> DFResult<RecordBatch> {
     use datafusion::arrow::{
         array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray, StructArray},
@@ -3279,7 +3339,8 @@ impl Database {
         // accepts `"UTC"`; without this normalisation the flush callback
         // path (which feeds MemBuffer batches straight into Delta) errors
         // out and data piles up in MemBuffer.
-        let batches: Vec<RecordBatch> = batches.into_iter().map(normalize_timestamp_tz).collect::<DFResult<Vec<_>>>()?;
+        let batches: Vec<RecordBatch> =
+            batches.into_iter().map(normalize_timestamp_tz).map(|batch| batch.and_then(derive_date_partition)).collect::<DFResult<_>>()?;
 
         // Extract project_id from first batch if not provided. If neither the
         // caller nor the data carries one, log loudly and bucket under

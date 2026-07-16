@@ -42,3 +42,30 @@ async fn timestamp_between_prunes_to_its_date_partition() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn write_derives_date_partition_from_timestamp() -> anyhow::Result<()> {
+    let env = E2eEnv::builder().start().await?;
+    let client = env.pg_client().await?;
+    let timestamp = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
+    let expected_date = timestamp.date_naive();
+
+    client
+        .execute(
+            &format!(
+                "INSERT INTO otel_logs_and_spans (project_id, date, timestamp, id, hashes, name, level, status_code, summary) \
+                 VALUES ('e2e_project', DATE '2000-01-01', TIMESTAMP '{timestamp}', 'mismatched-date', ARRAY[]::text[], 'span', 'INFO', 'OK', ARRAY['s'])"
+            ),
+            &[],
+        )
+        .await?;
+
+    let date: String = client
+        .query_one("SELECT CAST(date AS VARCHAR) FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND id = 'mismatched-date'", &[])
+        .await?
+        .get(0);
+    assert_eq!(date, expected_date.to_string());
+
+    Ok(())
+}
