@@ -285,7 +285,9 @@ const_default!(d_compact_min_files: usize = 5);
 const_default!(d_light_optimize_target: i64 = 32 * 1024 * 1024);
 const_default!(d_optimize_concurrency: usize = 4);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
-const_default!(d_optimize_schedule: String = "0 */30 * * * *");
+// Offset from the five-minute light job so the two rewrite paths never start
+// together at :00/:30 and compete for the maintenance memory pool.
+const_default!(d_optimize_schedule: String = "0 2,32 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
 // cold target. Calendar-age driven; idempotent (skips ≥-target files).
 const_default!(d_consolidate_schedule: String = "0 30 2 * * *");
@@ -1180,6 +1182,8 @@ mod tests {
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
+        assert_eq!(config.maintenance.timefusion_light_optimize_schedule, "0 */5 * * * *");
+        assert_eq!(config.maintenance.timefusion_optimize_schedule, "0 2,32 * * * *");
     }
 
     #[test]

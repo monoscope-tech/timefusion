@@ -3917,23 +3917,12 @@ impl Database {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         // Full optimize runs every 30 min over a 48h window — promote these
         // rewrites to the "warm" tier so day-old data lands smaller on disk
-        // without slowing the hot flush path.
-        // SortBy globally sorts by the schema's timestamp-DESC-first keys and
-        // declares the footer, so the ordering/limit pushdown keeps firing on
-        // the freshly-optimized current partition (Compact would concatenate →
-        // declare_sorted=false → pushdown disabled within one cycle). Falls back
-        // to ZOrder/Compact when Z-order is explicitly enabled or no sort order
-        // is declared.
-        let (optimize_type, declare_sorted) =
-            choose_optimize_type(schema, self.config.maintenance.timefusion_optimize_use_zorder, self.config.maintenance.timefusion_optimize_sort_by);
+        // without slowing the hot flush path. It must stay a plain Compact:
+        // SortBy has repeatedly exhausted the maintenance pool on the active
+        // partition. Fresh flushes and targeted light compaction retain sorting.
+        let (optimize_type, declare_sorted) = full_optimize_type(schema);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
-        // SortBy over already-sorted files is a streaming SortPreservingMergeExec
-        // (bounded); only a partition's one-time transition sort of legacy
-        // pre-sort files blocks. Serialize the SortBy path (concurrency 1) so
-        // those transition sorts can't stack across the multi-partition window
-        // and exhaust the maintenance pool (2026-07-14 OOM). Compact/ZOrder keep
-        // the configured concurrency.
-        let optimize_concurrency = if declare_sorted { 1 } else { self.config.maintenance.timefusion_optimize_max_concurrent_tasks };
+        let optimize_concurrency = self.config.maintenance.timefusion_optimize_max_concurrent_tasks;
 
         // Best-effort: retry bounded OCC conflicts against a fresh snapshot,
         // but never pause flushes (see optimize_table_light). This preserves
@@ -5826,6 +5815,10 @@ fn schema_order_by_clause(schema: &crate::schema_loader::TableSchema) -> String 
 /// exhaust the bounded maintenance pool on large partitions, so the safe
 /// default is `Compact` (bin-pack, no global sort). Returns
 /// `(optimize_type, declare_sorted)`.
+fn full_optimize_type(schema: &crate::schema_loader::TableSchema) -> (deltalake::operations::optimize::OptimizeType, bool) {
+    choose_optimize_type(schema, false, false)
+}
+
 fn choose_optimize_type(
     schema: &crate::schema_loader::TableSchema, allow_zorder: bool, allow_sort: bool,
 ) -> (deltalake::operations::optimize::OptimizeType, bool) {
@@ -7546,6 +7539,15 @@ mod tests {
         let c = Database::filesets_for_dates(&plus, &[d]);
         assert_eq!(a[&d], b[&d]);
         assert_ne!(a[&d], c[&d]);
+    }
+
+    #[test]
+    fn full_optimize_uses_compact_without_sorted_footer() {
+        use deltalake::operations::optimize::OptimizeType;
+        let schema = get_schema("otel_logs_and_spans").unwrap();
+        let (optimize_type, declare_sorted) = full_optimize_type(schema);
+        assert!(matches!(optimize_type, OptimizeType::Compact));
+        assert!(!declare_sorted);
     }
 
     /// Helper function to extract string value from array column, handling different string array types
