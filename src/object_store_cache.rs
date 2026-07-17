@@ -534,6 +534,7 @@ pub struct FoyerObjectStoreCache {
     metadata_stats: StatsRef,
     config: FoyerCacheConfig,
     refreshing: Arc<DashSet<String>>,
+    main_fetch_locks: Arc<dashmap::DashMap<String, Arc<Mutex<()>>>>,
     background_tasks: Arc<Mutex<JoinSet<()>>>,
 }
 
@@ -547,6 +548,7 @@ impl FoyerObjectStoreCache {
             metadata_stats: shared_cache.metadata_stats.clone(),
             config: shared_cache.config.clone(),
             refreshing: Arc::new(DashSet::new()),
+            main_fetch_locks: Arc::new(dashmap::DashMap::new()),
             background_tasks: Arc::new(Mutex::new(JoinSet::new())),
         }
     }
@@ -726,6 +728,10 @@ impl FoyerObjectStoreCache {
         fields(
             location = %location,
             cache_hit = Empty,
+            cache_fetch_leader = Empty,
+            cache_waited_for_inflight = Empty,
+            cache_entry_bytes = Empty,
+            cache_admission = Empty,
             is_checkpoint = Self::is_last_checkpoint(location),
         )
     )]
@@ -816,8 +822,31 @@ impl FoyerObjectStoreCache {
             }
         }
 
+        let fetch_lock = self.main_fetch_locks.entry(cache_key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone();
+        let waited_for_inflight = fetch_lock.try_lock().is_err();
+        let fetch_guard = fetch_lock.lock().await;
+        span.record("cache_waited_for_inflight", waited_for_inflight);
+
+        // A concurrent leader may have populated the object while we waited.
+        if waited_for_inflight {
+            if let Ok(Some(entry)) = self.cache.get(&cache_key).await {
+                let value = entry.value();
+                if !value.is_expired(self.get_ttl_for_path(location)) {
+                    self.update_stats(|s| {
+                        s.hits += 1;
+                        s.bytes_served += value.data.len() as u64;
+                    })
+                    .await;
+                    span.record("cache_hit", true);
+                    span.record("cache_entry_bytes", value.data.len() as i64);
+                    return Ok(Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone()));
+                }
+            }
+        }
+
         // Cache miss - fetch from inner store
         span.record("cache_hit", false);
+        span.record("cache_fetch_leader", true);
         self.record_miss_with_fetch().await;
         let is_parquet = is_parquet_file(location);
         let ttl = self.get_ttl_for_path(location);
@@ -846,7 +875,11 @@ impl FoyerObjectStoreCache {
         };
 
         self.update_stats(|s| s.inner_bytes_read += data.len() as u64).await;
+        span.record("cache_entry_bytes", data.len() as i64);
+        span.record("cache_admission", if data.len() > self.config.l1_max_entry_bytes { "disk" } else { "memory" });
         self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()));
+        drop(fetch_guard);
+        self.main_fetch_locks.remove(&cache_key);
         Ok(Self::make_get_result(Bytes::from(data), result.meta))
     }
 
@@ -2304,6 +2337,7 @@ mod tests {
         inner: Arc<InMemory>,
         heads: Arc<std::sync::atomic::AtomicUsize>,
         gets: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Duration,
     }
 
     impl std::fmt::Display for CountingStore {
@@ -2329,6 +2363,9 @@ mod tests {
             } else {
                 self.gets.fetch_add(1, Ordering::Relaxed);
             }
+            if !options.head && !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
             self.inner.get_opts(location, options).await
         }
 
@@ -2349,6 +2386,31 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn concurrent_cold_gets_share_one_inner_fetch() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let inner = Arc::new(InMemory::new());
+        let path = Path::from(format!("table/date={}/part.parquet", Utc::now().date_naive()));
+        inner.put(&path, PutPayload::from(Bytes::from(vec![b'x'; 1024]))).await?;
+        let gets = Arc::new(AtomicUsize::new(0));
+        let cache = FoyerObjectStoreCache::new(
+            Arc::new(CountingStore { inner, heads: Arc::new(AtomicUsize::new(0)), gets: gets.clone(), delay: Duration::from_millis(50) }),
+            FoyerCacheConfig::test_config("singleflight"),
+        )
+        .await?;
+
+        let (first, second) = tokio::join!(cache.get(&path), cache.get(&path));
+        first?;
+        second?;
+        assert_eq!(gets.load(Ordering::Relaxed), 1, "concurrent cold reads must share one inner GET");
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.misses, 1);
+        assert_eq!(stats.main.hits, 1);
+        cache.shutdown().await?;
+        Ok(())
+    }
+
     /// Locks in both performance wins: a suffix-based footer warm is a single GET
     /// (no HEAD), and a later footer read of a warmed file is a pure cache hit —
     /// zero S3 round-trips (no HEAD to classify, no GET).
@@ -2363,7 +2425,7 @@ mod tests {
 
         let heads = Arc::new(AtomicUsize::new(0));
         let gets = Arc::new(AtomicUsize::new(0));
-        let counting = Arc::new(CountingStore { inner: mem.clone(), heads: heads.clone(), gets: gets.clone() });
+        let counting = Arc::new(CountingStore { inner: mem.clone(), heads: heads.clone(), gets: gets.clone(), delay: Duration::ZERO });
 
         let config = FoyerCacheConfig::test_config_with("warm_footer_heads", |c| {
             c.parquet_metadata_size_hint = 1024;
