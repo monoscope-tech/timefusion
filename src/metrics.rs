@@ -92,6 +92,7 @@ counter_registry! {
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
     maintenance_checkpoint_failed => "timefusion.maintenance.checkpoint_failed": "Out-of-band checkpoint attempts that errored (e.g. R2 500 on the checkpoint PUT). Retried next tick; ingest is unaffected. WARN if sustained — checkpoints falling behind slows boot replay and blocks log cleanup",
     maintenance_log_cleanup_failed => "timefusion.maintenance.log_cleanup_failed": "Out-of-band expired-log-cleanup attempts that errored. Retried next tick; the _delta_log grows until it succeeds. WARN if sustained (a growing log slows every commit's version LIST)",
+    maintenance_cron_long_running => "timefusion.maintenance.cron_long_running": "Cron maintenance runs that exceeded the long-running warning threshold while still in progress. Slow-but-healthy runs are allowed to finish; sustained nonzero with no completion means a job is wedged.",
     reconcile_dangling_removed => "timefusion.maintenance.reconcile_dangling_removed": "Active Add entries whose parquet object was missing from the store and got Remove'd by the reconcile task. NONZERO means committed data was destroyed elsewhere (commit-path parquet deletion bug) — PAGE and investigate",
 }
 
@@ -399,6 +400,14 @@ pub fn record_dedup_chunk_skipped() {
     }
 }
 
+/// One cron maintenance run that exceeded the long-running warning threshold.
+pub fn record_cron_long_running() {
+    MAINTENANCE_STATS.cron_long_running.fetch_add(1, Relaxed);
+    if let Some(m) = METRICS.get() {
+        m.maintenance_cron_long_running.add(1, &[]);
+    }
+}
+
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 pub struct DmlStats {
@@ -437,6 +446,9 @@ pub struct MaintenanceStats {
     /// Cron fires actually dispatched (all jobs). Frozen while uptime grows =
     /// the scheduler is dead (2026-07-14 outage signature).
     pub cron_ticks_fired: AtomicU64,
+    /// Cron runs that exceeded the long-running warning threshold. Slow but
+    /// progressing work is allowed to finish; this is for observability.
+    pub cron_long_running: AtomicU64,
 }
 
 static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
@@ -453,6 +465,7 @@ static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     light_optimize_failed: AtomicU64::new(0),
     cron_ticks_skipped: AtomicU64::new(0),
     cron_ticks_fired: AtomicU64::new(0),
+    cron_long_running: AtomicU64::new(0),
 };
 
 pub fn maintenance_stats() -> &'static MaintenanceStats {

@@ -168,6 +168,9 @@ impl StatsTableProvider {
             rows.push(("maintenance", "dedup_failed_total".into(), m.dedup_failed.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_timed_out_total".into(), m.light_optimize_timed_out.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_failed_total".into(), m.light_optimize_failed.load(Relaxed).to_string()));
+            // Runs exceeding the long-running warning threshold. Slow progress
+            // is allowed; sustained nonzero with no completion = wedged.
+            rows.push(("maintenance", "cron_long_running_total".into(), m.cron_long_running.load(Relaxed).to_string()));
             // Fired frozen while uptime grows = scheduler dead (2026-07-14
             // outage); skipped growing = a job body is wedged or overlong.
             rows.push(("maintenance", "cron_ticks_fired".into(), m.cron_ticks_fired.load(Relaxed).to_string()));
@@ -352,6 +355,7 @@ mod tests {
         assert!(rows.contains(&("dml", "retry_exhausted_total")));
         assert!(rows.contains(&("maintenance", "dedup_timed_out_total")));
         assert!(rows.contains(&("maintenance", "light_optimize_timed_out_total")));
+        assert!(rows.contains(&("maintenance", "cron_long_running_total")));
         assert!(rows.contains(&("parquet", "metadata_cache_hits")));
         assert!(rows.contains(&("parquet", "bytes_read")));
     }
