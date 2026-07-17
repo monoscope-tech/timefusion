@@ -49,6 +49,36 @@ fn current_millis() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
+fn allocated_bytes(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let path = entry.path();
+            if path.file_name().is_some_and(|name| name == "metadata") {
+                return 0;
+            }
+            let Ok(meta) = entry.metadata() else {
+                return 0;
+            };
+            if meta.is_dir() {
+                return allocated_bytes(&path);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                meta.blocks().saturating_mul(512)
+            }
+            #[cfg(not(unix))]
+            {
+                meta.len()
+            }
+        })
+        .sum()
+}
+
 mod object_meta_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -234,6 +264,28 @@ pub struct CombinedCacheStats {
     pub metadata: CacheStats,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct FoyerRuntimeStats {
+    pub stats: CombinedCacheStats,
+    pub memory_size_bytes: usize,
+    pub disk_size_bytes: usize,
+    pub ttl_seconds: u64,
+    pub l1_max_entry_bytes: usize,
+    pub block_size_bytes: usize,
+    pub cache_recent_days: usize,
+    pub cache_dir: PathBuf,
+    pub metadata_memory_size_bytes: usize,
+    pub metadata_disk_size_bytes: usize,
+    /// Main-cache L1 payload bytes currently resident in memory.
+    pub l1_used_bytes: usize,
+    /// Physical bytes allocated by the main cache device, excluding metadata.
+    pub l2_used_bytes: u64,
+    /// Entries currently tracked by the main cache's L1 index.
+    pub entry_count: usize,
+    /// Main-cache L1 capacity evictions since process start.
+    pub evictions: u64,
+}
+
 impl CacheStats {
     fn log(&self) {
         let hit_rate = if self.hits + self.misses > 0 { (self.hits as f64 / (self.hits + self.misses) as f64) * 100.0 } else { 0.0 };
@@ -270,6 +322,20 @@ pub struct SharedFoyerCache {
     stats: StatsRef,
     metadata_stats: StatsRef,
     config: FoyerCacheConfig,
+    evictions: Arc<std::sync::atomic::AtomicU64>,
+}
+
+struct EvictionCounter(Arc<std::sync::atomic::AtomicU64>);
+
+impl foyer::EventListener for EvictionCounter {
+    type Key = String;
+    type Value = CacheValue;
+
+    fn on_leave(&self, event: foyer::Event, _: &Self::Key, _: &Self::Value) {
+        if event == foyer::Event::Evict {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl SharedFoyerCache {
@@ -307,9 +373,11 @@ impl SharedFoyerCache {
         // The main data cache wants a block big enough to hold full compaction
         // outputs (128MB) so they persist, capped to the device so it can't wedge.
         let data_block_size = capped_block_size(config.block_size_bytes, config.disk_size_bytes);
+        let evictions = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let cache = HybridCacheBuilder::new()
             .with_policy(HybridCachePolicy::WriteOnInsertion)
+            .with_event_listener(Arc::new(EvictionCounter(evictions.clone())))
             .memory(config.memory_size_bytes)
             .with_shards(config.shards)
             .with_weighter(|_key: &String, value: &CacheValue| value.data.len())
@@ -341,6 +409,7 @@ impl SharedFoyerCache {
             stats: Arc::new(RwLock::new(CacheStats::default())),
             metadata_stats: Arc::new(RwLock::new(CacheStats::default())),
             config,
+            evictions,
         })
     }
 
@@ -352,6 +421,25 @@ impl SharedFoyerCache {
         CombinedCacheStats {
             main: self.stats.try_read().map(|s| s.clone()).unwrap_or_default(),
             metadata: self.metadata_stats.try_read().map(|s| s.clone()).unwrap_or_default(),
+        }
+    }
+
+    pub fn runtime_stats(&self) -> FoyerRuntimeStats {
+        FoyerRuntimeStats {
+            stats: self.try_get_stats(),
+            memory_size_bytes: self.config.memory_size_bytes,
+            disk_size_bytes: self.config.disk_size_bytes,
+            ttl_seconds: self.config.ttl.as_secs(),
+            l1_max_entry_bytes: self.config.l1_max_entry_bytes,
+            block_size_bytes: self.config.block_size_bytes,
+            cache_recent_days: self.config.cache_recent_days,
+            cache_dir: self.config.cache_dir.clone(),
+            metadata_memory_size_bytes: self.config.metadata_memory_size_bytes,
+            metadata_disk_size_bytes: self.config.metadata_disk_size_bytes,
+            l1_used_bytes: self.cache.memory().usage(),
+            l2_used_bytes: allocated_bytes(&self.config.cache_dir),
+            entry_count: self.cache.memory().entries(),
+            evictions: self.evictions.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -1669,6 +1757,29 @@ mod tests {
         assert!(get_result.is_err(), "Expected error after delete, got: {:?}", get_result);
 
         cache.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_stats_exposes_effective_config_and_occupancy() -> anyhow::Result<()> {
+        let mut config = FoyerCacheConfig::test_config("runtime_stats");
+        config.memory_size_bytes = 1024 * 1024;
+        config.l1_max_entry_bytes = 64 * 1024;
+        let cache = SharedFoyerCache::new(config.clone()).await?;
+        let path = Path::from("test/file.parquet");
+        let meta = ObjectMeta { location: path, last_modified: Utc::now(), size: 6, e_tag: None, version: None };
+        cache.cache.insert("test/file.parquet".into(), CacheValue::new(b"cached".to_vec(), meta));
+
+        let stats = cache.runtime_stats();
+        assert_eq!(stats.memory_size_bytes, config.memory_size_bytes);
+        assert_eq!(stats.disk_size_bytes, config.disk_size_bytes);
+        assert_eq!(stats.ttl_seconds, config.ttl.as_secs());
+        assert_eq!(stats.l1_max_entry_bytes, config.l1_max_entry_bytes);
+        assert_eq!(stats.cache_dir, config.cache_dir);
+        assert!(stats.l1_used_bytes >= 6, "cached bytes must count toward L1 usage");
+        assert_eq!(stats.entry_count, 1);
+
+        cache.shutdown_by(tokio::time::Instant::now() + Duration::from_secs(5)).await?;
         Ok(())
     }
 

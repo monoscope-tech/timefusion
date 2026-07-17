@@ -24,7 +24,7 @@ use datafusion::{
     physical_plan::ExecutionPlan,
 };
 
-use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, errors::arrow_err, object_store_cache::CombinedCacheStats};
+use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, errors::arrow_err, object_store_cache::FoyerRuntimeStats};
 
 /// Snapshot of the size of the resolve/provider caches at scan time.
 /// Reported as `scan.fast_resolve_cache_entries` and
@@ -32,7 +32,7 @@ use crate::{buffered_write_layer::BufferedWriteLayer, database::ScanMetrics, err
 /// growth (documented on each cache's field) before it shows up as
 /// memory pressure in long-running processes.
 pub type CacheSizeSnapshot = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
-pub type FoyerStatsSnapshot = Arc<dyn Fn() -> CombinedCacheStats + Send + Sync>;
+pub type FoyerStatsSnapshot = Arc<dyn Fn() -> FoyerRuntimeStats + Send + Sync>;
 
 pub struct StatsTableProvider {
     layer: Option<Arc<BufferedWriteLayer>>,
@@ -222,7 +222,7 @@ impl StatsTableProvider {
 
         if let Some(snap) = &self.foyer_stats {
             let s = snap();
-            for (component, stats) in [("foyer", s.main), ("foyer_metadata", s.metadata)] {
+            for (component, stats) in [("foyer", s.stats.main), ("foyer_metadata", s.stats.metadata)] {
                 rows.push((component, "hits".into(), stats.hits.to_string()));
                 rows.push((component, "misses".into(), stats.misses.to_string()));
                 rows.push((component, "bytes_served".into(), stats.bytes_served.to_string()));
@@ -230,6 +230,19 @@ impl StatsTableProvider {
                 rows.push((component, "ttl_expirations".into(), stats.ttl_expirations.to_string()));
                 rows.push((component, "inner_gets".into(), stats.inner_gets.to_string()));
             }
+            rows.push(("foyer", "memory_mb".into(), (s.memory_size_bytes / 1024 / 1024).to_string()));
+            rows.push(("foyer", "disk_gb".into(), (s.disk_size_bytes / 1024 / 1024 / 1024).to_string()));
+            rows.push(("foyer", "ttl_seconds".into(), s.ttl_seconds.to_string()));
+            rows.push(("foyer", "l1_max_entry_mb".into(), (s.l1_max_entry_bytes / 1024 / 1024).to_string()));
+            rows.push(("foyer", "block_size_mb".into(), (s.block_size_bytes / 1024 / 1024).to_string()));
+            rows.push(("foyer", "cache_recent_days".into(), s.cache_recent_days.to_string()));
+            rows.push(("foyer", "cache_dir".into(), s.cache_dir.display().to_string()));
+            rows.push(("foyer", "metadata_memory_mb".into(), (s.metadata_memory_size_bytes / 1024 / 1024).to_string()));
+            rows.push(("foyer", "metadata_disk_gb".into(), (s.metadata_disk_size_bytes / 1024 / 1024 / 1024).to_string()));
+            rows.push(("foyer", "l1_used_bytes".into(), s.l1_used_bytes.to_string()));
+            rows.push(("foyer", "l2_used_bytes".into(), s.l2_used_bytes.to_string()));
+            rows.push(("foyer", "entry_count".into(), s.entry_count.to_string()));
+            rows.push(("foyer", "evictions".into(), s.evictions.to_string()));
         }
 
         {
@@ -282,6 +295,50 @@ impl TableProvider for StatsTableProvider {
 mod tests {
     use super::*;
     use arrow::array::StringArray;
+
+    #[test]
+    fn exposes_foyer_runtime_configuration_and_occupancy() {
+        let snapshot = FoyerRuntimeStats {
+            memory_size_bytes: 4 * 1024 * 1024,
+            disk_size_bytes: 128 * 1024 * 1024 * 1024,
+            ttl_seconds: 3600,
+            l1_max_entry_bytes: 64 * 1024 * 1024,
+            block_size_bytes: 256 * 1024 * 1024,
+            cache_recent_days: 1,
+            cache_dir: "/cache".into(),
+            metadata_memory_size_bytes: 512 * 1024 * 1024,
+            metadata_disk_size_bytes: 5 * 1024 * 1024 * 1024,
+            l1_used_bytes: 123,
+            l2_used_bytes: 456,
+            entry_count: 7,
+            evictions: 8,
+            ..Default::default()
+        };
+        let batch = StatsTableProvider::new(None).with_foyer_stats(Arc::new(move || snapshot.clone())).snapshot_batch().unwrap();
+        let components = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let keys = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let values = batch.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+        let rows: Vec<_> = (0..batch.num_rows()).map(|i| (components.value(i), keys.value(i), values.value(i))).collect();
+
+        for key in [
+            "memory_mb",
+            "disk_gb",
+            "ttl_seconds",
+            "l1_max_entry_mb",
+            "block_size_mb",
+            "cache_recent_days",
+            "cache_dir",
+            "metadata_memory_mb",
+            "metadata_disk_gb",
+            "l1_used_bytes",
+            "l2_used_bytes",
+            "entry_count",
+            "evictions",
+        ] {
+            assert!(rows.iter().any(|(component, actual, _)| *component == "foyer" && *actual == key), "missing foyer.{key}");
+        }
+        assert!(rows.contains(&("foyer", "cache_dir", "/cache")));
+    }
 
     #[test]
     fn exposes_dml_retry_outcomes() {
