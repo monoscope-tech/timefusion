@@ -3746,6 +3746,7 @@ impl Database {
     /// paths: record the version for read-after-write, swap the shared handle
     /// (version-guarded), warm the just-written files, invalidate stats, and
     /// return the newly added file URIs.
+    #[allow(clippy::too_many_arguments)]
     async fn record_committed_write(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
         warm: bool, dirty_bins: &[(String, i64)],
