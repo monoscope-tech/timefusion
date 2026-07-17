@@ -30,7 +30,7 @@ cron (`sec min hour dom mon dow`).
 | `TIMEFUSION_ALLOW_INSECURE_AUTH`  | `false`      | Opt into open auth for local dev (both pgwire and gRPC). |
 | `TIMEFUSION_DATA_DIR`             | `./data`     | Base dir for the WAL (`/wal`) and cache (`/cache`). |
 | `TIMEFUSION_TABLE_PREFIX`         | `timefusion` | Path prefix for tables within the bucket. |
-| `TIMEFUSION_STOP_GRACE_SECS`      | `50`         | Total graceful-shutdown budget; keep ≤ the orchestrator's SIGTERM→SIGKILL grace. |
+| `TIMEFUSION_STOP_GRACE_SECS`      | `70`         | Total graceful-shutdown budget; keep below the 90s CapRover SIGTERM→SIGKILL grace. |
 | `RUST_LOG`                        | —            | Standard `tracing` filter (e.g. `info`, `debug`). |
 | `LOG_FORMAT`                      | —            | Set `json` for structured logs. |
 

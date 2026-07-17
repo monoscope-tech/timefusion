@@ -86,10 +86,9 @@ Drain sequence:
 3. Database shuts down — releases foyer cache, log store handles.
 
 If drain exceeds the timeout, the process exits anyway. In-flight
-requests may see connection resets. Set `terminationGracePeriodSeconds`
-in your k8s pod spec to **at least** `TIMEFUSION_SHUTDOWN_TIMEOUT_SECS
-+ flush_overhead` (rough rule: 60s default is enough for ≤4GB
-MemBuffer).
+requests may see connection resets. `TIMEFUSION_STOP_GRACE_SECS` defaults
+to 70 seconds; keep it below the orchestrator's 90-second `StopGracePeriod`
+so the cursor snapshot and lock release finish before SIGKILL.
 
 ---
 

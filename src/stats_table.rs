@@ -131,6 +131,8 @@ impl StatsTableProvider {
             // each pinning the WAL GC floor. PAGE on >0; remedy = restart.
             rows.push(("buffered_layer", "orphaned_topics".into(), s.orphaned_topics.to_string()));
             rows.push(("buffered_layer", "orphan_pin_age_secs".into(), s.orphan_pin_age_secs.map(|v| v.to_string()).unwrap_or_else(|| "null".into())));
+            rows.push(("buffered_layer", "drained".into(), s.drained.to_string()));
+            rows.push(("wal", "recovery_duration_ms".into(), s.wal_recovery_duration_ms.to_string()));
             rows.push(("wal", "files".into(), s.wal_files.to_string()));
             rows.push(("wal", "disk_bytes".into(), s.wal_disk_bytes.to_string()));
             rows.push(("wal", "disk_mb".into(), format!("{:.1}", s.wal_disk_bytes as f64 / (1024.0 * 1024.0))));

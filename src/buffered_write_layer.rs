@@ -158,6 +158,10 @@ pub struct StatsSnapshot {
     /// Age (secs) of the oldest orphan's GC-floor pin — how long WAL file GC
     /// has been (partially) suspended. None when no orphan carries a pin.
     pub orphan_pin_age_secs: Option<u64>,
+    /// True when no buffered, airborne, or orphaned WAL-backed work remains.
+    pub drained: bool,
+    /// Duration of the startup WAL recovery that produced this process.
+    pub wal_recovery_duration_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -411,6 +415,8 @@ pub struct BufferedWriteLayer {
     /// True while `recover_from_wal` runs. Suppresses cursor-snapshot writes
     /// from mid-replay relief flushes — see `write_post_flush_snapshot`.
     recovery_active: std::sync::atomic::AtomicBool,
+    /// Duration of the completed startup WAL replay, surfaced for deploy alerts.
+    wal_recovery_duration_ms: AtomicU64,
     /// Per-topic pre-recovery cursor (P0), set once at the start of
     /// `recover_from_wal`. While `recovery_active`, `compute_wal_watermark`
     /// floors its result here so a mid-replay Delta commit's watermark metadata
@@ -491,6 +497,7 @@ impl BufferedWriteLayer {
             inflight_wal_pins: dashmap::DashMap::new(),
             wal_hold_seq: AtomicU64::new(0),
             recovery_active: std::sync::atomic::AtomicBool::new(false),
+            wal_recovery_duration_ms: AtomicU64::new(0),
             recovery_commit_floor: dashmap::DashMap::new(),
             #[cfg(test)]
             test_crash_after_reliefs: AtomicU64::new(u64::MAX),
@@ -1220,6 +1227,7 @@ impl BufferedWriteLayer {
             corrupted_entries_skipped: error_count as u64,
         };
 
+        self.wal_recovery_duration_ms.store(stats.recovery_duration_ms, Ordering::Relaxed);
         info!(
             "WAL recovery complete: inserts={}, deletes={}, updates={}, corrupted={}, duration={}ms",
             entries_replayed, deletes_replayed, updates_replayed, error_count, stats.recovery_duration_ms
@@ -1986,6 +1994,11 @@ impl BufferedWriteLayer {
             .min()
     }
 
+    /// True only when no buffered, airborne, or orphaned WAL-backed work remains.
+    pub fn is_drained(&self) -> bool {
+        self.oldest_unflushed_wal_append_micros().is_none()
+    }
+
     /// Holds the recovery cursor must park at for a topic: live-bucket holds
     /// merged with orphaned holds — an orphan's rows exist only in the WAL,
     /// so parking past them (before the rewind marker is dropped) would make
@@ -2344,6 +2357,8 @@ impl BufferedWriteLayer {
             process_rss_bytes: process_rss_bytes(),
             orphaned_topics: self.orphaned_wal_holds.len(),
             orphan_pin_age_secs: self.oldest_orphan_pin_micros().map(|pin| ((chrono::Utc::now().timestamp_micros() - pin).max(0) / 1_000_000) as u64),
+            drained: self.is_drained(),
+            wal_recovery_duration_ms: self.wal_recovery_duration_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -2634,6 +2649,7 @@ mod tests {
             let layer = Arc::new(crate::test_utils::test_helpers::test_layer(cfg).unwrap());
             let stats = layer.recover_from_wal().await.unwrap();
             assert!(stats.entries_replayed > 0, "Expected entries to be replayed from WAL");
+            assert_eq!(layer.snapshot_stats().wal_recovery_duration_ms, stats.recovery_duration_ms);
 
             let results = layer.query(&project, &table, &[]).unwrap();
             assert!(!results.is_empty(), "Expected results after WAL recovery");
@@ -3333,6 +3349,7 @@ mod tests {
         // the bucket un-flushed (WAL-only), so this snapshot must NOT
         // authorize the next boot's pure-mtime WAL sweep.
         assert!(!snap.drained, "a partial-flush shutdown must not claim drained (boot GC would eat the backlog)");
+        assert!(!layer.is_drained(), "a timed-out flush must remain visibly undrained");
     }
 
     /// Counterpart: a shutdown whose flush fully drains MUST claim drained,
@@ -3358,6 +3375,7 @@ mod tests {
         layer.shutdown().await.unwrap();
         let snap = layer.wal().load_cursor_snapshot().expect("snapshot written on shutdown");
         assert!(snap.clean_shutdown && snap.drained, "a fully-drained shutdown must claim drained=true");
+        assert!(layer.is_drained(), "a successful flush must report drained");
     }
 
     /// 2026-07-08 review findings 1+5+6: an orphan (failed commit whose rows

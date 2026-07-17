@@ -125,12 +125,12 @@ const_default!(d_wal_shards_per_topic: usize = 4);
 // Total graceful-shutdown budget shared by ALL serial shutdown phases
 // (PGWire drain → gRPC drain → buffered-layer flush + cursor snapshot).
 // Set to ~80% of the orchestrator's SIGTERM→SIGKILL grace (Docker/CapRover
-// `StopGracePeriod`; prod is 60s) so the clean cursor snapshot always lands
+// `StopGracePeriod`; prod is 90s) so the clean cursor snapshot always lands
 // before SIGKILL — the previous per-phase 180s ceilings assumed 540s of
 // grace nobody configured, and PGWire drain alone could eat the real grace
 // before the flush or snapshot ever started (2026-06-11 deploy). Anything
 // unflushed at the deadline is durable in the WAL and replays on next boot.
-const_default!(d_stop_grace: u64 = 50);
+const_default!(d_stop_grace: u64 = 70);
 const_default!(d_wal_corruption_threshold: usize = 10);
 // Concurrent staged flush commits. Parquet encode + S3 upload happen outside
 // the per-table commit lock (see insert_records_batch staged path), so this scales
