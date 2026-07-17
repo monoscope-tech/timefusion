@@ -105,19 +105,32 @@ jobs:
         run: |
           set -euo pipefail
           : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
+          flush_failed_before="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'flush_failed_total'")"
           deadline=$((SECONDS + 600))
           while true; do
             psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH'
             drained="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'drained'")"
+            flush_failed="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'flush_failed_total'")"
             if [ "$drained" = true ]; then
+              [ "$flush_failed" = "$flush_failed_before" ] || { echo "::error::FLUSH failures increased (${flush_failed_before} → ${flush_failed})"; exit 1; }
               break
             fi
+
+            # The first protected deploy targets an older image which lacks the
+            # `drained` stat. Its equivalent safe condition is an empty buffer,
+            # no WAL-only orphan, and no failed flush.
+            rows="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'mem_buffer' AND key = 'total_rows'")"
+            orphans="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'orphaned_topics'")"
+            if [ -z "$drained" ] && [ "$rows" = 0 ] && [ "$orphans" = 0 ] && [ "$flush_failed" = "$flush_failed_before" ]; then
+              echo "Legacy TimeFusion drain check passed"
+              break
+            fi
+
             if (( SECONDS >= deadline )); then
-              lag="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'rows_in_buffer_lag'")"
-              echo "::error::TimeFusion did not drain within 10m (rows_in_buffer_lag=${lag}); refusing deployment"
+              echo "::error::TimeFusion did not drain within 10m (drained=${drained:-missing}, rows=${rows}, orphans=${orphans}, flush_failures=${flush_failed_before}→${flush_failed}); refusing deployment"
               exit 1
             fi
-            sleep 5
+            sleep 10
           done
 
       - id: deploy
