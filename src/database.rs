@@ -1252,6 +1252,10 @@ pub struct Database {
     /// it), so aggregate concurrency — not the pool — is the real bound against
     /// the cgroup OOM (prod 2026-07-04). Permits = `timefusion_maintenance_rewrite_concurrency`.
     maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
+    /// Serializes the outer full and light maintenance jobs. Their rewrite
+    /// permits alone are insufficient: a waiting light job can exhaust its
+    /// table timeout before it ever starts work.
+    maintenance_job_sem: Arc<tokio::sync::Semaphore>,
     /// Serializes in-process Delta commits (flush appends vs dedup
     /// replace_where) PER PHYSICAL TABLE, keyed via `table_lock_key`.
     /// delta-kernel's OCC checker cannot evaluate the bare-string timestamp
@@ -1616,6 +1620,7 @@ impl Database {
             dedup_clean_fp: Arc::new(dashmap::DashMap::new()),
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
+            maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             commit_locks: Arc::new(dashmap::DashMap::new()),
             dml_locks: Arc::new(dashmap::DashMap::new()),
             snapshot_persist_gate: Arc::new(dashmap::DashMap::new()),
@@ -1823,6 +1828,9 @@ impl Database {
             move || {
                 let db = db.clone();
                 async move {
+                    let Ok(_maintenance_job) = db.maintenance_job_sem.clone().acquire_owned().await else {
+                        return;
+                    };
                     // Overlap protection lives in spawn_cron_job (skip-if-running).
                     info!("Running scheduled light optimize on recent small files");
                     // Dedup FIRST so the light compact bin-packs already-deduped files —
@@ -1854,6 +1862,9 @@ impl Database {
             move || {
                 let db = db.clone();
                 async move {
+                    let Ok(_maintenance_job) = db.maintenance_job_sem.clone().acquire_owned().await else {
+                        return;
+                    };
                     info!("Running scheduled optimize on all tables");
                     for (table_name, table) in db.unified_tables.read().await.iter() {
                         if let Err(e) = db.optimize_table(table, table_name, None).await {
@@ -7539,6 +7550,15 @@ mod tests {
         let c = Database::filesets_for_dates(&plus, &[d]);
         assert_eq!(a[&d], b[&d]);
         assert_ne!(a[&d], c[&d]);
+    }
+
+    #[tokio::test]
+    async fn maintenance_job_gate_serializes_full_and_light_jobs() {
+        let gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let full = gate.clone().acquire_owned().await.unwrap();
+        assert!(gate.clone().try_acquire_owned().is_err());
+        drop(full);
+        assert!(gate.try_acquire_owned().is_ok());
     }
 
     #[test]

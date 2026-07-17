@@ -103,7 +103,7 @@ cron (`sec min hour dom mon dow`).
 | `TIMEFUSION_VACUUM_RETENTION_HOURS`     | `24`            | File retention for VACUUM (also drives Delta `deletedFileRetentionDuration`). |
 | `TIMEFUSION_LOG_RETENTION_HOURS`        | `6`             | `_delta_log` (transaction-log) retention window. |
 | `TIMEFUSION_LIGHT_OPTIMIZE_SCHEDULE`    | `0 */5 * * * *` | Hot/today compaction (every 5 min). |
-| `TIMEFUSION_OPTIMIZE_SCHEDULE`          | `0 2,32 * * * *`| Full Compact every 30 min, offset from light optimize. |
+| `TIMEFUSION_OPTIMIZE_SCHEDULE`          | `0 */30 * * * *`| Full Compact every 30 min. |
 | `TIMEFUSION_CONSOLIDATE_SCHEDULE`       | `0 30 2 * * *`  | Daily cold consolidation sweep (02:30). |
 | `TIMEFUSION_VACUUM_SCHEDULE`            | `0 15 */6 * * *`| VACUUM sweep (every 6h). |
 | `TIMEFUSION_RECOMPRESS_SCHEDULE`        | `0 0 3 * * *`   | Cold recompression (03:00). |
