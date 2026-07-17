@@ -130,7 +130,7 @@ jobs:
               echo "::error::TimeFusion did not drain within 10m (drained=${drained:-missing}, rows=${rows}, orphans=${orphans}, flush_failures=${flush_failed_before}→${flush_failed}); refusing deployment"
               exit 1
             fi
-            sleep 10
+            sleep 11
           done
 
       - id: deploy
