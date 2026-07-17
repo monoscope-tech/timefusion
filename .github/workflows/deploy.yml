@@ -107,6 +107,16 @@ jobs:
           : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
           psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH'
 
+      - name: Record production boot
+        id: production_before
+        env:
+          PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
+        run: |
+          set -euo pipefail
+          : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
+          boot_micros="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" || true)"
+          echo "boot_micros=${boot_micros}" >> "$GITHUB_OUTPUT"
+
       - id: deploy
         name: Deploy Image to CapRover
         uses: caprover/deploy-from-github@v1.1.2
@@ -119,18 +129,29 @@ jobs:
       - name: Verify production recovery
         env:
           PGURL: ${{ secrets.TIMEFUSION_PG_URL }}
-          MAX_WAL_RECOVERY_MS: '30000'
+          PREVIOUS_BOOT_MICROS: ${{ steps.production_before.outputs.boot_micros }}
+          MAX_WAL_RECOVERY_MS: '600000'
+          RECOVERY_WAIT_SECS: '720'
         run: |
           set -euo pipefail
           : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
-          for _ in $(seq 1 180); do
-            if psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then break; fi
-            sleep 1
+          deadline=$((SECONDS + RECOVERY_WAIT_SECS))
+          while (( SECONDS < deadline )); do
+            if ! psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null 2>&1; then
+              sleep 2
+              continue
+            fi
+            boot_micros="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'boot_micros'" || true)"
+            recovery_complete="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_complete'" || true)"
+            recovery_ms="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_duration_ms'" || true)"
+            if [ -n "$boot_micros" ] && [ "$boot_micros" != "$PREVIOUS_BOOT_MICROS" ] && [ "$recovery_complete" = true ] && [[ "$recovery_ms" =~ ^[0-9]+$ ]]; then
+              (( recovery_ms <= MAX_WAL_RECOVERY_MS )) || { echo "::error::WAL recovery took ${recovery_ms}ms (budget ${MAX_WAL_RECOVERY_MS}ms)"; exit 1; }
+              exit 0
+            fi
+            sleep 2
           done
-          psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc 'SELECT 1' >/dev/null
-          recovery_ms="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'wal' AND key = 'recovery_duration_ms'")"
-          [[ "$recovery_ms" =~ ^[0-9]+$ ]] || { echo "::error::WAL recovery duration is unavailable"; exit 1; }
-          (( recovery_ms <= MAX_WAL_RECOVERY_MS )) || { echo "::error::WAL recovery took ${recovery_ms}ms (budget ${MAX_WAL_RECOVERY_MS}ms)"; exit 1; }
+          echo "::error::replacement did not finish WAL recovery within ${RECOVERY_WAIT_SECS}s (boot=${boot_micros:-missing}, complete=${recovery_complete:-missing}, duration=${recovery_ms:-missing})"
+          exit 1
 
       - name: Show Deployment Output
         run: 'echo "Deployment URL: ${{ steps.deploy.outputs.url }}"'

@@ -162,6 +162,10 @@ pub struct StatsSnapshot {
     pub drained: bool,
     /// Duration of the startup WAL recovery that produced this process.
     pub wal_recovery_duration_ms: u64,
+    /// True only after startup WAL recovery has returned successfully.
+    pub wal_recovery_complete: bool,
+    /// Process start time, used to distinguish a replacement from its predecessor.
+    pub boot_micros: i64,
 }
 
 #[derive(Debug, Default)]
@@ -417,6 +421,8 @@ pub struct BufferedWriteLayer {
     recovery_active: std::sync::atomic::AtomicBool,
     /// Duration of the completed startup WAL replay, surfaced for deploy alerts.
     wal_recovery_duration_ms: AtomicU64,
+    /// Set only after `recover_from_wal` returns successfully.
+    wal_recovery_complete: std::sync::atomic::AtomicBool,
     /// Per-topic pre-recovery cursor (P0), set once at the start of
     /// `recover_from_wal`. While `recovery_active`, `compute_wal_watermark`
     /// floors its result here so a mid-replay Delta commit's watermark metadata
@@ -498,6 +504,7 @@ impl BufferedWriteLayer {
             wal_hold_seq: AtomicU64::new(0),
             recovery_active: std::sync::atomic::AtomicBool::new(false),
             wal_recovery_duration_ms: AtomicU64::new(0),
+            wal_recovery_complete: std::sync::atomic::AtomicBool::new(false),
             recovery_commit_floor: dashmap::DashMap::new(),
             #[cfg(test)]
             test_crash_after_reliefs: AtomicU64::new(u64::MAX),
@@ -1228,6 +1235,7 @@ impl BufferedWriteLayer {
         };
 
         self.wal_recovery_duration_ms.store(stats.recovery_duration_ms, Ordering::Relaxed);
+        self.wal_recovery_complete.store(true, Ordering::Relaxed);
         info!(
             "WAL recovery complete: inserts={}, deletes={}, updates={}, corrupted={}, duration={}ms",
             entries_replayed, deletes_replayed, updates_replayed, error_count, stats.recovery_duration_ms
@@ -2359,6 +2367,8 @@ impl BufferedWriteLayer {
             orphan_pin_age_secs: self.oldest_orphan_pin_micros().map(|pin| ((chrono::Utc::now().timestamp_micros() - pin).max(0) / 1_000_000) as u64),
             drained: self.is_drained(),
             wal_recovery_duration_ms: self.wal_recovery_duration_ms.load(Ordering::Relaxed),
+            wal_recovery_complete: self.wal_recovery_complete.load(Ordering::Relaxed),
+            boot_micros: self.boot_micros,
         }
     }
 
@@ -2650,6 +2660,7 @@ mod tests {
             let stats = layer.recover_from_wal().await.unwrap();
             assert!(stats.entries_replayed > 0, "Expected entries to be replayed from WAL");
             assert_eq!(layer.snapshot_stats().wal_recovery_duration_ms, stats.recovery_duration_ms);
+            assert!(layer.snapshot_stats().wal_recovery_complete);
 
             let results = layer.query(&project, &table, &[]).unwrap();
             assert!(!results.is_empty(), "Expected results after WAL recovery");
