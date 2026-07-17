@@ -5378,6 +5378,7 @@ impl Database {
             if let Err(e) = self
                 .optimize_table_light_inner(
                     table_ref,
+                    table_name,
                     today,
                     &project_id,
                     &partition_filters,
@@ -5401,8 +5402,8 @@ impl Database {
     /// safety net against bursts from `flush_all_now` or shutdown flushes.
     #[allow(clippy::too_many_arguments)]
     async fn optimize_table_light_inner(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, today: chrono::NaiveDate, project_id: &str, partition_filters: &[PartitionFilter], target_size: i64,
-        writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType, start_time: std::time::Instant,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today: chrono::NaiveDate, project_id: &str, partition_filters: &[PartitionFilter],
+        target_size: i64, writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType, start_time: std::time::Instant,
     ) -> Result<()> {
         const MAX_RETRIES: usize = 4;
         // Optimize rewrites (compaction) materialize Arrow like dedup — hold a
@@ -5449,14 +5450,15 @@ impl Database {
                     let min_files = self.config.maintenance.timefusion_compact_min_files;
                     if metrics.total_considered_files < min_files {
                         debug!(
-                            "Skipping light optimization commit for project={} date={}: {} files < min threshold {}",
-                            project_id, today, metrics.total_considered_files, min_files
+                            "Skipping light optimization commit for table={} project={} date={}: {} files < min threshold {}",
+                            table_name, project_id, today, metrics.total_considered_files, min_files
                         );
                         return Ok(());
                     }
                     let duration = start_time.elapsed();
                     info!(
-                        "Light optimization completed for project={} date={} in {:?} (attempt {}): {} files considered, {} removed, {} added",
+                        "Light optimization completed for table={} project={} date={} in {:?} (attempt {}): {} files considered, {} removed, {} added",
+                        table_name,
                         project_id,
                         today,
                         duration,
@@ -5488,13 +5490,23 @@ impl Database {
                         continue;
                     }
                     crate::metrics::record_optimize_failed();
-                    error!("Light optimization operation failed (attempt {}): {}", attempt + 1, e);
+                    error!(
+                        "Light optimization operation failed for table={} project={} date={} (attempt {}): {}",
+                        table_name,
+                        project_id,
+                        today,
+                        attempt + 1,
+                        e
+                    );
                     return Err(anyhow::anyhow!("Light table optimization failed: {}", e));
                 }
             }
         }
         let err = last_err.map(|e| e.to_string()).unwrap_or_else(|| "exhausted retries".into());
-        warn!("Light optimization gave up after {} OCC conflicts; will retry next tick: {}", MAX_RETRIES, err);
+        warn!(
+            "Light optimization gave up for table={} project={} date={} after {} OCC conflicts; will retry next tick: {}",
+            table_name, project_id, today, MAX_RETRIES, err
+        );
         Ok(())
     }
 
