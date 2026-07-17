@@ -283,7 +283,7 @@ const_default!(d_compact_min_files: usize = 5);
 // merge memory on the hot path. Consolidation to 256MB/1GB happens later, once
 // the partition is sealed (warm optimize → daily cold consolidate).
 const_default!(d_light_optimize_target: i64 = 32 * 1024 * 1024);
-const_default!(d_optimize_concurrency: usize = 4);
+const_default!(d_optimize_concurrency: usize = 2);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
 // Daily cold consolidation sweep (02:30): bin-pack sealed partitions to the 1GB
@@ -336,6 +336,7 @@ const_default!(d_maintenance_rewrite_concurrency: usize = 1);
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
 // Arbitrarily-late replays still need read-side dedup — see the parity plan.
 const_default!(d_dedup_lookback_days: u64 = 1);
+const_default!(d_false: bool = false);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_query_partitions: usize = 0);
@@ -948,7 +949,8 @@ pub struct MaintenanceConfig {
     /// Concurrent merge tasks per optimize run. delta-rs defaults to
     /// num_cpus (48 on prod), where each task holds decompressed batches
     /// plus a zstd writer buffer — 2026-06-11 this OOM-killed the process
-    /// every optimize tick once small files accumulated.
+    /// every optimize tick once small files accumulated. Default 2 keeps the
+    /// merge footprint bounded on legacy / high-file-count partitions.
     #[serde(default = "d_optimize_concurrency")]
     pub timefusion_optimize_max_concurrent_tasks: usize,
     #[serde(default = "d_light_schedule")]
@@ -1014,6 +1016,10 @@ pub struct MaintenanceConfig {
     /// Days back (plus today) the dedup sweep scans. See `d_dedup_lookback_days`.
     #[serde(default = "d_dedup_lookback_days")]
     pub timefusion_dedup_lookback_days: u64,
+    /// Run the legacy partition-wide dedup probe as an audit/fallback. Dirty
+    /// sealed bins are the normal maintenance path.
+    #[serde(default = "d_false")]
+    pub timefusion_dedup_sweep_fallback: bool,
     /// Skip the read-side DedupExec (and restore per-scan LIMIT pushdown) for
     /// Delta-only queries whose every in-window (project, date) partition was
     /// verified duplicate-free by a sweep pass AND whose file set is unchanged

@@ -503,17 +503,17 @@ fn build_optimize_session_state(
     use datafusion::{execution::SessionStateBuilder, prelude::SessionConfig};
     let mut cfg = SessionConfig::new().set_bool("datafusion.execution.parquet.schema_force_view_types", false);
     // Bound per-operator peak memory (bare SessionConfig::new() otherwise keeps
-    // DataFusion's larger default) and reserve a merge floor so the Z-order
-    // ExternalSorter can spill instead of erroring under memory pressure.
+    // DataFusion's larger default) and reserve a small merge floor so the sort
+    // can spill instead of erroring under memory pressure.
     let _ = cfg.options_mut().set("datafusion.execution.batch_size", "8192");
-    let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "67108864");
+    let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "33554432");
     // Cap maintenance parallelism hard. Each partition's ExternalSorter reserves
     // sort_spill_reservation_bytes up-front from the bounded maintenance pool, so
-    // the query-derived count (≈ CPU cores) exhausts it before the Z-order sort can
-    // even start (prod 2026-07-12: ~46 sorters × 64 MB > the 4.8 GB pool). A few
-    // partitions keep reservations tiny and leave the pool free to spill to disk;
-    // background compaction doesn't need query-level fan-out.
-    const MAINTENANCE_MAX_PARTITIONS: usize = 4;
+    // the query-derived count (≈ CPU cores) exhausts it before the sort can even
+    // start (prod 2026-07-12: ~46 sorters × 64 MB > the 4.8 GB pool). Legacy and
+    // high-file-count partitions still blew the reservation at 4 partitions, so
+    // drop to 2 and halve the per-partition reservation to fit the pool.
+    const MAINTENANCE_MAX_PARTITIONS: usize = 2;
     let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
     cfg = cfg.with_target_partitions(parts);
     // `runtime_env` is the dedicated bounded maintenance pool (see
@@ -536,11 +536,11 @@ fn build_delta_write_session_state(
     let cfg: SessionConfig = deltalake::delta_datafusion::DeltaSessionConfig::default().into();
     let mut cfg = cfg.set_bool("datafusion.execution.parquet.schema_force_view_types", false);
     let _ = cfg.options_mut().set("datafusion.execution.batch_size", "8192");
-    // Reserve a merge floor so a recompress `ORDER BY` (global sort of a cold
-    // partition) spills to disk instead of erroring under the bounded
+    // Reserve a small merge floor so a recompress `ORDER BY` (global sort of a
+    // cold partition) spills to disk instead of erroring under the bounded
     // maintenance pool — same reason as `build_optimize_session_state`.
-    let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "67108864");
-    const MAINTENANCE_MAX_PARTITIONS: usize = 4;
+    let _ = cfg.options_mut().set("datafusion.execution.sort_spill_reservation_bytes", "33554432");
+    const MAINTENANCE_MAX_PARTITIONS: usize = 2;
     let parts = if target_partitions == 0 { MAINTENANCE_MAX_PARTITIONS } else { target_partitions.min(MAINTENANCE_MAX_PARTITIONS) };
     cfg = cfg.with_target_partitions(parts);
     SessionStateBuilder::new()
@@ -556,13 +556,12 @@ fn build_delta_write_session_state(
 /// from the system clock via `find_next_occurrence`, so they are predictable and
 /// independent of process start time — the same job fires at e.g. :00/:30 on
 /// every replica regardless of when it booted. Exits when `cancel` fires.
-/// Each fire runs on its own task; if it is still running at the next tick the
-/// tick is skipped (counted in `maintenance.cron_ticks_skipped`). A run that
-/// outlives `MAX_CONSECUTIVE_CRON_SKIPS` ticks is aborted as wedged and the job
-/// fires fresh — maintenance bodies are idempotent and an abort is
-/// crash-equivalent (Delta commits are atomic) — so one stuck S3/Delta call can
-/// never kill a job for the process lifetime. In-flight runs are also aborted
-/// on shutdown so they can't race the final flush.
+/// Each fire runs on its own detached task; if it is still running at the next
+/// tick the tick is skipped (counted in `maintenance.cron_ticks_skipped`). Slow
+/// but healthy runs are never aborted just because later ticks occur — only
+/// shutdown forces an in-flight abort. A long-running warning threshold is
+/// logged/metriced when a run outlives several ticks, so wedged I/O is visible
+/// without being killed pre-emptively.
 ///
 /// Replaces tokio-cron-scheduler, which silently stopped dispatching ticks in
 /// prod (2026-07-13: 0 optimize/checkpoint runs over 14h of uptime despite the
@@ -583,11 +582,13 @@ where
             return;
         }
     };
-    // A run still in flight after this many skipped ticks is aborted as wedged.
-    const MAX_CONSECUTIVE_CRON_SKIPS: u32 = 3;
+    // Log a warning once a run has been in flight this long. This is purely
+    // observability — slow-but-progressing work is allowed to finish.
+    const LONG_RUNNING_WARN_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(600);
     info!("{name} job scheduled with cron expression: {schedule}");
     tokio::spawn(async move {
         let mut running: Option<tokio::task::JoinHandle<()>> = None;
+        let mut running_since: Option<std::time::Instant> = None;
         let mut skips = 0u32;
         loop {
             let now = chrono::Utc::now();
@@ -612,18 +613,27 @@ where
                     // Fire on a detached task so a wedged/overlong run can never
                     // freeze this loop; overlapping runs are skipped instead of
                     // piled up (maintenance jobs are periodic + idempotent).
-                    if running.as_ref().is_some_and(|h| !h.is_finished()) {
-                        skips += 1;
-                        crate::metrics::maintenance_stats().cron_ticks_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if skips < MAX_CONSECUTIVE_CRON_SKIPS {
-                            warn!("{name} job tick skipped: previous run still in progress ({skips} consecutive)");
+                    match running.as_ref() {
+                        Some(h) if !h.is_finished() => {
+                            skips += 1;
+                            crate::metrics::maintenance_stats().cron_ticks_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if running_since.is_some_and(|s| s.elapsed() >= LONG_RUNNING_WARN_THRESHOLD) {
+                                warn!("{name} job run still in progress after {:?} — may be wedged or just slow (skips={skips})", LONG_RUNNING_WARN_THRESHOLD);
+                                crate::metrics::record_cron_long_running();
+                            } else {
+                                warn!("{name} job tick skipped: previous run still in progress ({skips} consecutive)");
+                            }
                             continue;
                         }
-                        warn!("{name} job run outlived {skips} ticks — aborting it as wedged and firing fresh");
-                        running.take().unwrap().abort();
+                        Some(_) => {
+                            // Previous run finished between ticks — reset skip
+                            // count and overwrite the handle below.
+                            skips = 0;
+                        }
+                        None => {}
                     }
-                    skips = 0;
                     crate::metrics::maintenance_stats().cron_ticks_fired.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    running_since = Some(std::time::Instant::now());
                     running = Some(tokio::spawn(job()));
                 }
             }
@@ -1241,6 +1251,10 @@ pub struct Database {
     /// Any commit touching the partition changes its file set → mismatch →
     /// dedup stays on until the next clean sweep pass.
     dedup_clean_fp: Arc<dashmap::DashMap<(String, String, String), u64>>,
+    /// Dirty `(project, table, date, 10-minute bin)` keys recorded only after
+    /// a Delta append commits. In-memory by design: after restart the
+    /// read-side DedupExec remains the correctness backstop.
+    dedup_dirty_bins: Arc<dashmap::DashMap<(String, String, String, i64), ()>>,
     /// Exponential failure backoff per (table, project, date) dedup target:
     /// (attempts, earliest next try). Without it a failing partition re-runs
     /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
@@ -1618,6 +1632,7 @@ impl Database {
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp: Arc::new(dashmap::DashMap::new()),
+            dedup_dirty_bins: Arc::new(dashmap::DashMap::new()),
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1835,10 +1850,10 @@ impl Database {
                     info!("Running scheduled light optimize on recent small files");
                     // Dedup FIRST so the light compact bin-packs already-deduped files —
                     // otherwise compact would merge duplicates into one file we'd rewrite again.
-                    // Each table runs under its own timeout: spawn_cron_job's wedge abort
-                    // kills the WHOLE closure, so without a per-table bound a slow first
-                    // table (the busy unified one) starves every table after it — they'd
-                    // never get compacted at all.
+                    // Each table is processed in order; a slow table delays the rest of
+                    // the tick but is allowed to finish. The outer maintenance_job_sem
+                    // serializes full maintenance jobs, and spawn_cron_job skips
+                    // overlapping ticks for this schedule.
                     for (table_name, table) in db.unified_tables.read().await.iter() {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
@@ -2243,7 +2258,7 @@ impl Database {
         let cache_sizes: crate::stats_table::CacheSizeSnapshot = Arc::new(move || (fr_handle.len(), dp_handle.len()));
         let foyer = self.object_store_cache.clone();
         let foyer_stats: crate::stats_table::FoyerStatsSnapshot =
-            Arc::new(move || foyer.as_ref().map_or_else(crate::object_store_cache::FoyerRuntimeStats::default, |cache| cache.runtime_stats()));
+            Arc::new(move || foyer.as_ref().map_or_else(|| crate::object_store_cache::FoyerRuntimeStats::default(), |cache| cache.runtime_stats()));
         ctx.register_table(
             "timefusion_stats",
             Arc::new(
@@ -3415,6 +3430,24 @@ impl Database {
         // Get the appropriate schema for this table
         let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
 
+        let dirty_bins: Vec<(String, i64)> = if schema.dedup_keys.is_empty() {
+            Vec::new()
+        } else {
+            const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+            batches
+                .iter()
+                .filter_map(|batch| batch.column_by_name("timestamp"))
+                .filter_map(|column| column.as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>())
+                .flat_map(|timestamps| {
+                    timestamps.iter().flatten().filter_map(|timestamp| {
+                        chrono::DateTime::from_timestamp_micros(timestamp).map(|time| (time.date_naive().to_string(), timestamp.div_euclid(BIN_MICROS)))
+                    })
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect()
+        };
+
         // Cluster by the declared sort keys (timestamp-first) so the parquet
         // SortingColumn footer is honest and the page index localizes the lead
         // key. `sorted` is false when a schema-evolved bucket can't be combined
@@ -3538,7 +3571,8 @@ impl Database {
                         new_table.state = Some(finalized.snapshot());
                         drop(commit_guard);
                         let _t_record = std::time::Instant::now();
-                        let _committed = self.record_committed_write(&table_ref, &project_id, &table_name, new_table, &pre_uris, watermark.is_some()).await;
+                        let _committed =
+                            self.record_committed_write(&table_ref, &project_id, &table_name, new_table, &pre_uris, watermark.is_some(), &dirty_bins).await;
                         info!(
                             "commit_timing project={} table={} refresh_ms={} build_ms={} record_ms={} files={}",
                             project_id,
@@ -3575,7 +3609,8 @@ impl Database {
                                     project_id, table_name, e
                                 );
                                 let post = { table_ref.read().await.clone() };
-                                let committed = self.record_committed_write(&table_ref, &project_id, &table_name, post, &pre_uris, watermark.is_some()).await;
+                                let committed =
+                                    self.record_committed_write(&table_ref, &project_id, &table_name, post, &pre_uris, watermark.is_some(), &dirty_bins).await;
                                 return Ok(committed);
                             }
                             CommitProbe::NotLanded => {
@@ -3631,7 +3666,7 @@ impl Database {
 
             match write_result {
                 Ok(new_table) => {
-                    let added = self.record_committed_write(&table_ref, &project_id, &table_name, new_table, &pre_uris, watermark.is_some()).await;
+                    let added = self.record_committed_write(&table_ref, &project_id, &table_name, new_table, &pre_uris, watermark.is_some(), &dirty_bins).await;
                     return Ok(added);
                 }
                 Err(e) => {
@@ -3713,7 +3748,7 @@ impl Database {
     /// return the newly added file URIs.
     async fn record_committed_write(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
-        warm: bool,
+        warm: bool, dirty_bins: &[(String, i64)],
     ) -> Vec<String> {
         let committed_version = new_table.version();
         if let Some(version) = committed_version {
@@ -3752,6 +3787,9 @@ impl Database {
             });
         }
         self.statistics_extractor.invalidate(project_id, table_name).await;
+        for (date, bin) in dirty_bins {
+            self.dedup_dirty_bins.insert((project_id.to_string(), table_name.to_string(), date.clone(), *bin), ());
+        }
         debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
         // Periodic reconcile, OFF the flush path: every Nth commit (offset per
         // table so tables with uniform write rates don't all rebuild at once)
@@ -4754,7 +4792,16 @@ impl Database {
             let table = { table_ref.read().await.clone() };
             let pre_uris: std::collections::HashSet<String> = table.get_file_uris().map(|uris| uris.collect()).unwrap_or_default();
             let sort = schema_optimize_sort_columns(schema);
-            if !sort.is_empty() {
+            let rewrite_bytes: u64 = targets.iter().map(|target| target.size.max(0) as u64).sum();
+            let row_counts: Option<Vec<u64>> =
+                targets.iter().map(|target| target.get_stats().ok().flatten().map(|stats| stats.num_records.max(0) as u64)).collect();
+            let estimated_decoded =
+                row_counts.as_ref().map(|counts| counts.iter().sum::<u64>().saturating_mul(self.config.maintenance.timefusion_dedup_bytes_per_row));
+            let within_budget = (self.config.maintenance.timefusion_dedup_max_rewrite_bytes == 0
+                || rewrite_bytes <= self.config.maintenance.timefusion_dedup_max_rewrite_bytes)
+                && (self.config.maintenance.timefusion_dedup_max_decoded_bytes == 0
+                    || estimated_decoded.is_some_and(|bytes| bytes <= self.config.maintenance.timefusion_dedup_max_decoded_bytes));
+            if !sort.is_empty() && within_budget && self.config.maintenance.timefusion_dedup_bytes_per_row <= 4096 {
                 let dedup = deltalake::operations::optimize::DedupConfig {
                     columns: schema.dedup_keys.clone(),
                     tiebreak: schema.dedup_tiebreak.as_ref().map(|column| deltalake::operations::optimize::SortColumn {
@@ -5196,26 +5243,86 @@ impl Database {
         Ok(())
     }
 
-    /// One table's light maintenance (dedup then bin-pack), bounded by a
-    /// per-table timeout so a single slow/wedged table can't consume the whole
-    /// tick and starve the tables after it (the cron-level wedge abort kills the
-    /// entire run mid-table). A timed-out table just resumes next tick.
-    async fn run_light_maintenance_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
-        // Separate budgets so a slow dedup can't consume the tick and starve the
-        // compaction (the whole point of this pass). If dedup overruns we still
-        // run optimize — compaction shrinks the file count that makes the next
-        // dedup probe cheaper, so the two converge instead of dedup blocking.
-        const DEDUP_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(90);
-        const OPTIMIZE_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(180);
-        match tokio::time::timeout(DEDUP_TIMEOUT, self.dedup_today_partitions(table, table_name, dedup_key)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => error!("Dedup sweep failed for {label}: {e}"),
-            Err(_) => warn!("Dedup sweep for {label} exceeded {DEDUP_TIMEOUT:?}; proceeding to optimize (resumes next tick)"),
+    async fn dedup_dirty_bins_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        if schema.dedup_keys.is_empty() {
+            return Ok(());
         }
-        match tokio::time::timeout(OPTIMIZE_TIMEOUT, self.optimize_table_light(table, table_name)).await {
-            Ok(Ok(())) => info!("Light optimize completed for {label}"),
-            Ok(Err(e)) => error!("Light optimize failed for {label}: {e}"),
-            Err(_) => warn!("Light optimize for {label} exceeded {OPTIMIZE_TIMEOUT:?}; skipping to next table (resumes next tick)"),
+        const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+        let sealed_before = (Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
+        let ready: Vec<_> = self
+            .dedup_dirty_bins
+            .iter()
+            .filter_map(|entry| {
+                let (project, name, date, bin) = entry.key();
+                (name == table_name && (*bin + 1) * BIN_MICROS <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
+            })
+            .take(8)
+            .collect();
+        for (project_id, date, bin) in ready {
+            let key = (project_id.clone(), table_name.to_string(), date.clone(), bin);
+            self.dedup_dirty_bins.remove(&key);
+            let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")?;
+            match self.dedup_partition(table, table_name, &project_id, date).await {
+                Ok((_, true)) => {}
+                Ok((_, false)) | Err(_) => {
+                    self.dedup_dirty_bins.insert(key, ());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One table's light maintenance (dedup then bin-pack). The old 90s/180s
+    /// per-table deadlines are now warning thresholds: a slow-but-healthy table
+    /// is allowed to finish, while exceeding the threshold is logged/metriced.
+    /// Actual errors and shutdown still stop work.
+    async fn run_light_maintenance_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
+        // These used to be cancellation deadlines; they are now warning
+        // thresholds. A slow-but-healthy table is allowed to finish, while
+        // exceeding the threshold is logged/metriced for observability.
+        const DEDUP_WARN: std::time::Duration = std::time::Duration::from_secs(90);
+        const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
+        let t0 = std::time::Instant::now();
+        match self.dedup_dirty_bins_for_table(table, table_name).await {
+            Ok(()) if t0.elapsed() > DEDUP_WARN => {
+                warn!("Dirty-bin dedup for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
+                crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(()) => {}
+            Err(e) => {
+                crate::metrics::maintenance_stats().dedup_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                error!("Dirty-bin dedup failed for {label}: {e}");
+            }
+        }
+        if self.config.maintenance.timefusion_dedup_sweep_fallback {
+            let t0 = std::time::Instant::now();
+            match self.dedup_today_partitions(table, table_name, dedup_key).await {
+                Ok(()) if t0.elapsed() > DEDUP_WARN => {
+                    warn!("Dedup fallback sweep for {label} took {:?} (exceeds {DEDUP_WARN:?} warning threshold)", t0.elapsed());
+                    crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    crate::metrics::maintenance_stats().dedup_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    error!("Dedup fallback sweep failed for {label}: {e}");
+                }
+            }
+        }
+        let t0 = std::time::Instant::now();
+        match self.optimize_table_light(table, table_name).await {
+            Ok(()) => {
+                if t0.elapsed() > OPTIMIZE_WARN {
+                    warn!("Light optimize for {label} took {:?} (exceeds {OPTIMIZE_WARN:?} warning threshold)", t0.elapsed());
+                    crate::metrics::maintenance_stats().light_optimize_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    info!("Light optimize completed for {label}");
+                }
+            }
+            Err(e) => {
+                crate::metrics::maintenance_stats().light_optimize_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                error!("Light optimize failed for {label}: {e}");
+            }
         }
     }
 
@@ -7320,16 +7427,16 @@ mod tests {
         let state = build_optimize_session_state(0, Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()));
         let exec = &state.config().options().execution;
         assert_eq!(exec.batch_size, 8192);
-        assert_eq!(exec.sort_spill_reservation_bytes, 67_108_864);
+        assert_eq!(exec.sort_spill_reservation_bytes, 33_554_432);
         // Parallelism capped so per-partition spill reservations fit the bounded pool.
-        assert_eq!(exec.target_partitions, 4, "0 (all cores) must cap to the maintenance limit");
+        assert_eq!(exec.target_partitions, 2, "0 (all cores) must cap to the maintenance limit");
         assert_eq!(
             build_optimize_session_state(64, Arc::new(datafusion::execution::runtime_env::RuntimeEnv::default()))
                 .config()
                 .options()
                 .execution
                 .target_partitions,
-            4
+            2
         );
     }
 
@@ -7380,6 +7487,32 @@ mod tests {
         cancel.cancel();
         let skipped = crate::metrics::maintenance_stats().cron_ticks_skipped.load(Relaxed) - skipped_before;
         assert!(skipped >= 1, "later ticks must be skipped (loop alive) while the first run hangs, got {skipped} skips");
+    }
+
+    /// A slow-but-healthy job must be allowed to complete across multiple
+    /// skipped ticks. Previously the scheduler aborted after three skips,
+    /// losing work on a still-progressing run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawn_cron_job_lets_slow_runs_finish() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let cancel = Arc::new(CancellationToken::new());
+        let completed = Arc::new(AtomicUsize::new(0));
+        spawn_cron_job("slow-test", "* * * * * *", cancel.clone(), {
+            let completed = completed.clone();
+            move || {
+                let completed = completed.clone();
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+                    completed.fetch_add(1, Relaxed);
+                }
+            }
+        });
+        // 6.5s spans 6 one-second ticks; the first run starts at t≈0 and would
+        // be aborted at the 4s tick under the old 3-skip rule. It must instead
+        // finish at t≈4.5s.
+        tokio::time::sleep(std::time::Duration::from_millis(6500)).await;
+        cancel.cancel();
+        assert_eq!(completed.load(Relaxed), 1, "slow-but-healthy run must complete, not be aborted");
     }
 
     /// The shared OCC classifier must treat every retryable delta-rs conflict as
@@ -8813,5 +8946,37 @@ mod tests {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn dirty_dedup_bins_enqueue_seal_and_requeue() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-dedup-bins-{}", uuid::Uuid::new_v4().simple()));
+        assert!(!cfg.maintenance.timefusion_dedup_sweep_fallback, "the broad fallback sweep must default off");
+        let db = Database::with_config(cfg).await?;
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let old = (Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+        let row = |id: &str, observed: &str, timestamp| json_to_batch(vec![test_span_ts(id, observed, &project, timestamp)]);
+
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "first", old)?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "second", old)?], true, None).await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 1, "successful commits enqueue their timestamp bin");
+        let table = db.unified_tables().read().await.get("otel_logs_and_spans").unwrap().clone();
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans").await?;
+        assert_eq!(delta_physical_row_count(&table).await?, 1, "sealed bin is physically deduplicated");
+        assert!(db.dedup_dirty_bins.is_empty(), "completed sealed bin is consumed");
+
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "later", old)?], true, None).await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 1, "late retry requeues the previously consumed bin");
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans").await?;
+        assert_eq!(delta_physical_row_count(&table).await?, 1, "later observed timestamp survives the requeue rewrite");
+
+        let fresh = Utc::now().timestamp_micros();
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "a", fresh)?], true, None).await?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("unsealed", "b", fresh)?], true, None).await?;
+        db.dedup_dirty_bins_for_table(&table, "otel_logs_and_spans").await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 1, "unsealed bin remains queued without rewrite");
+        assert_eq!(delta_physical_row_count(&table).await?, 3, "unsealed copies remain for read-side dedup");
+        Ok(())
     }
 }
