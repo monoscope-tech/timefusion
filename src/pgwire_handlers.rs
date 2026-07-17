@@ -264,9 +264,6 @@ impl LoggingSimpleQueryHandler {
                 stats.buckets_failed, stats.buckets_flushed
             )));
         }
-        if !layer.is_drained() {
-            return Err(admin_err("FLUSH completed but concurrent work remains buffered/WAL-durable; retry after quiescing writers"));
-        }
         Ok(vec![Response::Execution(Tag::new(&format!("FLUSH {}", stats.total_rows)))])
     }
 }
