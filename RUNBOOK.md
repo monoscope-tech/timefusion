@@ -126,6 +126,28 @@ process lifetime.
 
 ---
 
+## GitHub deployment verification
+
+The deployment workflow records the current `buffered_layer.boot_micros`, deploys
+one replacement, then waits for a *different* boot ID with
+`wal.recovery_complete=true`. This avoids treating a routable pgwire listener
+or an old Swarm task as proof that the replacement has finished WAL recovery.
+
+The workflow waits up to 12 minutes for recovery and rejects a completed replay
+over 10 minutes. Inspect the replacement with:
+
+```sql
+SELECT component, key, value
+FROM timefusion_stats
+WHERE (component = 'buffered_layer' AND key = 'boot_micros')
+   OR (component = 'wal' AND key IN ('recovery_complete', 'recovery_duration_ms'));
+```
+
+If recovery exceeds the budget, investigate WAL replay volume and flush health;
+do not reduce the verification to `SELECT 1` or bypass the WAL directory lock.
+
+---
+
 ## Schema migrations
 
 Schemas are YAML files under `schemas/`, compiled into the binary via
