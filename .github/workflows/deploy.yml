@@ -105,9 +105,20 @@ jobs:
         run: |
           set -euo pipefail
           : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
-          psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH'
-          drained="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'drained'")"
-          test "$drained" = true || { echo "::error::TimeFusion did not drain; refusing deployment"; exit 1; }
+          deadline=$((SECONDS + 600))
+          while true; do
+            psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH'
+            drained="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'drained'")"
+            if [ "$drained" = true ]; then
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              lag="$(psql "$PGURL" -v ON_ERROR_STOP=1 -Atqc "SELECT value FROM timefusion_stats WHERE component = 'buffered_layer' AND key = 'rows_in_buffer_lag'")"
+              echo "::error::TimeFusion did not drain within 10m (rows_in_buffer_lag=${lag}); refusing deployment"
+              exit 1
+            fi
+            sleep 5
+          done
 
       - id: deploy
         name: Deploy Image to CapRover
