@@ -4737,6 +4737,77 @@ impl Database {
                 tokio::time::sleep(occ_backoff(replan)).await;
                 continue;
             }
+
+            // The selected files are the complete overlap set for this sealed
+            // 10-minute bin. Let delta-rs globally sort and streaming-dedup that
+            // exact set: unlike normal optimize, `with_files` keeps large and
+            // single-file inputs instead of bin-packing or skipping them.
+            let paths: Vec<String> = targets.iter().map(|target| target.path.clone()).collect();
+            let before = ctx
+                .sql(&format!("SELECT count(*) FROM {scan_name} WHERE {chunk_filter}"))
+                .await?
+                .collect()
+                .await?
+                .first()
+                .and_then(|batch| batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|array| array.value(0) as u64))
+                .unwrap_or(0);
+            let table = { table_ref.read().await.clone() };
+            let pre_uris: std::collections::HashSet<String> = table.get_file_uris().map(|uris| uris.collect()).unwrap_or_default();
+            let sort = schema_optimize_sort_columns(schema);
+            if !sort.is_empty() {
+            let dedup = deltalake::operations::optimize::DedupConfig {
+                columns: schema.dedup_keys.clone(),
+                tiebreak: schema.dedup_tiebreak.as_ref().map(|column| deltalake::operations::optimize::SortColumn {
+                    column: column.clone(),
+                    descending: true,
+                    nulls_first: false,
+                }),
+            };
+            let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
+            match table
+                .optimize()
+                .with_type(deltalake::operations::optimize::OptimizeType::SortByDedup(sort, dedup))
+                .with_files(&paths)
+                .with_target_size(std::num::NonZeroU64::new(1).unwrap())
+                .with_max_concurrent_tasks(1)
+                .with_writer_properties(self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, true))
+                .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
+                .await
+            {
+                Ok((new_table, _)) => {
+                    let provider = TableProviderBuilder::default()
+                        .with_log_store(new_table.log_store())
+                        .with_eager_snapshot(Arc::new(new_table.snapshot()?.snapshot().clone()))
+                        .build()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("dedup SortByDedup post-rewrite provider: {e}"))?;
+                    let post_ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
+                        self.config.memory.timefusion_query_partitions,
+                        self.maintenance_runtime_env(),
+                    ));
+                    post_ctx.register_table(scan_name, Arc::new(provider))?;
+                    let after = post_ctx
+                        .sql(&format!("SELECT count(*) FROM {scan_name} WHERE {chunk_filter}"))
+                        .await?
+                        .collect()
+                        .await?
+                        .first()
+                        .and_then(|batch| batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|array| array.value(0) as u64))
+                        .unwrap_or(before);
+                    self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                    return Ok((before.saturating_sub(after), true));
+                }
+                Err(error) if replan + 1 < MAX_REPLANS && is_occ_conflict_err(&error.to_string()) => {
+                    debug!("dedup SortByDedup conflict for table={} chunk=[{}], re-planning: {}", table_name, label, error);
+                    tokio::time::sleep(occ_backoff(replan)).await;
+                    continue;
+                }
+                Err(error) => return Err(anyhow::anyhow!("dedup SortByDedup rewrite failed: {error}")),
+            }
+            }
+            // Tables without a declared sort order retain the bounded hash
+            // fallback below; all production dedup tables use SortByDedup.
             // 3. Decide the shard count. A dedup `SELECT * … collect()` decodes to
             // Arrow at 5-20× compressed OUTSIDE the memory pool, so an over-budget
             // chunk used to be skipped (dupe left forever). Instead we split the

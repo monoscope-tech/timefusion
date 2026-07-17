@@ -1,0 +1,87 @@
+table_name: otel_metrics
+partitions:
+  - project_id
+  - date
+dedup_keys:
+  - timestamp
+  - id
+dedup_tiebreak: ingested_at
+sorting_columns:
+  - name: timestamp
+    descending: true
+    nulls_first: true
+  - name: metric_name
+    descending: false
+    nulls_first: false
+  - name: series_id
+    descending: false
+    nulls_first: false
+z_order_columns: []
+fields:
+  - { name: project_id, data_type: Utf8, nullable: true }
+  - { name: timestamp, data_type: 'Timestamp(Microsecond, Some("UTC"))', nullable: false }
+  - { name: date, data_type: Date32, nullable: false }
+  - { name: start_timestamp, data_type: 'Timestamp(Microsecond, Some("UTC"))', nullable: true }
+  - { name: ingested_at, data_type: 'Timestamp(Microsecond, Some("UTC"))', nullable: false }
+  - { name: id, data_type: Utf8, nullable: false, bloom_filter: true }
+  - { name: series_id, data_type: Utf8, nullable: false, bloom_filter: true }
+  - { name: metric_name, data_type: Utf8, nullable: false, bloom_filter: true }
+  - { name: metric_description, data_type: Utf8, nullable: true }
+  - { name: metric_unit, data_type: Utf8, nullable: false }
+  - { name: metric_type, data_type: Utf8, nullable: false }
+  - { name: aggregation_temporality, data_type: Utf8, nullable: true }
+  - { name: is_monotonic, data_type: Boolean, nullable: true }
+  - { name: flags, data_type: Int64, nullable: false }
+  - { name: resource, data_type: Variant, nullable: true }
+  - { name: resource_schema_url, data_type: Utf8, nullable: true }
+  - { name: scope_name, data_type: Utf8, nullable: true }
+  - { name: scope_version, data_type: Utf8, nullable: true }
+  - { name: scope_schema_url, data_type: Utf8, nullable: true }
+  - { name: attributes, data_type: Variant, nullable: true }
+  - { name: dropped_attributes_count, data_type: Int64, nullable: false }
+  - { name: exemplars, data_type: Variant, nullable: true }
+  - { name: resource___service___name, data_type: Utf8, nullable: true }
+  - { name: resource___service___namespace, data_type: Utf8, nullable: true }
+  - { name: resource___service___instance___id, data_type: Utf8, nullable: true }
+  - { name: resource___service___version, data_type: Utf8, nullable: true }
+  - { name: resource___deployment___environment___name, data_type: Utf8, nullable: true }
+  - { name: resource___host___name, data_type: Utf8, nullable: true }
+  - { name: resource___container___name, data_type: Utf8, nullable: true }
+  - { name: resource___k8s___cluster___name, data_type: Utf8, nullable: true }
+  - { name: resource___k8s___namespace___name, data_type: Utf8, nullable: true }
+  - { name: resource___k8s___pod___name, data_type: Utf8, nullable: true }
+  - { name: resource___k8s___container___name, data_type: Utf8, nullable: true }
+  - { name: resource___cloud___provider, data_type: Utf8, nullable: true }
+  - { name: resource___cloud___region, data_type: Utf8, nullable: true }
+  - { name: resource___cloud___availability___zone, data_type: Utf8, nullable: true }
+  - { name: attributes___http___request___method, data_type: Utf8, nullable: true }
+  - { name: attributes___http___route, data_type: Utf8, nullable: true }
+  - { name: attributes___http___response___status_code, data_type: Int32, nullable: true }
+  - { name: attributes___error___type, data_type: Utf8, nullable: true }
+  - { name: attributes___rpc___service, data_type: Utf8, nullable: true }
+  - { name: attributes___rpc___method, data_type: Utf8, nullable: true }
+  - { name: attributes___rpc___grpc___status_code, data_type: Int32, nullable: true }
+  - { name: attributes___db___system___name, data_type: Utf8, nullable: true }
+  - { name: attributes___db___operation___name, data_type: Utf8, nullable: true }
+  - { name: attributes___messaging___system, data_type: Utf8, nullable: true }
+  - { name: attributes___messaging___operation, data_type: Utf8, nullable: true }
+  - { name: attributes___messaging___destination___name, data_type: Utf8, nullable: true }
+  - { name: value, data_type: Float64, nullable: true }
+  - { name: value_double, data_type: Float64, nullable: true }
+  - { name: value_int, data_type: Int64, nullable: true }
+  - { name: distribution_count, data_type: Int64, nullable: true }
+  - { name: distribution_sum, data_type: Float64, nullable: true }
+  - { name: distribution_min, data_type: Float64, nullable: true }
+  - { name: distribution_max, data_type: Float64, nullable: true }
+  - { name: hist_bucket_counts, data_type: 'List(Int64)', nullable: true }
+  - { name: hist_explicit_bounds, data_type: 'List(Float64)', nullable: true }
+  - { name: exp_hist_scale, data_type: Int32, nullable: true }
+  - { name: exp_hist_zero_count, data_type: Int64, nullable: true }
+  - { name: exp_hist_zero_threshold, data_type: Float64, nullable: true }
+  - { name: exp_hist_pos_offset, data_type: Int32, nullable: true }
+  - { name: exp_hist_pos_buckets, data_type: 'List(Int64)', nullable: true }
+  - { name: exp_hist_neg_offset, data_type: Int32, nullable: true }
+  - { name: exp_hist_neg_buckets, data_type: 'List(Int64)', nullable: true }
+  - { name: summary_quantiles, data_type: 'List(Float64)', nullable: true }
+  - { name: summary_values, data_type: 'List(Float64)', nullable: true }
+  - { name: message_size_bytes, data_type: Int64, nullable: false }

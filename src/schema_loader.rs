@@ -197,9 +197,12 @@ fn parse_arrow_data_type(s: &str) -> anyhow::Result<ArrowDataType> {
         "Boolean" => ArrowDataType::Boolean,
         "Int32" => ArrowDataType::Int32,
         "Int64" => ArrowDataType::Int64,
+        "Float64" => ArrowDataType::Float64,
         "UInt32" => ArrowDataType::UInt32,
         "UInt64" => ArrowDataType::UInt64,
         "List(Utf8)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Utf8View, true))),
+        "List(Int64)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Int64, true))),
+        "List(Float64)" => ArrowDataType::List(Arc::new(Field::new("item", ArrowDataType::Float64, true))),
         "Timestamp(Microsecond, None)" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
         "Timestamp(Microsecond, Some(\"UTC\"))" => ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
         // Variant: declare the inner buffers as Binary to match
@@ -232,7 +235,10 @@ fn parse_delta_data_type(s: &str) -> anyhow::Result<DeltaDataType> {
         "Boolean" => DeltaDataType::Primitive(Boolean),
         "Int32" | "UInt32" => DeltaDataType::Primitive(Integer),
         "Int64" | "UInt64" => DeltaDataType::Primitive(Long),
+        "Float64" => DeltaDataType::Primitive(Double),
         "List(Utf8)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(String), true))),
+        "List(Int64)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(Long), true))),
+        "List(Float64)" => DeltaDataType::Array(Box::new(ArrayType::new(DeltaDataType::Primitive(Double), true))),
         "Variant" => DeltaDataType::unshredded_variant(),
         _ if s.starts_with("Timestamp") => DeltaDataType::Primitive(Timestamp),
         _ => anyhow::bail!("Unknown type: {}", s),
@@ -392,5 +398,14 @@ mod tests {
             let want = data_cols.iter().position(|n| *n == def.name).unwrap() as i32;
             assert_eq!(sc.column_idx, want, "sort col `{}` column_idx mismatch", def.name);
         }
+    }
+
+    #[test]
+    fn otel_metrics_schema_supports_native_metric_values() {
+        let schema = get_schema("otel_metrics").expect("metrics schema registered");
+        assert_eq!(schema.partitions, ["project_id", "date"]);
+        let fields = schema.fields().expect("metrics fields parse");
+        assert!(matches!(fields.iter().find(|f| f.name() == "value").map(|f| f.data_type()), Some(ArrowDataType::Float64)));
+        assert!(matches!(fields.iter().find(|f| f.name() == "hist_bucket_counts").map(|f| f.data_type()), Some(ArrowDataType::List(_))));
     }
 }
