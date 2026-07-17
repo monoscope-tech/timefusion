@@ -4533,6 +4533,12 @@ impl Database {
     pub async fn dedup_partition(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate,
     ) -> Result<(u64, bool)> {
+        self.dedup_partition_range(table_ref, table_name, project_id, date, None).await
+    }
+
+    async fn dedup_partition_range(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, bin: Option<i64>,
+    ) -> Result<(u64, bool)> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
             return Ok((0, true));
@@ -4566,7 +4572,20 @@ impl Database {
         // so a future caller can't inject SQL through the partition predicate. date_str comes from NaiveDate::to_string
         // and is already safe.
         let safe_pid = project_id.replace('\'', "''");
-        let filter = format!("project_id = '{}' AND date = DATE '{}'", safe_pid, date_str);
+        let filter = if let Some(bin) = bin {
+            const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+            let start = chrono::DateTime::from_timestamp_micros(bin * BIN_MICROS).ok_or_else(|| anyhow::anyhow!("invalid dedup bin {bin}"))?;
+            let end = start + chrono::Duration::minutes(10);
+            format!(
+                "project_id = '{}' AND date = DATE '{}' AND \"timestamp\" >= TIMESTAMP '{}' AND \"timestamp\" < TIMESTAMP '{}'",
+                safe_pid,
+                date_str,
+                start.format("%Y-%m-%d %H:%M:%S"),
+                end.format("%Y-%m-%d %H:%M:%S")
+            )
+        } else {
+            format!("project_id = '{}' AND date = DATE '{}'", safe_pid, date_str)
+        };
         // Probe for duplicates BEFORE materializing anything: the common case
         // is zero dupes, and `SELECT *` + collect() of a whole day partition
         // (1.4M wide OTel rows observed) transiently allocated tens of GB
@@ -5264,7 +5283,7 @@ impl Database {
             let key = (project_id.clone(), table_name.to_string(), date.clone(), bin);
             self.dedup_dirty_bins.remove(&key);
             let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")?;
-            match self.dedup_partition(table, table_name, &project_id, date).await {
+            match self.dedup_partition_range(table, table_name, &project_id, date, Some(bin)).await {
                 Ok((_, true)) => {}
                 Ok((_, false)) | Err(_) => {
                     self.dedup_dirty_bins.insert(key, ());
