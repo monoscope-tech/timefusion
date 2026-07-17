@@ -828,20 +828,19 @@ impl FoyerObjectStoreCache {
         span.record("cache_waited_for_inflight", waited_for_inflight);
 
         // A concurrent leader may have populated the object while we waited.
-        if waited_for_inflight
-            && let Ok(Some(entry)) = self.cache.get(&cache_key).await {
-                let value = entry.value();
-                if !value.is_expired(self.get_ttl_for_path(location)) {
-                    self.update_stats(|s| {
-                        s.hits += 1;
-                        s.bytes_served += value.data.len() as u64;
-                    })
-                    .await;
-                    span.record("cache_hit", true);
-                    span.record("cache_entry_bytes", value.data.len() as i64);
-                    return Ok(Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone()));
-                }
+        if waited_for_inflight && let Ok(Some(entry)) = self.cache.get(&cache_key).await {
+            let value = entry.value();
+            if !value.is_expired(self.get_ttl_for_path(location)) {
+                self.update_stats(|s| {
+                    s.hits += 1;
+                    s.bytes_served += value.data.len() as u64;
+                })
+                .await;
+                span.record("cache_hit", true);
+                span.record("cache_entry_bytes", value.data.len() as i64);
+                return Ok(Self::make_get_result(Bytes::from(value.data.clone()), value.meta.clone()));
             }
+        }
 
         // Cache miss - fetch from inner store
         span.record("cache_hit", false);
