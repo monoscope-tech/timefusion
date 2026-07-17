@@ -2258,7 +2258,7 @@ impl Database {
         let cache_sizes: crate::stats_table::CacheSizeSnapshot = Arc::new(move || (fr_handle.len(), dp_handle.len()));
         let foyer = self.object_store_cache.clone();
         let foyer_stats: crate::stats_table::FoyerStatsSnapshot =
-            Arc::new(move || foyer.as_ref().map_or_else(|| crate::object_store_cache::FoyerRuntimeStats::default(), |cache| cache.runtime_stats()));
+            Arc::new(move || foyer.as_ref().map_or_else(crate::object_store_cache::FoyerRuntimeStats::default, |cache| cache.runtime_stats()));
         ctx.register_table(
             "timefusion_stats",
             Arc::new(
