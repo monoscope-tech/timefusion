@@ -850,35 +850,40 @@ impl FoyerObjectStoreCache {
         let ttl = self.get_ttl_for_path(location);
         debug!("Foyer cache MISS for: {} (fetching from S3, parquet={}, TTL={}s)", location, is_parquet, ttl.as_secs());
 
-        let start_time = std::time::Instant::now();
-        let inner_span = tracing::trace_span!(parent: &span, "s3.get", location = %location);
-        let result = self.inner.get(location).instrument(inner_span).await?;
-        let duration = start_time.elapsed();
+        let fetch_result = async {
+            let start_time = std::time::Instant::now();
+            let inner_span = tracing::trace_span!(parent: &span, "s3.get", location = %location);
+            let result = self.inner.get(location).instrument(inner_span).await?;
+            let duration = start_time.elapsed();
 
-        debug!("S3 GET request: {} (size: {} bytes, duration: {}ms, parquet: {})", location, result.meta.size, duration.as_millis(), is_parquet);
+            debug!("S3 GET request: {} (size: {} bytes, duration: {}ms, parquet: {})", location, result.meta.size, duration.as_millis(), is_parquet);
 
-        // Collect payload for caching
-        use futures::TryStreamExt;
-        let data = match result.payload {
-            GetResultPayload::Stream(s) => {
-                let chunks: Vec<Bytes> = s.try_collect().await?;
-                chunks.concat()
-            }
-            GetResultPayload::File(mut file, _) => {
-                use std::io::Read;
-                let mut buf = Vec::new();
-                file.read_to_end(&mut buf).map_err(|e| object_store::Error::Generic { store: "cache", source: Box::new(e) })?;
-                buf
-            }
-        };
+            // Collect payload for caching
+            use futures::TryStreamExt;
+            let data = match result.payload {
+                GetResultPayload::Stream(s) => {
+                    let chunks: Vec<Bytes> = s.try_collect().await?;
+                    chunks.concat()
+                }
+                GetResultPayload::File(mut file, _) => {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    file.read_to_end(&mut buf).map_err(|e| object_store::Error::Generic { store: "cache", source: Box::new(e) })?;
+                    buf
+                }
+            };
 
-        self.update_stats(|s| s.inner_bytes_read += data.len() as u64).await;
-        span.record("cache_entry_bytes", data.len() as i64);
-        span.record("cache_admission", if data.len() > self.config.l1_max_entry_bytes { "disk" } else { "memory" });
-        self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()));
+            self.update_stats(|s| s.inner_bytes_read += data.len() as u64).await;
+            span.record("cache_entry_bytes", data.len() as i64);
+            span.record("cache_admission", if data.len() > self.config.l1_max_entry_bytes { "disk" } else { "memory" });
+            self.insert_main_value(location, CacheValue::new(data.clone(), result.meta.clone()));
+            Ok(Self::make_get_result(Bytes::from(data), result.meta))
+        }
+        .await;
+
         drop(fetch_guard);
-        self.main_fetch_locks.remove(&cache_key);
-        Ok(Self::make_get_result(Bytes::from(data), result.meta))
+        self.main_fetch_locks.remove_if(&cache_key, |_, lock| Arc::ptr_eq(lock, &fetch_lock));
+        fetch_result
     }
 
     #[instrument(
@@ -2382,6 +2387,15 @@ mod tests {
         async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> ObjectStoreResult<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    #[tokio::test]
+    async fn failed_get_removes_fetch_lock() -> anyhow::Result<()> {
+        let cache = FoyerObjectStoreCache::new(Arc::new(InMemory::new()), FoyerCacheConfig::test_config("failed_get_cleanup")).await?;
+        assert!(cache.get(&Path::from("table/date=2026-01-01/missing.parquet")).await.is_err());
+        assert!(cache.main_fetch_locks.is_empty(), "failed fetch must not retain its lock");
+        cache.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]
