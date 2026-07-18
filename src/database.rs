@@ -748,6 +748,49 @@ pub(crate) fn is_occ_conflict_err(msg: &str) -> bool {
         || msg.contains("Transaction failed")
 }
 
+/// A Parquet file ends with `[footer_len: u32 LE][PAR1]`. Cheap structural
+/// check that catches the real-world checkpoint-corruption classes — an object
+/// overwritten with foreign bytes (an S3 XML error / SelectObjectContent body,
+/// 2026-07-17) or a truncated write — without reading the whole file. `tail`
+/// is the file's last 8 bytes.
+fn parquet_tail_ok(tail: &[u8], file_len: u64) -> bool {
+    tail.len() == 8 && &tail[4..] == b"PAR1" && {
+        let footer_len = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as u64;
+        footer_len > 0 && footer_len + 8 <= file_len
+    }
+}
+
+/// Verify the checkpoint that `_last_checkpoint` points to is a readable
+/// Parquet before TF trusts it enough to prune the JSON commit log behind it.
+/// `Ok(true)` = every part has a sane footer; `Ok(false)` = at least one part
+/// is definitively corrupt/foreign; `Err` = couldn't determine (missing part /
+/// transient store error). A missing `_last_checkpoint` returns `Ok(true)` —
+/// delta lists the log in that case, so it is not our gate to hold.
+async fn last_checkpoint_readable(store: &Arc<dyn object_store::ObjectStore>) -> Result<bool, object_store::Error> {
+    use object_store::{GetOptions, GetRange, ObjectStore, path::Path};
+    let lc = match store.get_opts(&Path::from("_delta_log/_last_checkpoint"), GetOptions::default()).await {
+        Ok(r) => r.bytes().await?,
+        Err(object_store::Error::NotFound { .. }) => return Ok(true),
+        Err(e) => return Err(e),
+    };
+    let meta: serde_json::Value = serde_json::from_slice(&lc).map_err(|e| object_store::Error::Generic { store: "checkpoint_verify", source: Box::new(e) })?;
+    let Some(version) = meta.get("version").and_then(serde_json::Value::as_u64) else { return Ok(false) };
+    let parts = meta.get("parts").and_then(serde_json::Value::as_u64).unwrap_or(1);
+    let paths: Vec<Path> = if parts <= 1 {
+        vec![Path::from(format!("_delta_log/{version:020}.checkpoint.parquet"))]
+    } else {
+        (1..=parts).map(|p| Path::from(format!("_delta_log/{version:020}.checkpoint.{p:010}.{parts:010}.parquet"))).collect()
+    };
+    for p in &paths {
+        let res = store.get_opts(p, GetOptions { range: Some(GetRange::Suffix(8)), ..Default::default() }).await?;
+        let size = res.meta.size;
+        if !parquet_tail_ok(&res.bytes().await?, size) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Exponential backoff between OCC conflict retries — single policy for every
 /// retry site (flush, optimize, dedup, DML): 150, 300, 600ms… capped so the
 /// shift can't overflow if a caller raises its attempt limit.
@@ -5612,9 +5655,33 @@ impl Database {
         const CHECKPOINT_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
         match tokio::time::timeout(CHECKPOINT_OP_TIMEOUT, deltalake::checkpoints::create_checkpoint(&table, None)).await {
             Ok(Ok(())) => {
-                self.checkpoint_versions.insert(url, version);
-                crate::metrics::maintenance_stats().checkpoints_created.fetch_add(1, Relaxed);
-                debug!("out-of-band checkpoint created for '{}' at v{}", table_name, version);
+                // Verify the just-written checkpoint is a readable Parquet before
+                // advancing the boundary or letting cleanup prune JSON behind it.
+                // A foreign/corrupt checkpoint object (an S3 error/Select body
+                // written over it, 2026-07-17) must never gate log cleanup — the
+                // JSON commit log is the only recovery source, and today's
+                // recovery depended on it still being present.
+                let store = table.log_store().object_store(None);
+                match last_checkpoint_readable(&store).await {
+                    Ok(true) => {
+                        self.checkpoint_versions.insert(url, version);
+                        crate::metrics::maintenance_stats().checkpoints_created.fetch_add(1, Relaxed);
+                        debug!("out-of-band checkpoint created + verified for '{}' at v{}", table_name, version);
+                    }
+                    Ok(false) => {
+                        crate::metrics::record_checkpoint_corrupt();
+                        error!(
+                            "checkpoint for '{}' at v{} is unreadable after write (foreign/corrupt object) — withholding log cleanup to preserve the JSON recovery log; PAGE",
+                            table_name, version
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        crate::metrics::record_checkpoint_failed();
+                        warn!("could not verify checkpoint for '{}' at v{}: {} — withholding log cleanup this tick", table_name, version, e);
+                        return;
+                    }
+                }
             }
             Ok(Err(e)) => {
                 crate::metrics::record_checkpoint_failed();
@@ -7249,6 +7316,25 @@ mod writer_properties_tests {
             let p = build_writer_properties(&cfg(), &schema_with(vec![], vec![]), level, true);
             assert_eq!(p.compression(&ColumnPath::from("anything")), Compression::ZSTD(ZstdLevel::try_new(level).unwrap()));
         }
+    }
+
+    // Regression for the 2026-07-17 otel_metrics outage: an S3
+    // SelectObjectContentRequest XML body (299 bytes, no PAR1 magic) was
+    // written over a delta-log checkpoint. The footer check must reject it so
+    // the checkpoint task withholds log cleanup and the JSON stays recoverable.
+    #[test]
+    fn parquet_tail_ok_rejects_foreign_and_truncated_objects() {
+        let good = b"\x10\x00\x00\x00PAR1"; // footer_len=16, magic ok
+        assert!(super::parquet_tail_ok(good, 1024));
+        // The real clobber: an XML body's last 8 bytes, no PAR1 magic.
+        assert!(!super::parquet_tail_ok(b"quest>\x00\x00", 299));
+        assert!(!super::parquet_tail_ok(b"Result>\n", 299));
+        // Valid magic but a footer length that can't fit in the file (corrupt).
+        assert!(!super::parquet_tail_ok(b"\xff\xff\xff\x7fPAR1", 64));
+        // footer_len == 0 is impossible for a real file.
+        assert!(!super::parquet_tail_ok(b"\x00\x00\x00\x00PAR1", 1024));
+        // Wrong length input.
+        assert!(!super::parquet_tail_ok(b"PAR1", 8));
     }
 
     #[test]

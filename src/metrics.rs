@@ -94,6 +94,7 @@ counter_registry! {
     maintenance_log_cleanup_failed => "timefusion.maintenance.log_cleanup_failed": "Out-of-band expired-log-cleanup attempts that errored. Retried next tick; the _delta_log grows until it succeeds. WARN if sustained (a growing log slows every commit's version LIST)",
     maintenance_cron_long_running => "timefusion.maintenance.cron_long_running": "Cron maintenance runs that exceeded the long-running warning threshold while still in progress. Slow-but-healthy runs are allowed to finish; sustained nonzero with no completion means a job is wedged.",
     reconcile_dangling_removed => "timefusion.maintenance.reconcile_dangling_removed": "Active Add entries whose parquet object was missing from the store and got Remove'd by the reconcile task. NONZERO means committed data was destroyed elsewhere (commit-path parquet deletion bug) — PAGE and investigate",
+    maintenance_checkpoint_corrupt => "timefusion.maintenance.checkpoint_corrupt": "Checkpoints that failed post-write footer verification — the object _last_checkpoint points to is not a readable Parquet file (foreign/corrupt bytes, e.g. an S3 error or SelectObjectContent body written over it, 2026-07-17). Log cleanup is withheld so the JSON commit log — the only recovery source — is never pruned behind an unreadable checkpoint. PAGE if > 0",
 }
 
 pub fn registry() -> Option<&'static MetricsRegistry> {
@@ -431,6 +432,10 @@ pub fn dml_stats() -> &'static DmlStats {
 pub struct MaintenanceStats {
     pub checkpoints_created: AtomicU64,
     pub checkpoint_failed: AtomicU64,
+    /// Checkpoints that wrote OK but failed post-write footer verification
+    /// (the referenced object isn't a readable Parquet). Log cleanup is
+    /// withheld so the JSON log stays recoverable. PAGE if > 0.
+    pub checkpoint_corrupt: AtomicU64,
     pub log_files_cleaned: AtomicU64,
     pub log_cleanup_failed: AtomicU64,
     pub checkpoint_lag_versions: AtomicU64,
@@ -454,6 +459,7 @@ pub struct MaintenanceStats {
 static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     checkpoints_created: AtomicU64::new(0),
     checkpoint_failed: AtomicU64::new(0),
+    checkpoint_corrupt: AtomicU64::new(0),
     log_files_cleaned: AtomicU64::new(0),
     log_cleanup_failed: AtomicU64::new(0),
     checkpoint_lag_versions: AtomicU64::new(0),
@@ -477,6 +483,14 @@ pub fn record_checkpoint_failed() {
     MAINTENANCE_STATS.checkpoint_failed.fetch_add(1, Relaxed);
     if let Some(m) = METRICS.get() {
         m.maintenance_checkpoint_failed.add(1, &[]);
+    }
+}
+
+/// One checkpoint that failed post-write footer verification (mirrors to OTel).
+pub fn record_checkpoint_corrupt() {
+    MAINTENANCE_STATS.checkpoint_corrupt.fetch_add(1, Relaxed);
+    if let Some(m) = METRICS.get() {
+        m.maintenance_checkpoint_corrupt.add(1, &[]);
     }
 }
 

@@ -154,6 +154,7 @@ impl StatsTableProvider {
             let m = crate::metrics::maintenance_stats();
             rows.push(("maintenance", "checkpoints_created".into(), m.checkpoints_created.load(Relaxed).to_string()));
             rows.push(("maintenance", "checkpoint_failed".into(), m.checkpoint_failed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "checkpoint_corrupt".into(), m.checkpoint_corrupt.load(Relaxed).to_string()));
             rows.push(("maintenance", "log_files_cleaned".into(), m.log_files_cleaned.load(Relaxed).to_string()));
             rows.push(("maintenance", "log_cleanup_failed".into(), m.log_cleanup_failed.load(Relaxed).to_string()));
             // Max version lag (current - last checkpointed) seen at the last
