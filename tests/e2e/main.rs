@@ -6,6 +6,7 @@
 mod harness;
 
 mod cache_warmth;
+mod deletion_vectors;
 mod dml_compression;
 mod eviction;
 mod flush_lifecycle;

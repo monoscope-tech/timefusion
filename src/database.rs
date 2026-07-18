@@ -2774,7 +2774,7 @@ impl Database {
         match self.create_or_load_delta_table(storage_uri, storage_options.clone(), cached_store.clone()).await {
             Ok(table) => {
                 info!("Loaded existing table '{}'", table_name);
-                let desired = HashMap::from([
+                let mut desired = HashMap::from([
                     ("delta.deletedFileRetentionDuration".to_string(), format!("interval {} hours", self.config.maintenance.timefusion_vacuum_retention_hours)),
                     ("delta.checkpointInterval".to_string(), self.config.parquet.timefusion_checkpoint_interval.to_string()),
                     // Reconcile _delta_log retention on EXISTING tables too — a config
@@ -2783,6 +2783,11 @@ impl Database {
                     // its log to ~6.7k objects → 3-5s commits, 2026-06-26).
                     ("delta.logRetentionDuration".to_string(), format!("interval {} hours", self.config.maintenance.timefusion_log_retention_hours)),
                 ]);
+                // One-time protocol upgrade so merge-on-read UPDATE/DELETE can attach DVs.
+                // Only when opted in; ensure_table_properties is idempotent (no commit if set).
+                if self.config.maintenance.timefusion_use_deletion_vectors {
+                    desired.insert("delta.enableDeletionVectors".to_string(), "true".to_string());
+                }
                 Ok(ensure_table_properties(table, desired).await)
             }
             Err(load_err) => {
@@ -2816,6 +2821,11 @@ impl Database {
                     // -1 = index all columns. Needed so kernel data-skipping can evaluate
                     // predicates on columns beyond the first 32 without "No such field" errors.
                     config.insert("delta.dataSkippingNumIndexedCols".to_string(), Some("-1".to_string()));
+                    // Enable merge-on-read deletion vectors at create so DV UPDATE/DELETE
+                    // works without a later protocol upgrade. Opt-in only.
+                    if self.config.maintenance.timefusion_use_deletion_vectors {
+                        config.insert("delta.enableDeletionVectors".to_string(), Some("true".to_string()));
+                    }
 
                     match CreateBuilder::new()
                         .with_location(storage_uri)

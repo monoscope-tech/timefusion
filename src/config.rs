@@ -1088,6 +1088,18 @@ pub struct MaintenanceConfig {
     /// `d_maintenance_rewrite_concurrency`.
     #[serde(default = "d_maintenance_rewrite_concurrency")]
     pub timefusion_maintenance_rewrite_concurrency: usize,
+    /// Perform UPDATE/DELETE as merge-on-read deletion-vector operations instead
+    /// of copy-on-write full-file rewrites. A DV UPDATE appends only the rewritten
+    /// matched rows and masks the originals with a roaring-bitmap deletion vector;
+    /// a DV DELETE just writes the mask. This avoids rewriting whole partitions for
+    /// a small predicate (the hash-enrichment UPDATE / retention DELETE hotspots).
+    ///
+    /// Requires the `deletionVectors` writer feature on the table — enabled lazily
+    /// on first DV write (a one-time protocol upgrade to reader/writer v3/v7). Off
+    /// by default: the upgrade is irreversible and every reader of these Delta
+    /// tables must understand DVs (TF's own scan does; external log readers may not).
+    #[serde(default)]
+    pub timefusion_use_deletion_vectors: bool,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.

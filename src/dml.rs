@@ -817,11 +817,12 @@ pub async fn perform_delta_update(
     // Clone captures per attempt: the operation may rerun after an OCC conflict.
     // zstd tier for the rewrite: without it the UpdateBuilder writes SNAPPY.
     let writer_properties = database.dml_writer_properties(table_name);
+    let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
         let (predicate, assignments, session) = (predicate.clone(), assignments.clone(), session.clone());
         let writer_properties = writer_properties.clone();
         async move {
-            let mut builder = delta_table.update().with_session_state(session).with_writer_properties(writer_properties);
+            let mut builder = delta_table.update().with_session_state(session).with_writer_properties(writer_properties).with_deletion_vectors(use_dv);
 
             if let Some(pred) = predicate {
                 builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
@@ -860,11 +861,12 @@ pub async fn perform_delta_delete(database: &Database, table_name: &str, project
     let span = tracing::Span::current();
     // zstd tier for the rewrite: without it the DeleteBuilder writes SNAPPY.
     let writer_properties = database.dml_writer_properties(table_name);
+    let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
         let (predicate, session) = (predicate.clone(), session.clone());
         let writer_properties = writer_properties.clone();
         async move {
-            let mut builder = delta_table.delete().with_session_state(session).with_writer_properties(writer_properties);
+            let mut builder = delta_table.delete().with_session_state(session).with_writer_properties(writer_properties).with_deletion_vectors(use_dv);
 
             if let Some(pred) = predicate {
                 builder = builder.with_predicate(convert_expr_to_delta(&pred)?);
