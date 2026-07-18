@@ -27,7 +27,7 @@ use datafusion::{
     prelude::{SessionContext, col, lit},
     scalar::ScalarValue,
 };
-use deltalake::{DeltaOps, DeltaTable};
+use deltalake::DeltaTable;
 use timefusion::optimizers::time_range_partition_pruner::with_date_partition_filters;
 
 const PROJECT: &str = "prune-proj";
@@ -84,9 +84,9 @@ fn batch_for_day(day: i32) -> Result<RecordBatch> {
 /// The first `write` auto-creates the table (partition columns honored only
 /// on creation); each subsequent write appends one more date-partition file.
 async fn build_table(uri: &str) -> Result<()> {
-    let mut table = DeltaOps::try_from_url(url::Url::parse(uri)?).await?.0;
+    let mut table = DeltaTable::try_from_url(url::Url::parse(uri)?).await?;
     for day in BASE_DAY..BASE_DAY + NUM_DAYS {
-        table = DeltaOps(table).write(vec![batch_for_day(day)?]).with_partition_columns(["project_id", "date"]).await?;
+        table = table.write(vec![batch_for_day(day)?]).with_partition_columns(["project_id", "date"]).await?;
     }
     Ok(())
 }
@@ -112,7 +112,7 @@ async fn merge_files_scanned(table: DeltaTable, predicate: Expr) -> Result<usize
 
     let join_pred = col("target.context___span_id").eq(col("source.span_id")).and(predicate);
 
-    let (_t, metrics) = DeltaOps(table)
+    let (_t, metrics) = table
         .merge(source_df, join_pred)
         .with_source_alias("source")
         .with_target_alias("target")
@@ -136,11 +136,11 @@ async fn merge_prunes_to_single_date_partition() -> Result<()> {
 
     // BUG shape: only `timestamp` bounds → delta cannot prune the `date`
     // partition, so all NUM_DAYS files are scanned.
-    let raw_scanned = merge_files_scanned(DeltaOps::try_from_url(url::Url::parse(&raw_uri)?).await?.0, user_predicate()).await?;
+    let raw_scanned = merge_files_scanned(DeltaTable::try_from_url(url::Url::parse(&raw_uri)?).await?, user_predicate()).await?;
 
     // FIX: derived `date` bound prunes to the single touched partition.
     let pruned_pred = with_date_partition_filters(user_predicate(), "timestamp");
-    let pruned_scanned = merge_files_scanned(DeltaOps::try_from_url(url::Url::parse(&pruned_uri)?).await?.0, pruned_pred).await?;
+    let pruned_scanned = merge_files_scanned(DeltaTable::try_from_url(url::Url::parse(&pruned_uri)?).await?, pruned_pred).await?;
 
     assert_eq!(raw_scanned, NUM_DAYS as usize, "raw timestamp predicate should scan every date partition (reproduces the OOM)");
     assert_eq!(pruned_scanned, 1, "date-augmented predicate should prune to the single touched partition");
