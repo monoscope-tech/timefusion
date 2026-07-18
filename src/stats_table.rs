@@ -169,6 +169,13 @@ impl StatsTableProvider {
             rows.push(("maintenance", "dedup_failed_total".into(), m.dedup_failed.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_timed_out_total".into(), m.light_optimize_timed_out.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_failed_total".into(), m.light_optimize_failed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dirty_bin_queue_depth".into(), m.dirty_bin_queue_depth.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dirty_bin_enqueued_total".into(), m.dirty_bin_enqueued.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dirty_bin_eligible_total".into(), m.dirty_bin_eligible.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dirty_bin_processed_total".into(), m.dirty_bin_processed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dirty_bin_requeued_total".into(), m.dirty_bin_requeued.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dirty_bin_dropped_rows_total".into(), m.dirty_bin_dropped_rows.load(Relaxed).to_string()));
+            rows.push(("maintenance", "dirty_bin_rewrite_duration_ms_total".into(), m.dirty_bin_rewrite_duration_ms.load(Relaxed).to_string()));
             // Runs exceeding the long-running warning threshold. Slow progress
             // is allowed; sustained nonzero with no completion = wedged.
             rows.push(("maintenance", "cron_long_running_total".into(), m.cron_long_running.load(Relaxed).to_string()));

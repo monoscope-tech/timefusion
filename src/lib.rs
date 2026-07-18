@@ -8,6 +8,7 @@ pub mod clock;
 pub mod config;
 pub mod count_pushdown;
 pub mod database;
+pub mod dirty_bin_queue;
 pub mod dml;
 pub mod dml_coalescer;
 pub mod errors;

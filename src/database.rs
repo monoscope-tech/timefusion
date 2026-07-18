@@ -1609,6 +1609,11 @@ impl Database {
         // Active tables rewrite their snapshot every flush; week-stale files
         // belong to dropped/idle tables and would otherwise accumulate forever.
         crate::snapshot_cache::prune_stale(&Self::delta_snapshot_dir(&cfg), std::time::Duration::from_secs(7 * 24 * 3600));
+        let dedup_dirty_bins = Arc::new(dashmap::DashMap::new());
+        for bin in crate::dirty_bin_queue::load(&cfg.core.timefusion_data_dir) {
+            dedup_dirty_bins.insert((bin.project_id, bin.table_name, bin.date, bin.bin), ());
+        }
+        crate::metrics::maintenance_stats().dirty_bin_queue_depth.store(dedup_dirty_bins.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let aws_endpoint = &cfg.aws.aws_s3_endpoint;
         let aws_url = Url::parse(aws_endpoint).expect("AWS endpoint must be a valid URL");
         deltalake::aws::register_handlers(Some(aws_url));
@@ -1675,7 +1680,7 @@ impl Database {
             last_written_versions: Arc::new(RwLock::new(HashMap::new())),
             last_dedup_versions: Arc::new(RwLock::new(HashMap::new())),
             dedup_clean_fp: Arc::new(dashmap::DashMap::new()),
-            dedup_dirty_bins: Arc::new(dashmap::DashMap::new()),
+            dedup_dirty_bins,
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -3832,7 +3837,7 @@ impl Database {
         }
         self.statistics_extractor.invalidate(project_id, table_name).await;
         for (date, bin) in dirty_bins {
-            self.dedup_dirty_bins.insert((project_id.to_string(), table_name.to_string(), date.clone(), *bin), ());
+            self.enqueue_dirty_bin(project_id, table_name, date, *bin);
         }
         debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
         // Periodic reconcile, OFF the flush path: every Nth commit (offset per
@@ -5306,6 +5311,29 @@ impl Database {
         Ok(())
     }
 
+    fn persist_dirty_bins(&self) {
+        let mut bins: Vec<_> = self
+            .dedup_dirty_bins
+            .iter()
+            .map(|entry| {
+                let (project_id, table_name, date, bin) = entry.key();
+                crate::dirty_bin_queue::DirtyBin { project_id: project_id.clone(), table_name: table_name.clone(), date: date.clone(), bin: *bin }
+            })
+            .collect();
+        bins.sort_by(|a, b| (&a.table_name, &a.project_id, &a.date, a.bin).cmp(&(&b.table_name, &b.project_id, &b.date, b.bin)));
+        crate::dirty_bin_queue::store(&self.config.core.timefusion_data_dir, &bins);
+        crate::metrics::maintenance_stats().dirty_bin_queue_depth.store(bins.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn enqueue_dirty_bin(&self, project_id: &str, table_name: &str, date: &str, bin: i64) {
+        let key = (project_id.to_string(), table_name.to_string(), date.to_string(), bin);
+        if self.dedup_dirty_bins.insert(key, ()).is_none() {
+            crate::metrics::maintenance_stats().dirty_bin_enqueued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info!(project_id, table_name, date, bin, event = "dirty_bin_enqueued");
+            self.persist_dirty_bins();
+        }
+    }
+
     async fn dedup_dirty_bins_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
@@ -5325,14 +5353,37 @@ impl Database {
         for (project_id, date, bin) in ready {
             let key = (project_id.clone(), table_name.to_string(), date.clone(), bin);
             self.dedup_dirty_bins.remove(&key);
-            let date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")?;
-            match self.dedup_partition_range(table, table_name, &project_id, date, Some(bin)).await {
-                Ok((_, true)) => {}
-                Ok((_, false)) | Err(_) => {
+            self.persist_dirty_bins();
+            crate::metrics::maintenance_stats().dirty_bin_eligible.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
+            let started = std::time::Instant::now();
+            let parsed_date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")?;
+            let result = self.dedup_partition_range(table, table_name, &project_id, parsed_date, Some(bin)).await;
+            match result {
+                Ok((dropped, true)) => {
+                    let elapsed = started.elapsed().as_millis() as u64;
+                    let stats = crate::metrics::maintenance_stats();
+                    stats.dirty_bin_processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stats.dirty_bin_dropped_rows.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                    stats.dirty_bin_rewrite_duration_ms.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+                    info!(project_id, table_name, date, bin, dropped, duration_ms = elapsed, event = "dirty_bin_complete");
+                }
+                Ok((_, false)) => {
                     self.dedup_dirty_bins.insert(key, ());
+                    self.persist_dirty_bins();
+                    crate::metrics::maintenance_stats().dirty_bin_requeued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(project_id, table_name, date, bin, event = "dirty_bin_requeued");
+                }
+                Err(error) => {
+                    self.dedup_dirty_bins.insert(key, ());
+                    self.persist_dirty_bins();
+                    crate::metrics::maintenance_stats().dirty_bin_requeued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(project_id, table_name, date, bin, %error, event = "dirty_bin_failure");
+                    info!(project_id, table_name, date, bin, event = "dirty_bin_requeued");
                 }
             }
         }
+        self.persist_dirty_bins();
         Ok(())
     }
 
@@ -5371,6 +5422,10 @@ impl Database {
                     error!("Dedup fallback sweep failed for {label}: {e}");
                 }
             }
+        }
+        if !self.config.maintenance.timefusion_light_optimize_enabled {
+            debug!("Light optimize disabled for {label}");
+            return;
         }
         let t0 = std::time::Instant::now();
         match self.optimize_table_light(table, table_name).await {
@@ -9064,6 +9119,23 @@ mod tests {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 180 seconds"))?
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn dirty_dedup_bins_survive_restart() -> Result<()> {
+        let cfg = create_test_config(&format!("dirty-dedup-restart-{}", uuid::Uuid::new_v4().simple()));
+        let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
+        let old = (Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+        let db = Database::with_config(Arc::clone(&cfg)).await?;
+        let batch = json_to_batch(vec![test_span_ts("restart", "first", &project, old)])?;
+        db.insert_records_batch(&project, "otel_logs_and_spans", vec![batch], true, None).await?;
+        assert_eq!(db.dedup_dirty_bins.len(), 1);
+        drop(db);
+
+        let restored = Database::with_config(cfg).await?;
+        assert_eq!(restored.dedup_dirty_bins.len(), 1, "restart restores the sealed late-event bin");
+        Ok(())
     }
 
     #[serial]

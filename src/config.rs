@@ -944,6 +944,10 @@ pub struct MaintenanceConfig {
     pub timefusion_optimize_sort_by: bool,
     #[serde(default = "d_compact_min_files")]
     pub timefusion_compact_min_files: usize,
+    /// Disabled by default after production OOMs; enable only after the
+    /// partition rewrite memory profile has been validated.
+    #[serde(default = "d_false")]
+    pub timefusion_light_optimize_enabled: bool,
     #[serde(default = "d_light_optimize_target")]
     pub timefusion_light_optimize_target_size: i64,
     /// Concurrent merge tasks per optimize run. delta-rs defaults to
