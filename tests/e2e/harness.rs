@@ -52,7 +52,9 @@ impl Default for E2eEnvBuilder {
             frozen_at_micros: FROZEN_START_MICROS,
             checkpoint_interval: 10,
             optimize_sort_by: false,
-            use_deletion_vectors: false,
+            // Mirror the prod default (on) so the whole e2e suite exercises the
+            // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
+            use_deletion_vectors: true,
         }
     }
 }
@@ -104,6 +106,10 @@ impl E2eEnvBuilder {
     }
     pub fn with_deletion_vectors(mut self) -> Self {
         self.use_deletion_vectors = true;
+        self
+    }
+    pub fn without_deletion_vectors(mut self) -> Self {
+        self.use_deletion_vectors = false;
         self
     }
 

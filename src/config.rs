@@ -1214,6 +1214,9 @@ mod tests {
         assert_eq!(config.cache.timefusion_cache_recent_days, 8);
         assert!(config.maintenance.timefusion_warm_after_compaction);
         assert!(config.maintenance.timefusion_evict_after_compaction);
+        // Merge-on-read DV is the default write path (and thus what all test
+        // harnesses that build from AppConfig::default() exercise).
+        assert!(config.maintenance.timefusion_use_deletion_vectors);
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
