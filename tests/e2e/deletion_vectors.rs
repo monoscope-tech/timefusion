@@ -106,6 +106,69 @@ async fn dv_update_and_delete_hide_rows_without_rewriting_files() -> anyhow::Res
     Ok(())
 }
 
+/// OPTIMIZE/compaction must consolidate deletion vectors: reading DV-masked files,
+/// dropping the deleted rows, and producing DV-free files — never resurrecting the
+/// logically-deleted rows.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn dv_compaction_consolidates_deletion_vectors() -> anyhow::Result<()> {
+    let env = E2eEnv::builder()
+        .with_deletion_vectors()
+        .with_bucket_duration(Duration::from_secs(60))
+        .start()
+        .await?;
+    let client = env.pg_client().await?;
+
+    let sec = 1_000_000i64;
+    for i in 0..20 {
+        insert_at(&client, &format!("c-{i}"), FROZEN_START_MICROS + i * sec).await?;
+    }
+    env.force_flush().await?;
+
+    // DV DELETE 3 rows and DV UPDATE 2 rows (mask + append).
+    client
+        .execute("DELETE FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND id IN ('c-1','c-2','c-3')", &[])
+        .await?;
+    client
+        .execute("UPDATE otel_logs_and_spans SET status_code = 'ERR' WHERE project_id = 'e2e_project' AND id IN ('c-4','c-5')", &[])
+        .await?;
+
+    // Full compaction: reads DV-masked data, drops deleted rows, writes DV-free files.
+    let db = env.db();
+    let table_ref = timefusion::database::get_unified_delta_table(db.unified_tables(), "otel_logs_and_spans")
+        .await
+        .ok_or_else(|| anyhow::anyhow!("unified table not found"))?;
+    db.optimize_table(&table_ref, "otel_logs_and_spans", None).await?;
+
+    // Post-compaction: deleted rows stay gone, updated rows keep their new value.
+    let count: i64 = client
+        .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"])
+        .await?
+        .get(0);
+    assert_eq!(count, 17, "compaction resurrected DV-deleted rows");
+
+    let errs: i64 = client
+        .query_one(
+            "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND status_code = 'ERR'",
+            &[&"e2e_project"],
+        )
+        .await?
+        .get(0);
+    assert_eq!(errs, 2, "DV-updated rows lost their value across compaction");
+
+    for id in ["c-1", "c-2", "c-3"] {
+        let gone: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"e2e_project", &id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(gone, 0, "deleted row {id} reappeared after compaction");
+    }
+    Ok(())
+}
+
 /// UPDATE ... FROM (the hash-enrichment MERGE shape) as merge-on-read: matched
 /// target rows are masked + their updated copies appended, not whole-file rewritten.
 #[serial_test::serial]
