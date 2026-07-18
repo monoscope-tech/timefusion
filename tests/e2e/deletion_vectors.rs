@@ -106,6 +106,60 @@ async fn dv_update_and_delete_hide_rows_without_rewriting_files() -> anyhow::Res
     Ok(())
 }
 
+/// Deletion vectors live in the Delta log, not the WAL. A full crash-restart must
+/// reload them from the committed log so masked rows stay masked and updates persist —
+/// guards the snapshot-reload / checkpoint-replay path against dropping DV descriptors.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn dv_state_survives_restart() -> anyhow::Result<()> {
+    let mut env = E2eEnv::builder()
+        .with_deletion_vectors()
+        .with_bucket_duration(Duration::from_secs(60))
+        .start()
+        .await?;
+    {
+        let client = env.pg_client().await?;
+        let sec = 1_000_000i64;
+        for i in 0..6 {
+            insert_at(&client, &format!("r-{i}"), FROZEN_START_MICROS + i * sec).await?;
+        }
+        env.force_flush().await?;
+        client
+            .execute("DELETE FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND id IN ('r-1','r-2')", &[])
+            .await?;
+        client
+            .execute("UPDATE otel_logs_and_spans SET status_code = 'ERR' WHERE project_id = 'e2e_project' AND id = 'r-3'", &[])
+            .await?;
+        let count: i64 = client
+            .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"])
+            .await?
+            .get(0);
+        assert_eq!(count, 4, "pre-restart count wrong");
+    }
+
+    env.restart().await?;
+
+    let client = env.pg_client().await?;
+    let count: i64 = client
+        .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"])
+        .await?
+        .get(0);
+    assert_eq!(count, 4, "DV-deleted rows resurrected across restart");
+    for id in ["r-1", "r-2"] {
+        let gone: i64 = client
+            .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"e2e_project", &id])
+            .await?
+            .get(0);
+        assert_eq!(gone, 0, "deleted row {id} came back after restart");
+    }
+    let updated: String = client
+        .query_one("SELECT status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = 'r-3'", &[&"e2e_project"])
+        .await?
+        .get(0);
+    assert_eq!(updated, "ERR", "DV update lost across restart");
+    Ok(())
+}
+
 /// OPTIMIZE/compaction must consolidate deletion vectors: reading DV-masked files,
 /// dropping the deleted rows, and producing DV-free files — never resurrecting the
 /// logically-deleted rows.
