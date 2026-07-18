@@ -39,10 +39,7 @@ async fn enrich(client: &tokio_postgres::Client, span: &str, trace: &str, tag: &
 
 async fn count_by_hash(client: &tokio_postgres::Client, tag: &str) -> anyhow::Result<i64> {
     Ok(client
-        .query_one(
-            &format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND hashes && ARRAY['{tag}']::text[]"),
-            &[],
-        )
+        .query_one(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND hashes && ARRAY['{tag}']::text[]"), &[])
         .await?
         .get(0))
 }
