@@ -169,7 +169,6 @@ impl StatsTableProvider {
             rows.push(("maintenance", "dedup_failed_total".into(), m.dedup_failed.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_timed_out_total".into(), m.light_optimize_timed_out.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_failed_total".into(), m.light_optimize_failed.load(Relaxed).to_string()));
-            rows.push(("maintenance", "light_optimize_skipped_total".into(), m.light_optimize_skipped.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_queue_depth".into(), m.dirty_bin_queue_depth.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_enqueued_total".into(), m.dirty_bin_enqueued.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_eligible_total".into(), m.dirty_bin_eligible.load(Relaxed).to_string()));

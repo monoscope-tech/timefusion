@@ -5446,10 +5446,10 @@ impl Database {
 
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         let today = Utc::now().date_naive();
-        let (project_ids, partition_files) = {
+        let project_ids = {
             let table = table_ref.read().await;
             let uris: Vec<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-            (Self::hot_project_ids(&uris, today), Self::partition_files_by_pid(&table, &format!("date={today}"))?)
+            Self::hot_project_ids(&uris, today)
         };
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
@@ -5468,14 +5468,7 @@ impl Database {
         // optimize fail loudly during heavy ingest; the next scheduler
         // tick (5 min later) usually catches a quiet enough window.
         let mut failed = 0;
-        let max_files = self.config.maintenance.timefusion_light_optimize_max_files;
         for project_id in project_ids {
-            let file_count = partition_files.get(&project_id).map_or(0, Vec::len);
-            if max_files != 0 && file_count > max_files {
-                crate::metrics::maintenance_stats().light_optimize_skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                warn!(table_name, project_id, date = %today, file_count, max_files, event = "light_optimize_skipped_over_file_limit");
-                continue;
-            }
             let partition_filters = vec![
                 PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
                 PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?,

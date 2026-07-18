@@ -283,10 +283,6 @@ const_default!(d_compact_min_files: usize = 5);
 // merge memory on the hot path. Consolidation to 256MB/1GB happens later, once
 // the partition is sealed (warm optimize → daily cold consolidate).
 const_default!(d_light_optimize_target: i64 = 32 * 1024 * 1024);
-// Bound a hot-partition maintenance job before it materializes enough files to
-// threaten the process. 0 explicitly disables this guard for an operator-run
-// catch-up after capacity has been validated.
-const_default!(d_light_optimize_max_files: usize = 128);
 const_default!(d_optimize_concurrency: usize = 2);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
@@ -952,10 +948,6 @@ pub struct MaintenanceConfig {
     /// small-file backlog. Set false only as an incident kill switch.
     #[serde(default = "d_true")]
     pub timefusion_light_optimize_enabled: bool,
-    /// Skip a hot partition once its active file count exceeds this bound,
-    /// preventing an unbounded in-process rewrite. 0 disables the guard.
-    #[serde(default = "d_light_optimize_max_files")]
-    pub timefusion_light_optimize_max_files: usize,
     #[serde(default = "d_light_optimize_target")]
     pub timefusion_light_optimize_target_size: i64,
     /// Concurrent merge tasks per optimize run. delta-rs defaults to
