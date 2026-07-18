@@ -1676,9 +1676,9 @@ impl Database {
             maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
-            fast_resolve_cache: dashmap::DashMap::new(),
+            fast_resolve_cache: Arc::new(dashmap::DashMap::new()),
             delta_has_files: dashmap::DashMap::new(),
-            delta_provider_cache: dashmap::DashMap::new(),
+            delta_provider_cache: Arc::new(dashmap::DashMap::new()),
             scan_metrics: Arc::new(ScanMetrics::default()),
             batch_queue: None,
             maintenance_shutdown: Arc::new(maintenance_shutdown),
@@ -4004,7 +4004,14 @@ impl Database {
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         let mut pre_uris: std::collections::HashSet<String> = if track_files { all_uris.iter().cloned().collect() } else { Default::default() };
 
-        let target_size = self.config.parquet.timefusion_optimize_target_size;
+        // Keep the active partition at the light-compaction target. A single
+        // day-sized file would make 1h and 3h predicates select the same file
+        // even when timestamp ordering makes their row groups disjoint.
+        let target_size = if window_dates.contains(&today) {
+            self.config.maintenance.timefusion_light_optimize_target_size
+        } else {
+            self.config.parquet.timefusion_optimize_target_size
+        };
 
         // delta-rs ZOrder has NO idempotence guard (unlike Compact it does no
         // size / single-file / already-sorted check): it rewrites every file in
@@ -4046,12 +4053,9 @@ impl Database {
             kept_dates.iter().filter_map(|d| PartitionFilter::try_from(("date", "=", d.to_string().as_str())).ok()).collect();
 
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        // Full optimize runs every 30 min over a 48h window — promote these
-        // rewrites to the "warm" tier so day-old data lands smaller on disk
-        // without slowing the hot flush path. It must stay a plain Compact:
-        // SortBy has repeatedly exhausted the maintenance pool on the active
-        // partition. Fresh flushes and targeted light compaction retain sorting.
-        let (optimize_type, declare_sorted) = full_optimize_type(schema);
+        // Sorting keeps rewritten files timestamp-local, so short ranges can
+        // prune whole files and row groups. It remains an incident kill switch.
+        let (optimize_type, declare_sorted) = full_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
         let optimize_concurrency = self.config.maintenance.timefusion_optimize_max_concurrent_tasks;
 
@@ -6185,16 +6189,10 @@ fn schema_order_by_clause(schema: &crate::schema_loader::TableSchema) -> String 
     format!(" ORDER BY {cols}")
 }
 
-/// Pick the optimize strategy for a rewrite. With `allow_sort` (config
-/// `timefusion_optimize_sort_by`, default OFF) prefers `SortBy` the schema's
-/// (timestamp-DESC-first) keys so the output is globally sorted with an honest
-/// footer — keeping the ordering/limit pushdown alive on optimized partitions.
-/// `allow_zorder` selects Z-order. Both are memory-heavy global sorts that can
-/// exhaust the bounded maintenance pool on large partitions, so the safe
-/// default is `Compact` (bin-pack, no global sort). Returns
-/// `(optimize_type, declare_sorted)`.
-fn full_optimize_type(schema: &crate::schema_loader::TableSchema) -> (deltalake::operations::optimize::OptimizeType, bool) {
-    choose_optimize_type(schema, false, false)
+/// Full compaction optionally sorts by the schema's timestamp-leading keys so
+/// rewritten files retain tight timestamp statistics and an honest footer.
+fn full_optimize_type(schema: &crate::schema_loader::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
+    choose_optimize_type(schema, false, allow_sort)
 }
 
 fn choose_optimize_type(
@@ -6216,7 +6214,7 @@ fn choose_optimize_type(
 /// order (flush/append, dedup) may pass `true`. Optimize/compact/recompress
 /// rewrite rows into Z-order or concatenation, so they MUST pass `false` —
 /// declaring an order the data doesn't have is a latent wrong-results bug for
-/// any reader that trusts it (see docs/plans/2026-06-17-parquet-ordering-pushdown.md).
+/// any reader that trusts it. SortBy is the rewrite path that may pass `true`.
 fn build_writer_properties(
     parquet_cfg: &crate::config::ParquetConfig, schema: &crate::schema_loader::TableSchema, zstd_level: i32, declare_sorted: bool,
 ) -> WriterProperties {
@@ -6247,7 +6245,7 @@ fn build_writer_properties(
     // only, for the columns we actually want blooms on.
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::try_new(zstd_level).unwrap_or_else(|_| ZstdLevel::try_new(ZSTD_COMPRESSION_LEVEL).unwrap())))
-        .set_max_row_group_row_count(Some(max_row_group_size))
+        .set_max_row_group_bytes(Some(max_row_group_size))
         .set_dictionary_enabled(true)
         .set_dictionary_page_size_limit(8388608)
         // Page-level stats only where they prune (the declared sort keys, set
@@ -6643,7 +6641,7 @@ impl ProjectRoutingTable {
         // counts here under sustained traffic flag pathological version
         // churn (very frequent compaction, racy update_state).
         if let Some(current_entry) = self.database.delta_provider_cache.get(&cache_key)
-            && !Arc::ptr_eq(&current_entry.value().1, &cell)
+            && !Arc::ptr_eq(&current_entry.cell, &cell)
         {
             self.database.scan_metrics.provider_build_abandoned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -7419,6 +7417,14 @@ mod writer_properties_tests {
         }
     }
 
+    #[test]
+    fn row_group_size_is_a_byte_limit() {
+        let mut c = cfg();
+        c.timefusion_max_row_group_size = 128 * 1024 * 1024;
+        let p = build_writer_properties(&c, &schema_with(vec![], vec![]), 3, true);
+        assert_eq!(p.max_row_group_bytes(), Some(c.timefusion_max_row_group_size));
+    }
+
     // Regression for the 2026-07-17 otel_metrics outage: an S3
     // SelectObjectContentRequest XML body (299 bytes, no PAR1 magic) was
     // written over a delta-log checkpoint. The footer check must reject it so
@@ -7988,12 +7994,12 @@ mod tests {
     }
 
     #[test]
-    fn full_optimize_uses_compact_without_sorted_footer() {
+    fn full_optimize_sorts_by_timestamp_when_enabled() {
         use deltalake::operations::optimize::OptimizeType;
         let schema = get_schema("otel_logs_and_spans").unwrap();
-        let (optimize_type, declare_sorted) = full_optimize_type(schema);
-        assert!(matches!(optimize_type, OptimizeType::Compact));
-        assert!(!declare_sorted);
+        let (optimize_type, declare_sorted) = full_optimize_type(schema, true);
+        assert!(matches!(optimize_type, OptimizeType::SortBy(_)));
+        assert!(declare_sorted);
     }
 
     /// Helper function to extract string value from array column, handling different string array types
