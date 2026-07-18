@@ -1060,6 +1060,7 @@ pub async fn perform_delta_merge_update(
 
     let span = tracing::Span::current();
     let source_batch = source.batch.clone();
+    let source_schema = source.schema.clone();
     let join_keys = source.join_keys.clone();
     let source_cols: std::collections::HashSet<String> = source.schema.fields().iter().map(|f| f.name().clone()).collect();
 
@@ -1070,22 +1071,44 @@ pub async fn perform_delta_merge_update(
 
     // Our zstd tier for the rewrite: without it the MergeBuilder writes SNAPPY.
     let writer_properties = database.dml_writer_properties(table_name);
+    let use_dv = database.config().maintenance.timefusion_use_deletion_vectors;
 
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
         // RecordBatch clones are Arc-backed (cheap); needed since the
         // operation may rerun after an OCC conflict.
-        let (source_batch, join_keys, source_cols) = (source_batch.clone(), join_keys.clone(), source_cols.clone());
+        let (source_batch, source_schema, join_keys, source_cols) =
+            (source_batch.clone(), source_schema.clone(), join_keys.clone(), source_cols.clone());
         let (predicate, assignments, session) = (predicate.clone(), assignments.clone(), session.clone());
         // Cloned per attempt (the closure reruns on OCC conflict).
         let writer_properties = writer_properties.clone();
         async move {
+            let join_pred = build_join_predicate("target", "source", &join_keys, predicate.as_ref(), &source_cols)?;
+
+            // Merge-on-read: append only the updated matched rows and mask the
+            // originals with a DV instead of rewriting whole matched files (the
+            // enrichment-MERGE OOM hotspot). Assignments/join_pred already address
+            // the target/source aliases the DV op scans under.
+            if use_dv {
+                use deltalake::operations::merge_dv::{merge_update_with_deletion_vectors, MergeDvUpdate};
+                return merge_update_with_deletion_vectors(&delta_table, session.as_ref(), MergeDvUpdate {
+                    source_batches: vec![source_batch],
+                    source_schema,
+                    target_predicate: predicate,
+                    join_predicate: join_pred,
+                    updates: assignments,
+                    target_alias: "target".to_string(),
+                    source_alias: "source".to_string(),
+                    writer_properties: Some(writer_properties),
+                })
+                .await
+                .map_err(exec_err("Failed to execute Delta MERGE UPDATE (deletion vectors)"));
+            }
+
             // Wrap the materialized source RecordBatch as a DataFrame. The
             // throwaway SessionContext only provides the DataFrame builder; merge
             // execution uses the session passed via `with_session_state`.
             let ctx = datafusion::prelude::SessionContext::new();
             let source_df = ctx.read_batch(source_batch).map_err(exec_err("Failed to wrap UPDATE FROM source as DataFrame"))?;
-
-            let join_pred = build_join_predicate("target", "source", &join_keys, predicate.as_ref(), &source_cols)?;
 
             let merge = delta_table
                 .merge(source_df, join_pred)

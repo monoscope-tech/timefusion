@@ -677,7 +677,13 @@ mod test_dml_operations {
     async fn test_update_from_does_not_block_readers_or_writers() -> Result<()> {
         timefusion::test_utils::init_test_logging();
         let test_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let cfg = create_test_config(&test_id);
+        let mut cfg = (*create_test_config(&test_id)).clone();
+        // This test observes concurrency during a SLOW merge. Force copy-on-write:
+        // the merge-on-read DV path finishes in milliseconds (it appends the matched
+        // rows + tiny DVs instead of rewriting whole files), leaving no window to
+        // observe reader/writer overlap. Lock behavior is orthogonal to the DV path.
+        cfg.maintenance.timefusion_use_deletion_vectors = false;
+        let cfg = Arc::new(cfg);
         let db = Arc::new(Database::with_config(cfg).await?);
         let mut ctx = db.clone().create_session_context();
         db.setup_session_context(&mut ctx)?;

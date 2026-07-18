@@ -105,3 +105,61 @@ async fn dv_update_and_delete_hide_rows_without_rewriting_files() -> anyhow::Res
 
     Ok(())
 }
+
+/// UPDATE ... FROM (the hash-enrichment MERGE shape) as merge-on-read: matched
+/// target rows are masked + their updated copies appended, not whole-file rewritten.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn dv_merge_update_from_source_masks_and_appends() -> anyhow::Result<()> {
+    let env = E2eEnv::builder()
+        .with_deletion_vectors()
+        .with_bucket_duration(Duration::from_secs(60))
+        .start()
+        .await?;
+    let client = env.pg_client().await?;
+
+    let sec = 1_000_000i64;
+    for i in 0..5 {
+        insert_at(&client, &format!("m-{i}"), FROZEN_START_MICROS + i * sec).await?;
+    }
+    env.advance(Duration::from_secs(180));
+    env.force_flush().await?;
+    let files_before = parquet_files(&env).await?;
+    assert_eq!(files_before.len(), 1, "expected one flushed data file, got {files_before:?}");
+
+    // MERGE-update: join the target against a VALUES source on id, set status_code
+    // from the source. Routes through perform_delta_merge_update -> DV merge op.
+    client
+        .execute(
+            "UPDATE otel_logs_and_spans SET status_code = src.newcode \
+             FROM (VALUES ('m-1', 'X1'), ('m-3', 'X3')) AS src(sid, newcode) \
+             WHERE otel_logs_and_spans.project_id = 'e2e_project' AND otel_logs_and_spans.id = src.sid",
+            &[],
+        )
+        .await?;
+
+    let files_after = parquet_files(&env).await?;
+    assert!(
+        files_after.len() > files_before.len() && files_before.iter().all(|f| files_after.contains(f)),
+        "DV merge-update should keep the masked original and append updated rows (before={files_before:?} after={files_after:?})"
+    );
+
+    let count: i64 = client
+        .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1", &[&"e2e_project"])
+        .await?
+        .get(0);
+    assert_eq!(count, 5, "merge-update must not change the row count");
+
+    for (id, expected) in [("m-1", "X1"), ("m-3", "X3"), ("m-2", "OK"), ("m-0", "OK")] {
+        let got: String = client
+            .query_one(
+                "SELECT status_code FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2",
+                &[&"e2e_project", &id],
+            )
+            .await?
+            .get(0);
+        assert_eq!(got, expected, "row {id} should read status_code={expected}");
+    }
+
+    Ok(())
+}
