@@ -713,19 +713,29 @@ impl<'a> DmlContext<'a> {
 /// earlier watermark would cut exactly those rows out of the merge and lose
 /// the update.
 fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_name: &str, project_id: &str, predicate: Option<&Expr>) -> Option<Option<Expr>> {
-    let Some(layer) = buffered_layer else {
-        return Some(predicate.cloned());
-    };
     let time_col = crate::dml_coalescer::table_time_column(table_name);
-    let watermark = layer.delta_flushed_watermark(project_id, table_name);
-    match crate::dml_coalescer::clamp_to_watermark(predicate, time_col, watermark) {
-        crate::dml_coalescer::WatermarkClamp::Keep(p) => Some(p),
-        crate::dml_coalescer::WatermarkClamp::SkipDelta => {
-            crate::metrics::record_dml_delta_leg_skipped();
-            debug!("DML delta leg skipped for {project_id}/{table_name}: time window entirely above flush watermark");
-            None
+    let base: Option<Expr> = match buffered_layer {
+        None => predicate.cloned(),
+        Some(layer) => {
+            let watermark = layer.delta_flushed_watermark(project_id, table_name);
+            match crate::dml_coalescer::clamp_to_watermark(predicate, time_col, watermark) {
+                crate::dml_coalescer::WatermarkClamp::Keep(p) => p,
+                crate::dml_coalescer::WatermarkClamp::SkipDelta => {
+                    crate::metrics::record_dml_delta_leg_skipped();
+                    debug!("DML delta leg skipped for {project_id}/{table_name}: time window entirely above flush watermark");
+                    return None;
+                }
+            }
         }
-    }
+    };
+    // Derive `date`-partition bounds from the (watermark-clamped) time-column
+    // predicate so the Delta leg prunes files instead of scanning every
+    // partition — only for tables actually partitioned by `date`.
+    let partitions_by_date = crate::schema_loader::get_schema(table_name).is_some_and(|s| s.partitions.iter().any(|p| p == "date"));
+    Some(match base {
+        Some(p) if partitions_by_date => Some(crate::optimizers::time_range_partition_pruner::with_date_partition_filters(p, time_col)),
+        other => other,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

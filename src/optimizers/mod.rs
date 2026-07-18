@@ -103,6 +103,31 @@ pub mod time_range_partition_pruner {
             _ => vec![],
         }
     }
+
+    /// AND `predicate` with `date`-partition filters derived from any
+    /// `time_column` bounds among its AND-conjuncts.
+    ///
+    /// Delta prunes files by the `date` partition column, but cannot map a raw
+    /// `timestamp` predicate onto it — so DML (UPDATE/DELETE/MERGE) filtering
+    /// only on `timestamp` scans *every* partition (the prod OOM: a narrow
+    /// hash-enrichment UPDATE scanning all 2704 files / 194 GB). The derived
+    /// `date` bounds are necessary conditions of the timestamp bounds, so
+    /// ANDing them prunes files without ever excluding a matching row.
+    /// Returns the predicate unchanged when no date filter can be derived.
+    pub fn with_date_partition_filters(predicate: Expr, time_column: &str) -> Expr {
+        fn walk(expr: &Expr, time_column: &str, out: &mut Vec<Expr>) {
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
+                    walk(left, time_column, out);
+                    walk(right, time_column, out);
+                }
+                other => out.extend(timestamp_to_date_filters(other, time_column)),
+            }
+        }
+        let mut date_filters = Vec::new();
+        walk(&predicate, time_column, &mut date_filters);
+        date_filters.into_iter().fold(predicate, Expr::and)
+    }
 }
 
 /// Utilities for checking project_id filters
@@ -234,5 +259,49 @@ mod tests {
         for (expr, expected_op) in cases {
             assert_eq!(date_filters(expr), vec![(expected_op, 19_723)]);
         }
+    }
+
+    /// Collect every `date <op> Date32` conjunct in an AND-tree.
+    fn all_date_bounds(expr: &Expr) -> Vec<(Operator, i32)> {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
+                let mut v = all_date_bounds(left);
+                v.extend(all_date_bounds(right));
+                v
+            }
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(col), Expr::Literal(ScalarValue::Date32(Some(day)), _)) if col.name == "date" => vec![(*op, *day)],
+                _ => vec![],
+            },
+            _ => vec![],
+        }
+    }
+
+    /// Regression for the 2026-07-17 prod OOM: the monoscope hash-enrichment
+    /// UPDATE-2 predicate (`project_id = ? AND timestamp >= ? AND timestamp < ?`)
+    /// must gain `date` partition bounds so the Delta merge prunes files instead
+    /// of scanning all 2704 partitions.
+    #[test]
+    fn monoscope_update_predicate_gains_date_partition_bounds() {
+        use datafusion::prelude::col;
+        let start = 1_704_067_200_000_000i64; // 2024-01-01 → day 19_723
+        let end = 1_704_240_000_000_000i64; //   2024-01-03 → day 19_725
+        let ts = || Expr::Column(datafusion::common::Column::new_unqualified("timestamp"));
+        let predicate = col("project_id")
+            .eq(Expr::Literal(ScalarValue::Utf8(Some("p".into())), None))
+            .and(Expr::BinaryExpr(BinaryExpr::new(Box::new(ts()), Operator::GtEq, Box::new(timestamp(start)))))
+            .and(Expr::BinaryExpr(BinaryExpr::new(Box::new(ts()), Operator::Lt, Box::new(timestamp(end)))));
+
+        // Bug: no `date` bounds derived from the raw timestamp predicate.
+        assert!(all_date_bounds(&predicate).is_empty());
+
+        let augmented = time_range_partition_pruner::with_date_partition_filters(predicate.clone(), "timestamp");
+        let mut bounds = all_date_bounds(&augmented);
+        bounds.sort_by_key(|(_, day)| *day);
+        assert_eq!(bounds, vec![(Operator::GtEq, 19_723), (Operator::LtEq, 19_725)]);
+
+        // No time-column bounds → predicate returned untouched.
+        let no_ts = col("project_id").eq(Expr::Literal(ScalarValue::Utf8(Some("p".into())), None));
+        assert!(all_date_bounds(&time_range_partition_pruner::with_date_partition_filters(no_ts.clone(), "timestamp")).is_empty());
     }
 }
