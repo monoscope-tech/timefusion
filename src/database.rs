@@ -2500,7 +2500,9 @@ impl Database {
         for key in keys {
             self.delta_provider_cache.remove(&key);
         }
-        self.scan_metrics.provider_cache_evictions.fetch_add((before.saturating_sub(self.delta_provider_cache.len())) as u64, std::sync::atomic::Ordering::Relaxed);
+        self.scan_metrics
+            .provider_cache_evictions
+            .fetch_add((before.saturating_sub(self.delta_provider_cache.len())) as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
@@ -6585,11 +6587,7 @@ impl ProjectRoutingTable {
             });
             let stale = e.version != current_version || e.created_at.elapsed() > ttl;
             if stale {
-                *e = CachedDeltaProvider {
-                    version: current_version,
-                    created_at: std::time::Instant::now(),
-                    cell: Arc::new(tokio::sync::OnceCell::new()),
-                };
+                *e = CachedDeltaProvider { version: current_version, created_at: std::time::Instant::now(), cell: Arc::new(tokio::sync::OnceCell::new()) };
             }
             // "Hit" = the cell was already initialised at this version when
             // we found it. We approximate this by checking initialised state
@@ -8451,11 +8449,7 @@ mod tests {
         let c1 = count1[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("count column").value(0);
         assert_eq!(c1, 1, "first query sees the v=1 row");
         assert_eq!(db.delta_provider_cache.len(), 1, "provider cache must retain the resolved provider for the warm query");
-        let stats = ctx
-            .sql("SELECT value FROM timefusion_stats WHERE component = 'scan' AND key = 'provider_cache_entries'")
-            .await?
-            .collect()
-            .await?;
+        let stats = ctx.sql("SELECT value FROM timefusion_stats WHERE component = 'scan' AND key = 'provider_cache_entries'").await?.collect().await?;
         let entries = stats[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().expect("stats value").value(0);
         assert_eq!(entries, "1", "timefusion_stats must observe the live provider cache, not a cloned startup snapshot");
 
