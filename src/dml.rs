@@ -1076,8 +1076,7 @@ pub async fn perform_delta_merge_update(
     let result = perform_delta_operation(database, table_name, project_id, |delta_table| {
         // RecordBatch clones are Arc-backed (cheap); needed since the
         // operation may rerun after an OCC conflict.
-        let (source_batch, source_schema, join_keys, source_cols) =
-            (source_batch.clone(), source_schema.clone(), join_keys.clone(), source_cols.clone());
+        let (source_batch, source_schema, join_keys, source_cols) = (source_batch.clone(), source_schema.clone(), join_keys.clone(), source_cols.clone());
         let (predicate, assignments, session) = (predicate.clone(), assignments.clone(), session.clone());
         // Cloned per attempt (the closure reruns on OCC conflict).
         let writer_properties = writer_properties.clone();
@@ -1089,17 +1088,21 @@ pub async fn perform_delta_merge_update(
             // enrichment-MERGE OOM hotspot). Assignments/join_pred already address
             // the target/source aliases the DV op scans under.
             if use_dv {
-                use deltalake::operations::merge_dv::{merge_update_with_deletion_vectors, MergeDvUpdate};
-                return merge_update_with_deletion_vectors(&delta_table, session.as_ref(), MergeDvUpdate {
-                    source_batches: vec![source_batch],
-                    source_schema,
-                    target_predicate: predicate,
-                    join_predicate: join_pred,
-                    updates: assignments,
-                    target_alias: "target".to_string(),
-                    source_alias: "source".to_string(),
-                    writer_properties: Some(writer_properties),
-                })
+                use deltalake::operations::merge_dv::{MergeDvUpdate, merge_update_with_deletion_vectors};
+                return merge_update_with_deletion_vectors(
+                    &delta_table,
+                    session.as_ref(),
+                    MergeDvUpdate {
+                        source_batches: vec![source_batch],
+                        source_schema,
+                        target_predicate: predicate,
+                        join_predicate: join_pred,
+                        updates: assignments,
+                        target_alias: "target".to_string(),
+                        source_alias: "source".to_string(),
+                        writer_properties: Some(writer_properties),
+                    },
+                )
                 .await
                 .map_err(exec_err("Failed to execute Delta MERGE UPDATE (deletion vectors)"));
             }
