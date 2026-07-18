@@ -1095,10 +1095,11 @@ pub struct MaintenanceConfig {
     /// a small predicate (the hash-enrichment UPDATE / retention DELETE hotspots).
     ///
     /// Requires the `deletionVectors` writer feature on the table — enabled lazily
-    /// on first DV write (a one-time protocol upgrade to reader/writer v3/v7). Off
-    /// by default: the upgrade is irreversible and every reader of these Delta
-    /// tables must understand DVs (TF's own scan does; external log readers may not).
-    #[serde(default)]
+    /// on first DV write (a one-time protocol upgrade to reader/writer v3/v7). On
+    /// by default. NOTE: the upgrade is irreversible and every reader of these Delta
+    /// tables must understand DVs (TF's own scan does; external log readers may not) —
+    /// set `TIMEFUSION_USE_DELETION_VECTORS=false` to keep copy-on-write rewrites.
+    #[serde(default = "d_true")]
     pub timefusion_use_deletion_vectors: bool,
 }
 
