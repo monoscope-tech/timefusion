@@ -217,6 +217,7 @@ impl StatsTableProvider {
             let pc_misses = m.provider_cache_misses.load(Relaxed);
             rows.push(("scan", "provider_cache_hits".into(), pc_hits.to_string()));
             rows.push(("scan", "provider_cache_misses".into(), pc_misses.to_string()));
+            rows.push(("scan", "provider_cache_evictions".into(), m.provider_cache_evictions.load(Relaxed).to_string()));
             rows.push(("scan", "provider_cache_hit_pct".into(), format!("{:.1}", pct(pc_hits, pc_hits + pc_misses))));
             rows.push(("scan", "provider_build_abandoned".into(), m.provider_build_abandoned.load(Relaxed).to_string()));
             rows.push(("scan", "lat_p50_us_approx".into(), m.latency_percentile_us(0.50).to_string()));

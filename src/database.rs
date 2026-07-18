@@ -56,7 +56,20 @@ const CACHE_SOFT_LIMIT_WARN: usize = 10_000;
 /// `OnceCell` is initialised exactly once per `(project, table, version)`; all
 /// concurrent first-time misses share the same Arc and await the same build.
 type DeltaProviderCell = tokio::sync::OnceCell<Arc<dyn datafusion::datasource::TableProvider>>;
-type DeltaProviderCache = dashmap::DashMap<(String, String), (u64, Arc<DeltaProviderCell>)>;
+
+struct CachedDeltaProvider {
+    version: u64,
+    created_at: std::time::Instant,
+    cell: Arc<DeltaProviderCell>,
+}
+
+impl fmt::Debug for CachedDeltaProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CachedDeltaProvider").field("version", &self.version).field("age", &self.created_at.elapsed()).finish_non_exhaustive()
+    }
+}
+
+type DeltaProviderCache = Arc<dashmap::DashMap<(String, String), CachedDeltaProvider>>;
 
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
 #[derive(Debug, Default, Clone, Copy)]
@@ -91,6 +104,7 @@ pub struct ScanMetrics {
     /// compaction) and the cache isn't paying for itself.
     pub provider_cache_hits: std::sync::atomic::AtomicU64,
     pub provider_cache_misses: std::sync::atomic::AtomicU64,
+    pub provider_cache_evictions: std::sync::atomic::AtomicU64,
     /// Provider builds that started against a version that was already
     /// stale by the time the build finished — the DashMap entry got
     /// replaced under us (a flush bumped the version) and the rebuilt
@@ -1194,7 +1208,7 @@ pub struct Database {
     /// — entries for tables dropped at runtime persist until process
     /// restart. Watch `scan.fast_resolve_cache_entries` in
     /// `timefusion_stats` for unbounded growth.
-    fast_resolve_cache: dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>,
+    fast_resolve_cache: Arc<dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>>,
     /// Per-(project,table) sticky bit: "Delta may hold matching files."
     /// Two seed paths so the bit is always at least as conservative as truth
     /// — never falsely `false`:
@@ -1230,7 +1244,8 @@ pub struct Database {
     /// query for `(project, table)` at the same snapshot version uses the
     /// same provider, varying only filters/projection/limit on scan().
     /// Invalidation: compare table.version() against the cached version
-    /// on lookup; mismatch → rebuild + replace.
+    /// on lookup; mismatch → rebuild + replace. Entries also expire after the
+    /// configured TTL and the cache is capped at its configured capacity.
     ///
     /// Concurrent misses are de-duplicated through a per-key `OnceCell`:
     /// the first task to miss installs the cell and starts the build; later
@@ -2471,6 +2486,21 @@ impl Database {
         let key = (project_id.to_string(), table_name.to_string());
         let flag = self.delta_has_files.entry(key).or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         flag.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn trim_delta_provider_cache(&self) {
+        let ttl = self.config.cache.provider_cache_ttl();
+        let before = self.delta_provider_cache.len();
+        self.delta_provider_cache.retain(|_, entry| entry.created_at.elapsed() <= ttl);
+        // The caller is about to insert one provider, so leave one slot free
+        // and keep the configured capacity strict after that insertion.
+        let capacity = self.config.cache.provider_cache_capacity().saturating_sub(1);
+        let overflow = self.delta_provider_cache.len().saturating_sub(capacity);
+        let keys: Vec<_> = self.delta_provider_cache.iter().take(overflow).map(|entry| entry.key().clone()).collect();
+        for key in keys {
+            self.delta_provider_cache.remove(&key);
+        }
+        self.scan_metrics.provider_cache_evictions.fetch_add((before.saturating_sub(self.delta_provider_cache.len())) as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn resolve_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
@@ -6529,25 +6559,43 @@ impl ProjectRoutingTable {
         // takes a per-shard READ lock, so concurrent hits don't block each
         // other. We only take the write path on miss or version mismatch —
         // events that happen seconds apart per project, not per query.
-        let read_hit = self.database.delta_provider_cache.get(&cache_key).filter(|e| e.value().0 == current_version).map(|e| Arc::clone(&e.value().1));
+        let ttl = self.database.config.cache.provider_cache_ttl();
+        let read_hit = self
+            .database
+            .delta_provider_cache
+            .get(&cache_key)
+            .filter(|entry| entry.version == current_version && entry.created_at.elapsed() <= ttl)
+            .map(|entry| Arc::clone(&entry.cell));
         let (cell, was_fresh_cell, brand_new_entry) = if let Some(c) = read_hit {
             (c, false, false)
         } else {
+            // Eviction is deliberately miss-only: scanning the whole map on
+            // every warm dashboard request would cost more than the provider
+            // construction this cache removes.
+            self.database.trim_delta_provider_cache();
             // Miss / stale — take the write path. Re-check after acquiring
             // the entry lock since another thread may have populated it
             // between our get() and entry() (DashMap doesn't upgrade locks).
             let entry = self.database.delta_provider_cache.entry(cache_key.clone());
             let brand_new = matches!(entry, dashmap::Entry::Vacant(_));
-            let mut e = entry.or_insert_with(|| (current_version, Arc::new(tokio::sync::OnceCell::new())));
-            let stale = e.0 != current_version;
+            let mut e = entry.or_insert_with(|| CachedDeltaProvider {
+                version: current_version,
+                created_at: std::time::Instant::now(),
+                cell: Arc::new(tokio::sync::OnceCell::new()),
+            });
+            let stale = e.version != current_version || e.created_at.elapsed() > ttl;
             if stale {
-                *e = (current_version, Arc::new(tokio::sync::OnceCell::new()));
+                *e = CachedDeltaProvider {
+                    version: current_version,
+                    created_at: std::time::Instant::now(),
+                    cell: Arc::new(tokio::sync::OnceCell::new()),
+                };
             }
             // "Hit" = the cell was already initialised at this version when
             // we found it. We approximate this by checking initialised state
             // BEFORE we touch get_or_try_init; close enough for an alerting
             // metric. Miss covers both "never seen" and "stale-replaced".
-            (Arc::clone(&e.1), stale, brand_new)
+            (Arc::clone(&e.cell), stale, brand_new)
         };
         if was_fresh_cell || !cell.initialized() {
             self.database.scan_metrics.provider_cache_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8402,6 +8450,14 @@ mod tests {
         let count1 = ctx.sql(&format!("SELECT count(*) AS c FROM {} WHERE project_id = '{}'", t, project_id)).await?.collect().await?;
         let c1 = count1[0].column(0).as_any().downcast_ref::<arrow::array::Int64Array>().expect("count column").value(0);
         assert_eq!(c1, 1, "first query sees the v=1 row");
+        assert_eq!(db.delta_provider_cache.len(), 1, "provider cache must retain the resolved provider for the warm query");
+        let stats = ctx
+            .sql("SELECT value FROM timefusion_stats WHERE component = 'scan' AND key = 'provider_cache_entries'")
+            .await?
+            .collect()
+            .await?;
+        let entries = stats[0].column(0).as_any().downcast_ref::<arrow::array::StringArray>().expect("stats value").value(0);
+        assert_eq!(entries, "1", "timefusion_stats must observe the live provider cache, not a cloned startup snapshot");
 
         // Second commit advances the snapshot version.
         let batch2 = json_to_batch(vec![test_span("v2", "span2", &project_id)])?;
@@ -8422,6 +8478,7 @@ mod tests {
             "STALE CACHE REGRESSION: second query must see the row added at v=v{v2}. \
              Got {c2}/2 — the delta_provider_cache version-mismatch branch is broken."
         );
+        assert_eq!(db.delta_provider_cache.len(), 1, "version invalidation replaces the entry instead of growing the cache");
         Ok(())
     }
 

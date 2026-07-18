@@ -210,6 +210,8 @@ const_default!(d_foyer_memory_mb: usize = 1024);
 // ENOSPC before eviction kicks in. Lower it on smaller disks.
 const_default!(d_foyer_disk_gb: usize = 500);
 const_default!(d_foyer_ttl: u64 = 604_800); // 7 days
+const_default!(d_provider_cache_ttl: u64 = 300); // 5 minutes
+const_default!(d_provider_cache_capacity: usize = 4_096);
 const_default!(d_foyer_shards: usize = 8);
 const_default!(d_foyer_file_size_mb: usize = 32);
 const_default!(d_foyer_stats: String = "true");
@@ -765,6 +767,12 @@ pub struct CacheConfig {
     pub timefusion_foyer_disk_gb: usize,
     #[serde(default = "d_foyer_ttl")]
     pub timefusion_foyer_ttl_seconds: u64,
+    /// Bounded lifetime of resolved Delta providers. A provider is also
+    /// invalidated immediately when its Delta snapshot version changes.
+    #[serde(default = "d_provider_cache_ttl")]
+    pub timefusion_provider_cache_ttl_seconds: u64,
+    #[serde(default = "d_provider_cache_capacity")]
+    pub timefusion_provider_cache_capacity: usize,
     #[serde(default = "d_foyer_shards")]
     pub timefusion_foyer_shards: usize,
     #[serde(default = "d_foyer_file_size_mb")]
@@ -829,6 +837,12 @@ impl CacheConfig {
     }
     pub fn ttl(&self) -> Duration {
         Duration::from_secs(self.timefusion_foyer_ttl_seconds)
+    }
+    pub fn provider_cache_ttl(&self) -> Duration {
+        Duration::from_secs(self.timefusion_provider_cache_ttl_seconds.max(1))
+    }
+    pub fn provider_cache_capacity(&self) -> usize {
+        self.timefusion_provider_cache_capacity.max(1)
     }
     pub fn stats_enabled(&self) -> bool {
         self.timefusion_foyer_stats.eq_ignore_ascii_case("true")
