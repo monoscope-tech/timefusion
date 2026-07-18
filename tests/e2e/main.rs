@@ -8,6 +8,7 @@ mod harness;
 mod cache_warmth;
 mod deletion_vectors;
 mod dml_compression;
+mod hash_enrichment;
 mod eviction;
 mod flush_lifecycle;
 mod insert_unnest_variant;
