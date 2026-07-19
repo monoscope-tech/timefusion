@@ -343,12 +343,15 @@ const_default!(d_dedup_max_decoded_bytes: u64 = 4 * 1024 * 1024 * 1024);
 const_default!(d_dedup_decode_inflation: u64 = 12);
 // 4 KiB/row decoded estimate for otel spans (wide Variant/JSON bodies).
 const_default!(d_dedup_bytes_per_row: u64 = 4096);
-// Two heavy maintenance rewrites in flight at a time. Each permit bounds one
-// Arrow-materializing rewrite (dedup / optimize / recompress); 2 lets the
-// hot-tail compactor and the sealed-bin dedup make progress concurrently
-// instead of the dedup backlog starving compaction. Peak transient heap is
-// `block_size_mb * this`; raise only with headroom (2026-07-04 OOM history).
-const_default!(d_maintenance_rewrite_concurrency: usize = 2);
+// Serial by default: one heavy Arrow-materializing rewrite (dedup / optimize /
+// recompress) in flight at a time. 2 was tried but on the memory-tight prod box
+// (85GB) draining a large sealed-bin backlog it doubled peak rewrite heap toward
+// the OOM ceiling AND starved query CPU on the CPU-quota-throttled container
+// (2026-07-19). Peak transient heap ≈ `block_size_mb * this`; raise to 2+ only
+// on a box with real memory+CPU headroom, via the env override. The hot-tail
+// compactor runs on its own cron (no shared job sem) so it still isn't starved
+// by dedup at concurrency 1 — the two just don't rewrite simultaneously.
+const_default!(d_maintenance_rewrite_concurrency: usize = 1);
 // How many days back (in addition to today) the dedup sweep covers. today-only
 // left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
