@@ -1058,6 +1058,11 @@ pub async fn perform_delta_merge_update(
 ) -> Result<u64> {
     info!("Performing Delta MERGE-UPDATE on table {} for project {} ({} source rows)", table_name, project_id, source.batch.num_rows());
 
+    // Gate concurrent merges: each scans the time-windowed target to hash-join
+    // keys; ungated bursts of per-project drains stampede a CPU-throttled box and
+    // starve read queries (prod 2026-07-19). Held across the OCC retry loop.
+    let _merge_permit = database.dml_merge_sem().acquire().await.map_err(exec_err("dml merge semaphore closed"))?;
+
     let span = tracing::Span::current();
     let source_batch = source.batch.clone();
     let source_schema = source.schema.clone();

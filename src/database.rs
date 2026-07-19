@@ -1324,6 +1324,10 @@ pub struct Database {
     /// it), so aggregate concurrency — not the pool — is the real bound against
     /// the cgroup OOM (prod 2026-07-04). Permits = `timefusion_maintenance_rewrite_concurrency`.
     maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
+    /// Caps concurrent user DML MERGE-UPDATEs (hash enrichment). Each scans the
+    /// time-windowed target to hash-join keys; ungated bursts starve reads on a
+    /// CPU-throttled box (prod 2026-07-19). Permits = `timefusion_dml_merge_concurrency`.
+    dml_merge_sem: Arc<tokio::sync::Semaphore>,
     /// Serializes the outer full and light maintenance jobs. Their rewrite
     /// permits alone are insufficient: a waiting light job can exhaust its
     /// table timeout before it ever starts work.
@@ -1394,6 +1398,11 @@ impl Database {
     /// Get the config for this database instance
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    /// Concurrency gate for user DML MERGE-UPDATEs — see `dml_merge_sem`.
+    pub(crate) fn dml_merge_sem(&self) -> &Arc<tokio::sync::Semaphore> {
+        &self.dml_merge_sem
     }
 
     /// Get the unified tables cache for direct access
@@ -1668,6 +1677,7 @@ impl Database {
 
         // Captured before `cfg` is moved into the struct literal below.
         let maint_rewrite_permits = cfg.maintenance.timefusion_maintenance_rewrite_concurrency.max(1);
+        let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
         let db = Self {
@@ -1698,6 +1708,7 @@ impl Database {
             dedup_dirty_bins,
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
+            dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             commit_locks: Arc::new(dashmap::DashMap::new()),
             dml_locks: Arc::new(dashmap::DashMap::new()),
