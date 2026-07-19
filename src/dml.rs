@@ -747,26 +747,34 @@ async fn perform_update_with_buffer(
     // Delta path uses MergeBuilder via perform_delta_merge_update — either
     // synchronously or deferred through the coalescer when enabled.
     if let Some(src) = source {
-        let update_span = tracing::trace_span!(parent: span, "delta.merge_update");
-        let src_for_mem = src.clone();
-        let src_for_delta = src;
         let coalescer = database.dml_coalescer().cloned();
         // `async move` must not take the Vec itself — the mem closure borrows it.
         let assignments = &assignments;
-        return DmlContext { database, buffered_layer, table_name, project_id, predicate }
-            .execute(
-                |layer, pred| layer.update_with_source(project_id, table_name, pred, assignments, &src_for_mem),
-                |delta_pred| async move {
-                    if let Some(coalescer) = coalescer {
-                        coalescer.enqueue(project_id, table_name, delta_pred.as_ref(), assignments, &src_for_delta, session);
-                        return Ok(0);
-                    }
-                    perform_delta_merge_update(database, table_name, project_id, delta_pred, assignments.clone(), src_for_delta, session)
-                        .instrument(update_span)
-                        .await
-                },
-            )
-            .await;
+        // Same-key source rows must be applied in successive rounds: one MERGE
+        // can't match a target row against two source rows, and the MemBuffer
+        // hash-join would keep only one — silently dropping the rest.
+        let mut total = 0u64;
+        for round in crate::dml_coalescer::split_source_rounds(src)? {
+            let src_for_mem = round.clone();
+            let src_for_delta = round;
+            let (coalescer, session) = (coalescer.clone(), session.clone());
+            let update_span = tracing::trace_span!(parent: span, "delta.merge_update");
+            total += DmlContext { database, buffered_layer, table_name, project_id, predicate: predicate.clone() }
+                .execute(
+                    |layer, pred| layer.update_with_source(project_id, table_name, pred, assignments, &src_for_mem),
+                    |delta_pred| async move {
+                        if let Some(coalescer) = coalescer {
+                            coalescer.enqueue(project_id, table_name, delta_pred.as_ref(), assignments, &src_for_delta, session);
+                            return Ok(0);
+                        }
+                        perform_delta_merge_update(database, table_name, project_id, delta_pred, assignments.clone(), src_for_delta, session)
+                            .instrument(update_span)
+                            .await
+                    },
+                )
+                .await?;
+        }
+        return Ok(total);
     }
 
     let update_span = tracing::trace_span!(parent: span, "delta.update");
@@ -1102,6 +1110,7 @@ pub async fn perform_delta_merge_update(
                         source_schema,
                         target_predicate: predicate,
                         join_predicate: join_pred,
+                        equi_keys: if database.config().maintenance.timefusion_dml_merge_key_prune { join_keys } else { vec![] },
                         updates: assignments,
                         target_alias: "target".to_string(),
                         source_alias: "source".to_string(),
@@ -1141,8 +1150,14 @@ pub async fn perform_delta_merge_update(
     })
     .await;
 
-    if let Ok(rows) = &result {
-        span.record("rows.updated", rows);
+    match &result {
+        Ok(rows) => {
+            span.record("rows.updated", rows);
+        }
+        // Diagnostic for the still-unreproduced "No field named ...context___span_id"
+        // schema failures (prod 2026-07-19): dump the exact predicates + keys so the
+        // next occurrence pins the plan shape that leaks a column into the scan.
+        Err(e) => warn!(target: "dml", "Delta MERGE-UPDATE failed for {project_id}/{table_name} keys={:?}: {e}", source.join_keys),
     }
     result
 }

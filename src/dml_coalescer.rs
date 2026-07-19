@@ -238,6 +238,19 @@ fn clamp_decomposed(d: &mut DecomposedPredicate, watermark_micros: i64) -> Clamp
     }
 }
 
+/// Split an [`UpdateSource`] into merge rounds so no single leg sees duplicate
+/// join keys: the Delta MERGE rejects a source that matches a target row twice,
+/// and the MemBuffer hash-join would silently keep only one match — dropping the
+/// rest (prod 2026-07-19: same-key multi-tag hash enrichment lost tags / errored).
+/// Returns one round for the common no-duplication case.
+pub(crate) fn split_source_rounds(source: UpdateSource) -> Result<Vec<UpdateSource>> {
+    let key_indices: Vec<usize> = source.join_keys.iter().map(|(_, s)| source.schema.index_of(s)).collect::<std::result::Result<_, _>>()?;
+    Ok(split_rounds(&source.batch, &key_indices)?
+        .into_iter()
+        .map(|batch| UpdateSource { batch, schema: source.schema.clone(), join_keys: source.join_keys.clone() })
+        .collect())
+}
+
 /// Split `batch` into merge rounds: exact-duplicate rows are dropped, and
 /// rows sharing a join key land in successive rounds (round N = each key's
 /// Nth distinct payload, in arrival order) so no single MERGE sees duplicate

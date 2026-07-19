@@ -1122,6 +1122,13 @@ pub struct MaintenanceConfig {
     /// set `TIMEFUSION_USE_DELETION_VECTORS=false` to keep copy-on-write rewrites.
     #[serde(default = "d_true")]
     pub timefusion_use_deletion_vectors: bool,
+    /// Push a `target.key IN (source key values)` filter into the DV merge's
+    /// per-file scan so parquet bloom filters prune files/row-groups holding none
+    /// of the source keys — turning a whole-window enrichment scan into a few-file
+    /// scan. Sound (bloom never false-negatives); on by default. Kill-switch:
+    /// `TIMEFUSION_DML_MERGE_KEY_PRUNE=false` reverts to scanning all window files.
+    #[serde(default = "d_true")]
+    pub timefusion_dml_merge_key_prune: bool,
 }
 
 /// Which DataFusion `MemoryPool` to back the runtime with.
