@@ -842,6 +842,12 @@ fn is_transient_s3_err(msg: &str) -> bool {
 /// actions instead of a predicate-evaluated replace_where.
 const DEDUP_FILE_COL: &str = "__tf_dedup_file";
 
+/// Project id from a Hive-partitioned parquet path (`…/project_id=X/…`), or
+/// `None` when absent (custom-project tables don't embed the segment).
+fn pid_from_path(path: &str) -> Option<&str> {
+    path.split('/').find_map(|seg| seg.strip_prefix("project_id="))
+}
+
 /// Order-insensitive fingerprint of a partition's live file set (read-side
 /// dedup skip): sorted-uris hash, so any add/remove/rewrite changes it.
 fn partition_file_fp(mut files: Vec<String>) -> u64 {
@@ -1900,8 +1906,31 @@ impl Database {
         let db = Arc::new(self.background_clone());
         let cancel = self.maintenance_shutdown.clone();
 
-        // Light optimize — dedup + bin-pack recent small files (every ~5 min).
-        spawn_cron_job("Light optimize", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), {
+        // Hot-tail compaction — bin-packs recent small files so 1h/today queries
+        // open a handful of files, not dozens of tiny ones. Runs on its OWN cron
+        // WITHOUT the shared `maintenance_job_sem`, so a long dedup / full-optimize
+        // / consolidate run can never starve it. Memory stays bounded by the
+        // per-rewrite `maintenance_rewrite_sem` inside optimize_table_light_inner.
+        spawn_cron_job("Hot compact", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move {
+                    info!("Running scheduled hot-tail compaction on recent small files");
+                    db.for_each_maintenance_table(|table, name, _key, label| {
+                        let db = db.clone();
+                        async move { db.run_hot_compact_for_table(&table, &name, &label).await }
+                    })
+                    .await;
+                }
+            }
+        });
+
+        // Sealed-bin dedup — drains the dirty-bin queue (>2h-sealed bins) and the
+        // optional broad fallback sweep. Separate cron from hot compaction so the
+        // two run independently; still serialized against full-optimize/consolidate
+        // via `maintenance_job_sem`.
+        spawn_cron_job("Dirty-bin dedup", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), {
             let db = db.clone();
             move || {
                 let db = db.clone();
@@ -1909,27 +1938,12 @@ impl Database {
                     let Ok(_maintenance_job) = db.maintenance_job_sem.clone().acquire_owned().await else {
                         return;
                     };
-                    // Overlap protection lives in spawn_cron_job (skip-if-running).
-                    info!("Running scheduled light optimize on recent small files");
-                    // Dedup FIRST so the light compact bin-packs already-deduped files —
-                    // otherwise compact would merge duplicates into one file we'd rewrite again.
-                    // Each table is processed in order; a slow table delays the rest of
-                    // the tick but is allowed to finish. The outer maintenance_job_sem
-                    // serializes full maintenance jobs, and spawn_cron_job skips
-                    // overlapping ticks for this schedule.
-                    for (table_name, table) in db.unified_tables.read().await.iter() {
-                        if db.maintenance_shutdown.is_cancelled() {
-                            return;
-                        }
-                        db.run_light_maintenance_for_table(table, table_name, table_name, &format!("unified table '{table_name}'")).await;
-                    }
-                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                        if db.maintenance_shutdown.is_cancelled() {
-                            return;
-                        }
-                        let key = format!("{project_id}:{table_name}");
-                        db.run_light_maintenance_for_table(table, table_name, &key, &format!("custom project '{project_id}' table '{table_name}'")).await;
-                    }
+                    info!("Running scheduled sealed-bin dedup");
+                    db.for_each_maintenance_table(|table, name, key, label| {
+                        let db = db.clone();
+                        async move { db.run_dedup_for_table(&table, &name, &key, &label).await }
+                    })
+                    .await;
                 }
             }
         });
@@ -4263,18 +4277,6 @@ impl Database {
     /// Project IDs with live files in one hot `(project_id, date)` partition.
     /// A light optimize must use both partition predicates: filtering by `date`
     /// alone conflicts with every project's append to the active day.
-    fn hot_project_ids(uris: &[String], date: chrono::NaiveDate) -> Vec<String> {
-        let date_marker = format!("/date={date}/");
-        uris.iter()
-            .filter(|uri| uri.contains(&date_marker))
-            .filter_map(|uri| uri.split('/').find_map(|segment| segment.strip_prefix("project_id=")))
-            .filter(|project_id| !project_id.is_empty())
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .map(str::to_owned)
-            .collect()
-    }
-
     /// Partition-ownership boundary between the warm (30-min Z-order) and cold
     /// (daily 1GB consolidate) tiers: a `date` is cold-owned once it's at least
     /// `after_days` older than `today`. The warm optimize processes the
@@ -5198,7 +5200,7 @@ impl Database {
     fn partition_files_by_pid(table: &DeltaTable, date_marker: &str) -> Result<HashMap<String, Vec<String>>> {
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
         for uri in table.get_file_uris()?.filter(|u| u.contains(date_marker) && u.ends_with(".parquet")) {
-            let pid = uri.split('/').find_map(|seg| seg.strip_prefix("project_id=")).unwrap_or("default").to_string();
+            let pid = pid_from_path(&uri).unwrap_or("default").to_string();
             m.entry(pid).or_default().push(uri);
         }
         Ok(m)
@@ -5386,16 +5388,21 @@ impl Database {
             return Ok(());
         }
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+        // Drain a big batch per tick, newest-sealed first: recent bins are the
+        // ones a dashboard is most likely to read, and processing them first
+        // keeps the drain from falling behind the enqueue rate on busy tables.
+        const DIRTY_BIN_BATCH: usize = 64;
         let sealed_before = (Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
-        let ready: Vec<_> = self
+        let mut ready: Vec<_> = self
             .dedup_dirty_bins
             .iter()
             .filter_map(|entry| {
                 let (project, name, date, bin) = entry.key();
                 (name == table_name && (*bin + 1) * BIN_MICROS <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
             })
-            .take(8)
             .collect();
+        ready.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        ready.truncate(DIRTY_BIN_BATCH);
         for (project_id, date, bin) in ready {
             let key = (project_id.clone(), table_name.to_string(), date.clone(), bin);
             self.dedup_dirty_bins.remove(&key);
@@ -5433,16 +5440,43 @@ impl Database {
         Ok(())
     }
 
-    /// One table's light maintenance (dedup then bin-pack). The old 90s/180s
-    /// per-table deadlines are now warning thresholds: a slow-but-healthy table
-    /// is allowed to finish, while exceeding the threshold is logged/metriced.
-    /// Actual errors and shutdown still stop work.
-    async fn run_light_maintenance_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
-        // These used to be cancellation deadlines; they are now warning
-        // thresholds. A slow-but-healthy table is allowed to finish, while
-        // exceeding the threshold is logged/metriced for observability.
+    /// Run `op` over every maintenance-eligible table (unified + custom-project),
+    /// bailing between tables on shutdown. `op` receives owned handles:
+    /// `(table, table_name, dedup_key, label)` — `dedup_key` is `table_name` for
+    /// unified tables and `project_id:table_name` for custom ones. Snapshots the
+    /// table lists up front so a long per-table rewrite doesn't hold the registry
+    /// read lock. Shared by the hot-compact and dedup crons.
+    async fn for_each_maintenance_table<F, Fut>(&self, op: F)
+    where
+        F: Fn(Arc<RwLock<DeltaTable>>, String, String, String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let mut tables: Vec<(Arc<RwLock<DeltaTable>>, String, String, String)> =
+            self.unified_tables.read().await.iter().map(|(n, t)| (t.clone(), n.clone(), n.clone(), format!("unified table '{n}'"))).collect();
+        tables.extend(
+            self.custom_project_tables
+                .read()
+                .await
+                .iter()
+                .map(|((p, n), t)| (t.clone(), n.clone(), format!("{p}:{n}"), format!("custom project '{p}' table '{n}'"))),
+        );
+        for (table, name, key, label) in tables {
+            if self.maintenance_shutdown.is_cancelled() {
+                return;
+            }
+            op(table, name, key, label).await;
+        }
+    }
+
+    /// One table's sealed-bin dedup (dirty-bin drain + optional broad fallback
+    /// sweep). Split out of the old `run_light_maintenance_for_table` so it runs
+    /// on its OWN cron and can no longer starve the hot-tail compactor: dedup
+    /// touches only sealed (>2h) bins, compaction only the recent tail, so the
+    /// two work on disjoint file sets and progress independently. The 90s
+    /// deadline is a warning threshold, not a cancellation — a healthy-but-slow
+    /// table finishes; only real errors and shutdown stop work.
+    async fn run_dedup_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
         const DEDUP_WARN: std::time::Duration = std::time::Duration::from_secs(90);
-        const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
         let t0 = std::time::Instant::now();
         match self.dedup_dirty_bins_for_table(table, table_name).await {
             Ok(()) if t0.elapsed() > DEDUP_WARN => {
@@ -5469,6 +5503,14 @@ impl Database {
                 }
             }
         }
+    }
+
+    /// One table's hot-tail compaction (bin-pack recent sub-target files). Runs
+    /// on its own cron, independent of dedup, so a dedup backlog can never
+    /// starve it — this is what keeps recent-window (1h/today) queries opening a
+    /// handful of files instead of dozens of tiny ones.
+    async fn run_hot_compact_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str) {
+        const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
         if !self.config.maintenance.timefusion_light_optimize_enabled {
             debug!("Light optimize disabled for {label}");
             return;
@@ -5492,12 +5534,17 @@ impl Database {
 
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
         let today = Utc::now().date_naive();
-        let project_ids = {
-            let table = table_ref.read().await;
-            let uris: Vec<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-            Self::hot_project_ids(&uris, today)
-        };
         let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
+        // Bound each run to the HOT TAIL: only today's sub-target files added in
+        // the last `hot_hours` window (data is append-forward, so recent
+        // modification_time ⇒ recent data). This keeps per-run cost proportional
+        // to the small recent tail instead of the whole growing day-partition, so
+        // the compactor converges in seconds and never re-touches the large
+        // already-compacted files or the sealed bins the dedup cron handles.
+        let hot_files = {
+            let table = table_ref.read().await;
+            Self::hot_tail_files(table.snapshot().ok(), today, target_size, self.config.maintenance.timefusion_light_optimize_hot_hours)
+        };
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         // SortBy the schema keys (declare_sorted=true) so the current partition's
         // light-compacted files keep an honest DESC footer for the pushdown
@@ -5513,8 +5560,13 @@ impl Database {
         // buckets and a 10× drop in ingest throughput. Better to let
         // optimize fail loudly during heavy ingest; the next scheduler
         // tick (5 min later) usually catches a quiet enough window.
+        let min_files = self.config.maintenance.timefusion_compact_min_files;
         let mut failed = 0;
-        for project_id in project_ids {
+        for (project_id, files) in &hot_files {
+            // Nothing to gain from bin-packing fewer than min_files recent files.
+            if files.len() < min_files {
+                continue;
+            }
             let partition_filters = vec![
                 PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
                 PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?,
@@ -5524,8 +5576,9 @@ impl Database {
                     table_ref,
                     table_name,
                     today,
-                    &project_id,
+                    project_id,
                     &partition_filters,
+                    files,
                     target_size,
                     &writer_properties,
                     optimize_type.clone(),
@@ -5541,13 +5594,52 @@ impl Database {
         Ok(())
     }
 
+    /// Recent sub-target files per project for the hot-tail compactor. Groups
+    /// today's files that are (a) smaller than `target_size` — already-compacted
+    /// files are skipped, `with_files` would otherwise rewrite them wholesale —
+    /// and (b) modified within the last `hot_hours`. Project/date are parsed
+    /// from the Hive path segments.
+    fn hot_tail_files(
+        snapshot: Option<&deltalake::table::state::DeltaTableState>, today: chrono::NaiveDate, target_size: i64, hot_hours: u64,
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        let cutoff_ms = (Utc::now() - chrono::Duration::hours(hot_hours as i64)).timestamp_millis();
+        // `path()` borrows the per-iteration LogicalFile temporary, so the path
+        // must be owned here; the grouping/filtering lives in the pure core.
+        match snapshot {
+            Some(s) => {
+                Self::group_hot_tail_files(s.log_data().iter().map(|f| (f.path().into_owned(), f.size(), f.modification_time())), today, target_size, cutoff_ms)
+            }
+            None => Default::default(),
+        }
+    }
+
+    /// Pure core of `hot_tail_files`: keep files that are today's, sub-target,
+    /// and recent (modified ≥ `cutoff_ms`), grouped by path-derived project_id.
+    fn group_hot_tail_files(
+        files: impl IntoIterator<Item = (impl AsRef<str>, i64, i64)>, today: chrono::NaiveDate, target_size: i64, cutoff_ms: i64,
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        let date_marker = format!("/date={today}/");
+        let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for (path, size, mod_ms) in files {
+            let path = path.as_ref();
+            if size >= target_size || mod_ms < cutoff_ms || !path.contains(&date_marker) {
+                continue;
+            }
+            if let Some(project_id) = pid_from_path(path).filter(|p| !p.is_empty()) {
+                out.entry(project_id.to_owned()).or_default().push(path.to_owned());
+            }
+        }
+        out
+    }
+
     /// Inner optimize loop. Caller is expected to hold the flush lock when
     /// a `BufferedWriteLayer` is active; the retry loop here remains as a
     /// safety net against bursts from `flush_all_now` or shutdown flushes.
     #[allow(clippy::too_many_arguments)]
     async fn optimize_table_light_inner(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today: chrono::NaiveDate, project_id: &str, partition_filters: &[PartitionFilter],
-        target_size: i64, writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType, start_time: std::time::Instant,
+        selected_files: &[String], target_size: i64, writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType,
+        start_time: std::time::Instant,
     ) -> Result<()> {
         const MAX_RETRIES: usize = 4;
         // Optimize rewrites (compaction) materialize Arrow like dedup — hold a
@@ -5573,6 +5665,10 @@ impl Database {
             let optimize_result = table_clone
                 .optimize()
                 .with_filters(partition_filters)
+                // Restrict the rewrite to exactly the hot-tail files (recent,
+                // sub-target). `with_files` bin-packs precisely this set — bounding
+                // per-run cost and never re-touching already-compacted large files.
+                .with_files(selected_files)
                 // Cloned per attempt: the retry loop re-submits after OCC conflicts.
                 .with_type(optimize_type.clone())
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
@@ -7967,16 +8063,23 @@ mod tests {
     }
 
     #[test]
-    fn hot_project_ids_are_limited_to_the_requested_date() {
-        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
-        let uris = vec![
-            "s3://b/t/project_id=alpha/date=2026-07-16/a.parquet".to_string(),
-            "s3://b/t/project_id=beta/date=2026-07-16/b.parquet".to_string(),
-            "s3://b/t/project_id=alpha/date=2026-07-16/c.parquet".to_string(),
-            "s3://b/t/project_id=old/date=2026-07-15/d.parquet".to_string(),
-            "s3://b/t/date=2026-07-16/e.parquet".to_string(),
+    fn hot_tail_files_keeps_only_recent_subtarget_todays_files() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+        let target = 32 * 1024 * 1024;
+        let cutoff = 1_000_000; // ms
+        let f = |p: &str, size: i64, mtime: i64| (p.to_string(), size, mtime);
+        let files = vec![
+            f("s3://b/t/project_id=alpha/date=2026-07-16/a.parquet", 1024, 2_000_000),     // keep
+            f("s3://b/t/project_id=alpha/date=2026-07-16/b.parquet", 5024, 3_000_000),     // keep
+            f("s3://b/t/project_id=beta/date=2026-07-16/c.parquet", 2048, 1_500_000),      // keep
+            f("s3://b/t/project_id=alpha/date=2026-07-16/big.parquet", target, 9_000_000), // skip: ≥target
+            f("s3://b/t/project_id=alpha/date=2026-07-16/stale.parquet", 100, 500_000),    // skip: too old
+            f("s3://b/t/project_id=alpha/date=2026-07-15/old.parquet", 100, 9_000_000),    // skip: not today
         ];
-        assert_eq!(Database::hot_project_ids(&uris, date), vec!["alpha", "beta"]);
+        let out = Database::group_hot_tail_files(files, today, target, cutoff);
+        assert_eq!(out.keys().cloned().collect::<Vec<_>>(), vec!["alpha", "beta"]);
+        assert_eq!(out["alpha"].len(), 2, "only the two recent sub-target alpha files");
+        assert_eq!(out["beta"].len(), 1);
     }
 
     /// Two identical file sets compare equal (→ partition skipped); adding a
