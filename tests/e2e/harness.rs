@@ -36,6 +36,7 @@ pub struct E2eEnvBuilder {
     checkpoint_interval: u64,
     optimize_sort_by: bool,
     use_deletion_vectors: bool,
+    warm_full_files: bool,
 }
 
 impl Default for E2eEnvBuilder {
@@ -52,6 +53,7 @@ impl Default for E2eEnvBuilder {
             frozen_at_micros: FROZEN_START_MICROS,
             checkpoint_interval: 10,
             optimize_sort_by: false,
+            warm_full_files: false,
             // Mirror the prod default (on) so the whole e2e suite exercises the
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
@@ -102,6 +104,13 @@ impl E2eEnvBuilder {
     }
     pub fn with_optimize_sort_by(mut self) -> Self {
         self.optimize_sort_by = true;
+        self
+    }
+    /// Warm freshly-flushed file BODIES (not just footers) into Foyer, so the
+    /// first recent-window scan after a flush is served warm instead of cold
+    /// from S3 — the "keep the hot tail warm" lever.
+    pub fn with_warm_full_files(mut self) -> Self {
+        self.warm_full_files = true;
         self
     }
     pub fn with_deletion_vectors(mut self) -> Self {
@@ -181,6 +190,7 @@ impl E2eEnvBuilder {
             checkpoint_interval: self.checkpoint_interval,
             optimize_sort_by: self.optimize_sort_by,
             use_deletion_vectors: self.use_deletion_vectors,
+            warm_full_files: self.warm_full_files,
             test_id: &test_id,
         });
 
@@ -277,6 +287,7 @@ impl E2eEnv {
             checkpoint_interval: self.builder.checkpoint_interval,
             optimize_sort_by: self.builder.optimize_sort_by,
             use_deletion_vectors: self.builder.use_deletion_vectors,
+            warm_full_files: self.builder.warm_full_files,
             test_id: &self.test_id,
         });
 
@@ -372,6 +383,7 @@ struct BuildCfgArgs<'a> {
     checkpoint_interval: u64,
     optimize_sort_by: bool,
     use_deletion_vectors: bool,
+    warm_full_files: bool,
     test_id: &'a str,
 }
 
@@ -396,6 +408,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.parquet.timefusion_checkpoint_interval = args.checkpoint_interval;
     cfg.maintenance.timefusion_optimize_sort_by = args.optimize_sort_by;
     cfg.maintenance.timefusion_use_deletion_vectors = args.use_deletion_vectors;
+    cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
     Arc::new(cfg)
 }
 

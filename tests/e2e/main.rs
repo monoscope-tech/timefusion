@@ -10,6 +10,7 @@ mod deletion_vectors;
 mod dml_compression;
 mod eviction;
 mod flush_lifecycle;
+mod flush_warm;
 mod hash_enrichment;
 mod insert_unnest_variant;
 mod multi_tenant_isolation;

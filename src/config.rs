@@ -1001,10 +1001,14 @@ pub struct MaintenanceConfig {
     #[serde(default = "d_true")]
     pub timefusion_warm_after_compaction: bool,
     /// In addition to footers, warm the full file contents into the main
-    /// (full-file) cache. Off by default — footers carry most of the
-    /// planning-latency win at a fraction of the bytes; enable for data-read
-    /// warmth on the hottest partitions.
-    #[serde(default)]
+    /// (full-file) cache. ON by default: recent-window dashboard queries are
+    /// scan/IO-bound and the dominant latency variance is the Foyer cold/warm
+    /// swing (measured 20-75x in prod) — warming recent file BODIES keeps that
+    /// hot tail served from cache instead of a cold S3 GET on first touch.
+    /// Recency-bounded by `timefusion_warm_recency_days`, so only the partitions
+    /// dashboards actually query pay the extra GETs. Disable on tiny-Foyer/
+    /// bandwidth-constrained deployments.
+    #[serde(default = "d_true")]
     pub timefusion_warm_full_files: bool,
     /// Only warm files whose `date=` partition is within this many days of
     /// today. Bounds warming to the partitions dashboards actually query.
@@ -1235,7 +1239,7 @@ mod tests {
         // Merge-on-read DV is the default write path (and thus what all test
         // harnesses that build from AppConfig::default() exercise).
         assert!(config.maintenance.timefusion_use_deletion_vectors);
-        assert!(!config.maintenance.timefusion_warm_full_files);
+        assert!(config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
     }
