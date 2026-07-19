@@ -70,6 +70,7 @@ impl fmt::Debug for CachedDeltaProvider {
 }
 
 type DeltaProviderCache = Arc<dashmap::DashMap<(String, String), CachedDeltaProvider>>;
+type FastResolveCache = Arc<dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>>;
 
 /// Captured per-scan to feed `ScanMetrics::record_scan`. Cheap to copy.
 #[derive(Debug, Default, Clone, Copy)]
@@ -1208,7 +1209,7 @@ pub struct Database {
     /// — entries for tables dropped at runtime persist until process
     /// restart. Watch `scan.fast_resolve_cache_entries` in
     /// `timefusion_stats` for unbounded growth.
-    fast_resolve_cache: Arc<dashmap::DashMap<(String, String), Arc<RwLock<DeltaTable>>>>,
+    fast_resolve_cache: FastResolveCache,
     /// Per-(project,table) sticky bit: "Delta may hold matching files."
     /// Two seed paths so the bit is always at least as conservative as truth
     /// — never falsely `false`:
