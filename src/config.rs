@@ -317,7 +317,7 @@ const_default!(d_checkpoint_schedule: String = "0 */2 * * * *");
 // left by past commit-path parquet deletions (the 2026-07-09 incident left 14);
 // a nonzero removal count means committed data was destroyed elsewhere.
 const_default!(d_reconcile_schedule: String = "0 0 * * * *");
-const_default!(d_warm_recency_days: u64 = 2);
+const_default!(d_warm_recency_days: u64 = 1);
 // 16: at concurrency 4 prod's 3.1k-file boot warm ran >55 min and was cut
 // short by a restart every time; 16 finishes it in ~1-3 min. Footer GETs are
 // ~64KB suffix ranges, well within R2/S3 burst limits.
@@ -1240,7 +1240,7 @@ mod tests {
         // harnesses that build from AppConfig::default() exercise).
         assert!(config.maintenance.timefusion_use_deletion_vectors);
         assert!(config.maintenance.timefusion_warm_full_files);
-        assert_eq!(config.maintenance.timefusion_warm_recency_days, 2);
+        assert_eq!(config.maintenance.timefusion_warm_recency_days, 1);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
     }
 
