@@ -1181,8 +1181,11 @@ pub struct MemoryConfig {
     pub timefusion_plan_cache_capacity: usize,
     /// Route `now()`/`current_timestamp` SELECTs through the shape cache (time fn
     /// parameterized to a fresh per-query instant) instead of bypassing it.
-    /// Off by default — it's the hot dashboard path; enable after canarying.
-    #[serde(default)]
+    /// On by default: 2026-07-19 prod CPU flamegraphs showed ~25% of CPU in
+    /// SessionState::optimize from now()-bearing dashboard cache misses. The
+    /// cached artifact is a placeholder plan template; the instant is re-bound
+    /// per query, so windows never freeze. Set =false to disable in an emergency.
+    #[serde(default = "d_true")]
     pub timefusion_plan_cache_time_fns: bool,
 }
 
