@@ -216,7 +216,21 @@ fn match_count_plan(plan: &LogicalPlan) -> Option<CountQuery> {
             _ => return None,
         }
     }
-    Some(CountQuery { table_name: scan.table_name.table().to_string(), project_id: project_id?, lo: lo?, hi: hi? })
+    let (lo, hi) = finalize_window(lo, hi, chrono::Utc::now().timestamp_micros())?;
+    Some(CountQuery { table_name: scan.table_name.table().to_string(), project_id: project_id?, lo, hi })
+}
+
+/// Resolve the count window's bounds. A lower bound is required (an unbounded
+/// count would scan everything). A one-sided `timestamp > cutoff` (no upper
+/// bound) is the common dashboard/export shape: treat the missing upper bound as
+/// `now`, keeping the window bounded so the dedup-clean date check stays cheap.
+/// The downstream MemBuffer-flushed + dedup-clean gates keep the result exact —
+/// an unflushed or dirty recent tail simply bails to a normal scan. Returns
+/// `None` when there's no lower bound or the window is empty (`lo > hi`).
+fn finalize_window(lo: Option<i64>, hi: Option<i64>, now: i64) -> Option<(i64, i64)> {
+    let lo = lo?;
+    let hi = hi.unwrap_or(now);
+    (lo <= hi).then_some((lo, hi))
 }
 
 /// Pure summing logic over per-file `(min_ts, max_ts, num_records)` stats:
@@ -348,5 +362,17 @@ mod tests {
         assert_eq!(sum_fully_contained([(None, Some(5), Some(1))], 100, 200), None);
         // empty file set → 0
         assert_eq!(sum_fully_contained([], 0, 50), Some(0));
+    }
+
+    #[test]
+    fn finalize_window_defaults_open_upper_bound_to_now() {
+        // Two-sided window passes through unchanged.
+        assert_eq!(finalize_window(Some(10), Some(50), 999), Some((10, 50)));
+        // One-sided `timestamp > cutoff` → upper bound becomes now.
+        assert_eq!(finalize_window(Some(10), None, 999), Some((10, 999)));
+        // No lower bound → not eligible (would scan everything).
+        assert_eq!(finalize_window(None, Some(50), 999), None);
+        // Empty window (lo > hi) → None.
+        assert_eq!(finalize_window(Some(60), Some(50), 999), None);
     }
 }

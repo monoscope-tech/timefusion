@@ -42,6 +42,13 @@ pub fn config() -> &'static AppConfig {
     CONFIG.get().expect("Config not initialized. Call init_config() first.")
 }
 
+/// Global config if initialized, else `None`. For construction paths that may
+/// run before `init_config()` (e.g. test-only server factories) and want to
+/// fall back to defaults rather than panic.
+pub fn try_config() -> Option<&'static AppConfig> {
+    CONFIG.get()
+}
+
 /// Whether the operator has opted into open auth for local dev via
 /// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Both the pgwire and gRPC auth
 /// paths gate their fail-secure defaults on this flag.
@@ -342,6 +349,7 @@ const_default!(d_false: bool = false);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_query_partitions: usize = 0);
+const_default!(d_plan_cache_capacity: usize = 1024);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
 fn d_service_version() -> String {
@@ -1146,6 +1154,16 @@ pub struct MemoryConfig {
     /// tests → sessions keep DataFusion's default.
     #[serde(default = "d_query_partitions")]
     pub timefusion_query_partitions: usize,
+    /// Cross-connection plan-cache capacity (unique canonical/shape templates).
+    /// 256 thrashed in prod (evicting ~half every ~60s); 1024 holds the working
+    /// set with room to spare. Each entry is one LogicalPlan (~KBs).
+    #[serde(default = "d_plan_cache_capacity")]
+    pub timefusion_plan_cache_capacity: usize,
+    /// Route `now()`/`current_timestamp` SELECTs through the shape cache (time fn
+    /// parameterized to a fresh per-query instant) instead of bypassing it.
+    /// Off by default — it's the hot dashboard path; enable after canarying.
+    #[serde(default)]
+    pub timefusion_plan_cache_time_fns: bool,
 }
 
 impl MemoryConfig {
