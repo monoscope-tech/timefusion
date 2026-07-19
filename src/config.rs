@@ -1125,9 +1125,11 @@ pub struct MaintenanceConfig {
     /// Push a `target.key IN (source key values)` filter into the DV merge's
     /// per-file scan so parquet bloom filters prune files/row-groups holding none
     /// of the source keys — turning a whole-window enrichment scan into a few-file
-    /// scan. Sound (bloom never false-negatives); on by default. Kill-switch:
-    /// `TIMEFUSION_DML_MERGE_KEY_PRUNE=false` reverts to scanning all window files.
-    #[serde(default = "d_true")]
+    /// scan. Sound (bloom never false-negatives). DEFAULT OFF after a large `IN`
+    /// list overflowed the stack in the fork's file-skipping expression walk
+    /// (prod crash-loop 2026-07-19, exit 134); re-enable with
+    /// `TIMEFUSION_DML_MERGE_KEY_PRUNE=true` only once the InList depth is bounded.
+    #[serde(default = "d_false")]
     pub timefusion_dml_merge_key_prune: bool,
 }
 
