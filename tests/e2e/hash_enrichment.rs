@@ -76,7 +76,8 @@ async fn enrich_bounded(client: &tokio_postgres::Client, span: &str, trace: &str
              AND o.context___span_id = u.span_id \
              AND o.context___trace_id = u.trace_id \
              AND NOT (COALESCE(o.hashes, '{{}}'::text[]) @> ARRAY[u.tag])",
-        ts(lo), ts(hi)
+        ts(lo),
+        ts(hi)
     );
     Ok(client.execute(&sql, &[]).await?)
 }
