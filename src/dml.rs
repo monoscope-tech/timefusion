@@ -1002,6 +1002,42 @@ fn requalify_for_merge(expr: Expr, source_cols: &std::collections::HashSet<Strin
     .map_err(exec_err("Failed to requalify for merge"))
 }
 
+/// Keep only the conjuncts of `predicate` that reference no source column, for
+/// use as the DV merge's file-pruning `target_predicate`. The equi-key
+/// equalities (`o.context___span_id = u.span_id`) and the `NOT (... @> u.tag)`
+/// cross-filter reference source columns: they can't prune target files by stats
+/// and make the fork's file-skipping scan fail to resolve the column, dropping
+/// rows after 3 retries (prod 2026-07-19). The join_predicate still enforces them.
+/// Source columns are identified by name in `source_cols`, matching
+/// [`requalify_for_merge`]'s convention.
+fn strip_source_conjuncts(predicate: &Expr, source_cols: &std::collections::HashSet<String>) -> Option<Expr> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut conjuncts = Vec::new();
+    let mut stack = vec![predicate.clone()];
+    while let Some(e) = stack.pop() {
+        match e {
+            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
+                stack.push(*left);
+                stack.push(*right);
+            }
+            other => conjuncts.push(other),
+        }
+    }
+    conjuncts.into_iter().rev().filter(|c| {
+        let mut has_source = false;
+        let _ = c.apply(|e| {
+            if let Expr::Column(col) = e {
+                if source_cols.contains(&col.name) {
+                    has_source = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+        !has_source
+    }).reduce(|acc, c| acc.and(c))
+}
+
 /// Build the join predicate that drives the merge: a conjunction of
 /// `target.k_i = source.k_i` clauses for each equi-key pair, AND-ed with the
 /// optional user predicate (which gets routed through [`requalify_for_merge`]
@@ -1108,7 +1144,7 @@ pub async fn perform_delta_merge_update(
                     MergeDvUpdate {
                         source_batches: vec![source_batch],
                         source_schema,
-                        target_predicate: predicate,
+                        target_predicate: predicate.as_ref().and_then(|p| strip_source_conjuncts(p, &source_cols)),
                         join_predicate: join_pred,
                         equi_keys: if database.config().maintenance.timefusion_dml_merge_key_prune { join_keys } else { vec![] },
                         updates: assignments,
@@ -1160,4 +1196,40 @@ pub async fn perform_delta_merge_update(
         Err(e) => warn!(target: "dml", "Delta MERGE-UPDATE failed for {project_id}/{table_name} keys={:?}: {e}", source.join_keys),
     }
     result
+}
+
+#[cfg(test)]
+mod strip_tests {
+    use std::collections::HashSet;
+
+    use datafusion::prelude::{col, lit};
+
+    use super::strip_source_conjuncts;
+
+    #[test]
+    fn strips_source_referencing_conjuncts_keeps_target_only() {
+        // The prod hash-enrichment shape: project_id + timestamp bounds (target-only)
+        // AND-ed with the equi-key equality and the NOT(@> u.tag) cross-filter, both
+        // of which reference source columns.
+        let source_cols: HashSet<String> = ["span_id", "trace_id", "tag"].iter().map(|s| s.to_string()).collect();
+        let pred = col("project_id")
+            .eq(lit("p1"))
+            .and(col("timestamp").gt(lit(1000i64)))
+            .and(col("context___span_id").eq(col("span_id"))) // references source `span_id`
+            .and(col("hashes").is_not_null().or(col("tag").is_not_null())); // references source `tag`
+
+        let stripped = strip_source_conjuncts(&pred, &source_cols).expect("target-only conjuncts remain");
+        let s = format!("{stripped}");
+        assert!(s.contains("project_id"), "kept project_id: {s}");
+        assert!(s.contains("timestamp"), "kept timestamp: {s}");
+        assert!(!s.contains("span_id"), "dropped the source equi-key: {s}");
+        assert!(!s.contains("tag"), "dropped the source cross-filter: {s}");
+    }
+
+    #[test]
+    fn all_source_conjuncts_strips_to_none() {
+        let source_cols: HashSet<String> = ["span_id"].iter().map(|s| s.to_string()).collect();
+        let pred = col("context___span_id").eq(col("span_id"));
+        assert!(strip_source_conjuncts(&pred, &source_cols).is_none());
+    }
 }
