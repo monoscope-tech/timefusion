@@ -1023,19 +1023,22 @@ fn strip_source_conjuncts(predicate: &Expr, source_cols: &std::collections::Hash
             other => conjuncts.push(other),
         }
     }
-    conjuncts.into_iter().rev().filter(|c| {
-        let mut has_source = false;
-        let _ = c.apply(|e| {
-            if let Expr::Column(col) = e {
-                if source_cols.contains(&col.name) {
-                    has_source = true;
-                    return Ok(TreeNodeRecursion::Stop);
-                }
-            }
-            Ok(TreeNodeRecursion::Continue)
-        });
-        !has_source
-    }).reduce(|acc, c| acc.and(c))
+    conjuncts
+        .into_iter()
+        .rev()
+        .filter(|c| {
+            let mut has_source = false;
+            let _ = c.apply(|e| {
+                if let Expr::Column(col) = e
+                    && source_cols.contains(&col.name) {
+                        has_source = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                Ok(TreeNodeRecursion::Continue)
+            });
+            !has_source
+        })
+        .reduce(|acc, c| acc.and(c))
 }
 
 /// Build the join predicate that drives the merge: a conjunction of
