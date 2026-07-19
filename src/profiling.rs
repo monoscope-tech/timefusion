@@ -75,6 +75,11 @@ mod imp {
                                 Err(e) => warn!("profiling: writing cpu flamegraph {:?} failed: {}", path, e),
                             }
                             prune_old(&dir, "cpu-", 10);
+                            // jemalloc auto-dumps a .heap every ~8GiB allocated
+                            // (lg_prof_interval:33) and never prunes them — left
+                            // alone they grow unbounded (95GB / 42k files seen in
+                            // prod). Cap to the newest 50 here on the same cadence.
+                            prune_old(&dir, "jeprof", 50);
                             seq += 1;
                         }
                         Err(e) => warn!("profiling: cpu report build failed: {}", e),
