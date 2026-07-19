@@ -5388,12 +5388,10 @@ impl Database {
             return Ok(());
         }
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
-        // Drain newest-sealed first (recent bins are the ones a dashboard is most
-        // likely to read). 16/tick keeps each tick short enough not to monopolize
-        // maintenance CPU for minutes while still draining faster than the old
-        // 8/tick — a large backlog drains over several ticks rather than one long
-        // CPU-heavy marathon that starves queries (2026-07-19).
-        const DIRTY_BIN_BATCH: usize = 16;
+        // Drain a big batch per tick, newest-sealed first: recent bins are the
+        // ones a dashboard is most likely to read, and processing them first
+        // keeps the drain from falling behind the enqueue rate on busy tables.
+        const DIRTY_BIN_BATCH: usize = 64;
         let sealed_before = (Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
         let mut ready: Vec<_> = self
             .dedup_dirty_bins
