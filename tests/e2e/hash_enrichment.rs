@@ -244,7 +244,10 @@ async fn bench_bloom_prune_ab() -> anyhow::Result<()> {
 
     let off = run(false).await?;
     let on = run(true).await?;
-    eprintln!("BLOOM-PRUNE A/B: {FILES} files × {ROWS_PER_FILE} rows, enrich 1 span — prune OFF {off:?} vs ON {on:?} ({:.1}× faster)", off.as_secs_f64() / on.as_secs_f64().max(1e-9));
+    eprintln!(
+        "BLOOM-PRUNE A/B: {FILES} files × {ROWS_PER_FILE} rows, enrich 1 span — prune OFF {off:?} vs ON {on:?} ({:.1}× faster)",
+        off.as_secs_f64() / on.as_secs_f64().max(1e-9)
+    );
     assert!(on < off, "bloom prune (ON {on:?}) should scan less than full (OFF {off:?})");
     Ok(())
 }

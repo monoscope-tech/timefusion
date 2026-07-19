@@ -1030,10 +1030,11 @@ fn strip_source_conjuncts(predicate: &Expr, source_cols: &std::collections::Hash
             let mut has_source = false;
             let _ = c.apply(|e| {
                 if let Expr::Column(col) = e
-                    && source_cols.contains(&col.name) {
-                        has_source = true;
-                        return Ok(TreeNodeRecursion::Stop);
-                    }
+                    && source_cols.contains(&col.name)
+                {
+                    has_source = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
                 Ok(TreeNodeRecursion::Continue)
             });
             !has_source
