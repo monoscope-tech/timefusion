@@ -42,13 +42,6 @@ pub fn config() -> &'static AppConfig {
     CONFIG.get().expect("Config not initialized. Call init_config() first.")
 }
 
-/// Global config if initialized, else `None`. For construction paths that may
-/// run before `init_config()` (e.g. test-only server factories) and want to
-/// fall back to defaults rather than panic.
-pub fn try_config() -> Option<&'static AppConfig> {
-    CONFIG.get()
-}
-
 /// Whether the operator has opted into open auth for local dev via
 /// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Both the pgwire and gRPC auth
 /// paths gate their fail-secure defaults on this flag.
@@ -292,11 +285,6 @@ const_default!(d_compact_min_files: usize = 5);
 // merge memory on the hot path. Consolidation to 256MB/1GB happens later, once
 // the partition is sealed (warm optimize → daily cold consolidate).
 const_default!(d_light_optimize_target: i64 = 32 * 1024 * 1024);
-// Hot-tail window for light compaction. 3h comfortably covers the recent
-// dashboard windows (1h/6h) plus the >2h dedup-seal boundary, so freshly
-// compacted files hand off cleanly to the sealed-bin dedup cron.
-const_default!(d_light_optimize_hot_hours: u64 = 3);
-const_default!(d_plan_cache_capacity: usize = 1024);
 const_default!(d_optimize_concurrency: usize = 2);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
@@ -343,12 +331,8 @@ const_default!(d_dedup_max_decoded_bytes: u64 = 4 * 1024 * 1024 * 1024);
 const_default!(d_dedup_decode_inflation: u64 = 12);
 // 4 KiB/row decoded estimate for otel spans (wide Variant/JSON bodies).
 const_default!(d_dedup_bytes_per_row: u64 = 4096);
-// Two heavy maintenance rewrites in flight at a time. Each permit bounds one
-// Arrow-materializing rewrite (dedup / optimize / recompress); 2 lets the
-// hot-tail compactor and the sealed-bin dedup make progress concurrently
-// instead of the dedup backlog starving compaction. Peak transient heap is
-// `block_size_mb * this`; raise only with headroom (2026-07-04 OOM history).
-const_default!(d_maintenance_rewrite_concurrency: usize = 2);
+// Serial by default: one heavy maintenance rewrite in flight at a time.
+const_default!(d_maintenance_rewrite_concurrency: usize = 1);
 // How many days back (in addition to today) the dedup sweep covers. today-only
 // left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
@@ -980,12 +964,6 @@ pub struct MaintenanceConfig {
     pub timefusion_light_optimize_enabled: bool,
     #[serde(default = "d_light_optimize_target")]
     pub timefusion_light_optimize_target_size: i64,
-    /// Hot-tail window (hours): the light compactor only bin-packs today's
-    /// sub-target files modified within this many hours, so each run's cost is
-    /// bounded to the recent tail instead of the whole growing day-partition.
-    /// Sealed files older than this are the dedup cron's job.
-    #[serde(default = "d_light_optimize_hot_hours")]
-    pub timefusion_light_optimize_hot_hours: u64,
     /// Concurrent merge tasks per optimize run. delta-rs defaults to
     /// num_cpus (48 on prod), where each task holds decompressed batches
     /// plus a zstd writer buffer — 2026-06-11 this OOM-killed the process
@@ -1168,16 +1146,6 @@ pub struct MemoryConfig {
     /// tests → sessions keep DataFusion's default.
     #[serde(default = "d_query_partitions")]
     pub timefusion_query_partitions: usize,
-    /// Cross-connection plan-cache capacity (unique canonical/shape templates).
-    /// 256 thrashed in prod (evicting ~half every ~60s); 1024 holds the working
-    /// set with room to spare. Each entry is one LogicalPlan (~KBs).
-    #[serde(default = "d_plan_cache_capacity")]
-    pub timefusion_plan_cache_capacity: usize,
-    /// Route `now()`/`current_timestamp` SELECTs through the shape cache (time fn
-    /// parameterized to a fresh per-query instant) instead of bypassing it.
-    /// Off by default — it's the hot dashboard path; enable after canarying.
-    #[serde(default)]
-    pub timefusion_plan_cache_time_fns: bool,
 }
 
 impl MemoryConfig {

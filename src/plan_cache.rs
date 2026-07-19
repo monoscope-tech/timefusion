@@ -289,9 +289,7 @@ async fn dml_completion(df: datafusion::dataframe::DataFrame) -> PgWireResult<Op
     Ok(Some(Response::Execution(tag.with_rows(rows))))
 }
 
-// Fallback when config isn't initialized (test-only factory paths). Prod reads
-// `memory.timefusion_plan_cache_capacity`. See config.rs.
-const DEFAULT_PLAN_CACHE_CAPACITY: usize = 1024;
+const DEFAULT_PLAN_CACHE_CAPACITY: usize = 256;
 
 /// Singleton handle so `timefusion_stats` can read the same cache the
 /// pgwire factory writes to without plumbing an Arc through the database
@@ -338,11 +336,6 @@ pub struct PlanCacheHook {
     served: dashmap::DashMap<String, ()>,
     shape_hits: std::sync::atomic::AtomicU64,
     shape_skips: std::sync::atomic::AtomicU64,
-    /// When true, `now()`-bearing SELECTs go through the shape cache with the
-    /// time function parameterized (fresh instant substituted per query) instead
-    /// of being bypassed. Off by default — it's the hot dashboard path, so enable
-    /// deliberately (TIMEFUSION_PLAN_CACHE_TIME_FNS=1) after canarying.
-    time_fn_shapes: bool,
 }
 
 #[derive(Clone)]
@@ -360,39 +353,27 @@ struct ShapeEntry {
 /// windows forever. Applies to BOTH the `$N` template cache and the shape
 /// cache — such statements re-plan per query instead.
 fn contains_plan_time_folded_fn(stmt: &Statement) -> bool {
-    // Union of both classes; TIME_FNS == PARAMETERIZABLE ∪ UNPARAMETERIZABLE.
-    stmt_uses_fn(stmt, PARAMETERIZABLE_TIME_FNS) || stmt_uses_fn(stmt, UNPARAMETERIZABLE_TIME_FNS)
-}
-
-/// The timestamp-returning time fns we can safely parameterize (replace the call
-/// with a `$N` placeholder bound to the current instant, so the plan is reusable
-/// and time stays fresh).
-const PARAMETERIZABLE_TIME_FNS: &[&str] = &["now", "current_timestamp", "statement_timestamp", "transaction_timestamp", "clock_timestamp", "localtimestamp"];
-
-/// Date/Time-returning time fns — different result type, riskier substitution —
-/// so a query using any of these stays on the bypass path.
-const UNPARAMETERIZABLE_TIME_FNS: &[&str] = &["current_date", "today", "current_time", "localtime"];
-
-fn is_parameterizable_time_fn(name: &str) -> bool {
-    PARAMETERIZABLE_TIME_FNS.contains(&name.to_lowercase().as_str())
-}
-
-fn contains_unparameterizable_time_fn(stmt: &Statement) -> bool {
-    stmt_uses_fn(stmt, UNPARAMETERIZABLE_TIME_FNS)
-}
-
-/// True if `stmt` calls any function named in `names` (case-insensitive, matching
-/// the last name segment). Shared AST-visitor for the time-fn classifiers.
-fn stmt_uses_fn(stmt: &Statement, names: &[&str]) -> bool {
     use std::ops::ControlFlow;
 
     use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, visit_expressions};
+    const TIME_FNS: &[&str] = &[
+        "now",
+        "current_timestamp",
+        "current_date",
+        "current_time",
+        "localtimestamp",
+        "localtime",
+        "statement_timestamp",
+        "transaction_timestamp",
+        "clock_timestamp",
+        "today",
+    ];
     let mut found = false;
     let _: ControlFlow<()> = visit_expressions(stmt, |e: &SqlExpr| {
         if let SqlExpr::Function(f) = e
             && let Some(name) = f.name.0.last()
             && let Some(ident) = name.as_ident()
-            && names.contains(&ident.value.to_lowercase().as_str())
+            && TIME_FNS.contains(&ident.value.to_lowercase().as_str())
         {
             found = true;
             return ControlFlow::Break(());
@@ -410,40 +391,21 @@ fn stmt_uses_fn(stmt: &Statement, names: &[&str]) -> bool {
 fn parameterize_statement(stmt: &Statement) -> Option<(Statement, Vec<ScalarValue>)> {
     use std::ops::ControlFlow;
 
-    use datafusion::sql::sqlparser::{
-        ast::{Expr as SqlExpr, Value, ValueWithSpan, visit_expressions_mut},
-        tokenizer::Span,
-    };
+    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value, visit_expressions_mut};
     let mut stmt = stmt.clone();
     let mut values: Vec<ScalarValue> = Vec::new();
-    // Capture "now" once so every now()/current_timestamp in the statement
-    // substitutes to the same fresh instant (matching SQL's single-evaluation
-    // semantics). Timezone-aware nanosecond mirrors DataFusion's native now();
-    // the caller casts to the placeholder's inferred type.
-    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     let _: ControlFlow<()> = visit_expressions_mut(&mut stmt, |e: &mut SqlExpr| {
-        match e {
+        if let SqlExpr::Value(vs) = e
+            && let Value::SingleQuotedString(s) = &vs.value
             // PG array literals ('{}', '{a,b}') must stay inline: PgArrayLiteralRewriter
             // rewrites them to typed list literals during analysis, and it only matches
             // Expr::Literal — a `$N` placeholder slips past it and gets mis-cast to a
             // single-element list (COALESCE(list_col, '{a,b}') → ['{a,b}'] instead of
             // ['a','b']). Cheap to skip: array-literal COALESCE is not a hot cached path.
-            SqlExpr::Value(vs) => {
-                if let Value::SingleQuotedString(s) = &vs.value
-                    && !s.trim_start().starts_with('{')
-                {
-                    values.push(ScalarValue::Utf8(Some(s.clone())));
-                    vs.value = Value::Placeholder(format!("${}", values.len()));
-                }
-            }
-            // now()/current_timestamp/… → placeholder bound to the captured instant,
-            // so the optimized plan is reusable across dashboard refreshes while the
-            // time window stays fresh (never frozen to plan-build time).
-            SqlExpr::Function(f) if f.name.0.last().and_then(|n| n.as_ident()).is_some_and(|i| is_parameterizable_time_fn(&i.value)) => {
-                values.push(ScalarValue::TimestampNanosecond(Some(now_ns), Some("+00:00".into())));
-                *e = SqlExpr::Value(ValueWithSpan { value: Value::Placeholder(format!("${}", values.len())), span: Span::empty() });
-            }
-            _ => {}
+            && !s.trim_start().starts_with('{')
+        {
+            values.push(ScalarValue::Utf8(Some(s.clone())));
+            vs.value = Value::Placeholder(format!("${}", values.len()));
         }
         ControlFlow::Continue(())
     });
@@ -452,15 +414,12 @@ fn parameterize_statement(stmt: &Statement) -> Option<(Statement, Vec<ScalarValu
 
 impl Default for PlanCacheHook {
     fn default() -> Self {
-        let cfg = crate::config::try_config().map(|c| &c.memory);
-        let capacity = cfg.map_or(DEFAULT_PLAN_CACHE_CAPACITY, |m| m.timefusion_plan_cache_capacity);
-        let time_fn_shapes = cfg.is_some_and(|m| m.timefusion_plan_cache_time_fns);
-        Self::new(capacity, time_fn_shapes)
+        Self::new(DEFAULT_PLAN_CACHE_CAPACITY)
     }
 }
 
 impl PlanCacheHook {
-    pub fn new(capacity: usize, time_fn_shapes: bool) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
             cache: dashmap::DashMap::new(),
             capacity: capacity.max(1),
@@ -470,7 +429,6 @@ impl PlanCacheHook {
             served: dashmap::DashMap::new(),
             shape_hits: std::sync::atomic::AtomicU64::new(0),
             shape_skips: std::sync::atomic::AtomicU64::new(0),
-            time_fn_shapes,
         }
     }
 
@@ -591,19 +549,9 @@ impl QueryHook for PlanCacheHook {
             return None;
         }
         // now()/current_date/... are const-folded by the optimizer using the
-        // query start time — a verbatim-cached optimized plan would freeze them.
-        // With time-fn shape caching on, route now()-bearing SELECTs to the shape
-        // path (which parameterizes the time fn → fresh instant per query);
-        // otherwise, and for unparameterizable date/time fns, plan fresh.
+        // query start time — a cached optimized plan would freeze them. Plan
+        // fresh every time for such statements (template AND shape paths).
         if contains_plan_time_folded_fn(statement) {
-            if self.time_fn_shapes && matches!(statement, Statement::Query(_)) && !contains_unparameterizable_time_fn(statement) {
-                let canonical = statement.to_string();
-                // Only when there are no client-supplied `$N` binds: parameterize
-                // numbers time-fn placeholders 1-based, which would collide.
-                if !Self::has_placeholder(&canonical) {
-                    return self.try_shape_cached_plan(statement, &canonical, session_context).await.map(Ok);
-                }
-            }
             return None;
         }
         let canonical = statement.to_string();
@@ -826,33 +774,5 @@ mod tests {
         assert!(!contains_plan_time_folded_fn(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > '2026-07-01'")));
         // A column merely NAMED now must not disqualify.
         assert!(!contains_plan_time_folded_fn(&parse("SELECT now FROM t WHERE project_id = 'p'")));
-    }
-
-    #[test]
-    fn parameterize_replaces_now_with_fresh_timestamp_placeholder() {
-        // now()/current_timestamp become $N bound to a fresh instant so the
-        // optimized plan is reusable while the window stays current (D2).
-        let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-        let stmt = parse("SELECT id FROM t WHERE project_id = 'p' AND ts > now() - INTERVAL '1 hour'");
-        let (param, values) = parameterize_statement(&stmt).expect("now() parameterizes");
-        let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-        let text = param.to_string();
-        assert!(!text.to_lowercase().contains("now("), "now() replaced by placeholder: {text}");
-        assert!(text.contains("$1") && text.contains("$2"), "project_id + now() both placeholders: {text}");
-        // Second value is the timestamp bound to the captured instant.
-        match values[1] {
-            ScalarValue::TimestampNanosecond(Some(ns), Some(_)) => assert!(before <= ns && ns <= after, "fresh instant"),
-            ref v => panic!("expected tz-aware nanosecond timestamp, got {v:?}"),
-        }
-        // Shape is literal-insensitive: two refreshes yield the same placeholder text.
-        let (param2, _) = parameterize_statement(&parse("SELECT id FROM t WHERE project_id = 'q' AND ts > now() - INTERVAL '1 hour'")).unwrap();
-        assert_eq!(text, param2.to_string(), "reusable shape key across refreshes");
-    }
-
-    #[test]
-    fn date_time_fns_stay_unparameterizable() {
-        // Date/Time-returning fns must NOT take the shape path (type risk).
-        assert!(contains_unparameterizable_time_fn(&parse("SELECT id FROM t WHERE d = current_date")));
-        assert!(!contains_unparameterizable_time_fn(&parse("SELECT id FROM t WHERE ts > now()")));
     }
 }
