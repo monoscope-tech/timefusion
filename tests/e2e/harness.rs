@@ -37,6 +37,7 @@ pub struct E2eEnvBuilder {
     optimize_sort_by: bool,
     use_deletion_vectors: bool,
     warm_full_files: bool,
+    dml_merge_key_prune: bool,
 }
 
 impl Default for E2eEnvBuilder {
@@ -57,6 +58,7 @@ impl Default for E2eEnvBuilder {
             // Mirror the prod default (on) so the whole e2e suite exercises the
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
+            dml_merge_key_prune: true,
         }
     }
 }
@@ -119,6 +121,10 @@ impl E2eEnvBuilder {
     }
     pub fn without_deletion_vectors(mut self) -> Self {
         self.use_deletion_vectors = false;
+        self
+    }
+    pub fn with_dml_merge_key_prune(mut self, on: bool) -> Self {
+        self.dml_merge_key_prune = on;
         self
     }
 
@@ -191,6 +197,7 @@ impl E2eEnvBuilder {
             optimize_sort_by: self.optimize_sort_by,
             use_deletion_vectors: self.use_deletion_vectors,
             warm_full_files: self.warm_full_files,
+            dml_merge_key_prune: self.dml_merge_key_prune,
             test_id: &test_id,
         });
 
@@ -288,6 +295,7 @@ impl E2eEnv {
             optimize_sort_by: self.builder.optimize_sort_by,
             use_deletion_vectors: self.builder.use_deletion_vectors,
             warm_full_files: self.builder.warm_full_files,
+            dml_merge_key_prune: self.builder.dml_merge_key_prune,
             test_id: &self.test_id,
         });
 
@@ -384,6 +392,7 @@ struct BuildCfgArgs<'a> {
     optimize_sort_by: bool,
     use_deletion_vectors: bool,
     warm_full_files: bool,
+    dml_merge_key_prune: bool,
     test_id: &'a str,
 }
 
@@ -409,6 +418,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_optimize_sort_by = args.optimize_sort_by;
     cfg.maintenance.timefusion_use_deletion_vectors = args.use_deletion_vectors;
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
+    cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
     Arc::new(cfg)
 }
 

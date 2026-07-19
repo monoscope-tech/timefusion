@@ -82,6 +82,31 @@ async fn enrich_bounded(client: &tokio_postgres::Client, span: &str, trace: &str
     Ok(client.execute(&sql, &[]).await?)
 }
 
+/// The EXACT monoscope prod shape: nested source subquery with `ORDER BY`, and
+/// parameterized `unnest($1::text[])` arrays. The Sort + nested projection change
+/// the join plan so the equi-key equality is retained in the Filter (and thus in
+/// the DV merge's target_predicate) — reproducing the prod "No field named
+/// otel_logs_and_spans.context___span_id" crash + dropped rows. Flat inlined
+/// unnest (see `enrich`) does NOT trigger it.
+async fn enrich_prod_shape(client: &tokio_postgres::Client, spans: &[&str], traces: &[&str], tags: &[&str], lo: i64, hi: i64) -> anyhow::Result<u64> {
+    let ts = |m: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(m).unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string();
+    let sql = format!(
+        "UPDATE otel_logs_and_spans o \
+           SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag] \
+           FROM ( SELECT span_id, trace_id, tag FROM \
+                    ( SELECT unnest($1::text[]) AS span_id, unnest($2::text[]) AS trace_id, unnest($3::text[]) AS tag ) raw \
+                  ORDER BY span_id, trace_id ) u \
+           WHERE o.project_id = 'e2e_project' AND o.timestamp >= '{}' AND o.timestamp < '{}' \
+             AND o.context___span_id = u.span_id \
+             AND o.context___trace_id = u.trace_id \
+             AND NOT (COALESCE(o.hashes, '{{}}'::text[]) @> ARRAY[u.tag])",
+        ts(lo),
+        ts(hi)
+    );
+    let (sv, tv, gv) = (spans.to_vec(), traces.to_vec(), tags.to_vec());
+    Ok(client.execute(&sql, &[&sv, &tv, &gv]).await?)
+}
+
 async fn count_by_hash(client: &tokio_postgres::Client, tag: &str) -> anyhow::Result<i64> {
     Ok(client
         .query_one(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project' AND hashes && ARRAY['{tag}']::text[]"), &[])
@@ -178,6 +203,52 @@ async fn hash_enrichment_same_key_multiple_tags_applies_all() -> anyhow::Result<
     Ok(())
 }
 
+/// Insert `rows` spans (distinct span/trace ids under `prefix`) into one flushed
+/// parquet file. Returns nothing; caller evicts.
+async fn insert_file(client: &tokio_postgres::Client, env: &E2eEnv, prefix: &str, rows: usize, ts: i64) -> anyhow::Result<()> {
+    for r in 0..rows {
+        insert_span(client, &format!("{prefix}-{r}"), &format!("{prefix}-span-{r}"), &format!("{prefix}-trace-{r}"), ts).await?;
+    }
+    env.force_flush().await?;
+    Ok(())
+}
+
+/// #1 LOCAL A/B BENCHMARK (run on demand): enrich one span against many files
+/// with the bloom-prune ON vs OFF and compare merge wall-clock. Proves the
+/// join-key IN-filter actually reduces merge scan work locally — not just in prod.
+/// `cargo test --test e2e --features e2e bench_bloom_prune_ab -- --ignored --nocapture`
+#[ignore]
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn bench_bloom_prune_ab() -> anyhow::Result<()> {
+    const FILES: usize = 20;
+    const ROWS_PER_FILE: usize = 400;
+
+    async fn run(prune: bool) -> anyhow::Result<std::time::Duration> {
+        let env = E2eEnv::builder().with_deletion_vectors().with_dml_merge_key_prune(prune).with_bucket_duration(Duration::from_secs(60)).start().await?;
+        let client = env.pg_client().await?;
+        for f in 0..FILES {
+            insert_file(&client, &env, &format!("f{f}"), ROWS_PER_FILE, FROZEN_START_MICROS).await?;
+        }
+        env.advance(Duration::from_secs(600));
+        env.force_evict().await?; // all Delta, cold MemBuffer → merge scans Delta
+        // Enrich one span living in the LAST file — prune must skip the other 19 files.
+        let (span, trace) = (format!("f{}-span-7", FILES - 1), format!("f{}-trace-7", FILES - 1));
+        let t = std::time::Instant::now();
+        let updated = enrich(&client, &span, &trace, "BENCH").await?;
+        let elapsed = t.elapsed();
+        assert_eq!(updated, 1, "prune={prune}: enrichment matched wrong count");
+        assert_eq!(count_by_hash(&client, "BENCH").await?, 1, "prune={prune}: soundness — tag lost");
+        Ok(elapsed)
+    }
+
+    let off = run(false).await?;
+    let on = run(true).await?;
+    eprintln!("BLOOM-PRUNE A/B: {FILES} files × {ROWS_PER_FILE} rows, enrich 1 span — prune OFF {off:?} vs ON {on:?} ({:.1}× faster)", off.as_secs_f64() / on.as_secs_f64().max(1e-9));
+    assert!(on < off, "bloom prune (ON {on:?}) should scan less than full (OFF {off:?})");
+    Ok(())
+}
+
 /// #1 bloom-prune soundness: the `key IN (source keys)` filter pushed into the DV
 /// merge scan (so parquet bloom filters skip non-matching files) must never drop a
 /// real match. Insert N spans into N separate flushed+evicted files (same
@@ -209,6 +280,34 @@ async fn hash_enrichment_bloom_prune_never_drops_a_match() -> anyhow::Result<()>
     for i in [3usize, 6, 0, 7] {
         assert_eq!(count_by_hash(&client, &format!("P{i}")).await?, 1, "bloom-prune: tag P{i} lost");
     }
+    Ok(())
+}
+
+/// Coverage of the exact monoscope prod shape (nested source subquery with
+/// ORDER BY + parameterized unnest arrays) on the DV path. NOTE: this does NOT
+/// reproduce the prod "No field named ...context___span_id" crash — it passes
+/// even with strip_source_conjuncts reverted, so the real trigger is some prod
+/// condition not captured locally (verified 2026-07-19). Kept as happy-path
+/// coverage of the prod SQL shape; the strip fix is covered by strip_tests +
+/// confirmed in prod (errors 8/10min → 0 on 73a9d3d).
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn hash_enrichment_prod_shape_ordered_subquery_dv_path() -> anyhow::Result<()> {
+    let env = E2eEnv::builder().with_deletion_vectors().with_bucket_duration(Duration::from_secs(60)).start().await?;
+    let client = env.pg_client().await?;
+
+    insert_span(&client, "ps-1", "span-x", "trace-x", FROZEN_START_MICROS).await?;
+    insert_span(&client, "ps-2", "span-y", "trace-y", FROZEN_START_MICROS + 1_000_000).await?;
+    env.force_flush().await?;
+    env.advance(Duration::from_secs(600));
+    env.force_evict().await?; // rows Delta-only → DV merge path
+
+    let lo = FROZEN_START_MICROS - 60_000_000;
+    let hi = FROZEN_START_MICROS + 120_000_000;
+    let updated = enrich_prod_shape(&client, &["span-x", "span-y"], &["trace-x", "trace-y"], &["PX", "PY"], lo, hi).await?;
+    assert_eq!(updated, 2, "prod-shape enrichment matched wrong row count (crash → 0/dropped)");
+    assert_eq!(count_by_hash(&client, "PX").await?, 1, "prod-shape: tag PX lost (the context___span_id crash)");
+    assert_eq!(count_by_hash(&client, "PY").await?, 1, "prod-shape: tag PY lost");
     Ok(())
 }
 
