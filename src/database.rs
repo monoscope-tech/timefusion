@@ -25,7 +25,7 @@ use deltalake::{
     DeltaTable, DeltaTableBuilder, PartitionFilter, datafusion::parquet::file::properties::WriterProperties, kernel::transaction::CommitProperties,
     logstore::LogStore, operations::create::CreateBuilder,
 };
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use instrumented_object_store::instrument_object_store;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -4308,14 +4308,64 @@ impl Database {
     /// alone conflicts with every project's append to the active day.
     fn hot_project_ids(uris: &[String], date: chrono::NaiveDate) -> Vec<String> {
         let date_marker = format!("/date={date}/");
-        uris.iter()
+        let mut counts = std::collections::HashMap::<&str, usize>::new();
+        for project_id in uris
+            .iter()
             .filter(|uri| uri.contains(&date_marker))
             .filter_map(|uri| uri.split('/').find_map(|segment| segment.strip_prefix("project_id=")))
             .filter(|project_id| !project_id.is_empty())
-            .collect::<std::collections::BTreeSet<_>>()
+        {
+            *counts.entry(project_id).or_default() += 1;
+        }
+        // Most-fragmented partition first: it's the one whose recent-window
+        // queries open the most files, so it benefits most from an early tick.
+        let mut projects: Vec<_> = counts.into_iter().collect();
+        projects.sort_unstable_by(|(a, a_count), (b, b_count)| b_count.cmp(a_count).then_with(|| a.cmp(b)));
+        projects.into_iter().map(|(project_id, _)| project_id.to_owned()).collect()
+    }
+
+    /// Select the specific files a light optimize should bin-pack, instead of
+    /// letting `OptimizeBuilder` rewrite the whole `date=today` partition. That
+    /// partition-wide rewrite records a read predicate spanning the live tail,
+    /// so every concurrent ingestion flush trips the OCC conflict checker and
+    /// the commit loses (prod 2026-07-20: never converged, 541 tiny files on a
+    /// 3h window). Here we pick only already-flushed small files up to
+    /// `target_size`, plus at most one existing sorted run to merge into, and
+    /// hand that exact set to `with_binned_files` — the appends that land after
+    /// selection aren't in the set, so they don't conflict.
+    async fn light_optimize_tail(table: &DeltaTable, filters: &[PartitionFilter], target_size: i64, min_files: usize) -> Result<Vec<String>> {
+        // Tag the fork stamps on sorted-run outputs (delta-rs optimize.rs). Kept
+        // in sync by the exact rev pin; a fork rename would need a deliberate bump.
+        const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
+        let cap = target_size.max(1);
+        let (mut fresh, runs): (Vec<_>, Vec<_>) = table
+            .get_active_add_actions_by_partitions(filters)
+            .try_collect::<Vec<_>>()
+            .await?
             .into_iter()
-            .map(str::to_owned)
-            .collect()
+            .partition(|add| !add.tags().get(SORTED_RUN_TAG).is_some_and(|v| v.as_deref() == Some("true")));
+        if fresh.len() < min_files {
+            return Ok(vec![]);
+        }
+        // Newest-first: recent-window (1h/6h) queries hit the freshest data, so
+        // compacting the newest small files first is what shrinks their file
+        // count. Churn stays bounded — compacted files become tagged sorted runs
+        // and drop out of `fresh` next tick.
+        fresh.sort_unstable_by_key(|add| std::cmp::Reverse(add.modification_time()));
+        let mut bytes = 0;
+        let mut files = vec![];
+        for add in fresh {
+            if !files.is_empty() && bytes + add.size() > cap {
+                break;
+            }
+            bytes += add.size();
+            files.push(add.path().to_string());
+        }
+        // Merge into the most recent existing sorted run if it still fits budget.
+        if let Some(run) = runs.into_iter().max_by_key(|add| add.modification_time()).filter(|run| bytes + run.size() <= cap) {
+            files.push(run.path().to_string());
+        }
+        Ok(files)
     }
 
     /// Partition-ownership boundary between the warm (30-min Z-order) and cold
@@ -5583,11 +5633,20 @@ impl Database {
         // optimize fail loudly during heavy ingest; the next scheduler
         // tick (5 min later) usually catches a quiet enough window.
         let mut failed = 0;
+        let today_str = today.to_string();
         for project_id in project_ids {
             let partition_filters = vec![
                 PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
-                PartitionFilter::try_from(("date", "=", today.to_string().as_str()))?,
+                PartitionFilter::try_from(("date", "=", today_str.as_str()))?,
             ];
+            let selected_files = {
+                let table = table_ref.read().await;
+                Self::light_optimize_tail(&table, &partition_filters, target_size, self.config.maintenance.timefusion_compact_min_files).await?
+            };
+            if selected_files.is_empty() {
+                continue;
+            }
+            info!(table_name, project_id, date = %today, selected_files = selected_files.len(), event = "light_optimize_tail_selected");
             if let Err(e) = self
                 .optimize_table_light_inner(
                     table_ref,
@@ -5595,6 +5654,7 @@ impl Database {
                     today,
                     &project_id,
                     &partition_filters,
+                    &selected_files,
                     target_size,
                     &writer_properties,
                     optimize_type.clone(),
@@ -5616,7 +5676,8 @@ impl Database {
     #[allow(clippy::too_many_arguments)]
     async fn optimize_table_light_inner(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today: chrono::NaiveDate, project_id: &str, partition_filters: &[PartitionFilter],
-        target_size: i64, writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType, start_time: std::time::Instant,
+        selected_files: &[String], target_size: i64, writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType,
+        start_time: std::time::Instant,
     ) -> Result<()> {
         const MAX_RETRIES: usize = 4;
         // Optimize rewrites (compaction) materialize Arrow like dedup — hold a
@@ -5642,6 +5703,10 @@ impl Database {
             let optimize_result = table_clone
                 .optimize()
                 .with_filters(partition_filters)
+                // Restrict the rewrite to the pre-selected sealed files so live
+                // appends after selection aren't in the commit's file set (avoids
+                // the OCC race on the hot today-partition).
+                .with_binned_files(selected_files)
                 // Cloned per attempt: the retry loop re-submits after OCC conflicts.
                 .with_type(optimize_type.clone())
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
@@ -8044,16 +8109,20 @@ mod tests {
     }
 
     #[test]
-    fn hot_project_ids_are_limited_to_the_requested_date() {
+    fn hot_project_ids_prioritize_the_most_fragmented_hot_partition() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
         let uris = vec![
             "s3://b/t/project_id=alpha/date=2026-07-16/a.parquet".to_string(),
             "s3://b/t/project_id=beta/date=2026-07-16/b.parquet".to_string(),
             "s3://b/t/project_id=alpha/date=2026-07-16/c.parquet".to_string(),
-            "s3://b/t/project_id=old/date=2026-07-15/d.parquet".to_string(),
-            "s3://b/t/date=2026-07-16/e.parquet".to_string(),
+            "s3://b/t/project_id=beta/date=2026-07-16/d.parquet".to_string(),
+            "s3://b/t/project_id=beta/date=2026-07-16/e.parquet".to_string(),
+            "s3://b/t/project_id=old/date=2026-07-15/f.parquet".to_string(),
+            "s3://b/t/date=2026-07-16/g.parquet".to_string(),
         ];
-        assert_eq!(Database::hot_project_ids(&uris, date), vec!["alpha", "beta"]);
+        // beta has 3 files today, alpha 2 → beta first; the wrong-date and
+        // missing-project_id URIs are excluded.
+        assert_eq!(Database::hot_project_ids(&uris, date), vec!["beta", "alpha"]);
     }
 
     /// Two identical file sets compare equal (→ partition skipped); adding a
