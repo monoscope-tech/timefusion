@@ -433,7 +433,10 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
     use std::ops::ControlFlow;
 
     use datafusion::sql::sqlparser::{
-        ast::{CastKind, DataType as SqlDataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, TimezoneInfo, Value, ValueWithSpan, visit_expressions_mut},
+        ast::{
+            CastKind, DataType as SqlDataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, TimezoneInfo, Value, ValueWithSpan,
+            visit_expressions_mut,
+        },
         tokenizer::Span,
     };
     let mut stmt = stmt.clone();
@@ -597,7 +600,9 @@ impl PlanCacheHook {
     /// would get distinct placeholders → "ORDER BY must be in GROUP BY").
     /// Repeated dashboard refreshes send identical SQL except now(), so the shape
     /// key is still stable → hits. `true` (pure literal SELECTs) lifts all.
-    async fn try_shape_cached_plan(&self, statement: &Statement, canonical: &str, session_context: &SessionContext, include_strings: bool) -> Option<LogicalPlan> {
+    async fn try_shape_cached_plan(
+        &self, statement: &Statement, canonical: &str, session_context: &SessionContext, include_strings: bool,
+    ) -> Option<LogicalPlan> {
         use std::sync::atomic::Ordering::Relaxed;
         if !matches!(statement, Statement::Query(_)) {
             return None;
