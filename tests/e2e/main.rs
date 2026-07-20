@@ -19,6 +19,7 @@ mod ordering_pushdown;
 mod partition_pruning;
 mod postcommit_hooks;
 mod pressure_flush;
+mod recent_window_pruning;
 mod restart_recovery;
 mod smoke;
 mod staged_commit;

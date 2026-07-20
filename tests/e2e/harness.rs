@@ -39,6 +39,7 @@ pub struct E2eEnvBuilder {
     warm_full_files: bool,
     dml_merge_key_prune: bool,
     dml_coalesce_secs: u64,
+    page_row_count_limit: Option<usize>,
 }
 
 impl Default for E2eEnvBuilder {
@@ -63,6 +64,7 @@ impl Default for E2eEnvBuilder {
             // 0 = synchronous DML (prod-default off). Prod runs 60s; set >0 to
             // exercise the coalescer defer/drain path in tests.
             dml_coalesce_secs: 0,
+            page_row_count_limit: None,
         }
     }
 }
@@ -110,6 +112,12 @@ impl E2eEnvBuilder {
     }
     pub fn with_optimize_sort_by(mut self) -> Self {
         self.optimize_sort_by = true;
+        self
+    }
+    /// Force small parquet data pages (row-count capped) so a few hundred rows
+    /// yield many pages within one row group — exercises page-index pruning.
+    pub fn with_page_row_count_limit(mut self, rows: usize) -> Self {
+        self.page_row_count_limit = Some(rows);
         self
     }
     /// Warm freshly-flushed file BODIES (not just footers) into Foyer, so the
@@ -209,6 +217,7 @@ impl E2eEnvBuilder {
             warm_full_files: self.warm_full_files,
             dml_merge_key_prune: self.dml_merge_key_prune,
             dml_coalesce_secs: self.dml_coalesce_secs,
+            page_row_count_limit: self.page_row_count_limit,
             test_id: &test_id,
         });
 
@@ -308,6 +317,7 @@ impl E2eEnv {
             warm_full_files: self.builder.warm_full_files,
             dml_merge_key_prune: self.builder.dml_merge_key_prune,
             dml_coalesce_secs: self.builder.dml_coalesce_secs,
+            page_row_count_limit: self.builder.page_row_count_limit,
             test_id: &self.test_id,
         });
 
@@ -414,6 +424,7 @@ struct BuildCfgArgs<'a> {
     warm_full_files: bool,
     dml_merge_key_prune: bool,
     dml_coalesce_secs: u64,
+    page_row_count_limit: Option<usize>,
     test_id: &'a str,
 }
 
@@ -441,6 +452,9 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
     cfg.buffer.timefusion_dml_coalesce_secs = args.dml_coalesce_secs;
+    if let Some(rows) = args.page_row_count_limit {
+        cfg.parquet.timefusion_page_row_count_limit = rows;
+    }
     Arc::new(cfg)
 }
 

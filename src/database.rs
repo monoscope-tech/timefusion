@@ -6709,8 +6709,16 @@ impl ProjectRoutingTable {
                 // `create_session_context`). delta-rs's default is `true` (BinaryView),
                 // which mismatches our Binary-typed MemBuffer at the union and
                 // panics in physical planning.
-                if let Some(ss) = session_state { table.table_provider().with_session(Arc::new(ss)).await } else { table.table_provider().await }
-                    .map_err(|e| DataFusionError::External(Box::new(e)))
+                // Opt into parquet pushdown even under Deletion Vectors: this is a
+                // READ-ONLY scan, so it's safe (unlike DV write ops, which need row
+                // positions preserved). Reclaims row-group/page pruning that DV
+                // otherwise disables table-wide — the recent-window dashboard lever.
+                if let Some(ss) = session_state {
+                    table.table_provider().with_session(Arc::new(ss)).with_pushdown_with_deletion_vectors(true).await
+                } else {
+                    table.table_provider().with_pushdown_with_deletion_vectors(true).await
+                }
+                .map_err(|e| DataFusionError::External(Box::new(e)))
             })
             .await?
             .clone();
