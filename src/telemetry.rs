@@ -86,7 +86,9 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     let _ = LOGGER_PROVIDER.set(logger_provider);
 
     // Get log filter from environment
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // Tantivy emits an INFO event for every segment operation; recovery bursts
+    // otherwise flood stdout and OTLP with merge/GC internals.
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn"));
 
     // Initialize tracing subscriber with telemetry and formatting layers
     let is_json = config.is_json_logging();

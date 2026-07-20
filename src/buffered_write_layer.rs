@@ -8,6 +8,7 @@ use std::{
 
 use arrow::array::RecordBatch;
 use futures::stream::{self, StreamExt};
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, Notify},
     task::JoinHandle,
@@ -164,6 +165,8 @@ pub struct StatsSnapshot {
     pub wal_recovery_duration_ms: u64,
     /// True only after startup WAL recovery has returned successfully.
     pub wal_recovery_complete: bool,
+    /// Committed Parquet files awaiting post-replay Tantivy indexing.
+    pub tantivy_recovery_pending_files: usize,
     /// Process start time, used to distinguish a replacement from its predecessor.
     pub boot_micros: i64,
 }
@@ -176,6 +179,26 @@ pub struct RecoveryStats {
     pub newest_entry_timestamp: Option<i64>,
     pub recovery_duration_ms: u64,
     pub corrupted_entries_skipped: u64,
+    pub tantivy_files_deferred: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DeferredTantivyFile {
+    pub project_id: String,
+    pub table_name: String,
+    pub uri: String,
+}
+
+fn deferred_tantivy_path(config: &AppConfig) -> std::path::PathBuf {
+    config.core.timefusion_data_dir.join("tantivy-recovery-pending.json")
+}
+
+fn persist_deferred_tantivy_files(path: &std::path::Path, files: &[DeferredTantivyFile]) {
+    let Ok(bytes) = serde_json::to_vec(files) else { return };
+    let tmp = path.with_extension("tmp");
+    if std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new("."))).is_ok() && std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(tmp, path);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -433,6 +456,10 @@ pub struct BufferedWriteLayer {
     /// Static (read-only during replay) → no per-entry cost, safe for the
     /// concurrent relief drain to read. Empty outside recovery.
     recovery_commit_floor: dashmap::DashMap<(String, String), ShardHolds>,
+    /// Delta files committed by replay relief flushes. Indexing them before
+    /// replay ends would publish a partial replayed state.
+    deferred_tantivy_files: std::sync::Mutex<Vec<DeferredTantivyFile>>,
+    deferred_tantivy_path: std::path::PathBuf,
     /// Test-only: bail out of `recover_from_wal` once this many relief drains
     /// have committed + advanced the rewind marker, simulating a crash
     /// mid-replay. `u64::MAX` = disabled.
@@ -468,7 +495,7 @@ impl BufferedWriteLayer {
         let mem_buffer = Arc::new(MemBuffer::new_with_max_index_bytes_and_shards(text_index_max_bytes, wal.shards_per_topic()));
 
         Ok(Self {
-            config: cfg,
+            config: cfg.clone(),
             wal,
             mem_buffer,
             shutdown: CancellationToken::new(),
@@ -506,6 +533,10 @@ impl BufferedWriteLayer {
             wal_recovery_duration_ms: AtomicU64::new(0),
             wal_recovery_complete: std::sync::atomic::AtomicBool::new(false),
             recovery_commit_floor: dashmap::DashMap::new(),
+            deferred_tantivy_files: std::sync::Mutex::new(
+                std::fs::read(deferred_tantivy_path(&cfg)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default(),
+            ),
+            deferred_tantivy_path: deferred_tantivy_path(&cfg),
             #[cfg(test)]
             test_crash_after_reliefs: AtomicU64::new(u64::MAX),
         })
@@ -519,6 +550,28 @@ impl BufferedWriteLayer {
     pub fn with_tantivy_indexer(mut self, callback: TantivyIndexCallback) -> Self {
         self.tantivy_index_callback = Some(callback);
         self
+    }
+
+    pub fn deferred_tantivy_files(&self) -> Vec<DeferredTantivyFile> {
+        self.deferred_tantivy_files.lock().unwrap().clone()
+    }
+
+    pub fn complete_deferred_tantivy_file(&self, file: &DeferredTantivyFile) {
+        let mut files = self.deferred_tantivy_files.lock().unwrap();
+        files.retain(|f| f != file);
+        persist_deferred_tantivy_files(&self.deferred_tantivy_path, &files);
+    }
+
+    fn defer_tantivy_files(&self, project_id: &str, table_name: &str, uris: Vec<String>) {
+        let mut files = self.deferred_tantivy_files.lock().unwrap();
+        files.extend(uris.into_iter().filter(|uri| uri.ends_with(".parquet")).map(|uri| DeferredTantivyFile {
+            project_id: project_id.into(),
+            table_name: table_name.into(),
+            uri,
+        }));
+        files.sort();
+        files.dedup();
+        persist_deferred_tantivy_files(&self.deferred_tantivy_path, &files);
     }
 
     /// Effective MemBuffer budget after subtracting other long-lived allocations
@@ -1232,6 +1285,7 @@ impl BufferedWriteLayer {
             newest_entry_timestamp: newest_ts,
             recovery_duration_ms: start.elapsed().as_millis() as u64,
             corrupted_entries_skipped: error_count as u64,
+            tantivy_files_deferred: self.deferred_tantivy_files.lock().unwrap().len() as u64,
         };
 
         self.wal_recovery_duration_ms.store(stats.recovery_duration_ms, Ordering::Relaxed);
@@ -1835,7 +1889,10 @@ impl BufferedWriteLayer {
         // bounds the worst-case fan-out (many tables flushing simultaneously)
         // so concurrent uploads can't saturate S3 connections or grow tantivy
         // writer heap unbounded.
-        if let Some(ref idx_cb) = self.tantivy_index_callback {
+        if self.recovery_active.load(Ordering::Relaxed) {
+            self.defer_tantivy_files(&bucket.project_id, &bucket.table_name, added_files);
+            crate::metrics::record_tantivy_recovery_deferred();
+        } else if let Some(ref idx_cb) = self.tantivy_index_callback {
             let cb = idx_cb.clone();
             let pid = bucket.project_id.clone();
             let tname = bucket.table_name.clone();
@@ -2368,6 +2425,7 @@ impl BufferedWriteLayer {
             drained: self.is_drained(),
             wal_recovery_duration_ms: self.wal_recovery_duration_ms.load(Ordering::Relaxed),
             wal_recovery_complete: self.wal_recovery_complete.load(Ordering::Relaxed),
+            tantivy_recovery_pending_files: self.deferred_tantivy_files.lock().unwrap().len(),
             boot_micros: self.boot_micros,
         }
     }
@@ -2774,13 +2832,24 @@ mod tests {
                         tc.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                Ok(Vec::new())
+                Ok(vec![format!("s3://test/otel_logs_and_spans/project_id={p}/date=2026-07-20/part-{t}.parquet")])
+            })
+        }));
+        let tantivy_builds = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tb = tantivy_builds.clone();
+        layer.tantivy_index_callback = Some(Arc::new(move |_p, _t, _b, _files| {
+            let tb = tb.clone();
+            Box::pin(async move {
+                tb.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             })
         }));
         let layer = Arc::new(layer);
 
         layer.recover_from_wal().await.unwrap();
 
+        assert_eq!(tantivy_builds.load(Ordering::Relaxed), 0, "replay relief must not build Tantivy indexes before WAL recovery completes");
+        assert!(!layer.deferred_tantivy_files().is_empty(), "replay-relief output files must be queued for post-recovery indexing");
         assert!(flushes.load(Ordering::Relaxed) > 0, "replay never drained to Delta despite exceeding the budget");
         assert_eq!(unsafe_claims.load(Ordering::Relaxed), 0, "mid-replay commit claimed a watermark beyond the durable read cursor");
         // 2026-07-08 review finding: mid-replay relief flushes must not

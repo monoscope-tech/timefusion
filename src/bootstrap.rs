@@ -122,6 +122,7 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     // and warm the local index cache with recent blobs (config-gated).
     db.spawn_tantivy_backfill();
     db.spawn_tantivy_prefetch();
+    db.spawn_deferred_tantivy_reindex(Arc::clone(&buffered_layer));
 
     Ok(Bootstrapped { db, buffered_layer, session_ctx: Arc::new(session_context), shutdown: CancellationToken::new() })
 }

@@ -311,6 +311,10 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
         }
     });
 
+    // PGWire is serving and WAL replay has returned; only now may recovery
+    // relief files be indexed.
+    db.spawn_deferred_tantivy_reindex(Arc::clone(&buffered_layer));
+
     // Start gRPC ingestion server alongside PGWire
     let grpc_port = cfg.core.grpc_port;
     // GRPC_TOKEN: required shared bearer token. Clients send

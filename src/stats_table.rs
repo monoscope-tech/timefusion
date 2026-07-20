@@ -135,6 +135,7 @@ impl StatsTableProvider {
             rows.push(("buffered_layer", "boot_micros".into(), s.boot_micros.to_string()));
             rows.push(("wal", "recovery_complete".into(), s.wal_recovery_complete.to_string()));
             rows.push(("wal", "recovery_duration_ms".into(), s.wal_recovery_duration_ms.to_string()));
+            rows.push(("tantivy", "recovery_pending_files".into(), s.tantivy_recovery_pending_files.to_string()));
             rows.push(("wal", "files".into(), s.wal_files.to_string()));
             rows.push(("wal", "disk_bytes".into(), s.wal_disk_bytes.to_string()));
             rows.push(("wal", "disk_mb".into(), format!("{:.1}", s.wal_disk_bytes as f64 / (1024.0 * 1024.0))));

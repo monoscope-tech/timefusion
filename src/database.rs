@@ -1820,6 +1820,37 @@ impl Database {
         });
     }
 
+    /// Rebuild only files deferred by WAL replay, after replay has completed.
+    /// The on-disk queue is removed entry-by-entry only after a successful
+    /// build, so a second restart resumes the remaining work.
+    pub fn spawn_deferred_tantivy_reindex(self: &Arc<Self>, layer: Arc<crate::buffered_write_layer::BufferedWriteLayer>) {
+        let Some(svc) = self.tantivy_indexer().cloned() else { return };
+        if layer.deferred_tantivy_files().is_empty() {
+            return;
+        }
+        let db = Arc::clone(self);
+        tokio::spawn(async move {
+            for file in layer.deferred_tantivy_files() {
+                let table_ref = match db.resolve_table("default", &file.table_name).await {
+                    Ok(table) => Ok(table),
+                    Err(_) => db.resolve_table(&file.project_id, &file.table_name).await,
+                };
+                let result = async {
+                    let table = table_ref?;
+                    let store = table.read().await.log_store().object_store(None);
+                    let rel = crate::tantivy_index::service::parquet_rel_of_uri(&file.uri)
+                        .ok_or_else(|| anyhow::anyhow!("invalid deferred parquet URI {}", file.uri))?;
+                    svc.build_index_for_file(&file.table_name, &file.project_id, rel, &file.uri, store).await
+                }
+                .await;
+                match result {
+                    Ok(()) => layer.complete_deferred_tantivy_file(&file),
+                    Err(e) => warn!("tantivy recovery reindex failed for {}/{} {}: {e:#}", file.project_id, file.table_name, file.uri),
+                }
+            }
+        });
+    }
+
     /// Startup cache warmer (gated on `timefusion_tantivy_prefetch_days`):
     /// pull recent index blobs into the local disk cache in the background.
     pub fn spawn_tantivy_prefetch(&self) {

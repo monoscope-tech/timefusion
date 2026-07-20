@@ -73,6 +73,7 @@ counter_registry! {
     tantivy_prefilter_skipped  => "timefusion.tantivy.prefilter_skipped": "Queries where tantivy lookup was attempted but pushdown was skipped (no index, hit cap, or low selectivity)",
     tantivy_prefilter_errors   => "timefusion.tantivy.prefilter_errors": "Tantivy lookups that errored (S3 down, parse failure, etc.)",
     tantivy_build_failures     => "timefusion.tantivy.build_failures": "Post-flush tantivy index builds that errored — accumulating drift means queries silently fall back to UDF scan",
+    tantivy_recovery_deferred  => "timefusion.tantivy.recovery_deferred": "Parquet files whose Tantivy builds were deferred until WAL replay completed",
     dedup_dropped_rows         => "timefusion.flush.dedup_dropped_rows": "Rows collapsed by per-table dedup_keys (last-write-wins) before Delta commit",
     optimize_partitions_rewritten => "timefusion.optimize.partitions_rewritten": "Date partitions rewritten by full (z-order) optimize",
     optimize_partitions_skipped   => "timefusion.optimize.partitions_skipped": "Date partitions skipped by full optimize because their file set was unchanged since the last run (cache churn avoided)",
@@ -203,6 +204,9 @@ pub fn init_metrics(
     layer_counter!("timefusion.mem_buffer.rows_flushed_total", "Cumulative rows drained from MemBuffer to Delta", |s| s.rows_flushed_total);
     layer_gauge!("timefusion.wal.disk_bytes", "Disk bytes occupied by WAL shards", |s| s.wal_disk_bytes);
     layer_gauge!("timefusion.wal.files", "Number of WAL segment files on disk", |s| s.wal_files as u64);
+    layer_gauge!("timefusion.tantivy.recovery_pending_files", "Committed Parquet files awaiting post-WAL-replay Tantivy indexing", |s| s
+        .tantivy_recovery_pending_files
+        as u64);
 
     // Index lag: how far behind ingest the newest published tantivy index is.
     // Computed as max(0, now - newest_max_timestamp). Surfaces the post-flush
@@ -300,6 +304,7 @@ simple_recorders! {
     record_tantivy_prefilter_skipped => tantivy_prefilter_skipped,
     record_tantivy_prefilter_error => tantivy_prefilter_errors,
     record_tantivy_build_failure => tantivy_build_failures,
+    record_tantivy_recovery_deferred => tantivy_recovery_deferred,
     record_count_pushdown_used => count_pushdown_used,
     record_backpressure_engaged => backpressure_engaged,
     record_backpressure_rejected => backpressure_rejected,
