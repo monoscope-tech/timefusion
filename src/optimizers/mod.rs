@@ -141,6 +141,26 @@ pub mod time_range_partition_pruner {
         walk(&predicate, time_column, &mut date_filters);
         date_filters.into_iter().fold(predicate, Expr::and)
     }
+
+    /// Collect every `date <op> Date32(day)` conjunct in an AND-tree — the
+    /// bounds `with_date_partition_filters` derived (or that were already
+    /// present). Used to log why a merge did/didn't prune: an empty result on a
+    /// predicate that has a time filter means the timestamp→date derivation
+    /// didn't fire (a shape gap → full partition scan).
+    pub fn extract_date_bounds(expr: &Expr) -> Vec<(Operator, i32)> {
+        match expr {
+            Expr::BinaryExpr(BinaryExpr { left, op: Operator::And, right }) => {
+                let mut v = extract_date_bounds(left);
+                v.extend(extract_date_bounds(right));
+                v
+            }
+            Expr::BinaryExpr(BinaryExpr { left, op, right }) => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(c), Expr::Literal(ScalarValue::Date32(Some(day)), _)) if c.name == "date" => vec![(*op, *day)],
+                _ => vec![],
+            },
+            _ => vec![],
+        }
+    }
 }
 
 /// Utilities for checking project_id filters

@@ -733,7 +733,26 @@ fn delta_leg_predicate(buffered_layer: Option<&Arc<BufferedWriteLayer>>, table_n
     // partition — only for tables actually partitioned by `date`.
     let partitions_by_date = crate::schema_loader::get_schema(table_name).is_some_and(|s| s.partitions.iter().any(|p| p == "date"));
     Some(match base {
-        Some(p) if partitions_by_date => Some(crate::optimizers::time_range_partition_pruner::with_date_partition_filters(p, time_col)),
+        Some(p) if partitions_by_date => {
+            let augmented = crate::optimizers::time_range_partition_pruner::with_date_partition_filters(p, time_col);
+            // Diagnostic for the 2026-07-20 residual full-scans: log the derived
+            // `date` bounds. Empty bounds on a merge that has a time filter means
+            // the timestamp→date derivation missed the predicate shape → the leg
+            // scans every partition. Correlate with ScanMetadataCompleted's
+            // predicate_filtered=0 to find the un-pruned merges.
+            // Diagnostic for the 2026-07-20 residual full-scans. One compact line
+            // per merge: `days` is the span the derived `date` bounds cover.
+            // Correlate with ScanMetadataCompleted.predicate_filtered:
+            //   days=0 (empty)  → shape gap, timestamp→date derivation missed it;
+            //   days large      → legit wide time-window, nothing to prune.
+            let bounds = crate::optimizers::time_range_partition_pruner::extract_date_bounds(&augmented);
+            let day_span = match (bounds.iter().map(|(_, d)| *d).min(), bounds.iter().map(|(_, d)| *d).max()) {
+                (Some(lo), Some(hi)) => hi - lo + 1,
+                _ => 0,
+            };
+            info!(project_id, table_name, date_bounds = bounds.len(), days = day_span, "DML delta-leg date-partition bounds");
+            Some(augmented)
+        }
         other => other,
     })
 }
