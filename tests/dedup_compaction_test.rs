@@ -450,15 +450,17 @@ async fn update_from_on_duplicated_target_updates_all_copies() -> Result<()> {
     Ok(())
 }
 
-/// Reproduction (prod 2026-07-09 `dml coalesce: drain failed … MERGE matched a
-/// target row with multiple source rows`): the cardinality violation is
-/// SOURCE-side. When two source rows carry the same join key, they both match a
-/// single target row and delta-rs aborts the whole MERGE. This is what must be
-/// prevented on the write path (dedup the source last-write-wins before the
-/// MERGE) — target-storage dedup (Fix 1/2/3) does NOT address it.
+/// Regression for the prod 2026-07-09 `MERGE matched a target row with multiple
+/// source rows` cardinality abort, and its 2026-07-19 fix (`split_source_rounds`,
+/// commit 9314499). The violation is SOURCE-side: two source rows sharing a join
+/// key both match one target row, which delta-rs would abort. TF now splits such
+/// a source into successive single-key rounds and applies them last-write-wins
+/// instead of failing — so same-key multi-tag hash enrichment neither errors nor
+/// silently drops tags. The UPDATE must therefore SUCCEED, apply every round
+/// (count = rounds), and leave the target holding the last source row's value.
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
-async fn update_from_fails_on_duplicate_source_keys() -> Result<()> {
+async fn update_from_duplicate_source_keys_applies_last_write_wins() -> Result<()> {
     let cfg = TestConfigBuilder::new("update_dup_source").with_buffer_mode(BufferMode::Enabled).build();
     let _env = walrus_env_guard(&cfg.core.timefusion_data_dir);
     let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
@@ -471,7 +473,7 @@ async fn update_from_fails_on_duplicate_source_keys() -> Result<()> {
     let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
     assert_eq!(delta_physical_row_count(&table_ref).await?, 1, "precondition: exactly one target row");
 
-    // Source with TWO rows for the same id → two source rows match one target row.
+    // Source with TWO rows for the same id → split into two rounds ('a' then 'b').
     let mut ctx = Arc::clone(&db).create_session_context();
     db.setup_session_context(&mut ctx)?;
     let sql = format!(
@@ -479,17 +481,17 @@ async fn update_from_fails_on_duplicate_source_keys() -> Result<()> {
          FROM (VALUES ('dup_id', 'a'), ('dup_id', 'b')) AS u(id, name) \
          WHERE project_id = '{project_id}' AND otel_logs_and_spans.id = u.id"
     );
-    let res = match ctx.sql(&sql).await {
-        Ok(df) => df.collect().await,
-        Err(e) => Err(e),
-    };
+    let updated = ctx.sql(&sql).await?.collect().await?[0].column(0).as_primitive::<datafusion::arrow::datatypes::UInt64Type>().value(0);
+    assert_eq!(updated, 2, "both rounds applied to the single target row (last-write-wins), not aborted");
 
-    let err = res.expect_err("UPDATE ... FROM with duplicate source keys must fail — repro of the prod MERGE cardinality error");
-    let msg = err.to_string().to_lowercase();
-    assert!(
-        msg.contains("multiple source rows") || msg.contains("multiple rows") || msg.contains("cardinality"),
-        "expected a delta-rs MERGE cardinality error, got: {}",
-        err
-    );
+    // Last source row wins; the target stays a single logical row.
+    let rows = ctx
+        .sql(&format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'"))
+        .await?
+        .collect()
+        .await?;
+    let total: usize = rows.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "target remains a single logical row");
+    assert_eq!(rows[0].column(0).as_string_view().value(0), "b", "last source row wins");
     Ok(())
 }
