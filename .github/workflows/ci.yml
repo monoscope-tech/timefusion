@@ -39,8 +39,23 @@ jobs:
   # share ~all artifacts with `cargo test` — running them in one job lets
   # them reuse target/ instead of recompiling the world per-job.
   build-test:
-    name: Clippy & Test
+    name: Clippy & Test (shard ${{ matrix.shard }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    # The test run is the dominant cost: `cargo test` runs the ~24 integration
+    # binaries strictly serially, each re-bootstrapping MinIO/Delta, and the
+    # tantivy/sqllogictest suites dominate — serial runs blew past the 45m cap
+    # (2026-07-20, cancelled). We shard across 4 isolated runners with nextest's
+    # `--partition`, which distributes every test across shards (no target left
+    # unrun, unlike hand-listing `--test` targets) so wall-clock ≈ slowest shard.
+    # `--test-threads=1` per shard is REQUIRED for correctness: many tests are
+    # `#[serial]` because they share the process-global `WALRUS_DATA_DIR`, and
+    # nextest's process-per-test model ignores `serial_test`'s in-process lock
+    # (verified: 9/9 tantivy_e2e fail concurrent). Single-threaded per runner
+    # reproduces today's sequential-per-binary semantics safely.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     # Warm-cache runs finish in ~13m, but a Cargo.lock change busts the
     # rust-cache key and forces a full cold recompile, which alone can approach
     # the old 25m cap and starve the (S3-integration-heavy) test run — the
@@ -119,8 +134,11 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: build-test
+      - uses: taiki-e/install-action@nextest
 
+      # Clippy is shard-independent — run it once (on shard 1) instead of 4×.
       - name: Clippy
+        if: ${{ matrix.shard == 1 }}
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       # Default features only. `--all-features` would enable `e2e`, which runs
@@ -130,8 +148,11 @@ jobs:
       # 2026-07-20). The e2e suite is owned by the `e2e` job below (single-
       # threaded); the only other features are `test` (unused) and `profiling`
       # (prod-only, already lint-covered by the Clippy step's --all-features).
+      #
+      # See the job-level comment for why `--test-threads=1` is required.
+      # `--no-fail-fast` so one failure still reports the rest of the shard.
       - name: Test
-        run: cargo test --locked
+        run: cargo nextest run --locked --no-fail-fast --test-threads=1 --partition hash:${{ matrix.shard }}/4
 
   # E2E suite: full pgwire → BufferedWriteLayer → WAL → Delta path against a
   # per-test MinIO via testcontainers. Runs in its own job so failures are
