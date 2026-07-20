@@ -1142,15 +1142,17 @@ pub async fn perform_delta_merge_update(
             // the target/source aliases the DV op scans under.
             if use_dv {
                 use deltalake::operations::merge_dv::{MergeDvUpdate, merge_update_with_deletion_vectors};
+                let target_predicate = predicate.as_ref().and_then(|p| strip_source_conjuncts(p, &source_cols));
+                let equi_keys = if database.config().maintenance.timefusion_dml_merge_key_prune { join_keys } else { vec![] };
                 return merge_update_with_deletion_vectors(
                     &delta_table,
                     session.as_ref(),
                     MergeDvUpdate {
                         source_batches: vec![source_batch],
                         source_schema,
-                        target_predicate: predicate.as_ref().and_then(|p| strip_source_conjuncts(p, &source_cols)),
-                        join_predicate: join_pred,
-                        equi_keys: if database.config().maintenance.timefusion_dml_merge_key_prune { join_keys } else { vec![] },
+                        target_predicate: target_predicate.clone(),
+                        join_predicate: join_pred.clone(),
+                        equi_keys: equi_keys.clone(),
                         updates: assignments,
                         target_alias: "target".to_string(),
                         source_alias: "source".to_string(),
@@ -1158,7 +1160,19 @@ pub async fn perform_delta_merge_update(
                     },
                 )
                 .await
-                .map_err(exec_err("Failed to execute Delta MERGE UPDATE (deletion vectors)"));
+                .map_err(|e| {
+                    // Diagnostic for the prod "No field named …context___span_id" DV
+                    // merge drops (2026-07-20): local repro couldn't trigger it, so
+                    // capture the exact predicate shape from prod on failure.
+                    warn!(
+                        error = %e,
+                        join_predicate = ?join_pred,
+                        target_predicate = ?target_predicate,
+                        equi_keys = ?equi_keys,
+                        "DV MERGE UPDATE failed — predicate diagnostic"
+                    );
+                    exec_err("Failed to execute Delta MERGE UPDATE (deletion vectors)")(e)
+                });
             }
 
             // Wrap the materialized source RecordBatch as a DataFrame. The

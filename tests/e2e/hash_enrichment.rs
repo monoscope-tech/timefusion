@@ -331,3 +331,46 @@ async fn hash_enrichment_bounded_timestamp_dv_path() -> anyhow::Result<()> {
     assert_eq!(count_by_hash(&client, "B1").await?, 1, "bounded DV enrichment: hash not applied");
     Ok(())
 }
+
+/// PROD REPRO (2026-07-20): with the coalescer ON (prod runs
+/// TIMEFUSION_DML_COALESCE_SECS=60), the deferred Delta-leg merge for an
+/// already-flushed row DROPS after 3 retries with
+/// "No field named otel_logs_and_spans.context___span_id" — so flushed rows
+/// never get their enrichment hashes, breaking anomaly-alert matching. Every
+/// other hash_enrichment test runs the sync path (coalesce=0) and passes; this
+/// one exercises the untested coalescer drain path. Must end with the hash
+/// present.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn coalesced_enrichment_of_flushed_row_is_not_dropped() -> anyhow::Result<()> {
+    let env = E2eEnv::builder()
+        .with_deletion_vectors()
+        .with_dml_merge_key_prune(true)
+        .with_dml_coalesce_secs(60)
+        .with_bucket_duration(Duration::from_secs(60))
+        .start()
+        .await?;
+    let client = env.pg_client().await?;
+
+    // Row lands in Delta and is evicted from the MemBuffer, so only the deferred
+    // Delta leg can apply the enrichment (the mem leg no-ops).
+    insert_span(&client, "c-1", "span-c", "trace-c", FROZEN_START_MICROS).await?;
+    env.force_flush().await?;
+    env.force_evict().await?;
+
+    // Enrich with the EXACT prod shape (nested ORDER BY source), routed through
+    // the coalescer: mem leg no-ops (row evicted), Delta leg deferred.
+    let lo = FROZEN_START_MICROS - 1_000_000;
+    let hi = FROZEN_START_MICROS + 60_000_000;
+    enrich_prod_shape(&client, &["span-c"], &["trace-c"], &["C1"], lo, hi).await?;
+
+    // Drain the coalescer: this is the exact path that DROPS in prod.
+    env.drain_dml_coalescer().await;
+
+    assert_eq!(
+        count_by_hash(&client, "C1").await?,
+        1,
+        "coalesced Delta-leg enrichment of a flushed row was dropped — hash never applied (prod DV+key-prune merge bug)"
+    );
+    Ok(())
+}

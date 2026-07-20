@@ -38,6 +38,7 @@ pub struct E2eEnvBuilder {
     use_deletion_vectors: bool,
     warm_full_files: bool,
     dml_merge_key_prune: bool,
+    dml_coalesce_secs: u64,
 }
 
 impl Default for E2eEnvBuilder {
@@ -59,6 +60,9 @@ impl Default for E2eEnvBuilder {
             // merge-on-read DV write path. Opt out per-test with `without_deletion_vectors`.
             use_deletion_vectors: true,
             dml_merge_key_prune: true,
+            // 0 = synchronous DML (prod-default off). Prod runs 60s; set >0 to
+            // exercise the coalescer defer/drain path in tests.
+            dml_coalesce_secs: 0,
         }
     }
 }
@@ -125,6 +129,12 @@ impl E2eEnvBuilder {
     }
     pub fn with_dml_merge_key_prune(mut self, on: bool) -> Self {
         self.dml_merge_key_prune = on;
+        self
+    }
+    /// Defer `UPDATE ... FROM` Delta legs through the coalescer (prod runs 60s);
+    /// drain explicitly with `E2eEnv::drain_dml_coalescer`. 0 = synchronous.
+    pub fn with_dml_coalesce_secs(mut self, secs: u64) -> Self {
+        self.dml_coalesce_secs = secs;
         self
     }
 
@@ -198,6 +208,7 @@ impl E2eEnvBuilder {
             use_deletion_vectors: self.use_deletion_vectors,
             warm_full_files: self.warm_full_files,
             dml_merge_key_prune: self.dml_merge_key_prune,
+            dml_coalesce_secs: self.dml_coalesce_secs,
             test_id: &test_id,
         });
 
@@ -296,6 +307,7 @@ impl E2eEnv {
             use_deletion_vectors: self.builder.use_deletion_vectors,
             warm_full_files: self.builder.warm_full_files,
             dml_merge_key_prune: self.builder.dml_merge_key_prune,
+            dml_coalesce_secs: self.builder.dml_coalesce_secs,
             test_id: &self.test_id,
         });
 
@@ -329,6 +341,14 @@ impl E2eEnv {
 
     pub async fn force_evict(&self) -> Result<()> {
         self.buffered_layer().force_evict_now().await
+    }
+
+    /// Drain the DML coalescer synchronously (runs the deferred Delta-leg
+    /// merges now). No-op when coalescing is disabled (secs = 0).
+    pub async fn drain_dml_coalescer(&self) {
+        if let Some(c) = self.db().dml_coalescer() {
+            c.drain(self.db()).await;
+        }
     }
 
     /// Wait for the next flush-task iteration to complete (success or
@@ -393,6 +413,7 @@ struct BuildCfgArgs<'a> {
     use_deletion_vectors: bool,
     warm_full_files: bool,
     dml_merge_key_prune: bool,
+    dml_coalesce_secs: u64,
     test_id: &'a str,
 }
 
@@ -419,6 +440,7 @@ fn build_config(args: BuildCfgArgs<'_>) -> Arc<AppConfig> {
     cfg.maintenance.timefusion_use_deletion_vectors = args.use_deletion_vectors;
     cfg.maintenance.timefusion_warm_full_files = args.warm_full_files;
     cfg.maintenance.timefusion_dml_merge_key_prune = args.dml_merge_key_prune;
+    cfg.buffer.timefusion_dml_coalesce_secs = args.dml_coalesce_secs;
     Arc::new(cfg)
 }
 
