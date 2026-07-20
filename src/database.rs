@@ -4366,32 +4366,43 @@ impl Database {
         // in sync by the exact rev pin; a fork rename would need a deliberate bump.
         const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
         let cap = target_size.max(1);
-        let (mut fresh, runs): (Vec<_>, Vec<_>) = table
-            .get_active_add_actions_by_partitions(filters)
-            .try_collect::<Vec<_>>()
-            .await?
-            .into_iter()
-            .partition(|add| add.tags().get(SORTED_RUN_TAG).is_none_or(|v| v.as_deref() != Some("true")));
+        // Don't compact the still-filling tail: files whose newest event is within
+        // SEAL_LAG of now may still receive appends / DV-merge rewrites, so
+        // compacting them (a) races concurrent commits → OCC abort (the wedged
+        // optimize on today's partition, prod 2026-07-20) and (b) would need
+        // re-compaction. Only compact sealed time slices.
+        const SEAL_LAG_MICROS: i64 = 15 * 60 * 1_000_000;
+        let seal = Utc::now().timestamp_micros() - SEAL_LAG_MICROS;
+        let adds: Vec<_> = table.get_active_add_actions_by_partitions(filters).try_collect::<Vec<_>>().await?;
+        // Only untagged (not-yet-sorted) files, sealed, with an event-time range.
+        // Binning by EVENT time (not arrival/modification_time) is what makes the
+        // sorted output runs time-DISJOINT, so file-range pruning can exclude
+        // files outside a query's window (arrival-time binning left every file
+        // overlapping → files_ranges_pruned=56→56, i.e. no pruning).
+        let mut fresh: Vec<(String, i64, i64)> = adds
+            .iter()
+            .filter(|add| add.tags().get(SORTED_RUN_TAG).is_none_or(|v| v.as_deref() != Some("true")))
+            .filter_map(|add| {
+                let min = add.stat_min_i64("timestamp")?;
+                let max = add.stat_max_i64("timestamp")?;
+                (max <= seal).then(|| (add.path().to_string(), min, add.size()))
+            })
+            .collect();
         if fresh.len() < min_files {
             return Ok(vec![]);
         }
-        // Newest-first: recent-window (1h/6h) queries hit the freshest data, so
-        // compacting the newest small files first is what shrinks their file
-        // count. Churn stays bounded — compacted files become tagged sorted runs
-        // and drop out of `fresh` next tick.
-        fresh.sort_unstable_by_key(|add| std::cmp::Reverse(add.modification_time()));
-        let mut bytes = 0;
+        fresh.sort_unstable_by_key(|(_, min, _)| *min);
+        // Pack the earliest contiguous slice up to `cap` → one time-disjoint run
+        // per tick. Small commit converges quickly and shrinks the conflict window;
+        // later ticks pack the next (strictly later) slice.
+        let mut bytes = 0i64;
         let mut files = vec![];
-        for add in fresh {
-            if !files.is_empty() && bytes + add.size() > cap {
+        for (path, _, size) in fresh {
+            if !files.is_empty() && bytes + size > cap {
                 break;
             }
-            bytes += add.size();
-            files.push(add.path().to_string());
-        }
-        // Merge into the most recent existing sorted run if it still fits budget.
-        if let Some(run) = runs.into_iter().max_by_key(|add| add.modification_time()).filter(|run| bytes + run.size() <= cap) {
-            files.push(run.path().to_string());
+            bytes += size;
+            files.push(path);
         }
         Ok(files)
     }
