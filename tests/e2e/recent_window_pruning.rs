@@ -91,10 +91,7 @@ async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
         "predicate was not pushed into the parquet scan (pushdown_rows_pruned=0); \
          the Deletion-Vectors feature gate disabled parquet pushdown.\nplan:\n{plan}"
     );
-    assert!(
-        scanned < total_rows / 2,
-        "scan read {scanned}/{total_rows} rows for a 49-row window — pruning not effective.\nplan:\n{plan}"
-    );
+    assert!(scanned < total_rows / 2, "scan read {scanned}/{total_rows} rows for a 49-row window — pruning not effective.\nplan:\n{plan}");
 
     Ok(())
 }
