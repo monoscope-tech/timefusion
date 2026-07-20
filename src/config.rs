@@ -358,7 +358,7 @@ const_default!(d_false: bool = false);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_query_partitions: usize = 0);
-const_default!(d_plan_cache_capacity: usize = 1024);
+const_default!(d_plan_cache_capacity: usize = 2048);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
 fn d_service_version() -> String {
