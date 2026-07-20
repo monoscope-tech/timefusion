@@ -17,6 +17,12 @@ use crate::config::TelemetryConfig;
 /// Kept for `shutdown_telemetry` to flush buffered log batches at exit.
 static LOGGER_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 
+/// Max spans/logs per OTLP export message. TF's spans/logs embed full query
+/// text, so the SDK default (512) overflowed the collector's 4MB gRPC limit
+/// (messages up to 39MB → every export failed). 32 keeps a typical message
+/// ~2-3MB. See init_telemetry.
+const EXPORT_BATCH: usize = 32;
+
 pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     // Set global propagator for trace context
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
@@ -32,19 +38,26 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
         .with_attributes([KeyValue::new("service.name", service_name.clone()), KeyValue::new("service.version", service_version.clone())])
         .build();
 
-    // Span export honors the standard OTEL_TRACES_EXPORTER=none switch —
-    // prod runs with spans off (per-query span volume) but logs/metrics on.
-    // Note: In opentelemetry-otlp 0.31, message size limits cannot be directly configured
-    // through the public API. The default limit is 4MB for incoming messages.
-    // Batch configuration is handled automatically (batch size 512, delay 5s,
-    // queue 2048).
+    // Span export honors the standard OTEL_TRACES_EXPORTER=none switch. When on
+    // (prod has OTEL_TRACES_EXPORTER=otlp), TF's spans carry full query text +
+    // attributes, so the DEFAULT batch of 512 produced export messages up to
+    // 39MB — far over the collector's 4MB gRPC receive limit — and every export
+    // failed ("resource exhausted"), silently losing TF's self-observability.
+    // opentelemetry-otlp 0.31 can't raise the message-size limit via the public
+    // API, so we cap the batch instead: EXPORT_BATCH keeps a typical message
+    // well under 4MB (≈76KB/span observed → ~2.4MB at 32). A single span larger
+    // than 4MB still can't be sent, but those are rare vs the batch-size overflow.
     let telemetry_layer = if config.otel_traces_exporter.as_deref() == Some("none") {
         None
     } else {
+        use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor};
         let span_exporter =
             opentelemetry_otlp::SpanExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(Duration::from_secs(10)).build()?;
+        let span_processor = BatchSpanProcessor::builder(span_exporter)
+            .with_batch_config(BatchConfigBuilder::default().with_max_export_batch_size(EXPORT_BATCH).build())
+            .build();
         let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
-            .with_batch_exporter(span_exporter)
+            .with_span_processor(span_processor)
             .with_sampler(Sampler::AlwaysOn)
             .with_id_generator(RandomIdGenerator::default())
             .with_resource(resource.clone())
@@ -59,7 +72,12 @@ pub fn init_telemetry(config: &TelemetryConfig) -> anyhow::Result<()> {
     // The bridge must not observe the exporter's own tracing output —
     // tonic/hyper events inside an export would recurse into another export.
     let log_exporter = opentelemetry_otlp::LogExporter::builder().with_tonic().with_endpoint(otlp_endpoint).with_timeout(Duration::from_secs(10)).build()?;
-    let logger_provider = SdkLoggerProvider::builder().with_batch_exporter(log_exporter).with_resource(resource).build();
+    // Slow-statement logs also carry full SQL text, so cap the log batch too
+    // (same 4MB-limit reasoning as spans above).
+    let log_processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(log_exporter)
+        .with_batch_config(opentelemetry_sdk::logs::BatchConfigBuilder::default().with_max_export_batch_size(EXPORT_BATCH).build())
+        .build();
+    let logger_provider = SdkLoggerProvider::builder().with_log_processor(log_processor).with_resource(resource).build();
     let log_bridge =
         opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider).with_filter(tracing_subscriber::filter::filter_fn(|meta| {
             let t = meta.target();
