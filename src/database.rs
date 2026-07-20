@@ -1943,8 +1943,43 @@ impl Database {
         let db = Arc::new(self.background_clone());
         let cancel = self.maintenance_shutdown.clone();
 
-        // Light optimize — dedup + bin-pack recent small files (every ~5 min).
-        spawn_cron_job("Light optimize", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), {
+        // Hot compact — bin-pack today's small files (every ~5 min). Runs WITHOUT
+        // the maintenance_job_sem so it can't be starved behind the dedup backlog
+        // or a long full-optimize: prod 2026-07-20 showed the busy project only
+        // got compacted ~every 40 min because dedup churning an old-date backlog
+        // wedged the shared serial pass >600s. Compaction touches only today; dedup
+        // skips today — disjoint partitions, so decoupling is safe. Peak heap stays
+        // bounded by maintenance_rewrite_sem, acquired per rewrite.
+        spawn_cron_job("Hot compact", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), {
+            let db = db.clone();
+            move || {
+                let db = db.clone();
+                async move {
+                    if !db.config.maintenance.timefusion_light_optimize_enabled {
+                        return;
+                    }
+                    info!("Running scheduled hot-tail compaction on today's small files");
+                    for (table_name, table) in db.unified_tables.read().await.iter() {
+                        if db.maintenance_shutdown.is_cancelled() {
+                            return;
+                        }
+                        db.run_hot_compact_for_table(table, table_name, &format!("unified table '{table_name}'")).await;
+                    }
+                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
+                        if db.maintenance_shutdown.is_cancelled() {
+                            return;
+                        }
+                        db.run_hot_compact_for_table(table, table_name, &format!("custom project '{project_id}' table '{table_name}'")).await;
+                    }
+                }
+            }
+        });
+
+        // Dedup — collapse duplicates in sealed (< today) partitions on its own
+        // cron, decoupled from hot compaction above. Keeps the job_sem so it stays
+        // serialized against the full optimize job (the other job_sem holder).
+        // spawn_cron_job skips overlapping ticks.
+        spawn_cron_job("Dedup", &self.config.maintenance.timefusion_dedup_schedule, cancel.clone(), {
             let db = db.clone();
             move || {
                 let db = db.clone();
@@ -1952,26 +1987,19 @@ impl Database {
                     let Ok(_maintenance_job) = db.maintenance_job_sem.clone().acquire_owned().await else {
                         return;
                     };
-                    // Overlap protection lives in spawn_cron_job (skip-if-running).
-                    info!("Running scheduled light optimize on recent small files");
-                    // Dedup FIRST so the light compact bin-packs already-deduped files —
-                    // otherwise compact would merge duplicates into one file we'd rewrite again.
-                    // Each table is processed in order; a slow table delays the rest of
-                    // the tick but is allowed to finish. The outer maintenance_job_sem
-                    // serializes full maintenance jobs, and spawn_cron_job skips
-                    // overlapping ticks for this schedule.
+                    info!("Running scheduled dedup on sealed partitions");
                     for (table_name, table) in db.unified_tables.read().await.iter() {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
-                        db.run_light_maintenance_for_table(table, table_name, table_name, &format!("unified table '{table_name}'")).await;
+                        db.run_dedup_for_table(table, table_name, table_name, &format!("unified table '{table_name}'")).await;
                     }
                     for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
                         let key = format!("{project_id}:{table_name}");
-                        db.run_light_maintenance_for_table(table, table_name, &key, &format!("custom project '{project_id}' table '{table_name}'")).await;
+                        db.run_dedup_for_table(table, table_name, &key, &format!("custom project '{project_id}' table '{table_name}'")).await;
                     }
                 }
             }
@@ -5552,16 +5580,11 @@ impl Database {
         Ok(())
     }
 
-    /// One table's light maintenance (dedup then bin-pack). The old 90s/180s
-    /// per-table deadlines are now warning thresholds: a slow-but-healthy table
-    /// is allowed to finish, while exceeding the threshold is logged/metriced.
-    /// Actual errors and shutdown still stop work.
-    async fn run_light_maintenance_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
-        // These used to be cancellation deadlines; they are now warning
-        // thresholds. A slow-but-healthy table is allowed to finish, while
-        // exceeding the threshold is logged/metriced for observability.
+    /// One table's dedup of sealed partitions (dirty-bin rewrite + optional
+    /// fallback sweep). The 90s deadline is a warning threshold, not a
+    /// cancellation: a slow-but-healthy table is allowed to finish.
+    async fn run_dedup_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, dedup_key: &str, label: &str) {
         const DEDUP_WARN: std::time::Duration = std::time::Duration::from_secs(90);
-        const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
         let t0 = std::time::Instant::now();
         match self.dedup_dirty_bins_for_table(table, table_name).await {
             Ok(()) if t0.elapsed() > DEDUP_WARN => {
@@ -5588,10 +5611,12 @@ impl Database {
                 }
             }
         }
-        if !self.config.maintenance.timefusion_light_optimize_enabled {
-            debug!("Light optimize disabled for {label}");
-            return;
-        }
+    }
+
+    /// One table's hot-tail compaction (bin-pack today's small files). The 180s
+    /// deadline is a warning threshold, not a cancellation.
+    async fn run_hot_compact_for_table(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, label: &str) {
+        const OPTIMIZE_WARN: std::time::Duration = std::time::Duration::from_secs(180);
         let t0 = std::time::Instant::now();
         match self.optimize_table_light(table, table_name).await {
             Ok(()) => {
@@ -5624,48 +5649,48 @@ impl Database {
         let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, declare_sorted);
 
-        // Best-effort optimize: retry on OCC conflict but DO NOT hold the
-        // flush lock. Earlier we wrapped this in `with_flush_paused` to
-        // ensure optimize won the race against flush commits, but the
-        // retry+OCC time is 4–10s and flushes accumulate buckets during
-        // that window — at 25h-bench scale we saw 46+ stuck MemBuffer
-        // buckets and a 10× drop in ingest throughput. Better to let
-        // optimize fail loudly during heavy ingest; the next scheduler
-        // tick (5 min later) usually catches a quiet enough window.
-        let mut failed = 0;
+        // Fan out across projects so the most-fragmented one (ordered first by
+        // hot_project_ids) doesn't wait behind the others. Actual concurrent
+        // rewrites are still bounded by maintenance_rewrite_sem (acquired inside
+        // optimize_table_light_inner), so peak heap is unchanged — parallelism is
+        // opt-in via TIMEFUSION_MAINTENANCE_REWRITE_CONCURRENCY (default 1 = serial).
+        // Per-project optimizes commit to disjoint (project_id, today) partitions,
+        // so concurrent commits don't OCC-conflict with each other.
         let today_str = today.to_string();
-        for project_id in project_ids {
-            let partition_filters =
-                vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", today_str.as_str()))?];
-            let selected_files = {
-                let table = table_ref.read().await;
-                Self::light_optimize_tail(&table, &partition_filters, target_size, self.config.maintenance.timefusion_compact_min_files).await?
-            };
-            if selected_files.is_empty() {
-                continue;
-            }
-            info!(table_name, project_id, date = %today, selected_files = selected_files.len(), event = "light_optimize_tail_selected");
-            if let Err(e) = self
-                .optimize_table_light_inner(
-                    table_ref,
-                    table_name,
-                    today,
-                    &project_id,
-                    &partition_filters,
-                    &selected_files,
-                    target_size,
-                    &writer_properties,
-                    optimize_type.clone(),
-                    std::time::Instant::now(),
-                )
-                .await
-            {
-                failed += 1;
-                warn!("Light optimize failed for project={} date={}: {}", project_id, today, e);
-            }
-        }
+        let concurrency = self.config.maintenance.timefusion_maintenance_rewrite_concurrency.max(1);
+        let failed = futures::stream::iter(project_ids)
+            .map(|project_id| self.optimize_one_hot_project(table_ref, table_name, today, &today_str, project_id, target_size, &writer_properties, &optimize_type))
+            .buffer_unordered(concurrency)
+            .filter(|r| std::future::ready(r.is_err()))
+            .count()
+            .await;
         anyhow::ensure!(failed == 0, "Light optimize failed for {failed} hot partition(s)");
         Ok(())
+    }
+
+    /// Compact one hot `(project_id, today)` partition: select the bounded tail
+    /// file set and hand it to the retrying optimize. Errors are logged and
+    /// returned so the caller can count failed partitions.
+    #[allow(clippy::too_many_arguments)]
+    async fn optimize_one_hot_project(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today: chrono::NaiveDate, today_str: &str, project_id: String, target_size: i64,
+        writer_properties: &WriterProperties, optimize_type: &deltalake::operations::optimize::OptimizeType,
+    ) -> Result<()> {
+        let partition_filters = vec![
+            PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
+            PartitionFilter::try_from(("date", "=", today_str))?,
+        ];
+        let selected_files = {
+            let table = table_ref.read().await;
+            Self::light_optimize_tail(&table, &partition_filters, target_size, self.config.maintenance.timefusion_compact_min_files).await?
+        };
+        if selected_files.is_empty() {
+            return Ok(());
+        }
+        info!(table_name, project_id, date = %today, selected_files = selected_files.len(), event = "light_optimize_tail_selected");
+        self.optimize_table_light_inner(table_ref, table_name, today, &project_id, &partition_filters, &selected_files, target_size, writer_properties, optimize_type.clone(), std::time::Instant::now())
+            .await
+            .inspect_err(|e| warn!("Light optimize failed for project={} date={}: {}", project_id, today, e))
     }
 
     /// Inner optimize loop. Caller is expected to hold the flush lock when

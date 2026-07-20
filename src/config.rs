@@ -988,6 +988,12 @@ pub struct MaintenanceConfig {
     pub timefusion_optimize_max_concurrent_tasks: usize,
     #[serde(default = "d_light_schedule")]
     pub timefusion_light_optimize_schedule: String,
+    /// Dirty-bin dedup of sealed (< today) partitions. Runs on its OWN cron,
+    /// decoupled from hot-tail compaction: dedup churning an old-date backlog
+    /// must not starve today's compaction (they touch disjoint partitions —
+    /// dedup skips today, compaction only touches today). Default 5 min.
+    #[serde(default = "d_light_schedule")]
+    pub timefusion_dedup_schedule: String,
     #[serde(default = "d_optimize_schedule")]
     pub timefusion_optimize_schedule: String,
     #[serde(default = "d_consolidate_schedule")]
