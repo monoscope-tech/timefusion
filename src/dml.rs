@@ -1013,6 +1013,7 @@ fn requalify_for_merge(expr: Expr, source_cols: &std::collections::HashSet<Strin
 ///     high-cardinality key isn't in the stats schema, so the file-skipping scan
 ///     fails to resolve it ("No field named otel_logs_and_spans.context___span_id",
 ///     dropping ~1000 rows/drop after 3 retries — prod 2026-07-20).
+///
 /// The join_predicate still enforces the equi-keys and their non-null-ness, so
 /// dropping these from the file-pruning predicate is sound (pruning is only an
 /// optimization). Columns matched by NAME, per [`requalify_for_merge`]'s convention.
