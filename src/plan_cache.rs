@@ -433,11 +433,29 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
     use std::ops::ControlFlow;
 
     use datafusion::sql::sqlparser::{
-        ast::{Expr as SqlExpr, Value, ValueWithSpan, visit_expressions_mut},
+        ast::{Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Value, ValueWithSpan, visit_expressions_mut},
         tokenizer::Span,
     };
     let mut stmt = stmt.clone();
     let mut values: Vec<ScalarValue> = Vec::new();
+
+    // Parameterize a numeric literal ONLY when reached as a value-context child
+    // (function arg, comparison operand, CASE/BETWEEN/cast). A bare
+    // `Expr::Value(Number)` — which is exactly what GROUP BY / ORDER BY ordinals
+    // and LIMIT / OFFSET are — is never a child of these containers, so ordinals
+    // keep their positional meaning at every nesting level. Numbers that can't be
+    // parsed (or would lose precision) stay inline. This is the fix for the
+    // dashboard shape fragmentation: time_bucket(60,…), approx_percentile(0.95,…),
+    // `duration <= 500`, epoch bounds all differ only by numeric literals.
+    fn take_number(e: &mut SqlExpr, base: usize, values: &mut Vec<ScalarValue>) {
+        if let SqlExpr::Value(vs) = e
+            && let Value::Number(n, _) = &vs.value
+            && let Some(sv) = n.parse::<i64>().map(|i| ScalarValue::Int64(Some(i))).ok().or_else(|| n.parse::<f64>().ok().map(|f| ScalarValue::Float64(Some(f))))
+        {
+            values.push(sv);
+            vs.value = Value::Placeholder(format!("${}", base + values.len()));
+        }
+    }
     // Capture "now" once so every now()/current_timestamp in the statement
     // substitutes to the same fresh instant (matching SQL's single-evaluation
     // semantics). Timezone-aware nanosecond mirrors DataFusion's native now();
@@ -465,6 +483,52 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
             SqlExpr::Function(f) if f.name.0.last().and_then(|n| n.as_ident()).is_some_and(|i| is_parameterizable_time_fn(&i.value)) => {
                 values.push(ScalarValue::TimestampNanosecond(Some(now_ns), Some("+00:00".into())));
                 *e = SqlExpr::Value(ValueWithSpan { value: Value::Placeholder(format!("${}", base + values.len())), span: Span::empty() });
+            }
+            // Value-context containers: parameterize their direct numeric-literal
+            // children. See take_number — this deliberately never touches a
+            // standalone Number (ordinals / LIMIT / OFFSET). Gated on
+            // `include_strings`: the mixed now()+`$N` execute path calls with
+            // `false` and binds only time-fn placeholders positionally, so it must
+            // not gain extra numeric placeholders.
+            SqlExpr::BinaryOp { left, right, .. } if include_strings => {
+                take_number(left, base, &mut values);
+                take_number(right, base, &mut values);
+            }
+            SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) | SqlExpr::Cast { expr, .. } if include_strings => take_number(expr, base, &mut values),
+            SqlExpr::Between { expr, low, high, .. } if include_strings => {
+                take_number(expr, base, &mut values);
+                take_number(low, base, &mut values);
+                take_number(high, base, &mut values);
+            }
+            SqlExpr::InList { expr, list, .. } if include_strings => {
+                take_number(expr, base, &mut values);
+                list.iter_mut().for_each(|e| take_number(e, base, &mut values));
+            }
+            SqlExpr::Case { operand, conditions, else_result, .. } if include_strings => {
+                if let Some(op) = operand {
+                    take_number(op, base, &mut values);
+                }
+                for w in conditions.iter_mut() {
+                    take_number(&mut w.condition, base, &mut values);
+                    take_number(&mut w.result, base, &mut values);
+                }
+                if let Some(er) = else_result {
+                    take_number(er, base, &mut values);
+                }
+            }
+            SqlExpr::Function(f) if include_strings => {
+                if let FunctionArguments::List(list) = &mut f.args {
+                    for arg in list.args.iter_mut() {
+                        let ex = match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                            FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } | FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(e), .. } => Some(e),
+                            _ => None,
+                        };
+                        if let Some(e) = ex {
+                            take_number(e, base, &mut values);
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -864,22 +928,58 @@ mod tests {
     }
 
     #[test]
-    fn parameterize_extracts_strings_in_walk_order_and_skips_numbers() {
+    fn parameterize_extracts_strings_and_value_context_numbers_in_walk_order() {
         let stmt = parse("SELECT id FROM t WHERE project_id = 'p1' AND ts > '2026-07-01' AND n = 5 LIMIT 100");
-        let (param, values) = parameterize_statement(&stmt, 0, true).expect("has string literals");
+        let (param, values) = parameterize_statement(&stmt, 0, true).expect("has literals");
         let text = param.to_string();
-        assert!(text.contains("$1") && text.contains("$2"), "strings become placeholders: {text}");
-        assert!(text.contains("= 5") && text.contains("LIMIT 100"), "numbers stay inline: {text}");
-        assert_eq!(values, vec![ScalarValue::Utf8(Some("p1".into())), ScalarValue::Utf8(Some("2026-07-01".into()))], "values extracted in walk order");
-        // Same shape with different literals → identical shape key.
-        let stmt2 = parse("SELECT id FROM t WHERE project_id = 'p2' AND ts > '2026-07-04' AND n = 5 LIMIT 100");
+        assert!(text.contains("$1") && text.contains("$2") && text.contains("$3"), "strings + the comparison number become placeholders: {text}");
+        assert!(text.contains("LIMIT 100"), "LIMIT stays inline (not an ordinal-safe value context): {text}");
+        // Walk order: 'p1', '2026-07-01', then the numeric 5 from `n = 5`.
+        assert_eq!(
+            values,
+            vec![ScalarValue::Utf8(Some("p1".into())), ScalarValue::Utf8(Some("2026-07-01".into())), ScalarValue::Int64(Some(5))],
+            "values extracted in walk order"
+        );
+        // Same shape with different literals (incl. the number) → identical shape key.
+        let stmt2 = parse("SELECT id FROM t WHERE project_id = 'p2' AND ts > '2026-07-04' AND n = 9 LIMIT 100");
         let (param2, _) = parameterize_statement(&stmt2, 0, true).unwrap();
         assert_eq!(text, param2.to_string(), "shape key must be literal-insensitive");
     }
 
     #[test]
-    fn parameterize_none_without_string_literals() {
-        assert!(parameterize_statement(&parse("SELECT count(*) FROM t WHERE n = 5"), 0, true).is_none());
+    fn parameterize_none_without_any_literals() {
+        // No string/number/time-fn literals to lift → nothing to cache-generalize.
+        assert!(parameterize_statement(&parse("SELECT count(*) FROM t"), 0, true).is_none());
+    }
+
+    #[test]
+    fn numeric_literals_in_value_contexts_parameterize() {
+        // The 2026-07-20 plateau fix: dashboard shapes that differ only by numeric
+        // literals (bucket size, percentile, duration thresholds, epoch bounds) must
+        // collapse to one cached shape instead of replanning every refresh.
+        let a = "SELECT time_bucket(60, timestamp), approx_percentile(0.95, duration) FROM t WHERE project_id = 'p' AND duration <= 500 AND timestamp >= 1721000000000000";
+        let b = "SELECT time_bucket(300, timestamp), approx_percentile(0.99, duration) FROM t WHERE project_id = 'p' AND duration <= 900 AND timestamp >= 1722000000000000";
+        let (pa, va) = parameterize_statement(&parse(a), 0, true).expect("numbers parameterize");
+        let (pb, _) = parameterize_statement(&parse(b), 0, true).unwrap();
+        let ta = pa.to_string();
+        assert!(!ta.contains("60") && !ta.contains("0.95") && !ta.contains("500"), "numerics replaced: {ta}");
+        assert_eq!(ta, pb.to_string(), "shape identical across differing numeric literals");
+        // 4 numbers + the 'p' string all captured.
+        assert_eq!(va.len(), 5, "captured {:?}", va);
+    }
+
+    #[test]
+    fn ordinals_and_limit_stay_inline() {
+        // SAFETY regression: GROUP BY / ORDER BY ordinals and LIMIT/OFFSET are bare
+        // Number nodes; parameterizing them would change ORDER BY 1 into ordering by
+        // a constant (wrong results). Only the 'p' string may be lifted.
+        let stmt = parse("SELECT status_code, count(*) FROM t WHERE project_id = 'p' GROUP BY 1 ORDER BY 1 LIMIT 100 OFFSET 20");
+        let (param, values) = parameterize_statement(&stmt, 0, true).expect("'p' parameterizes");
+        let text = param.to_string();
+        assert!(text.contains("GROUP BY 1"), "group-by ordinal inline: {text}");
+        assert!(text.contains("ORDER BY 1"), "order-by ordinal inline: {text}");
+        assert!(text.contains("LIMIT 100") && text.contains("OFFSET 20"), "limit/offset inline: {text}");
+        assert_eq!(values, vec![ScalarValue::Utf8(Some("p".into()))], "only the string lifted, no ordinals");
     }
 
     #[test]
