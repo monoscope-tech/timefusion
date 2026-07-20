@@ -215,15 +215,8 @@ fn request_reclaim_sweep_deletes_consumed_files_promptly() {
     let dir = common::current_wal_dir();
     // Data files are millis-named (all digits); everything else (index db,
     // meta) is excluded.
-    let data_files = || {
-        std::fs::read_dir(&dir)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit()))
-                    .count()
-            })
-            .unwrap_or(0)
-    };
+    let data_files =
+        || std::fs::read_dir(&dir).map(|rd| rd.flatten().filter(|e| e.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit())).count()).unwrap_or(0);
 
     // Fill file 1 completely (100 x 10MiB blocks) and roll into file 2 so
     // file 1 becomes fully_allocated: ~9MiB entries take one block each,
@@ -248,10 +241,7 @@ fn request_reclaim_sweep_deletes_consumed_files_promptly() {
             break; // fully-consumed file reclaimed; only the active file remains
         }
         if std::time::Instant::now() >= deadline {
-            let states: Vec<_> = Walrus::file_reclaim_states()
-                .into_iter()
-                .filter(|(p, ..)| p.starts_with(dir.to_string_lossy().as_ref()))
-                .collect();
+            let states: Vec<_> = Walrus::file_reclaim_states().into_iter().filter(|(p, ..)| p.starts_with(dir.to_string_lossy().as_ref())).collect();
             panic!("consumed file not reclaimed within 15s of request_reclaim_sweep (data files={n}); states={states:?}");
         }
         std::thread::sleep(std::time::Duration::from_millis(100));

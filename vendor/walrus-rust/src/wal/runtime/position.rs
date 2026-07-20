@@ -180,10 +180,7 @@ impl Walrus {
     /// `(path, locked, checkpointed, total, fully_allocated)`.
     #[doc(hidden)]
     pub fn file_reclaim_states() -> Vec<(String, u16, u16, u16, bool)> {
-        FileStateTracker::all_paths()
-            .into_iter()
-            .filter_map(|p| FileStateTracker::get_state_snapshot(&p).map(|(l, c, t, f)| (p, l, c, t, f)))
-            .collect()
+        FileStateTracker::all_paths().into_iter().filter_map(|p| FileStateTracker::get_state_snapshot(&p).map(|(l, c, t, f)| (p, l, c, t, f))).collect()
     }
 
     /// Test/diagnostic accessor: per-block file accounting for the file
