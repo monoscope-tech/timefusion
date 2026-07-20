@@ -5462,7 +5462,8 @@ impl Database {
             info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
             let started = std::time::Instant::now();
             let parsed_date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")?;
-            let result = match tokio::time::timeout(DIRTY_BIN_BUDGET, self.dedup_partition_range(table, table_name, &project_id, parsed_date, Some(bin))).await {
+            let result = match tokio::time::timeout(DIRTY_BIN_BUDGET, self.dedup_partition_range(table, table_name, &project_id, parsed_date, Some(bin))).await
+            {
                 Ok(r) => r,
                 Err(_) => {
                     // Over budget — requeue and move on so other maintenance runs.
