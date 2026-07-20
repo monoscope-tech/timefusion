@@ -1002,15 +1002,21 @@ fn requalify_for_merge(expr: Expr, source_cols: &std::collections::HashSet<Strin
     .map_err(exec_err("Failed to requalify for merge"))
 }
 
-/// Keep only the conjuncts of `predicate` that reference no source column, for
-/// use as the DV merge's file-pruning `target_predicate`. The equi-key
-/// equalities (`o.context___span_id = u.span_id`) and the `NOT (... @> u.tag)`
-/// cross-filter reference source columns: they can't prune target files by stats
-/// and make the fork's file-skipping scan fail to resolve the column, dropping
-/// rows after 3 retries (prod 2026-07-19). The join_predicate still enforces them.
-/// Source columns are identified by name in `source_cols`, matching
-/// [`requalify_for_merge`]'s convention.
-fn strip_source_conjuncts(predicate: &Expr, source_cols: &std::collections::HashSet<String>) -> Option<Expr> {
+/// Keep only the conjuncts of `predicate` that reference none of `strip_cols`,
+/// for use as the DV merge's file-pruning `target_predicate`. `strip_cols` holds
+/// the source columns AND the equi-key TARGET columns, because neither class can
+/// prune target files and both break the fork's file-skipping scan:
+///   - equi-key equalities (`o.context___span_id = u.span_id`) and `NOT (... @> u.tag)`
+///     reference SOURCE columns the file scan has no schema for;
+///   - the optimizer inserts `IsNotNull(o.context___span_id)` null-rejection on
+///     the join keys — TARGET-only, so it survived a source-only strip, but the
+///     high-cardinality key isn't in the stats schema, so the file-skipping scan
+///     fails to resolve it ("No field named otel_logs_and_spans.context___span_id",
+///     dropping ~1000 rows/drop after 3 retries — prod 2026-07-20).
+/// The join_predicate still enforces the equi-keys and their non-null-ness, so
+/// dropping these from the file-pruning predicate is sound (pruning is only an
+/// optimization). Columns matched by NAME, per [`requalify_for_merge`]'s convention.
+fn strip_source_conjuncts(predicate: &Expr, strip_cols: &std::collections::HashSet<String>) -> Option<Expr> {
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     let mut conjuncts = Vec::new();
     let mut stack = vec![predicate.clone()];
@@ -1027,17 +1033,17 @@ fn strip_source_conjuncts(predicate: &Expr, source_cols: &std::collections::Hash
         .into_iter()
         .rev()
         .filter(|c| {
-            let mut has_source = false;
+            let mut hit = false;
             let _ = c.apply(|e| {
                 if let Expr::Column(col) = e
-                    && source_cols.contains(&col.name)
+                    && strip_cols.contains(&col.name)
                 {
-                    has_source = true;
+                    hit = true;
                     return Ok(TreeNodeRecursion::Stop);
                 }
                 Ok(TreeNodeRecursion::Continue)
             });
-            !has_source
+            !hit
         })
         .reduce(|acc, c| acc.and(c))
 }
@@ -1142,7 +1148,12 @@ pub async fn perform_delta_merge_update(
             // the target/source aliases the DV op scans under.
             if use_dv {
                 use deltalake::operations::merge_dv::{MergeDvUpdate, merge_update_with_deletion_vectors};
-                let target_predicate = predicate.as_ref().and_then(|p| strip_source_conjuncts(p, &source_cols));
+                // Strip source cols AND equi-key target cols from the file-pruning
+                // predicate (the latter carry the optimizer's IsNotNull(join-key)
+                // conjuncts the fork's stats scan can't resolve — prod drop bug).
+                let mut strip_cols = source_cols.clone();
+                strip_cols.extend(join_keys.iter().map(|(t, _)| t.clone()));
+                let target_predicate = predicate.as_ref().and_then(|p| strip_source_conjuncts(p, &strip_cols));
                 let equi_keys = if database.config().maintenance.timefusion_dml_merge_key_prune { join_keys } else { vec![] };
                 return merge_update_with_deletion_vectors(
                     &delta_table,
@@ -1242,6 +1253,27 @@ mod strip_tests {
         assert!(s.contains("timestamp"), "kept timestamp: {s}");
         assert!(!s.contains("span_id"), "dropped the source equi-key: {s}");
         assert!(!s.contains("tag"), "dropped the source cross-filter: {s}");
+    }
+
+    #[test]
+    fn strips_isnotnull_on_equi_key_target_columns() {
+        // Prod 2026-07-20 drop bug: the optimizer inserts IsNotNull(o.context___span_id)
+        // null-rejection on the join keys. It's TARGET-only (survives a source-only
+        // strip) but the high-cardinality key isn't in the stats schema, so the fork's
+        // file-skipping scan fails to resolve it. strip_cols includes the equi-key
+        // TARGET columns so these conjuncts are dropped from the file-pruning predicate.
+        let strip_cols: HashSet<String> = ["span_id", "trace_id", "tag", "context___span_id", "context___trace_id"].iter().map(|s| s.to_string()).collect();
+        let pred = col("date")
+            .gt_eq(lit("2026-07-20"))
+            .and(col("timestamp").gt(lit(1000i64)))
+            .and(col("context___span_id").is_not_null()) // optimizer null-rejection — must strip
+            .and(col("context___trace_id").is_not_null());
+
+        let stripped = strip_source_conjuncts(&pred, &strip_cols).expect("date + timestamp remain");
+        let s = format!("{stripped}");
+        assert!(s.contains("date") && s.contains("timestamp"), "kept prunable partition/stat conjuncts: {s}");
+        assert!(!s.contains("context___span_id"), "dropped IsNotNull(context___span_id): {s}");
+        assert!(!s.contains("context___trace_id"), "dropped IsNotNull(context___trace_id): {s}");
     }
 
     #[test]
