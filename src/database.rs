@@ -4343,7 +4343,7 @@ impl Database {
             .try_collect::<Vec<_>>()
             .await?
             .into_iter()
-            .partition(|add| !add.tags().get(SORTED_RUN_TAG).is_some_and(|v| v.as_deref() == Some("true")));
+            .partition(|add| add.tags().get(SORTED_RUN_TAG).is_none_or(|v| v.as_deref() != Some("true")));
         if fresh.len() < min_files {
             return Ok(vec![]);
         }
@@ -5635,10 +5635,8 @@ impl Database {
         let mut failed = 0;
         let today_str = today.to_string();
         for project_id in project_ids {
-            let partition_filters = vec![
-                PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
-                PartitionFilter::try_from(("date", "=", today_str.as_str()))?,
-            ];
+            let partition_filters =
+                vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", today_str.as_str()))?];
             let selected_files = {
                 let table = table_ref.read().await;
                 Self::light_optimize_tail(&table, &partition_filters, target_size, self.config.maintenance.timefusion_compact_min_files).await?
