@@ -1267,6 +1267,13 @@ impl BufferedWriteLayer {
             self.write_post_flush_snapshot().await;
         }
 
+        // Cursors are parked and durable: every file whose entries sit wholly
+        // behind them is position-exactly reclaimable NOW — ask walrus to run
+        // its deletion sweep on the next background tick instead of waiting
+        // the periodic 1000-tick cadence (a consumed multi-GB replay backlog
+        // otherwise occupies disk for ~200s after boot).
+        self.wal.request_reclaim_sweep();
+
         // NB: replay loads entries straight into MemBuffer (bypassing the
         // insert-path reservation), so a large backlog can leave the process
         // over the memory budget. We deliberately do NOT drain here — that

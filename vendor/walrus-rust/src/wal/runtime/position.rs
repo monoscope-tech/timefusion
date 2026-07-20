@@ -159,6 +159,33 @@ impl Walrus {
         Ok(())
     }
 
+    /// Re-evaluate every tracked file's delete-eligibility and ask the
+    /// background worker to run its deletion sweep on the next tick
+    /// (~fsync interval) instead of waiting for the periodic 1000-tick
+    /// cadence. The re-evaluation matters as much as the sweep: a
+    /// checkpoint-time `flush_check` can race `set_fully_allocated` /
+    /// block-unlock and miss the enqueue, and its built-in retry only fires
+    /// on a future checkpoint of the same file — which never comes after a
+    /// final cursor fast-forward (e.g. a boot's cursor restore over a fully
+    /// consumed backlog). Safe to call at any time — deletion still happens
+    /// on the worker thread with the mmap/fd pool dropped first.
+    pub fn request_reclaim_sweep(&self) {
+        for path in FileStateTracker::all_paths() {
+            super::allocator::flush_check(path);
+        }
+        super::SWEEP_NOW.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Test/diagnostic accessor: every tracked file's reclaim state as
+    /// `(path, locked, checkpointed, total, fully_allocated)`.
+    #[doc(hidden)]
+    pub fn file_reclaim_states() -> Vec<(String, u16, u16, u16, bool)> {
+        FileStateTracker::all_paths()
+            .into_iter()
+            .filter_map(|p| FileStateTracker::get_state_snapshot(&p).map(|(l, c, t, f)| (p, l, c, t, f)))
+            .collect()
+    }
+
     /// Test/diagnostic accessor: per-block file accounting for the file
     /// owning `block_id`. Returns `(checkpointed, total)` block counts on
     /// that file — file becomes eligible for deletion when

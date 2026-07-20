@@ -191,3 +191,69 @@ fn position_snapshot_then_set_recreates_cursor() {
     assert_eq!(b.data, b"4");
     assert!(wal.read_next(topic, true).unwrap().is_none());
 }
+
+/// `request_reclaim_sweep` must get a fully-consumed, fully-allocated file
+/// physically deleted within a background tick or two — TimeFusion calls it
+/// after boot recovery parks the cursors, so a consumed replay backlog frees
+/// its disk immediately instead of waiting the periodic 1000-tick (~200s)
+/// sweep cadence. Differential: without the forced sweep this test times out
+/// (the periodic sweep is minutes away).
+///
+/// IGNORED by default: `BlockStateTracker`/`FileStateTracker` are
+/// process-global keyed by per-INSTANCE block ids, so parallel tests'
+/// Walrus instances collide (all allocate ids 1,2,3…) and corrupt each
+/// other's checkpoint counters — this test's 100 concurrent allocations
+/// make that latent flake near-certain. Prod runs a single Walrus, where
+/// the accounting is sound. Run standalone:
+///   cargo test --test position -- --ignored request_reclaim_sweep
+#[test]
+#[ignore = "global block-id trackers collide across parallel Walrus instances; run standalone with --ignored"]
+fn request_reclaim_sweep_deletes_consumed_files_promptly() {
+    let _env = setup();
+    let wal = Walrus::new().unwrap();
+    let topic = "sweep-reclaim";
+    let dir = common::current_wal_dir();
+    // Data files are millis-named (all digits); everything else (index db,
+    // meta) is excluded.
+    let data_files = || {
+        std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit()))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+
+    // Fill file 1 completely (100 x 10MiB blocks) and roll into file 2 so
+    // file 1 becomes fully_allocated: ~9MiB entries take one block each,
+    // the 101st allocation rolls the file.
+    let entry = vec![0xCD; 9 * 1024 * 1024];
+    for _ in 0..101 {
+        wal.append_for_topic(topic, &entry).unwrap();
+    }
+    assert!(data_files() >= 2, "the 101st block must have rolled into a second data file");
+
+    // Consume everything: fast-forward checkpoints all sealed blocks, which
+    // enqueues file 1 as deletable (flush_check).
+    let tail = wal.current_position(topic).unwrap();
+    wal.set_persisted_read_position(topic, tail).unwrap();
+
+    wal.request_reclaim_sweep();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let n = data_files();
+        if n <= 1 {
+            break; // fully-consumed file reclaimed; only the active file remains
+        }
+        if std::time::Instant::now() >= deadline {
+            let states: Vec<_> = Walrus::file_reclaim_states()
+                .into_iter()
+                .filter(|(p, ..)| p.starts_with(dir.to_string_lossy().as_ref()))
+                .collect();
+            panic!("consumed file not reclaimed within 15s of request_reclaim_sweep (data files={n}); states={states:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}

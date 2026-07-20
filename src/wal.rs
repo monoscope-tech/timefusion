@@ -742,6 +742,15 @@ impl WalManager {
         Ok(())
     }
 
+    /// Trigger walrus's position-exact file reclaim sweep on its next
+    /// background tick (~fsync interval) instead of the periodic 1000-tick
+    /// cadence. Called after recovery parks the cursors: a consumed replay
+    /// backlog's files are already checkpoint-eligible, and this reclaims
+    /// the disk immediately rather than ~200s later.
+    pub fn request_reclaim_sweep(&self) {
+        self.wal.request_reclaim_sweep();
+    }
+
     pub fn data_dir(&self) -> &PathBuf {
         &self.data_dir
     }
@@ -1434,12 +1443,19 @@ const GC_FLOOR_SLACK_MICROS: i64 = 10 * 60 * 1_000_000;
 /// Delete WAL files older than `max_age` by mtime, recursing into subdirs.
 /// Skips dotfiles/dotdirs (`.timefusion_meta/`).
 ///
-/// Why this exists: `walrus-rust`'s GC bookkeeping (`FileStateTracker`) is an
-/// in-process `HashMap`. On restart every file walrus wrote previously is
-/// invisible to its delete predicate, so files leak forever. Prod was at
-/// 467 GB of orphaned WAL on 2026-06-09 (12-min startup); see memory
-/// `wal_bloat_startup.md`. mtime is a sufficient proxy for a file's newest
-/// entry — walrus rotates to a new file once one is fully allocated.
+/// Why this still exists: walrus's own reclaim is position-EXACT and, since
+/// the watermark rework, works across restarts too (`startup_chore` rebuilds
+/// `FileStateTracker` from the file scan, `set_persisted_read_position`
+/// checkpoints skipped blocks, and boot re-runs `flush_check`; deletion
+/// happens on the background sweep — see `request_reclaim_sweep`). That
+/// covers every file whose entries are behind all owning shards' cursors.
+/// This mtime sweep remains the FALLBACK for what the position predicate
+/// can't free: files pinned by dead/stalled shards whose cursor will never
+/// advance, and foreign junk in the dir. (History: pre-rework walrus never
+/// reclaimed across restarts — prod hit 467 GB of orphaned WAL on
+/// 2026-06-09, 12-min startup; see memory `wal_bloat_startup.md`.) mtime is
+/// a sufficient proxy for a file's newest entry — walrus rotates to a new
+/// file once one is fully allocated.
 ///
 /// `unflushed_floor_micros` makes the age heuristic sound: mtime age alone
 /// assumed "old ⇒ already flushed", which deleted un-flushed backlog during

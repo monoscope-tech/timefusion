@@ -218,6 +218,16 @@ impl FileStateTracker {
         MAP.get_or_init(|| RwLock::new(HashMap::new()))
     }
 
+    /// Snapshot of all tracked file paths — lets a reclaim sweep re-run
+    /// `flush_check` across every file, closing the window where a
+    /// checkpoint-time eligibility check raced `set_fully_allocated` /
+    /// block-unlock and nothing ever retried (the in-line retry relies on a
+    /// FUTURE `set_checkpointed_true` for the same file, which never comes
+    /// after a final cursor fast-forward).
+    pub(super) fn all_paths() -> Vec<String> {
+        Self::map().read().map(|r| r.keys().cloned().collect()).unwrap_or_default()
+    }
+
     pub(super) fn register_file_if_absent(file_path: &str) {
         let map = Self::map();
         let mut w = map.write().expect("file state map write lock poisoned");

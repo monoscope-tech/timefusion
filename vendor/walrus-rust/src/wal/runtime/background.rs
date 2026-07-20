@@ -30,6 +30,12 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
     let (del_tx, del_rx) = mpsc::channel::<String>();
     let del_tx_arc = Arc::new(del_tx);
     let _ = DELETION_TX.set(del_tx_arc.clone());
+    // Only the worker whose channel won the DELETION_TX race ever receives
+    // deletion requests — every later worker's del_rx stays empty. The forced
+    // sweep flag must be consumed by the OWNER only, or (with multiple Walrus
+    // instances, e.g. parallel tests) a non-owner tick eats the flag against
+    // an empty delete_pending and the request is lost.
+    let owns_deletions = DELETION_TX.get().is_some_and(|tx| Arc::ptr_eq(tx, &del_tx_arc));
     let pool: HashMap<String, StorageImpl> = HashMap::new();
     let tick = Arc::new(AtomicU64::new(0));
     let sleep_millis = match fsync_schedule {
@@ -165,11 +171,17 @@ pub(super) fn start_background_workers(fsync_schedule: FsyncSchedule) -> Arc<mps
                 delete_pending.insert(path);
             }
 
-            // Phase 5: Periodic cleanup
+            // Phase 5: Periodic cleanup — every 1000 ticks, or immediately when
+            // a sweep was requested (post-recovery reclaim of a consumed backlog).
             let n = tick.fetch_add(1, Ordering::Relaxed) + 1;
-            if n >= 1000 {
-                // WARN: we clean up once every 1000 times the fsync runs
-                if tick.compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            let forced = owns_deletions && super::SWEEP_NOW.swap(false, Ordering::AcqRel);
+            if forced || n >= 1000 {
+                // Single background thread owns this loop; the CAS only guards
+                // the tick reset on the periodic path.
+                if forced || tick.compare_exchange(n, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    if forced {
+                        tick.store(0, Ordering::Relaxed);
+                    }
                     let mut empty: HashMap<String, StorageImpl> = HashMap::new();
                     std::mem::swap(&mut pool, &mut empty); // reset map every hour to avoid unconstrained overflow
 
