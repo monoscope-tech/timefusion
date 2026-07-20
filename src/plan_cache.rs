@@ -450,7 +450,8 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
     fn take_number(e: &mut SqlExpr, base: usize, values: &mut Vec<ScalarValue>) {
         if let SqlExpr::Value(vs) = e
             && let Value::Number(n, _) = &vs.value
-            && let Some(sv) = n.parse::<i64>().map(|i| ScalarValue::Int64(Some(i))).ok().or_else(|| n.parse::<f64>().ok().map(|f| ScalarValue::Float64(Some(f))))
+            && let Some(sv) =
+                n.parse::<i64>().map(|i| ScalarValue::Int64(Some(i))).ok().or_else(|| n.parse::<f64>().ok().map(|f| ScalarValue::Float64(Some(f))))
         {
             values.push(sv);
             vs.value = Value::Placeholder(format!("${}", base + values.len()));
