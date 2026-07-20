@@ -134,7 +134,12 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: build-test
-      - uses: taiki-e/install-action@nextest
+      # Pin the nextest version (not the floating `@nextest` tag) so an upstream
+      # release can't silently change --partition/CLI behavior, matching the
+      # MinIO/mc image pinning above.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.140
 
       # Clippy is shard-independent — run it once (on shard 1) instead of 4×.
       - name: Clippy
