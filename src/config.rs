@@ -348,6 +348,7 @@ const_default!(d_dedup_bytes_per_row: u64 = 4096);
 // Serial by default: one heavy maintenance rewrite in flight at a time.
 const_default!(d_maintenance_rewrite_concurrency: usize = 1);
 const_default!(d_dml_merge_concurrency: usize = 4);
+const_default!(d_dirty_bin_drain_batch: usize = 32);
 // How many days back (in addition to today) the dedup sweep covers. today-only
 // left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
 // crossing midnight UTC) uncollapsed forever; 1 catches the day-boundary case.
@@ -1116,6 +1117,14 @@ pub struct MaintenanceConfig {
     /// caps that so reads keep CPU; drains queue behind it.
     #[serde(default = "d_dml_merge_concurrency")]
     pub timefusion_dml_merge_concurrency: usize,
+    /// Eligible (sealed >2h) dirty bins drained per table per maintenance tick.
+    /// Serial-within-table on purpose (concurrent bins commit to the same Delta
+    /// log → OCC storm), so this is the only drain-rate lever. The old fixed 8
+    /// couldn't keep up with the eligible-bin enqueue rate (prod backlog 3341,
+    /// 2026-07-20); 32 drains it without cancelling — the per-table deadlines are
+    /// advisory warnings, not cutoffs.
+    #[serde(default = "d_dirty_bin_drain_batch")]
+    pub timefusion_dirty_bin_drain_batch: usize,
     /// Perform UPDATE/DELETE as merge-on-read deletion-vector operations instead
     /// of copy-on-write full-file rewrites. A DV UPDATE appends only the rewritten
     /// matched rows and masks the originals with a roaring-bitmap deletion vector;

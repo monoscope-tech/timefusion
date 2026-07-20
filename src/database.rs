@@ -5406,7 +5406,7 @@ impl Database {
                 let (project, name, date, bin) = entry.key();
                 (name == table_name && (*bin + 1) * BIN_MICROS <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
             })
-            .take(8)
+            .take(self.config.maintenance.timefusion_dirty_bin_drain_batch.max(1))
             .collect();
         for (project_id, date, bin) in ready {
             let key = (project_id.clone(), table_name.to_string(), date.clone(), bin);

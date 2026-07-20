@@ -64,8 +64,21 @@ pub mod time_range_partition_pruner {
     /// `"event_time"`). Non-matching columns are skipped — pruning only fires for
     /// the table's declared time column.
     pub fn timestamp_to_date_filters(expr: &Expr, time_column: &str) -> Vec<Expr> {
+        // Unwrap Cast/TryCast around a literal: extended-protocol param binding
+        // plus TypeCoercion wraps the timestamp bound in a Cast when the param's
+        // unit differs from the µs column (e.g. `ts >= CAST($1 AS Timestamp(us))`),
+        // which otherwise hid the literal and silently disabled date pruning for
+        // ~6% of prod hash-enrichment merges (full 207 GB scans).
+        fn unwrap_literal(expr: &Expr) -> Option<&ScalarValue> {
+            match expr {
+                Expr::Literal(scalar, _) => Some(scalar),
+                Expr::Cast(c) => unwrap_literal(c.expr.as_ref()),
+                Expr::TryCast(c) => unwrap_literal(c.expr.as_ref()),
+                _ => None,
+            }
+        }
         let date_filter = |expr: &Expr, op: Operator| {
-            let Expr::Literal(scalar, _) = expr else { return None };
+            let scalar = unwrap_literal(expr)?;
             let ts_nanos = match scalar {
                 ScalarValue::TimestampNanosecond(Some(ts), _) => *ts,
                 ScalarValue::TimestampMicrosecond(Some(ts), _) => ts.checked_mul(1_000)?,
@@ -303,5 +316,19 @@ mod tests {
         // No time-column bounds → predicate returned untouched.
         let no_ts = col("project_id").eq(Expr::Literal(ScalarValue::Utf8(Some("p".into())), None));
         assert!(all_date_bounds(&time_range_partition_pruner::with_date_partition_filters(no_ts.clone(), "timestamp")).is_empty());
+    }
+
+    /// Regression for the 2026-07-20 prod finding: ~6% of hash-enrichment merges
+    /// full-scanned (207 GB, predicate_filtered=0) because extended-protocol param
+    /// binding + TypeCoercion wraps the timestamp bound in a `Cast(Literal)` — the
+    /// literal side must be unwrapped or no `date` bound is derived.
+    #[test]
+    fn cast_wrapped_timestamp_literal_still_derives_date_bounds() {
+        let start = 1_704_067_200_000_000i64; // 2024-01-01 → day 19_723
+        let ts_col = Expr::Column(datafusion::common::Column::new_unqualified("timestamp"));
+        // `timestamp >= CAST($1 AS Timestamp(ns))` where the bound param arrived as µs.
+        let cast_lit = Expr::Cast(Cast::new(Box::new(timestamp(start)), DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))));
+        let expr = Expr::BinaryExpr(BinaryExpr::new(Box::new(ts_col), Operator::GtEq, Box::new(cast_lit)));
+        assert_eq!(date_filters(expr), vec![(Operator::GtEq, 19_723)]);
     }
 }
