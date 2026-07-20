@@ -5659,7 +5659,9 @@ impl Database {
         let today_str = today.to_string();
         let concurrency = self.config.maintenance.timefusion_maintenance_rewrite_concurrency.max(1);
         let failed = futures::stream::iter(project_ids)
-            .map(|project_id| self.optimize_one_hot_project(table_ref, table_name, today, &today_str, project_id, target_size, &writer_properties, &optimize_type))
+            .map(|project_id| {
+                self.optimize_one_hot_project(table_ref, table_name, today, &today_str, project_id, target_size, &writer_properties, &optimize_type)
+            })
             .buffer_unordered(concurrency)
             .filter(|r| std::future::ready(r.is_err()))
             .count()
@@ -5676,10 +5678,8 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today: chrono::NaiveDate, today_str: &str, project_id: String, target_size: i64,
         writer_properties: &WriterProperties, optimize_type: &deltalake::operations::optimize::OptimizeType,
     ) -> Result<()> {
-        let partition_filters = vec![
-            PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
-            PartitionFilter::try_from(("date", "=", today_str))?,
-        ];
+        let partition_filters =
+            vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", today_str))?];
         let selected_files = {
             let table = table_ref.read().await;
             Self::light_optimize_tail(&table, &partition_filters, target_size, self.config.maintenance.timefusion_compact_min_files).await?
@@ -5688,9 +5688,20 @@ impl Database {
             return Ok(());
         }
         info!(table_name, project_id, date = %today, selected_files = selected_files.len(), event = "light_optimize_tail_selected");
-        self.optimize_table_light_inner(table_ref, table_name, today, &project_id, &partition_filters, &selected_files, target_size, writer_properties, optimize_type.clone(), std::time::Instant::now())
-            .await
-            .inspect_err(|e| warn!("Light optimize failed for project={} date={}: {}", project_id, today, e))
+        self.optimize_table_light_inner(
+            table_ref,
+            table_name,
+            today,
+            &project_id,
+            &partition_filters,
+            &selected_files,
+            target_size,
+            writer_properties,
+            optimize_type.clone(),
+            std::time::Instant::now(),
+        )
+        .await
+        .inspect_err(|e| warn!("Light optimize failed for project={} date={}: {}", project_id, today, e))
     }
 
     /// Inner optimize loop. Caller is expected to hold the flush lock when
