@@ -52,7 +52,7 @@ use datafusion_postgres::{
         error::{PgWireError, PgWireResult},
     },
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::errors::arrow_err;
 
@@ -433,7 +433,7 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
     use std::ops::ControlFlow;
 
     use datafusion::sql::sqlparser::{
-        ast::{Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, Value, ValueWithSpan, visit_expressions_mut},
+        ast::{CastKind, DataType as SqlDataType, Expr as SqlExpr, FunctionArg, FunctionArgExpr, FunctionArguments, TimezoneInfo, Value, ValueWithSpan, visit_expressions_mut},
         tokenizer::Span,
     };
     let mut stmt = stmt.clone();
@@ -483,7 +483,19 @@ fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) 
             // time window stays fresh (never frozen to plan-build time).
             SqlExpr::Function(f) if f.name.0.last().and_then(|n| n.as_ident()).is_some_and(|i| is_parameterizable_time_fn(&i.value)) => {
                 values.push(ScalarValue::TimestampNanosecond(Some(now_ns), Some("+00:00".into())));
-                *e = SqlExpr::Value(ValueWithSpan { value: Value::Placeholder(format!("${}", base + values.len())), span: Span::empty() });
+                let placeholder = SqlExpr::Value(ValueWithSpan { value: Value::Placeholder(format!("${}", base + values.len())), span: Span::empty() });
+                // Wrap in CAST(... AS TIMESTAMPTZ): a BARE placeholder is untyped, so
+                // `now() - INTERVAL '1h'` (every dashboard time window) failed to
+                // optimize with "Cannot infer common argument type Timestamp >=
+                // Interval" → the shape negative-cached → 0 shape hits in prod
+                // (2026-07-20). Typing the placeholder lets the arithmetic infer.
+                *e = SqlExpr::Cast {
+                    kind: CastKind::Cast,
+                    expr: Box::new(placeholder),
+                    data_type: SqlDataType::Timestamp(None, TimezoneInfo::Tz),
+                    format: None,
+                    array: false,
+                };
             }
             // Value-context containers: parameterize their direct numeric-literal
             // children. See take_number — this deliberately never touches a
@@ -578,12 +590,19 @@ impl PlanCacheHook {
     /// substituted, pre-optimized plan, or `None` to fall back to the normal
     /// parse→optimize pipeline. Every failure installs a negative entry so a
     /// shape that can't parameterize is only attempted once.
-    async fn try_shape_cached_plan(&self, statement: &Statement, canonical: &str, session_context: &SessionContext) -> Option<LogicalPlan> {
+    /// `include_strings=false` lifts ONLY the time fn (now()) and leaves every
+    /// other literal inline — used for now()-bearing queries, where lifting
+    /// strings/numbers breaks planning (INTERVAL '…' → INTERVAL $n is
+    /// unplannable, and the same time_bucket('1m',…) in GROUP BY and ORDER BY
+    /// would get distinct placeholders → "ORDER BY must be in GROUP BY").
+    /// Repeated dashboard refreshes send identical SQL except now(), so the shape
+    /// key is still stable → hits. `true` (pure literal SELECTs) lifts all.
+    async fn try_shape_cached_plan(&self, statement: &Statement, canonical: &str, session_context: &SessionContext, include_strings: bool) -> Option<LogicalPlan> {
         use std::sync::atomic::Ordering::Relaxed;
         if !matches!(statement, Statement::Query(_)) {
             return None;
         }
-        let (param_stmt, values) = parameterize_statement(statement, 0, true)?;
+        let (param_stmt, values) = parameterize_statement(statement, 0, include_strings)?;
         let shape_key = param_stmt.to_string();
         let entry = self.get_or_build_shape(&shape_key, param_stmt, values.len(), session_context).await?;
 
@@ -619,9 +638,21 @@ impl PlanCacheHook {
         }
         // Build the placeholder plan once for this shape.
         let state = session_context.state();
+        // Capture the build error so we can see WHY a shape negative-caches in
+        // prod (2026-07-20: dashboard now()+$N shapes all failed to build → 0
+        // shape hits). Swallowed silently before.
         let built = match state.statement_to_plan(DfStatement::Statement(Box::new(param_stmt))).await {
-            Ok(p) => state.optimize(&p).ok(),
-            Err(_) => None,
+            Ok(p) => match state.optimize(&p) {
+                Ok(opt) => Some(opt),
+                Err(e) => {
+                    warn!(target: "plan_cache", "shape optimize failed: {shape_key} — {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!(target: "plan_cache", "shape plan failed: {shape_key} — {e}");
+                None
+            }
         }
         .and_then(|plan| {
             if value_count == 0 {
@@ -633,7 +664,6 @@ impl PlanCacheHook {
         });
         if built.is_none() {
             self.shape_skips.fetch_add(1, Relaxed);
-            debug!(target: "plan_cache", "shape negative-cached: {shape_key}");
         }
         // Soft cap shares the template cache's philosophy: clear half on
         // overflow (shape variety should be tiny in steady state).
@@ -742,8 +772,9 @@ impl QueryHook for PlanCacheHook {
             if self.time_fn_shapes && matches!(statement, Statement::Query(_)) && !contains_unparameterizable_time_fn(statement) {
                 let canonical = statement.to_string();
                 if !Self::has_placeholder(&canonical) {
-                    // Pure now()/literals: parameterize + substitute at parse.
-                    return self.try_shape_cached_plan(statement, &canonical, session_context).await.map(Ok);
+                    // Pure now()-bearing: lift ONLY now() (include_strings=false),
+                    // keep other literals inline so INTERVAL/time_bucket plan.
+                    return self.try_shape_cached_plan(statement, &canonical, session_context, false).await.map(Ok);
                 } else if stmt_uses_fn(statement, PARAMETERIZABLE_TIME_FNS) {
                     // Mixed now()+client `$N`: cache a template that keeps BOTH the
                     // client placeholders and the time-fn placeholders open; the
@@ -756,10 +787,9 @@ impl QueryHook for PlanCacheHook {
         }
         let canonical = statement.to_string();
         if !Self::has_placeholder(&canonical) {
-            // Literal-bearing SELECT: try the shape cache (parameterize →
-            // cached placeholder plan → substitute). Falls back to the
-            // normal pipeline on any miss/failure.
-            return self.try_shape_cached_plan(statement, &canonical, session_context).await.map(Ok);
+            // Literal-bearing SELECT (no now()): lift all literals for a
+            // literal-insensitive shape.
+            return self.try_shape_cached_plan(statement, &canonical, session_context, true).await.map(Ok);
         }
 
         // Lock-free read: DashMap.get returns a guard that just locks the
