@@ -744,14 +744,12 @@ impl BufferConfig {
     pub fn wal_max_file_count(&self) -> usize {
         self.timefusion_wal_max_file_count
     }
-    /// Byte ceiling for the unflushed-WAL force-flush backstop, or `None` when
-    /// disabled (`TIMEFUSION_WAL_MAX_UNFLUSHED_MB` unset/0 — the default). Opt-in
-    /// because the always-on memory-pressure valve already drains the common
-    /// lagging-flush case; this guards the rarer stuck-cursor backlog. Set it to
-    /// bound restart replay by on-disk WAL size (e.g. 12000 for the 30GB-buffer
-    /// prod instance).
+    /// Byte ceiling for the unflushed-WAL force-flush backstop. An explicit
+    /// value overrides the default quarter-buffer ceiling, which bounds the
+    /// active bucket's restart replay even when memory pressure has not fired.
     pub fn wal_max_unflushed_bytes(&self) -> Option<u64> {
-        (self.timefusion_wal_max_unflushed_mb > 0).then(|| (self.timefusion_wal_max_unflushed_mb as u64).saturating_mul(1024 * 1024))
+        let mb = if self.timefusion_wal_max_unflushed_mb > 0 { self.timefusion_wal_max_unflushed_mb } else { self.max_memory_mb() / 4 };
+        Some((mb as u64).saturating_mul(1024 * 1024))
     }
     pub fn bucket_duration_secs(&self) -> u64 {
         self.timefusion_bucket_duration_secs.max(1)
@@ -1261,6 +1259,7 @@ mod tests {
         assert_eq!(config.core.pgwire_port, 5432);
         assert_eq!(config.buffer.timefusion_flush_interval_secs, 60);
         assert_eq!(config.buffer.timefusion_bucket_duration_secs, 300);
+        assert_eq!(config.buffer.wal_max_unflushed_bytes(), Some(1024 * 1024 * 1024));
         assert_eq!(config.cache.timefusion_foyer_memory_mb, 1024);
         assert_eq!(config.cache.timefusion_foyer_disk_gb, 500);
         assert_eq!(config.cache.disk_size_bytes(), 500 * 1024 * 1024 * 1024);
@@ -1295,14 +1294,13 @@ mod tests {
         assert_eq!(config.cache.disk_size_bytes(), 1024 * 1024 * 1024);
     }
 
-    // issue #83: the unflushed-WAL force-flush backstop is opt-in — disabled
-    // (None) unless an explicit MB ceiling is set.
     #[test]
-    fn test_wal_max_unflushed_bytes_optin() {
+    fn wal_backlog_limit_defaults_to_a_quarter_of_buffer_and_allows_override() {
         let mut config = AppConfig::default();
-        config.buffer.timefusion_wal_max_unflushed_mb = 0;
-        assert_eq!(config.buffer.wal_max_unflushed_bytes(), None, "unset → disabled");
-        config.buffer.timefusion_wal_max_unflushed_mb = 8000;
-        assert_eq!(config.buffer.wal_max_unflushed_bytes(), Some(8000u64 * 1024 * 1024), "explicit ceiling");
+        config.buffer.timefusion_buffer_max_memory_mb = 30_000;
+        assert_eq!(config.buffer.wal_max_unflushed_bytes(), Some(7_500 * 1024 * 1024));
+
+        config.buffer.timefusion_wal_max_unflushed_mb = 12_000;
+        assert_eq!(config.buffer.wal_max_unflushed_bytes(), Some(12_000 * 1024 * 1024));
     }
 }
