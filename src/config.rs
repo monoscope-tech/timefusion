@@ -49,6 +49,13 @@ pub fn try_config() -> Option<&'static AppConfig> {
     CONFIG.get()
 }
 
+/// Test-only: seed the global config so construction paths that read
+/// `try_config()` (e.g. `PlanCacheHook::default`) see it. No-op if already set.
+#[doc(hidden)]
+pub fn set_config_for_test(cfg: AppConfig) {
+    let _ = CONFIG.set(cfg);
+}
+
 /// Whether the operator has opted into open auth for local dev via
 /// `TIMEFUSION_ALLOW_INSECURE_AUTH=true`. Both the pgwire and gRPC auth
 /// paths gate their fail-secure defaults on this flag.

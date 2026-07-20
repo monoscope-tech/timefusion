@@ -402,12 +402,34 @@ fn stmt_uses_fn(stmt: &Statement, names: &[&str]) -> bool {
     found
 }
 
-/// Replace every string literal in a SELECT with `$N` (walk order), returning
-/// the parameterized statement + the extracted values. `None` when there's
-/// nothing to extract. Numbers/booleans stay inline — they steer plan shape
-/// (LIMIT, bucket sizes) and vary little; strings carry the high-churn values
-/// (timestamps, project ids, search terms).
-fn parameterize_statement(stmt: &Statement) -> Option<(Statement, Vec<ScalarValue>)> {
+/// Highest client-supplied `$N` placeholder index already in `stmt` (0 if none).
+/// Lets the mixed now()+`$N` path number its injected time-fn placeholders
+/// above the client's so the two numbering spaces don't collide.
+fn max_placeholder_index(stmt: &Statement) -> usize {
+    use std::ops::ControlFlow;
+
+    use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Value, visit_expressions};
+    let mut max = 0usize;
+    let _: ControlFlow<()> = visit_expressions(stmt, |e: &SqlExpr| {
+        if let SqlExpr::Value(vs) = e
+            && let Value::Placeholder(p) = &vs.value
+            && let Ok(n) = p.trim_start_matches('$').parse::<usize>()
+        {
+            max = max.max(n);
+        }
+        ControlFlow::Continue(())
+    });
+    max
+}
+
+/// Replace string literals (when `include_strings`) and parameterizable time
+/// fns in a SELECT with `$N` placeholders numbered `base + walk_position`,
+/// returning the parameterized statement + the extracted values in `$` order.
+/// `None` when nothing was extracted. Numbers/booleans stay inline — they steer
+/// plan shape (LIMIT, bucket sizes) and vary little. `base > 0` leaves the
+/// client's `$1..$base` binds untouched (mixed now()+`$N` path); `include_strings`
+/// is off there because a prepared statement's literals are fixed across binds.
+fn parameterize_statement(stmt: &Statement, base: usize, include_strings: bool) -> Option<(Statement, Vec<ScalarValue>)> {
     use std::ops::ControlFlow;
 
     use datafusion::sql::sqlparser::{
@@ -429,11 +451,12 @@ fn parameterize_statement(stmt: &Statement) -> Option<(Statement, Vec<ScalarValu
             // single-element list (COALESCE(list_col, '{a,b}') → ['{a,b}'] instead of
             // ['a','b']). Cheap to skip: array-literal COALESCE is not a hot cached path.
             SqlExpr::Value(vs) => {
-                if let Value::SingleQuotedString(s) = &vs.value
+                if include_strings
+                    && let Value::SingleQuotedString(s) = &vs.value
                     && !s.trim_start().starts_with('{')
                 {
                     values.push(ScalarValue::Utf8(Some(s.clone())));
-                    vs.value = Value::Placeholder(format!("${}", values.len()));
+                    vs.value = Value::Placeholder(format!("${}", base + values.len()));
                 }
             }
             // now()/current_timestamp/… → placeholder bound to the captured instant,
@@ -441,7 +464,7 @@ fn parameterize_statement(stmt: &Statement) -> Option<(Statement, Vec<ScalarValu
             // time window stays fresh (never frozen to plan-build time).
             SqlExpr::Function(f) if f.name.0.last().and_then(|n| n.as_ident()).is_some_and(|i| is_parameterizable_time_fn(&i.value)) => {
                 values.push(ScalarValue::TimestampNanosecond(Some(now_ns), Some("+00:00".into())));
-                *e = SqlExpr::Value(ValueWithSpan { value: Value::Placeholder(format!("${}", values.len())), span: Span::empty() });
+                *e = SqlExpr::Value(ValueWithSpan { value: Value::Placeholder(format!("${}", base + values.len())), span: Span::empty() });
             }
             _ => {}
         }
@@ -495,38 +518,9 @@ impl PlanCacheHook {
         if !matches!(statement, Statement::Query(_)) {
             return None;
         }
-        let (param_stmt, values) = parameterize_statement(statement)?;
+        let (param_stmt, values) = parameterize_statement(statement, 0, true)?;
         let shape_key = param_stmt.to_string();
-
-        let entry: Option<ShapeEntry> = match self.shapes.get(&shape_key) {
-            Some(e) => e.value().clone(), // Some(entry) hit / None negative
-            None => {
-                // Build the placeholder plan once for this shape.
-                let state = session_context.state();
-                let built = match state.statement_to_plan(DfStatement::Statement(Box::new(param_stmt))).await {
-                    Ok(p) => state.optimize(&p).ok(),
-                    Err(_) => None,
-                };
-                let built = built.and_then(|plan| {
-                    let types = plan.get_parameter_types().ok()?;
-                    let param_types = (1..=values.len()).map(|i| types.get(&format!("${i}")).cloned().flatten()).collect();
-                    Some(ShapeEntry { plan, param_types })
-                });
-                if built.is_none() {
-                    self.shape_skips.fetch_add(1, Relaxed);
-                    debug!(target: "plan_cache", "shape negative-cached: {shape_key}");
-                }
-                // Soft cap shares the template cache's philosophy: clear half
-                // on overflow (shape variety should be tiny in steady state).
-                if self.shapes.len() >= self.capacity {
-                    let cap = self.capacity;
-                    self.shapes.retain(|_, _| fastrand::usize(..cap) >= cap / 2);
-                }
-                self.shapes.insert(shape_key.clone(), built.clone());
-                built
-            }
-        };
-        let entry = entry?; // negative entry → normal path
+        let entry = self.get_or_build_shape(&shape_key, param_stmt, values.len(), session_context).await?;
 
         // Substitute this query's literals, cast to the inferred types.
         let cast_values: Vec<ScalarValue> = values
@@ -541,6 +535,63 @@ impl PlanCacheHook {
         let plan = fold_literal_casts(plan).ok()?;
         self.shape_hits.fetch_add(1, Relaxed);
         // Mark so `was_pre_optimized` lets the handler skip state.optimize().
+        if self.served.len() >= 4096 {
+            self.served.retain(|_, _| fastrand::bool());
+        }
+        self.served.insert(canonical.to_string(), ());
+        Some(plan)
+    }
+
+    /// Get or build+optimize+cache the placeholder template for `shape_key`.
+    /// `value_count` = how many leading `$N` types to record for the caller to
+    /// cast its client literals against (0 for the mixed path, which binds its
+    /// injected params by inferred type at execute). `None` = negative entry:
+    /// this shape failed to plan once; don't retry per query.
+    async fn get_or_build_shape(&self, shape_key: &str, param_stmt: Statement, value_count: usize, session_context: &SessionContext) -> Option<ShapeEntry> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(e) = self.shapes.get(shape_key) {
+            return e.value().clone(); // Some(entry) hit / None negative
+        }
+        // Build the placeholder plan once for this shape.
+        let state = session_context.state();
+        let built = match state.statement_to_plan(DfStatement::Statement(Box::new(param_stmt))).await {
+            Ok(p) => state.optimize(&p).ok(),
+            Err(_) => None,
+        }
+        .and_then(|plan| {
+            if value_count == 0 {
+                return Some(ShapeEntry { plan, param_types: Vec::new() });
+            }
+            let types = plan.get_parameter_types().ok()?;
+            let param_types = (1..=value_count).map(|i| types.get(&format!("${i}")).cloned().flatten()).collect();
+            Some(ShapeEntry { plan, param_types })
+        });
+        if built.is_none() {
+            self.shape_skips.fetch_add(1, Relaxed);
+            debug!(target: "plan_cache", "shape negative-cached: {shape_key}");
+        }
+        // Soft cap shares the template cache's philosophy: clear half on
+        // overflow (shape variety should be tiny in steady state).
+        if self.shapes.len() >= self.capacity {
+            let cap = self.capacity;
+            self.shapes.retain(|_, _| fastrand::usize(..cap) >= cap / 2);
+        }
+        self.shapes.insert(shape_key.to_string(), built.clone());
+        built
+    }
+
+    /// Mixed now()+client-`$N` path: cache an OPTIMIZED template whose time-fn
+    /// placeholders are numbered above the client's binds and whose client
+    /// placeholders stay open. Returns the template unsubstituted —
+    /// `extra_execute_params` supplies a fresh instant for the time-fn
+    /// placeholders on every execute, so the window never freezes, even for a
+    /// reused (named) prepared statement whose parse hook runs only once.
+    async fn try_mixed_time_fn_plan(&self, statement: &Statement, canonical: &str, session_context: &SessionContext) -> Option<LogicalPlan> {
+        let base = max_placeholder_index(statement);
+        let (param_stmt, _) = parameterize_statement(statement, base, false)?;
+        let shape_key = param_stmt.to_string();
+        let plan = self.get_or_build_shape(&shape_key, param_stmt, 0, session_context).await?.plan;
+        self.shape_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.served.len() >= 4096 {
             self.served.retain(|_, _| fastrand::bool());
         }
@@ -582,6 +633,33 @@ impl QueryHook for PlanCacheHook {
         None
     }
 
+    /// Trailing placeholders the mixed path injects — the Parse/Describe path
+    /// hides these from the client's ParameterDescription. Equals the number of
+    /// values `extra_execute_params` appends for the same statement.
+    fn injected_param_count(&self, statement: &Statement) -> usize {
+        self.extra_execute_params(statement).len()
+    }
+
+    /// Fresh instant(s) for the time-fn placeholders the mixed now()+`$N` path
+    /// injected at parse (numbered above the client's binds). Appended to the
+    /// client's params before substitution, so `now()` is re-evaluated on every
+    /// execute. Empty for the pure path (M=0, substituted at parse) and for any
+    /// statement we didn't shape-cache — surplus is ignored by the executor.
+    fn extra_execute_params(&self, statement: &Statement) -> Vec<ScalarValue> {
+        if !self.time_fn_shapes
+            || !matches!(statement, Statement::Query(_))
+            || contains_unparameterizable_time_fn(statement)
+            || !stmt_uses_fn(statement, PARAMETERIZABLE_TIME_FNS)
+        {
+            return Vec::new();
+        }
+        let base = max_placeholder_index(statement);
+        if base == 0 {
+            return Vec::new(); // pure path substitutes at parse
+        }
+        parameterize_statement(statement, base, false).map_or(Vec::new(), |(_, values)| values)
+    }
+
     async fn handle_extended_parse_query(
         &self, statement: &Statement, session_context: &SessionContext, _client: &(dyn ClientInfo + Send + Sync),
     ) -> Option<PgWireResult<LogicalPlan>> {
@@ -598,10 +676,15 @@ impl QueryHook for PlanCacheHook {
         if contains_plan_time_folded_fn(statement) {
             if self.time_fn_shapes && matches!(statement, Statement::Query(_)) && !contains_unparameterizable_time_fn(statement) {
                 let canonical = statement.to_string();
-                // Only when there are no client-supplied `$N` binds: parameterize
-                // numbers time-fn placeholders 1-based, which would collide.
                 if !Self::has_placeholder(&canonical) {
+                    // Pure now()/literals: parameterize + substitute at parse.
                     return self.try_shape_cached_plan(statement, &canonical, session_context).await.map(Ok);
+                } else if stmt_uses_fn(statement, PARAMETERIZABLE_TIME_FNS) {
+                    // Mixed now()+client `$N`: cache a template that keeps BOTH the
+                    // client placeholders and the time-fn placeholders open; the
+                    // fresh instant is injected per-execute by extra_execute_params
+                    // (correct even for reused prepared statements).
+                    return self.try_mixed_time_fn_plan(statement, &canonical, session_context).await.map(Ok);
                 }
             }
             return None;
@@ -783,20 +866,20 @@ mod tests {
     #[test]
     fn parameterize_extracts_strings_in_walk_order_and_skips_numbers() {
         let stmt = parse("SELECT id FROM t WHERE project_id = 'p1' AND ts > '2026-07-01' AND n = 5 LIMIT 100");
-        let (param, values) = parameterize_statement(&stmt).expect("has string literals");
+        let (param, values) = parameterize_statement(&stmt, 0, true).expect("has string literals");
         let text = param.to_string();
         assert!(text.contains("$1") && text.contains("$2"), "strings become placeholders: {text}");
         assert!(text.contains("= 5") && text.contains("LIMIT 100"), "numbers stay inline: {text}");
         assert_eq!(values, vec![ScalarValue::Utf8(Some("p1".into())), ScalarValue::Utf8(Some("2026-07-01".into()))], "values extracted in walk order");
         // Same shape with different literals → identical shape key.
         let stmt2 = parse("SELECT id FROM t WHERE project_id = 'p2' AND ts > '2026-07-04' AND n = 5 LIMIT 100");
-        let (param2, _) = parameterize_statement(&stmt2).unwrap();
+        let (param2, _) = parameterize_statement(&stmt2, 0, true).unwrap();
         assert_eq!(text, param2.to_string(), "shape key must be literal-insensitive");
     }
 
     #[test]
     fn parameterize_none_without_string_literals() {
-        assert!(parameterize_statement(&parse("SELECT count(*) FROM t WHERE n = 5")).is_none());
+        assert!(parameterize_statement(&parse("SELECT count(*) FROM t WHERE n = 5"), 0, true).is_none());
     }
 
     #[test]
@@ -806,7 +889,7 @@ mod tests {
         // mis-cast to single-element lists (COALESCE(list_col, '{a,b}') → ['{a,b}']
         // instead of ['a','b']; edge_cases.slt:172). Array literals must stay inline.
         let stmt = parse("SELECT ARRAY_LENGTH(COALESCE(parent_id, '{a,b}')) FROM t WHERE project_id = 'p'");
-        let (param, values) = parameterize_statement(&stmt).expect("the 'p' literal still parameterizes");
+        let (param, values) = parameterize_statement(&stmt, 0, true).expect("the 'p' literal still parameterizes");
         let text = param.to_string();
         assert!(text.contains("'{a,b}'"), "PG array literal stays inline: {text}");
         assert_eq!(values, vec![ScalarValue::Utf8(Some("p".into()))], "only the non-array string is extracted");
@@ -834,7 +917,7 @@ mod tests {
         // optimized plan is reusable while the window stays current (D2).
         let before = chrono::Utc::now().timestamp_nanos_opt().unwrap();
         let stmt = parse("SELECT id FROM t WHERE project_id = 'p' AND ts > now() - INTERVAL '1 hour'");
-        let (param, values) = parameterize_statement(&stmt).expect("now() parameterizes");
+        let (param, values) = parameterize_statement(&stmt, 0, true).expect("now() parameterizes");
         let after = chrono::Utc::now().timestamp_nanos_opt().unwrap();
         let text = param.to_string();
         assert!(!text.to_lowercase().contains("now("), "now() replaced by placeholder: {text}");
@@ -845,8 +928,48 @@ mod tests {
             ref v => panic!("expected tz-aware nanosecond timestamp, got {v:?}"),
         }
         // Shape is literal-insensitive: two refreshes yield the same placeholder text.
-        let (param2, _) = parameterize_statement(&parse("SELECT id FROM t WHERE project_id = 'q' AND ts > now() - INTERVAL '1 hour'")).unwrap();
+        let (param2, _) = parameterize_statement(&parse("SELECT id FROM t WHERE project_id = 'q' AND ts > now() - INTERVAL '1 hour'"), 0, true).unwrap();
         assert_eq!(text, param2.to_string(), "reusable shape key across refreshes");
+    }
+
+    #[test]
+    fn max_placeholder_index_finds_highest_client_bind() {
+        assert_eq!(max_placeholder_index(&parse("SELECT id FROM t WHERE project_id = $1 AND n = $3")), 3);
+        assert_eq!(max_placeholder_index(&parse("SELECT id FROM t WHERE project_id = 'p'")), 0);
+    }
+
+    #[test]
+    fn mixed_parameterizes_time_fns_above_client_binds_only() {
+        // Mixed now()+$N: time-fn numbered above the client's max ($1 → now() = $2),
+        // client $1 untouched, string literals left inline (fixed across binds).
+        let stmt = parse("SELECT id FROM t WHERE project_id = $1 AND level = 'error' AND ts > now() - INTERVAL '1 hour'");
+        let (param, values) = parameterize_statement(&stmt, 1, false).expect("now() parameterizes");
+        let text = param.to_string();
+        assert!(!text.to_lowercase().contains("now("), "now() replaced: {text}");
+        assert!(text.contains("$1") && text.contains("$2"), "client $1 kept, now() → $2: {text}");
+        assert!(text.contains("'error'"), "string literal stays inline in mixed path: {text}");
+        assert_eq!(values.len(), 1, "only the time-fn is extracted");
+        assert!(matches!(values[0], ScalarValue::TimestampNanosecond(Some(_), Some(_))));
+    }
+
+    #[test]
+    fn extra_execute_params_supplies_fresh_instant_for_mixed_only() {
+        let hook = PlanCacheHook::new(64, true);
+        let mixed = parse("SELECT id FROM t WHERE project_id = $1 AND ts > now() - INTERVAL '1 hour'");
+        // Two executes → two fresh instants (never frozen), one value each ($2).
+        let a = hook.extra_execute_params(&mixed);
+        let b = hook.extra_execute_params(&mixed);
+        assert_eq!(a.len(), 1);
+        match (&a[0], &b[0]) {
+            (ScalarValue::TimestampNanosecond(Some(x), _), ScalarValue::TimestampNanosecond(Some(y), _)) => assert!(y >= x, "monotonic fresh instant"),
+            _ => panic!("expected tz-aware nanosecond timestamps"),
+        }
+        // Pure path (no client bind) substitutes at parse → no execute-time extras.
+        assert!(hook.extra_execute_params(&parse("SELECT id FROM t WHERE project_id = 'p' AND ts > now()")).is_empty());
+        // No time fn → nothing to inject.
+        assert!(hook.extra_execute_params(&parse("SELECT id FROM t WHERE project_id = $1")).is_empty());
+        // Flag off → feature disabled entirely.
+        assert!(PlanCacheHook::new(64, false).extra_execute_params(&mixed).is_empty());
     }
 
     #[test]

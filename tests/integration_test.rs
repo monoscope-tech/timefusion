@@ -331,4 +331,42 @@ mod integration {
     // pgwire path, Delta + MemBuffer-tantivy). A pgwire integration repro here
     // would just re-run the same assertions via 200 sequential single-row
     // INSERTs (~80s) — redundant.
+
+    // Mixed now()+client-$N plan caching: a reused prepared statement carrying
+    // BOTH a bound param and now() must re-evaluate now() on every execute (not
+    // freeze it at parse). tokio-postgres caches prepared statements by SQL
+    // text, so the second `query()` reuses the statement (Parse once, Bind/
+    // Execute twice) — the exact case that froze before the execute-time
+    // now()-injection hook (datafusion-postgres fork extra_execute_params).
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn mixed_now_and_param_prepared_statement_stays_fresh() -> Result<()> {
+        // PlanCacheHook reads time-fn shape caching from the global config.
+        let mut cfg = timefusion::config::AppConfig::default();
+        cfg.memory.timefusion_plan_cache_time_fns = true;
+        timefusion::config::set_config_for_test(cfg);
+
+        let server = TestServer::start().await?;
+        let client = TestServer::connect(server.port).await?;
+
+        // Mixed shape: $1 (client bind) + now() (injected at $2). The
+        // `::timestamptz` cast gives the now() placeholder a concrete type so the
+        // template optimizes cleanly.
+        let sql = "SELECT $1::bigint AS a, now()::timestamptz AS t";
+        let r1 = client.query_one(sql, &[&42i64]).await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let r2 = client.query_one(sql, &[&7i64]).await?; // same SQL → reused prepared stmt
+
+        // Client bind resolves alongside the injected now() on every execute.
+        assert_eq!(r1.get::<_, i64>("a"), 42);
+        assert_eq!(r2.get::<_, i64>("a"), 7);
+
+        // now() is fresh per execute — the freeze bug would make these equal.
+        let t1: std::time::SystemTime = r1.get("t");
+        let t2: std::time::SystemTime = r2.get("t");
+        assert!(t2 > t1, "now() must advance across executes of a reused prepared statement (t1={t1:?} t2={t2:?})");
+
+        drop(server);
+        Ok(())
+    }
 }
