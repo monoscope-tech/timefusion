@@ -105,7 +105,19 @@ jobs:
         run: |
           set -euo pipefail
           : "${PGURL:?TIMEFUSION_PG_URL GitHub Actions secret is required}"
-          psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH'
+          # Best-effort pre-deploy flush. The unflushed tail is WAL-durable and the
+          # replacement replays it, so this must NOT fail the deploy when prod is
+          # unreachable — most often it's mid-boot from the *previous* deploy
+          # (psql: "the database system is starting up"). Failing here deadlocked
+          # every deploy after a slow boot (2026-07-20). Retry briefly, then proceed.
+          for attempt in $(seq 1 12); do
+            if psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH' 2>&1; then
+              echo "flush ok (attempt $attempt)"; exit 0
+            fi
+            echo "flush attempt $attempt failed (prod likely still booting); retrying in 15s"
+            sleep 15
+          done
+          echo "::warning::pre-deploy FLUSH never succeeded; proceeding (tail is WAL-durable, replay will recover it)"
 
       - name: Record production boot
         id: production_before
