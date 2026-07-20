@@ -485,11 +485,7 @@ async fn update_from_duplicate_source_keys_applies_last_write_wins() -> Result<(
     assert_eq!(updated, 2, "both rounds applied to the single target row (last-write-wins), not aborted");
 
     // Last source row wins; the target stays a single logical row.
-    let rows = ctx
-        .sql(&format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'"))
-        .await?
-        .collect()
-        .await?;
+    let rows = ctx.sql(&format!("SELECT name FROM otel_logs_and_spans WHERE project_id = '{project_id}' AND id = 'dup_id'")).await?.collect().await?;
     let total: usize = rows.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 1, "target remains a single logical row");
     assert_eq!(rows[0].column(0).as_string_view().value(0), "b", "last source row wins");
