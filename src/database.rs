@@ -5429,13 +5429,28 @@ impl Database {
             return Ok(());
         }
         const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+        // Cap a single bin's rewrite so one pathological partition can't hold the
+        // shared maintenance lock (maintenance_job_sem=1) and starve every other
+        // table's dedup + light_optimize. Prod 2026-07-20: a today-partition bin
+        // took 648s (replace_where can't prune files while DV disables pushdown),
+        // stalling all maintenance for ~half the boot window. On timeout the bin
+        // is requeued for a later tick.
+        const DIRTY_BIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
         let sealed_before = (Utc::now() - chrono::Duration::hours(2)).timestamp_micros();
+        // Skip TODAY's partition: it's the hot, still-growing partition, so a
+        // dedup replace_where rewrites an ever-larger file set for a handful of
+        // dupes (579 rows / 648s observed). Today's dupes are collapsed at read
+        // time by DedupExec (correct), and the partition is deduped once it seals
+        // (date < today ⇒ eligible tomorrow). Hot-tail light_optimize still
+        // sorts/compacts today independently — this only defers DEDUP, not the
+        // sorted layout that recent-window (1h/6h) queries prune on.
+        let today = Utc::now().date_naive().to_string();
         let ready: Vec<_> = self
             .dedup_dirty_bins
             .iter()
             .filter_map(|entry| {
                 let (project, name, date, bin) = entry.key();
-                (name == table_name && (*bin + 1) * BIN_MICROS <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
+                (name == table_name && *date != today && (*bin + 1) * BIN_MICROS <= sealed_before).then(|| (project.clone(), date.clone(), *bin))
             })
             .take(self.config.maintenance.timefusion_dirty_bin_drain_batch.max(1))
             .collect();
@@ -5447,7 +5462,17 @@ impl Database {
             info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
             let started = std::time::Instant::now();
             let parsed_date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")?;
-            let result = self.dedup_partition_range(table, table_name, &project_id, parsed_date, Some(bin)).await;
+            let result = match tokio::time::timeout(DIRTY_BIN_BUDGET, self.dedup_partition_range(table, table_name, &project_id, parsed_date, Some(bin))).await {
+                Ok(r) => r,
+                Err(_) => {
+                    // Over budget — requeue and move on so other maintenance runs.
+                    self.dedup_dirty_bins.insert(key.clone(), ());
+                    self.persist_dirty_bins();
+                    crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    warn!(project_id, table_name, date, bin, budget_secs = DIRTY_BIN_BUDGET.as_secs(), event = "dirty_bin_timeout");
+                    continue;
+                }
+            };
             match result {
                 Ok((dropped, true)) => {
                     let elapsed = started.elapsed().as_millis() as u64;
