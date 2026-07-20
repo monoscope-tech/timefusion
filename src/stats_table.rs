@@ -192,6 +192,15 @@ impl StatsTableProvider {
             rows.push(("plan_cache", "hits".into(), hits.to_string()));
             rows.push(("plan_cache", "misses".into(), misses.to_string()));
             rows.push(("plan_cache", "hit_pct".into(), format!("{:.1}", hit_pct)));
+            // Shape path = literal-bearing and now()-bearing SELECTs (the dashboard
+            // hot path). Separate from the placeholder-`$N` counters above, and
+            // previously unexposed — so the now()-shape caching (the bulk of the
+            // dashboard work) was entirely invisible in stats. shape_hits = a plan
+            // was served via the shape path (built or reused); shape_skips = a shape
+            // couldn't be parameterized and fell back to a fresh plan.
+            let (shape_hits, shape_skips) = pc.shape_counters();
+            rows.push(("plan_cache", "shape_hits".into(), shape_hits.to_string()));
+            rows.push(("plan_cache", "shape_skips".into(), shape_skips.to_string()));
         }
 
         if let Some(m) = &self.scan_metrics {
