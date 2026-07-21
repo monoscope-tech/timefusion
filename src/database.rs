@@ -4075,9 +4075,15 @@ impl Database {
         // S3 I/O). With after_days=1 this leaves warm processing only today —
         // the partition still taking writes.
         let after_days = self.config.parquet.cold_optimize_after_days();
+        // When the light (hot-tail) tier is on, it owns `today`: its event-time
+        // binned selection produces time-DISJOINT sorted runs, while this
+        // whole-partition rewrite re-bins them in snapshot (arrival) order —
+        // undoing the disjointness — and its full-day SortBy is the rewrite
+        // that kept dying of external-sort starvation (prod 2026-07-21).
+        let skip_today = self.config.maintenance.timefusion_light_optimize_enabled;
         let window_dates: Vec<chrono::NaiveDate> = (0..=num_days)
             .map(|days_ago| (now - chrono::Duration::days(days_ago as i64)).date_naive())
-            .filter(|d| !Self::date_is_cold(today, *d, after_days))
+            .filter(|d| !Self::date_is_cold(today, *d, after_days) && !(skip_today && *d == today))
             .collect();
 
         // Snapshot the current live file set once: drives both the ZOrder
