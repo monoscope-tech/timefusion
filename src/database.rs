@@ -4399,7 +4399,13 @@ impl Database {
         // compacting them (a) races concurrent commits → OCC abort (the wedged
         // optimize on today's partition, prod 2026-07-20) and (b) would need
         // re-compaction. Only compact sealed time slices.
-        const SEAL_LAG_MICROS: i64 = 15 * 60 * 1_000_000;
+        // 5min (was 15): the 60s flush interval spreads a high-volume project's
+        // recent window across ~70 tiny files faster than a 15-min lag let the
+        // hot tier reach them, pinning 1h queries at ~1s of file-opens (prod
+        // 2026-07-21). 5min still clears the current 10-min bucket's active fill
+        // while collapsing the tail ~3×; OCC against a late append/DV-rewrite is
+        // absorbed by with_binned_files scoping + the optimize retry loop.
+        const SEAL_LAG_MICROS: i64 = 5 * 60 * 1_000_000;
         let seal = Utc::now().timestamp_micros() - SEAL_LAG_MICROS;
         let adds: Vec<_> = table.get_active_add_actions_by_partitions(filters).try_collect::<Vec<_>>().await?;
         // Only untagged (not-yet-sorted) files, sealed, with an event-time range.
@@ -9637,7 +9643,11 @@ mod tests {
         assert!(!cfg.maintenance.timefusion_dedup_sweep_fallback, "the broad fallback sweep must default off");
         let db = Database::with_config(cfg).await?;
         let project = format!("dirty_{}", uuid::Uuid::new_v4().simple());
-        let old = (Utc::now() - chrono::Duration::hours(3)).timestamp_micros();
+        // A PRIOR calendar date: dedup_dirty_bins_for_table skips today's
+        // (still-growing) partition by design, so the sealed bin must also be
+        // `date < today` to actually be rewritten (26h back is both sealed and
+        // a previous date regardless of time-of-day).
+        let old = (Utc::now() - chrono::Duration::hours(26)).timestamp_micros();
         let row = |id: &str, observed: &str, timestamp| json_to_batch(vec![test_span_ts(id, observed, &project, timestamp)]);
 
         db.insert_records_batch(&project, "otel_logs_and_spans", vec![row("sealed", "first", old)?], true, None).await?;
