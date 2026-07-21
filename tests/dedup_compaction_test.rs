@@ -491,3 +491,118 @@ async fn update_from_duplicate_source_keys_applies_last_write_wins() -> Result<(
     assert_eq!(rows[0].column(0).as_string_view().value(0), "b", "last source row wins");
     Ok(())
 }
+
+/// Regression for the 2026-07-21 wide-dashboard latency incident: the cold
+/// consolidate sweep must produce event-time DISJOINT sorted runs. The old
+/// whole-partition optimize binned files in snapshot (arrival) order, so a day
+/// whose files interleave event times (dedup rewrites, DV merges, backfill)
+/// merged into runs that ALL overlapped the full day — a recent-window or
+/// ORDER-BY-timestamp-DESC-LIMIT query had to open every file. Event-time
+/// binned selection makes successive runs cover strictly later slices.
+#[serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_consolidate_produces_event_time_disjoint_runs() -> Result<()> {
+    use timefusion::test_utils::test_helpers::minio_test_config;
+    let id = format!("cold-consol-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let dir = format!("/tmp/timefusion-{id}");
+    let _env = walrus_env_guard(std::path::Path::new(&dir));
+    let project_id = format!("proj_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+
+    // A sealed, cold date (3 days back). Arrival order interleaves event
+    // times: hours [0, 6, 1, 7, 2, 8] — snapshot-order binning mixes early and
+    // late hours in every bin; event-time binning separates them.
+    let base = (chrono::Utc::now() - chrono::Duration::days(3)).date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let date = base.date_naive();
+    let hours = [0i64, 6, 1, 7, 2, 8];
+
+    // Event-time range from the raw Add stats JSON (timestamps are RFC3339).
+    fn ts_range(stats: &str) -> Option<(i64, i64)> {
+        let v: serde_json::Value = serde_json::from_str(stats).ok()?;
+        let get = |key: &str| v[key]["timestamp"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp_micros());
+        Some((get("minValues")?, get("maxValues")?))
+    }
+
+    // The flush path (not the skip_queue direct commit) is what writes
+    // min/max timestamp stats into the Add actions — the same files the prod
+    // selection sees; flush_immediately lands each insert as its own commit.
+    let cfg = {
+        let mut c = (*minio_test_config(&id, &dir)).clone();
+        c.buffer.timefusion_flush_immediately = true;
+        Arc::new(c)
+    };
+    let sizes: Vec<i64> = {
+        let db = Arc::new(Database::with_config(Arc::clone(&cfg)).await?);
+        for (i, h) in hours.iter().enumerate() {
+            let ts = (base + chrono::Duration::hours(*h)).timestamp_micros();
+            let mut row = test_span_ts(&format!("id-{i}"), &format!("span-{i}"), &project_id, ts);
+            // Data-dominated file sizes (incompressible ~140KB payload): run
+            // sizes must scale with their member rows for the size-based
+            // convergence assertions below; 1-row files are otherwise pure
+            // footer overhead and merging wouldn't grow them.
+            let blob: String = (0..4000).map(|_| uuid::Uuid::new_v4().to_string()).collect();
+            row["summary"] = serde_json::json!([blob]);
+            let batch = json_to_batch(vec![row])?;
+            // flush_immediately → each insert flushes as its own Delta commit.
+            db.insert_records_batch(&project_id, "otel_logs_and_spans", vec![batch], false, None).await?;
+        }
+        let table_ref = db.unified_tables().read().await.get("otel_logs_and_spans").expect("table created").clone();
+        let guard = table_ref.read().await;
+        let marker = format!("project_id={project_id}/date={date}");
+        let batch = guard.snapshot()?.add_actions_table(true)?;
+        let paths = batch.column_by_name("path").unwrap();
+        let file_sizes = batch.column_by_name("size_bytes").unwrap().as_primitive::<Int64Type>();
+        (0..file_sizes.len())
+            .filter(|&i| timefusion::test_utils::test_helpers::array_get_str(paths.as_ref(), i).contains(&marker))
+            .map(|i| file_sizes.value(i))
+            .collect()
+    };
+    assert_eq!(sizes.len(), 6, "each skip_queue insert must land as its own file");
+
+    // Cold target sized so ~2 files fit per run but 3 don't → forces >1 run.
+    let median = {
+        let mut s = sizes.clone();
+        s.sort();
+        s[s.len() / 2]
+    };
+    let mut cfg2 = (*cfg).clone();
+    cfg2.parquet.timefusion_cold_optimize_target_size = median * 5 / 2;
+    let db = Arc::new(Database::with_config(Arc::new(cfg2)).await?);
+    let table_ref = db.get_or_create_unified_table("otel_logs_and_spans").await?;
+    db.consolidate_sealed_partitions(&table_ref, "otel_logs_and_spans").await?;
+
+    // Collect (min,max) event-time ranges of the partition's live files.
+    let filters = vec![
+        deltalake::PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?,
+        deltalake::PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?,
+    ];
+    let ranges: Vec<(i64, i64)> = {
+        use futures::TryStreamExt;
+        let guard = table_ref.read().await;
+        let adds: Vec<_> = guard.get_active_add_actions_by_partitions(&filters).try_collect().await?;
+        // A run without readable timestamp stats overlaps everything —
+        // equally fatal for pruning, so it must fail the disjointness assert.
+        adds.iter().map(|a| a.stats().and_then(|s| ts_range(&s)).unwrap_or((i64::MIN, i64::MAX))).collect()
+    };
+    assert!(ranges.len() < 6, "consolidation must merge files (got {} of 6)", ranges.len());
+    assert!(ranges.len() >= 2, "target must split the day into multiple runs (got {})", ranges.len());
+    let mut sorted = ranges.clone();
+    sorted.sort();
+    for w in sorted.windows(2) {
+        assert!(w[0].1 < w[1].0, "consolidated runs must be event-time disjoint, got overlapping ranges {:?} and {:?} (all: {:?})", w[0], w[1], sorted);
+    }
+    assert_eq!(delta_physical_row_count(&table_ref).await?, 6, "consolidation must not lose rows");
+
+    // Idempotence: a second sweep must not rewrite converged runs.
+    let before: Vec<(i64, i64)> = sorted.clone();
+    db.consolidate_sealed_partitions(&table_ref, "otel_logs_and_spans").await?;
+    let after: Vec<(i64, i64)> = {
+        use futures::TryStreamExt;
+        let guard = table_ref.read().await;
+        let adds: Vec<_> = guard.get_active_add_actions_by_partitions(&filters).try_collect().await?;
+        let mut r: Vec<_> = adds.iter().map(|a| a.stats().and_then(|s| ts_range(&s)).unwrap_or((i64::MIN, i64::MAX))).collect();
+        r.sort();
+        r
+    };
+    assert_eq!(after, before, "second sweep must be a no-op on converged runs");
+    Ok(())
+}

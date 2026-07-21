@@ -4372,7 +4372,14 @@ impl Database {
     /// `target_size`, plus at most one existing sorted run to merge into, and
     /// hand that exact set to `with_binned_files` — the appends that land after
     /// selection aren't in the set, so they don't conflict.
-    async fn light_optimize_tail(table: &DeltaTable, filters: &[PartitionFilter], target_size: i64, min_files: usize) -> Result<Vec<String>> {
+    /// `include_sorted_runs` re-admits already-tagged sorted runs to the
+    /// packing (the cold tier's leveled re-merge); the hot tier excludes them
+    /// (its runs are the cold tier's input). Files at ≥ 7/8·target are always
+    /// excluded — they're converged, and re-selecting one alone would rewrite
+    /// it 1→1 forever.
+    async fn light_optimize_tail(
+        table: &DeltaTable, filters: &[PartitionFilter], target_size: i64, min_files: usize, include_sorted_runs: bool,
+    ) -> Result<Vec<String>> {
         // Tag the fork stamps on sorted-run outputs (delta-rs optimize.rs). Kept
         // in sync by the exact rev pin; a fork rename would need a deliberate bump.
         const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
@@ -4390,12 +4397,19 @@ impl Database {
         // sorted output runs time-DISJOINT, so file-range pruning can exclude
         // files outside a query's window (arrival-time binning left every file
         // overlapping → files_ranges_pruned=56→56, i.e. no pruning).
+        let converged = cap - cap / 8;
         let mut fresh: Vec<(String, i64, i64)> = adds
             .iter()
-            .filter(|add| add.tags().get(SORTED_RUN_TAG).is_none_or(|v| v.as_deref() != Some("true")))
+            .filter(|add| include_sorted_runs || add.tags().get(SORTED_RUN_TAG).is_none_or(|v| v.as_deref() != Some("true")))
+            .filter(|add| add.size() < converged)
             .filter_map(|add| {
-                let min = add.stat_min_i64("timestamp")?;
-                let max = add.stat_max_i64("timestamp")?;
+                // Parse the raw Add stats JSON: the snapshot's parsed-stats
+                // column (`stats_parsed`) isn't materialized on this path, so
+                // the kernel `stat_min_i64`/`stat_max_i64` accessors return
+                // None for every file — the 2026-07-20 event-time binning read
+                // them and silently selected NOTHING (hot compaction was a
+                // no-op in prod while today-partitions grew to 474+ files).
+                let (min, max) = Self::event_time_range_from_stats(&add.stats()?)?;
                 (max <= seal).then(|| (add.path().to_string(), min, add.size()))
             })
             .collect();
@@ -4410,12 +4424,34 @@ impl Database {
         let mut files = vec![];
         for (path, _, size) in fresh {
             if !files.is_empty() && bytes + size > cap {
-                break;
+                // A lone-file slice is already a run — rewriting it is pure
+                // churn. Skip past it to the next time slice instead of
+                // wedging the pass behind it.
+                if files.len() >= 2 {
+                    break;
+                }
+                bytes = 0;
+                files.clear();
             }
             bytes += size;
             files.push(path);
         }
+        if files.len() < 2 {
+            files.clear();
+        }
         Ok(files)
+    }
+
+    /// `[min, max]` event time (micros) of a file from its raw Add stats JSON.
+    /// Timestamp stats serialize as RFC3339 strings (epoch numbers accepted for
+    /// long-typed columns).
+    fn event_time_range_from_stats(stats: &str) -> Option<(i64, i64)> {
+        let stats: serde_json::Value = serde_json::from_str(stats).ok()?;
+        let get = |key: &str| {
+            let v = &stats[key]["timestamp"];
+            v.as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp_micros()).or_else(|| v.as_i64())
+        };
+        Some((get("minValues")?, get("maxValues")?))
     }
 
     /// Partition-ownership boundary between the warm (30-min Z-order) and cold
@@ -4442,9 +4478,9 @@ impl Database {
     /// Compact a single `date=` partition by bin-packing its small files
     /// (`Compact`, not Z-order — a pure row-group merge that preserves
     /// Variant/Binary column bytes). Powers the on-demand `OPTIMIZE <table>
-    /// WHERE date = '...'` pgwire command, the `optimize` CLI subcommand, and
-    /// the daily cold consolidation sweep — all compacting partitions outside
-    /// the scheduled 48h Z-order window. Target size scales with partition age
+    /// WHERE date = '...'` pgwire command and the `optimize` CLI subcommand
+    /// (the daily cold sweep uses `consolidate_date_binned` for event-time
+    /// disjoint runs). Target size scales with partition age
     /// (`optimize_target_for_date`). Commits once; returns (removed, added).
     pub async fn compact_date(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate) -> Result<(u64, u64)> {
         self.compact_date_with(table_ref, table_name, date, self.config.maintenance.timefusion_optimize_max_concurrent_tasks).await
@@ -4739,8 +4775,8 @@ impl Database {
 
     /// Daily cold consolidation: bin-pack every sealed partition (date older
     /// than `cold_optimize_after_days`) toward the 1GB cold target. Calendar-age
-    /// driven and idempotent — `compact_date`'s Compact skips files already
-    /// ≥ target, so already-consolidated partitions cost a plan, not a rewrite
+    /// driven and idempotent — converged runs are excluded from re-selection,
+    /// so already-consolidated partitions cost a snapshot scan, not a rewrite
     /// (bounds S3 I/O across the whole cold backlog). Covers "previous days and
     /// further", picking up backfill that landed in old partitions.
     pub async fn consolidate_sealed_partitions(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
@@ -4749,10 +4785,60 @@ impl Database {
         let dates: Vec<chrono::NaiveDate> = self.partition_dates(table_ref).await?.into_iter().filter(|d| Self::date_is_cold(today, *d, after_days)).collect();
         info!("consolidate: table={} sweeping {} sealed partition(s) older than {}d", table_name, dates.len(), after_days);
         for date in dates {
-            // Concurrency 1: bound peak memory of the 1GB-target merges so the
-            // daily in-process sweep can't OOM the instance (see compact_date_with).
-            if let Err(e) = self.compact_date_with(table_ref, table_name, date, 1).await {
+            if let Err(e) = self.consolidate_date_binned(table_ref, table_name, date).await {
                 warn!("consolidate: skipping date={} after error: {}", date, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Leveled (L2) consolidation of one sealed `date`: per project, repeatedly
+    /// select the earliest event-time slice of small files up to the cold
+    /// target and rewrite it as one sorted run (`with_binned_files`, one commit
+    /// per run). Successive passes take strictly later slices, so — unlike the
+    /// whole-partition optimize, whose internal bins pack in snapshot order and
+    /// mix event times — the output runs are event-time DISJOINT: a recent-window
+    /// or `ORDER BY timestamp DESC LIMIT` query reads only the run(s) overlapping
+    /// its range instead of every file in the day. Per-pass memory is bounded by
+    /// one ≤target sort (the whole-day SortBy died of external-sort starvation,
+    /// prod 2026-07-21). Converges: outputs ≥ 7/8·target (and lone tail runs)
+    /// are excluded from re-selection by `light_optimize_tail`.
+    async fn consolidate_date_binned(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate) -> Result<()> {
+        let target_size = self.optimize_target_for_date(date);
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
+        let date_str = date.to_string();
+        let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
+        // Backstop against a selection that stops shrinking (e.g. a rewrite
+        // that keeps losing OCC to a dedup); a normal day converges in
+        // partition_bytes/target passes.
+        const MAX_PASSES: usize = 128;
+        for project_id in Self::hot_project_ids(&uris, date) {
+            let partition_filters =
+                vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
+            for _ in 0..MAX_PASSES {
+                let selected_files = {
+                    let table = table_ref.read().await;
+                    Self::light_optimize_tail(&table, &partition_filters, target_size, 2, true).await?
+                };
+                if selected_files.is_empty() {
+                    break;
+                }
+                self.optimize_table_light_inner(
+                    table_ref,
+                    table_name,
+                    date,
+                    &project_id,
+                    &partition_filters,
+                    &selected_files,
+                    target_size,
+                    &writer_properties,
+                    optimize_type.clone(),
+                    2,
+                    std::time::Instant::now(),
+                )
+                .await?;
             }
         }
         Ok(())
@@ -5702,9 +5788,10 @@ impl Database {
     ) -> Result<()> {
         let partition_filters =
             vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", today_str))?];
+        let min_files = self.config.maintenance.timefusion_compact_min_files;
         let selected_files = {
             let table = table_ref.read().await;
-            Self::light_optimize_tail(&table, &partition_filters, target_size, self.config.maintenance.timefusion_compact_min_files).await?
+            Self::light_optimize_tail(&table, &partition_filters, target_size, min_files, false).await?
         };
         if selected_files.is_empty() {
             return Ok(());
@@ -5720,6 +5807,7 @@ impl Database {
             target_size,
             writer_properties,
             optimize_type.clone(),
+            min_files,
             std::time::Instant::now(),
         )
         .await
@@ -5733,7 +5821,7 @@ impl Database {
     async fn optimize_table_light_inner(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today: chrono::NaiveDate, project_id: &str, partition_filters: &[PartitionFilter],
         selected_files: &[String], target_size: i64, writer_properties: &WriterProperties, optimize_type: deltalake::operations::optimize::OptimizeType,
-        start_time: std::time::Instant,
+        min_files: usize, start_time: std::time::Instant,
     ) -> Result<()> {
         const MAX_RETRIES: usize = 4;
         // Optimize rewrites (compaction) materialize Arrow like dedup — hold a
@@ -5781,7 +5869,6 @@ impl Database {
                 .await;
             match optimize_result {
                 Ok((new_table, metrics)) => {
-                    let min_files = self.config.maintenance.timefusion_compact_min_files;
                     if metrics.total_considered_files < min_files {
                         debug!(
                             "Skipping light optimization commit for table={} project={} date={}: {} files < min threshold {}",
