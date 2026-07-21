@@ -5795,29 +5795,42 @@ impl Database {
         let partition_filters =
             vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", today_str))?];
         let min_files = self.config.maintenance.timefusion_compact_min_files;
-        let selected_files = {
-            let table = table_ref.read().await;
-            Self::light_optimize_tail(&table, &partition_filters, target_size, min_files, false).await?
-        };
-        if selected_files.is_empty() {
-            return Ok(());
+        // Pack successive time-disjoint bins in one tick until the tail is
+        // converged. `light_optimize_tail` returns one bin (the earliest sealed
+        // slice) per call; on a high-volume project the day fragments to dozens
+        // of files between 5-min ticks, so one-bin-per-tick perpetually lags
+        // ingest (prod 2026-07-21: 12 files compacted/tick while 69 remained in
+        // the 1h window → 6s+ scans). Each compacted output is tagged
+        // (SORTED_RUN_TAG) and excluded from re-selection, so re-reading the
+        // post-swap snapshot yields the next slice — never the just-written run.
+        // Bound the passes so a large backlog can't wedge the tick.
+        const MAX_BINS_PER_TICK: usize = 12;
+        for pass in 0..MAX_BINS_PER_TICK {
+            let selected_files = {
+                let table = table_ref.read().await;
+                Self::light_optimize_tail(&table, &partition_filters, target_size, min_files, false).await?
+            };
+            if selected_files.is_empty() {
+                return Ok(());
+            }
+            info!(table_name, project_id, date = %today, selected_files = selected_files.len(), pass, event = "light_optimize_tail_selected");
+            self.optimize_table_light_inner(
+                table_ref,
+                table_name,
+                today,
+                &project_id,
+                &partition_filters,
+                &selected_files,
+                target_size,
+                writer_properties,
+                optimize_type.clone(),
+                min_files,
+                std::time::Instant::now(),
+            )
+            .await
+            .inspect_err(|e| warn!("Light optimize failed for project={} date={}: {}", project_id, today, e))?;
         }
-        info!(table_name, project_id, date = %today, selected_files = selected_files.len(), event = "light_optimize_tail_selected");
-        self.optimize_table_light_inner(
-            table_ref,
-            table_name,
-            today,
-            &project_id,
-            &partition_filters,
-            &selected_files,
-            target_size,
-            writer_properties,
-            optimize_type.clone(),
-            min_files,
-            std::time::Instant::now(),
-        )
-        .await
-        .inspect_err(|e| warn!("Light optimize failed for project={} date={}: {}", project_id, today, e))
+        Ok(())
     }
 
     /// Inner optimize loop. Caller is expected to hold the flush lock when
