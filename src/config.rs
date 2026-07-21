@@ -1231,6 +1231,16 @@ pub struct MemoryConfig {
     /// 1h dashboard path) are never gated and keep full parallelism.
     #[serde(default = "d_max_concurrent_scan_readers")]
     pub timefusion_max_concurrent_scan_readers: usize,
+    /// Maintenance (compaction/dedup) FairSpillPool size in GiB. 0 = derived:
+    /// `memory_limit − query_pool` clamped to [1, 8] GiB. The derived ceiling
+    /// was sized for the old 25 GB box; on the 188 GB box it starves the warm
+    /// SortBy optimize — a 256 MB-zstd merge bin decompresses to 2–6 GB of
+    /// Arrow (cold 1 GB bins to 8–15 GB), so every 30-min optimize died with
+    /// "Not enough memory to continue external sort" and sealed days stayed at
+    /// 300–4800 files (prod 2026-07-20/21, the direct cause of 5–30s wide
+    /// dashboard scans). Set explicitly (e.g. 24) where the container allows.
+    #[serde(default)]
+    pub timefusion_maintenance_pool_gb: usize,
     #[serde(default = "d_wide_scan_lookback_hours")]
     pub timefusion_wide_scan_lookback_hours: u64,
     /// Cross-connection plan-cache capacity (unique canonical/shape templates).
@@ -1251,6 +1261,17 @@ pub struct MemoryConfig {
 impl MemoryConfig {
     pub fn memory_limit_bytes(&self) -> usize {
         self.timefusion_memory_limit_gb * GIB
+    }
+
+    /// Maintenance pool size: explicit knob wins; otherwise the headroom
+    /// between the query pool and the memory limit, clamped to [1, 8] GiB.
+    pub fn maintenance_pool_bytes(&self) -> usize {
+        if self.timefusion_maintenance_pool_gb > 0 {
+            return self.timefusion_maintenance_pool_gb * GIB;
+        }
+        let limit = self.memory_limit_bytes();
+        let query_pool = (limit as f64 * self.timefusion_memory_fraction) as usize;
+        limit.saturating_sub(query_pool).clamp(GIB, 8 * GIB)
     }
 }
 
@@ -1321,6 +1342,25 @@ mod tests {
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 1);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
+    }
+
+    // Regression for the 2026-07-21 compaction outage: the derived maintenance
+    // pool (limit − query pool, clamped to 8 GiB) starved SortBy external sorts
+    // on the big box, so every warm/cold optimize failed and sealed days stayed
+    // at hundreds of files. The explicit knob must win over the derived clamp.
+    #[test]
+    fn maintenance_pool_knob_overrides_derived_clamp() {
+        let mut config = AppConfig::default();
+        config.memory.timefusion_memory_limit_gb = 32;
+        config.memory.timefusion_memory_fraction = 0.75;
+        // Derived: 32 − 24 = 8 GiB (exactly at the clamp ceiling).
+        assert_eq!(config.memory.maintenance_pool_bytes(), 8 * GIB);
+        config.memory.timefusion_maintenance_pool_gb = 24;
+        assert_eq!(config.memory.maintenance_pool_bytes(), 24 * GIB);
+        // Derived floor: tiny leftover clamps up to 1 GiB.
+        config.memory.timefusion_maintenance_pool_gb = 0;
+        config.memory.timefusion_memory_fraction = 0.99;
+        assert_eq!(config.memory.maintenance_pool_bytes(), GIB);
     }
 
     #[test]

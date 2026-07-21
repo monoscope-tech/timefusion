@@ -3385,10 +3385,7 @@ impl Database {
         };
         self.maintenance_runtime_env
             .get_or_init(|| {
-                let memory_limit_bytes = self.config.memory.memory_limit_bytes();
-                let query_pool = (memory_limit_bytes as f64 * self.config.memory.timefusion_memory_fraction) as usize;
-                // Budget headroom between the query pool and the hard limit, clamped to [1, 8] GiB.
-                let pool_size = memory_limit_bytes.saturating_sub(query_pool).clamp(1 << 30, 8 << 30);
+                let pool_size = self.config.memory.maintenance_pool_bytes();
                 let spill_dir = self.config.core.timefusion_data_dir.join("maintenance_spill");
                 let _ = std::fs::create_dir_all(&spill_dir);
                 let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir]));
@@ -4147,7 +4144,12 @@ impl Database {
         // prune whole files and row groups. It remains an incident kill switch.
         let (optimize_type, declare_sorted) = full_optimize_type(schema, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
-        let optimize_concurrency = self.config.maintenance.timefusion_optimize_max_concurrent_tasks;
+        // SortBy bins materialize their decompressed Arrow set in the shared
+        // maintenance pool (a 256MB-zstd bin ≈ 2–6GB Arrow), so concurrent bin
+        // sorts starve each other's external-sort reservations and the whole
+        // optimize fails ("Not enough memory to continue external sort", prod
+        // 2026-07-21). Serialize sort bins — same rule as compact_date.
+        let optimize_concurrency = if declare_sorted { 1 } else { self.config.maintenance.timefusion_optimize_max_concurrent_tasks };
 
         // Best-effort: retry bounded OCC conflicts against a fresh snapshot,
         // but never pause flushes (see optimize_table_light). This preserves
