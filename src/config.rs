@@ -363,6 +363,14 @@ const_default!(d_false: bool = false);
 const_default!(d_mem_gb: usize = 8);
 const_default!(d_mem_fraction: f64 = 0.9);
 const_default!(d_query_partitions: usize = 0);
+// Wide-scan admission guard. 16 concurrent Parquet decoders bounds untracked
+// decode heap well under the 25 GB pool on the 188 GB/48-core box (48-way was
+// the OOM). Wide observability windows are already latency-bound below this, so
+// gating is near-free on speed. 2h lookback keeps the hot 1h/last-few-hours
+// dashboards ungated (they page-prune to tiny per-file bytes) while 3d+/no-time
+// scans queue. Both tunable via TIMEFUSION_{MAX_CONCURRENT_SCAN_READERS,WIDE_SCAN_LOOKBACK_HOURS}.
+const_default!(d_max_concurrent_scan_readers: usize = 16);
+const_default!(d_wide_scan_lookback_hours: u64 = 2);
 const_default!(d_plan_cache_capacity: usize = 2048);
 const_default!(d_otlp_endpoint: String = "http://localhost:4317");
 const_default!(d_service_name: String = "timefusion");
@@ -532,6 +540,12 @@ pub struct AwsConfig {
 /// humantime and PANIC the process at boot on a unitless value — a prod
 /// `TIMEFUSION_S3_CONNECT_TIMEOUT=150` crash-looped TF on 2026-06-24. Treat an
 /// all-digit string as seconds; pass anything with a unit through untouched.
+/// Warm-connection pool size per host, shared by both object-store client
+/// construction paths. 128 gives headroom above the ~48-way query scan fanout
+/// so concurrent GETs reuse sockets instead of re-doing TLS (the connection
+/// starvation that failed the 2026-06-24 compaction under load).
+pub(crate) const S3_POOL_MAX_IDLE_PER_HOST: usize = 128;
+
 fn normalize_duration(s: String) -> String {
     if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) { format!("{s}s") } else { s }
 }
@@ -568,6 +582,11 @@ impl AwsConfig {
         // delta-rs register path and the direct AmazonS3Builder agree.
         opts.insert("connect_timeout".into(), self.connect_timeout());
         opts.insert("timeout".into(), self.request_timeout());
+        // Keep TLS connections warm for the query read path: a recent-window
+        // scan fans out ~target_partitions (48) concurrent GETs; the object_store
+        // default idle cap can force TLS re-establishment mid-fanout and starve
+        // R2. Matches create_object_store's direct AmazonS3Builder client.
+        opts.insert("pool_max_idle_per_host".into(), S3_POOL_MAX_IDLE_PER_HOST.to_string());
         opts
     }
 }
@@ -1199,6 +1218,21 @@ pub struct MemoryConfig {
     /// tests → sessions keep DataFusion's default.
     #[serde(default = "d_query_partitions")]
     pub timefusion_query_partitions: usize,
+    /// Admission guard for wide-window read scans. A query reaching further back
+    /// than `timefusion_wide_scan_lookback_hours` (or with no lower time bound)
+    /// opens hundreds of Parquet files whose row groups aren't page-pruned (a
+    /// one-sided `timestamp >= cutoff` can't prune files past the date cut), so
+    /// its per-file decode buffers are large and unbounded by the DataFusion
+    /// memory pool (Parquet decode is untracked). At `target_partitions` (~48)
+    /// concurrent decoders this OOM-restarted prod from a single 7-day dashboard
+    /// (2026-07-20). Wide scans are gated to `timefusion_max_concurrent_scan_readers`
+    /// concurrent batch-decodes across ALL queries so they degrade to slower
+    /// rather than take the process down; narrow recent-window scans (the hot
+    /// 1h dashboard path) are never gated and keep full parallelism.
+    #[serde(default = "d_max_concurrent_scan_readers")]
+    pub timefusion_max_concurrent_scan_readers: usize,
+    #[serde(default = "d_wide_scan_lookback_hours")]
+    pub timefusion_wide_scan_lookback_hours: u64,
     /// Cross-connection plan-cache capacity (unique canonical/shape templates).
     /// 256 thrashed in prod (evicting ~half every ~60s); 1024 holds the working
     /// set with room to spare. Each entry is one LogicalPlan (~KBs).

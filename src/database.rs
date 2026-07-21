@@ -16,7 +16,7 @@ use datafusion::{
     execution::{TaskContext, context::SessionContext},
     logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, col, dml::InsertOp, lit},
     physical_expr::expressions::{CastExpr, Column as PhysicalColumn},
-    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream, projection::ProjectionExec, union::UnionExec},
+    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream, projection::ProjectionExec, stream::RecordBatchStreamAdapter, union::UnionExec},
     scalar::ScalarValue,
 };
 use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
@@ -1329,6 +1329,10 @@ pub struct Database {
     /// time-windowed target to hash-join keys; ungated bursts starve reads on a
     /// CPU-throttled box (prod 2026-07-19). Permits = `timefusion_dml_merge_concurrency`.
     dml_merge_sem: Arc<tokio::sync::Semaphore>,
+    /// Caps concurrent Parquet batch-decodes for WIDE read scans (see
+    /// `timefusion_max_concurrent_scan_readers`). Shared across all queries so a
+    /// burst of wide-window dashboards can't stack decode buffers into an OOM.
+    heavy_scan_sem: Arc<tokio::sync::Semaphore>,
     /// Serializes the outer full and light maintenance jobs. Their rewrite
     /// permits alone are insufficient: a waiting light job can exhaust its
     /// table timeout before it ever starts work.
@@ -1679,6 +1683,7 @@ impl Database {
         // Captured before `cfg` is moved into the struct literal below.
         let maint_rewrite_permits = cfg.maintenance.timefusion_maintenance_rewrite_concurrency.max(1);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
+        let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1);
         let maintenance_shutdown = CancellationToken::new();
         let maintenance_cancel_guard = Arc::new(maintenance_shutdown.clone().drop_guard());
         let db = Self {
@@ -1710,6 +1715,7 @@ impl Database {
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
+            heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
             commit_locks: Arc::new(dashmap::DashMap::new()),
             dml_locks: Arc::new(dashmap::DashMap::new()),
@@ -3268,7 +3274,7 @@ impl Database {
         let client_options = ClientOptions::new()
             .with_config(ClientConfigKey::ConnectTimeout, self.config.aws.connect_timeout())
             .with_config(ClientConfigKey::Timeout, self.config.aws.request_timeout())
-            .with_config(ClientConfigKey::PoolMaxIdlePerHost, "64".to_string());
+            .with_config(ClientConfigKey::PoolMaxIdlePerHost, crate::config::S3_POOL_MAX_IDLE_PER_HOST.to_string());
 
         // Build S3 configuration
         let mut builder = AmazonS3Builder::new().with_bucket_name(bucket).with_retry(retry_config).with_client_options(client_options);
@@ -6876,7 +6882,33 @@ impl ProjectRoutingTable {
             None => self.schema.clone(),
         };
 
-        Self::coerce_plan_to_schema(delta_plan, &target_schema)
+        let coerced = Self::coerce_plan_to_schema(delta_plan, &target_schema)?;
+        Ok(self.gate_if_wide(coerced, filters))
+    }
+
+    /// A read scan is "wide" if it reaches further back than the configured
+    /// lookback (or has no lower time bound at all) — the case where a one-sided
+    /// `timestamp >= cutoff` can't prune files past the date cut and every file's
+    /// row groups are fully decoded. Uses lookback DEPTH (`now - min_ts`), not
+    /// raw window width, so the hot one-sided `>= now()-1h` dashboard (whose max
+    /// is open-ended) reads as narrow.
+    fn is_wide_scan(&self, filters: &[Expr]) -> bool {
+        let hours = self.database.config.memory.timefusion_wide_scan_lookback_hours;
+        let cutoff_micros = (hours as i64).saturating_mul(3_600_000_000);
+        match self.extract_time_range_from_filters(filters) {
+            Some((min, _)) if min != i64::MIN => crate::clock::now_micros().saturating_sub(min) > cutoff_micros,
+            _ => true, // no lower bound → full-history scan → always gate
+        }
+    }
+
+    /// Wrap a wide Delta scan so its Parquet decoding draws from the shared
+    /// `heavy_scan_sem`, bounding concurrent decode heap across all queries.
+    fn gate_if_wide(&self, plan: Arc<dyn ExecutionPlan>, filters: &[Expr]) -> Arc<dyn ExecutionPlan> {
+        if self.is_wide_scan(filters) {
+            Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone()))
+        } else {
+            plan
+        }
     }
 
     /// Wrap an execution plan with type coercion if the output schema doesn't match the target.
@@ -7014,6 +7046,73 @@ impl ProjectRoutingTable {
             (None, Some(max)) => Some((i64::MIN, max)),
             (None, None) => None,
         }
+    }
+}
+
+/// Concurrency-gates a wide read scan: each output partition acquires a permit
+/// from a shared semaphore around every batch decode, bounding the number of
+/// Parquet row groups decoded at once across ALL wide queries. This is the
+/// admission guard that keeps a wide-window dashboard (hundreds of files, no
+/// page pruning) from OOM-restarting the process — Parquet decode heap is
+/// untracked by the DataFusion memory pool, so at full `target_partitions`
+/// parallelism a single 7-day query took the box down (prod 2026-07-20).
+///
+/// Acquisition is PER-BATCH, not per-stream: a permit held for a partition's
+/// whole lifetime would deadlock `SortPreservingMergeExec`, which needs a batch
+/// from every input partition before it can emit — with fewer permits than
+/// partitions, the un-permitted partitions could never produce their first
+/// batch. Releasing between batches lets all partitions make forward progress
+/// in waves of `permits`.
+#[derive(Debug)]
+struct GatedScanExec {
+    input: Arc<dyn ExecutionPlan>,
+    sem: Arc<tokio::sync::Semaphore>,
+    properties: Arc<PlanProperties>,
+}
+
+impl GatedScanExec {
+    fn new(input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>) -> Self {
+        let properties = input.properties().clone();
+        Self { input, sem, properties }
+    }
+}
+
+impl DisplayAs for GatedScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => write!(f, "GatedScanExec: permits={}", self.sem.available_permits()),
+            _ => write!(f, "GatedScanExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for GatedScanExec {
+    fn name(&self) -> &'static str {
+        "GatedScanExec"
+    }
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self { input: children[0].clone(), sem: self.sem.clone(), properties: self.properties.clone() }))
+    }
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
+        let inner = self.input.execute(partition, context)?;
+        let schema = inner.schema();
+        let sem = self.sem.clone();
+        // Hold a permit only across each `poll_next` (one batch decode), then
+        // release so other partitions/queries can proceed — see type docs.
+        let gated = futures::stream::unfold(inner, move |mut inner| {
+            let sem = sem.clone();
+            async move {
+                let _permit = sem.acquire_owned().await.ok()?;
+                futures::StreamExt::next(&mut inner).await.map(|item| (item, inner))
+            }
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, gated)))
     }
 }
 
@@ -7860,6 +7959,30 @@ mod tests {
                 .target_partitions,
             2
         );
+    }
+
+    /// GatedScanExec must release its permit BETWEEN batches: a per-stream hold
+    /// deadlocks any consumer that needs a batch from every input partition at
+    /// once (SortPreservingMerge) when permits < partitions. Here 8 partitions
+    /// contend for 2 permits and every partition's first batch is awaited
+    /// concurrently — a regression to per-stream holding hangs this barrier.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gated_scan_exec_releases_permit_between_batches_no_deadlock() {
+        use arrow::array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let partitions: Vec<Vec<RecordBatch>> =
+            (0..8).map(|i| vec![RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![i]))]).unwrap()]).collect();
+        let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, schema.clone(), None).unwrap())));
+        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(2))));
+        let ctx = Arc::new(TaskContext::default());
+        let mut streams: Vec<_> = (0..8).map(|p| gated.execute(p, ctx.clone()).unwrap()).collect();
+        let firsts = tokio::time::timeout(std::time::Duration::from_secs(10), futures::future::join_all(streams.iter_mut().map(futures::StreamExt::next)))
+            .await
+            .expect("GatedScanExec deadlocked — per-batch permit release regressed");
+        let mut vals: Vec<i32> = firsts.into_iter().map(|b| b.unwrap().unwrap().column(0).as_any().downcast_ref::<Int32Array>().unwrap().value(0)).collect();
+        vals.sort();
+        assert_eq!(vals, (0..8).collect::<Vec<_>>(), "every gated partition must yield its row");
     }
 
     /// spawn_cron_job must fire on the wall-clock schedule (regression: the
