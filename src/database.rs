@@ -4412,13 +4412,13 @@ impl Database {
         // compacting them (a) races concurrent commits → OCC abort (the wedged
         // optimize on today's partition, prod 2026-07-20) and (b) would need
         // re-compaction. Only compact sealed time slices.
-        // 5min (was 15): the 60s flush interval spreads a high-volume project's
-        // recent window across ~70 tiny files faster than a 15-min lag let the
-        // hot tier reach them, pinning 1h queries at ~1s of file-opens (prod
-        // 2026-07-21). 5min still clears the current 10-min bucket's active fill
-        // while collapsing the tail ~3×; OCC against a late append/DV-rewrite is
-        // absorbed by with_binned_files scoping + the optimize retry loop.
-        const SEAL_LAG_MICROS: i64 = 5 * 60 * 1_000_000;
+        // 15min: a 5min lag was tried (shrinks the recent file count faster) but
+        // THRASHED the Foyer cache — rewriting the recent window every 5min churns
+        // file IDs faster than 1h-window queries reuse the warm bodies, so 1h
+        // latency stuck at 2-7s and never warmed while 3h (stable older files) did
+        // (prod 2026-07-21). 15min lets recent files settle so the cache stays
+        // warm → 1h/3h converge to ~0.2s once the box has ~30min uptime.
+        const SEAL_LAG_MICROS: i64 = 15 * 60 * 1_000_000;
         let seal = Utc::now().timestamp_micros() - SEAL_LAG_MICROS;
         let adds: Vec<_> = table.get_active_add_actions_by_partitions(filters).try_collect::<Vec<_>>().await?;
         // Only untagged (not-yet-sorted) files, sealed, with an event-time range.
