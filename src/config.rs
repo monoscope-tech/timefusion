@@ -298,7 +298,12 @@ const_default!(d_compact_min_files: usize = 5);
 // the same growing files repeatedly (write amplification) and add in-process
 // merge memory on the hot path. Consolidation to 256MB/1GB happens later, once
 // the partition is sealed (warm optimize → daily cold consolidate).
-const_default!(d_light_optimize_target: i64 = 32 * 1024 * 1024);
+// 256MB (was 32MB): on the 188GB/48-core box the small-merge-memory rationale is
+// moot, and 32MB left the hot (today) partition as dozens of tiny files for a
+// high-write project — recent 1h/3h queries were file-OPEN-latency bound (~62
+// opens ≈ 1.2s). A larger target collapses today's sealed slices into a few
+// large event-time-disjoint runs so recent queries open a handful of files.
+const_default!(d_light_optimize_target: i64 = 256 * 1024 * 1024);
 const_default!(d_optimize_concurrency: usize = 2);
 const_default!(d_light_schedule: String = "0 */5 * * * *");
 const_default!(d_optimize_schedule: String = "0 */30 * * * *");
