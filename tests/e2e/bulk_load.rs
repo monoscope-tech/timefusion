@@ -35,16 +35,10 @@ async fn bulk_alias_skips_membuffer_but_is_queryable() -> anyhow::Result<()> {
     // Bulk alias must NOT grow the MemBuffer (skip_queue → straight to Delta).
     insert_bulk(&client, "bulk-1", FROZEN_START_MICROS).await?;
     let after_bulk = env.snapshot_stats().mem_total_rows;
-    assert_eq!(
-        after_bulk, buffered_rows,
-        "bulk insert must bypass the MemBuffer; rows grew {buffered_rows}→{after_bulk}"
-    );
+    assert_eq!(after_bulk, buffered_rows, "bulk insert must bypass the MemBuffer; rows grew {buffered_rows}→{after_bulk}");
 
     // ...yet the bulk row is immediately visible in the real table (it's in Delta).
-    let count: i64 = client
-        .query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"e2e_project", &"bulk-1"])
-        .await?
-        .get(0);
+    let count: i64 = client.query_one("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = $1 AND id = $2", &[&"e2e_project", &"bulk-1"]).await?.get(0);
     assert_eq!(count, 1, "bulk row not visible in otel_logs_and_spans (skip_queue write lost)");
 
     Ok(())

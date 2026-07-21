@@ -2399,7 +2399,7 @@ impl Database {
                 let bulk_table =
                     ProjectRoutingTable::new("default".to_string(), Arc::new(self.clone()), schema.schema_ref(), batch_queue.clone(), table_name.clone())
                         .with_skip_queue(true);
-                ctx.register_table(&format!("{table_name}__bulk"), Arc::new(bulk_table))?;
+                ctx.register_table(format!("{table_name}__bulk"), Arc::new(bulk_table))?;
             }
         }
 
