@@ -4378,13 +4378,17 @@ impl Database {
     /// `target_size`, plus at most one existing sorted run to merge into, and
     /// hand that exact set to `with_binned_files` — the appends that land after
     /// selection aren't in the set, so they don't conflict.
-    /// `include_sorted_runs` re-admits already-tagged sorted runs to the
-    /// packing (the cold tier's leveled re-merge); the hot tier excludes them
-    /// (its runs are the cold tier's input). Files at ≥ 7/8·target are always
+    /// `sorted_run_cap` bounds which already-tagged sorted runs are re-admitted
+    /// to the packing: the cold tier passes `i64::MAX` (its leveled re-merge
+    /// folds any sub-target run), the hot tier passes `target/4` so each tick's
+    /// small output run keeps folding into the next pack until it reaches ~1/4
+    /// target — otherwise a busy project accrues one 5-min run per tick (~100+
+    /// files/day again). Growing a run 4× before exclusion bounds rewrite
+    /// amplification at ~3× per byte. Files at ≥ 7/8·target are always
     /// excluded — they're converged, and re-selecting one alone would rewrite
     /// it 1→1 forever.
     async fn light_optimize_tail(
-        table: &DeltaTable, filters: &[PartitionFilter], target_size: i64, min_files: usize, include_sorted_runs: bool,
+        table: &DeltaTable, filters: &[PartitionFilter], target_size: i64, min_files: usize, sorted_run_cap: i64,
     ) -> Result<Vec<String>> {
         // Tag the fork stamps on sorted-run outputs (delta-rs optimize.rs). Kept
         // in sync by the exact rev pin; a fork rename would need a deliberate bump.
@@ -4406,7 +4410,7 @@ impl Database {
         let converged = cap - cap / 8;
         let mut fresh: Vec<(String, i64, i64)> = adds
             .iter()
-            .filter(|add| include_sorted_runs || add.tags().get(SORTED_RUN_TAG).is_none_or(|v| v.as_deref() != Some("true")))
+            .filter(|add| add.size() < sorted_run_cap || add.tags().get(SORTED_RUN_TAG).is_none_or(|v| v.as_deref() != Some("true")))
             .filter(|add| add.size() < converged)
             .filter_map(|add| {
                 // Parse the raw Add stats JSON: the snapshot's parsed-stats
@@ -4826,7 +4830,7 @@ impl Database {
             for _ in 0..MAX_PASSES {
                 let selected_files = {
                     let table = table_ref.read().await;
-                    Self::light_optimize_tail(&table, &partition_filters, target_size, 2, true).await?
+                    Self::light_optimize_tail(&table, &partition_filters, target_size, 2, i64::MAX).await?
                 };
                 if selected_files.is_empty() {
                     break;
@@ -5808,7 +5812,7 @@ impl Database {
         for pass in 0..MAX_BINS_PER_TICK {
             let selected_files = {
                 let table = table_ref.read().await;
-                Self::light_optimize_tail(&table, &partition_filters, target_size, min_files, false).await?
+                Self::light_optimize_tail(&table, &partition_filters, target_size, min_files, target_size / 4).await?
             };
             if selected_files.is_empty() {
                 return Ok(());
