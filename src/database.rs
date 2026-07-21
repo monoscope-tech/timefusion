@@ -16,7 +16,10 @@ use datafusion::{
     execution::{TaskContext, context::SessionContext},
     logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown, col, dml::InsertOp, lit},
     physical_expr::expressions::{CastExpr, Column as PhysicalColumn},
-    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream, projection::ProjectionExec, stream::RecordBatchStreamAdapter, union::UnionExec},
+    physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream, projection::ProjectionExec, stream::RecordBatchStreamAdapter,
+        union::UnionExec,
+    },
     scalar::ScalarValue,
 };
 use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
@@ -6904,11 +6907,7 @@ impl ProjectRoutingTable {
     /// Wrap a wide Delta scan so its Parquet decoding draws from the shared
     /// `heavy_scan_sem`, bounding concurrent decode heap across all queries.
     fn gate_if_wide(&self, plan: Arc<dyn ExecutionPlan>, filters: &[Expr]) -> Arc<dyn ExecutionPlan> {
-        if self.is_wide_scan(filters) {
-            Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone()))
-        } else {
-            plan
-        }
+        if self.is_wide_scan(filters) { Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone())) } else { plan }
     }
 
     /// Wrap an execution plan with type coercion if the output schema doesn't match the target.
