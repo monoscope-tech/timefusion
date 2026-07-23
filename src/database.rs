@@ -3434,9 +3434,7 @@ impl Database {
 
     /// Hot-tail light optimize: the reserved slice (see field doc).
     fn light_optimize_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
-        self.light_optimize_runtime_env
-            .get_or_init(|| self.build_spill_runtime_env(self.light_optimize_pool_bytes(), "light_optimize_spill"))
-            .clone()
+        self.light_optimize_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.light_optimize_pool_bytes(), "light_optimize_spill")).clone()
     }
 
     /// The DML serialization mutex for the PHYSICAL table backing
