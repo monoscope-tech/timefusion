@@ -5803,15 +5803,14 @@ impl Database {
         let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, declare_sorted);
 
-        // Fan out across projects so the most-fragmented one (ordered first by
-        // hot_project_ids) doesn't wait behind the others. Actual concurrent
-        // rewrites are still bounded by maintenance_rewrite_sem (acquired inside
-        // optimize_table_light_inner), so peak heap is unchanged — parallelism is
-        // opt-in via TIMEFUSION_MAINTENANCE_REWRITE_CONCURRENCY (default 1 = serial).
-        // Per-project optimizes commit to disjoint (project_id, today) partitions,
-        // so concurrent commits don't OCC-conflict with each other.
+        // Serial across projects: each bin sort decompresses its ≤target_size
+        // parquet into several GB of Arrow, so two concurrent sorts overflow the
+        // dedicated light_optimize pool slice (prod 2026-07-23: SortPreservingMerge
+        // 'Resources exhausted' at 6GB with only the busiest project failing).
+        // One sort at a time owns the whole slice; MAX_BINS_PER_TICK bounds the
+        // per-project work so the tick still can't wedge on one backlog.
         let today_str = today.to_string();
-        let concurrency = self.config.maintenance.timefusion_maintenance_rewrite_concurrency.max(1);
+        let concurrency = 1;
         let failed = futures::stream::iter(project_ids)
             .map(|project_id| {
                 self.optimize_one_hot_project(table_ref, table_name, today, &today_str, project_id, target_size, &writer_properties, &optimize_type)
