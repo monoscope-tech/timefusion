@@ -3417,11 +3417,13 @@ impl Database {
     }
 
     /// Light-optimize slice of the maintenance budget: one per-sort budget
-    /// (1/4 of the pool) per concurrent hot-tail sort, capped so heavy
-    /// maintenance always keeps at least 1/4.
+    /// (1/3 of the pool) per concurrent hot-tail sort, capped so heavy
+    /// maintenance always keeps at least 1/4. 1/4 (6GB of 24) was marginal:
+    /// a single busiest-project bin sort peaked ~5.8GB (prod 2026-07-23,
+    /// SortPreservingMerge exhaustion even with serial fan-out).
     fn light_optimize_pool_bytes(&self) -> usize {
         let pool = self.config.memory.maintenance_pool_bytes();
-        (pool / 4 * self.config.maintenance.timefusion_light_optimize_concurrency.max(1)).min(pool * 3 / 4)
+        (pool / 3 * self.config.maintenance.timefusion_light_optimize_concurrency.max(1)).min(pool * 3 / 4)
     }
 
     /// Heavy maintenance (dedup, recompress, Z-order): the budget left after

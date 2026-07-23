@@ -1141,7 +1141,7 @@ pub struct MaintenanceConfig {
     pub timefusion_maintenance_rewrite_concurrency: usize,
     /// Concurrent hot-tail light-optimize sorts (per-project fan-out). Each
     /// sort decompresses its ≤target_size bin into several GB of Arrow, so the
-    /// light pool slice is sized as N × the per-sort budget (1/4 of the
+    /// light pool slice is sized as N × the per-sort budget (1/3 of the
     /// maintenance pool each) and the heavy pool gets the remainder — raising
     /// this trades heavy-maintenance headroom for hot-tail throughput.
     /// 2 concurrent sorts in one 6GB slice starved in prod 2026-07-23.
