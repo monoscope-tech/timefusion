@@ -1186,6 +1186,13 @@ pub struct Database {
     /// pool so a Z-order global sort can always reserve its merge floor and spill
     /// instead of losing the race for the saturated shared Greedy pool.
     maintenance_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    /// Hot-tail light-optimize slice carved out of the maintenance budget:
+    /// heavy rewrites (dedup, recompress, Z-order) can hold the shared pool
+    /// for minutes, and the small (≤target_size) hot-tail sorts starved
+    /// behind them every tick (prod 2026-07-22: 22 `Resources exhausted`
+    /// in 25 min with zero OCC conflicts). Separate pool ⇒ today's
+    /// compaction always has its reserve; total budget stays constant.
+    light_optimize_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
     unified_tables: UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
@@ -1693,6 +1700,7 @@ impl Database {
             config: cfg,
             runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
+            light_optimize_runtime_env: Arc::new(std::sync::OnceLock::new()),
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: Arc::new(dashmap::DashMap::new()),
@@ -3390,26 +3398,35 @@ impl Database {
     /// The pool is bounded (still pooled → fails-as-error, never OOM-kills, per
     /// the 2026-07-04 incident) and sized from the budget left over the query
     /// pool so query + maintenance together stay within `memory_limit`.
-    fn maintenance_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+    fn build_spill_runtime_env(&self, pool_size: usize, spill_subdir: &str) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         use datafusion::execution::{
             disk_manager::{DiskManagerBuilder, DiskManagerMode},
             memory_pool::FairSpillPool,
             runtime_env::RuntimeEnvBuilder,
         };
+        let spill_dir = self.config.core.timefusion_data_dir.join(spill_subdir);
+        let _ = std::fs::create_dir_all(&spill_dir);
+        let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir]));
+        Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
+                .with_disk_manager_builder(disk)
+                .build()
+                .expect("build maintenance runtime env"),
+        )
+    }
+
+    /// Heavy maintenance (dedup, recompress, Z-order): 3/4 of the budget.
+    fn maintenance_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.maintenance_runtime_env
-            .get_or_init(|| {
-                let pool_size = self.config.memory.maintenance_pool_bytes();
-                let spill_dir = self.config.core.timefusion_data_dir.join("maintenance_spill");
-                let _ = std::fs::create_dir_all(&spill_dir);
-                let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir]));
-                Arc::new(
-                    RuntimeEnvBuilder::new()
-                        .with_memory_pool(Arc::new(FairSpillPool::new(pool_size)))
-                        .with_disk_manager_builder(disk)
-                        .build()
-                        .expect("build maintenance runtime env"),
-                )
-            })
+            .get_or_init(|| self.build_spill_runtime_env(self.config.memory.maintenance_pool_bytes() * 3 / 4, "maintenance_spill"))
+            .clone()
+    }
+
+    /// Hot-tail light optimize: the reserved 1/4 slice (see field doc).
+    fn light_optimize_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
+        self.light_optimize_runtime_env
+            .get_or_init(|| self.build_spill_runtime_env(self.config.memory.maintenance_pool_bytes() / 4, "light_optimize_spill"))
             .clone()
     }
 
@@ -5907,7 +5924,7 @@ impl Database {
                 // the optimize-internal Parquet read uses `schema_force_view_types=true`
                 // (delta-rs's default), it returns BinaryView and the rewrite blows up
                 // mid-scan with "Expected ... Binary, got ... BinaryView".
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
+                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env())))
                 .await;
             match optimize_result {
                 Ok((new_table, metrics)) => {
