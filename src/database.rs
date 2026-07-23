@@ -3416,17 +3416,26 @@ impl Database {
         )
     }
 
-    /// Heavy maintenance (dedup, recompress, Z-order): 3/4 of the budget.
+    /// Light-optimize slice of the maintenance budget: one per-sort budget
+    /// (1/4 of the pool) per concurrent hot-tail sort, capped so heavy
+    /// maintenance always keeps at least 1/4.
+    fn light_optimize_pool_bytes(&self) -> usize {
+        let pool = self.config.memory.maintenance_pool_bytes();
+        (pool / 4 * self.config.maintenance.timefusion_light_optimize_concurrency.max(1)).min(pool * 3 / 4)
+    }
+
+    /// Heavy maintenance (dedup, recompress, Z-order): the budget left after
+    /// the light-optimize slice.
     fn maintenance_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.maintenance_runtime_env
-            .get_or_init(|| self.build_spill_runtime_env(self.config.memory.maintenance_pool_bytes() * 3 / 4, "maintenance_spill"))
+            .get_or_init(|| self.build_spill_runtime_env(self.config.memory.maintenance_pool_bytes() - self.light_optimize_pool_bytes(), "maintenance_spill"))
             .clone()
     }
 
-    /// Hot-tail light optimize: the reserved 1/4 slice (see field doc).
+    /// Hot-tail light optimize: the reserved slice (see field doc).
     fn light_optimize_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.light_optimize_runtime_env
-            .get_or_init(|| self.build_spill_runtime_env(self.config.memory.maintenance_pool_bytes() / 4, "light_optimize_spill"))
+            .get_or_init(|| self.build_spill_runtime_env(self.light_optimize_pool_bytes(), "light_optimize_spill"))
             .clone()
     }
 
@@ -5803,14 +5812,14 @@ impl Database {
         let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, declare_sorted);
 
-        // Serial across projects: each bin sort decompresses its ≤target_size
-        // parquet into several GB of Arrow, so two concurrent sorts overflow the
-        // dedicated light_optimize pool slice (prod 2026-07-23: SortPreservingMerge
-        // 'Resources exhausted' at 6GB with only the busiest project failing).
-        // One sort at a time owns the whole slice; MAX_BINS_PER_TICK bounds the
-        // per-project work so the tick still can't wedge on one backlog.
+        // Per-project fan-out gated by TIMEFUSION_LIGHT_OPTIMIZE_CONCURRENCY
+        // (default 1 = serial): each bin sort decompresses its ≤target_size
+        // parquet into several GB of Arrow, so the light pool slice is sized
+        // as one per-sort budget per allowed sort (`light_optimize_pool_bytes`)
+        // — inheriting the heavy-rewrite knob overflowed a fixed slice
+        // (prod 2026-07-23: 2 sorts in 6GB, busiest project starved every tick).
         let today_str = today.to_string();
-        let concurrency = 1;
+        let concurrency = self.config.maintenance.timefusion_light_optimize_concurrency.max(1);
         let failed = futures::stream::iter(project_ids)
             .map(|project_id| {
                 self.optimize_one_hot_project(table_ref, table_name, today, &today_str, project_id, target_size, &writer_properties, &optimize_type)

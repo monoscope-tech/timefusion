@@ -352,6 +352,7 @@ const_default!(d_dedup_decode_inflation: u64 = 12);
 const_default!(d_dedup_bytes_per_row: u64 = 4096);
 // Serial by default: one heavy maintenance rewrite in flight at a time.
 const_default!(d_maintenance_rewrite_concurrency: usize = 1);
+const_default!(d_light_optimize_concurrency: usize = 1);
 const_default!(d_dml_merge_concurrency: usize = 4);
 const_default!(d_dirty_bin_drain_batch: usize = 32);
 // How many days back (in addition to today) the dedup sweep covers. today-only
@@ -1138,6 +1139,14 @@ pub struct MaintenanceConfig {
     /// `d_maintenance_rewrite_concurrency`.
     #[serde(default = "d_maintenance_rewrite_concurrency")]
     pub timefusion_maintenance_rewrite_concurrency: usize,
+    /// Concurrent hot-tail light-optimize sorts (per-project fan-out). Each
+    /// sort decompresses its ≤target_size bin into several GB of Arrow, so the
+    /// light pool slice is sized as N × the per-sort budget (1/4 of the
+    /// maintenance pool each) and the heavy pool gets the remainder — raising
+    /// this trades heavy-maintenance headroom for hot-tail throughput.
+    /// 2 concurrent sorts in one 6GB slice starved in prod 2026-07-23.
+    #[serde(default = "d_light_optimize_concurrency")]
+    pub timefusion_light_optimize_concurrency: usize,
     /// Max concurrent user DML MERGE-UPDATEs (hash-enrichment `UPDATE ... FROM`).
     /// Each merge scans the time-windowed target partition to locate join-key
     /// matches — heavy on a CPU-throttled box. Ungated, bursts of per-project
