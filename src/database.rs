@@ -4096,7 +4096,7 @@ impl Database {
         let skip_today = self.config.maintenance.timefusion_light_optimize_enabled;
         let window_dates: Vec<chrono::NaiveDate> = (0..=num_days)
             .map(|days_ago| (now - chrono::Duration::days(days_ago as i64)).date_naive())
-            .filter(|d| !Self::date_is_cold(today, *d, after_days) && !(skip_today && *d == today))
+            .filter(|d| !(Self::date_is_cold(today, *d, after_days) || skip_today && *d == today))
             .collect();
 
         // Snapshot the current live file set once: drives both the ZOrder
