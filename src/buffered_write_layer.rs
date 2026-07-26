@@ -1590,11 +1590,11 @@ impl BufferedWriteLayer {
     /// HARD WAL cap (2026-07-26 merge storm: soft thresholds only WARNed while
     /// 121GB of acked writes piled up). Own task, NOT the flush loop: the loop
     /// awaits flushes inline, so a stalled S3 flush — the exact overload mode
-    /// this guards against — would delay engagement unboundedly. Note the gauge
-    /// is total on-disk WAL bytes (same as the soft thresholds): flushed-but-
-    /// not-yet-GC'd segments count, so the limit must stay comfortably above
-    /// the GC sweep's steady-state residue. Rejected inserts land in the
-    /// upstream DLQ and auto-replay once the gate clears.
+    /// this guards against — would delay engagement unboundedly. The gauge is
+    /// UN-flushed WAL bytes (`unflushed_wal_bytes`), i.e. what a restart must
+    /// replay — NOT total on-disk bytes, which include flushed segments the
+    /// age-gated GC holds for ~90min. Rejected inserts land in the upstream
+    /// DLQ and auto-replay once the gate clears.
     async fn run_wal_gate_task(&self) {
         let Some(hard) = self.config.buffer.wal_hard_limit_bytes() else { return };
         loop {
@@ -1602,13 +1602,18 @@ impl BufferedWriteLayer {
                 _ = tokio::time::sleep(Duration::from_secs(15)) => {}
                 _ = self.shutdown.cancelled() => return,
             }
-            let (_, total_bytes) = self.wal.wal_stats();
-            let over = total_bytes > hard;
+            // Gate on UN-flushed backlog (what a restart must replay), not
+            // total on-disk bytes: flushed segments legitimately sit for up
+            // to wal_gc_max_age (~90min) before the age-gated GC reclaims
+            // them, and latching on those would reject ingest for data that
+            // is already durable in Delta (2026-07-26 post-deploy latch).
+            let backlog = self.wal.unflushed_wal_bytes(self.oldest_unflushed_wal_append_micros());
+            let over = backlog > hard;
             if over != self.wal_hard_backpressure.swap(over, Ordering::Relaxed) {
                 if over {
                     error!(
                         "WAL backlog {}MB exceeds HARD limit {}MB — rejecting INSERTs until flush catches up (writes fail into the upstream DLQ)",
-                        total_bytes / (1024 * 1024),
+                        backlog / (1024 * 1024),
                         hard / (1024 * 1024)
                     );
                 } else {

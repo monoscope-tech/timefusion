@@ -673,7 +673,8 @@ pub struct BufferConfig {
     /// inflating restart replay (issue #83). 0 = derive from the buffer budget.
     #[serde(default)]
     pub timefusion_wal_max_unflushed_mb: usize,
-    /// HARD cap on on-disk WAL bytes: past this, INSERTs are rejected (the
+    /// HARD cap on UN-flushed WAL bytes (what a restart must replay — flushed
+    /// segments awaiting age-gated GC don't count): past this, INSERTs are rejected (the
     /// upstream DLQ absorbs and replays them) instead of acking writes into an
     /// unbounded backlog. The soft thresholds above only trigger emergency
     /// flushes — during the 2026-07-26 merge storm a 6GB "limit" grew to 121GB
