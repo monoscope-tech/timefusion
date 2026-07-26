@@ -374,3 +374,67 @@ async fn coalesced_enrichment_of_flushed_row_is_not_dropped() -> anyhow::Result<
     );
     Ok(())
 }
+
+/// Cross-project fold (2026-07-26 merge storm): same-shape enrichments for N
+/// projects, drained once, must apply every project's tag via ONE folded merge
+/// — one kernel metadata scan + one OCC commit instead of one per project.
+/// COALESCE_MERGES pins the fold; per-project counts pin correctness.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::Result<()> {
+    let env = E2eEnv::builder()
+        .with_deletion_vectors()
+        .with_dml_merge_key_prune(true)
+        .with_dml_coalesce_secs(60)
+        .with_bucket_duration(Duration::from_secs(60))
+        .start()
+        .await?;
+    let client = env.pg_client().await?;
+    let ts = |m: i64| chrono::DateTime::<chrono::Utc>::from_timestamp_micros(m).unwrap().format("%Y-%m-%d %H:%M:%S%.f").to_string();
+    let projects = ["fold_a", "fold_b", "fold_c"];
+
+    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap();
+    for p in projects {
+        let sql = format!(
+            "INSERT INTO otel_logs_and_spans \
+             (project_id, date, timestamp, id, name, status_code, level, hashes, summary, context___span_id, context___trace_id) \
+             VALUES ('{p}', '{}', '{}', 'id-{p}', 'span', 'OK', 'INFO', ARRAY[]::text[], $1, 'span-{p}', 'trace-{p}')",
+            dt.date_naive(),
+            dt.format("%Y-%m-%d %H:%M:%S%.f"),
+        );
+        client.execute(&sql, &[&vec!["s"]]).await?;
+    }
+    // Rows must be Delta-only so the enrichment rides the deferred Delta leg.
+    env.force_flush().await?;
+    env.force_evict().await?;
+
+    let merges_before = timefusion::metrics::dml_stats().coalesce_merges.load(std::sync::atomic::Ordering::Relaxed);
+    let (lo, hi) = (FROZEN_START_MICROS - 1_000_000, FROZEN_START_MICROS + 60_000_000);
+    for p in projects {
+        let sql = format!(
+            "UPDATE otel_logs_and_spans o \
+               SET hashes = COALESCE(o.hashes, '{{}}'::text[]) || ARRAY[u.tag] \
+               FROM ( SELECT unnest(ARRAY['span-{p}']::text[]) AS span_id, \
+                             unnest(ARRAY['trace-{p}']::text[]) AS trace_id, \
+                             unnest(ARRAY['TAG-{p}']::text[])   AS tag ) u \
+               WHERE o.project_id = '{p}' AND o.timestamp >= '{}' AND o.timestamp < '{}' \
+                 AND o.context___span_id = u.span_id \
+                 AND o.context___trace_id = u.trace_id",
+            ts(lo),
+            ts(hi)
+        );
+        client.execute(&sql, &[]).await?;
+    }
+    env.drain_dml_coalescer().await;
+
+    for p in projects {
+        let count: i64 = client
+            .query_one(&format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{p}' AND hashes && ARRAY['TAG-{p}']::text[]"), &[])
+            .await?
+            .get(0);
+        assert_eq!(count, 1, "folded enrichment lost project {p}'s tag");
+    }
+    let merges = timefusion::metrics::dml_stats().coalesce_merges.load(std::sync::atomic::Ordering::Relaxed) - merges_before;
+    assert_eq!(merges, 1, "expected ONE folded merge for {} same-shape project groups, got {merges}", projects.len());
+    Ok(())
+}

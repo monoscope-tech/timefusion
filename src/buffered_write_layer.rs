@@ -371,6 +371,11 @@ pub struct BufferedWriteLayer {
     backpressure_engaged_total: AtomicU64,
     backpressure_rejected_total: AtomicU64,
     backpressure_force_flush_total: AtomicU64,
+    /// Set by the flush loop when on-disk WAL bytes exceed the HARD limit
+    /// (`wal_hard_limit_bytes`); while set, `insert` rejects instead of acking
+    /// into an unbounded backlog (the upstream DLQ absorbs + replays). Cleared
+    /// by the same loop once the backlog drains below the limit.
+    wal_hard_backpressure: std::sync::atomic::AtomicBool,
     /// Cumulative rows accepted into MemBuffer (post-WAL) and rows drained to
     /// Delta. Diff two `timefusion_stats` scrapes to get ingest-rate vs
     /// drain-rate: if `rows_ingested_total` climbs faster than
@@ -505,6 +510,7 @@ impl BufferedWriteLayer {
             flush_lock: Mutex::new(()),
             relief_lock: Mutex::new(()),
             reserved_bytes: AtomicUsize::new(0),
+            wal_hard_backpressure: std::sync::atomic::AtomicBool::new(false),
             pressure_notify: Arc::new(Notify::new()),
             flush_tick_notify: Arc::new(Notify::new()),
             eviction_tick_notify: Arc::new(Notify::new()),
@@ -818,6 +824,16 @@ impl BufferedWriteLayer {
 
     #[instrument(skip(self, batches), fields(project_id, table_name, batch_count))]
     pub async fn insert(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> anyhow::Result<()> {
+        // Fail fast while the WAL backlog is over its HARD cap (see
+        // `wal_hard_backpressure`): acking more work would only deepen an
+        // unbounded, hours-to-recover backlog. The producer's DLQ replays.
+        if self.wal_hard_backpressure.load(Ordering::Relaxed) {
+            crate::metrics::record_ingest_error(project_id, table_name);
+            anyhow::bail!(
+                "WAL backlog exceeds hard limit ({}GB); insert rejected under backpressure — retry later",
+                self.config.buffer.timefusion_wal_hard_limit_gb
+            );
+        }
         // Memory pressure no longer triggers a synchronous flush_all_now in the
         // insert path — that violated the "inserts return fast, Delta happens on
         // a routine" invariant by stalling pgwire/gRPC threads on S3 commits
@@ -1423,6 +1439,12 @@ impl BufferedWriteLayer {
             gc_this.run_wal_gc_task().await;
         });
 
+        // WAL hard-cap gate (independent of the flush loop — see run_wal_gate_task).
+        let gate_this = Arc::clone(&this);
+        let gate_handle = tokio::spawn(async move {
+            gate_this.run_wal_gate_task().await;
+        });
+
         // One-shot post-replay drain. WAL replay loads the backlog straight into
         // MemBuffer; this flushes it down under budget in the background so the
         // listener serves immediately instead of blocking on the drain.
@@ -1437,6 +1459,7 @@ impl BufferedWriteLayer {
             handles.push(flush_handle);
             handles.push(eviction_handle);
             handles.push(gc_handle);
+            handles.push(gate_handle);
             handles.push(drain_handle);
         }
 
@@ -1561,6 +1584,37 @@ impl BufferedWriteLayer {
             // `notify_waiters` wakes all currently parked awaiters; if no
             // test is watching, the call is essentially free.
             self.flush_tick_notify.notify_waiters();
+        }
+    }
+
+    /// HARD WAL cap (2026-07-26 merge storm: soft thresholds only WARNed while
+    /// 121GB of acked writes piled up). Own task, NOT the flush loop: the loop
+    /// awaits flushes inline, so a stalled S3 flush — the exact overload mode
+    /// this guards against — would delay engagement unboundedly. Note the gauge
+    /// is total on-disk WAL bytes (same as the soft thresholds): flushed-but-
+    /// not-yet-GC'd segments count, so the limit must stay comfortably above
+    /// the GC sweep's steady-state residue. Rejected inserts land in the
+    /// upstream DLQ and auto-replay once the gate clears.
+    async fn run_wal_gate_task(&self) {
+        let Some(hard) = self.config.buffer.wal_hard_limit_bytes() else { return };
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                _ = self.shutdown.cancelled() => return,
+            }
+            let (_, total_bytes) = self.wal.wal_stats();
+            let over = total_bytes > hard;
+            if over != self.wal_hard_backpressure.swap(over, Ordering::Relaxed) {
+                if over {
+                    error!(
+                        "WAL backlog {}MB exceeds HARD limit {}MB — rejecting INSERTs until flush catches up (writes fail into the upstream DLQ)",
+                        total_bytes / (1024 * 1024),
+                        hard / (1024 * 1024)
+                    );
+                } else {
+                    info!("WAL backlog back under hard limit — accepting INSERTs again");
+                }
+            }
         }
     }
 
@@ -4366,5 +4420,28 @@ mod tests {
 
         // Verify reservation is released (should be 0 after successful insert)
         assert_eq!(layer.reserved_bytes.load(Ordering::Acquire), 0);
+    }
+
+    /// WAL hard cap (2026-07-26): while `wal_hard_backpressure` is set, inserts
+    /// must be REJECTED (fail into the producer's DLQ), and accepted again the
+    /// moment it clears — pinning both directions of the flush-loop toggle's
+    /// contract at the insert gate.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn insert_rejected_while_wal_hard_backpressure_set() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let wal_dir = cfg.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(std::path::Path::new(&wal_dir));
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let (project, table) = (format!("w{test_id}"), format!("w{test_id}"));
+        let layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+
+        layer.wal_hard_backpressure.store(true, Ordering::Relaxed);
+        let err = layer.insert(&project, &table, vec![create_test_batch(&project)]).await.expect_err("insert must be rejected under WAL hard backpressure");
+        assert!(err.to_string().contains("hard limit"), "unexpected error: {err}");
+
+        layer.wal_hard_backpressure.store(false, Ordering::Relaxed);
+        layer.insert(&project, &table, vec![create_test_batch(&project)]).await.expect("insert must succeed once backpressure clears");
     }
 }

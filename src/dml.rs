@@ -699,6 +699,41 @@ impl<'a> DmlContext<'a> {
     }
 }
 
+/// Debug-format `value` into at most ~`limit` bytes, discarding output past
+/// the cap instead of materializing it first — a 40k-row IN-list predicate
+/// debug-prints to ~50MB, and building that string on the DV-merge failure
+/// path (i.e. during overload) broke OTLP export for the whole process
+/// (2026-07-26 incident).
+fn fmt_capped(value: &dyn std::fmt::Debug, limit: usize) -> String {
+    struct Trunc {
+        buf: String,
+        limit: usize,
+        truncated: bool,
+    }
+    impl std::fmt::Write for Trunc {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let room = self.limit.saturating_sub(self.buf.len());
+            if s.len() <= room {
+                self.buf.push_str(s);
+            } else {
+                let mut n = room;
+                while !s.is_char_boundary(n) {
+                    n -= 1;
+                }
+                self.buf.push_str(&s[..n]);
+                self.truncated = true;
+            }
+            Ok(())
+        }
+    }
+    let mut w = Trunc { buf: String::with_capacity(limit.min(4096)), limit, truncated: false };
+    let _ = std::fmt::write(&mut w, format_args!("{value:?}"));
+    if w.truncated {
+        w.buf.push_str("… [truncated]");
+    }
+    w.buf
+}
+
 /// Watermark-clamp a Delta leg's predicate (see
 /// `dml_coalescer::clamp_to_watermark`): rows above the flush watermark are
 /// buffer-only, so the mem leg already updated them and the flush persists
@@ -1171,8 +1206,14 @@ pub async fn perform_delta_merge_update(
                 // Strip source cols AND equi-key target cols from the file-pruning
                 // predicate (the latter carry the optimizer's IsNotNull(join-key)
                 // conjuncts the fork's stats scan can't resolve — prod drop bug).
+                // EXCEPT partition columns: they resolve from partition values (no
+                // stats-schema gap), and stripping them would drop the coalescer
+                // fold's `project_id IN (...)` filter — un-pruning the merge scan
+                // back to every tenant's files in the window.
+                let partition_cols = crate::schema_loader::get_schema(table_name).map(|s| s.partitions.clone()).unwrap_or_default();
                 let mut strip_cols = source_cols.clone();
                 strip_cols.extend(join_keys.iter().map(|(t, _)| t.clone()));
+                strip_cols.retain(|c| !partition_cols.contains(c));
                 let target_predicate = predicate.as_ref().and_then(|p| strip_source_conjuncts(p, &strip_cols));
                 let equi_keys = if database.config().maintenance.timefusion_dml_merge_key_prune { join_keys } else { vec![] };
                 return merge_update_with_deletion_vectors(
@@ -1188,6 +1229,10 @@ pub async fn perform_delta_merge_update(
                         target_alias: "target".to_string(),
                         source_alias: "source".to_string(),
                         writer_properties: Some(writer_properties),
+                        // Sound here and only here: every perform_delta_merge_update
+                        // caller ran the mem leg first (DmlContext::execute), so
+                        // concurrently flushed rows already carry post-DML values.
+                        tolerate_concurrent_appends: database.config().maintenance.timefusion_dml_merge_append_rebase,
                     },
                 )
                 .await
@@ -1195,10 +1240,13 @@ pub async fn perform_delta_merge_update(
                     // Diagnostic for the prod "No field named …context___span_id" DV
                     // merge drops (2026-07-20): local repro couldn't trigger it, so
                     // capture the exact predicate shape from prod on failure.
+                    // Truncated: a large source (40k-row IN lists) debug-printed
+                    // here produced 50MB span events that broke OTLP export for
+                    // the whole process during the 2026-07-26 incident.
                     warn!(
                         error = %e,
-                        join_predicate = ?join_pred,
-                        target_predicate = ?target_predicate,
+                        join_predicate = %fmt_capped(&join_pred, 4096),
+                        target_predicate = %fmt_capped(&target_predicate, 4096),
                         equi_keys = ?equi_keys,
                         "DV MERGE UPDATE failed — predicate diagnostic"
                     );
@@ -1294,6 +1342,27 @@ mod strip_tests {
         assert!(s.contains("date") && s.contains("timestamp"), "kept prunable partition/stat conjuncts: {s}");
         assert!(!s.contains("context___span_id"), "dropped IsNotNull(context___span_id): {s}");
         assert!(!s.contains("context___trace_id"), "dropped IsNotNull(context___trace_id): {s}");
+    }
+
+    /// The coalescer fold's `project_id IN (...)` conjunct must SURVIVE the
+    /// equi-key strip: `project_id` is a partition column (resolvable from
+    /// partition values), and stripping it un-prunes the folded merge back to
+    /// every tenant's files in the window.
+    #[test]
+    fn partition_column_equi_key_conjuncts_survive_the_strip() {
+        let source_cols: HashSet<String> = ["span_id", "trace_id", "tag", "project_id"].iter().map(|s| s.to_string()).collect();
+        let join_keys = [("context___span_id", "span_id"), ("context___trace_id", "trace_id"), ("project_id", "project_id")];
+        let partition_cols = ["project_id".to_string(), "date".to_string()];
+        let mut strip_cols = source_cols.clone();
+        strip_cols.extend(join_keys.iter().map(|(t, _)| t.to_string()));
+        strip_cols.retain(|c| !partition_cols.contains(c));
+
+        let pred =
+            col("date").gt_eq(lit("2026-07-26")).and(col("project_id").in_list(vec![lit("p1"), lit("p2")], false)).and(col("context___span_id").is_not_null());
+        let stripped = strip_source_conjuncts(&pred, &strip_cols).expect("date + IN-list remain");
+        let s = format!("{stripped}");
+        assert!(s.contains("project_id") && s.contains("IN"), "partition IN-list must survive: {s}");
+        assert!(!s.contains("context___span_id"), "IsNotNull(equi data key) still stripped: {s}");
     }
 
     #[test]

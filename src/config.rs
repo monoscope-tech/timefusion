@@ -216,6 +216,7 @@ const_default!(d_flush_bucket_timeout_secs: u64 = 600);
 //   "none"      — never fsync (test/throwaway data only)
 const_default!(d_wal_fsync_mode: String = "ms");
 const_default!(d_wal_max_files: usize = 200);
+const_default!(d_wal_hard_limit_gb: u64 = 24);
 const_default!(d_foyer_memory_mb: usize = 1024);
 // Local disk is cheap and fast relative to S3 GETs, so default the cache large
 // — servers run 500GB–1TB cache volumes. foyer creates the backing file sparse
@@ -672,6 +673,18 @@ pub struct BufferConfig {
     /// inflating restart replay (issue #83). 0 = derive from the buffer budget.
     #[serde(default)]
     pub timefusion_wal_max_unflushed_mb: usize,
+    /// HARD cap on on-disk WAL bytes: past this, INSERTs are rejected (the
+    /// upstream DLQ absorbs and replays them) instead of acking writes into an
+    /// unbounded backlog. The soft thresholds above only trigger emergency
+    /// flushes — during the 2026-07-26 merge storm a 6GB "limit" grew to 121GB
+    /// of acked-but-unflushed data because nothing refused work. Checked every
+    /// ~15s by a dedicated WAL-gate task (`run_wal_gate_task` — deliberately
+    /// NOT the flush loop, which stalls in exactly the overload this guards
+    /// against; no per-append dir scan). DML mem legs
+    /// are exempt: failing an UPDATE mid-statement would desync mem vs Delta.
+    /// 0 disables. Default 24GB (a few minutes of recovery replay).
+    #[serde(default = "d_wal_hard_limit_gb")]
+    pub timefusion_wal_hard_limit_gb: u64,
     #[serde(default = "d_bucket_duration_secs")]
     pub timefusion_bucket_duration_secs: u64,
     #[serde(default = "d_pressure_flush_pct")]
@@ -682,6 +695,14 @@ pub struct BufferConfig {
     /// Delta merges; 0 keeps the synchronous per-statement path.
     #[serde(default = "d_dml_coalesce_secs")]
     pub timefusion_dml_coalesce_secs: u64,
+    /// Fold same-shape coalesced groups across projects into one MERGE per
+    /// unified table per drain (`project_id` becomes a join key + IN-list
+    /// partition filter). Eliminates the per-project metadata-scan + OCC-commit
+    /// multiplication that starved flush during the 2026-07-26 merge storm.
+    /// Kill switch: `TIMEFUSION_DML_COALESCE_FOLD=false` restores per-project
+    /// merges.
+    #[serde(default = "d_true")]
+    pub timefusion_dml_coalesce_fold: bool,
     #[serde(default = "d_flush_bucket_timeout_secs")]
     pub timefusion_flush_bucket_timeout_secs: u64,
     /// WAL shards per (project, table) topic. Higher = more append parallelism
@@ -741,6 +762,9 @@ impl BufferConfig {
     pub fn dml_coalesce_secs(&self) -> u64 {
         self.timefusion_dml_coalesce_secs
     }
+    pub fn dml_coalesce_fold(&self) -> bool {
+        self.timefusion_dml_coalesce_fold
+    }
     pub fn delta_scan_concurrency(&self) -> usize {
         self.timefusion_delta_scan_concurrency.max(1)
     }
@@ -775,6 +799,9 @@ impl BufferConfig {
     pub fn wal_max_unflushed_bytes(&self) -> Option<u64> {
         let mb = if self.timefusion_wal_max_unflushed_mb > 0 { self.timefusion_wal_max_unflushed_mb } else { self.max_memory_mb() / 4 };
         Some((mb as u64).saturating_mul(1024 * 1024))
+    }
+    pub fn wal_hard_limit_bytes(&self) -> Option<u64> {
+        (self.timefusion_wal_hard_limit_gb > 0).then(|| self.timefusion_wal_hard_limit_gb.saturating_mul(1024 * 1024 * 1024))
     }
     pub fn bucket_duration_secs(&self) -> u64 {
         self.timefusion_bucket_duration_secs.max(1)
@@ -1175,6 +1202,19 @@ pub struct MaintenanceConfig {
     /// set `TIMEFUSION_USE_DELETION_VECTORS=false` to keep copy-on-write rewrites.
     #[serde(default = "d_true")]
     pub timefusion_use_deletion_vectors: bool,
+    /// Commit DV merges append-tolerantly: a concurrent flush commit (AddFile
+    /// only) no longer aborts the merge with ConcurrentAppend — the commit
+    /// rebases instead of re-running the whole scan+join (the 2026-07-26 OCC
+    /// retry storm). Sound because the mem leg runs before every Delta leg, so
+    /// rows flushed after the merge's snapshot already carry post-DML values;
+    /// removed-file conflicts (optimize/vacuum) still abort and retry. That
+    /// contract is per-process: it relies on the single-writer WAL flock
+    /// (`WalDirLock`) — if the table ever gains a second concurrent writer
+    /// whose flushes bypass this process's mem leg, set this to false or its
+    /// rows can miss enrichment merges. On by default;
+    /// `TIMEFUSION_DML_MERGE_APPEND_REBASE=false` restores strict OCC.
+    #[serde(default = "d_true")]
+    pub timefusion_dml_merge_append_rebase: bool,
     /// Push a `target.key IN (source key values)` filter into the DV merge's
     /// per-file scan so parquet bloom filters prune files/row-groups holding none
     /// of the source keys — turning a whole-window enrichment scan into a few-file

@@ -309,6 +309,13 @@ struct PendingGroup {
     /// registry identical to what the synchronous merge would have used.
     session: Arc<dyn Session>,
     attempts: u32,
+    /// `Some(projects)` marks a drain-time cross-project fold (see
+    /// `fold_groups`): batches carry an appended `project_id` column, the
+    /// residual carries a `project_id IN (...)` filter, and the watermark
+    /// clamp must use the MAX watermark across these projects (a row is
+    /// provably buffer-only only when it is unflushed for EVERY member).
+    /// `None` for ordinary single-project statement groups.
+    folded_projects: Option<Vec<String>>,
 }
 
 /// Hash of everything that must match exactly for two statements to share
@@ -329,11 +336,151 @@ fn shape_fingerprint(join_keys: &[(String, String)], assignments: &[(String, Exp
     h.finish()
 }
 
+/// `project_id = '<id>'` equality conjunct, either operand order — via the
+/// canonical matcher (`extract_project_id_from_expr`) so the routing, DML
+/// extraction, and folding shapes can't drift apart. Any other shape stays in
+/// the residual and blocks folding for that group.
+fn is_project_eq(e: &Expr, project_id: &str) -> bool {
+    crate::optimizers::extract_project_id_from_expr(e).as_deref() == Some(project_id)
+}
+
+/// Fold same-shape single-project groups on unified tables into one group per
+/// (table, shape): `project_id` moves from a per-group residual equality into
+/// a source column + join key + `IN (...)` partition filter, so one drain
+/// issues ONE merge (one kernel metadata scan, one OCC commit) instead of one
+/// per project. Data-scan bytes are unchanged — `project_id` is a partition
+/// column, so the folded IN-list prunes to exactly the union of the files the
+/// per-project merges would have read.
+///
+/// Groups are eligible only when they carry exactly one `project_id = <own>`
+/// residual conjunct (anything else risks changing which rows the predicate
+/// matches), their source schema has no `project_id` column yet, and the
+/// project stores the table in the unified Delta table (custom-storage
+/// projects resolve to physically separate tables — never fold those).
+/// Ineligible groups and singleton buckets pass through untouched; any arrow
+/// failure while folding a bucket falls back to its unfolded members.
+fn fold_groups(groups: Vec<(GroupKey, PendingGroup)>, custom_storage: &std::collections::HashSet<(String, String)>) -> Vec<(GroupKey, PendingGroup)> {
+    // A fold candidate: its enqueue key/group plus the residual with the
+    // own-project equality stripped.
+    type Member = (GroupKey, PendingGroup, Vec<Expr>);
+    let mut out = Vec::with_capacity(groups.len());
+    let mut buckets: HashMap<(String, u64), Vec<Member>> = HashMap::new();
+    for (key, group) in groups {
+        // The optimizer usually pushes `project_id = '<id>'` into the
+        // TableScan (partition column), so most predicates carry no project
+        // conjunct at all — scope rides in `key.project_id`. Strip an explicit
+        // own-project equality when present; any OTHER reference to
+        // project_id (IN, !=, expressions) is a shape we can't restate as the
+        // folded IN-list, so it stays unfolded.
+        let stripped: Vec<Expr> = group.predicate.residual.iter().filter(|e| !is_project_eq(e, &key.project_id)).cloned().collect();
+        let eligible = group.folded_projects.is_none()
+            && !stripped.iter().any(|e| e.column_refs().iter().any(|c| c.name == "project_id"))
+            && group.schema.field_with_name("project_id").is_err()
+            && !group.join_keys.iter().any(|(t, s)| t == "project_id" || s == "project_id")
+            && !custom_storage.contains(&(key.project_id.clone(), key.table_name.clone()));
+        if !eligible {
+            out.push((key, group));
+            continue;
+        }
+        let fp = shape_fingerprint(&group.join_keys, &group.assignments, &stripped, &group.schema);
+        buckets.entry((key.table_name.clone(), fp)).or_default().push((key, group, stripped));
+    }
+    for ((table_name, shape_fp), mut members) in buckets {
+        if members.len() == 1 {
+            let (key, group, _) = members.pop().expect("len checked");
+            out.push((key, group));
+            continue;
+        }
+        // Deterministic member order → stable IN-list, fingerprint, and rep key.
+        members.sort_by(|a, b| a.0.project_id.cmp(&b.0.project_id));
+        let total_rows: usize = members.iter().flat_map(|(_, g, _)| &g.batches).map(RecordBatch::num_rows).sum();
+        if total_rows > MAX_QUEUED_SOURCE_ROWS {
+            out.extend(members.into_iter().map(|(k, g, _)| (k, g)));
+            continue;
+        }
+        match build_folded(&table_name, shape_fp, &members) {
+            Ok(folded) => {
+                debug!("dml coalesce: folded {} projects into one {} merge group", members.len(), table_name);
+                out.push(folded);
+            }
+            Err(e) => {
+                warn!("dml coalesce: folding {} groups for {} failed ({e}), draining per-project", members.len(), table_name);
+                out.extend(members.into_iter().map(|(k, g, _)| (k, g)));
+            }
+        }
+    }
+    out
+}
+
+/// Assemble the folded group: append a constant `project_id` column to every
+/// member batch, widen the union time window, and swap the per-project
+/// equality residual for one `project_id IN (...)` filter. The folded
+/// GroupKey's fingerprint hashes the shape AND the member set, so a failed
+/// fold re-queued via `requeue` can only ever merge with a fold of the exact
+/// same members — a different member set gets a different key (mixing them
+/// would pin an older IN-list to newer members' rows and silently drop their
+/// delta legs).
+fn build_folded(table_name: &str, shape_fp: u64, members: &[(GroupKey, PendingGroup, Vec<Expr>)]) -> Result<(GroupKey, PendingGroup)> {
+    use datafusion::arrow::{array::StringArray, datatypes::Field};
+    let (rep_key, base, stripped) = &members[0];
+    let projects: Vec<String> = members.iter().map(|(k, _, _)| k.project_id.clone()).collect();
+
+    let schema: SchemaRef = Arc::new(datafusion::arrow::datatypes::Schema::new(
+        base.schema
+            .fields()
+            .iter()
+            .cloned()
+            .chain(std::iter::once(Arc::new(Field::new("project_id", datafusion::arrow::datatypes::DataType::Utf8, false))))
+            .collect::<Vec<_>>(),
+    ));
+    let mut batches = Vec::new();
+    for (key, group, _) in members {
+        for batch in &group.batches {
+            let project_col = Arc::new(StringArray::from_iter_values(std::iter::repeat_n(key.project_id.as_str(), batch.num_rows())));
+            let cols = batch.columns().iter().cloned().chain(std::iter::once(project_col as _)).collect();
+            batches.push(RecordBatch::try_new(schema.clone(), cols).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?);
+        }
+    }
+
+    let mut predicate = DecomposedPredicate {
+        residual: stripped
+            .iter()
+            .cloned()
+            .chain(std::iter::once(datafusion::prelude::col("project_id").in_list(projects.iter().map(|p| lit(p.as_str())).collect(), false)))
+            .collect(),
+        lower: base.predicate.lower.clone(),
+        upper: base.predicate.upper.clone(),
+    };
+    for (_, group, _) in &members[1..] {
+        predicate.widen(&group.predicate);
+    }
+
+    let mut h = std::hash::DefaultHasher::new();
+    shape_fp.hash(&mut h);
+    projects.hash(&mut h);
+    let key = GroupKey { project_id: rep_key.project_id.clone(), table_name: table_name.to_string(), fingerprint: h.finish() };
+    let group = PendingGroup {
+        join_keys: base.join_keys.iter().cloned().chain(std::iter::once(("project_id".to_string(), "project_id".to_string()))).collect(),
+        assignments: base.assignments.clone(),
+        predicate,
+        time_col: base.time_col,
+        schema,
+        batches,
+        // Any member's session works: same shape ⇒ same function registry.
+        session: base.session.clone(),
+        attempts: members.iter().map(|(_, g, _)| g.attempts).max().unwrap_or(0),
+        folded_projects: Some(projects),
+    };
+    Ok((key, group))
+}
+
 /// Accumulates deferred `UPDATE ... FROM` Delta legs and drains them as
 /// batched merges. One instance per `Database`, created when
 /// `TIMEFUSION_DML_COALESCE_SECS > 0`.
 pub struct DmlCoalescer {
     interval_secs: u64,
+    /// See `fold_groups` — cross-project folding of same-shape groups.
+    fold: bool,
     groups: std::sync::Mutex<HashMap<GroupKey, PendingGroup>>,
     queued_rows: AtomicUsize,
     drain_notify: Notify,
@@ -352,9 +499,10 @@ impl std::fmt::Debug for DmlCoalescer {
 }
 
 impl DmlCoalescer {
-    pub fn new(interval_secs: u64) -> Self {
+    pub fn new(interval_secs: u64, fold: bool) -> Self {
         Self {
             interval_secs: interval_secs.max(1),
+            fold,
             groups: std::sync::Mutex::new(HashMap::new()),
             queued_rows: AtomicUsize::new(0),
             drain_notify: Notify::new(),
@@ -401,6 +549,7 @@ impl DmlCoalescer {
                         batches: vec![source.batch.clone()],
                         session,
                         attempts: 0,
+                        folded_projects: None,
                     });
                 }
             }
@@ -422,9 +571,15 @@ impl DmlCoalescer {
             self.queued_rows.store(0, Ordering::Relaxed);
             g.drain().collect()
         };
+        let groups = if self.fold && groups.len() > 1 { fold_groups(groups, &db.custom_storage_keys().await) } else { groups };
         for (key, mut group) in groups {
             if let Some(layer) = db.buffered_layer() {
-                let wm = layer.delta_flushed_watermark(&key.project_id, &key.table_name);
+                // Folded groups clamp against the MAX member watermark: a row
+                // is excludable only when it is unflushed for every member.
+                let wm = match &group.folded_projects {
+                    Some(ps) => ps.iter().map(|p| layer.delta_flushed_watermark(p, &key.table_name)).max().unwrap_or(i64::MIN),
+                    None => layer.delta_flushed_watermark(&key.project_id, &key.table_name),
+                };
                 match clamp_decomposed(&mut group.predicate, wm) {
                     ClampAction::Skip => {
                         crate::metrics::record_dml_delta_leg_skipped();
@@ -659,6 +814,71 @@ mod tests {
         assert_eq!(rounds[2].num_rows(), 1); // a/t1/4
         let total: usize = rounds.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total, 4, "exact duplicate dropped");
+    }
+
+    #[test]
+    fn is_project_eq_matches_only_exact_literal_equality() {
+        assert!(is_project_eq(&col("project_id").eq(lit("p1")), "p1"));
+        assert!(is_project_eq(&lit("p1").eq(col("project_id")), "p1")); // swapped operands
+        assert!(!is_project_eq(&col("project_id").eq(lit("p2")), "p1")); // other project
+        assert!(!is_project_eq(&col("project_id").not_eq(lit("p1")), "p1")); // wrong op
+        assert!(!is_project_eq(&col("other_col").eq(lit("p1")), "p1")); // wrong column
+    }
+
+    /// Pin the folded group's whole shape: appended project column + join key,
+    /// IN-list residual, union window, and a member-set-sensitive fingerprint
+    /// (a re-queued fold must never merge with a fold of different members —
+    /// its IN-list would drop the extra members' delta legs).
+    #[test]
+    fn build_folded_appends_project_column_and_unions_windows() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("span_id", DataType::Utf8, false), Field::new("tag", DataType::Utf8, false)]));
+        let batch = |ids: &[&str]| {
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(ids.to_vec())), Arc::new(StringArray::from(vec!["t"; ids.len()]))]).unwrap()
+        };
+        let member = |project: &str, lo: i64, hi: i64, ids: &[&str]| {
+            let pred = col("project_id").eq(lit(project)).and(window(lo, hi));
+            let d = DecomposedPredicate::decompose(Some(&pred), "timestamp");
+            let stripped: Vec<Expr> = d.residual.iter().filter(|e| !is_project_eq(e, project)).cloned().collect();
+            assert!(stripped.is_empty());
+            let group = PendingGroup {
+                join_keys: vec![("context___span_id".into(), "span_id".into())],
+                assignments: vec![("hashes".into(), col("source.tag"))],
+                predicate: d,
+                time_col: "timestamp",
+                schema: schema.clone(),
+                batches: vec![batch(ids)],
+                session: Arc::new(datafusion::execution::SessionStateBuilder::new().build()),
+                attempts: 0,
+                folded_projects: None,
+            };
+            (GroupKey { project_id: project.into(), table_name: "otel_logs_and_spans".into(), fingerprint: 1 }, group, stripped)
+        };
+        let members = vec![member("p1", 100, 200, &["a", "b"]), member("p2", 50, 150, &["c"])];
+        let (key, folded) = build_folded("otel_logs_and_spans", 42, &members).unwrap();
+
+        // Schema + batches: project_id appended as a constant column per member.
+        assert_eq!(folded.schema.fields().last().unwrap().name(), "project_id");
+        assert_eq!(folded.batches.len(), 2);
+        let projects_of = |b: &RecordBatch| b.column(2).as_any().downcast_ref::<StringArray>().unwrap().value(0).to_string();
+        assert_eq!(projects_of(&folded.batches[0]), "p1");
+        assert_eq!(projects_of(&folded.batches[1]), "p2");
+        // Join keys extended; window is the union; residual is the IN-list.
+        assert_eq!(folded.join_keys.last().unwrap(), &("project_id".to_string(), "project_id".to_string()));
+        assert_eq!(folded.predicate.lower.as_ref().unwrap().value, ts(50));
+        assert_eq!(folded.predicate.upper.as_ref().unwrap().value, ts(200));
+        assert_eq!(folded.predicate.residual.len(), 1);
+        assert!(folded.predicate.residual[0].to_string().contains("IN"));
+        assert_eq!(folded.folded_projects.as_deref(), Some(&["p1".to_string(), "p2".to_string()][..]));
+
+        // Member-set-sensitive key: same shape, different members → different fingerprint.
+        let (key2, _) = build_folded("otel_logs_and_spans", 42, &members[..1]).unwrap();
+        assert_ne!(key.fingerprint, key2.fingerprint);
+
+        // Folded batches concat + round-split cleanly under the widened keys.
+        let merged = concat_batches(&folded.schema, &folded.batches).unwrap();
+        assert_eq!(merged.num_rows(), 3);
+        let src = UpdateSource { batch: merged, schema: folded.schema.clone(), join_keys: folded.join_keys.clone() };
+        assert_eq!(split_source_rounds(src).unwrap().len(), 1, "distinct (span, project) keys must stay in one round");
     }
 
     #[test]

@@ -387,6 +387,7 @@ pub fn record_dml_coalesce_enqueued() {
 
 /// One Delta merge executed by a coalescer drain.
 pub fn record_dml_coalesce_merge() {
+    DML_STATS.coalesce_merges.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Some(m) = METRICS.get() {
         m.dml_coalesce_merges.add(1, &[]);
     }
@@ -420,9 +421,13 @@ pub struct DmlStats {
     pub occ_conflicts: AtomicU64,
     pub retry_successes: AtomicU64,
     pub retry_exhausted: AtomicU64,
+    /// Delta merges executed by coalescer drains — readable in-process (the
+    /// OTel counter isn't); tests assert on deltas of this to pin folding.
+    pub coalesce_merges: AtomicU64,
 }
 
-static DML_STATS: DmlStats = DmlStats { occ_conflicts: AtomicU64::new(0), retry_successes: AtomicU64::new(0), retry_exhausted: AtomicU64::new(0) };
+static DML_STATS: DmlStats =
+    DmlStats { occ_conflicts: AtomicU64::new(0), retry_successes: AtomicU64::new(0), retry_exhausted: AtomicU64::new(0), coalesce_merges: AtomicU64::new(0) };
 
 pub fn dml_stats() -> &'static DmlStats {
     &DML_STATS

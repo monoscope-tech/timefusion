@@ -1786,7 +1786,7 @@ impl Database {
         if secs == 0 {
             return;
         }
-        let coalescer = Arc::new(crate::dml_coalescer::DmlCoalescer::new(secs));
+        let coalescer = Arc::new(crate::dml_coalescer::DmlCoalescer::new(secs, self.config.buffer.dml_coalesce_fold()));
         if self.dml_coalescer.set(coalescer.clone()).is_ok() {
             tokio::spawn(coalescer.run(self.background_clone(), (*self.maintenance_shutdown).clone()));
         }
@@ -2520,6 +2520,13 @@ impl Database {
     /// Check if a project has custom storage configuration (their own S3 bucket)
     async fn has_custom_storage(&self, project_id: &str, table_name: &str) -> bool {
         self.storage_configs.read().await.contains_key(&(project_id.to_string(), table_name.to_string()))
+    }
+
+    /// Snapshot of the custom-storage (project, table) keys — one lock
+    /// acquisition for callers that need many membership checks (the
+    /// coalescer's fold pass). Custom storage is rare, so the clone is tiny.
+    pub(crate) async fn custom_storage_keys(&self) -> std::collections::HashSet<(String, String)> {
+        self.storage_configs.read().await.keys().cloned().collect()
     }
 
     #[instrument(
@@ -8573,7 +8580,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_by_bounds_a_blocked_dml_drain() -> Result<()> {
         let db = Database::with_config(create_test_config("shutdown-drain-bound")).await?;
-        let coalescer = Arc::new(crate::dml_coalescer::DmlCoalescer::new(600));
+        let coalescer = Arc::new(crate::dml_coalescer::DmlCoalescer::new(600, true));
         let _ = db.dml_coalescer.set(coalescer.clone());
         let _held = coalescer.lock_drain_for_test().await; // drain() blocks on this
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
