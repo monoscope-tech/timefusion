@@ -216,7 +216,7 @@ const_default!(d_flush_bucket_timeout_secs: u64 = 600);
 //   "none"      — never fsync (test/throwaway data only)
 const_default!(d_wal_fsync_mode: String = "ms");
 const_default!(d_wal_max_files: usize = 200);
-const_default!(d_wal_hard_limit_gb: u64 = 96);
+const_default!(d_wal_hard_limit_gb: u64 = 192);
 const_default!(d_foyer_memory_mb: usize = 1024);
 // Local disk is cheap and fast relative to S3 GETs, so default the cache large
 // — servers run 500GB–1TB cache volumes. foyer creates the backing file sparse
@@ -679,7 +679,9 @@ pub struct BufferConfig {
     /// 2026-07-26 merge storm the WAL grew to 121GB while the soft thresholds
     /// only WARNed. Total on-disk includes flushed segments the age-gated GC
     /// holds for ~90min and all active per-shard files, so keep this far
-    /// above the busy-hour residue (~56GB observed during catch-up bursts).
+    /// above the busy-hour residue (a 2026-07-26 catch-up burst wrote
+    /// 4.6GB/min and reached ~99GB of young+flushed segments while flush was
+    /// fully healthy — the breaker must not trip on that).
     /// Checked every ~15s by a dedicated WAL-gate task (`run_wal_gate_task` —
     /// deliberately NOT the flush loop, which stalls in exactly the overload
     /// this guards against). DML mem legs are exempt: failing an UPDATE
@@ -743,7 +745,13 @@ impl BufferConfig {
     /// drained-gated boot sweep, NEVER from age alone. Do not tighten or
     /// bypass the floor on the strength of this age.
     pub fn wal_gc_max_age(&self) -> Duration {
-        Duration::from_secs((self.retention_mins() + 20) * 60)
+        // Fixed 30min, decoupled from buffer retention: GC soundness comes
+        // from the un-flushed floor (see the doc above), never from age — age
+        // only delays reclaiming FLUSHED segments. The old retention+20min
+        // (~90min) held ~3x more dead weight on disk, which under catch-up
+        // bursts (2026-07-26: 4.6GB/min) pushed total-on-disk into the
+        // disk-runaway breaker and flapped ingest for no durability benefit.
+        Duration::from_secs(30 * 60)
     }
     pub fn eviction_interval_secs(&self) -> u64 {
         self.timefusion_eviction_interval_secs.max(1)
