@@ -1028,11 +1028,6 @@ impl WalManager {
         self.known_topics.len()
     }
 
-    /// See [`unflushed_wal_bytes`].
-    pub fn unflushed_wal_bytes(&self, floor_micros: Option<i64>) -> u64 {
-        unflushed_wal_bytes(&self.data_dir, floor_micros)
-    }
-
     /// Returns WAL file count and total size in bytes by scanning the data directory.
     pub fn wal_stats(&self) -> (usize, u64) {
         let mut file_count = 0usize;
@@ -1469,30 +1464,6 @@ const GC_FLOOR_SLACK_MICROS: i64 = 10 * 60 * 1_000_000;
 /// (`BufferedWriteLayer::oldest_unflushed_wal_append_micros`); no file at or
 /// after `floor − slack` is deleted, whatever its age. `None` = no un-flushed
 /// data ⇒ pure mtime.
-/// Total size in bytes of WAL files that may still hold UN-flushed entries:
-/// files whose mtime is at or after `floor_micros` (the oldest un-flushed
-/// append, minus the same slack WAL GC uses). Files modified strictly before
-/// the floor contain only flushed entries — the exact soundness rule
-/// `gc_wal_files` deletes by, minus its age heuristic. `floor = None` means
-/// nothing is un-flushed: backlog 0.
-pub fn unflushed_wal_bytes(wal_dir: &std::path::Path, floor_micros: Option<i64>) -> u64 {
-    use std::time::SystemTime;
-    let Some(floor) = floor_micros else { return 0 };
-    let floor_ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(floor.saturating_sub(GC_FLOOR_SLACK_MICROS).max(0) as u64);
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(wal_dir) {
-        for entry in entries.flatten() {
-            if let Ok(meta) = entry.metadata()
-                && meta.is_file()
-                && meta.modified().unwrap_or(SystemTime::UNIX_EPOCH) >= floor_ts
-            {
-                total += meta.len();
-            }
-        }
-    }
-    total
-}
-
 pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration, unflushed_floor_micros: Option<i64>) -> std::io::Result<(u64, u64)> {
     use std::time::SystemTime;
     let mut cutoff = SystemTime::now().checked_sub(max_age).unwrap_or(SystemTime::UNIX_EPOCH);
@@ -2210,25 +2181,6 @@ mod tests {
         let (deleted, _) = gc_wal_files(root, std::time::Duration::ZERO, Some(chrono::Utc::now().timestamp_micros() + 3600 * 1_000_000)).unwrap();
         assert_eq!(deleted, 1);
         assert!(!f.exists());
-    }
-
-    /// The WAL hard gate's gauge: only files at/after the un-flushed floor
-    /// count as backlog — flushed segments awaiting age-gated GC must NOT
-    /// latch the gate (2026-07-26 post-deploy: 33GB of flushed segments held
-    /// ingest rejected for what would have been ~90min).
-    #[test]
-    fn unflushed_wal_bytes_counts_only_files_at_or_after_floor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        std::fs::write(root.join("1770000000000"), vec![0u8; 512]).unwrap();
-
-        assert_eq!(unflushed_wal_bytes(root, None), 0, "no un-flushed appends → zero backlog");
-        // Floor an hour in the past: the just-written file is at/after it → counted.
-        let past = chrono::Utc::now().timestamp_micros() - 3600 * 1_000_000;
-        assert_eq!(unflushed_wal_bytes(root, Some(past)), 512);
-        // Floor an hour in the future: the file predates it (fully flushed) → excluded.
-        let future = chrono::Utc::now().timestamp_micros() + 3600 * 1_000_000;
-        assert_eq!(unflushed_wal_bytes(root, Some(future)), 0);
     }
 
     /// Boot GC gating (2026-07-08 review findings): `clean_shutdown=true` is

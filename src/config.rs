@@ -216,7 +216,7 @@ const_default!(d_flush_bucket_timeout_secs: u64 = 600);
 //   "none"      — never fsync (test/throwaway data only)
 const_default!(d_wal_fsync_mode: String = "ms");
 const_default!(d_wal_max_files: usize = 200);
-const_default!(d_wal_hard_limit_gb: u64 = 24);
+const_default!(d_wal_hard_limit_gb: u64 = 96);
 const_default!(d_foyer_memory_mb: usize = 1024);
 // Local disk is cheap and fast relative to S3 GETs, so default the cache large
 // — servers run 500GB–1TB cache volumes. foyer creates the backing file sparse
@@ -673,17 +673,17 @@ pub struct BufferConfig {
     /// inflating restart replay (issue #83). 0 = derive from the buffer budget.
     #[serde(default)]
     pub timefusion_wal_max_unflushed_mb: usize,
-    /// HARD cap on UN-flushed WAL bytes (what a restart must replay — flushed
-    /// segments awaiting age-gated GC don't count): past this, INSERTs are rejected (the
-    /// upstream DLQ absorbs and replays them) instead of acking writes into an
-    /// unbounded backlog. The soft thresholds above only trigger emergency
-    /// flushes — during the 2026-07-26 merge storm a 6GB "limit" grew to 121GB
-    /// of acked-but-unflushed data because nothing refused work. Checked every
-    /// ~15s by a dedicated WAL-gate task (`run_wal_gate_task` — deliberately
-    /// NOT the flush loop, which stalls in exactly the overload this guards
-    /// against; no per-append dir scan). DML mem legs
-    /// are exempt: failing an UPDATE mid-statement would desync mem vs Delta.
-    /// 0 disables. Default 24GB (a few minutes of recovery replay).
+    /// Disk-runaway breaker: HARD cap on total on-disk WAL bytes, past which
+    /// INSERTs are rejected (the upstream DLQ absorbs and replays them)
+    /// instead of acking writes into unbounded disk growth — during the
+    /// 2026-07-26 merge storm the WAL grew to 121GB while the soft thresholds
+    /// only WARNed. Total on-disk includes flushed segments the age-gated GC
+    /// holds for ~90min and all active per-shard files, so keep this far
+    /// above the busy-hour residue (~56GB observed during catch-up bursts).
+    /// Checked every ~15s by a dedicated WAL-gate task (`run_wal_gate_task` —
+    /// deliberately NOT the flush loop, which stalls in exactly the overload
+    /// this guards against). DML mem legs are exempt: failing an UPDATE
+    /// mid-statement would desync mem vs Delta. 0 disables. Default 96GB.
     #[serde(default = "d_wal_hard_limit_gb")]
     pub timefusion_wal_hard_limit_gb: u64,
     #[serde(default = "d_bucket_duration_secs")]
