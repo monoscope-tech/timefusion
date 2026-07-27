@@ -49,20 +49,32 @@ const CAS_BACKOFF_BASE_MICROS: u64 = 1;
 /// Maximum backoff exponent (caps delay at ~1ms)
 const CAS_BACKOFF_MAX_EXPONENT: u32 = 10;
 
-/// Write raw bytes with owner-only (0600) permissions on Unix; plain write
-/// elsewhere.
-fn write_owner_only(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+/// Create `path` for writing with owner-only (0600) permissions on Unix.
+/// `exclusive` fails if the file already exists — use it where an existing file
+/// means a name collision that must not silently overwrite user data.
+pub(crate) fn create_owner_only(path: &std::path::Path, exclusive: bool) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true);
+    if exclusive {
+        opts.create_new(true);
+    } else {
+        opts.create(true).truncate(true);
+    }
     #[cfg(unix)]
     {
-        use std::{io::Write, os::unix::fs::OpenOptionsExt};
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-        f.write_all(contents)?;
-        f.sync_all()
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents)
-    }
+    opts.open(path)
+}
+
+/// Write raw bytes with owner-only (0600) permissions on Unix; plain write
+/// elsewhere.
+pub(crate) fn write_owner_only(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = create_owner_only(path, false)?;
+    f.write_all(contents)?;
+    f.sync_all()
 }
 
 /// Returns false when the payload could not be persisted — the WAL is then

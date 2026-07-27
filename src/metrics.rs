@@ -89,7 +89,8 @@ counter_registry! {
     dml_delta_leg_skipped      => "timefusion.dml.delta_leg_skipped": "DML Delta legs skipped because the predicate's time window lies entirely above the flush watermark — the matched rows are buffer-only, so the flush persists their post-DML values and the Delta merge would scan+commit for nothing",
     dml_coalesce_enqueued      => "timefusion.dml.coalesce_enqueued": "UPDATE ... FROM statements whose Delta leg was deferred into the coalescer queue",
     dml_coalesce_merges        => "timefusion.dml.coalesce_merges": "Delta merges executed by coalescer drains (each replaces N deferred statement-merges; compare with coalesce_enqueued for the batching ratio)",
-    dml_coalesce_dropped       => "timefusion.dml.coalesce_dropped": "Coalesced DML groups dropped after exhausting drain retries — deferred Delta updates were LOST for rows already in Delta (buffer-resident rows are unaffected). PAGE if > 0",
+    dml_coalesce_dropped       => "timefusion.dml.coalesce_dropped": "Coalesced DML groups whose rows could NOT even be quarantined — deferred Delta updates were LOST for rows already in Delta (buffer-resident rows are unaffected). PAGE if > 0",
+    dml_coalesce_quarantined   => "timefusion.dml.coalesce_quarantined": "Coalesced DML groups parked to <wal_dir>/quarantine/dml after exhausting drain retries. Rows are recoverable (Arrow IPC + .meta sidecar) but the Delta leg has NOT applied — investigate and re-drive. ALERT if > 0",
     dedup_chunk_skipped        => "timefusion.dedup.chunk_skipped": "Dedup chunk rewrites skipped (over the rewrite-byte budget, or partition in failure backoff). Duplicates persist in Delta — read-side dedup keeps queries correct — until a later sweep or manual compaction clears them. WARN if sustained",
     maintenance_checkpoint_failed => "timefusion.maintenance.checkpoint_failed": "Out-of-band checkpoint attempts that errored (e.g. R2 500 on the checkpoint PUT). Retried next tick; ingest is unaffected. WARN if sustained — checkpoints falling behind slows boot replay and blocks log cleanup",
     maintenance_log_cleanup_failed => "timefusion.maintenance.log_cleanup_failed": "Out-of-band expired-log-cleanup attempts that errored. Retried next tick; the _delta_log grows until it succeeds. WARN if sustained (a growing log slows every commit's version LIST)",
@@ -393,7 +394,16 @@ pub fn record_dml_coalesce_merge() {
     }
 }
 
-/// One coalesced DML group dropped after exhausting drain retries.
+/// One coalesced DML group parked to the quarantine dir after exhausting
+/// drain retries. Recoverable — unlike `record_dml_coalesce_dropped`.
+pub fn record_dml_coalesce_quarantined() {
+    DML_STATS.coalesce_quarantined.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(m) = METRICS.get() {
+        m.dml_coalesce_quarantined.add(1, &[]);
+    }
+}
+
+/// One coalesced DML group whose rows could not be quarantined — real loss.
 pub fn record_dml_coalesce_dropped() {
     if let Some(m) = METRICS.get() {
         m.dml_coalesce_dropped.add(1, &[]);
@@ -424,10 +434,18 @@ pub struct DmlStats {
     /// Delta merges executed by coalescer drains — readable in-process (the
     /// OTel counter isn't); tests assert on deltas of this to pin folding.
     pub coalesce_merges: AtomicU64,
+    /// Groups parked to `<wal_dir>/quarantine/dml` — in-process readable so
+    /// tests can assert the terminal branch parks instead of dropping.
+    pub coalesce_quarantined: AtomicU64,
 }
 
-static DML_STATS: DmlStats =
-    DmlStats { occ_conflicts: AtomicU64::new(0), retry_successes: AtomicU64::new(0), retry_exhausted: AtomicU64::new(0), coalesce_merges: AtomicU64::new(0) };
+static DML_STATS: DmlStats = DmlStats {
+    occ_conflicts: AtomicU64::new(0),
+    retry_successes: AtomicU64::new(0),
+    retry_exhausted: AtomicU64::new(0),
+    coalesce_merges: AtomicU64::new(0),
+    coalesce_quarantined: AtomicU64::new(0),
+};
 
 pub fn dml_stats() -> &'static DmlStats {
     &DML_STATS

@@ -23,8 +23,15 @@
 //! Durability: the mem leg WAL-appends `UpdateWithSource` before enqueue, so
 //! buffer-resident rows survive a crash with their post-DML values. What a
 //! crash CAN lose is the deferred Delta leg for rows that were already in
-//! Delta when the statement ran — bounded by the drain interval and surfaced
-//! by `timefusion.dml.coalesce_dropped` when drains exhaust retries.
+//! Delta when the statement ran — bounded by the drain interval.
+//!
+//! A group that exhausts `MAX_DRAIN_ATTEMPTS` is **parked**, not dropped: its
+//! rows go to `<wal_dir>/quarantine/dml` as Arrow IPC + a `.meta` sidecar
+//! (`timefusion.dml.coalesce_quarantined`). Dropping was unrecoverable — the
+//! Delta leg targets rows already flushed out of the buffer, so there is no
+//! newer copy to converge from and read-side dedup (first-seen-wins) cannot
+//! repair it. `timefusion.dml.coalesce_dropped` now means the *quarantine
+//! write itself* failed, i.e. genuine loss.
 
 use std::{
     collections::HashMap,
@@ -59,9 +66,117 @@ use crate::dml::UpdateSource;
 /// `MAX_UPDATE_SOURCE_ROWS` — a drained group must stay mergeable.
 const MAX_QUEUED_SOURCE_ROWS: usize = 1_000_000;
 
-/// Drain attempts per group before it is dropped (each drain already carries
-/// perform_delta_merge_update's 4-attempt OCC retry underneath).
+/// Drain attempts per group before it is quarantined (each drain already
+/// carries perform_delta_merge_update's 4-attempt OCC retry underneath).
 const MAX_DRAIN_ATTEMPTS: u32 = 3;
+
+/// Max source rows fed to a single Delta MERGE. `MAX_QUEUED_SOURCE_ROWS` only
+/// *notifies* a drain, so a group can grow past it unbounded — on 2026-07-27
+/// one reached 1_252_311 rows (7457 statements) and every MERGE attempt died
+/// with "Resources exhausted", costing the whole group. Rounds are therefore
+/// chunked: many bounded merges instead of one unbounded one. Each chunk is an
+/// independent commit, which the idempotence contract already permits.
+const MAX_MERGE_ROWS: usize = 100_000;
+
+/// Zero-copy slices of `batch` of at most `max` rows, covering every row once.
+fn chunk_rows(batch: &RecordBatch, max: usize) -> impl Iterator<Item = RecordBatch> + '_ {
+    (0..batch.num_rows()).step_by(max).map(move |off| batch.slice(off, max.min(batch.num_rows() - off)))
+}
+
+/// Persist a terminally-failed group's source rows as an Arrow IPC file plus a
+/// `.meta` sidecar, so the Delta leg can be re-driven instead of lost.
+///
+/// Before this existed the terminal branch logged and dropped: 2026-07-27
+/// 04:42Z lost 1_252_311 enrichment rows that way. The loss is permanent
+/// without a sidecar — the mem leg already applied, and the Delta leg is
+/// watermark-clamped to rows that have *already* flushed and left the buffer,
+/// so Delta keeps stale pre-DML values with no newer copy anywhere (read-side
+/// dedup is first-seen-wins and cannot repair it).
+///
+/// Returns false when nothing could be persisted; the caller must then keep
+/// the loud error path, because the rows are genuinely gone.
+fn quarantine_group(dir: &std::path::Path, key: &GroupKey, group: &PendingGroup, batches: &[RecordBatch], reason: &str) -> bool {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        error!("dml quarantine: cannot create {dir:?}: {e}");
+        return false;
+    }
+    // Schema drift is itself a quarantine reason (concat failure), so keep
+    // only what this IPC file can actually hold and say so if any are left.
+    let (writable, skipped): (Vec<&RecordBatch>, usize) = {
+        let keep: Vec<&RecordBatch> = batches.iter().filter(|b| b.schema() == group.schema).collect();
+        let skipped = batches.len() - keep.len();
+        (keep, skipped)
+    };
+    if writable.is_empty() {
+        error!(
+            "dml quarantine: no batch matches the group schema for {}/{} — {} rows LOST: {reason}",
+            key.project_id,
+            key.table_name,
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+        );
+        return false;
+    }
+    let rows: usize = writable.iter().copied().map(RecordBatch::num_rows).sum();
+    // Fingerprint disambiguates two groups for the same project/table parked in
+    // the same microsecond; `create_new` then turns any residual collision into
+    // an error rather than a silent truncation of already-parked user data.
+    let stem = format!("{}_{:016x}_{}__{}", crate::clock::now_micros(), key.fingerprint, key.project_id, key.table_name).replace(['/', '\\', ':', '\0'], "_");
+    let (path, file) = match (0..16).find_map(|n| {
+        let p = dir.join(if n == 0 { format!("{stem}.arrow") } else { format!("{stem}-{n}.arrow") });
+        crate::buffered_write_layer::create_owner_only(&p, true).ok().map(|f| (p, f))
+    }) {
+        Some(pf) => pf,
+        None => {
+            error!("dml quarantine: cannot create a unique payload file under {dir:?} for {}/{}", key.project_id, key.table_name);
+            return false;
+        }
+    };
+
+    // Arrow IPC (not raw bytes): self-describing schema, so a re-drive needs
+    // only the sidecar for the merge shape. Streamed straight to the file —
+    // buffering a multi-GB group in a Vec first risks OOM at the exact moment
+    // memory exhaustion is what brought us here.
+    match datafusion::arrow::ipc::writer::FileWriter::try_new(std::io::BufWriter::new(file), &group.schema) {
+        Ok(mut w) => {
+            if let Err(e) = writable.iter().try_for_each(|b| w.write(b)).and_then(|()| w.finish()) {
+                error!("dml quarantine: IPC write failed for {path:?}: {e}");
+                return false;
+            }
+        }
+        Err(e) => {
+            error!("dml quarantine: IPC writer init failed for {path:?}: {e}");
+            return false;
+        }
+    }
+
+    let meta = format!(
+        "project_id={}\ntable_name={}\nfolded_projects={}\njoin_keys={}\nassignments={}\npredicate={}\ntime_col={}\nattempts={}\nrows={}\nstatements={}\nreason={reason}\n",
+        key.project_id,
+        key.table_name,
+        group.folded_projects.as_ref().map_or(String::new(), |p| p.join(",")),
+        group.join_keys.iter().map(|(t, s)| format!("{t}={s}")).collect::<Vec<_>>().join(","),
+        group.assignments.iter().map(|(c, e)| format!("{c}:={e}")).collect::<Vec<_>>().join(","),
+        group.predicate.reconstruct(group.time_col).map_or(String::new(), |e| e.to_string()),
+        group.time_col,
+        group.attempts,
+        rows,
+        group.batches.len(),
+    );
+    if let Err(e) = crate::buffered_write_layer::write_owner_only(&path.with_extension("meta"), meta.as_bytes()) {
+        error!("dml quarantine: meta write failed for {path:?}: {e}");
+    }
+    error!("dml quarantine: parked {}/{} ({rows} rows) at {path:?}: {reason}", key.project_id, key.table_name);
+    crate::metrics::record_dml_coalesce_quarantined();
+    if skipped > 0 {
+        // Partially parked is partially LOST — the skipped batches have no
+        // other copy. Page on it, or the recoverable-looking quarantine metric
+        // would mask real loss.
+        let lost: usize = batches.iter().filter(|b| b.schema() != group.schema).map(RecordBatch::num_rows).sum();
+        crate::metrics::record_dml_coalesce_dropped();
+        error!("dml quarantine: {skipped} schema-mismatched batch(es) for {}/{} could NOT be parked — {lost} rows LOST", key.project_id, key.table_name);
+    }
+    true
+}
 
 /// The table's time column ("timestamp" unless the schema overrides it) —
 /// the column whose range conjuncts are widened and watermark-clamped.
@@ -486,6 +601,8 @@ pub struct DmlCoalescer {
     drain_notify: Notify,
     /// Serializes drains (timer vs shutdown vs test-triggered).
     drain_lock: tokio::sync::Mutex<()>,
+    /// Where terminally-failed groups are parked instead of dropped.
+    quarantine_dir: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for DmlCoalescer {
@@ -507,6 +624,8 @@ impl DmlCoalescer {
             queued_rows: AtomicUsize::new(0),
             drain_notify: Notify::new(),
             drain_lock: tokio::sync::Mutex::new(()),
+            // try_config: unit tests construct a coalescer without init_config.
+            quarantine_dir: crate::config::try_config().map_or_else(|| std::path::PathBuf::from("./data/wal"), |c| c.core.wal_dir()).join("quarantine/dml"),
         }
     }
 
@@ -591,16 +710,19 @@ impl DmlCoalescer {
             }
             // A failure in any prep step (schema drift within a
             // fingerprint-matched group, missing join key, row conversion) is
-            // a bug, not an operational state — drop loudly and move on.
-            let drop_group = |stage: &str, e: &dyn std::fmt::Display| {
-                crate::metrics::record_dml_coalesce_dropped();
-                error!("dml coalesce: {stage} failed for {}/{}: {e}", key.project_id, key.table_name);
+            // a bug, not an operational state — but the rows are still
+            // unapplied in Delta, so park them rather than drop them.
+            let park_group = |stage: &str, e: &dyn std::fmt::Display, batches: &[RecordBatch]| {
+                if !quarantine_group(&self.quarantine_dir, &key, &group, batches, &format!("{stage} failed: {e}")) {
+                    crate::metrics::record_dml_coalesce_dropped();
+                    error!("dml coalesce: {stage} failed for {}/{} — rows LOST: {e}", key.project_id, key.table_name);
+                }
             };
             let statements = group.batches.len();
             let merged = match concat_batches(&group.schema, &group.batches) {
                 Ok(b) => b,
                 Err(e) => {
-                    drop_group("concat", &e);
+                    park_group("concat", &e, &group.batches);
                     continue;
                 }
             };
@@ -611,13 +733,14 @@ impl DmlCoalescer {
             let rounds = match key_indices.and_then(|idx| split_rounds(&merged, &idx)) {
                 Ok(r) => r,
                 Err(e) => {
-                    drop_group("round split", &e);
+                    park_group("round split", &e, std::slice::from_ref(&merged));
                     continue;
                 }
             };
             let predicate = group.predicate.reconstruct(group.time_col);
             let mut failed = None;
-            for round in rounds {
+            // Chunk each round to bound per-MERGE memory (see MAX_MERGE_ROWS).
+            for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
                 let source = UpdateSource { batch: round, schema: group.schema.clone(), join_keys: group.join_keys.clone() };
                 match crate::dml::perform_delta_merge_update(
                     db,
@@ -643,14 +766,20 @@ impl DmlCoalescer {
             if let Some(e) = failed {
                 group.attempts += 1;
                 if group.attempts >= MAX_DRAIN_ATTEMPTS {
-                    crate::metrics::record_dml_coalesce_dropped();
-                    error!(
-                        "dml coalesce: DROPPING {}/{} group after {} failed drains ({statements} stmts, {} rows): {e}",
-                        key.project_id,
-                        key.table_name,
-                        group.attempts,
-                        merged.num_rows()
-                    );
+                    // Park, don't drop: the mem leg already applied and the
+                    // Delta leg targets rows no longer in the buffer, so a
+                    // dropped group is permanent divergence with no self-heal.
+                    let reason = format!("{} failed drains: {e}", group.attempts);
+                    if !quarantine_group(&self.quarantine_dir, &key, &group, std::slice::from_ref(&merged), &reason) {
+                        crate::metrics::record_dml_coalesce_dropped();
+                        error!(
+                            "dml coalesce: LOST {}/{} group after {} failed drains ({statements} stmts, {} rows) — quarantine write failed: {e}",
+                            key.project_id,
+                            key.table_name,
+                            group.attempts,
+                            merged.num_rows()
+                        );
+                    }
                 } else {
                     warn!(
                         "dml coalesce: drain failed for {}/{} (attempt {}/{MAX_DRAIN_ATTEMPTS}), re-queueing: {e}",
@@ -721,6 +850,120 @@ mod tests {
 
     fn window(lo: i64, hi: i64) -> Expr {
         col("timestamp").gt_eq(lit(ts(lo))).and(col("timestamp").lt(lit(ts(hi))))
+    }
+
+    /// Regression guard for the 2026-07-27 04:42Z loss: the terminal drain
+    /// branch dropped 1_252_311 enrichment rows with only an `error!`. The
+    /// rows must instead land on disk, self-describing and re-drivable.
+    // #[serial]: asserts exact deltas on the process-global DML_STATS counters.
+    #[test]
+    #[serial_test::serial]
+    fn terminal_failure_quarantines_rows_recoverably() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false), Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["a", "b"])), Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+        let key = GroupKey { project_id: "proj/1".into(), table_name: "otel_logs_and_spans".into(), fingerprint: 7 };
+        let group = PendingGroup {
+            join_keys: vec![("id".into(), "id".into())],
+            assignments: vec![("n".into(), lit(9i64))],
+            predicate: DecomposedPredicate::decompose(Some(&window(100, 200)), "timestamp"),
+            time_col: "timestamp",
+            schema: schema.clone(),
+            batches: vec![batch.clone()],
+            session: Arc::new(datafusion::prelude::SessionContext::new().state()),
+            attempts: MAX_DRAIN_ATTEMPTS,
+            folded_projects: Some(vec!["proj/1".into(), "proj2".into()]),
+        };
+
+        let before = crate::metrics::dml_stats().coalesce_quarantined.load(Ordering::Relaxed);
+        assert!(quarantine_group(dir.path(), &key, &group, std::slice::from_ref(&batch), "resources exhausted"));
+        assert_eq!(crate::metrics::dml_stats().coalesce_quarantined.load(Ordering::Relaxed), before + 1);
+
+        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).collect();
+        let arrow = files.iter().find(|p| p.extension().is_some_and(|e| e == "arrow")).expect("no .arrow payload");
+        let meta = std::fs::read_to_string(files.iter().find(|p| p.extension().is_some_and(|e| e == "meta")).expect("no .meta")).unwrap();
+
+        // Payload round-trips through Arrow IPC with rows intact — this is
+        // what makes a re-drive possible at all.
+        let f = std::fs::File::open(arrow).unwrap();
+        let reader = datafusion::arrow::ipc::reader::FileReader::try_new(f, None).unwrap();
+        let read: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
+        assert_eq!(read.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        assert_eq!(read[0].schema().fields().len(), 2);
+
+        // Sidecar carries the merge shape a re-drive needs.
+        for want in ["project_id=proj/1", "rows=2", "join_keys=id=id", "reason=resources exhausted", "folded_projects=proj/1,proj2"] {
+            assert!(meta.contains(want), "meta missing {want:?}:\n{meta}");
+        }
+        assert!(meta.contains("assignments=n:="), "meta missing assignments:\n{meta}");
+
+        // Filename must not smuggle the '/' from project_id into a subdir.
+        assert!(arrow.parent().unwrap() == dir.path(), "payload escaped the quarantine dir");
+    }
+
+    /// Two parks of the same project/table must never overwrite each other,
+    /// even under a frozen clock (e2e virtual time) — an overwrite would be
+    /// exactly the silent loss this whole mechanism exists to prevent. And a
+    /// batch that cannot be parked must page via `coalesce_dropped`, not hide
+    /// behind the recoverable-looking `coalesce_quarantined`.
+    #[test]
+    #[serial_test::serial]
+    fn parks_are_collision_proof_and_partial_loss_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let key = GroupKey { project_id: "p".into(), table_name: "t".into(), fingerprint: 1 };
+        let mut group = PendingGroup {
+            join_keys: vec![("n".into(), "n".into())],
+            assignments: vec![("n".into(), lit(1i64))],
+            predicate: DecomposedPredicate::decompose(None, "timestamp"),
+            time_col: "timestamp",
+            schema: schema.clone(),
+            batches: vec![batch.clone()],
+            session: Arc::new(datafusion::prelude::SessionContext::new().state()),
+            attempts: MAX_DRAIN_ATTEMPTS,
+            folded_projects: None,
+        };
+
+        for _ in 0..3 {
+            assert!(quarantine_group(dir.path(), &key, &group, std::slice::from_ref(&batch), "x"));
+        }
+        let payloads = std::fs::read_dir(dir.path()).unwrap().filter(|e| e.as_ref().unwrap().path().extension().is_some_and(|x| x == "arrow")).count();
+        assert_eq!(payloads, 3, "parks overwrote each other instead of getting distinct names");
+
+        // A batch whose schema differs from the group's cannot go in the IPC
+        // file; that is real loss and must bump the paging metric.
+        let other =
+            RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)])), vec![Arc::new(StringArray::from(vec!["z"]))]).unwrap();
+        group.batches = vec![batch.clone(), other.clone()];
+        let dropped_before = crate::metrics::dml_stats().coalesce_quarantined.load(Ordering::Relaxed);
+        assert!(quarantine_group(dir.path(), &key, &group, &[batch.clone(), other], "mixed"));
+        assert_eq!(crate::metrics::dml_stats().coalesce_quarantined.load(Ordering::Relaxed), dropped_before + 1);
+        let meta = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "meta"))
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .find(|m| m.contains("reason=mixed"))
+            .expect("no meta for the mixed-schema park");
+        // Only the matching batch's row is accounted as parked.
+        assert!(meta.contains("rows=1"), "meta over-claims parked rows:\n{meta}");
+    }
+
+    /// A round larger than `MAX_MERGE_ROWS` must be fed to Delta as several
+    /// bounded slices covering every row exactly once — one unbounded MERGE is
+    /// what exhausted memory on 2026-07-27.
+    #[test]
+    fn oversized_round_chunks_to_bounded_merges() {
+        let rows = MAX_MERGE_ROWS * 2 + 7;
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let round = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..rows as i64))]).unwrap();
+
+        let chunks: Vec<RecordBatch> = chunk_rows(&round, MAX_MERGE_ROWS).collect();
+
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.num_rows() <= MAX_MERGE_ROWS));
+        assert_eq!(chunks.iter().map(RecordBatch::num_rows).sum::<usize>(), rows, "chunking must not drop or duplicate rows");
     }
 
     #[test]

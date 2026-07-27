@@ -319,11 +319,7 @@ async fn acked_rows_survive_sigkill_during_flush() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn acked_rows_survive_sigkill_under_memory_pressure() -> Result<()> {
-    let mut tf = Tf::start(
-        "pressure",
-        TfOpts { flush_interval_secs: 3600, buffer_max_memory_mb: 8, ..Default::default() },
-    )
-    .await?;
+    let mut tf = Tf::start("pressure", TfOpts { flush_interval_secs: 3600, buffer_max_memory_mb: 8, ..Default::default() }).await?;
     let client = tf.connect().await?;
     let ts = chrono::Utc::now().timestamp_micros();
 
