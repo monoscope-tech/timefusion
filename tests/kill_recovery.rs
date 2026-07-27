@@ -32,6 +32,14 @@ const PROJECT: &str = "kill_test";
 
 // ---------------------------------------------------------------- MinIO setup
 
+/// An unused localhost port: bind :0, read the assignment, release it. The
+/// window between release and the child's bind is small enough in practice, and
+/// unlike a fixed port it cannot collide with a concurrent test or a socket the
+/// previous incarnation has not finished releasing.
+fn free_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
+}
+
 async fn port_open(addr: &str) -> bool {
     tokio::net::TcpStream::connect(addr).await.is_ok()
 }
@@ -127,9 +135,7 @@ impl Tf {
         let data_dir = std::env::temp_dir().join(format!("tf-kill-{test_name}-{id}"));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(data_dir.join("wal")).ok();
-        // Port derived from a fresh UUID keeps concurrent cargo test targets apart.
-        let port = 5900 + (u16::from_le_bytes([id.as_bytes()[0], id.as_bytes()[1]]) % 600);
-        let mut tf = Self { child: None, port, data_dir, bucket, prefix, endpoint, opts };
+        let mut tf = Self { child: None, port: free_port()?, data_dir, bucket, prefix, endpoint, opts };
         tf.spawn().await?;
         Ok(tf)
     }
@@ -137,6 +143,11 @@ impl Tf {
     /// (Re)spawn the real binary against the SAME data dir + table prefix, so a
     /// restart sees the previous incarnation's WAL exactly as prod does.
     async fn spawn(&mut self) -> Result<()> {
+        // A fresh port every spawn. A hash-derived fixed port collided between
+        // concurrent tests, and re-binding the same port right after SIGKILL hit
+        // EADDRINUSE while the dead process's socket lingered — both surfaced as
+        // "never became ready", not as a durability failure.
+        self.port = free_port()?;
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_timefusion"));
         cmd.env("AWS_S3_ENDPOINT", &self.endpoint)
             .env("AWS_ENDPOINT_URL", &self.endpoint)

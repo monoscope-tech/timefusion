@@ -670,22 +670,52 @@ const WAL_WATERMARK_KEY: &str = "timefusion.wal_watermark";
 /// `commitInfo.info[WAL_WATERMARK_KEY]`. Only shards with a position are
 /// included — absent shards mean "no constraint from this commit", which is
 /// how the per-shard MAX aggregation across commits ignores them.
-fn serialize_watermark_to_json(watermark: &crate::buffered_write_layer::DeltaWatermark) -> serde_json::Map<String, serde_json::Value> {
-    watermark
+fn serialize_watermark_to_json(
+    watermark: &crate::buffered_write_layer::DeltaWatermark, project_id: &str, table_name: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut map: serde_json::Map<String, serde_json::Value> = watermark
         .iter()
         .enumerate()
         .filter_map(|(shard, pos)| pos.map(|p| (shard.to_string(), serde_json::json!({ "block_id": p.block_id, "offset": p.offset }))))
-        .collect()
+        .collect();
+    if !map.is_empty() {
+        // Topic scope. Unified-table tenants all commit to ONE Delta log, and
+        // walrus positions are per-topic, so an unscoped watermark read back by
+        // a different tenant advances its cursor past unreplayed entries.
+        // Non-numeric keys are already skipped by older readers, so adding this
+        // is backward-compatible on the read side.
+        map.insert(WATERMARK_TOPIC_KEY.to_string(), serde_json::Value::String(wal_topic(project_id, table_name)));
+    }
+    map
+}
+
+/// Key inside the watermark object naming the topic that produced it.
+const WATERMARK_TOPIC_KEY: &str = "topic";
+
+/// Logical WAL topic for a (project, table) — matches `wal.rs`'s topic naming.
+fn wal_topic(project_id: &str, table_name: &str) -> String {
+    format!("{project_id}:{table_name}")
 }
 
 /// Inverse of `serialize_watermark_to_json`. Out-of-range or malformed shards
 /// are dropped silently — schema-evolution-friendly: future writers can add
 /// fields without breaking older readers.
-fn parse_watermark_from_json(info: &std::collections::HashMap<String, serde_json::Value>, shards: usize) -> Vec<Option<walrus_rust::WalPosition>> {
+fn parse_watermark_from_json(
+    info: &std::collections::HashMap<String, serde_json::Value>, shards: usize, project_id: &str, table_name: &str,
+) -> Vec<Option<walrus_rust::WalPosition>> {
     let mut out = vec![None; shards];
     let Some(wm) = info.get(WAL_WATERMARK_KEY).and_then(|v| v.as_object()) else {
         return out;
     };
+    // Only apply a watermark to the topic that wrote it. A commit from another
+    // tenant of the same unified table, or a legacy commit with no topic at
+    // all, contributes nothing — an unattributable position is indistinguishable
+    // from another tenant's, and over-advancing a cursor loses acked writes,
+    // whereas under-advancing only replays duplicates (read-side dedup drops
+    // those).
+    if wm.get(WATERMARK_TOPIC_KEY).and_then(|v| v.as_str()) != Some(wal_topic(project_id, table_name).as_str()) {
+        return out;
+    }
     for (shard_str, pos_val) in wm {
         let Ok(shard) = shard_str.parse::<usize>() else { continue };
         if shard >= shards {
@@ -703,11 +733,11 @@ fn parse_watermark_from_json(info: &std::collections::HashMap<String, serde_json
 /// Used during startup to compute the cursor each shard should sit at to
 /// be consistent with all recent Delta commits.
 fn max_watermark_across_commits<'a>(
-    commit_infos: impl IntoIterator<Item = &'a std::collections::HashMap<String, serde_json::Value>>, shards: usize,
+    commit_infos: impl IntoIterator<Item = &'a std::collections::HashMap<String, serde_json::Value>>, shards: usize, project_id: &str, table_name: &str,
 ) -> Vec<Option<walrus_rust::WalPosition>> {
     let mut acc = vec![None; shards];
     for info in commit_infos {
-        for (shard, p) in parse_watermark_from_json(info, shards).into_iter().enumerate() {
+        for (shard, p) in parse_watermark_from_json(info, shards, project_id, table_name).into_iter().enumerate() {
             let Some(candidate) = p else { continue };
             acc[shard] = Some(acc[shard].map_or(candidate, |prev: walrus_rust::WalPosition| prev.max(candidate)));
         }
@@ -731,8 +761,8 @@ fn base_commit_properties() -> CommitProperties {
 /// Empty when the watermark has no positions (e.g. WAL-replay-derived buckets);
 /// delta-rs writes the commit without the key in that case, and recovery
 /// silently skips that commit.
-fn build_watermark_commit_properties(watermark: &crate::buffered_write_layer::DeltaWatermark) -> CommitProperties {
-    let entries = serialize_watermark_to_json(watermark);
+fn build_watermark_commit_properties(watermark: &crate::buffered_write_layer::DeltaWatermark, project_id: &str, table_name: &str) -> CommitProperties {
+    let entries = serialize_watermark_to_json(watermark, project_id, table_name);
     if entries.is_empty() {
         return base_commit_properties();
     }
@@ -3669,7 +3699,7 @@ impl Database {
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
 
         // Hoist out of the retry loop — the watermark is the same on every attempt.
-        let commit_properties = watermark.map(build_watermark_commit_properties);
+        let commit_properties = watermark.map(|w| build_watermark_commit_properties(w, project_id.as_str(), table_name.as_str()));
         // Let the post-commit hook advance the snapshot incrementally — carry
         // the materialized file list forward, append the committed files, drop
         // any removed ones — instead of re-materializing the whole active set.
@@ -4091,7 +4121,7 @@ impl Database {
         };
         drop(table);
 
-        let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), wal.shards_per_topic());
+        let delta_max = max_watermark_across_commits(commits.iter().map(|ci| &ci.info), wal.shards_per_topic(), project_id, table_name);
         let advanced = wal.merge_persisted_positions(project_id, table_name, &delta_max)?;
         if advanced > 0 {
             info!("Delta-derived cursor advance: project={}, table={}, shards_advanced={}", project_id, table_name, advanced);
@@ -8367,11 +8397,43 @@ mod tests {
     fn watermark_serialize_parse_roundtrip() {
         use walrus_rust::WalPosition;
         let wm = vec![Some(WalPosition { block_id: 7, offset: 1024 }), None, Some(WalPosition { block_id: 9, offset: 0 }), None];
-        let json = serialize_watermark_to_json(&wm);
+        let json = serialize_watermark_to_json(&wm, "p", "t");
         let mut info = std::collections::HashMap::new();
         info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
-        let parsed = parse_watermark_from_json(&info, wm.len());
+        let parsed = parse_watermark_from_json(&info, wm.len(), "p", "t");
         assert_eq!(parsed, wm);
+    }
+
+    /// On the unified table every default project commits to ONE Delta log, so
+    /// `derive_wal_cursor_for_table` sees every tenant's watermarks. Positions
+    /// are per-`topic:shard` walrus offsets and are NOT comparable across
+    /// topics: a busy tenant's high block_id applied to a quiet tenant's cursor
+    /// skips that tenant's unreplayed WAL entries — acked-write loss on any
+    /// Delta-scan boot (which runs on EVERY boot, `bootstrap.rs`). A watermark
+    /// must therefore only ever be applied to the topic that wrote it.
+    #[test]
+    fn watermark_is_scoped_to_its_own_topic() {
+        use walrus_rust::WalPosition;
+        let busy = serialize_watermark_to_json(&vec![Some(WalPosition { block_id: 9_000, offset: 0 })], "busy_proj", "otel_logs_and_spans");
+        let mut info = std::collections::HashMap::new();
+        info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(busy));
+
+        // The tenant that wrote it still gets it.
+        assert_eq!(parse_watermark_from_json(&info, 1, "busy_proj", "otel_logs_and_spans"), vec![Some(WalPosition { block_id: 9_000, offset: 0 })]);
+        // Another tenant sharing the same physical log must get nothing.
+        assert_eq!(parse_watermark_from_json(&info, 1, "quiet_proj", "otel_logs_and_spans"), vec![None]);
+        // Same project, different table is also a different topic.
+        assert_eq!(parse_watermark_from_json(&info, 1, "busy_proj", "otel_metrics"), vec![None]);
+
+        // A legacy (pre-fix) commit carries no topic. It must contribute
+        // nothing rather than be applied to everyone: unattributable is
+        // indistinguishable from another tenant's, and duplicates (which
+        // read-side dedup removes) are always preferable to loss.
+        let legacy: serde_json::Map<String, serde_json::Value> =
+            [("0".to_string(), serde_json::json!({ "block_id": 9_000, "offset": 0 }))].into_iter().collect();
+        let mut old = std::collections::HashMap::new();
+        old.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(legacy));
+        assert_eq!(parse_watermark_from_json(&old, 1, "any_proj", "otel_logs_and_spans"), vec![None]);
     }
 
     /// All-None watermark serializes to an empty object, which
@@ -8382,10 +8444,10 @@ mod tests {
     #[test]
     fn watermark_all_none_omits_metadata() {
         let wm: crate::buffered_write_layer::DeltaWatermark = vec![None, None, None];
-        assert!(serialize_watermark_to_json(&wm).is_empty());
+        assert!(serialize_watermark_to_json(&wm, "p", "t").is_empty());
         let mut info = std::collections::HashMap::new();
         info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(serde_json::Map::new()));
-        assert!(parse_watermark_from_json(&info, 3).iter().all(|p| p.is_none()));
+        assert!(parse_watermark_from_json(&info, 3, "p", "t").iter().all(|p| p.is_none()));
     }
 
     /// Per-shard MAX across commits: a shard's position is whichever commit
@@ -8397,6 +8459,8 @@ mod tests {
         let mk_info = |entries: &[(usize, u64, u64)]| {
             let map: serde_json::Map<String, serde_json::Value> =
                 entries.iter().map(|(s, b, o)| (s.to_string(), serde_json::json!({ "block_id": b, "offset": o }))).collect();
+            let mut map = map;
+            map.insert(WATERMARK_TOPIC_KEY.to_string(), serde_json::Value::String(wal_topic("p", "t")));
             let mut info = std::collections::HashMap::new();
             info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(map));
             info
@@ -8410,7 +8474,7 @@ mod tests {
         // Commit D: shard 1 at (5, 30) — BEHIND A on shard 1; must lose to A
         let d = mk_info(&[(1, 5, 30)]);
 
-        let max = max_watermark_across_commits([&a, &b, &c, &d], 3);
+        let max = max_watermark_across_commits([&a, &b, &c, &d], 3, "p", "t");
         assert_eq!(max[0], Some(WalPosition { block_id: 6, offset: 0 }));
         assert_eq!(max[1], Some(WalPosition { block_id: 5, offset: 50 }));
         assert_eq!(max[2], None, "shard 2 unwritten by all commits stays None");
@@ -8425,12 +8489,13 @@ mod tests {
         info.insert(
             WAL_WATERMARK_KEY.to_string(),
             serde_json::json!({
+                "topic": "p:t",
                 "0": {"block_id": 1, "offset": 10},
                 "99": {"block_id": 1, "offset": 999},
                 "garbage": {"block_id": 1, "offset": 0},
             }),
         );
-        let parsed = parse_watermark_from_json(&info, 4);
+        let parsed = parse_watermark_from_json(&info, 4, "p", "t");
         assert_eq!(parsed[0], Some(walrus_rust::WalPosition { block_id: 1, offset: 10 }));
         assert!(parsed[1..].iter().all(|p| p.is_none()));
     }
