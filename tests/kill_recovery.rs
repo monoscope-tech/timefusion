@@ -183,7 +183,13 @@ impl Tf {
     }
 
     async fn wait_ready(&self) -> Result<()> {
-        for _ in 0..600 {
+        // 60s was enough locally but not on CI, where four test shards, MinIO
+        // and a debug-build TimeFusion contend for one runner: shard 2 failed at
+        // 63.8s having spawned fine. Boot here is dominated by Delta/MinIO
+        // round-trips, so wait generously — a real failure to start still fails,
+        // just later.
+        let attempts = if std::env::var_os("CI").is_some() { 3000 } else { 600 };
+        for _ in 0..attempts {
             if port_open(&format!("127.0.0.1:{}", self.port)).await && self.connect().await.is_ok() {
                 return Ok(());
             }
@@ -344,9 +350,10 @@ async fn acked_rows_survive_sigkill_under_memory_pressure() -> Result<()> {
     // server ACKED are the ones that must survive.
     let mut acked = 0usize;
     for round in 0..40 {
-        match insert_rows(&client, PROJECT, &format!("p{round}"), 500, ts).await {
-            Ok(()) => acked += 500,
-            Err(_) => {} // explicit backpressure — producer's DLQ handles it
+        // An Err here is explicit backpressure, which the producer DLQs — only
+        // acked rows carry a durability promise.
+        if insert_rows(&client, PROJECT, &format!("p{round}"), 500, ts).await.is_ok() {
+            acked += 500;
         }
     }
     assert!(acked > 0, "every insert was rejected; test proves nothing");

@@ -106,6 +106,40 @@ only a problem if the ledger *also* carries the static pool budget as reserved �
 Greedy by default and has a FairSpill-starved-ingest history (2026-05-28), so do
 not let the wrapper quietly re-import FairSpill semantics.
 
+### MEASURED: parquet decode heap in prod (2026-07-27, `component='scan_decode'`)
+
+Step 3 of the rollout (accounting-only) shipped in `fc8007d` and answered the
+sizing question the rest of this document was guessing at. Read from
+`timefusion_stats` after ~40 minutes of live traffic:
+
+| metric | 09:52 (quiet) | 10:20 (busy) |
+|---|---|---|
+| `bytes_total` | 5.2 GB | **254.5 GB** |
+| `peak_batch_bytes` | 1.26 MB | **145.8 MB** |
+| `polls_inflight_peak` | 1 | **6** (of 16 permits) |
+| `worst_case_heap_mb` | 1.2 | **834** |
+
+Conclusions, which change the plan:
+
+- **A single decoded batch reached 145.8 MB** — 115× the quiet-period figure. So
+  decode memory is driven by batch *size*, not just concurrency, and any
+  per-stream estimate calibrated in a quiet window is ~100× low.
+- **Observed worst case is ~834 MB**, and the ceiling at full gate saturation is
+  `145.8 MB × 16 ≈ 2.3 GB` — not the tens of GB feared. **A Transient budget of
+  ~3 GB covers decode at the current `MAX_CONCURRENT_SCAN_READERS=16`.**
+- That reconciles with the 2026-07-20 OOM: at the 48-way concurrency of the time,
+  `145.8 MB × 48 ≈ 7 GB`, which alone exceeds this box's ~8.7 GB of slack. So
+  `GatedScanExec`'s cap of 16 is what currently keeps decode survivable, and the
+  gate — not a ledger — is doing the real work today.
+- Throughput is ~6.7 GB/min of decoded Arrow, so the *cumulative* counter is a
+  churn signal, not a memory signal; only the peak product bounds heap.
+
+**Implication for Part 1:** decode no longer needs to lead the ledger for
+*safety* — it is already bounded by the semaphore. It should still be charged so
+the budget is honest, but the unbounded consumers (DML coalescer queue, DML
+mem-legs, maintenance `collect()`) are now the higher-risk entries, since nothing
+caps them at all.
+
 **The `Transient` ledger is the single highest-value piece of this whole
 document** — and per review it must lead with the consumer that actually killed
 prod. Ordered by demonstrated blast radius:
