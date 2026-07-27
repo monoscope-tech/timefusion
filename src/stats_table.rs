@@ -235,6 +235,16 @@ impl StatsTableProvider {
             let fr_hits = m.fast_resolve_hits.load(Relaxed);
             let fr_misses = m.fast_resolve_misses.load(Relaxed);
             let pct = |n: u64, d: u64| if d > 0 { n as f64 * 100.0 / d as f64 } else { 0.0 };
+            // Parquet decode heap — the largest consumer outside every budget.
+            // `peak_batch_bytes x polls_inflight_peak` bounds the worst-case
+            // concurrent decode heap, which is what a Transient budget must cover.
+            let dpeak = m.decode_peak_batch_bytes.load(Relaxed);
+            let dinflight_peak = m.decode_polls_inflight_peak.load(Relaxed);
+            rows.push(("scan_decode", "bytes_total".into(), m.decode_bytes_total.load(Relaxed).to_string()));
+            rows.push(("scan_decode", "peak_batch_bytes".into(), dpeak.to_string()));
+            rows.push(("scan_decode", "polls_inflight".into(), m.decode_polls_inflight.load(Relaxed).to_string()));
+            rows.push(("scan_decode", "polls_inflight_peak".into(), dinflight_peak.to_string()));
+            rows.push(("scan_decode", "worst_case_heap_mb".into(), format!("{:.1}", (dpeak * dinflight_peak) as f64 / (1024.0 * 1024.0))));
             rows.push(("scan", "total".into(), total.to_string()));
             rows.push(("scan", "skipped_delta".into(), skipped.to_string()));
             rows.push(("scan", "skipped_delta_pct".into(), format!("{:.1}", pct(skipped, total))));

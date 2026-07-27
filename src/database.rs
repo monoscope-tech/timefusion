@@ -131,9 +131,41 @@ pub struct ScanMetrics {
     /// see how much of the user-visible tail is outside the scan call.
     pub pgwire_total: std::sync::atomic::AtomicU64,
     pub pgwire_latency_buckets: [std::sync::atomic::AtomicU64; 32],
+    /// Parquet decode heap, measured at the `GatedScanExec` choke point.
+    ///
+    /// Decode is the one large consumer outside every budget — no DataFusion
+    /// pool tracks it (`config.rs` says so explicitly), so it draws purely on
+    /// whatever slack the configured budgets leave. On the prod box that slack
+    /// is ~12GB, and a single wide scan's 48-way decode has exceeded it
+    /// (2026-07-20). Nobody has ever had a number for it; these three make it
+    /// measurable before anything tries to *bound* it:
+    ///
+    /// `worst-case concurrent decode heap ≈ decode_peak_batch_bytes ×
+    /// decode_polls_inflight_peak`, which is the figure to size a Transient
+    /// budget from.
+    pub decode_bytes_total: std::sync::atomic::AtomicU64,
+    pub decode_peak_batch_bytes: std::sync::atomic::AtomicU64,
+    pub decode_polls_inflight: std::sync::atomic::AtomicU64,
+    pub decode_polls_inflight_peak: std::sync::atomic::AtomicU64,
 }
 
 impl ScanMetrics {
+    /// One gated decode entered: bump the in-flight gauge and its high-water
+    /// mark. Returns nothing — the caller pairs it with `decode_end`.
+    fn decode_begin(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = self.decode_polls_inflight.fetch_add(1, Relaxed) + 1;
+        self.decode_polls_inflight_peak.fetch_max(n, Relaxed);
+    }
+
+    /// One gated decode finished, having produced `bytes` of Arrow.
+    fn decode_end(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.decode_polls_inflight.fetch_sub(1, Relaxed);
+        self.decode_bytes_total.fetch_add(bytes, Relaxed);
+        self.decode_peak_batch_bytes.fetch_max(bytes, Relaxed);
+    }
+
     pub fn record_scan(&self, duration_us: u64, skipped_delta: bool, has_mem: bool, has_delta: bool, fast_resolve_hit: Option<bool>) {
         use std::sync::atomic::Ordering::Relaxed;
         self.scans_total.fetch_add(1, Relaxed);
@@ -7183,7 +7215,11 @@ impl ProjectRoutingTable {
     /// Wrap a wide Delta scan so its Parquet decoding draws from the shared
     /// `heavy_scan_sem`, bounding concurrent decode heap across all queries.
     fn gate_if_wide(&self, plan: Arc<dyn ExecutionPlan>, filters: &[Expr]) -> Arc<dyn ExecutionPlan> {
-        if self.is_wide_scan(filters) { Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone())) } else { plan }
+        if self.is_wide_scan(filters) {
+            Arc::new(GatedScanExec::new(plan, self.database.heavy_scan_sem.clone(), Some(self.database.scan_metrics.clone())))
+        } else {
+            plan
+        }
     }
 
     /// Wrap an execution plan with type coercion if the output schema doesn't match the target.
@@ -7343,12 +7379,14 @@ struct GatedScanExec {
     input: Arc<dyn ExecutionPlan>,
     sem: Arc<tokio::sync::Semaphore>,
     properties: Arc<PlanProperties>,
+    /// Decode accounting only — this operator never denies on memory.
+    metrics: Option<Arc<ScanMetrics>>,
 }
 
 impl GatedScanExec {
-    fn new(input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>) -> Self {
+    fn new(input: Arc<dyn ExecutionPlan>, sem: Arc<tokio::sync::Semaphore>, metrics: Option<Arc<ScanMetrics>>) -> Self {
         let properties = input.properties().clone();
-        Self { input, sem, properties }
+        Self { input, sem, properties, metrics }
     }
 }
 
@@ -7372,19 +7410,31 @@ impl ExecutionPlan for GatedScanExec {
         vec![&self.input]
     }
     fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(Self { input: children[0].clone(), sem: self.sem.clone(), properties: self.properties.clone() }))
+        Ok(Arc::new(Self { input: children[0].clone(), sem: self.sem.clone(), properties: self.properties.clone(), metrics: self.metrics.clone() }))
     }
     fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DFResult<SendableRecordBatchStream> {
         let inner = self.input.execute(partition, context)?;
         let schema = inner.schema();
         let sem = self.sem.clone();
+        let metrics = self.metrics.clone();
         // Hold a permit only across each `poll_next` (one batch decode), then
         // release so other partitions/queries can proceed — see type docs.
+        // The permit window is also exactly the decode window, which is what
+        // makes this the honest place to measure decode heap.
         let gated = futures::stream::unfold(inner, move |mut inner| {
             let sem = sem.clone();
+            let metrics = metrics.clone();
             async move {
                 let _permit = sem.acquire_owned().await.ok()?;
-                futures::StreamExt::next(&mut inner).await.map(|item| (item, inner))
+                if let Some(m) = &metrics {
+                    m.decode_begin();
+                }
+                let next = futures::StreamExt::next(&mut inner).await;
+                if let Some(m) = &metrics {
+                    // Size the decoded Arrow, not the compressed parquet.
+                    m.decode_end(next.as_ref().and_then(|r| r.as_ref().ok()).map_or(0, |b: &RecordBatch| b.get_array_memory_size() as u64));
+                }
+                next.map(|item| (item, inner))
             }
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, gated)))
@@ -8249,7 +8299,7 @@ mod tests {
         let partitions: Vec<Vec<RecordBatch>> =
             (0..8).map(|i| vec![RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![i]))]).unwrap()]).collect();
         let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, schema.clone(), None).unwrap())));
-        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(2))));
+        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(2)), None));
         let ctx = Arc::new(TaskContext::default());
         let mut streams: Vec<_> = (0..8).map(|p| gated.execute(p, ctx.clone()).unwrap()).collect();
         let firsts = tokio::time::timeout(std::time::Duration::from_secs(10), futures::future::join_all(streams.iter_mut().map(futures::StreamExt::next)))
@@ -8258,6 +8308,37 @@ mod tests {
         let mut vals: Vec<i32> = firsts.into_iter().map(|b| b.unwrap().unwrap().column(0).as_any().downcast_ref::<Int32Array>().unwrap().value(0)).collect();
         vals.sort();
         assert_eq!(vals, (0..8).collect::<Vec<_>>(), "every gated partition must yield its row");
+    }
+
+    /// Parquet decode is outside every DataFusion pool, so its heap has never
+    /// been measured — a single wide scan's decode exceeded the box's whole
+    /// slack on 2026-07-20. GatedScanExec's permit window IS the decode window,
+    /// so it can account decoded Arrow bytes there. Accounting only: it must
+    /// never refuse a batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gated_scan_exec_accounts_decoded_bytes() {
+        use arrow::array::Int32Array;
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+        use std::sync::atomic::Ordering::Relaxed;
+        let schema = Arc::new(ArrowSchema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from((0..512).collect::<Vec<i32>>()))]).unwrap();
+        let want = batch.get_array_memory_size() as u64;
+        let partitions = vec![vec![batch.clone(), batch.clone()]];
+        let src: Arc<dyn ExecutionPlan> = Arc::new(DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(&partitions, schema, None).unwrap())));
+
+        let metrics = Arc::new(ScanMetrics::default());
+        let gated = Arc::new(GatedScanExec::new(src, Arc::new(tokio::sync::Semaphore::new(4)), Some(metrics.clone())));
+        let mut stream = gated.execute(0, Arc::new(TaskContext::default())).unwrap();
+        let mut rows = 0;
+        while let Some(b) = futures::StreamExt::next(&mut stream).await {
+            rows += b.unwrap().num_rows();
+        }
+
+        assert_eq!(rows, 1024, "gating must not drop batches");
+        assert_eq!(metrics.decode_bytes_total.load(Relaxed), want * 2, "both decoded batches must be accounted");
+        assert_eq!(metrics.decode_peak_batch_bytes.load(Relaxed), want);
+        assert_eq!(metrics.decode_polls_inflight.load(Relaxed), 0, "in-flight gauge must return to zero");
+        assert_eq!(metrics.decode_polls_inflight_peak.load(Relaxed), 1, "one partition polled serially = peak 1");
     }
 
     /// spawn_cron_job must fire on the wall-clock schedule (regression: the
