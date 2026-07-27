@@ -129,7 +129,12 @@ impl Tf {
     async fn start(test_name: &str, opts: TfOpts) -> Result<Self> {
         let endpoint = ensure_minio().await?;
         let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let bucket = "timefusion-kill".to_string();
+        // Per-run bucket, not a shared one: the e2e/sqllogictest suites reset
+        // MinIO, which silently deletes buckets out from under a concurrent
+        // suite (see CLAUDE.md). A unique prefix does not protect against that;
+        // a unique bucket does. This is why CI's parallel shards saw these
+        // tests fail while they passed locally.
+        let bucket = format!("timefusion-kill-{id}");
         create_bucket(&endpoint, &bucket).await?;
         let prefix = format!("kill-{test_name}-{id}");
         let data_dir = std::env::temp_dir().join(format!("tf-kill-{test_name}-{id}"));
