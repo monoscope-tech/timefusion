@@ -692,6 +692,53 @@ fn serialize_watermark_to_json(
 /// Key inside the watermark object naming the topic that produced it.
 const WATERMARK_TOPIC_KEY: &str = "topic";
 
+/// Delete `datafusion-*` spill directories left behind by a previous process.
+///
+/// DataFusion's `DiskManager` removes its temp dirs on `Drop`, which a SIGKILL
+/// skips — so every OOM kill leaks that run's spill files. Prod had 205 orphans
+/// dating back 15 days: 133 GB in `maintenance_spill` plus 53 GB in
+/// `light_optimize_spill`, on the same volume as the WAL. A full disk means WAL
+/// appends fail, which is an outage plus write loss, so this is a durability
+/// concern rather than housekeeping.
+///
+/// Safe to run unconditionally at spill-env construction: it happens once per
+/// dir during startup, and the WAL dir flock guarantees we are the only
+/// TimeFusion process, so no live spill file can exist yet.
+fn reap_orphaned_spill_dirs(spill_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(spill_dir) else { return };
+    let (mut dirs, mut bytes) = (0u64, 0u64);
+    for e in entries.flatten() {
+        // DiskManager names them `datafusion-XXXXXX`; touch nothing else.
+        if !e.file_name().to_string_lossy().starts_with("datafusion-") {
+            continue;
+        }
+        let path = e.path();
+        let size = dir_size_bytes(&path);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                dirs += 1;
+                bytes += size;
+            }
+            Err(err) => warn!("spill reap: cannot remove {path:?}: {err}"),
+        }
+    }
+    if dirs > 0 {
+        info!("spill reap: removed {dirs} orphaned spill dir(s), {} MB freed from {spill_dir:?}", bytes / (1024 * 1024));
+    }
+}
+
+/// Recursive byte total, best-effort (unreadable entries count as 0).
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else { return 0 };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => dir_size_bytes(&e.path()),
+            _ => e.metadata().map_or(0, |m| m.len()),
+        })
+        .sum()
+}
+
 /// Logical WAL topic for a (project, table) — matches `wal.rs`'s topic naming.
 fn wal_topic(project_id: &str, table_name: &str) -> String {
     format!("{project_id}:{table_name}")
@@ -3443,6 +3490,7 @@ impl Database {
         };
         let spill_dir = self.config.core.timefusion_data_dir.join(spill_subdir);
         let _ = std::fs::create_dir_all(&spill_dir);
+        reap_orphaned_spill_dirs(&spill_dir);
         let disk = DiskManagerBuilder::default().with_mode(DiskManagerMode::Directories(vec![spill_dir]));
         Arc::new(
             RuntimeEnvBuilder::new()
@@ -8402,6 +8450,30 @@ mod tests {
         info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
         let parsed = parse_watermark_from_json(&info, wm.len(), "p", "t");
         assert_eq!(parsed, wm);
+    }
+
+    /// Orphaned `datafusion-*` spill dirs are reaped; anything else in the
+    /// spill dir is left alone. Prod leaked 186 GB this way because a SIGKILL
+    /// skips `DiskManager`'s Drop cleanup, and the volume is shared with the WAL.
+    #[test]
+    fn spill_reap_removes_only_datafusion_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let orphan = dir.path().join("datafusion-AbCdEf");
+        std::fs::create_dir_all(orphan.join("nested")).unwrap();
+        std::fs::write(orphan.join("nested").join("0.arrow"), vec![7u8; 2048]).unwrap();
+        let keep_dir = dir.path().join("something-else");
+        std::fs::create_dir_all(&keep_dir).unwrap();
+        let keep_file = dir.path().join("notes.txt");
+        std::fs::write(&keep_file, b"keep").unwrap();
+
+        assert_eq!(dir_size_bytes(&orphan), 2048);
+        reap_orphaned_spill_dirs(dir.path());
+
+        assert!(!orphan.exists(), "orphaned spill dir survived");
+        assert!(keep_dir.exists() && keep_file.exists(), "reaper touched unrelated entries");
+        // Idempotent / tolerant of an empty dir.
+        reap_orphaned_spill_dirs(dir.path());
+        reap_orphaned_spill_dirs(&dir.path().join("does-not-exist"));
     }
 
     /// On the unified table every default project commits to ONE Delta log, so

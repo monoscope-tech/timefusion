@@ -76,6 +76,26 @@ impl StatsTableProvider {
     fn snapshot_batch(&self) -> DFResult<RecordBatch> {
         let mut rows: Vec<(&'static str, String, String)> = Vec::with_capacity(16);
 
+        // Boot memory budget. `slack_mb` is the figure that matters: it is what
+        // absorbs allocation no budget tracks (parquet decode, walrus mmaps,
+        // tantivy, allocator overhead), and a small slack is how the box gets
+        // OOM-killed while every individual budget reads healthy.
+        if let Some(a) = crate::autotune::boot_budget_audit() {
+            for (k, v) in [
+                ("committed_mb", a.committed_mb),
+                ("warn_at_mb", a.warn_at_mb),
+                ("slack_mb", a.slack_mb()),
+                ("query_pool_mb", a.query_pool_mb),
+                ("mem_buffer_hard_mb", a.mem_buffer_hard_mb),
+                ("maintenance_pool_mb", a.maintenance_pool_mb),
+                ("foyer_mb", a.foyer_mb),
+                ("df_metadata_cache_mb", a.df_metadata_cache_mb),
+            ] {
+                rows.push(("budget", k.into(), v.to_string()));
+            }
+            rows.push(("budget", "oversubscribed".into(), a.oversubscribed().to_string()));
+        }
+
         if let Some(layer) = &self.layer {
             let s = layer.snapshot_stats();
             rows.push(("mem_buffer", "project_count".into(), s.mem_project_count.to_string()));

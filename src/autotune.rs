@@ -160,32 +160,101 @@ pub fn apply(config: &mut AppConfig) {
     // auto-derived split respects the ≈72% invariant by construction; this
     // checks the FINAL post-override sum and warns loudly — operators keep
     // authority, but the failure mode becomes visible instead of an OOM.
-    if let Some((reserved_mb, limit_mb)) = memory_oversubscription(config, total_ram_mb) {
-        tracing::warn!(
-            "Memory budget oversubscribed: TIMEFUSION_MEMORY_LIMIT_GB ({}GB) + TIMEFUSION_BUFFER_MAX_MEMORY_MB ({}MB) + \
-             TIMEFUSION_FOYER_MEMORY_MB ({}MB) + TIMEFUSION_FOYER_METADATA_MEMORY_MB ({}MB) = {}MB > {}MB ({}% of {}MB detected RAM) \
-             — expect OOM kills under load; lower one of these knobs",
-            config.memory.timefusion_memory_limit_gb,
-            config.buffer.timefusion_buffer_max_memory_mb,
-            config.cache.timefusion_foyer_memory_mb,
-            config.cache.timefusion_foyer_metadata_memory_mb,
-            reserved_mb,
-            limit_mb,
-            OVERSUB_WARN_PCT,
-            total_ram_mb
-        );
+    let audit = budget_audit(config, total_ram_mb);
+    let _ = BOOT_AUDIT.set(audit);
+    // Always emit the breakdown: "we fit" is the interesting case too, since
+    // the slack is what absorbs untracked allocation, and an operator tuning a
+    // knob needs the current split in front of them.
+    let msg = format!(
+        "bootstrap.phase=budget_audit committed_mb={} warn_at_mb={} slack_mb={} \
+         (query_pool={} mem_buffer_hard={} maintenance_pool={} foyer={} df_metadata_cache={}) ram_mb={total_ram_mb} — \
+         slack absorbs UNTRACKED allocation (parquet decode, walrus mmaps, tantivy, allocator overhead); one wide scan can \
+         exceed a small slack, which is how a box gets OOM-killed while every individual budget looks fine",
+        audit.committed_mb,
+        audit.warn_at_mb,
+        audit.warn_at_mb.saturating_sub(audit.committed_mb),
+        audit.query_pool_mb,
+        audit.mem_buffer_hard_mb,
+        audit.maintenance_pool_mb,
+        audit.foyer_mb,
+        audit.df_metadata_cache_mb,
+    );
+    // "We fit" is worth logging too: the slack figure is the operator's only
+    // view of how much room the untracked consumers actually have.
+    if audit.oversubscribed() {
+        tracing::warn!("{msg} — OVERSUBSCRIBED, expect OOM kills under load; lower one of these knobs");
+    } else {
+        info!("{msg}");
     }
 }
 
-/// Fix E (2026-07-08 plan): `Some((reserved_mb, limit_mb))` when the final
-/// (post-override) memory reservations exceed [`OVERSUB_WARN_PCT`] of RAM.
-fn memory_oversubscription(config: &AppConfig, total_ram_mb: usize) -> Option<(usize, usize)> {
-    let reserved_mb = config.memory.timefusion_memory_limit_gb * 1024
-        + config.buffer.timefusion_buffer_max_memory_mb
-        + config.cache.timefusion_foyer_memory_mb
-        + config.cache.timefusion_foyer_metadata_memory_mb;
-    let limit_mb = total_ram_mb * OVERSUB_WARN_PCT / 100;
-    (total_ram_mb > 0 && reserved_mb > limit_mb).then_some((reserved_mb, limit_mb))
+/// Every budget this process commits to, in MB. Sums to what the process can
+/// allocate *before* any untracked allocation (parquet decode, walrus mmaps,
+/// tantivy, jemalloc slack) — so `committed` well under the limit is the point,
+/// not `committed` merely fitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetAudit {
+    pub query_pool_mb: usize,
+    pub mem_buffer_hard_mb: usize,
+    pub maintenance_pool_mb: usize,
+    pub foyer_mb: usize,
+    pub df_metadata_cache_mb: usize,
+    pub committed_mb: usize,
+    pub warn_at_mb: usize,
+}
+
+impl BudgetAudit {
+    pub const fn oversubscribed(&self) -> bool {
+        self.committed_mb > self.warn_at_mb
+    }
+
+    pub const fn slack_mb(&self) -> usize {
+        self.warn_at_mb.saturating_sub(self.committed_mb)
+    }
+}
+
+/// The audit computed at startup, so `timefusion_stats` can report it without
+/// re-detecting RAM — a startup log line rotates away, but an operator
+/// diagnosing an OOM needs the committed-vs-slack split on demand.
+static BOOT_AUDIT: std::sync::OnceLock<BudgetAudit> = std::sync::OnceLock::new();
+
+pub fn boot_budget_audit() -> Option<&'static BudgetAudit> {
+    BOOT_AUDIT.get()
+}
+
+/// Sum the committed budgets against RAM.
+///
+/// The previous version undercounted by ~30GB on the prod box and so passed
+/// while the container was OOM-killed four times in nine hours. Four terms were
+/// wrong, each independently enough to hide a kill:
+///
+/// 1. **The maintenance pool was omitted entirely** — 24GB in prod.
+/// 2. **MemBuffer was counted at nominal**, but admission runs to a 120% hard
+///    ceiling (`HARD_LIMIT_HEADROOM_DIVISOR` in `buffered_write_layer`), so the
+///    largest consumer was understated by a fifth.
+/// 3. **`memory_fraction` was ignored**: the query pool is
+///    `limit × fraction` (see `Database::shared_runtime_env`), not `limit`.
+/// 4. **The DataFusion metadata cache was omitted.**
+///
+/// The light-optimize slice is deliberately NOT added: it is carved *out of*
+/// `maintenance_pool_bytes()`, so counting it again would double-count.
+pub fn budget_audit(config: &AppConfig, total_ram_mb: usize) -> BudgetAudit {
+    const MB: usize = 1024 * 1024;
+    // Mirrors the 120% admission ceiling in buffered_write_layer.
+    let mem_buffer_hard_mb = config.buffer.timefusion_buffer_max_memory_mb * 6 / 5;
+    let query_pool_mb = (config.memory.timefusion_memory_limit_gb as f64 * 1024.0 * config.memory.timefusion_memory_fraction) as usize;
+    let maintenance_pool_mb = config.memory.maintenance_pool_bytes() / MB;
+    let foyer_mb = config.cache.timefusion_foyer_memory_mb + config.cache.timefusion_foyer_metadata_memory_mb;
+    let df_metadata_cache_mb = config.cache.timefusion_df_metadata_cache_mb;
+    BudgetAudit {
+        query_pool_mb,
+        mem_buffer_hard_mb,
+        maintenance_pool_mb,
+        foyer_mb,
+        df_metadata_cache_mb,
+        committed_mb: query_pool_mb + mem_buffer_hard_mb + maintenance_pool_mb + foyer_mb + df_metadata_cache_mb,
+        warn_at_mb: total_ram_mb * OVERSUB_WARN_PCT / 100,
+    }
 }
 
 fn env_unset(name: &str) -> bool {
@@ -272,21 +341,49 @@ mod tests {
         let _ = buffer_before;
     }
 
+    /// The prod config that was OOM-killed four times in nine hours on
+    /// 2026-07-27 must audit as oversubscribed. The previous check passed it,
+    /// because it omitted the maintenance pool, counted MemBuffer at nominal
+    /// instead of its 120% admission ceiling, ignored `memory_fraction`, and
+    /// left out the DataFusion metadata cache.
     #[test]
-    fn oversubscribed_pinned_envs_are_flagged() {
+    fn budget_audit_flags_the_prod_config_that_was_oom_killed() {
         let mut cfg = AppConfig::default();
-        cfg.memory.timefusion_memory_limit_gb = 24; // 24576MB
-        cfg.buffer.timefusion_buffer_max_memory_mb = 8192;
-        cfg.cache.timefusion_foyer_memory_mb = 2048;
+        cfg.memory.timefusion_memory_limit_gb = 26;
+        cfg.memory.timefusion_memory_fraction = 0.75;
+        cfg.buffer.timefusion_buffer_max_memory_mb = 24000;
+        cfg.memory.timefusion_maintenance_pool_gb = 24;
+        cfg.cache.timefusion_foyer_memory_mb = 4048;
         cfg.cache.timefusion_foyer_metadata_memory_mb = 512;
-        // 35328MB reserved vs 32GB host → over the 85% line (27852MB).
-        let (reserved, limit) = memory_oversubscription(&cfg, 32 * 1024).expect("must flag oversubscription");
-        assert_eq!(reserved, 35328);
-        assert_eq!(limit, 27852);
-        // Same knobs on a 64GB host are fine.
-        assert_eq!(memory_oversubscription(&cfg, 64 * 1024), None);
-        // Unknown RAM (0) must not divide-by-zero or false-positive.
-        assert_eq!(memory_oversubscription(&cfg, 0), None);
+
+        // The container limit, not the 188GB host: this is what the kernel kills on.
+        let a = budget_audit(&cfg, 85 * 1024);
+        assert_eq!(a.query_pool_mb, 19968); // 26GB x 0.75 — fraction applied
+        assert_eq!(a.mem_buffer_hard_mb, 28800); // 24000 x 1.2 — the real ceiling
+        assert_eq!(a.maintenance_pool_mb, 24576); // was missing entirely
+        assert_eq!(a.foyer_mb, 4560);
+        assert_eq!(a.df_metadata_cache_mb, 512);
+        assert_eq!(a.committed_mb, 78416); // ~76.6 GiB committed
+        assert!(a.oversubscribed(), "prod config must be flagged: {a:?}");
+
+        // Every term must be counted — dropping any one of the four previously
+        // missing pieces would have to change the total.
+        assert_eq!(a.committed_mb, a.query_pool_mb + a.mem_buffer_hard_mb + a.maintenance_pool_mb + a.foyer_mb + a.df_metadata_cache_mb);
+    }
+
+    #[test]
+    fn budget_audit_passes_a_config_with_real_slack() {
+        let mut cfg = AppConfig::default();
+        cfg.memory.timefusion_memory_limit_gb = 8;
+        cfg.memory.timefusion_memory_fraction = 0.75;
+        cfg.buffer.timefusion_buffer_max_memory_mb = 4096;
+        cfg.memory.timefusion_maintenance_pool_gb = 8;
+        cfg.cache.timefusion_foyer_memory_mb = 1024;
+        cfg.cache.timefusion_foyer_metadata_memory_mb = 256;
+        assert!(!budget_audit(&cfg, 64 * 1024).oversubscribed());
+        // Unknown RAM (0) must not divide-by-zero; warn_at collapses to 0 so a
+        // non-zero commitment is flagged rather than silently passing.
+        assert_eq!(budget_audit(&cfg, 0).warn_at_mb, 0);
     }
 
     #[test]
