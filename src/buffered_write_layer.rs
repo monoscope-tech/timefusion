@@ -4177,6 +4177,59 @@ mod tests {
         assert!(layer.snapshot_stats().backpressure_engaged_total >= 1, "backpressure_engaged_total must record the over-limit event");
     }
 
+    /// Regression for the 2026-05-28 dual-write incident (#25, PR #26): memory
+    /// pressure with only *current-bucket* (not-yet-completed) data. Pre-fix,
+    /// the pressure path only flushed completed buckets, found nothing
+    /// flushable, and rejected the insert. The relief path must force-flush the
+    /// current bucket so inserts keep succeeding. Same over-limit setup as
+    /// `backpressure_flushes_instead_of_rejecting`, but rows carry *now*
+    /// timestamps so no bucket is ever "completed".
+    #[serial]
+    #[tokio::test]
+    async fn pressure_flushes_current_bucket() {
+        use arrow::{
+            array::{StringArray, TimestampMicrosecondArray},
+            datatypes::{DataType, Field, Schema, TimeUnit},
+        };
+
+        let dir = tempdir().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.core.timefusion_data_dir = dir.path().to_path_buf();
+        cfg.buffer.timefusion_buffer_max_memory_mb = 64; // floor → hard limit ~76.8MB
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        let cfg = Arc::new(cfg);
+
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let (project, table) = (format!("cb{test_id}"), format!("cb{test_id}"));
+
+        let mut layer = crate::test_utils::test_helpers::test_layer(cfg).unwrap();
+        layer.delta_write_callback = Some(Arc::new(move |_p, _t, _b, _wm| Box::pin(async move { Ok(Vec::new()) })));
+        let layer = Arc::new(layer);
+
+        // NOW timestamp → every row lands in the current (unsealed) bucket.
+        let now_ts = crate::clock::now_micros();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+            Field::new("payload", DataType::Utf8, false),
+        ]));
+        let rows = 30_000usize;
+        let make_batch = || {
+            let ts = TimestampMicrosecondArray::from(vec![now_ts; rows]);
+            let payload = StringArray::from(vec!["x".repeat(400); rows]); // ~12MB
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(ts), Arc::new(payload)]).unwrap()
+        };
+
+        // ~96MB cumulative into a ~76.8MB buffer with zero completed buckets:
+        // relief must force-flush the current bucket, never reject.
+        for i in 0..8 {
+            layer
+                .insert(&project, &table, vec![make_batch()])
+                .await
+                .unwrap_or_else(|e| panic!("insert {i} with only current-bucket data must succeed under pressure, got: {e}"));
+        }
+    }
+
     /// Build a layer with a no-op (always-succeed) Delta callback and an old-bucket
     /// batch maker, sharing the over-limit setup of the two decouple tests below.
     /// `backpressure_secs = 0` makes `reserve_with_backpressure` return immediately
