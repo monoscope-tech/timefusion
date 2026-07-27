@@ -89,6 +89,7 @@ impl StatsTableProvider {
                 ("mem_buffer_hard_mb", a.mem_buffer_hard_mb),
                 ("maintenance_pool_mb", a.maintenance_pool_mb),
                 ("foyer_mb", a.foyer_mb),
+                ("tantivy_peak_mb", a.tantivy_peak_mb),
                 ("df_metadata_cache_mb", a.df_metadata_cache_mb),
             ] {
                 rows.push(("budget", k.into(), v.to_string()));

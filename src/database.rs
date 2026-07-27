@@ -701,10 +701,25 @@ const WATERMARK_TOPIC_KEY: &str = "topic";
 /// appends fail, which is an outage plus write loss, so this is a durability
 /// concern rather than housekeeping.
 ///
-/// Safe to run unconditionally at spill-env construction: it happens once per
-/// dir during startup, and the WAL dir flock guarantees we are the only
-/// TimeFusion process, so no live spill file can exist yet.
+/// Safe despite the runtime env being built lazily (`get_or_init` on the first
+/// maintenance job, not at startup): each spill dir has exactly one owning
+/// runtime env, and the initializer runs once *before* that env exists, so
+/// nothing this process wrote can be present yet. Everything found belongs to a
+/// dead process — the WAL dir flock guarantees no second live TimeFusion.
+///
+/// Runs on a detached thread: prod's backlog was 186 GB across 205 dirs, and
+/// walking plus unlinking that inline would stall the maintenance job that
+/// happened to trigger initialization (and any caller blocked on the same
+/// `OnceCell`). Reclaiming a dead process's garbage is never urgent.
 fn reap_orphaned_spill_dirs(spill_dir: &std::path::Path) {
+    let dir = spill_dir.to_path_buf();
+    std::thread::Builder::new()
+        .name("spill-reap".into())
+        .spawn(move || reap_orphaned_spill_dirs_blocking(&dir))
+        .map_or_else(|e| warn!("spill reap: cannot spawn reaper for {spill_dir:?}: {e}"), |_| ());
+}
+
+fn reap_orphaned_spill_dirs_blocking(spill_dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(spill_dir) else { return };
     let (mut dirs, mut bytes) = (0u64, 0u64);
     for e in entries.flatten() {
@@ -8467,13 +8482,13 @@ mod tests {
         std::fs::write(&keep_file, b"keep").unwrap();
 
         assert_eq!(dir_size_bytes(&orphan), 2048);
-        reap_orphaned_spill_dirs(dir.path());
+        reap_orphaned_spill_dirs_blocking(dir.path());
 
         assert!(!orphan.exists(), "orphaned spill dir survived");
         assert!(keep_dir.exists() && keep_file.exists(), "reaper touched unrelated entries");
-        // Idempotent / tolerant of an empty dir.
-        reap_orphaned_spill_dirs(dir.path());
-        reap_orphaned_spill_dirs(&dir.path().join("does-not-exist"));
+        // Idempotent / tolerant of an empty or absent dir.
+        reap_orphaned_spill_dirs_blocking(dir.path());
+        reap_orphaned_spill_dirs_blocking(&dir.path().join("does-not-exist"));
     }
 
     /// On the unified table every default project commits to ONE Delta log, so

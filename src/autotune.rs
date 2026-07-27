@@ -13,6 +13,12 @@
 //!     reserved    ≈ 72% RAM, leaving headroom for Arrow scratch, walrus
 //!                  mmaps, tantivy, OS page cache.
 //!
+//! That remaining ~28% is not spare — it is the only budget parquet decode has
+//! (explicitly unpooled), alongside walrus mmaps and allocator slack. See
+//! [`budget_audit`], which sums what the process actually commits (including
+//! the maintenance pool and MemBuffer's 120% admission ceiling, both of which
+//! the previous check omitted) and warns when the remainder gets thin.
+//!
 //! Disk budget: foyer caches take up to 40% of free space on the data dir,
 //! capped at 500GB to avoid runaway on very large volumes.
 //!
@@ -30,9 +36,18 @@ const RAM_FRACTION_FOYER_META: f64 = 0.02;
 const DISK_FRACTION_FOYER: f64 = 0.40;
 const DISK_FRACTION_FOYER_META: f64 = 0.02;
 
-/// Warn when the final (post-override) sum of memory reservations exceeds
-/// this share of detected RAM — the counterpart of the ≈72% budget above.
-const OVERSUB_WARN_PCT: usize = 85;
+/// Warn when the final (post-override) sum of memory reservations exceeds this
+/// share of detected RAM — the counterpart of the ≈72% budget above.
+///
+/// Was 85%, which is *not* the counterpart of a 72% design target: it leaves
+/// only 15% for everything no budget tracks. Prod's real commitment audits at
+/// 83.5% of its 85 GiB container — passing the old line — while being
+/// OOM-killed four times in nine hours, because parquet decode alone
+/// (explicitly unpooled) can exceed a 12 GB remainder. 75% keeps a little
+/// tolerance over the documented 72% target while still flagging that config.
+/// Small hosts can exceed this via the 1 GiB maintenance-pool floor plus the
+/// df-metadata cache; that is a truthful warning, and it stays WARN-only.
+const OVERSUB_WARN_PCT: usize = 75;
 
 const MIN_QUERY_POOL_GB: usize = 1;
 const MAX_QUERY_POOL_GB: usize = 32;
@@ -167,7 +182,7 @@ pub fn apply(config: &mut AppConfig) {
     // knob needs the current split in front of them.
     let msg = format!(
         "bootstrap.phase=budget_audit committed_mb={} warn_at_mb={} slack_mb={} \
-         (query_pool={} mem_buffer_hard={} maintenance_pool={} foyer={} df_metadata_cache={}) ram_mb={total_ram_mb} — \
+         (query_pool={} mem_buffer_hard={} maintenance_pool={} foyer={} tantivy_peak={} df_metadata_cache={}) ram_mb={total_ram_mb} — \
          slack absorbs UNTRACKED allocation (parquet decode, walrus mmaps, tantivy, allocator overhead); one wide scan can \
          exceed a small slack, which is how a box gets OOM-killed while every individual budget looks fine",
         audit.committed_mb,
@@ -177,6 +192,7 @@ pub fn apply(config: &mut AppConfig) {
         audit.mem_buffer_hard_mb,
         audit.maintenance_pool_mb,
         audit.foyer_mb,
+        audit.tantivy_peak_mb,
         audit.df_metadata_cache_mb,
     );
     // "We fit" is worth logging too: the slack figure is the operator's only
@@ -198,6 +214,7 @@ pub struct BudgetAudit {
     pub mem_buffer_hard_mb: usize,
     pub maintenance_pool_mb: usize,
     pub foyer_mb: usize,
+    pub tantivy_peak_mb: usize,
     pub df_metadata_cache_mb: usize,
     pub committed_mb: usize,
     pub warn_at_mb: usize,
@@ -240,19 +257,27 @@ pub fn boot_budget_audit() -> Option<&'static BudgetAudit> {
 /// `maintenance_pool_bytes()`, so counting it again would double-count.
 pub fn budget_audit(config: &AppConfig, total_ram_mb: usize) -> BudgetAudit {
     const MB: usize = 1024 * 1024;
-    // Mirrors the 120% admission ceiling in buffered_write_layer.
-    let mem_buffer_hard_mb = config.buffer.timefusion_buffer_max_memory_mb * 6 / 5;
+    let foyer_mb = if config.cache.is_disabled() { 0 } else { (config.cache.memory_size_bytes() + config.cache.metadata_memory_size_bytes()) / MB };
+    // Peak tantivy writer heap: one writer per in-flight flush.
+    let tantivy_peak_mb =
+        if config.tantivy.indexed_tables().is_empty() { 0 } else { crate::tantivy_index::builder::WRITER_HEAP_BYTES * config.buffer.flush_parallelism() / MB };
+    // Mirror `BufferedWriteLayer::max_memory_bytes`: the configured knob is
+    // reduced by foyer + tantivy (which are counted separately below, so using
+    // the raw knob here would double-count them), then admission runs to a 120%
+    // hard ceiling (HARD_LIMIT_HEADROOM_DIVISOR).
+    let mem_buffer_budget_mb = config.buffer.max_memory_mb().saturating_sub(foyer_mb + tantivy_peak_mb).max(64);
+    let mem_buffer_hard_mb = mem_buffer_budget_mb * 6 / 5;
     let query_pool_mb = (config.memory.timefusion_memory_limit_gb as f64 * 1024.0 * config.memory.timefusion_memory_fraction) as usize;
     let maintenance_pool_mb = config.memory.maintenance_pool_bytes() / MB;
-    let foyer_mb = config.cache.timefusion_foyer_memory_mb + config.cache.timefusion_foyer_metadata_memory_mb;
     let df_metadata_cache_mb = config.cache.timefusion_df_metadata_cache_mb;
     BudgetAudit {
         query_pool_mb,
         mem_buffer_hard_mb,
         maintenance_pool_mb,
         foyer_mb,
+        tantivy_peak_mb,
         df_metadata_cache_mb,
-        committed_mb: query_pool_mb + mem_buffer_hard_mb + maintenance_pool_mb + foyer_mb + df_metadata_cache_mb,
+        committed_mb: query_pool_mb + mem_buffer_hard_mb + maintenance_pool_mb + foyer_mb + tantivy_peak_mb + df_metadata_cache_mb,
         warn_at_mb: total_ram_mb * OVERSUB_WARN_PCT / 100,
     }
 }
@@ -359,16 +384,20 @@ mod tests {
         // The container limit, not the 188GB host: this is what the kernel kills on.
         let a = budget_audit(&cfg, 85 * 1024);
         assert_eq!(a.query_pool_mb, 19968); // 26GB x 0.75 — fraction applied
-        assert_eq!(a.mem_buffer_hard_mb, 28800); // 24000 x 1.2 — the real ceiling
         assert_eq!(a.maintenance_pool_mb, 24576); // was missing entirely
         assert_eq!(a.foyer_mb, 4560);
         assert_eq!(a.df_metadata_cache_mb, 512);
-        assert_eq!(a.committed_mb, 78416); // ~76.6 GiB committed
-        assert!(a.oversubscribed(), "prod config must be flagged: {a:?}");
+        // MemBuffer's ceiling is on its EFFECTIVE budget (knob − foyer −
+        // tantivy peak), then x1.2 — not the raw knob, which would count foyer
+        // twice since it is summed separately.
+        let effective = 24000 - a.foyer_mb - a.tantivy_peak_mb;
+        assert_eq!(a.mem_buffer_hard_mb, effective * 6 / 5);
 
-        // Every term must be counted — dropping any one of the four previously
-        // missing pieces would have to change the total.
-        assert_eq!(a.committed_mb, a.query_pool_mb + a.mem_buffer_hard_mb + a.maintenance_pool_mb + a.foyer_mb + a.df_metadata_cache_mb);
+        assert_eq!(a.committed_mb, a.query_pool_mb + a.mem_buffer_hard_mb + a.maintenance_pool_mb + a.foyer_mb + a.tantivy_peak_mb + a.df_metadata_cache_mb);
+        // ~71 GiB of an 85 GiB container: under the OLD 85% line, which is why
+        // the box could be killed four times while the check stayed silent.
+        assert!(a.committed_mb > 85 * 1024 * 80 / 100, "expected >80% committed, got {a:?}");
+        assert!(a.oversubscribed(), "prod config must be flagged: {a:?}");
     }
 
     #[test]
