@@ -625,7 +625,10 @@ impl DmlCoalescer {
             drain_notify: Notify::new(),
             drain_lock: tokio::sync::Mutex::new(()),
             // try_config: unit tests construct a coalescer without init_config.
-            quarantine_dir: crate::config::try_config().map_or_else(|| std::path::PathBuf::from("./data/wal"), |c| c.core.wal_dir()).join("quarantine/dml"),
+            quarantine_dir: crate::config::try_config()
+                .map_or_else(|| std::path::PathBuf::from("./data/wal"), |c| c.core.wal_dir())
+                .join(crate::wal::QUARANTINE_DIR_NAME)
+                .join("dml"),
         }
     }
 

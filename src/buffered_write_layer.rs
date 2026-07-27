@@ -1004,7 +1004,7 @@ impl BufferedWriteLayer {
         let (mut delete_nanos, mut update_nanos) = (0u128, 0u128);
         let mem_buffer = &self.mem_buffer;
 
-        let quarantine_dir = self.wal.data_dir().join("quarantine");
+        let quarantine_dir = self.wal.data_dir().join(crate::wal::QUARANTINE_DIR_NAME);
         // Entries whose quarantine copy failed to persist still exist ONLY in
         // the WAL — recovery must not park past them / drop the marker.
         let quarantine_failures = AtomicU64::new(0u64);

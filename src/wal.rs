@@ -1439,6 +1439,10 @@ pub fn boot_wal_gc(wal_dir: &std::path::Path, max_age: std::time::Duration) {
 /// move to position-based deletability (file deletable iff every entry ≤
 /// every shard's persisted cursor).
 const GC_FLOOR_SLACK_MICROS: i64 = 10 * 60 * 1_000_000;
+/// Directory under the WAL dir holding quarantined payloads (WAL entries that
+/// failed to decode, DML groups that exhausted their drains). Exempt from
+/// [`gc_wal_files`]: these bytes are the only remaining copy of that data.
+pub(crate) const QUARANTINE_DIR_NAME: &str = "quarantine";
 
 /// Delete WAL files older than `max_age` by mtime, recursing into subdirs.
 /// Skips dotfiles/dotdirs (`.timefusion_meta/`).
@@ -1491,6 +1495,16 @@ pub fn gc_wal_files(wal_dir: &std::path::Path, max_age: std::time::Duration, unf
                 Err(_) => continue,
             };
             if meta.is_dir() {
+                // Never recurse into quarantine. This walk deletes by mtime with
+                // no name filter, and quarantined bytes are the ONLY copy of
+                // data parked for a human to re-drive — a 78MB DML group parked
+                // at 08:11 on 2026-07-27 was gone by 08:48, and the WAL
+                // quarantine had been self-emptying the same way. GC reclaims
+                // WAL segments, never parked user data. (Growth here is
+                // deliberate: it is the loss-canary an operator watches.)
+                if name.eq_ignore_ascii_case(QUARANTINE_DIR_NAME) {
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }
@@ -2157,6 +2171,36 @@ mod tests {
         assert!(!f1.exists() && !f2.exists());
         assert!(root.join(".timefusion_meta/cursor_snapshot.json").exists(), "meta dir must be skipped");
         assert!(root.join(".timefusion_meta/topics").exists());
+    }
+
+    /// Regression: prod 2026-07-27. The GC walk recurses the whole WAL dir and
+    /// deletes ANY file past the age cutoff with no name filter, so it also ate
+    /// `quarantine/`. Observed live: a DML group parked at 08:11 (78MB Arrow +
+    /// .meta) was gone by 08:48 — the quarantine promise of "recoverable" was
+    /// void, and the pre-existing WAL quarantine had been self-emptying the same
+    /// way. Quarantined bytes are the ONLY copy of that data; GC reclaims WAL
+    /// segments, never user data parked for a human.
+    #[test]
+    fn gc_wal_files_never_deletes_quarantined_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("quarantine/dml")).unwrap();
+        let wal_seg = root.join("1779989695814");
+        let parked_wal = root.join("quarantine/1779989695814_insert_corrupt_p__t.bin");
+        let parked_dml = root.join("quarantine/dml/1785139919343391_abc_p__t.arrow");
+        let parked_meta = root.join("quarantine/dml/1785139919343391_abc_p__t.meta");
+        for p in [&wal_seg, &parked_wal, &parked_dml, &parked_meta] {
+            std::fs::write(p, vec![0u8; 256]).unwrap();
+        }
+
+        // max_age=0 ⇒ everything is past the cutoff. The WAL segment goes; the
+        // quarantined payloads must not.
+        let (deleted, _) = gc_wal_files(root, std::time::Duration::ZERO, None).unwrap();
+        assert_eq!(deleted, 1, "only the WAL segment should be reclaimed");
+        assert!(!wal_seg.exists());
+        assert!(parked_wal.exists(), "WAL quarantine payload deleted by GC");
+        assert!(parked_dml.exists(), "DML quarantine payload deleted by GC");
+        assert!(parked_meta.exists(), "DML quarantine sidecar deleted by GC");
     }
 
     /// Regression: prod 2026-07-08. GC deleted files purely by mtime,
