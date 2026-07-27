@@ -521,7 +521,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     println!("compacting {} partition(s) of '{}' ({})", dates.len(), table, scope);
     let (mut tot_r, mut tot_a) = (0u64, 0u64);
     for d in &dates {
-        match db.compact_date(&table_ref, &table, *d).await {
+        match db.compact_date(&table_ref, &table, *d, None).await {
             Ok((r, a)) => {
                 tot_r += r;
                 tot_a += a;

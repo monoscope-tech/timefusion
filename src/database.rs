@@ -4544,8 +4544,10 @@ impl Database {
     /// (the daily cold sweep uses `consolidate_date_binned` for event-time
     /// disjoint runs). Target size scales with partition age
     /// (`optimize_target_for_date`). Commits once; returns (removed, added).
-    pub async fn compact_date(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate) -> Result<(u64, u64)> {
-        self.compact_date_with(table_ref, table_name, date, self.config.maintenance.timefusion_optimize_max_concurrent_tasks).await
+    pub async fn compact_date(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, project_id: Option<&str>,
+    ) -> Result<(u64, u64)> {
+        self.compact_date_with(table_ref, table_name, date, project_id, self.config.maintenance.timefusion_optimize_max_concurrent_tasks).await
     }
 
     /// `compact_date` with an explicit merge concurrency. The cold consolidation
@@ -4554,11 +4556,17 @@ impl Database {
     /// (the off-box recipe uses concurrency 1 for the same reason). The on-demand
     /// pgwire/CLI callers keep the configured concurrency.
     async fn compact_date_with(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, max_concurrent: usize,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, project_id: Option<&str>, max_concurrent: usize,
     ) -> Result<(u64, u64)> {
         let target_size = self.optimize_target_for_date(date);
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        let partition_filters = vec![PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?];
+        let mut partition_filters = vec![PartitionFilter::try_from(("date", "=", date.to_string().as_str()))?];
+        // Scope to one tenant when asked: a whole date spans every project's
+        // files (tens of GB on a busy day — doesn't fit in-process), one
+        // (project, date) partition is a few GB.
+        if let Some(pid) = project_id {
+            partition_filters.push(PartitionFilter::try_from(("project_id", "=", pid))?);
+        }
         // Old-event-time backlog data still lands in recent-old partitions, so a
         // concurrent flush/dedup can delete files mid-merge → Serializable OCC
         // conflict at commit (the merge read now-removed files). Refresh the

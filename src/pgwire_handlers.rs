@@ -213,8 +213,8 @@ impl LoggingSimpleQueryHandler {
             None => return Err(admin_err("OPTIMIZE is not available on this server")),
         };
         let table_ref = db.get_or_create_unified_table(&cmd.table).await.map_err(|e| admin_err(&format!("OPTIMIZE: open table '{}': {e}", cmd.table)))?;
-        let (removed, added) = db.compact_date(&table_ref, &cmd.table, cmd.date).await.map_err(|e| admin_err(&e.to_string()))?;
-        info!("pgwire OPTIMIZE {} date={}: {removed} removed, {added} added", cmd.table, cmd.date);
+        let (removed, added) = db.compact_date(&table_ref, &cmd.table, cmd.date, cmd.project_id.as_deref()).await.map_err(|e| admin_err(&e.to_string()))?;
+        info!("pgwire OPTIMIZE {} date={} project={:?}: {removed} removed, {added} added", cmd.table, cmd.date, cmd.project_id);
         Ok(vec![Response::Execution(Tag::new(&format!("OPTIMIZE {removed} {added}")))])
     }
 
@@ -273,6 +273,11 @@ impl LoggingSimpleQueryHandler {
 pub(crate) struct OptimizeCmd {
     pub table: String,
     pub date: chrono::NaiveDate,
+    /// Restrict the compaction to one tenant's partition. A whole-date
+    /// optimize spans every project's files for that date — tens of GB on a
+    /// busy day, which doesn't fit in-process next to serving load
+    /// (2026-07-27: two OOMs). One (project, date) partition is a few GB.
+    pub project_id: Option<String>,
 }
 
 fn admin_err(msg: &str) -> PgWireError {
@@ -304,13 +309,45 @@ pub(crate) fn parse_optimize(query: &str) -> Result<Option<OptimizeCmd>, String>
             "OPTIMIZE {table} needs a date filter: OPTIMIZE {table} WHERE date = 'YYYY-MM-DD' (bare OPTIMIZE is disabled — it would compact all history in-process)"
         ));
     }
-    let cond = where_part[5..].trim(); // after WHERE
-    if !cond.to_ascii_lowercase().starts_with("date") {
-        return Err("OPTIMIZE only supports a single `date` filter".to_string());
+    // `WHERE date = '...'` optionally AND-ed (either order) with
+    // `project_id = '...'`.
+    let mut date = None;
+    let mut project_id = None;
+    for cond in split_and(where_part[5..].trim()) {
+        let cond = cond.trim();
+        let lower_cond = cond.to_ascii_lowercase();
+        let (col, len) = if lower_cond.starts_with("project_id") {
+            ("project_id", 10)
+        } else if lower_cond.starts_with("date") {
+            ("date", 4)
+        } else {
+            return Err("OPTIMIZE supports only `date` and `project_id` filters".to_string());
+        };
+        let val = cond[len..].trim().strip_prefix('=').ok_or("expected: <col> = '<value>'")?.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+        match col {
+            "date" => date = Some(val.parse::<chrono::NaiveDate>().map_err(|_| format!("invalid date '{val}', expected YYYY-MM-DD"))?),
+            _ => project_id = Some(val.to_string()),
+        }
     }
-    let val = cond[4..].trim().strip_prefix('=').ok_or("expected: date = 'YYYY-MM-DD'")?.trim().trim_matches(|c| c == '\'' || c == '"').trim();
-    let date = val.parse::<chrono::NaiveDate>().map_err(|_| format!("invalid date '{val}', expected YYYY-MM-DD"))?;
-    Ok(Some(OptimizeCmd { table: table.to_string(), date }))
+    let date = date.ok_or("OPTIMIZE requires a date filter: WHERE date = 'YYYY-MM-DD'")?;
+    Ok(Some(OptimizeCmd { table: table.to_string(), date, project_id }))
+}
+
+/// Split a WHERE tail on top-level ` AND ` (case-insensitive). Values are
+/// simple quoted literals, so no nesting to worry about.
+fn split_and(s: &str) -> Vec<&str> {
+    let lower = s.to_ascii_lowercase();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut search = 0;
+    while let Some(i) = lower[search..].find(" and ") {
+        let at = search + i;
+        parts.push(&s[start..at]);
+        start = at + 5;
+        search = start;
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 /// An intercepted `VACUUM <table> [RETAIN <n> HOURS]` admin command.
@@ -661,9 +698,22 @@ mod tests {
         // Bare OPTIMIZE (no date) is rejected — would compact all history in-process.
         assert!(parse_optimize("OPTIMIZE otel_logs_and_spans").is_err());
         assert!(parse_optimize("OPTIMIZE").is_err());
-        // Non-date filter, bad date.
+        // project_id alone (no date bound), bad date, unknown column.
         assert!(parse_optimize("OPTIMIZE t WHERE project_id = 'x'").is_err());
         assert!(parse_optimize("OPTIMIZE t WHERE date = 'not-a-date'").is_err());
+        assert!(parse_optimize("OPTIMIZE t WHERE date = '2026-01-02' AND name = 'x'").is_err());
+    }
+
+    /// Tenant-scoped compaction (2026-07-27: whole-date OPTIMIZE OOM'd twice
+    /// in-process; one (project, date) partition is the safe unit).
+    #[test]
+    fn optimize_accepts_project_and_date_in_either_order() {
+        let cmd = parse_optimize("OPTIMIZE t WHERE project_id = 'p-1' AND date = '2026-01-02'").unwrap().unwrap();
+        assert_eq!(cmd.project_id.as_deref(), Some("p-1"));
+        assert_eq!(cmd.date, "2026-01-02".parse().unwrap());
+        let cmd = parse_optimize("optimize t where date='2026-01-02' and PROJECT_ID=\"p-1\"").unwrap().unwrap();
+        assert_eq!(cmd.project_id.as_deref(), Some("p-1"));
+        assert!(parse_optimize("OPTIMIZE t WHERE date = '2026-01-02'").unwrap().unwrap().project_id.is_none());
     }
 
     #[test]
