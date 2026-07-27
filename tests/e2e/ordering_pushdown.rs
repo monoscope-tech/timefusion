@@ -99,7 +99,7 @@ async fn optimized_partition_still_advertises_desc_ordering() -> anyhow::Result<
     // Compact the partition → SortBy rewrite (globally sorted, honest DESC footer).
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap().date_naive();
     let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
-    let (removed, added) = env.db().compact_date(&table_ref, "otel_logs_and_spans", date).await?;
+    let (removed, added) = env.db().compact_date(&table_ref, "otel_logs_and_spans", date, None).await?;
     assert!(removed >= 1 && added >= 1, "compaction should have rewritten files (removed={removed}, added={added})");
 
     // Fresh rows into MemBuffer so the query spans MemBuffer ∪ (optimized) Delta.

@@ -66,7 +66,7 @@ async fn recent_window_prunes_within_compacted_file() -> anyhow::Result<()> {
     // Compact → one timestamp-DESC-sorted file, one row group, ~12 pages.
     let date = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(FROZEN_START_MICROS).unwrap().date_naive();
     let table_ref = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?;
-    let (removed, added) = env.db().compact_date(&table_ref, "otel_logs_and_spans", date).await?;
+    let (removed, added) = env.db().compact_date(&table_ref, "otel_logs_and_spans", date, None).await?;
     assert!(removed >= 2 && added >= 1, "compaction should merge files (removed={removed}, added={added})");
 
     // Narrow trailing window: newest ~50 rows (last ~50s of the 600s span).

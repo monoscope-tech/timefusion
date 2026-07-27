@@ -438,3 +438,95 @@ async fn coalesced_enrichment_folds_across_projects_into_one_merge() -> anyhow::
     assert_eq!(merges, 1, "expected ONE folded merge for {} same-shape project groups, got {merges}", projects.len());
     Ok(())
 }
+
+/// 2026-07-27 incident reproduction: rows APPENDED WHILE A DV MERGE IS IN
+/// FLIGHT must survive the merge's commit.
+///
+/// `3c9a6aa` made coalesced DV merges commit with
+/// `with_tolerate_concurrent_appends`: instead of aborting when a flush commit
+/// wins the OCC race, the merge rebases over the winning AddFile-only commit.
+/// Its soundness argument is:
+///
+///   "the mem leg runs before every Delta leg, so concurrently flushed rows
+///    already carry post-DML values"
+///
+/// That holds only for rows already in MemBuffer when the mem leg ran. A row
+/// INSERTed after the mem leg and flushed before the merge commits is an
+/// AddFile the merge now tolerates — but the merge's rewritten file set was
+/// computed from a snapshot that predates it. If the rebase reconciles by
+/// replacing state rather than layering onto it, that row is silently removed
+/// from Delta: no error, no DLQ, the producer was already acked. That is
+/// exactly the prod signature — 9 minutes of acked, committed rows absent with
+/// zero failure signal anywhere in the pipeline.
+///
+/// Loops the interleaving: the race window is the merge's metadata scan, so a
+/// single pass can miss it while a handful reliably lands in it.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn append_during_dv_merge_is_not_dropped() -> anyhow::Result<()> {
+    let env = E2eEnv::builder()
+        .with_deletion_vectors()
+        .with_dml_merge_key_prune(true)
+        .with_dml_coalesce_secs(60) // defer the Delta leg so we control when it runs
+        .with_bucket_duration(Duration::from_secs(60))
+        .start()
+        .await?;
+    let client = env.pg_client().await?;
+
+    const ROUNDS: usize = 5;
+    const BASE_ROWS: usize = 40;
+
+    let mut expected = 0usize;
+    for round in 0..ROUNDS {
+        // (1) Baseline rows, flushed to Delta so the enrichment rides the
+        //     deferred Delta leg (merge-on-read DV rewrite) rather than MemBuffer.
+        for i in 0..BASE_ROWS {
+            let id = format!("base-{round}-{i}");
+            insert_span(&client, &id, &format!("span-{round}-{i}"), &format!("trace-{round}-{i}"), FROZEN_START_MICROS).await?;
+        }
+        expected += BASE_ROWS;
+        env.force_flush().await?;
+        env.force_evict().await?;
+
+        // (2) Queue an enrichment for the baseline rows; the coalescer holds the
+        //     Delta leg until we drain it.
+        for i in 0..BASE_ROWS {
+            enrich(&client, &format!("span-{round}-{i}"), &format!("trace-{round}-{i}"), &format!("TAG-{round}")).await?;
+        }
+
+        // (3) Run the merge and, concurrently, append + flush NEW rows so their
+        //     AddFile commit races the merge's commit — the tolerated-append path.
+        let drain = {
+            let db = std::sync::Arc::clone(env.db());
+            tokio::spawn(async move {
+                if let Some(c) = db.dml_coalescer() {
+                    c.drain(&db).await;
+                }
+            })
+        };
+
+        let late_client = env.pg_client().await?;
+        let mut late = 0usize;
+        for i in 0..10 {
+            let id = format!("late-{round}-{i}");
+            insert_span(&late_client, &id, &format!("lspan-{round}-{i}"), &format!("ltrace-{round}-{i}"), FROZEN_START_MICROS).await?;
+            late += 1;
+            // Force the append to become a Delta commit mid-merge.
+            let _ = env.force_flush().await;
+        }
+        expected += late;
+        drain.await?;
+
+        // (4) Nothing may have vanished. Count from Delta only.
+        env.force_flush().await?;
+        env.force_evict().await?;
+        let row = client.query_one("SELECT count(*) FROM otel_logs_and_spans WHERE project_id = 'e2e_project'", &[]).await?;
+        let got: i64 = row.get(0);
+        assert_eq!(
+            got, expected as i64,
+            "round {round}: ACKED ROWS VANISHED — expected {expected} rows after a DV merge raced concurrent appends, found {got}. \
+             A committed row was removed by the merge's rebase (tolerate_concurrent_appends)."
+        );
+    }
+    Ok(())
+}
