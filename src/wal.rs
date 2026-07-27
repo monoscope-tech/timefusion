@@ -1444,6 +1444,39 @@ const GC_FLOOR_SLACK_MICROS: i64 = 10 * 60 * 1_000_000;
 /// [`gc_wal_files`]: these bytes are the only remaining copy of that data.
 pub(crate) const QUARANTINE_DIR_NAME: &str = "quarantine";
 
+/// Recursive `(payload_files, total_bytes)` under `<wal_dir>/quarantine`.
+///
+/// Deliberately separate from [`WalManager::wal_stats`], which is flat and
+/// therefore blind to this subtree — that blindness is why parked data could be
+/// deleted for weeks without a single gauge moving. `payload_files` counts
+/// re-drivable items (`.bin` WAL entries, `.arrow` DML groups) and excludes
+/// `.meta` sidecars so the number reads as "items awaiting a human"; `bytes`
+/// bills everything on disk, since disk is what fills.
+///
+/// ALERT on payload_files > 0: quarantine growth is silent data loss deferred,
+/// not housekeeping.
+pub fn quarantine_stats(wal_dir: &std::path::Path) -> (usize, u64) {
+    let (mut files, mut bytes) = (0usize, 0u64);
+    let mut stack = vec![wal_dir.join(QUARANTINE_DIR_NAME)];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            bytes += meta.len();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".bin") || name.ends_with(".arrow") {
+                files += 1;
+            }
+        }
+    }
+    (files, bytes)
+}
+
 /// Delete WAL files older than `max_age` by mtime, recursing into subdirs.
 /// Skips dotfiles/dotdirs (`.timefusion_meta/`).
 ///
@@ -2171,6 +2204,33 @@ mod tests {
         assert!(!f1.exists() && !f2.exists());
         assert!(root.join(".timefusion_meta/cursor_snapshot.json").exists(), "meta dir must be skipped");
         assert!(root.join(".timefusion_meta/topics").exists());
+    }
+
+    /// Quarantined payloads are the only copy of data parked for a human, and
+    /// `wal_stats()` is flat — so before this they were invisible to every gauge
+    /// while `gc_wal_files` silently deleted them (2026-07-27). An operator needs
+    /// a number to alert on, and it must count BOTH the flat `quarantine/*.bin`
+    /// WAL entries and the nested `quarantine/dml/*` groups.
+    #[test]
+    fn quarantine_stats_counts_both_tiers_recursively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("quarantine/dml")).unwrap();
+        // A WAL segment outside quarantine must NOT be counted.
+        std::fs::write(root.join("1779989695814"), vec![0u8; 4096]).unwrap();
+        std::fs::write(root.join("quarantine/a_insert_corrupt.bin"), vec![0u8; 100]).unwrap();
+        std::fs::write(root.join("quarantine/dml/g.arrow"), vec![0u8; 250]).unwrap();
+        std::fs::write(root.join("quarantine/dml/g.meta"), vec![0u8; 50]).unwrap();
+
+        // Sidecars are metadata, not payloads: count payloads so the number
+        // means "parked items awaiting re-drive", but bill all bytes on disk.
+        let (files, bytes) = quarantine_stats(root);
+        assert_eq!(files, 2, "one .bin + one .arrow payload");
+        assert_eq!(bytes, 400, "all quarantine bytes incl. the .meta sidecar");
+
+        // Absent dir is the normal case and must be zero, not an error.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(quarantine_stats(empty.path()), (0, 0));
     }
 
     /// Regression: prod 2026-07-27. The GC walk recurses the whole WAL dir and

@@ -160,6 +160,10 @@ impl StatsTableProvider {
             rows.push(("wal", "files".into(), s.wal_files.to_string()));
             rows.push(("wal", "disk_bytes".into(), s.wal_disk_bytes.to_string()));
             rows.push(("wal", "disk_mb".into(), format!("{:.1}", s.wal_disk_bytes as f64 / (1024.0 * 1024.0))));
+            // Parked payloads: invisible to wal_disk_bytes (flat walk), which is
+            // how gc_wal_files deleted them unnoticed. ALERT if files > 0.
+            rows.push(("wal", "quarantine_files".into(), s.quarantine_files.to_string()));
+            rows.push(("wal", "quarantine_mb".into(), format!("{:.1}", s.quarantine_bytes as f64 / (1024.0 * 1024.0))));
             rows.push(("wal", "shards_per_topic".into(), s.wal_shards_per_topic.to_string()));
             rows.push(("wal", "known_topics".into(), s.wal_known_topics.to_string()));
         } else {

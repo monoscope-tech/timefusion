@@ -132,6 +132,11 @@ pub struct StatsSnapshot {
     pub pressure_pct: u32,
     pub wal_files: usize,
     pub wal_disk_bytes: u64,
+    /// Parked payloads awaiting a human re-drive. `wal_disk_bytes` is blind to
+    /// these (its walk is flat), which is how they were silently deleted for
+    /// weeks. Non-zero means deferred data loss — alert on it.
+    pub quarantine_files: usize,
+    pub quarantine_bytes: u64,
     pub wal_shards_per_topic: usize,
     pub wal_known_topics: usize,
     pub bucket_duration_micros: i64,
@@ -2469,6 +2474,7 @@ impl BufferedWriteLayer {
     pub fn snapshot_stats(&self) -> StatsSnapshot {
         let mem = self.mem_buffer.get_stats();
         let (wal_files, wal_bytes) = self.wal.wal_stats();
+        let (quarantine_files, quarantine_bytes) = crate::wal::quarantine_stats(self.wal.data_dir());
         let oldest_bucket_age_secs = mem.oldest_bucket_micros.map(|ts| {
             let now = crate::clock::now_micros();
             ((now - ts).max(0) / 1_000_000) as u64
@@ -2484,6 +2490,8 @@ impl BufferedWriteLayer {
             max_memory_bytes: self.max_memory_bytes(),
             pressure_pct: self.pressure_pct(),
             wal_files,
+            quarantine_files,
+            quarantine_bytes,
             wal_disk_bytes: wal_bytes,
             wal_shards_per_topic: self.wal.shards_per_topic(),
             wal_known_topics: self.wal.known_topic_count(),
