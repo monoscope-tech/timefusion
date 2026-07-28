@@ -62,6 +62,8 @@ counter_registry! {
     ingest_rows                => "timefusion.ingest.rows": "Rows accepted into MemBuffer",
     ingest_errors              => "timefusion.ingest.errors": "Ingest call failures",
     wal_corruption             => "timefusion.wal.corruption_events": "WAL entries that failed to deserialize or replay",
+    quarantine_redriven        => "timefusion.wal.quarantine_redriven": "Quarantined WAL payloads successfully re-ingested through the durable insert path at boot",
+    quarantine_backlog         => "timefusion.wal.quarantine_backlog_events": "Boot-time detections of a non-empty quarantine after re-drive — acked data is NOT in the store. PAGE if > 0",
     wal_gc_deleted_files       => "timefusion.wal.gc_deleted_files": "Stale WAL files reclaimed by the mtime reaper (walrus leaks files across restarts)",
     flush_completed            => "timefusion.flush.completed": "Flush cycles that committed to Delta",
     flush_failed               => "timefusion.flush.failed": "Flush cycles that errored",
@@ -299,6 +301,8 @@ macro_rules! simple_recorders {
 
 simple_recorders! {
     record_wal_corruption => wal_corruption,
+    record_quarantine_redriven => quarantine_redriven,
+    record_quarantine_backlog => quarantine_backlog,
     record_query => query_executions,
     record_tantivy_prefilter_attempt => tantivy_prefilter_attempts,
     record_tantivy_prefilter_used => tantivy_prefilter_used,

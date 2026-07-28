@@ -285,9 +285,18 @@ write before fsync). Behavior:
 - Recovery continues with subsequent entries.
 - `wal_corruption_threshold` (default 10) caps tolerance — exceeding it
   fails recovery hard and the process exits.
+- At the end of recovery, boot **re-drives** every flat `*.bin` Insert
+  payload back through the durable insert path (WAL append + MemBuffer).
+  Successes move to `quarantine/redriven/` (forensic copies, excluded
+  from the alert count). What remains is loss-pending: boot emits an
+  `ALERT:` error log plus the `timefusion.wal.quarantine_backlog_events`
+  metric — page on either.
 
-Mitigation: copy quarantine files off-host for forensic analysis,
-then delete (they're not source-of-truth). Set
+Mitigation for what remains parked (torn-tail `insert_corrupt` payloads
+and `dml/` groups can't self-re-drive): copy the files off-host for
+forensic analysis; re-drive the data from the producer's Kafka/DLQ copy
+if retention still holds it. Only delete quarantine files after the data
+is confirmed present in the store. Set
 `TIMEFUSION_WAL_CORRUPTION_THRESHOLD=1` if you want fail-fast.
 
 ### Stale cursor snapshot

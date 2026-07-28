@@ -1351,7 +1351,82 @@ impl BufferedWriteLayer {
             insert_bytes / (1024 * 1024),
             if entries_replayed > 0 { insert_bytes / entries_replayed } else { 0 },
         );
+
+        // Quarantine must never be a quiet outcome: re-drive what can go back
+        // through the durable ingest path, then ALERT on whatever remains.
+        self.redrive_quarantine().await;
+        let (q_files, q_bytes) = crate::wal::quarantine_stats(self.wal.data_dir());
+        if q_files > 0 {
+            crate::metrics::record_quarantine_backlog();
+            error!(
+                "ALERT: {} quarantined WAL payload(s) ({:.1} MB) remain under {:?} — acked data is NOT in the store; investigate and re-drive (see RUNBOOK 'WAL quarantine')",
+                q_files,
+                q_bytes as f64 / (1024.0 * 1024.0),
+                self.wal.data_dir().join(crate::wal::QUARANTINE_DIR_NAME)
+            );
+        }
         Ok(stats)
+    }
+
+    /// Boot-time quarantine re-drive: each flat `quarantine/*.bin` payload
+    /// whose `.meta` sidecar says `operation=Insert` is decoded and sent back
+    /// through the normal durable insert path (WAL append + MemBuffer), so a
+    /// success is acked-durable before the file moves to `quarantine/redriven/`
+    /// (kept for forensics, excluded from the alert count). Failures stay
+    /// parked for a human — notably `insert_corrupt` torn-tail payloads that
+    /// can never decode, and `dml/` groups whose replay failures are
+    /// deterministic (re-driving would just re-fail).
+    async fn redrive_quarantine(self: &Arc<Self>) {
+        let qdir = self.wal.data_dir().join(crate::wal::QUARANTINE_DIR_NAME);
+        let Ok(rd) = std::fs::read_dir(&qdir) else { return };
+        let redriven_dir = qdir.join(crate::wal::QUARANTINE_REDRIVEN_DIR_NAME);
+        let (mut ok, mut failed) = (0u64, 0u64);
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "bin") {
+                continue;
+            }
+            let meta_path = path.with_extension("meta");
+            let meta = std::fs::read_to_string(&meta_path).unwrap_or_default();
+            let field = |k: &str| meta.lines().find_map(|l| l.strip_prefix(k).and_then(|l| l.strip_prefix('=')).map(str::to_owned));
+            let (Some(project_id), Some(table_name)) = (field("project_id"), field("table_name")) else {
+                warn!("quarantine re-drive: {:?} has no parseable .meta sidecar; leaving parked", path);
+                failed += 1;
+                continue;
+            };
+            if field("operation").as_deref() != Some("Insert") {
+                failed += 1;
+                continue;
+            }
+            let res: anyhow::Result<()> = async {
+                let data = std::fs::read(&path)?;
+                let batch = WalManager::deserialize_batch(&data, &table_name)?;
+                anyhow::ensure!(batch.num_rows() > 0, "empty batch");
+                self.insert(&project_id, &table_name, vec![batch]).await
+            }
+            .await;
+            match res {
+                Ok(()) => {
+                    ok += 1;
+                    crate::metrics::record_quarantine_redriven();
+                    if let Err(e) = std::fs::create_dir_all(&redriven_dir)
+                        .and_then(|()| std::fs::rename(&path, redriven_dir.join(entry.file_name())))
+                        .and_then(|()| std::fs::rename(&meta_path, redriven_dir.join(meta_path.file_name().unwrap_or_default())))
+                    {
+                        // Data is already durable (WAL-acked); a leftover copy
+                        // only inflates the alert count.
+                        warn!("quarantine re-drive: re-ingested {:?} but failed to archive it: {}", path, e);
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    warn!("quarantine re-drive: {:?} failed, leaving parked: {}", path, e);
+                }
+            }
+        }
+        if ok + failed > 0 {
+            info!("quarantine re-drive: {} re-ingested (moved to redriven/), {} left parked", ok, failed);
+        }
     }
 
     /// Mid-replay pressure relief, spawned single-flight by `recover_from_wal`
@@ -3804,6 +3879,50 @@ mod tests {
             cfg.core.wal_dir().join(".timefusion_meta").join("recovery_rewind.json").exists(),
             "rewind marker must survive the bail so the next boot re-reads the un-preserved entries"
         );
+    }
+
+    /// P0 quarantine re-drive (2026-07-28 silent-loss incidents): a parked
+    /// insert payload with a valid Arrow IPC body must go back through the
+    /// durable insert path at boot and be archived under `redriven/`; a
+    /// torn-tail (undecodable) payload stays parked and keeps the alert
+    /// count non-zero.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn boot_redrives_quarantined_insert_payloads() {
+        let dir = tempdir().unwrap();
+        let cfg = create_test_config(dir.path().to_path_buf());
+        let wal_dir = cfg.core.wal_dir();
+        let _env = crate::test_utils::test_helpers::walrus_env_guard(&wal_dir);
+        let test_id = &uuid::Uuid::new_v4().to_string()[..4];
+        let project = format!("r{}", test_id);
+        let table = format!("r{}", test_id);
+
+        let batch = crate::test_utils::test_helpers::json_to_batch(vec![crate::test_utils::test_helpers::test_span_ts(
+            "a",
+            "s1",
+            &project,
+            crate::clock::now_micros(),
+        )])
+        .unwrap();
+        let data = crate::wal::serialize_record_batch(&batch).unwrap();
+
+        // Build the layer FIRST: walrus's boot dir scan reads any pre-existing
+        // top-level file as a WAL segment, and quarantine payloads aren't that.
+        let layer = Arc::new(crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap());
+        let qdir = wal_dir.join("quarantine");
+        std::fs::create_dir_all(&qdir).unwrap();
+        let meta = |kind: &str| format!("ts_micros=1\nproject_id={project}\ntable_name={table}\noperation=Insert\nkind={kind}\nreason=x\nbytes=0\n");
+        std::fs::write(qdir.join("1_insert_incompatible_t.bin"), &data).unwrap();
+        std::fs::write(qdir.join("1_insert_incompatible_t.meta"), meta("insert_incompatible")).unwrap();
+        std::fs::write(qdir.join("2_insert_corrupt_t.bin"), &data[..data.len() / 2]).unwrap();
+        std::fs::write(qdir.join("2_insert_corrupt_t.meta"), meta("insert_corrupt")).unwrap();
+        layer.recover_from_wal().await.unwrap();
+
+        assert_eq!(layer.snapshot_stats().mem_total_rows, 1, "re-driven payload's row must be back in the store");
+        assert!(qdir.join("redriven/1_insert_incompatible_t.bin").exists(), "re-driven payload archived for forensics");
+        assert!(qdir.join("redriven/1_insert_incompatible_t.meta").exists());
+        let (files, _) = crate::wal::quarantine_stats(&wal_dir);
+        assert_eq!(files, 1, "torn-tail payload stays parked and keeps the alert count non-zero");
     }
 
     /// Build the (`UpdateSource`, assignments) pair used by the `update_with_source`

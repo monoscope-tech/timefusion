@@ -46,7 +46,7 @@ cron (`sec min hour dom mon dow`).
 | `TIMEFUSION_FLUSH_PARALLELISM`        | `8`     | Concurrent staged flush commits (Parquet encode + S3 upload). |
 | `TIMEFUSION_PRESSURE_FLUSH_PCT`       | `75`    | Memory-pressure % that wakes an early flush; `0` disables. |
 | `TIMEFUSION_WRITE_BACKPRESSURE_SECS`  | `60`    | Max secs an insert flushes-to-free-RAM before failing; `0` = fail fast. |
-| `TIMEFUSION_WAL_FSYNC_MODE`           | `ms`    | `ms` (async every `wal_fsync_ms`), `sync_each`, or `none`. |
+| `TIMEFUSION_WAL_FSYNC_MODE`           | `sync_each` | `sync_each` (fsync per entry, durable default), `ms` (async every `wal_fsync_ms`; torn-tail loss on OOM-kill), or `none`. |
 | `TIMEFUSION_WAL_FSYNC_MS`             | `200`   | Async fsync interval for `ms` mode. |
 | `TIMEFUSION_WAL_MAX_FILE_COUNT`       | `200`   | WAL file retention cap. |
 | `TIMEFUSION_WAL_SHARDS_PER_TOPIC`     | `4`     | Append parallelism per `(project, table)` topic. |

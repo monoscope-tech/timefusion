@@ -1443,6 +1443,10 @@ const GC_FLOOR_SLACK_MICROS: i64 = 10 * 60 * 1_000_000;
 /// failed to decode, DML groups that exhausted their drains). Exempt from
 /// [`gc_wal_files`]: these bytes are the only remaining copy of that data.
 pub(crate) const QUARANTINE_DIR_NAME: &str = "quarantine";
+/// Subdir of the quarantine dir holding payloads that were successfully
+/// re-ingested at boot (`redrive_quarantine`). Kept for forensics, but no
+/// longer "awaiting a human" — excluded from [`quarantine_stats`].
+pub(crate) const QUARANTINE_REDRIVEN_DIR_NAME: &str = "redriven";
 
 /// Recursive `(payload_files, total_bytes)` under `<wal_dir>/quarantine`.
 ///
@@ -1463,7 +1467,11 @@ pub fn quarantine_stats(wal_dir: &std::path::Path) -> (usize, u64) {
         for entry in rd.flatten() {
             let Ok(meta) = entry.metadata() else { continue };
             if meta.is_dir() {
-                stack.push(entry.path());
+                // `redriven/` holds already-re-ingested payloads — forensic
+                // copies, not pending loss; counting them would alert forever.
+                if entry.file_name() != QUARANTINE_REDRIVEN_DIR_NAME {
+                    stack.push(entry.path());
+                }
                 continue;
             }
             bytes += meta.len();
@@ -2224,6 +2232,10 @@ mod tests {
 
         // Sidecars are metadata, not payloads: count payloads so the number
         // means "parked items awaiting re-drive", but bill all bytes on disk.
+        // Already-re-ingested payloads under redriven/ are forensic copies,
+        // not pending loss — they must not keep the alert firing.
+        std::fs::create_dir_all(root.join("quarantine/redriven")).unwrap();
+        std::fs::write(root.join("quarantine/redriven/old_insert_corrupt.bin"), vec![0u8; 900]).unwrap();
         let (files, bytes) = quarantine_stats(root);
         assert_eq!(files, 2, "one .bin + one .arrow payload");
         assert_eq!(bytes, 400, "all quarantine bytes incl. the .meta sidecar");

@@ -211,10 +211,13 @@ const_default!(d_dml_coalesce_secs: u64 = 0);
 // commit, so a generous ceiling loses nothing.
 const_default!(d_flush_bucket_timeout_secs: u64 = 600);
 // Durability mode for the WAL. One of:
-//   "ms"        — async fsync every `wal_fsync_ms` (default; ~200ms loss window)
-//   "sync_each" — fsync after every entry (zero data-loss window, ~1ms per write)
+//   "sync_each" — fsync after every entry (default; zero data-loss window, ~1ms per write)
+//   "ms"        — async fsync every `wal_fsync_ms` (~200ms loss window; a torn
+//                 mmap tail after OOM/SIGKILL quarantines acked entries — the
+//                 2026-07 silent-loss incidents)
 //   "none"      — never fsync (test/throwaway data only)
-const_default!(d_wal_fsync_mode: String = "ms");
+const_default!(d_wal_fsync_mode: String = "sync_each");
+const_default!(d_wal_ack_fsync: bool = true);
 const_default!(d_wal_max_files: usize = 200);
 const_default!(d_wal_hard_limit_gb: u64 = 192);
 const_default!(d_foyer_memory_mb: usize = 1024);
@@ -660,9 +663,11 @@ pub struct BufferConfig {
     /// Fsync the WAL shard before acking DML appends (machine-crash
     /// durability). Batched INSERT appends are always flushed before ack by
     /// walrus's `batch_write`; only single-entry DML appends defer to the
-    /// background fsync thread — this closes that window. Default off: an
-    /// OOM/SIGKILL never loses mmap'd writes, only power loss does.
-    #[serde(default)]
+    /// background fsync thread — this closes that window. Default on: a torn
+    /// mmap tail after OOM/SIGKILL can quarantine acked-but-unsynced entries
+    /// (the "only power loss" reasoning was wrong — see WAL quarantine
+    /// incidents, 2026-07).
+    #[serde(default = "d_wal_ack_fsync")]
     pub timefusion_wal_ack_fsync: bool,
     #[serde(default = "d_wal_max_files")]
     pub timefusion_wal_max_file_count: usize,
@@ -724,7 +729,7 @@ pub struct BufferConfig {
 }
 
 /// WAL durability mode. See `d_wal_fsync_mode` for the env-var encoding.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalFsyncMode {
     Milliseconds(u64),
     SyncEach,
@@ -1400,6 +1405,11 @@ mod tests {
         assert!(!config.maintenance.timefusion_warm_full_files);
         assert_eq!(config.maintenance.timefusion_warm_recency_days, 1);
         assert_eq!(config.maintenance.timefusion_warm_concurrency, 16);
+        // Durable-by-default WAL (2026-07 quarantine incidents): an async
+        // fsync default let OOM-kills tear the mmap tail and silently
+        // quarantine acked rows. Pin the durable defaults.
+        assert_eq!(config.buffer.wal_fsync_mode(), WalFsyncMode::SyncEach);
+        assert!(config.buffer.wal_ack_fsync());
     }
 
     // Regression for the 2026-07-21 compaction outage: the derived maintenance
