@@ -272,15 +272,28 @@ impl DerivedBudget {
     /// buffer rather than a free-standing constant (today's 6 GB threshold
     /// vs a 24 GB buffer had drifted 9× out of proportion — doc §4).
     pub fn wal_flush_byte_threshold(&self) -> u64 {
-        (self.ingest_buffer_bytes / 2) as u64
+        // Floor at 4 GiB: the WAL counts PREALLOCATED file bytes (walrus
+        // blocks are up to 1 GiB each, MAX_ALLOC), so a threshold below a few
+        // blocks trips on preallocation alone — on a small box the derived
+        // half-buffer value (~800 MB) fired at "1000 MB" of WAL holding 150 MB
+        // of rows, draining open buckets before hard-limit backpressure could
+        // engage (the e2e backpressure test caught this, as it did the
+        // quarter-buffer default before it). Small boxes are guarded by the
+        // file count + memory pressure; the byte ceiling is a prod-scale
+        // replay bound, not a small-box valve.
+        ((self.ingest_buffer_bytes / 2) as u64).max(4 * GIB as u64)
     }
 
-    /// WAL emergency-flush file-count threshold, scaled proportionally to
-    /// the ingest buffer against the 24 GiB baseline that produced the
-    /// legacy 200-file default.
+    /// WAL emergency-flush file-count threshold: the legacy 200 as a FLOOR,
+    /// scaled up on boxes with a bigger ingest buffer than the 24 GiB baseline.
+    /// Never derived downward: 200 bounds restart REPLAY, not memory, and the
+    /// first derivation (max(50, scaled)) tripped at 50 files on small boxes —
+    /// the WAL emergency flush then drained the open bucket before the
+    /// hard-limit backpressure path could ever engage, which is exactly the
+    /// preemption the e2e backpressure test exists to catch (it did).
     pub fn wal_flush_file_threshold(&self) -> usize {
         let baseline_buffer = 24 * GIB;
-        (200.0 * (self.ingest_buffer_bytes as f64 / baseline_buffer as f64)).round().max(50.0) as usize
+        (200.0 * (self.ingest_buffer_bytes as f64 / baseline_buffer as f64)).round().max(200.0) as usize
     }
 }
 

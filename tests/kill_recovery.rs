@@ -174,6 +174,12 @@ impl Tf {
             .env("TIMEFUSION_FLUSH_INTERVAL_SECS", self.opts.flush_interval_secs.to_string())
             .env("TIMEFUSION_BUFFER_MAX_MEMORY_MB", self.opts.buffer_max_memory_mb.to_string())
             .env("TIMEFUSION_FOYER_DISABLED", "true")
+            // Explicit password, matching connect()'s `password=postgres`. Locally
+            // the binary's dotenv() found the repo .env (PGWIRE_PASSWORD=postgres)
+            // and auth happened to line up; on CI there is no .env, so insecure
+            // mode expected an EMPTY password and rejected the harness every
+            // 100ms for 300s — every "never became ready" since the suite landed.
+            .env("PGWIRE_PASSWORD", "postgres")
             .env("TIMEFUSION_ALLOW_INSECURE_AUTH", "true")
             .env("RUST_LOG", "warn,timefusion=info")
             // Capture BOTH streams to a per-spawn file: tracing writes to
