@@ -372,7 +372,12 @@ const_default!(d_dedup_bytes_per_row: u64 = 4096);
 // Serial by default: one heavy maintenance rewrite in flight at a time.
 const_default!(d_maintenance_rewrite_concurrency: usize = 1);
 const_default!(d_light_optimize_concurrency: usize = 1);
-const_default!(d_dml_merge_concurrency: usize = 4);
+const_default!(d_light_optimize_tick_budget_secs: u64 = 240);
+// Serial: each merge-update decodes + rewrites whole hot partitions with
+// pool-invisible memory; 4-way stacking under the drain hash-update storm
+// (~3 UPDATEs/s) drove the 2026-07-29 OOM crash-loop. Results are identical
+// either way — permits only bound peak memory, excess statements queue.
+const_default!(d_dml_merge_concurrency: usize = 1);
 const_default!(d_dirty_bin_drain_batch: usize = 32);
 // How many days back (in addition to today) the dedup sweep covers. today-only
 // left cross-flush dupes that landed in a prior-day partition (a late DLQ replay
@@ -1258,6 +1263,12 @@ pub struct MaintenanceConfig {
     /// 2 concurrent sorts in one 6GB slice starved in prod 2026-07-23.
     #[serde(default = "d_light_optimize_concurrency")]
     pub timefusion_light_optimize_concurrency: usize,
+    /// Wall-clock budget for one light-optimize tick. The round-robin stops
+    /// starting new rounds past this, so a backlog can't run past its own cron
+    /// period and stack ticks (prod 2026-07-29: "still in progress after 600s"
+    /// on a 300s schedule). Default 240s = 4min, under the 5min schedule.
+    #[serde(default = "d_light_optimize_tick_budget_secs")]
+    pub timefusion_light_optimize_tick_budget_secs: u64,
     /// Max concurrent user DML MERGE-UPDATEs (hash-enrichment `UPDATE ... FROM`).
     /// Each merge scans the time-windowed target partition to locate join-key
     /// matches — heavy on a CPU-throttled box. Ungated, bursts of per-project
