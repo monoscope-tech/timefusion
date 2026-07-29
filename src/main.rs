@@ -17,7 +17,11 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // Analyze: `jeprof --svg <binary> <prof_prefix>.*.heap`.
 #[cfg(all(feature = "profiling", target_os = "linux"))]
 #[unsafe(export_name = "malloc_conf")]
-pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:33,prof_prefix:/app/data/timefusion/profiles/jeprof\0";
+// background_thread + 1s dirty decay: without background threads jemalloc only
+// purges dirty pages on allocation events per-arena, so 4-8GB/min of write-path
+// churn retained ~2/3 of RSS as freed-but-unreturned pages (2026-07-29: 26GB
+// live heap vs 115GB RSS at the cgroup OOM kill).
+pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19,lg_prof_interval:33,prof_prefix:/app/data/timefusion/profiles/jeprof,background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0\0";
 
 use std::sync::Arc;
 
