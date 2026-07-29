@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use timefusion::{
     schema_loader::{FieldDef, SortingColumnDef, TableSchema, TantivyFieldConfig},
     tantivy_index::{
-        builder::IndexBuildStats,
+        builder::{IndexBuildStats, MergeMode},
         manifest::{self, ManifestEntry},
         query_index,
         reader::Hit,
@@ -73,7 +73,7 @@ async fn pack_upload_download_unpack_query_roundtrip() {
     let batches = vec![batch()];
 
     // Build & pack
-    let (blob, stats): (_, IndexBuildStats) = store::build_and_pack(&table, &batches, 3).expect("build_and_pack");
+    let (blob, stats): (_, IndexBuildStats) = store::build_and_pack(&table, &batches, 3, MergeMode::Deferred).expect("build_and_pack");
     assert_eq!(stats.rows, 3);
     assert!(!blob.is_empty());
 
@@ -174,7 +174,7 @@ fn verify_blob_accepts_built_index_and_rejects_corruption() {
     // fails every future read on its immutable path). The merge-thread race
     // that produced corrupt blobs is timing-dependent — the fix is the
     // `wait_merging_threads()` join in `index_to_writer`; this pins the guard.
-    let (blob, _) = store::build_and_pack(&table(), &[batch()], 3).expect("build_and_pack");
+    let (blob, _) = store::build_and_pack(&table(), &[batch()], 3, MergeMode::Now).expect("build_and_pack");
     store::verify_blob(&blob).expect("freshly built blob must verify");
 
     // Truncating the blob yields an invalid tar.zst; verify must error, not panic.

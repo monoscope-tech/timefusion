@@ -23,6 +23,7 @@ use crate::{
     config::TantivyConfig,
     schema_loader,
     tantivy_index::{
+        builder::MergeMode,
         manifest::{self, ManifestEntry},
         store,
     },
@@ -95,11 +96,11 @@ impl TantivyIndexService {
             let path = store::index_path_for_parquet(table_name, &rel);
             // ordinals_valid=false: flush batches are indexed BEFORE the
             // Delta writer's sort, so doc order ≠ parquet row order.
-            return self.build_pack_upload(table_name, project_id, &rel, path, added_files, batches, false).await;
+            return self.build_pack_upload(table_name, project_id, &rel, path, added_files, batches, false, MergeMode::Deferred).await;
         }
         let bucket_uuid = Uuid::new_v4().to_string();
         let path = store::blob_path(table_name, project_id, &bucket_uuid);
-        self.build_pack_upload(table_name, project_id, &bucket_key(&bucket_uuid), path, added_files, batches, false).await
+        self.build_pack_upload(table_name, project_id, &bucket_key(&bucket_uuid), path, added_files, batches, false, MergeMode::Deferred).await
     }
 
     /// Build & publish an index for a single already-committed parquet file,
@@ -119,7 +120,12 @@ impl TantivyIndexService {
         let path = store::index_path_for_parquet(table_name, parquet_rel);
         // ordinals_valid=true: batches came from the committed parquet in row
         // order, so `_row_ordinal` is a valid parquet row index.
-        self.build_pack_upload(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], batches, true).await
+        //
+        // MergeMode::Now: every caller of this (post-optimize reindex, startup
+        // backfill, post-WAL-recovery reindex) is already a maintenance task off
+        // the ingest path — so this rebuild IS the merge cadence that collapses
+        // the multi-segment blobs the flush path deferred.
+        self.build_pack_upload(table_name, project_id, parquet_rel, path, vec![parquet_uri.to_string()], batches, true, MergeMode::Now).await
     }
 
     /// Build+pack `batches`, upload to `blob_path`, and upsert the manifest
@@ -130,12 +136,12 @@ impl TantivyIndexService {
     #[allow(clippy::too_many_arguments)]
     async fn build_pack_upload(
         &self, table_name: &str, project_id: &str, manifest_key: &str, blob_path: object_store::path::Path, covered_files: Vec<String>,
-        batches: Vec<arrow::record_batch::RecordBatch>, ordinals_valid: bool,
+        batches: Vec<arrow::record_batch::RecordBatch>, ordinals_valid: bool, merge: MergeMode,
     ) -> Result<()> {
         let svc_table = schema_loader::get_schema(table_name).with_context(|| format!("schema not found for {table_name}"))?.clone();
         let level = self.config.compression_level();
         let pack_result = tokio::task::spawn_blocking(move || {
-            let (blob, stats) = store::build_and_pack(&svc_table, &batches, level)?;
+            let (blob, stats) = store::build_and_pack(&svc_table, &batches, level, merge)?;
             // Guard against publishing a corrupt archive (see store::verify_blob).
             store::verify_blob(&blob).context("verify packed blob")?;
             Ok::<_, anyhow::Error>((blob, stats))
@@ -161,7 +167,7 @@ impl TantivyIndexService {
                 return Err(e);
             }
         };
-        debug!("tantivy index for {project_id}/{table_name} built: rows={} bytes={}", stats.rows, blob.len());
+        debug!("tantivy index for {project_id}/{table_name} built: rows={} bytes={} segments={}", stats.rows, blob.len(), stats.segments);
         store::upload(self.object_store.as_ref(), &blob_path, blob).await?;
         let entry = ManifestEntry {
             index: Some(blob_path.to_string()),

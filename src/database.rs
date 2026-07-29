@@ -2294,14 +2294,11 @@ impl Database {
         // parquet of bins that never reached their wave commit because the
         // process died between staging and committing. Best-effort by
         // construction — see `reconcile_staged_intents`.
-        for (table_name, table) in db.unified_tables.read().await.iter() {
-            db.reconcile_staged_intents(table, table_name).await;
-        }
         // Custom-storage tables stage into the same manifest (the hot-compact
-        // cron covers them too) — they need their own reconcile pass or their
-        // orphans are never targeted at all.
-        for (key, table) in db.custom_project_tables.read().await.iter() {
-            db.reconcile_staged_intents(table, &key.1).await;
+        // cron covers them too), so `all_tables` covers both or their orphans
+        // are never targeted at all.
+        for (_project_id, table_name, table) in db.all_tables().await {
+            db.reconcile_staged_intents(&table, &table_name).await;
         }
 
         // Hot compact — bin-pack today's small files (every ~5 min). Runs WITHOUT
@@ -2320,17 +2317,11 @@ impl Database {
                         return;
                     }
                     info!("Running scheduled hot-tail compaction on today's small files");
-                    for (table_name, table) in db.unified_tables.read().await.iter() {
+                    for (project_id, table_name, table) in db.all_tables().await {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
-                        db.run_hot_compact_for_table(table, table_name, &format!("unified table '{table_name}'")).await;
-                    }
-                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                        if db.maintenance_shutdown.is_cancelled() {
-                            return;
-                        }
-                        db.run_hot_compact_for_table(table, table_name, &format!("custom project '{project_id}' table '{table_name}'")).await;
+                        db.run_hot_compact_for_table(&table, &table_name, &Self::table_label(&project_id, &table_name)).await;
                     }
                 }
             }
@@ -2349,18 +2340,14 @@ impl Database {
                         return;
                     };
                     info!("Running scheduled dedup on sealed partitions");
-                    for (table_name, table) in db.unified_tables.read().await.iter() {
+                    for (project_id, table_name, table) in db.all_tables().await {
                         if db.maintenance_shutdown.is_cancelled() {
                             return;
                         }
-                        db.run_dedup_for_table(table, table_name, table_name, &format!("unified table '{table_name}'")).await;
-                    }
-                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                        if db.maintenance_shutdown.is_cancelled() {
-                            return;
-                        }
-                        let key = format!("{project_id}:{table_name}");
-                        db.run_dedup_for_table(table, table_name, &key, &format!("custom project '{project_id}' table '{table_name}'")).await;
+                        // Dedup key: bare table name for unified tables, tenant-scoped
+                        // for custom-storage ones (they are separate Delta logs).
+                        let key = if project_id.is_empty() { table_name.clone() } else { format!("{project_id}:{table_name}") };
+                        db.run_dedup_for_table(&table, &table_name, &key, &Self::table_label(&project_id, &table_name)).await;
                     }
                 }
             }
@@ -2376,14 +2363,9 @@ impl Database {
                         return;
                     };
                     info!("Running scheduled optimize on all tables");
-                    for (table_name, table) in db.unified_tables.read().await.iter() {
-                        if let Err(e) = db.optimize_table(table, table_name, None).await {
-                            error!("Optimize failed for unified table '{}': {}", table_name, e);
-                        }
-                    }
-                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                        if let Err(e) = db.optimize_table(table, table_name, None).await {
-                            error!("Optimize failed for custom project '{}' table '{}': {}", project_id, table_name, e);
+                    for (project_id, table_name, table) in db.all_tables().await {
+                        if let Err(e) = db.optimize_table(&table, &table_name, None).await {
+                            error!("Optimize failed for {}: {}", Self::table_label(&project_id, &table_name), e);
                         }
                     }
                 }
@@ -2442,13 +2424,9 @@ impl Database {
                 let db = db.clone();
                 async move {
                     info!("Running scheduled vacuum on all tables");
-                    for (table_name, table) in db.unified_tables.read().await.iter() {
-                        info!("Vacuuming unified table '{}' (retention: {}h)", table_name, vacuum_retention);
-                        db.vacuum_table(table, vacuum_retention).await;
-                    }
-                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                        info!("Vacuuming custom project '{}' table '{}' (retention: {}h)", project_id, table_name, vacuum_retention);
-                        db.vacuum_table(table, vacuum_retention).await;
+                    for (project_id, table_name, table) in db.all_tables().await {
+                        info!("Vacuuming {} (retention: {}h)", Self::table_label(&project_id, &table_name), vacuum_retention);
+                        db.vacuum_table(&table, vacuum_retention).await;
                     }
                 }
             }
@@ -2498,27 +2476,17 @@ impl Database {
                 async move {
                     info!("Refreshing Delta Lake statistics cache");
                     db.statistics_extractor.clear_cache().await;
-                    // Pre-warm unified tables (empty project_id — they're shared).
-                    for (table_name, table) in db.unified_tables.read().await.iter() {
+                    // Unified tables pre-warm under an empty project_id — they're shared.
+                    for (project_id, table_name, table) in db.all_tables().await {
+                        let label = Self::table_label(&project_id, &table_name);
                         let table = table.read().await;
                         let current_version = table.version().unwrap_or(0);
-                        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
+                        let schema_def = get_schema(&table_name).unwrap_or_else(get_default_schema);
                         let schema = schema_def.schema_ref();
-                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, "", table_name, &schema).await {
-                            error!("Failed to refresh statistics for unified table '{}': {}", table_name, e);
+                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, &project_id, &table_name, &schema).await {
+                            error!("Failed to refresh statistics for {}: {}", label, e);
                         } else {
-                            debug!("Refreshed statistics for unified table '{}' (version {})", table_name, current_version);
-                        }
-                    }
-                    for ((project_id, table_name), table) in db.custom_project_tables.read().await.iter() {
-                        let table = table.read().await;
-                        let current_version = table.version().unwrap_or(0);
-                        let schema_def = get_schema(table_name).unwrap_or_else(get_default_schema);
-                        let schema = schema_def.schema_ref();
-                        if let Err(e) = db.statistics_extractor.extract_statistics(&table, project_id, table_name, &schema).await {
-                            error!("Failed to refresh statistics for {}:{}: {}", project_id, table_name, e);
-                        } else {
-                            debug!("Refreshed statistics for {}:{} (version {})", project_id, table_name, current_version);
+                            debug!("Refreshed statistics for {} (version {})", label, current_version);
                         }
                     }
                 }
@@ -3051,27 +3019,27 @@ impl Database {
 
     /// Resolve a unified table (shared by all default projects, partitioned by project_id)
     async fn resolve_unified_table(&self, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
-        // Check unified_tables cache first
-        {
-            let tables = self.unified_tables.read().await;
-            if let Some(table) = tables.get(table_name) {
-                debug!("Found unified table '{}' in cache", table_name);
-                // For unified tables, we use table_name as the key for version tracking
-                let last_written_version = {
-                    let versions = self.last_written_versions.read().await;
-                    // Use empty string for project_id since unified tables aren't project-specific
-                    versions.get(&("".to_string(), table_name.to_string())).cloned()
-                };
+        // Check unified_tables cache first. Clone the handle and DROP the map
+        // guard before the refresh: `update_table` replays the Delta log, and a
+        // read guard held across it blocks writers — which, tokio's RwLock being
+        // write-preferring, then blocks every later reader (the maintenance-wedge
+        // shape documented on `all_tables`).
+        let cached = self.unified_tables.read().await.get(table_name).cloned();
+        if let Some(table) = cached {
+            debug!("Found unified table '{}' in cache", table_name);
+            // For unified tables, we use table_name as the key for version tracking
+            let last_written_version = {
+                let versions = self.last_written_versions.read().await;
+                // Use empty string for project_id since unified tables aren't project-specific
+                versions.get(&("".to_string(), table_name.to_string())).cloned()
+            };
 
-                let current_version = table.read().await.version();
-                let should_update = should_refresh_table(current_version, last_written_version);
-
-                if should_update {
-                    self.update_table(table, "", table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
-                }
-
-                return Ok(Arc::clone(table));
+            let current_version = table.read().await.version();
+            if should_refresh_table(current_version, last_written_version) {
+                self.update_table(&table, "", table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
             }
+
+            return Ok(table);
         }
 
         // Not in cache, create/load it
@@ -3080,25 +3048,22 @@ impl Database {
 
     /// Resolve a custom project table (isolated table for projects with their own S3 bucket)
     async fn resolve_custom_table(&self, project_id: &str, table_name: &str) -> DFResult<Arc<RwLock<DeltaTable>>> {
-        // Check custom_project_tables cache first
-        {
-            let tables = self.custom_project_tables.read().await;
-            if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
-                debug!("Found custom table for project '{}' table '{}' in cache", project_id, table_name);
-                let last_written_version = {
-                    let versions = self.last_written_versions.read().await;
-                    versions.get(&(project_id.to_string(), table_name.to_string())).cloned()
-                };
+        // Check custom_project_tables cache first — handle cloned and the map
+        // guard dropped before the refresh (see `resolve_unified_table`).
+        let cached = self.custom_project_tables.read().await.get(&(project_id.to_string(), table_name.to_string())).cloned();
+        if let Some(table) = cached {
+            debug!("Found custom table for project '{}' table '{}' in cache", project_id, table_name);
+            let last_written_version = {
+                let versions = self.last_written_versions.read().await;
+                versions.get(&(project_id.to_string(), table_name.to_string())).cloned()
+            };
 
-                let current_version = table.read().await.version();
-                let should_update = should_refresh_table(current_version, last_written_version);
-
-                if should_update {
-                    self.update_table(table, project_id, table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
-                }
-
-                return Ok(Arc::clone(table));
+            let current_version = table.read().await.version();
+            if should_refresh_table(current_version, last_written_version) {
+                self.update_table(&table, project_id, table_name).await.map_err(|e| DataFusionError::Execution(format!("Failed to update table: {}", e)))?;
             }
+
+            return Ok(table);
         }
 
         // Not in cache, create/load it
@@ -3134,15 +3099,20 @@ impl Database {
 
         info!("Creating or loading unified table '{}' at: {}", table_name, storage_uri);
 
-        // Hold write lock during table creation
+        // Load OUTSIDE the write lock. `create_delta_table_internal` replays the
+        // Delta log over the network and is not time-bounded (a dead endpoint or a
+        // huge log can hold it for minutes or forever); holding the map's write
+        // guard across it blocks EVERY reader of the map, and because tokio's
+        // RwLock is write-preferring one queued writer also blocks every later
+        // reader. That wedges all maintenance jobs on their first table lookup
+        // while ingest/queries stay healthy on `fast_resolve_cache` — the
+        // 2026-07-29 22:05 total-maintenance-wedge shape. Two racing first
+        // touches may both load; the double-check below keeps the first insert.
+        let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
         let mut tables = self.unified_tables.write().await;
-
-        // Double-check after acquiring write lock
         if let Some(table) = tables.get(table_name) {
             return Ok(Arc::clone(table));
         }
-
-        let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
         let table_arc = Arc::new(RwLock::new(table));
         tables.insert(table_name.to_string(), Arc::clone(&table_arc));
         info!("Cached unified table '{}', cache now contains {} entries", table_name, tables.len());
@@ -3196,15 +3166,15 @@ impl Database {
 
         info!("Creating or loading custom table for project '{}' table '{}' at: {}", project_id, table_name, storage_uri);
 
-        // Hold write lock during table creation
+        // Load OUTSIDE the write lock — see `get_or_create_unified_table`. Worse
+        // here: the load targets a TENANT's BYO bucket, so one unreachable
+        // endpoint or stale credential set can pin this map's write guard
+        // indefinitely and wedge every maintenance job that walks the map.
+        let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
         let mut tables = self.custom_project_tables.write().await;
-
-        // Double-check after acquiring write lock
         if let Some(table) = tables.get(&(project_id.to_string(), table_name.to_string())) {
             return Ok(Arc::clone(table));
         }
-
-        let table = self.create_delta_table_internal(&storage_uri, &storage_options, table_name).await?;
         let table_arc = Arc::new(RwLock::new(table));
         tables.insert((project_id.to_string(), table_name.to_string()), Arc::clone(&table_arc));
         info!("Cached custom table for project '{}' table '{}', cache now contains {} entries", project_id, table_name, tables.len());
@@ -7386,7 +7356,7 @@ impl Database {
     pub async fn run_checkpoint_maintenance(&self) {
         // Reset the lag gauge so it reflects THIS tick's worst table.
         crate::metrics::maintenance_stats().checkpoint_lag_versions.store(0, std::sync::atomic::Ordering::Relaxed);
-        for (name, table) in self.all_tables().await {
+        for (_project_id, name, table) in self.all_tables().await {
             self.checkpoint_and_cleanup_table(&table, &name).await;
         }
     }
@@ -7394,7 +7364,7 @@ impl Database {
     /// One dangling-Add reconcile tick across every registered table. Driven by
     /// the reconcile cron job (and directly by tests).
     pub async fn run_reconcile_maintenance(&self) {
-        for (name, table) in self.all_tables().await {
+        for (_project_id, name, table) in self.all_tables().await {
             self.reconcile_dangling_adds(&table, &name).await;
         }
     }
@@ -7471,11 +7441,24 @@ impl Database {
         Ok(path)
     }
 
-    /// Flatten unified + custom project tables into one (name, handle) list.
-    async fn all_tables(&self) -> Vec<(String, Arc<RwLock<DeltaTable>>)> {
-        let mut out: Vec<(String, Arc<RwLock<DeltaTable>>)> = self.unified_tables.read().await.iter().map(|(n, t)| (n.clone(), t.clone())).collect();
-        out.extend(self.custom_project_tables.read().await.iter().map(|((_, n), t)| (n.clone(), t.clone())));
+    /// Flatten unified + custom project tables into one (project_id, name, handle)
+    /// list — `project_id` empty for unified tables (shared by all default
+    /// projects). A SNAPSHOT by design: every maintenance pass must iterate this
+    /// instead of `MAP.read().await.iter()`, because holding a table-map read
+    /// guard across the pass's awaits lets one queued writer (a first-touch table
+    /// load) block every subsequent reader — tokio's RwLock is write-preferring —
+    /// and wedge all maintenance jobs at once (2026-07-29 22:05).
+    async fn all_tables(&self) -> Vec<(String, String, Arc<RwLock<DeltaTable>>)> {
+        let mut out: Vec<(String, String, Arc<RwLock<DeltaTable>>)> =
+            self.unified_tables.read().await.iter().map(|(n, t)| (String::new(), n.clone(), t.clone())).collect();
+        out.extend(self.custom_project_tables.read().await.iter().map(|((p, n), t)| (p.clone(), n.clone(), t.clone())));
         out
+    }
+
+    /// Human label for a table from `all_tables`, matching the pre-existing
+    /// per-job log wording so operator greps keep working.
+    fn table_label(project_id: &str, table_name: &str) -> String {
+        if project_id.is_empty() { format!("unified table '{table_name}'") } else { format!("custom project '{project_id}' table '{table_name}'") }
     }
 
     /// Get table statistics using the statistics extractor

@@ -1,9 +1,9 @@
 //! Build a tantivy index from a stream of `RecordBatch`es.
 //!
 //! Strategy: in-memory `tantivy::Index` (RAMDirectory) — caller is responsible
-//! for serializing it to bytes (see `store::pack_index`). Index is wrapped in
-//! a single segment per batch group; segments are merged before close to keep
-//! the on-disk footprint small.
+//! for serializing it to bytes (see `store::pack_index`). Each build is a
+//! one-shot single commit; whether its segments are merged before close is the
+//! caller's choice via `MergeMode` (see that type for why deferring is safe).
 //!
 //! Field mapping (from `schema.rs`):
 //! - `_timestamp` ← row's `timestamp` column (Timestamp microseconds)
@@ -23,7 +23,8 @@ use arrow::{
 };
 use parquet_variant_compute::VariantArray;
 use parquet_variant_json::VariantToJson;
-use tantivy::{Index, IndexWriter, doc, schema::Schema as TSchema};
+use tantivy::{Index, IndexWriter, doc, merge_policy::NoMergePolicy, schema::Schema as TSchema};
+use tracing::{debug, warn};
 
 use crate::{
     schema_loader::TableSchema,
@@ -35,12 +36,46 @@ use crate::{
 /// MemBuffer budget (`max_memory_bytes`).
 pub const WRITER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 
+/// Segment-count safety valve for `MergeMode::Deferred`: past this many
+/// segments a build merges inline anyway, because per-query cost is linear in
+/// segment count (one term-dictionary seek per segment) and an index whose
+/// parquet never gets compacted would otherwise stay pathological forever.
+/// Generous on purpose — a normal flush bucket lands well under it, so the
+/// valve only fires for outlier-sized buckets.
+pub const MAX_DEFERRED_SEGMENTS: usize = 32;
+
+/// When a build is allowed to spend CPU on segment merges.
+///
+/// Merging is *semantically invisible*: it changes neither the hit set nor any
+/// stored/fast-field value, only the number of segment readers a query opens
+/// and the packed blob's size. That is what makes deferring it safe.
+///
+/// It is not cheap though — tantivy schedules merges from
+/// `SegmentUpdater::consider_merge_options()`, which runs on **every in-flight
+/// segment flush**, not just on commit. Under the default `LogMergePolicy` that
+/// puts `TermMerger` work concurrently with `add_document`, inside the ingest
+/// window, ×`tantivy_spawn_sem` concurrent builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeMode {
+    /// Ingest path (post-flush sidecar build, MemBuffer bucket index): install
+    /// `NoMergePolicy` and ship whatever segments the per-thread arena flushes
+    /// produced. Bounded by `MAX_DEFERRED_SEGMENTS`; collapsed to one segment
+    /// later by the post-optimize / backfill rebuilds, which run `Now`.
+    Deferred,
+    /// Maintenance path (post-optimize reindex, startup backfill, WAL-recovery
+    /// reindex): merge everything into a single segment after the commit. These
+    /// callers are already off the ingest path, so this is the merge cadence.
+    Now,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct IndexBuildStats {
     pub rows: u64,
     pub batches: u32,
     pub min_timestamp_micros: Option<i64>,
     pub max_timestamp_micros: Option<i64>,
+    /// Segments in the finished index (1 when merged).
+    pub segments: usize,
 }
 
 /// Build an in-memory tantivy `Index` from `batches`. Returns the index and
@@ -50,26 +85,46 @@ pub fn build_in_memory(table: &TableSchema, batches: &[RecordBatch]) -> Result<(
     let built = build_for_table(table);
     let index = Index::create_in_ram(built.schema.clone());
     crate::tantivy_index::schema::register_tokenizers(&index);
-    let stats = index_to_writer(&built, &index, batches)?;
+    // Bucket indexes are a query-time cache rebuilt on every row-count change —
+    // merging them is pure waste.
+    let stats = index_to_writer(&built, &index, batches, MergeMode::Deferred)?;
     Ok((index, built, stats))
 }
 
 /// Append `batches` to an existing tantivy `Index` (created in RAM or on disk).
 /// Used by `store::build_to_dir` to write directly to a `MmapDirectory`.
-pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatch]) -> Result<IndexBuildStats> {
+pub fn index_to_writer(built: &BuiltSchema, index: &Index, batches: &[RecordBatch], merge: MergeMode) -> Result<IndexBuildStats> {
     let mut writer: IndexWriter = index.writer(WRITER_HEAP_BYTES).context("create tantivy writer")?;
+    // Merges are driven explicitly below, never by the writer's own policy: the
+    // default `LogMergePolicy` fires from `consider_merge_options()` on every
+    // in-flight segment flush, i.e. *while* documents are still being added.
+    writer.set_merge_policy(Box::new(NoMergePolicy));
     let mut stats = IndexBuildStats::default();
     for batch in batches {
         index_batch(built, &mut writer, batch, &mut stats)?;
         stats.batches += 1;
     }
     writer.commit().context("tantivy commit")?;
-    // Join background merge threads before returning: `commit()` schedules segment
-    // merges on tantivy's threadpool, and dropping the writer does NOT wait for them.
+    let segment_ids = index.searchable_segment_ids().map_err(|e| anyhow!("list segments: {e}"))?;
+    stats.segments = segment_ids.len();
+    let over_valve = stats.segments > MAX_DEFERRED_SEGMENTS;
+    if stats.segments > 1 && (merge == MergeMode::Now || over_valve) {
+        if over_valve && merge == MergeMode::Deferred {
+            warn!("tantivy build produced {} segments (> {MAX_DEFERRED_SEGMENTS}); merging inline", stats.segments);
+        }
+        writer.merge(&segment_ids).wait().map_err(|e| anyhow!("merge segments: {e}"))?;
+        stats.segments = 1;
+        crate::metrics::record_tantivy_merge_executed();
+    } else if stats.segments > 1 {
+        debug!("tantivy build deferring merge of {} segments", stats.segments);
+        crate::metrics::record_tantivy_merge_deferred();
+    }
+    // Join background merge threads before returning: an explicit `merge()` runs
+    // on tantivy's threadpool, and dropping the writer does NOT wait for it.
     // If the caller then tars the index dir (`store::pack_dir`) while a merge is still
     // GC-ing source segments, the archive captures vanished/half-rewritten files —
     // surfacing as non-fatal `tar append` (build) / `tar unpack` (read) failures that
-    // silently disable the index. Waiting leaves the dir quiescent and fully merged.
+    // silently disable the index. Waiting leaves the dir quiescent.
     writer.wait_merging_threads().context("wait merging threads")?;
     Ok(stats)
 }
@@ -251,4 +306,103 @@ fn flatten_kv(v: &serde_json::Value, prefix: &str, out: &mut String) {
 /// Returns the schema attached to a tantivy index (helper for tests).
 pub fn index_schema(index: &Index) -> TSchema {
     index.schema()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{StringArray, TimestampMicrosecondArray},
+        datatypes::{Field, Schema as ArrowSchema, TimeUnit},
+    };
+    use tantivy::{Term, query::TermQuery, schema::IndexRecordOption};
+
+    use super::*;
+    use crate::{
+        schema_loader::{FieldDef, TantivyFieldConfig},
+        tantivy_index::reader::{Hit, query_index},
+    };
+
+    fn table() -> TableSchema {
+        let f = |name: &str, dt: &str, tv: Option<TantivyFieldConfig>| FieldDef {
+            name: name.into(),
+            data_type: dt.into(),
+            nullable: true,
+            tantivy: tv,
+            dictionary: None,
+            bloom_filter: false,
+        };
+        TableSchema {
+            table_name: "logs".into(),
+            partitions: vec![],
+            sorting_columns: vec![],
+            z_order_columns: vec![],
+            time_column: None,
+            dedup_keys: vec![],
+            dedup_tiebreak: None,
+            fields: vec![
+                f("timestamp", "Timestamp(Microsecond, Some(\"UTC\"))", None),
+                f("id", "Utf8", None),
+                f("level", "Utf8", Some(TantivyFieldConfig { indexed: true, tokenizer: Some("raw".into()), flatten: None })),
+            ],
+        }
+    }
+
+    /// One row per batch so each `index_to_writer` call is a separate commit
+    /// producing its own (tiny, same-sized) segment — the shape the default
+    /// `LogMergePolicy` would collapse once ≥8 pile up in one level.
+    fn batch(n: i64) -> RecordBatch {
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())), false),
+            Field::new("id", DataType::Utf8, false),
+            Field::new("level", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![n * 1_000]).with_timezone("UTC")),
+                Arc::new(StringArray::from(vec![format!("id{n}")])),
+                Arc::new(StringArray::from(vec![if n % 2 == 0 { "INFO" } else { "ERROR" }])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn error_hits(index: &Index, built: &BuiltSchema) -> Vec<Hit> {
+        let q = TermQuery::new(Term::from_field_text(built.user_fields["level"].field, "ERROR"), IndexRecordOption::Basic);
+        let mut hits = query_index(index, &q, None).expect("query");
+        hits.sort_by(|a, b| a.timestamp_micros.cmp(&b.timestamp_micros));
+        hits
+    }
+
+    /// Phase 4: merging must not run on the ingest path. Pins all three
+    /// invariants on one index — (i) 12 deferred commits leave 12 segments
+    /// (default `LogMergePolicy` merges at ≥8 same-level segments, so an
+    /// accidental policy regression fails here), (ii) the explicit merge path
+    /// collapses them to one segment, (iii) the hit set is byte-identical
+    /// across the merge, which is what makes deferral safe.
+    #[test]
+    fn deferred_commits_do_not_merge_and_explicit_merge_preserves_hits() {
+        let built = build_for_table(&table());
+        let index = Index::create_in_ram(built.schema.clone());
+        crate::tantivy_index::schema::register_tokenizers(&index);
+
+        for n in 0..12 {
+            let stats = index_to_writer(&built, &index, &[batch(n)], MergeMode::Deferred).expect("deferred build");
+            assert_eq!(stats.rows, 1);
+            assert_eq!(stats.segments as i64, n + 1, "deferred build must add a segment, never merge");
+        }
+        let unmerged = error_hits(&index, &built);
+        assert_eq!(unmerged.len(), 6, "6 odd-numbered rows are ERROR");
+        assert_eq!(index.searchable_segment_ids().unwrap().len(), 12);
+
+        // Maintenance cadence: no new documents, merge what's there.
+        let stats = index_to_writer(&built, &index, &[], MergeMode::Now).expect("merge build");
+        assert_eq!(stats.segments, 1, "explicit merge must collapse segments");
+        assert_eq!(index.searchable_segment_ids().unwrap().len(), 1);
+
+        // Merging is semantically invisible: same hits, same ts/id/ordinals.
+        assert_eq!(error_hits(&index, &built), unmerged);
+    }
 }

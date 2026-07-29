@@ -16,6 +16,6 @@ pub mod service;
 pub mod store;
 pub mod udf;
 
-pub use builder::{IndexBuildStats, build_in_memory};
+pub use builder::{IndexBuildStats, MergeMode, build_in_memory};
 pub use reader::{Hit, query_index};
 pub use schema::{ID_FIELD, TS_FIELD, build_for_table};

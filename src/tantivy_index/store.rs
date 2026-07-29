@@ -20,6 +20,8 @@ use bytes::Bytes;
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjPath};
 use tantivy::Index;
 
+use crate::tantivy_index::builder::MergeMode;
+
 pub const INDEX_PREFIX: &str = "indexes";
 pub const INDEX_VERSION: &str = "v1";
 pub const BLOB_SUFFIX: &str = ".tantivy.tar.zst";
@@ -69,24 +71,24 @@ pub async fn read_parquet_batches(store: Arc<dyn ObjectStore>, parquet_rel: &str
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot, then
 /// pack it into a `tar.zst` blob. Avoids any RAM→disk copy.
 pub fn build_and_pack(
-    table: &crate::schema_loader::TableSchema, batches: &[arrow::record_batch::RecordBatch], level: i32,
+    table: &crate::schema_loader::TableSchema, batches: &[arrow::record_batch::RecordBatch], level: i32, merge: MergeMode,
 ) -> Result<(Bytes, crate::tantivy_index::builder::IndexBuildStats)> {
     let tmp = tempfile::tempdir().context("build_and_pack: tempdir")?;
-    let (_built, stats) = build_to_dir(table, batches, tmp.path())?;
+    let (_built, stats) = build_to_dir(table, batches, tmp.path(), merge)?;
     let bytes = pack_dir(tmp.path(), level)?;
     Ok((bytes, stats))
 }
 
 /// Build a tantivy `Index` to a fresh on-disk directory in one shot.
 pub fn build_to_dir(
-    table: &crate::schema_loader::TableSchema, batches: &[arrow::record_batch::RecordBatch], dir: &Path,
+    table: &crate::schema_loader::TableSchema, batches: &[arrow::record_batch::RecordBatch], dir: &Path, merge: MergeMode,
 ) -> Result<(crate::tantivy_index::schema::BuiltSchema, crate::tantivy_index::builder::IndexBuildStats)> {
     use tantivy::directory::MmapDirectory;
     let built = crate::tantivy_index::schema::build_for_table(table);
     let mmap_dir = MmapDirectory::open(dir).map_err(|e| anyhow!("open mmap dir: {e}"))?;
     let index = Index::create(mmap_dir, built.schema.clone(), Default::default()).map_err(|e| anyhow!("create disk index: {e}"))?;
     crate::tantivy_index::schema::register_tokenizers(&index);
-    let stats = crate::tantivy_index::builder::index_to_writer(&built, &index, batches)?;
+    let stats = crate::tantivy_index::builder::index_to_writer(&built, &index, batches, merge)?;
     Ok((built, stats))
 }
 
