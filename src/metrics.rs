@@ -479,6 +479,21 @@ pub struct MaintenanceStats {
     pub dedup_failed: AtomicU64,
     pub light_optimize_timed_out: AtomicU64,
     pub light_optimize_failed: AtomicU64,
+    /// Ticks that hit the wall-clock budget with hot projects still pending.
+    pub light_optimize_tick_truncated: AtomicU64,
+    /// Wave-engine per-tick accounting. `planned` counts projects the tick's
+    /// single metadata walk found work for; `completed` counts bins that landed.
+    /// ALERT when completed lags planned for N consecutive ticks — that's the
+    /// "8 of 11 hot projects never reached" shape (prod 2026-07-29).
+    pub light_optimize_projects_planned: AtomicU64,
+    pub light_optimize_projects_completed: AtomicU64,
+    pub light_optimize_bins_committed: AtomicU64,
+    pub light_optimize_waves_committed: AtomicU64,
+    /// Waves not STARTED because the WAL was over its emergency-flush threshold
+    /// (durability outranks compaction) or memory was near the cgroup limit.
+    /// Chronic nonzero = compaction is being starved, not protected.
+    pub light_optimize_wal_yields: AtomicU64,
+    pub light_optimize_memory_brakes: AtomicU64,
     pub dirty_bin_queue_depth: AtomicU64,
     pub dirty_bin_enqueued: AtomicU64,
     pub dirty_bin_eligible: AtomicU64,
@@ -510,6 +525,13 @@ static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     dedup_failed: AtomicU64::new(0),
     light_optimize_timed_out: AtomicU64::new(0),
     light_optimize_failed: AtomicU64::new(0),
+    light_optimize_tick_truncated: AtomicU64::new(0),
+    light_optimize_projects_planned: AtomicU64::new(0),
+    light_optimize_projects_completed: AtomicU64::new(0),
+    light_optimize_bins_committed: AtomicU64::new(0),
+    light_optimize_waves_committed: AtomicU64::new(0),
+    light_optimize_wal_yields: AtomicU64::new(0),
+    light_optimize_memory_brakes: AtomicU64::new(0),
     dirty_bin_queue_depth: AtomicU64::new(0),
     dirty_bin_enqueued: AtomicU64::new(0),
     dirty_bin_eligible: AtomicU64::new(0),

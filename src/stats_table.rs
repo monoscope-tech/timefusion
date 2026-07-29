@@ -195,6 +195,15 @@ impl StatsTableProvider {
             rows.push(("maintenance", "dedup_failed_total".into(), m.dedup_failed.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_timed_out_total".into(), m.light_optimize_timed_out.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_failed_total".into(), m.light_optimize_failed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "light_optimize_tick_truncated_total".into(), m.light_optimize_tick_truncated.load(Relaxed).to_string()));
+            // planned vs completed is the per-tick coverage check: a persistent
+            // gap means hot projects are going uncompacted (prod 2026-07-29).
+            rows.push(("maintenance", "light_optimize_projects_planned_total".into(), m.light_optimize_projects_planned.load(Relaxed).to_string()));
+            rows.push(("maintenance", "light_optimize_projects_completed_total".into(), m.light_optimize_projects_completed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "light_optimize_bins_committed_total".into(), m.light_optimize_bins_committed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "light_optimize_waves_committed_total".into(), m.light_optimize_waves_committed.load(Relaxed).to_string()));
+            rows.push(("maintenance", "light_optimize_wal_yields_total".into(), m.light_optimize_wal_yields.load(Relaxed).to_string()));
+            rows.push(("maintenance", "light_optimize_memory_brakes_total".into(), m.light_optimize_memory_brakes.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_queue_depth".into(), m.dirty_bin_queue_depth.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_enqueued_total".into(), m.dirty_bin_enqueued.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_eligible_total".into(), m.dirty_bin_eligible.load(Relaxed).to_string()));

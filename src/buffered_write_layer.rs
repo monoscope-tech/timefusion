@@ -238,7 +238,7 @@ fn flushable_bytes(b: &crate::mem_buffer::FlushableBucket) -> u64 {
 /// per-bucket estimate (`get_array_memory_size` on wide Utf8View / replayed
 /// batches) is over-counting, so backpressure is tripping on phantom bytes
 /// rather than real memory.
-fn process_rss_bytes() -> Option<usize> {
+pub(crate) fn process_rss_bytes() -> Option<usize> {
     // statm fields are in pages; resident is field 2. 4 KiB pages on every
     // Linux target TF deploys to (x86_64) — avoids a libc dependency.
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
@@ -1683,11 +1683,9 @@ impl BufferedWriteLayer {
             // memory-pressure valve misses — issue #83). flush_all_now advances
             // the read cursor so WAL GC can reclaim the backlog, keeping
             // restart replay bounded.
-            let max_files = self.config.buffer.wal_max_file_count();
-            let max_unflushed = self.config.buffer.wal_max_unflushed_bytes();
-            let files_over = max_files > 0 && file_count > max_files;
-            let bytes_over = max_unflushed.is_some_and(|max| total_bytes > max);
-            if files_over || bytes_over {
+            let max_files = self.config.effective_wal_max_files();
+            let max_unflushed = Some(self.config.effective_wal_max_unflushed_bytes());
+            if self.is_wal_over_threshold() {
                 warn!(
                     "WAL over threshold (files {}/{}, bytes {}MB/{}), triggering emergency flush",
                     file_count,
@@ -1704,6 +1702,16 @@ impl BufferedWriteLayer {
             // test is watching, the call is essentially free.
             self.flush_tick_notify.notify_waiters();
         }
+    }
+
+    /// The emergency-flush predicate: WAL over EITHER threshold (file count or
+    /// unflushed bytes). Cheap (two atomics behind `wal_stats`), so compaction
+    /// can consult it at wave boundaries and yield while durability catches up —
+    /// the flusher's own hysteresis is the only state, no second controller.
+    pub fn is_wal_over_threshold(&self) -> bool {
+        let (file_count, total_bytes) = self.wal.wal_stats();
+        let max_files = self.config.effective_wal_max_files();
+        (max_files > 0 && file_count > max_files) || Some(self.config.effective_wal_max_unflushed_bytes()).is_some_and(|max| total_bytes > max)
     }
 
     /// HARD WAL cap — a DISK-RUNAWAY breaker (2026-07-26 merge storm: WAL

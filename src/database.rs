@@ -1187,10 +1187,15 @@ struct PreparedWrite {
     staged_writer: Option<deltalake::writer::RecordBatchWriter>,
 }
 
-fn remove_for_add(add: &deltalake::kernel::Add) -> deltalake::kernel::Remove {
+/// `data_change`: true when the rewrite drops rows (dedup), false for a
+/// data-preserving compaction — the fork's conflict checker only counts
+/// `data_change: true` removals as conflicts (conflict_checker.rs:561), so a
+/// compaction Remove marked true loses every OCC race to concurrent appends
+/// (the aa50480 incident the fork rev is pinned for).
+fn remove_for_add(add: &deltalake::kernel::Add, data_change: bool) -> deltalake::kernel::Remove {
     deltalake::kernel::Remove {
         path: add.path.clone(),
-        data_change: true,
+        data_change,
         deletion_timestamp: Some(Utc::now().timestamp_millis()),
         size: Some(add.size),
         extended_file_metadata: Some(true),
@@ -1649,7 +1654,7 @@ pub struct Database {
     /// recompress) that materialize Arrow. Their footprint is invisible to the
     /// DataFusion memory pool (a `SELECT * … collect()` doesn't reserve through
     /// it), so aggregate concurrency — not the pool — is the real bound against
-    /// the cgroup OOM (prod 2026-07-04). Permits = `timefusion_maintenance_rewrite_concurrency`.
+    /// the cgroup OOM (prod 2026-07-04). Permits = `derived.rewrite_permits()`.
     maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Caps concurrent user DML MERGE-UPDATEs (hash enrichment). Each scans the
     /// time-windowed target to hash-join keys; ungated bursts starve reads on a
@@ -1720,9 +1725,15 @@ pub struct Database {
     /// storage URL. Lets that task skip idle tables and tables whose version
     /// hasn't advanced by `checkpoint_interval` since the last checkpoint. Since
     /// checkpoint/log-cleanup no longer run in the commit hook (base_commit_properties),
-    /// this task is the only checkpoint driver. In-memory only: after a restart
+    /// this task and `checkpoint_after_waves` (post-tick) are the only
+    /// checkpoint drivers. In-memory only: after a restart
     /// the first tick checkpoints every table once, which is harmless.
     checkpoint_versions: Arc<dashmap::DashMap<String, u64>>,
+    /// Where the last truncated light-optimize tick stopped, as an index into
+    /// that tick's debt-ordered project list. The next tick rotates its plan by
+    /// this so an overloaded box degrades to "every project within k ticks"
+    /// instead of forever re-serving the same debt-ordered prefix.
+    light_optimize_cursor: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Database {
@@ -2007,7 +2018,7 @@ impl Database {
         let statistics_extractor = Arc::new(DeltaStatisticsExtractor::new(stats_cache_size, 300, page_row_limit));
 
         // Captured before `cfg` is moved into the struct literal below.
-        let maint_rewrite_permits = cfg.maintenance.timefusion_maintenance_rewrite_concurrency.max(1);
+        let maint_rewrite_permits = cfg.derived.rewrite_permits().max(1);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1);
         let maintenance_shutdown = CancellationToken::new();
@@ -2056,6 +2067,7 @@ impl Database {
             dml_coalescer: Arc::new(std::sync::OnceLock::new()),
             zorder_filesets: Arc::new(RwLock::new(HashMap::new())),
             checkpoint_versions: Arc::new(dashmap::DashMap::new()),
+            light_optimize_cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
 
         Ok(db)
@@ -2277,6 +2289,20 @@ impl Database {
     pub async fn start_maintenance_schedulers(self) -> Result<Self> {
         let db = Arc::new(self.background_clone());
         let cancel = self.maintenance_shutdown.clone();
+
+        // Before any maintenance job can stage new work: delete the staged
+        // parquet of bins that never reached their wave commit because the
+        // process died between staging and committing. Best-effort by
+        // construction — see `reconcile_staged_intents`.
+        for (table_name, table) in db.unified_tables.read().await.iter() {
+            db.reconcile_staged_intents(table, table_name).await;
+        }
+        // Custom-storage tables stage into the same manifest (the hot-compact
+        // cron covers them too) — they need their own reconcile pass or their
+        // orphans are never targeted at all.
+        for (key, table) in db.custom_project_tables.read().await.iter() {
+            db.reconcile_staged_intents(table, &key.1).await;
+        }
 
         // Hot compact — bin-pack today's small files (every ~5 min). Runs WITHOUT
         // the maintenance_job_sem so it can't be starved behind the dedup backlog
@@ -2613,7 +2639,10 @@ impl Database {
         let _ = options.set("datafusion.optimizer.max_passes", "5");
 
         // Configure memory limit for DataFusion operations
-        let memory_fraction = self.config.memory.timefusion_memory_fraction;
+        // datafusion.execution.memory_fraction is the per-query share of the (already
+        // tree-sized) pool — a fixed 0.9 replaces the deleted TIMEFUSION_MEMORY_FRACTION
+        // knob, whose prod value was calibrated against the old hand-set limit.
+        let memory_fraction = 0.9;
         let sort_spill_reservation_bytes = self.config.memory.timefusion_sort_spill_reservation_bytes.unwrap_or(67_108_864);
 
         // Set memory-related configuration options
@@ -3208,6 +3237,12 @@ impl Database {
                     // at create (the live otel_logs_and_spans sat at 1 day and regrew
                     // its log to ~6.7k objects → 3-5s commits, 2026-06-26).
                     ("delta.logRetentionDuration".to_string(), format!("interval {} hours", self.config.maintenance.timefusion_log_retention_hours)),
+                    // Reconciled on EXISTING tables too, or the stats trimming
+                    // never reaches the one table that pays the CPU. Takes
+                    // precedence over the legacy `dataSkippingNumIndexedCols=-1`
+                    // baked in at create (delta-rs reads stats_columns first), so
+                    // the old key is left alone rather than removed.
+                    ("delta.dataSkippingStatsColumns".to_string(), stats_columns_for(get_schema(table_name).unwrap_or_else(get_default_schema))),
                 ]);
                 // One-time protocol upgrade so merge-on-read UPDATE/DELETE can attach DVs.
                 // Only when opted in; ensure_table_properties is idempotent (no commit if set).
@@ -3243,10 +3278,15 @@ impl Database {
                         Some(format!("interval {} hours", self.config.maintenance.timefusion_log_retention_hours)),
                     );
                     config.insert("delta.enableExpiredLogCleanup".to_string(), Some("true".to_string()));
-                    // Default of 32 leaf columns isn't enough for our wide schema (90+ fields);
-                    // -1 = index all columns. Needed so kernel data-skipping can evaluate
-                    // predicates on columns beyond the first 32 without "No such field" errors.
-                    config.insert("delta.dataSkippingNumIndexedCols".to_string(), Some("-1".to_string()));
+                    // Stats for an EXPLICIT column list, not all 90+ leaf columns
+                    // (the old `dataSkippingNumIndexedCols=-1`). Whole-schema stats
+                    // made every Add carry a min/max/nullCount for each wide
+                    // JSON/variant column: 18.4% of process CPU was `parse_json_impl`
+                    // on Add stats during log replay (cpu-000014.svg, 2026-07-29),
+                    // paid by queries and maintenance alike. The listed columns are
+                    // the only ones data-skipping and compaction actually prune on
+                    // (see `stats_columns_for`); everything else was carried cost.
+                    config.insert("delta.dataSkippingStatsColumns".to_string(), Some(stats_columns_for(schema)));
                     // Enable merge-on-read deletion vectors at create so DV UPDATE/DELETE
                     // works without a later protocol upgrade. Opt-in only.
                     if self.config.maintenance.timefusion_use_deletion_vectors {
@@ -3585,13 +3625,17 @@ impl Database {
                 *table = new_table;
             }
         }
-        // Eviction is in-cache only (cheap), so run it inline. Warming issues S3
-        // GETs, so detach it — the maintenance loop shouldn't block on priming
-        // the cache (preserves the previous in-`warm_cache_for_uris` spawn).
-        self.evict_cache_for_uris(&warm_table_uri, &removed);
+        // WARM BEFORE EVICT, always: any multi-file swap that evicts first
+        // cold-starts the hottest query window (the 2026-07-21 cache-thrash
+        // shape, concentrated by wave commits swapping K bins at once). Warming
+        // issues S3 GETs, so the whole pair is detached — the maintenance loop
+        // never blocks on priming the cache, and eviction rides behind the warm
+        // inside the same task so the ordering holds without blocking anyone.
         let db = self.clone();
         tokio::spawn(async move {
-            db.warm_cache_for_uris(warm_store, warm_table_uri, added).await;
+            let uri = warm_table_uri;
+            db.warm_cache_for_uris(warm_store, uri.clone(), added).await;
+            db.evict_cache_for_uris(&uri, &removed);
         });
         live_uris
     }
@@ -3710,9 +3754,7 @@ impl Database {
     fn shared_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.runtime_env
             .get_or_init(|| {
-                let memory_limit_bytes = self.config.memory.memory_limit_bytes();
-                let memory_fraction = self.config.memory.timefusion_memory_fraction;
-                let pool_size = (memory_limit_bytes as f64 * memory_fraction) as usize;
+                let pool_size = self.config.derived.query_pool_bytes();
                 let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match self.config.memory.timefusion_memory_pool {
                     crate::config::MemoryPoolKind::Greedy => Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(pool_size)),
                     crate::config::MemoryPoolKind::FairSpill => Arc::new(datafusion::execution::memory_pool::FairSpillPool::new(pool_size)),
@@ -3759,15 +3801,15 @@ impl Database {
     /// a single busiest-project bin sort peaked ~5.8GB (prod 2026-07-23,
     /// SortPreservingMerge exhaustion even with serial fan-out).
     fn light_optimize_pool_bytes(&self) -> usize {
-        let pool = self.config.memory.maintenance_pool_bytes();
-        (pool / 3 * self.config.maintenance.timefusion_light_optimize_concurrency.max(1)).min(pool * 3 / 4)
+        let pool = self.config.derived.maintenance_pool_bytes();
+        (pool / 3 * self.config.derived.max_light_optimize_k()).min(pool * 3 / 4)
     }
 
     /// Heavy maintenance (dedup, recompress, Z-order): the budget left after
     /// the light-optimize slice.
     fn maintenance_runtime_env(&self) -> Arc<datafusion::execution::runtime_env::RuntimeEnv> {
         self.maintenance_runtime_env
-            .get_or_init(|| self.build_spill_runtime_env(self.config.memory.maintenance_pool_bytes() - self.light_optimize_pool_bytes(), "maintenance_spill"))
+            .get_or_init(|| self.build_spill_runtime_env(self.config.derived.maintenance_pool_bytes() - self.light_optimize_pool_bytes(), "maintenance_spill"))
             .clone()
     }
 
@@ -4841,7 +4883,7 @@ impl Database {
         // sorts starve each other's external-sort reservations and the whole
         // optimize fails ("Not enough memory to continue external sort", prod
         // 2026-07-21). Serialize sort bins — same rule as compact_date.
-        let optimize_concurrency = if declare_sorted { 1 } else { self.config.maintenance.timefusion_optimize_max_concurrent_tasks };
+        let optimize_concurrency = if declare_sorted { 1 } else { self.config.derived.optimize_merge_tasks() };
 
         // Best-effort: retry bounded OCC conflicts against a fresh snapshot,
         // but never pause flushes (see optimize_table_light). This preserves
@@ -5072,72 +5114,64 @@ impl Database {
     async fn light_optimize_tail(
         table: &DeltaTable, filters: &[PartitionFilter], target_size: i64, min_files: usize, sorted_run_cap: i64,
     ) -> Result<Vec<String>> {
-        // Tag the fork stamps on sorted-run outputs (delta-rs optimize.rs). Kept
-        // in sync by the exact rev pin; a fork rename would need a deliberate bump.
-        const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
-        let cap = target_size.max(1);
-        // Don't compact the still-filling tail: files whose newest event is within
-        // SEAL_LAG of now may still receive appends / DV-merge rewrites, so
-        // compacting them (a) races concurrent commits → OCC abort (the wedged
-        // optimize on today's partition, prod 2026-07-20) and (b) would need
-        // re-compaction. Only compact sealed time slices.
-        // 15min: a 5min lag was tried (shrinks the recent file count faster) but
-        // THRASHED the Foyer cache — rewriting the recent window every 5min churns
-        // file IDs faster than 1h-window queries reuse the warm bodies, so 1h
-        // latency stuck at 2-7s and never warmed while 3h (stable older files) did
-        // (prod 2026-07-21). 15min lets recent files settle so the cache stays
-        // warm → 1h/3h converge to ~0.2s once the box has ~30min uptime.
-        const SEAL_LAG_MICROS: i64 = 15 * 60 * 1_000_000;
-        let seal = Utc::now().timestamp_micros() - SEAL_LAG_MICROS;
         let adds: Vec<_> = table.get_active_add_actions_by_partitions(filters).try_collect::<Vec<_>>().await?;
-        // Only untagged (not-yet-sorted) files, sealed, with an event-time range.
-        // Binning by EVENT time (not arrival/modification_time) is what makes the
-        // sorted output runs time-DISJOINT, so file-range pruning can exclude
-        // files outside a query's window (arrival-time binning left every file
-        // overlapping → files_ranges_pruned=56→56, i.e. no pruning).
-        let converged = cap - cap / 8;
-        let mut fresh: Vec<(String, i64, i64)> = adds
+        let tail: Vec<TailAdd> = adds
             .iter()
-            .filter(|add| add.size() < sorted_run_cap || add.tags().get(SORTED_RUN_TAG).is_none_or(|v| v.as_deref() != Some("true")))
-            .filter(|add| add.size() < converged)
-            .filter_map(|add| {
-                // Parse the raw Add stats JSON: the snapshot's parsed-stats
-                // column (`stats_parsed`) isn't materialized on this path, so
-                // the kernel `stat_min_i64`/`stat_max_i64` accessors return
-                // None for every file — the 2026-07-20 event-time binning read
-                // them and silently selected NOTHING (hot compaction was a
-                // no-op in prod while today-partitions grew to 474+ files).
-                let (min, max) = Self::event_time_range_from_stats(&add.stats()?)?;
-                (max <= seal).then(|| (add.path().to_string(), min, add.size()))
-            })
+            .filter(|add| add.size() < target_size.max(1)) // cheap gate before the stats parse
+            .map(|add| TailAdd::from_stats(add.path().to_string(), add.size(), is_sorted_run(&add.tags()), add.stats().as_deref()))
             .collect();
-        if fresh.len() < min_files {
-            return Ok(vec![]);
-        }
-        fresh.sort_unstable_by_key(|(_, min, _)| *min);
-        // Pack the earliest contiguous slice up to `cap` → one time-disjoint run
-        // per tick. Small commit converges quickly and shrinks the conflict window;
-        // later ticks pack the next (strictly later) slice.
-        let mut bytes = 0i64;
-        let mut files = vec![];
-        for (path, _, size) in fresh {
-            if !files.is_empty() && bytes + size > cap {
-                // A lone-file slice is already a run — rewriting it is pure
-                // churn. Skip past it to the next time slice instead of
-                // wedging the pass behind it.
-                if files.len() >= 2 {
-                    break;
-                }
-                bytes = 0;
-                files.clear();
+        Ok(select_tail_bin(&tail, target_size, min_files, sorted_run_cap, seal_micros_now()))
+    }
+
+    /// ONE tag-first walk of the snapshot that plans a bin for EVERY hot project
+    /// of `date=today`, replacing the per-project `light_optimize_tail` walk.
+    /// The old shape re-walked and re-parsed Add stats once per project per pass
+    /// — up to 132 walks/tick over 24,343 files, and `ScanLogReplayProcessor`
+    /// plus Add-stats JSON parsing were 34.5% + 18.4% of process CPU
+    /// (prod profile 2026-07-29). Here the converged (≥ 7/8 target) and
+    /// over-cap sorted-run files are skipped by size/tag BEFORE their stats JSON
+    /// is touched, so the parse cost is O(live tail), not O(active files).
+    ///
+    /// Returns one bin per project, ordered by compaction debt (raw small-file
+    /// count — the most fragmented partition opens the most files per query, so
+    /// it goes first within the round).
+    /// TODO: weight the debt score by read traffic — a partition nobody queries
+    /// is deferred work, not urgent work (needs per-project query counters).
+    fn select_all_hot_bins(table: &DeltaTable, today_str: &str, target_size: i64, min_files: usize, sorted_run_cap: i64) -> Result<Vec<(String, Vec<String>)>> {
+        let date_marker = format!("date={today_str}/");
+        let seal = seal_micros_now();
+        let cap = target_size.max(1);
+        let converged = cap - cap / 8;
+        let mut per_project: HashMap<String, Vec<TailAdd>> = HashMap::new();
+        for file in table.snapshot()?.log_data().iter() {
+            let path = file.path();
+            if !path.contains(&date_marker) {
+                continue;
             }
-            bytes += size;
-            files.push(path);
+            let Some(project_id) = path.split('/').find_map(|s| s.strip_prefix("project_id=")).filter(|p| !p.is_empty()).map(str::to_owned) else {
+                continue;
+            };
+            // Tag-first: both exclusions are pure metadata, so a converged file
+            // or an over-cap sorted run never reaches the stats parse.
+            let size = file.size();
+            if size >= converged {
+                continue;
+            }
+            if size >= sorted_run_cap && is_sorted_run(&file.tags()) {
+                continue;
+            }
+            per_project.entry(project_id).or_default().push(TailAdd::from_stats(path.into_owned(), size, false, file.stats().as_deref()));
         }
-        if files.len() < 2 {
-            files.clear();
-        }
-        Ok(files)
+        let mut planned: Vec<(String, Vec<String>, usize)> = per_project
+            .into_iter()
+            .map(|(project_id, adds)| {
+                let debt = adds.len();
+                (project_id, select_tail_bin(&adds, target_size, min_files, sorted_run_cap, seal), debt)
+            })
+            .filter(|(_, bin, _)| !bin.is_empty())
+            .collect();
+        planned.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        Ok(planned.into_iter().map(|(project_id, bin, _)| (project_id, bin)).collect())
     }
 
     /// `[min, max]` event time (micros) of a file from its raw Add stats JSON.
@@ -5183,7 +5217,7 @@ impl Database {
     pub async fn compact_date(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, project_id: Option<&str>,
     ) -> Result<(u64, u64)> {
-        self.compact_date_with(table_ref, table_name, date, project_id, self.config.maintenance.timefusion_optimize_max_concurrent_tasks).await
+        self.compact_date_with(table_ref, table_name, date, project_id, self.config.derived.optimize_merge_tasks()).await
     }
 
     /// `compact_date` with an explicit merge concurrency. The cold consolidation
@@ -5575,12 +5609,41 @@ impl Database {
         self.dedup_partition_range(table_ref, table_name, project_id, date, None).await
     }
 
+    /// Stage-and-commit one partition (or one 10-minute bin of it) as a SINGLE
+    /// wave. Used by the fallback sweep, which has no queue to batch across; the
+    /// dirty-bin path stages with [`Self::stage_dedup_partition_range`] directly
+    /// so one wave can span many bins.
     async fn dedup_partition_range(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, bin: Option<i64>,
     ) -> Result<(u64, bool)> {
+        let (units, complete) = self.stage_dedup_partition_range(table_ref, table_name, project_id, date, bin, None).await?;
+        if units.is_empty() {
+            return Ok((0, complete));
+        }
+        let markers = vec![format!("date={date}/")];
+        let result = self.commit_wave(table_ref, table_name, &markers, true, units, 0).await;
+        let dropped = wave_dropped_rows(&result.landed);
+        for bin in &result.landed {
+            if let Some(d) = &bin.dedup {
+                info!("dedup rewrite: table={} chunk=[{}] dropped={} (before={} after={})", table_name, d.label, d.dropped(), d.before, d.after);
+            }
+        }
+        // A unit that didn't land left its duplicates in place — the partition
+        // must NOT be certified clean (2026-07-05 review).
+        Ok((dropped, complete && result.failed.is_empty()))
+    }
+
+    /// Probe one partition/bin for duplicates and STAGE (never commit) a
+    /// replacement parquet set per duplicate-bearing chunk. Returns the staged
+    /// units plus `complete` — false when duplicate-bearing work was skipped
+    /// (unsealed chunks, budget guards, vanished snapshot rows), which forbids
+    /// certifying the partition clean.
+    async fn stage_dedup_partition_range(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, date: chrono::NaiveDate, bin: Option<i64>, key: Option<DirtyBinKey>,
+    ) -> Result<(Vec<StagedBin>, bool)> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         if schema.dedup_keys.is_empty() {
-            return Ok((0, true));
+            return Ok((Vec::new(), true));
         }
         let date_str = date.to_string();
 
@@ -5715,25 +5778,62 @@ impl Database {
             if dup_rows <= 0 { (Vec::new(), false) } else { (vec![(filter.clone(), format!("project_id = '{safe_pid}' AND date = '{date_str}'"))], false) }
         };
         if chunks.is_empty() {
-            return Ok((0, !skipped_any));
+            return Ok((Vec::new(), !skipped_any));
         }
 
-        let mut total_dropped = 0u64;
+        // Chunks of one partition stage CONCURRENTLY, bounded by the same
+        // `maintenance_rewrite_sem` each staging task takes around its Arrow
+        // materialization — `buffer_unordered` only decides how many tasks are
+        // in flight, the semaphore decides how many are decoding at once.
+        use futures::stream::StreamExt;
+        let permits = self.config.derived.rewrite_permits().max(1);
+        let staged: Vec<Result<BinOutcome<StagedBin>>> = futures::stream::iter(chunks.into_iter().map(|(chunk_filter, label)| {
+            let (filter, key, date_str) = (&filter, key.clone(), date_str.as_str());
+            async move { self.stage_dedup_chunk(table_ref, table_name, project_id, schema, scan_name, filter, &chunk_filter, &label, date_str, key).await }
+        }))
+        .buffer_unordered(permits)
+        .collect()
+        .await;
+        let mut units = Vec::new();
         let mut all_complete = !skipped_any;
-        for (chunk_filter, label) in chunks {
-            let (dropped, complete) = self.dedup_rewrite_chunk(table_ref, table_name, project_id, schema, scan_name, &filter, &chunk_filter, &label).await?;
-            total_dropped += dropped;
-            all_complete &= complete;
+        let mut first_err = None;
+        for outcome in staged {
+            match outcome {
+                Ok(BinOutcome::Staged(unit)) => units.push(unit),
+                // The chunk's rows vanished / were rewritten concurrently:
+                // nothing was verified, so the partition stays uncertified.
+                Ok(BinOutcome::Retry) => all_complete = false,
+                // Probe false-positive: verified duplicate-free, nothing to commit.
+                Ok(BinOutcome::Converged) => {}
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
         }
-        Ok((total_dropped, all_complete))
+        if let Some(e) = first_err {
+            // One chunk's failure abandons the partition's whole staging batch:
+            // clean up the siblings' parquet rather than leaking it (their
+            // Adds are in no commit and VACUUM would take days to notice).
+            self.discard_bins(&units).await;
+            return Err(e);
+        }
+        Ok((units, all_complete))
     }
 
-    /// Rewrite one duplicate-bearing chunk as a TARGETED file transaction:
-    /// learn exactly which files hold the chunk's rows (via the provider's
-    /// synthetic [`DEDUP_FILE_COL`]), re-read those files' FULL row sets (rows
-    /// outside the chunk window are carried into the replacements verbatim),
-    /// dedup, stage replacement parquet, and commit Remove(old)+Add(new) in
-    /// one transaction.
+    /// STAGE one duplicate-bearing chunk as a TARGETED file rewrite: learn
+    /// exactly which files hold the chunk's rows (via the provider's synthetic
+    /// [`DEDUP_FILE_COL`]), re-read those files' FULL row sets (rows outside the
+    /// chunk window are carried into the replacements verbatim), dedup, and write
+    /// replacement parquet. Returns the Remove(old)+Add(new) actions for a WAVE
+    /// commit — this function commits nothing.
+    ///
+    /// Staging without committing is what ends the 572s serial dedup runs
+    /// (prod 2026-07-29): chunks used to rewrite AND commit strictly one at a
+    /// time because concurrent per-chunk commits to one Delta log were an OCC
+    /// storm. With [`Self::commit_wave`] batching them under the shared
+    /// per-physical-table commit lock, that reason is gone — and so are the
+    /// optimize-vs-dedup delete-delete aborts, since both engines' Removes now
+    /// serialize instead of racing inside each other's OCC window.
     ///
     /// No `replace_where`: its predicate had to be a bare string (delta-rs
     /// can't stringify typed TIMESTAMP literals into the commit), which
@@ -5744,16 +5844,16 @@ impl Database {
     /// files, and — since files are immutable — there is no race against
     /// concurrent flush appends: fresh rows in the window live in files this
     /// commit never touches.
+    ///
+    /// `Retry` = the chunk's rows vanished under a concurrent rewrite (caller
+    /// must not certify the partition clean); `Converged` = probe false-positive,
+    /// verified duplicate-free.
     #[allow(clippy::too_many_arguments)]
-    async fn dedup_rewrite_chunk(
+    async fn stage_dedup_chunk(
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, project_id: &str, schema: &crate::schema_loader::TableSchema, scan_name: &str,
-        partition_filter: &str, chunk_filter: &str, label: &str,
-    ) -> Result<(u64, bool)> {
-        use deltalake::{
-            kernel::{Action, transaction::TableReference},
-            protocol::DeltaOperation,
-            writer::DeltaWriter,
-        };
+        partition_filter: &str, chunk_filter: &str, label: &str, date_str: &str, key: Option<DirtyBinKey>,
+    ) -> Result<BinOutcome<StagedBin>> {
+        use deltalake::{kernel::Action, writer::DeltaWriter};
         let read_string_column = |batches: Vec<RecordBatch>| -> Result<Vec<String>> {
             let mut out = Vec::new();
             for batch in batches {
@@ -5764,10 +5864,11 @@ impl Database {
             Ok(out)
         };
         // Re-plan loop: a concurrent rewrite (optimize / z-order / another
-        // dedup) can remove a target file mid-flight. Detected under the
-        // commit lock; the chunk is re-planned from a fresh snapshot.
+        // dedup) can remove a target file mid-flight, so the scan's file ids no
+        // longer map onto the snapshot's Adds. The snapshot→commit window is NOT
+        // handled here any more — `commit_wave`'s liveness check drops the stale
+        // unit and the dirty bin is requeued for the next tick.
         const MAX_REPLANS: usize = 3;
-        let commit_lock = self.commit_lock(project_id, table_name).await;
         for replan in 0..MAX_REPLANS {
             // Scan and file-mapping MUST share one snapshot: the caller's ctx
             // is pinned at dedup_partition entry, and on the heavily-churned
@@ -5803,7 +5904,7 @@ impl Database {
             if file_ids.is_empty() {
                 // Probe saw dupes but this snapshot has no rows for the chunk
                 // (concurrent rewrite) — nothing verified, don't certify clean.
-                return Ok((0, false));
+                return Ok(BinOutcome::Retry);
             }
             // 2. Map scan values to Add actions in the SAME snapshot
             // (suffix-match either direction: the scan column carries the
@@ -5835,87 +5936,14 @@ impl Database {
                 continue;
             }
 
-            // The selected files are the complete overlap set for this sealed
-            // 10-minute bin. Let delta-rs globally sort and streaming-dedup that
-            // exact set: unlike normal optimize, `with_files` keeps large and
-            // single-file inputs instead of bin-packing or skipping them.
-            let paths: Vec<String> = targets.iter().map(|target| target.path.clone()).collect();
-            let before = ctx
-                .sql(&format!("SELECT count(*) FROM {scan_name} WHERE {chunk_filter}"))
-                .await?
-                .collect()
-                .await?
-                .first()
-                .and_then(|batch| batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|array| array.value(0) as u64))
-                .unwrap_or(0);
-            let table = { table_ref.read().await.clone() };
-            let pre_uris: std::collections::HashSet<String> = table.get_file_uris().map(|uris| uris.collect()).unwrap_or_default();
-            let sort = schema_optimize_sort_columns(schema);
-            let rewrite_bytes: u64 = targets.iter().map(|target| target.size.max(0) as u64).sum();
-            let row_counts: Option<Vec<u64>> =
-                targets.iter().map(|target| target.get_stats().ok().flatten().map(|stats| stats.num_records.max(0) as u64)).collect();
-            let estimated_decoded =
-                row_counts.as_ref().map(|counts| counts.iter().sum::<u64>().saturating_mul(self.config.maintenance.timefusion_dedup_bytes_per_row));
-            let within_budget = (self.config.maintenance.timefusion_dedup_max_rewrite_bytes == 0
-                || rewrite_bytes <= self.config.maintenance.timefusion_dedup_max_rewrite_bytes)
-                && (self.config.maintenance.timefusion_dedup_max_decoded_bytes == 0
-                    || estimated_decoded.is_some_and(|bytes| bytes <= self.config.maintenance.timefusion_dedup_max_decoded_bytes));
-            if !sort.is_empty() && within_budget && self.config.maintenance.timefusion_dedup_bytes_per_row <= 4096 {
-                let dedup = deltalake::operations::optimize::DedupConfig {
-                    columns: schema.dedup_keys.clone(),
-                    tiebreak: schema.dedup_tiebreak.as_ref().map(|column| deltalake::operations::optimize::SortColumn {
-                        column: column.clone(),
-                        descending: true,
-                        nulls_first: false,
-                    }),
-                };
-                let _permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
-                match table
-                    .optimize()
-                    .with_type(deltalake::operations::optimize::OptimizeType::SortByDedup(sort, dedup))
-                    .with_files(&paths)
-                    .with_target_size(std::num::NonZeroU64::new(1).unwrap())
-                    .with_max_concurrent_tasks(1)
-                    .with_writer_properties(self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, true))
-                    .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                    .with_session_state(Arc::new(self.maintenance_session_state()))
-                    .await
-                {
-                    Ok((new_table, _)) => {
-                        let provider = TableProviderBuilder::default()
-                            .with_log_store(new_table.log_store())
-                            .with_eager_snapshot(Arc::new(new_table.snapshot()?.snapshot().clone()))
-                            .build()
-                            .await
-                            .map_err(|e| anyhow::anyhow!("dedup SortByDedup post-rewrite provider: {e}"))?;
-                        let post_ctx = datafusion::prelude::SessionContext::new_with_state(build_optimize_session_state(
-                            self.config.memory.timefusion_query_partitions,
-                            self.maintenance_runtime_env(),
-                        ));
-                        post_ctx.register_table(scan_name, Arc::new(provider))?;
-                        let after = post_ctx
-                            .sql(&format!("SELECT count(*) FROM {scan_name} WHERE {chunk_filter}"))
-                            .await?
-                            .collect()
-                            .await?
-                            .first()
-                            .and_then(|batch| {
-                                batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|array| array.value(0) as u64)
-                            })
-                            .unwrap_or(before);
-                        self.swap_and_refresh_cache(table_ref, new_table, Some(&pre_uris), &[]).await;
-                        return Ok((before.saturating_sub(after), true));
-                    }
-                    Err(error) if replan + 1 < MAX_REPLANS && is_occ_conflict_err(&error.to_string()) => {
-                        debug!("dedup SortByDedup conflict for table={} chunk=[{}], re-planning: {}", table_name, label, error);
-                        tokio::time::sleep(occ_backoff(replan)).await;
-                        continue;
-                    }
-                    Err(error) => return Err(anyhow::anyhow!("dedup SortByDedup rewrite failed: {error}")),
-                }
-            }
-            // Tables without a declared sort order retain the bounded hash
-            // fallback below; all production dedup tables use SortByDedup.
+            // 2026-07-29 (Phase 2): the delta-rs `SortByDedup` OptimizeBuilder
+            // fast path was removed here. It rewrote AND committed inside one
+            // call, so it could not be staged for a wave — and its per-chunk
+            // commit is precisely the delete-delete partner that aborted against
+            // light optimize. The shard path below covers the same inputs: the
+            // fast path only ran when the whole chunk fit the rewrite budgets,
+            // which is the shard path's `shards == 1` case.
+            //
             // 3. Decide the shard count. A dedup `SELECT * … collect()` decodes to
             // Arrow at 5-20× compressed OUTSIDE the memory pool, so an over-budget
             // chunk used to be skipped (dupe left forever). Instead we split the
@@ -5974,15 +6002,17 @@ impl Database {
                         label,
                         targets.len()
                     );
-                    return Ok((0, false));
+                    return Ok(BinOutcome::Retry);
                 }
             }
 
             // 4. Rewrite each shard independently: collect (bounded to ~one budget by
             // the bucket range), dedup, stage its own parquet. The permit bounds
-            // concurrent Arrow materializations across the sweep; held for the loop
-            // only, dropped before the commit-retry loop (log write + OCC sleeps decode
-            // nothing). Out-of-window rows in the target files carry through verbatim
+            // concurrent Arrow materializations across the sweep — unlike hot-wave
+            // staging (which has its own K-bounded light pool), dedup materializes
+            // Arrow OUTSIDE any pool, which is exactly what this semaphore is for.
+            // Held for the shard loop only, dropped before the unit is handed to a
+            // wave (the commit decodes nothing). Out-of-window rows in the target files carry through verbatim
             // (their keys are unique → no drop). On any per-shard error, already-staged
             // parquet is cleaned before returning so a mid-loop failure leaks nothing.
             let rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
@@ -6038,100 +6068,40 @@ impl Database {
                 return Err(e);
             }
             if before == 0 {
-                return Ok((0, false));
+                return Ok(BinOutcome::Retry);
             }
             if before == after {
                 // Probe false-positive (a concurrent rewrite already deduped): discard
                 // the staged no-op copies, certify clean, commit nothing.
                 Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                return Ok((0, true));
+                return Ok(BinOutcome::Converged);
             }
-            let dropped = (before - after) as u64;
-            let removes: Vec<Action> = targets.iter().map(|a| Action::Remove(remove_for_add(a))).collect();
-
-            // 6. Commit Remove+Add under the commit lock, verifying every
-            // target file is still live in the refreshed snapshot (a missing
-            // one means a concurrent rewrite superseded our read → re-plan).
-            const MAX_RETRIES: usize = 4;
-            for attempt in 0..MAX_RETRIES {
-                let commit_guard = commit_lock.lock().await;
-                if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
-                    debug!("dedup rewrite pre-commit refresh failed (attempt {}): {}", attempt + 1, e);
-                }
-                let mut new_table = { table_ref.read().await.clone() };
-                let live: std::collections::HashSet<String> = new_table.snapshot()?.log_data().iter().map(|f| f.path().into_owned()).collect();
-                if targets.iter().any(|t| !live.contains(&t.path)) {
-                    drop(commit_guard);
-                    Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                    debug!("dedup rewrite: target rewritten concurrently, re-planning table={} chunk=[{}]", table_name, label);
-                    tokio::time::sleep(occ_backoff(replan)).await;
-                    break; // out of the commit loop → next re-plan iteration
-                }
-                let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                let op = DeltaOperation::Write {
-                    mode: deltalake::protocol::SaveMode::Overwrite,
-                    partition_by: (!schema.partitions.is_empty()).then(|| schema.partitions.clone()),
-                    predicate: None,
-                };
-                let commit_res =
-                    deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                        .with_actions(removes.iter().chain(adds.iter()).cloned().collect::<Vec<_>>())
-                        .build(Some(new_table.snapshot()? as &dyn TableReference), new_table.log_store(), op)
-                        .await;
-                match commit_res {
-                    Ok(finalized) => {
-                        new_table.state = Some(finalized.snapshot());
-                        // Release before post-commit work (swap + cache warm), matching
-                        // the flush staged path — holding it would serialize appends.
-                        drop(commit_guard);
-                        self.swap_and_refresh_cache(table_ref, new_table, Some(&pre_uris), &[]).await;
-                        crate::metrics::record_compaction_dedup_dropped(dropped);
-                        info!(
-                            "dedup rewrite: table={} chunk=[{}] files={} dropped={} (before={} after={})",
-                            table_name,
-                            label,
-                            targets.len(),
-                            dropped,
-                            before,
-                            after
-                        );
-                        return Ok((dropped, true));
-                    }
-                    Err(e) => {
-                        drop(commit_guard);
-                        if is_occ_conflict_err(&e.to_string()) && attempt + 1 < MAX_RETRIES {
-                            debug!("dedup rewrite OCC conflict (attempt {}/{}) table={} chunk=[{}]", attempt + 1, MAX_RETRIES, table_name, label);
-                            tokio::time::sleep(occ_backoff(attempt)).await;
-                        } else {
-                            // Terminal (non-OCC, or retries exhausted): probe before
-                            // deleting the NEW files. A landed-but-hook-failed commit
-                            // already Removed the OLD files, so the new files are the
-                            // only live copy — deleting them loses data (unlike the
-                            // pure-append flush path, where the originals survive).
-                            match self.probe_commit_landed(table_ref, &adds).await {
-                                CommitProbe::Landed => {
-                                    warn!("dedup rewrite for '{}' chunk=[{}] reported an error but LANDED (post-commit hook failed): {}", table_name, label, e);
-                                    let post = { table_ref.read().await.clone() };
-                                    self.swap_and_refresh_cache(table_ref, post, Some(&pre_uris), &[]).await;
-                                    crate::metrics::record_compaction_dedup_dropped(dropped);
-                                    return Ok((dropped, true));
-                                }
-                                CommitProbe::NotLanded => {
-                                    Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
-                                    return Err(anyhow::anyhow!("dedup rewrite commit failed: {e}"));
-                                }
-                                CommitProbe::Inconclusive => {
-                                    warn!(
-                                        "dedup rewrite for '{}' chunk=[{}] errored, landing UNCONFIRMED — leaving new files in place: {}",
-                                        table_name, label, e
-                                    );
-                                    return Err(anyhow::anyhow!("dedup rewrite commit failed (landing unconfirmed): {e}"));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Row-DROPPING rewrite: data_change=true on both sides. See
+            // `staged_actions` — the snapshot-isolation downgrade the hot path
+            // enjoys is only sound for data-preserving commits.
+            let (removes, adds) = staged_actions(&targets, adds, true);
+            // Record the intent BEFORE the unit can be handed to a wave commit, so
+            // a crash anywhere in the staging->commit window leaves a trail to
+            // clean up (same guarantee as hot bins).
+            let wave_id = uuid::Uuid::new_v4().to_string();
+            self.record_staged_intent(&StagedIntent {
+                wave_id: wave_id.clone(),
+                table_name: table_name.to_string(),
+                project_id: project_id.to_string(),
+                recorded_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                paths: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
+            });
+            debug!(table_name, project_id, chunk = label, files = targets.len(), before, after, event = "dedup_chunk_staged");
+            return Ok(BinOutcome::Staged(StagedBin {
+                project_id: project_id.to_string(),
+                wave_id,
+                target_paths: targets.iter().map(|t| t.path.clone()).collect(),
+                removes,
+                adds,
+                stage_store,
+                data_change: true,
+                dedup: Some(DedupUnit { key: key.clone(), date: date_str.to_string(), label: label.to_string(), before: before as u64, after: after as u64 }),
+            }));
         }
         anyhow::bail!("dedup rewrite: re-plan attempts exhausted for table={} chunk=[{}]", table_name, label)
     }
@@ -6356,52 +6326,126 @@ impl Database {
             })
             .take(self.config.maintenance.timefusion_dirty_bin_drain_batch.max(1))
             .collect();
-        for (project_id, date, bin) in ready {
-            let key = (project_id.clone(), table_name.to_string(), date.clone(), bin);
-            self.dedup_dirty_bins.remove(&key);
+        if ready.is_empty() {
+            return Ok(());
+        }
+        // Phase 2 (2026-07-29): bins STAGE in parallel and commit in WAVES.
+        // Previously each bin rewrote and committed strictly one at a time —
+        // serialization was deliberate, because concurrent per-bin commits to
+        // one Delta log were an OCC storm — and a drain took up to 572s. Batched
+        // commits remove that reason, so the only remaining bound on rewrite
+        // parallelism is memory: `stage_dedup_chunk` takes a
+        // `maintenance_rewrite_sem` permit around its (pool-invisible) Arrow
+        // materialization, and `buffer_unordered(permits)` keeps in-flight
+        // staging matched to it rather than unbounded.
+        //
+        // A bounded stream, not the hot path's `round_robin_bins` driver: the
+        // dirty queue is already fair (FIFO, capped per tick by
+        // `dirty_bin_drain_batch`), each bin is served exactly once per tick,
+        // and there is no per-round re-plan — the driver's rotation/round
+        // semantics would add ceremony with nothing to schedule.
+        use futures::stream::StreamExt;
+        let permits = self.config.derived.rewrite_permits().max(1);
+        // A wave's units all sit in memory as Delta actions only (their parquet
+        // is already in R2), so the cap is about commit size, not memory.
+        const DEDUP_WAVE_UNITS: usize = 8;
+        let mut staging = futures::stream::iter(ready.into_iter().map(|(project_id, date, bin)| {
+            let table_name = table_name;
+            async move {
+                let key: DirtyBinKey = (project_id.clone(), table_name.to_string(), date.clone(), bin);
+                self.dedup_dirty_bins.remove(&key);
+                self.persist_dirty_bins();
+                crate::metrics::maintenance_stats().dirty_bin_eligible.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
+                let started = std::time::Instant::now();
+                let staged = match chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
+                    Ok(parsed) => {
+                        tokio::time::timeout(
+                            DIRTY_BIN_BUDGET,
+                            self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())),
+                        )
+                        .await
+                    }
+                    Err(e) => Ok(Err(anyhow::anyhow!("invalid dirty-bin date {date}: {e}"))),
+                };
+                (key, started.elapsed(), staged)
+            }
+        }))
+        .buffer_unordered(permits);
+
+        let mut wave: Vec<StagedBin> = Vec::new();
+        let requeue = |key: DirtyBinKey, counter: &std::sync::atomic::AtomicU64| {
+            self.dedup_dirty_bins.insert(key, ());
             self.persist_dirty_bins();
-            crate::metrics::maintenance_stats().dirty_bin_eligible.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
-            let started = std::time::Instant::now();
-            let parsed_date = chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d")?;
-            let result = match tokio::time::timeout(DIRTY_BIN_BUDGET, self.dedup_partition_range(table, table_name, &project_id, parsed_date, Some(bin))).await
-            {
-                Ok(r) => r,
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        while let Some((key, elapsed, staged)) = staging.next().await {
+            let stats = crate::metrics::maintenance_stats();
+            let (project_id, _, date, bin) = key.clone();
+            match staged {
+                // Over budget — requeue and move on so other maintenance runs.
                 Err(_) => {
-                    // Over budget — requeue and move on so other maintenance runs.
-                    self.dedup_dirty_bins.insert(key.clone(), ());
-                    self.persist_dirty_bins();
-                    crate::metrics::maintenance_stats().dedup_timed_out.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    requeue(key, &stats.dedup_timed_out);
                     warn!(project_id, table_name, date, bin, budget_secs = DIRTY_BIN_BUDGET.as_secs(), event = "dirty_bin_timeout");
                     continue;
                 }
-            };
-            match result {
-                Ok((dropped, true)) => {
-                    let elapsed = started.elapsed().as_millis() as u64;
-                    let stats = crate::metrics::maintenance_stats();
-                    stats.dirty_bin_processed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    stats.dirty_bin_dropped_rows.fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
-                    stats.dirty_bin_rewrite_duration_ms.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
-                    info!(project_id, table_name, date, bin, dropped, duration_ms = elapsed, event = "dirty_bin_complete");
-                }
-                Ok((_, false)) => {
-                    self.dedup_dirty_bins.insert(key, ());
-                    self.persist_dirty_bins();
-                    crate::metrics::maintenance_stats().dirty_bin_requeued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    warn!(project_id, table_name, date, bin, event = "dirty_bin_requeued");
-                }
-                Err(error) => {
-                    self.dedup_dirty_bins.insert(key, ());
-                    self.persist_dirty_bins();
-                    crate::metrics::maintenance_stats().dirty_bin_requeued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Err(error)) => {
+                    requeue(key, &stats.dirty_bin_requeued);
                     warn!(project_id, table_name, date, bin, %error, event = "dirty_bin_failure");
-                    info!(project_id, table_name, date, bin, event = "dirty_bin_requeued");
+                    continue;
+                }
+                Ok(Ok((units, complete))) => {
+                    stats.dirty_bin_rewrite_duration_ms.fetch_add(elapsed.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                    // Duplicate-bearing work was skipped inside the bin (unsealed
+                    // chunk, unshardable key group): the bin is NOT done, so it
+                    // goes back on the queue even if its other chunks land.
+                    if !complete {
+                        requeue(key, &stats.dirty_bin_requeued);
+                        warn!(project_id, table_name, date, bin, event = "dirty_bin_requeued");
+                    }
+                    wave.extend(units);
                 }
             }
+            if wave.len() >= DEDUP_WAVE_UNITS {
+                self.commit_dedup_wave(table, table_name, std::mem::take(&mut wave)).await;
+            }
+        }
+        if !wave.is_empty() {
+            self.commit_dedup_wave(table, table_name, wave).await;
         }
         self.persist_dirty_bins();
         Ok(())
+    }
+
+    /// Commit one dedup wave and settle its units' dirty-bin bookkeeping: a unit
+    /// that didn't land (stale target, failed/unconfirmed commit) puts its bin
+    /// back on the queue, because its duplicates are still in the table.
+    async fn commit_dedup_wave(&self, table: &Arc<RwLock<DeltaTable>>, table_name: &str, units: Vec<StagedBin>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut markers: Vec<String> = units.iter().filter_map(|u| u.dedup.as_ref()).map(|d| format!("date={}/", d.date)).collect();
+        markers.sort();
+        markers.dedup();
+        let result = self.commit_wave(table, table_name, &markers, true, units, 0).await;
+        let stats = crate::metrics::maintenance_stats();
+        let mut landed_bins: std::collections::HashSet<DirtyBinKey> = std::collections::HashSet::new();
+        for unit in &result.landed {
+            let Some(d) = &unit.dedup else { continue };
+            info!(table_name, chunk = d.label, dropped = d.dropped(), before = d.before, after = d.after, event = "dirty_bin_chunk_complete");
+            stats.dirty_bin_dropped_rows.fetch_add(d.dropped(), Relaxed);
+            if let Some(key) = d.key.clone() {
+                landed_bins.insert(key);
+            }
+        }
+        for unit in &result.failed {
+            let Some(key) = unit.dedup.as_ref().and_then(|d| d.key.clone()) else { continue };
+            landed_bins.remove(&key);
+            let (project_id, _, date, bin) = key.clone();
+            self.dedup_dirty_bins.insert(key, ());
+            stats.dirty_bin_requeued.fetch_add(1, Relaxed);
+            warn!(project_id, table_name, date, bin, event = "dirty_bin_requeued");
+        }
+        stats.dirty_bin_processed.fetch_add(landed_bins.len() as u64, Relaxed);
+        self.persist_dirty_bins();
     }
 
     /// One table's dedup of sealed partitions (dirty-bin rewrite + optional
@@ -6458,92 +6502,578 @@ impl Database {
         }
     }
 
+    /// Hot-tail compaction for one table, as plan-once → rewrite-parallel →
+    /// commit-once WAVES (design doc: docs/compaction-redesign-2026-07-29.md).
+    ///
+    /// Per tick: ONE tag-first metadata walk plans a bin for every hot project
+    /// (`select_all_hot_bins`), each round's bins are rewritten to staged parquet
+    /// in parallel WITHOUT touching the Delta log, and the whole round lands in
+    /// ONE `CommitBuilder` transaction. This replaces the per-bin
+    /// `OptimizeBuilder` path: it was 132 metadata walks and ~130 commits per
+    /// tick on one shared log, where the commits alone (OCC ladders to attempt
+    /// 9-20) were most of a 40-65s pass, and the per-project greedy drain left 8
+    /// of 11 hot projects unreached on a 5-min cron (prod 2026-07-29).
+    ///
+    /// `TIMEFUSION_LIGHT_OPTIMIZE_ENABLED=false` remains the incident kill switch.
     pub async fn optimize_table_light(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
         let today = Utc::now().date_naive();
-        let project_ids = {
-            let table = table_ref.read().await;
-            let uris: Vec<String> = table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-            Self::hot_project_ids(&uris, today)
-        };
-        let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
-        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
-        // SortBy the schema keys (declare_sorted=true) so the current partition's
-        // light-compacted files keep an honest DESC footer for the pushdown
-        // (only when timefusion_optimize_sort_by is on; else memory-safe Compact).
-        let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
-        // Intermediate tier: this output is rewritten tonight by consolidate/recompress.
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, declare_sorted);
-
-        // Per-project fan-out gated by TIMEFUSION_LIGHT_OPTIMIZE_CONCURRENCY
-        // (default 1 = serial): each bin sort decompresses its ≤target_size
-        // parquet into several GB of Arrow, so the light pool slice is sized
-        // as one per-sort budget per allowed sort (`light_optimize_pool_bytes`)
-        // — inheriting the heavy-rewrite knob overflowed a fixed slice
-        // (prod 2026-07-23: 2 sorts in 6GB, busiest project starved every tick).
         let today_str = today.to_string();
-        let concurrency = self.config.maintenance.timefusion_light_optimize_concurrency.max(1);
-        let failed = futures::stream::iter(project_ids)
-            .map(|project_id| {
-                self.optimize_one_hot_project(table_ref, table_name, today, &today_str, project_id, target_size, &writer_properties, &optimize_type)
-            })
-            .buffer_unordered(concurrency)
-            .filter(|r| std::future::ready(r.is_err()))
-            .count()
-            .await;
-        anyhow::ensure!(failed == 0, "Light optimize failed for {failed} hot partition(s)");
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+        let target_size = self.config.maintenance.timefusion_light_optimize_target_size;
+        let min_files = self.config.maintenance.timefusion_compact_min_files;
+        // Plan ONCE for round 0; later rounds re-plan from the post-commit
+        // snapshot (see `plan` below) so a wave never re-selects the run it just
+        // wrote. Bins are ordered by compaction debt.
+        let mut planned = {
+            let table = table_ref.read().await;
+            Self::select_all_hot_bins(&table, &today_str, target_size, min_files, target_size / 4)?
+        };
+        // Rotation cursor: start where the last truncated tick stopped so the
+        // same tail is never skipped twice in a row (a truncated tick otherwise
+        // always serves the same debt-ordered prefix).
+        let cursor = self.light_optimize_cursor.swap(0, Relaxed);
+        if cursor > 0 && cursor < planned.len() {
+            planned.rotate_left(cursor);
+        }
+        if planned.is_empty() {
+            return Ok(());
+        }
+        crate::metrics::maintenance_stats().light_optimize_projects_planned.fetch_add(planned.len() as u64, Relaxed);
+        info!(table_name, date = %today, projects = planned.len(), event = "light_optimize_planned");
+        let project_ids: Vec<String> = planned.iter().map(|(project_id, _)| project_id.clone()).collect();
+        // Bins the current wave should stage, replaced wholesale by each wave's
+        // post-commit re-plan. A project absent from the map has no work left
+        // this tick and drops out of the round-robin.
+        let plan: tokio::sync::Mutex<HashMap<String, Vec<String>>> = tokio::sync::Mutex::new(planned.into_iter().collect());
+
+        let concurrency = self.config.derived.light_optimize_k(project_ids.len());
+        // Bound total rounds so a large backlog can't wedge the tick even if the
+        // wall-clock budget is raised.
+        const MAX_WAVES: usize = 12;
+        let deadline = std::time::Instant::now() + self.light_optimize_tick_budget();
+        let order_index: HashMap<String, usize> = project_ids.iter().enumerate().map(|(i, p)| (p.clone(), i)).collect();
+        let failed = round_robin_bins(
+            project_ids,
+            MAX_WAVES,
+            concurrency,
+            deadline,
+            |round, remaining| {
+                info!(table_name, round, remaining = remaining.len(), event = "light_optimize_tick_budget_exhausted");
+                crate::metrics::maintenance_stats().light_optimize_tick_truncated.fetch_add(1, Relaxed);
+                // Next tick starts at the first project this tick never served.
+                let resume = remaining.first().and_then(|p| order_index.get(p).copied()).unwrap_or(0);
+                self.light_optimize_cursor.store(resume, Relaxed);
+            },
+            || self.light_optimize_brake(),
+            |project_id, round| {
+                let (schema, plan) = (schema, &plan);
+                async move {
+                    let files = plan.lock().await.remove(&project_id).unwrap_or_default();
+                    if files.is_empty() {
+                        return (project_id, Ok(BinOutcome::Converged));
+                    }
+                    info!(table_name, project_id, date = %today, selected_files = files.len(), round, event = "light_optimize_tail_selected");
+                    let staged = self.stage_hot_bin(table_ref, table_name, schema, &project_id, files).await;
+                    (project_id, staged)
+                }
+            },
+            |bins, round| {
+                let (plan, today_str) = (&plan, today_str.as_str());
+                async move {
+                    let staged = bins.len();
+                    let failed = self.commit_wave(table_ref, table_name, &[format!("date={today_str}/")], false, bins, round).await.failed.len();
+                    // Round 0 only: one bin per project, so this is directly
+                    // comparable to `projects_planned` (the alert is
+                    // completed < planned for N consecutive ticks).
+                    if round == 0 {
+                        crate::metrics::maintenance_stats().light_optimize_projects_completed.fetch_add((staged - failed.min(staged)) as u64, Relaxed);
+                    }
+                    // Re-plan the NEXT wave from the just-committed snapshot: the
+                    // outputs are tagged sorted runs and excluded from
+                    // re-selection, so this yields each project's next time slice
+                    // — never the run this wave wrote. One walk per wave, not per
+                    // project per pass — and none at all when no further round
+                    // can run (round cap / deadline), which would walk the
+                    // snapshot only to discard the result.
+                    if round + 1 < MAX_WAVES && std::time::Instant::now() < deadline {
+                        let next = {
+                            let table = table_ref.read().await;
+                            Self::select_all_hot_bins(&table, today_str, target_size, min_files, target_size / 4).unwrap_or_default()
+                        };
+                        *plan.lock().await = next.into_iter().collect();
+                    }
+                    failed
+                }
+            },
+        )
+        .await;
+        // Checkpoint after the tick's final commit rather than per N versions:
+        // wave commits are ~40x rarer than the old per-bin commits, so a
+        // version-count cadence would checkpoint ~40x less often exactly where
+        // replay-tail length is the top CPU cost (34.5% of process CPU in
+        // ScanLogReplayProcessor, prod profile 2026-07-29).
+        self.checkpoint_after_waves(table_ref, table_name).await;
+        anyhow::ensure!(failed == 0, "Light optimize failed for {failed} hot bin(s)");
         Ok(())
     }
 
-    /// Compact one hot `(project_id, today)` partition: select the bounded tail
-    /// file set and hand it to the retrying optimize. Errors are logged and
-    /// returned so the caller can count failed partitions.
-    #[allow(clippy::too_many_arguments)]
-    async fn optimize_one_hot_project(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, today: chrono::NaiveDate, today_str: &str, project_id: String, target_size: i64,
-        writer_properties: &WriterProperties, optimize_type: &deltalake::operations::optimize::OptimizeType,
-    ) -> Result<()> {
-        let partition_filters =
-            vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", today_str))?];
-        let min_files = self.config.maintenance.timefusion_compact_min_files;
-        // Pack successive time-disjoint bins in one tick until the tail is
-        // converged. `light_optimize_tail` returns one bin (the earliest sealed
-        // slice) per call; on a high-volume project the day fragments to dozens
-        // of files between 5-min ticks, so one-bin-per-tick perpetually lags
-        // ingest (prod 2026-07-21: 12 files compacted/tick while 69 remained in
-        // the 1h window → 6s+ scans). Each compacted output is tagged
-        // (SORTED_RUN_TAG) and excluded from re-selection, so re-reading the
-        // post-swap snapshot yields the next slice — never the just-written run.
-        // Bound the passes so a large backlog can't wedge the tick.
-        const MAX_BINS_PER_TICK: usize = 12;
-        for pass in 0..MAX_BINS_PER_TICK {
-            let selected_files = {
-                let table = table_ref.read().await;
-                Self::light_optimize_tail(&table, &partition_filters, target_size, min_files, target_size / 4).await?
-            };
-            if selected_files.is_empty() {
+    /// Stage ONE bin's rewrite: read exactly the selected files, sort by the
+    /// schema keys, write staged parquet, and return the Remove+Add actions for
+    /// the wave commit. No Delta commit and no table lock — pure object-store +
+    /// CPU work, so waves parallelize against the idle cores instead of
+    /// serializing behind the log. Uncommitted parquet is invisible to readers,
+    /// and any failure cleans up its own staged files (`cleanup_orphaned_parquet`)
+    /// so a failed bin leaks nothing and blocks no other bin.
+    ///
+    /// `Retry` = the bin's files were rewritten concurrently (dedup race); the
+    /// project stays in the rotation and the next round's re-plan serves it a
+    /// fresh bin. `Converged` = nothing worth staging.
+    async fn stage_hot_bin(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, schema: &crate::schema_loader::TableSchema, project_id: &str, files: Vec<String>,
+    ) -> Result<BinOutcome<StagedBin>> {
+        use deltalake::{delta_datafusion::TableProviderBuilder, kernel::Action, writer::DeltaWriter};
+        // One read-lock, one table clone per bin: the pinned scan snapshot and
+        // the writer's staging table both derive from it (a second clone per
+        // bin was pure waste — K bins x up to 12 waves per tick).
+        let staging_table = { table_ref.read().await.clone() };
+        let (snapshot, log_store) = (Arc::new(staging_table.snapshot()?.snapshot().clone()), staging_table.log_store());
+        // Map paths to Add actions in the SAME snapshot the scan reads, so the
+        // Remove tombstones carry the exact fields of the files we rewrote.
+        let wanted: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
+        let targets: Vec<deltalake::kernel::Add> = snapshot
+            .log_data()
+            .iter()
+            .filter(|f| wanted.contains(f.path().as_ref()))
+            .map(|f| {
+                #[allow(deprecated)]
+                f.add_action()
+            })
+            .collect();
+        if targets.len() != files.len() {
+            debug!(table_name, project_id, mapped = targets.len(), selected = files.len(), event = "light_optimize_bin_vanished");
+            return Ok(BinOutcome::Retry);
+        }
+        // NO maintenance_rewrite_sem here, deliberately: that semaphore (2
+        // permits, shared with dedup/recompress) exists because heavy rewrites'
+        // Arrow is pool-invisible. Wave staging is different: its concurrency
+        // is already bounded by K, its sorts run in the light pool sized for
+        // exactly K concurrent sorts, and its writer buffers are budgeted by
+        // writer_reserve in the derived tree. Taking the shared permit would
+        // cap waves at 2 (or 0 while dedup holds both) and burn the tick
+        // deadline waiting — starving the parallelism the pool paid for.
+        let stage_store = staging_table.log_store().object_store(None);
+        let mut adds: Vec<Action> = Vec::new();
+        let staged: Result<()> = async {
+            // File-scoped provider over the pinned snapshot: reads exactly this
+            // bin's files, so no predicate and no per-file stats parsing.
+            let provider = TableProviderBuilder::default()
+                .with_log_store(log_store)
+                .with_eager_snapshot(Arc::clone(&snapshot))
+                .with_file_paths(files.clone())
+                .build()
+                .await
+                .map_err(|e| anyhow::anyhow!("hot bin provider: {e}"))?;
+            // The light session state forces non-view Parquet types: Variant
+            // columns are Struct{Binary, Binary} on disk and a view-typed read
+            // blows the rewrite up mid-scan with "Expected Binary, got BinaryView".
+            let ctx = datafusion::prelude::SessionContext::new_with_state(self.light_optimize_session_state());
+            ctx.register_table("hot_bin", Arc::new(provider))?;
+            let batches: Vec<RecordBatch> = ctx.sql("SELECT * FROM hot_bin").await?.collect().await?;
+            if batches.iter().all(|b| b.num_rows() == 0) {
                 return Ok(());
             }
-            info!(table_name, project_id, date = %today, selected_files = selected_files.len(), pass, event = "light_optimize_tail_selected");
-            self.optimize_table_light_inner(
-                table_ref,
-                table_name,
-                today,
-                &project_id,
-                &partition_filters,
-                &selected_files,
-                target_size,
-                writer_properties,
-                optimize_type.clone(),
-                min_files,
-                std::time::Instant::now(),
-            )
-            .await
-            .inspect_err(|e| warn!("Light optimize failed for project={} date={}: {}", project_id, today, e))?;
+            let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
+            let (batches, sorted) = sort_batches_by_schema(schema, batches);
+            // Intermediate tier: this output is rewritten tonight by
+            // consolidate/recompress, so it isn't worth max compression.
+            let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
+            let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
+                .map_err(|e| anyhow::anyhow!("hot bin writer: {e}"))?
+                .with_writer_properties(writer_properties);
+            let target_schema = writer.arrow_schema();
+            for b in &batches {
+                let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
+                writer.write(casted).await.map_err(|e| anyhow::anyhow!("hot bin stage: {e}"))?;
+            }
+            adds.extend(writer.flush().await.map_err(|e| anyhow::anyhow!("hot bin flush: {e}"))?.into_iter().map(|mut add| {
+                // Tag the output so the next tick's selection treats it as a
+                // sorted run (folded only while under the sorted-run cap).
+                if sorted {
+                    add.tags.get_or_insert_with(Default::default).insert(SORTED_RUN_TAG.to_string(), Some("true".to_string()));
+                }
+                Action::Add(add)
+            }));
+            Ok(())
         }
-        Ok(())
+        .await;
+        if let Err(e) = staged {
+            Self::cleanup_orphaned_parquet(&stage_store, &adds).await;
+            warn!("Light optimize staging failed for project={} table={}: {}", project_id, table_name, e);
+            return Err(e);
+        }
+        if adds.is_empty() {
+            // Zero rows staged: nothing to commit, and retrying the same
+            // zero-row selection would loop — treat as converged for this tick.
+            return Ok(BinOutcome::Converged);
+        }
+        // Record the intent BEFORE the bin can be handed to a wave commit, so a
+        // crash anywhere in the staging→commit window leaves a trail to clean up.
+        let wave_id = uuid::Uuid::new_v4().to_string();
+        self.record_staged_intent(&StagedIntent {
+            wave_id: wave_id.clone(),
+            table_name: table_name.to_string(),
+            project_id: project_id.to_string(),
+            recorded_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            paths: adds.iter().filter_map(|a| if let Action::Add(add) = a { Some(add.path.clone()) } else { None }).collect(),
+        });
+        // Data-preserving compaction: BOTH sides carry data_change=false so the
+        // fork's snapshot-isolation downgrade applies and concurrent ingest
+        // appends can't veto the wave (see `staged_actions`; aa50480).
+        let (removes, adds) = staged_actions(&targets, adds, false);
+        Ok(BinOutcome::Staged(StagedBin {
+            project_id: project_id.to_string(),
+            wave_id,
+            target_paths: files,
+            removes,
+            adds,
+            stage_store,
+            data_change: false,
+            dedup: None,
+        }))
     }
 
-    /// Inner optimize loop. Caller is expected to hold the flush lock when
+    /// Commit one WAVE: every staged unit's Remove+Add in a SINGLE transaction.
+    /// Before committing, each unit's target files are verified still live in the
+    /// refreshed snapshot; a unit whose target was rewritten concurrently has ONLY
+    /// its own actions dropped (and its staged parquet cleaned) — the rest of the
+    /// wave still commits.
+    ///
+    /// Shared by BOTH producers — hot-tail compaction (today's partitions) and
+    /// dirty-bin dedup (sealed dates). They are disjoint by construction: dedup
+    /// skips `date == today` and hot compaction only ever selects it, so the two
+    /// engines never stage the same file. What they DO share is this commit path
+    /// and the per-physical-table commit lock, which is what ends the
+    /// optimize-vs-dedup delete-delete aborts (prod 2026-07-29, 3x in one day):
+    /// their Removes can no longer interleave inside each other's OCC window.
+    ///
+    /// `data_change` selects the two engines' one real difference — see
+    /// [`staged_actions`] and [`wave_operation`]. Every unit in a wave must agree
+    /// on it (waves are built by one producer).
+    async fn commit_wave(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date_markers: &[String], data_change: bool, bins: Vec<StagedBin>, round: usize,
+    ) -> WaveResult {
+        use deltalake::kernel::{Action, transaction::TableReference};
+        debug_assert!(bins.iter().all(|b| b.data_change == data_change), "a wave must not mix data-preserving and row-dropping units");
+        let engine = if data_change { "dedup" } else { "light optimize" };
+        let mut bins = bins;
+        let mut failed: Vec<StagedBin> = Vec::new();
+        // Key on "" explicitly: the wave spans MULTIPLE projects of one physical
+        // table, and every other unified-log writer (flush, dedup, coalesced
+        // commit) serializes under the ("", table) key. Keying on
+        // bins[0].project_id would silently pick a DIFFERENT lock if that
+        // project has custom storage (table_lock_key only collapses non-custom
+        // projects) — the liveness check would then race dedup's Removes.
+        let commit_lock = self.commit_lock("", table_name).await;
+        // The wave spans several projects of a handful of dates, so the
+        // warm/evict diff is scoped to those dates rather than the whole
+        // (26k-file) table.
+        let markers: Vec<&str> = date_markers.iter().map(String::as_str).collect();
+        let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+        const MAX_RETRIES: usize = 4;
+        for attempt in 0..MAX_RETRIES {
+            let commit_guard = commit_lock.lock().await;
+            if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
+                debug!("{engine} wave pre-commit refresh failed (attempt {}): {}", attempt + 1, e);
+            }
+            let mut new_table = { table_ref.read().await.clone() };
+            let live: std::collections::HashSet<String> = match new_table.snapshot() {
+                Ok(s) => s.log_data().iter().map(|f| f.path().into_owned()).collect(),
+                Err(e) => {
+                    drop(commit_guard);
+                    error!("{engine} wave: no snapshot for {table_name}: {e}");
+                    self.discard_bins(&bins).await;
+                    failed.extend(bins);
+                    return WaveResult { landed: Vec::new(), failed };
+                }
+            };
+            let (fresh, stale) = split_live_bins(bins, |b| &b.target_paths, &live);
+            for bin in &stale {
+                debug!(table_name, project_id = %bin.project_id, engine, event = "wave_bin_stale_at_commit");
+            }
+            self.discard_bins(&stale).await;
+            failed.extend(stale);
+            if fresh.is_empty() {
+                drop(commit_guard);
+                return WaveResult { landed: Vec::new(), failed };
+            }
+            let actions: Vec<Action> = fresh.iter().flat_map(|b| b.removes.iter().chain(b.adds.iter()).cloned()).collect();
+            let pre_uris: Option<std::collections::HashSet<String>> = track_files.then(|| scoped_file_uris(&new_table, &markers).into_iter().collect());
+            let partitions = get_schema(table_name).unwrap_or_else(get_default_schema).partitions.clone();
+            let op = wave_operation(data_change, self.config.maintenance.timefusion_light_optimize_target_size, (!partitions.is_empty()).then_some(partitions));
+            let snapshot_ref = match new_table.snapshot() {
+                Ok(s) => s as &dyn TableReference,
+                Err(_) => {
+                    drop(commit_guard);
+                    failed.extend(fresh);
+                    return WaveResult { landed: Vec::new(), failed };
+                }
+            };
+            let commit_res =
+                deltalake::kernel::transaction::CommitBuilder::from(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
+                    .with_actions(actions)
+                    .build(Some(snapshot_ref), new_table.log_store(), op)
+                    .await;
+            match commit_res {
+                Ok(finalized) => {
+                    new_table.state = Some(finalized.snapshot());
+                    // Release before post-commit work (swap + cache warm) —
+                    // holding it would serialize ingest appends.
+                    drop(commit_guard);
+                    let bins_committed = fresh.len();
+                    self.clear_bin_intents(&fresh);
+                    info!(table_name, engine, round, bins = bins_committed, attempt = attempt + 1, event = "wave_committed");
+                    // WARM BEFORE EVICT: a wave swaps K bins at once, so
+                    // evicting first would cold-start the hottest query window
+                    // every wave (the 2026-07-21 cache-thrash lesson).
+                    self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &markers).await;
+                    Self::record_wave_landed(&fresh, data_change);
+                    return WaveResult { landed: fresh, failed };
+                }
+                Err(e) => {
+                    drop(commit_guard);
+                    let occ = is_occ_conflict_err(&e.to_string());
+                    if occ {
+                        crate::metrics::record_optimize_conflict();
+                    }
+                    if occ && attempt + 1 < MAX_RETRIES {
+                        debug!("{engine} wave OCC conflict (attempt {}/{}) table={}", attempt + 1, MAX_RETRIES, table_name);
+                        tokio::time::sleep(occ_backoff(attempt)).await;
+                        bins = fresh; // re-verify liveness against the newer snapshot
+                        continue;
+                    }
+                    // Terminal: probe before deleting the NEW files. A
+                    // landed-but-hook-failed commit already Removed the OLD
+                    // files, so the new files are the only live copy.
+                    let all_adds: Vec<Action> = fresh.iter().flat_map(|b| b.adds.iter().cloned()).collect();
+                    match self.probe_commit_landed(table_ref, &all_adds).await {
+                        CommitProbe::Landed => {
+                            warn!("{engine} wave for '{}' reported an error but LANDED (post-commit hook failed): {}", table_name, e);
+                            let post = { table_ref.read().await.clone() };
+                            self.swap_and_refresh_cache(table_ref, post, pre_uris.as_ref(), &markers).await;
+                            self.clear_bin_intents(&fresh);
+                            Self::record_wave_landed(&fresh, data_change);
+                            return WaveResult { landed: fresh, failed };
+                        }
+                        CommitProbe::NotLanded => {
+                            crate::metrics::record_optimize_failed();
+                            error!("{engine} wave commit failed for '{}': {}", table_name, e);
+                            self.discard_bins(&fresh).await;
+                            failed.extend(fresh);
+                            return WaveResult { landed: Vec::new(), failed };
+                        }
+                        CommitProbe::Inconclusive => {
+                            // Staged files stay in place (they may be the only
+                            // live copy) — the units still count as failed, so a
+                            // dedup unit's dirty bin is requeued.
+                            warn!("{engine} wave for '{}' errored, landing UNCONFIRMED — leaving new files in place: {}", table_name, e);
+                            failed.extend(fresh);
+                            return WaveResult { landed: Vec::new(), failed };
+                        }
+                    }
+                }
+            }
+        }
+        WaveResult { landed: Vec::new(), failed }
+    }
+
+    /// Per-engine counters for a landed wave. Dedup's dropped-row accounting is
+    /// reported HERE and nowhere else: staging knows `before`/`after` long before
+    /// the transaction exists, and a unit that loses the liveness check or the
+    /// commit dropped exactly zero rows from the table.
+    fn record_wave_landed(landed: &[StagedBin], data_change: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stats = crate::metrics::maintenance_stats();
+        if data_change {
+            for dropped in landed.iter().filter_map(|b| b.dedup.as_ref()).map(DedupUnit::dropped).filter(|d| *d > 0) {
+                crate::metrics::record_compaction_dedup_dropped(dropped);
+            }
+        } else {
+            stats.light_optimize_bins_committed.fetch_add(landed.len() as u64, Relaxed);
+            stats.light_optimize_waves_committed.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Cleanup + intent-clear for bins leaving the wave uncommitted. One helper
+    /// because the pair IS the crash-safety invariant — a drifted copy that
+    /// cleans without clearing (or vice versa) breaks the manifest's meaning.
+    async fn discard_bins(&self, bins: &[StagedBin]) {
+        for bin in bins {
+            Self::cleanup_orphaned_parquet(&bin.stage_store, &bin.adds).await;
+        }
+        self.clear_bin_intents(bins);
+    }
+
+    fn clear_bin_intents(&self, bins: &[StagedBin]) {
+        self.clear_staged_intent(&bins.iter().map(|b| b.wave_id.as_str()).collect::<Vec<_>>());
+    }
+
+    /// Local-disk record of staged-but-uncommitted parquet, so a crash between
+    /// staging and the wave commit doesn't leave objects in R2 that nothing
+    /// references and nothing knows to delete. Lives on the WAL volume (same
+    /// disk, already durable-by-design for exactly this class of intent).
+    ///
+    /// Written AFTER the writer flush rather than before the first write: the
+    /// delta-rs `RecordBatchWriter` mints the object names itself, so the
+    /// "intended paths" are not knowable earlier. That leaves only a
+    /// crash-mid-PUT window uncovered (a partial object under a name nobody
+    /// ever learned) — VACUUM's job, as before. The window this closes is the
+    /// long one: staging → wave commit, which spans the whole wave.
+    fn staged_intent_path(&self) -> PathBuf {
+        let wal_dir = self.config.core.wal_dir();
+        wal_dir.parent().map(|p| p.to_path_buf()).unwrap_or(wal_dir).join("staged_intent.jsonl")
+    }
+
+    /// Append one bin's staged paths. Best-effort: a manifest write failure
+    /// must never fail the compaction, only widen the VACUUM backstop's job.
+    fn record_staged_intent(&self, entry: &StagedIntent) {
+        use std::io::Write;
+        let path = self.staged_intent_path();
+        let write = (|| -> std::io::Result<()> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+            writeln!(file, "{}", serde_json::to_string(entry)?)
+        })();
+        if let Err(e) = write {
+            warn!("staged-intent manifest append failed ({:?}): {} — orphan cleanup falls back to VACUUM", path, e);
+        }
+    }
+
+    /// Drop one wave's entries, rewrite-compacting the append-only file. Called
+    /// after the wave commits or after its staged parquet is cleaned up, i.e.
+    /// once the entry can no longer describe an orphan.
+    fn clear_staged_intent(&self, wave_ids: &[&str]) {
+        let path = self.staged_intent_path();
+        let Ok(contents) = std::fs::read_to_string(&path) else { return };
+        let kept: Vec<String> = parse_staged_intents(&contents)
+            .into_iter()
+            .filter(|e| !wave_ids.contains(&e.wave_id.as_str()))
+            .filter_map(|e| serde_json::to_string(&e).ok())
+            .collect();
+        let write = if kept.is_empty() { std::fs::write(&path, b"") } else { std::fs::write(&path, kept.join("\n") + "\n") };
+        if let Err(e) = write {
+            warn!("staged-intent manifest compaction failed ({:?}): {}", path, e);
+        }
+    }
+
+    /// Boot-time orphan sweep: delete staged parquet the Delta log doesn't
+    /// reference, BY KEY (no LIST — R2 listing is a known incident source).
+    /// Every failure mode degrades to a `warn!` and a no-op: the manifest is a
+    /// cleanup aid, correctness never depends on it.
+    async fn reconcile_staged_intents(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
+        use object_store::ObjectStoreExt;
+        let path = self.staged_intent_path();
+        let Ok(contents) = std::fs::read_to_string(&path) else { return };
+        let entries = parse_staged_intents(&contents);
+        if entries.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let (referenced, store) = {
+            let table = table_ref.read().await;
+            let Ok(snapshot) = table.snapshot() else {
+                warn!("staged-intent reconcile skipped for '{table_name}': no snapshot loaded");
+                return;
+            };
+            (snapshot.log_data().iter().map(|f| f.path().into_owned()).collect::<std::collections::HashSet<String>>(), table.log_store().object_store(None))
+        };
+        let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let orphans = staged_orphan_deletions(&entries, table_name, now_secs, &referenced);
+        // Deletes are independent single-key calls — run them concurrently so a
+        // crash that left many staged bins doesn't serialize N R2 round-trips
+        // in front of maintenance startup.
+        let orphan_count = orphans.len();
+        let deleted = futures::stream::iter(orphans)
+            .map(|orphan| {
+                let store = &store;
+                async move {
+                    match store.delete(&object_store::path::Path::from(orphan.as_str())).await {
+                        // NotFound = already gone (cleanup ran, or the crash preceded the PUT).
+                        Ok(()) | Err(object_store::Error::NotFound { .. }) => 1usize,
+                        Err(e) => {
+                            warn!("staged-intent reconcile: delete failed for {}: {}", orphan, e);
+                            0
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(8)
+            .fold(0usize, |acc, n| async move { acc + n })
+            .await;
+        info!(table_name, entries = entries.len(), orphans = orphan_count, deleted, event = "staged_intent_reconciled");
+        // Clear ONLY the entries this reconcile actually judged: this table's,
+        // old enough to be unambiguous. Other tables' entries (and young ones)
+        // stay for their own reconcile pass.
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.table_name == table_name && now_secs.saturating_sub(e.recorded_at) >= STAGED_INTENT_MIN_AGE_SECS)
+            .map(|e| e.wave_id.as_str())
+            .collect();
+        self.clear_staged_intent(&ids);
+    }
+
+    /// Checkpoint after a tick's waves when the log has advanced enough since the
+    /// last checkpoint. Owned by the wave engine rather than left to the commit
+    /// count: waves cut compaction commits ~40x, so a per-N-versions cadence
+    /// would checkpoint ~40x less often exactly where the replay tail is the top
+    /// CPU cost (34.5% of process CPU in log replay, prod profile 2026-07-29).
+    async fn checkpoint_after_waves(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str) {
+        /// Small on purpose: a tick's waves add ~2-3 versions, so this
+        /// checkpoints every few ticks instead of every tick.
+        const WAVE_CHECKPOINT_VERSIONS: u64 = 20;
+        let (url, version) = {
+            let g = table_ref.read().await;
+            (g.table_url().to_string(), g.version().unwrap_or(0))
+        };
+        let last = self.checkpoint_versions.get(&url).map(|e| *e).unwrap_or(0);
+        if version.saturating_sub(last) >= WAVE_CHECKPOINT_VERSIONS {
+            self.checkpoint_and_cleanup_table(table_ref, table_name).await;
+        }
+    }
+
+    /// One-way safety brakes, checked at WAVE BOUNDARIES only (in-flight bins
+    /// always finish and commit). Both convert an overload into a truncated
+    /// tick rather than an incident: durability outranks compaction, and an
+    /// OOM-kill (exit 137) means WAL recovery and quarantine — our known
+    /// silent-loss sink. Never sizes concurrency; strictly "start no more work".
+    fn light_optimize_brake(&self) -> Option<&'static str> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.buffered_layer().is_some_and(|layer| layer.is_wal_over_threshold()) {
+            info!(event = "light_optimize_wal_yield");
+            crate::metrics::maintenance_stats().light_optimize_wal_yields.fetch_add(1, Relaxed);
+            return Some("wal_over_threshold");
+        }
+        let limit = self.config.derived.memory_brake_limit_bytes();
+        if limit > 0 && process_memory_bytes().is_some_and(|used| used > limit) {
+            info!(limit, event = "light_optimize_memory_brake");
+            crate::metrics::maintenance_stats().light_optimize_memory_brakes.fetch_add(1, Relaxed);
+            return Some("memory_brake");
+        }
+        None
+    }
+
+    /// Wall-clock budget for one light-optimize tick. Bounds the round-robin so a
+    /// backlog can't run past its own cron period and stack ticks (prod 2026-07-29:
+    /// "still in progress after 600s" on a 300s schedule).
+    fn light_optimize_tick_budget(&self) -> std::time::Duration {
+        let period = cron_period(&self.config.maintenance.timefusion_light_optimize_schedule);
+        self.config.derived.tick_budget(period)
+    }
+
+    /// Inner optimize loop for the COLD consolidate path (the 5-min hot tail
+    /// moved to `stage_hot_bin`/`commit_hot_wave`). Caller is expected to hold the flush lock when
     /// a `BufferedWriteLayer` is active; the retry loop here remains as a
     /// safety net against bursts from `flush_all_now` or shutdown flushes.
     #[allow(clippy::too_many_arguments)]
@@ -6562,9 +7092,9 @@ impl Database {
         // and removes (to evict). Hoisted out of the retry loop — only a
         // successful commit (which returns) changes the file set — and scoped to
         // the one hot `(project_id, today)` partition this optimize is filtered
-        // to. This is the highest-frequency walk in the process (up to
-        // 12 passes x 4 attempts per hot project per 5-min tick), and it was
-        // walking the whole 26k-file table each time.
+        // to. Sole remaining caller is the nightly consolidate sweep (up to
+        // 128 passes x 4 attempts per sealed date) — still worth scoping: it
+        // once walked the whole 26k-file table each time.
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
         let (pid_marker, date_marker) = (format!("project_id={project_id}/"), format!("date={today}/"));
         let scope = [pid_marker.as_str(), date_marker.as_str()];
@@ -6576,7 +7106,7 @@ impl Database {
                 table.clone()
             };
             if attempt == 0 {
-                info!(table_name, project_id, date = %today, target_size, max_concurrent_tasks = self.config.maintenance.timefusion_optimize_max_concurrent_tasks, event = "light_optimize_started");
+                info!(table_name, project_id, date = %today, target_size, max_concurrent_tasks = self.config.derived.optimize_merge_tasks(), event = "light_optimize_started");
             } else {
                 debug!("Light optimize retry {}/{} after OCC conflict", attempt + 1, MAX_RETRIES);
             }
@@ -6590,7 +7120,7 @@ impl Database {
                 // Cloned per attempt: the retry loop re-submits after OCC conflicts.
                 .with_type(optimize_type.clone())
                 .with_target_size(std::num::NonZero::new(target_size as u64).unwrap_or(std::num::NonZero::new(1).unwrap()))
-                .with_max_concurrent_tasks(self.config.maintenance.timefusion_optimize_max_concurrent_tasks)
+                .with_max_concurrent_tasks(self.config.derived.optimize_merge_tasks())
                 .with_writer_properties(writer_properties.clone())
                 .with_min_commit_interval(tokio::time::Duration::from_secs(30))
                 // Apply the compaction's Add+Remove to the materialized snapshot
@@ -7196,6 +7726,28 @@ fn schema_optimize_sort_columns(schema: &crate::schema_loader::TableSchema) -> V
         .collect()
 }
 
+/// Columns that get per-file min/max/nullCount stats in the Delta log
+/// (`delta.dataSkippingStatsColumns`). Deliberately narrow: the time column
+/// (every query and `light_optimize_tail`'s event-time binning read it), the
+/// declared sort keys (what file pruning is ordered by), and the dedup keys +
+/// tiebreak (what the dedup probes prune on). Partition columns are excluded —
+/// they're encoded in the path, not the stats. Writing stats for the whole 90+
+/// column schema instead cost 18.4% of process CPU in Add-stats `parse_json_impl`
+/// on every log replay (prod profile 2026-07-29).
+fn stats_columns_for(schema: &crate::schema_loader::TableSchema) -> String {
+    let mut cols: Vec<&str> = Vec::new();
+    for c in std::iter::once(schema.time_column_name())
+        .chain(schema.sorting_columns.iter().map(|c| c.name.as_str()))
+        .chain(schema.dedup_keys.iter().map(String::as_str))
+        .chain(schema.dedup_tiebreak.as_deref())
+    {
+        if !schema.partitions.iter().any(|p| p == c) && !cols.contains(&c) {
+            cols.push(c);
+        }
+    }
+    cols.join(",")
+}
+
 /// SQL `ORDER BY` clause (leading space, quoted identifiers) matching the
 /// schema's sort order, for rewrite paths that stream through a `SELECT` rather
 /// than delta-rs optimize (recompress). Empty when no sort order is declared.
@@ -7216,6 +7768,396 @@ fn schema_order_by_clause(schema: &crate::schema_loader::TableSchema) -> String 
 /// rewritten files retain tight timestamp statistics and an honest footer.
 fn full_optimize_type(schema: &crate::schema_loader::TableSchema, allow_sort: bool) -> (deltalake::operations::optimize::OptimizeType, bool) {
     choose_optimize_type(schema, false, allow_sort)
+}
+
+/// One staged bin's intent line in the staged-intent manifest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct StagedIntent {
+    wave_id: String,
+    /// Owning table — reconcile/clear act ONLY on their own table's entries;
+    /// without this the first table reconciled at boot judged every other
+    /// table's entries "orphan" against the wrong snapshot and cleared them.
+    #[serde(default)]
+    table_name: String,
+    project_id: String,
+    /// Unix seconds at staging. Reconcile skips entries younger than a wave's
+    /// max age: on an overlapping rolling deploy the booting instance must not
+    /// delete parquet a still-running instance staged but hasn't committed yet
+    /// (the v279-shaped hazard). Old entries are unambiguous crash leftovers.
+    #[serde(default)]
+    recorded_at: u64,
+    paths: Vec<String>,
+}
+
+/// Parse the append-only manifest, SKIPPING any line that doesn't decode. The
+/// manifest is a cleanup aid, never a correctness input (staged parquet is
+/// invisible to readers until the atomic wave commit, and VACUUM is the
+/// backstop), so a torn tail from an unclean shutdown must degrade to "fewer
+/// entries", never to a boot failure.
+fn parse_staged_intents(contents: &str) -> Vec<StagedIntent> {
+    contents.lines().filter(|l| !l.trim().is_empty()).filter_map(|line| serde_json::from_str::<StagedIntent>(line).ok()).collect()
+}
+
+/// Which staged paths to delete on boot: everything the Delta log does NOT
+/// reference. A referenced path belongs to a wave that DID commit (the manifest
+/// entry just never got removed — crash after commit, before compaction of the
+/// manifest), and deleting it would destroy live data. Pure so the decision is
+/// testable without an object store; deliberately takes the referenced set from
+/// the snapshot rather than a LIST — R2 listing is a known incident source and
+/// this path must never issue one.
+/// `now_secs` gates the rolling-deploy hazard: entries younger than
+/// `STAGED_INTENT_MIN_AGE_SECS` may belong to a live instance sharing the
+/// volume and are left for its own wave commit / the next boot / VACUUM.
+const STAGED_INTENT_MIN_AGE_SECS: u64 = 30 * 60;
+
+fn staged_orphan_deletions(entries: &[StagedIntent], table_name: &str, now_secs: u64, referenced: &std::collections::HashSet<String>) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| e.table_name == table_name)
+        .filter(|e| now_secs.saturating_sub(e.recorded_at) >= STAGED_INTENT_MIN_AGE_SECS)
+        .flat_map(|e| e.paths.iter())
+        .filter(|p| !referenced.contains(p.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// One bin rewritten to staged parquet but NOT yet committed. Uncommitted Adds
+/// are invisible to Delta readers, so a wave can hold several of these while
+/// other bins finish; the wave commit turns them all into one transaction.
+struct StagedBin {
+    project_id: String,
+    /// Manifest key for this bin's staged files (see `record_staged_intent`).
+    wave_id: String,
+    /// The files this bin replaces — re-verified live under the commit lock.
+    target_paths: Vec<String>,
+    removes: Vec<deltalake::kernel::Action>,
+    adds: Vec<deltalake::kernel::Action>,
+    /// Store the staged parquet was written to, for `cleanup_orphaned_parquet`.
+    stage_store: Arc<dyn object_store::ObjectStore>,
+    /// Whether this unit's rewrite changes the LOGICAL data (see
+    /// [`staged_actions`]): false for hot compaction, true for dedup.
+    data_change: bool,
+    /// Dedup-only accounting; `None` for hot compaction bins.
+    dedup: Option<DedupUnit>,
+}
+
+/// Per-unit outcome of one wave commit. Per-unit (not a count) because dedup
+/// has to requeue exactly the dirty bins that did NOT land.
+struct WaveResult {
+    landed: Vec<StagedBin>,
+    failed: Vec<StagedBin>,
+}
+
+/// Dirty-bin queue key: (project_id, table_name, date, 10-minute bin).
+type DirtyBinKey = (String, String, String, i64);
+
+/// The extra baggage a dedup unit carries through a wave: the rows it drops
+/// (reported once the unit LANDS, never at staging time) and the dirty-bin it
+/// came from, so a unit that loses the liveness check or the commit is requeued
+/// instead of silently certifying a partition that still holds duplicates.
+struct DedupUnit {
+    /// `None` for the fallback whole-partition sweep, which has no queue entry.
+    key: Option<DirtyBinKey>,
+    /// Partition date, for scoping the wave's cache warm/evict diff.
+    date: String,
+    /// Human label for logs only (`project … timestamp in [a, b)`).
+    label: String,
+    before: u64,
+    after: u64,
+}
+
+impl DedupUnit {
+    fn dropped(&self) -> u64 {
+        self.before.saturating_sub(self.after)
+    }
+}
+
+/// Rows a set of LANDED dedup units removed from the table. Units that never
+/// landed contribute nothing — they staged a smaller copy that no commit
+/// references, so their `before - after` is a rewrite that didn't happen.
+fn wave_dropped_rows(bins: &[StagedBin]) -> u64 {
+    bins.iter().filter_map(|b| b.dedup.as_ref()).map(DedupUnit::dropped).sum()
+}
+
+/// Assemble one staged unit's Remove+Add actions.
+///
+/// `data_change` is the load-bearing bit of the whole wave engine and the ONE
+/// thing that differs between its two producers:
+///
+/// * **Hot compaction (`false`)** — the rewrite preserves every row, so both
+///   sides are marked data-preserving and the fork's conflict checker downgrades
+///   the commit to snapshot isolation (`conflict_checker.rs:561` only counts
+///   `data_change: true` removals as conflicts). That is what lets a wave commit
+///   next to concurrent ingest appends without the OCC ladder (aa50480).
+/// * **Dedup (`true`)** — the rewrite DROPS rows. Marking those actions
+///   data-preserving would be a lie to every concurrent reader/writer: a
+///   transaction that read the removed files would no longer be told its read
+///   set was invalidated, so the isolation downgrade is only sound for
+///   data-preserving commits. Dedup pays the honest OCC price; the wave still
+///   wins because N chunk commits collapse into one.
+///
+/// [`wave_operation`] derives the `DeltaOperation` from the same flag so the two
+/// can never drift apart.
+fn staged_actions(
+    targets: &[deltalake::kernel::Add], staged: Vec<deltalake::kernel::Action>, data_change: bool,
+) -> (Vec<deltalake::kernel::Action>, Vec<deltalake::kernel::Action>) {
+    use deltalake::kernel::Action;
+    let removes: Vec<Action> = targets.iter().map(|a| Action::Remove(remove_for_add(a, data_change))).collect();
+    let adds: Vec<Action> = staged
+        .into_iter()
+        .map(|a| match a {
+            Action::Add(mut add) => {
+                add.data_change = data_change;
+                Action::Add(add)
+            }
+            other => other,
+        })
+        .collect();
+    (removes, adds)
+}
+
+/// The operation a wave commits under, derived from [`staged_actions`]'s
+/// `data_change`. An Optimize over data-preserving actions is what the fork
+/// downgrades to snapshot isolation; a Write/Overwrite would re-inherit the OCC
+/// ladder the wave design exists to kill (aa50480 / 96f4785). Conversely a
+/// row-dropping dedup MUST stay a Write — an Optimize that silently changed the
+/// logical data would let a concurrent transaction keep a read set the commit
+/// invalidated.
+fn wave_operation(data_change: bool, target_size: i64, partition_by: Option<Vec<String>>) -> deltalake::protocol::DeltaOperation {
+    use deltalake::protocol::DeltaOperation;
+    if data_change {
+        DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Overwrite, partition_by, predicate: None }
+    } else {
+        DeltaOperation::Optimize { predicate: None, target_size }
+    }
+}
+
+/// Gap between the light-optimize schedule's next two fires — the period the
+/// tick budget is derived from (`derived.tick_budget`). Zero when the schedule
+/// can't be parsed, in which case the budget falls back to the cron period the
+/// scheduler itself would use.
+fn cron_period(schedule: &str) -> std::time::Duration {
+    let Ok(cron) = schedule.parse::<croner::Cron>() else { return std::time::Duration::ZERO };
+    let now = Utc::now();
+    let Ok(first) = cron.find_next_occurrence(&now, false) else { return std::time::Duration::ZERO };
+    let Ok(second) = cron.find_next_occurrence(&first, false) else { return std::time::Duration::ZERO };
+    (second - first).to_std().unwrap_or(std::time::Duration::ZERO)
+}
+
+/// Current process memory footprint for the wave-boundary brake. cgroup
+/// `memory.current` is the number the OOM killer acts on (it includes page
+/// cache the kernel can reclaim, so this is conservative); `/proc/self/statm`
+/// RSS is the fallback. `None` on platforms with neither (dev macOS) — the
+/// brake then never engages, which is the safe default for a non-prod box.
+/// Charged memory for the brake: cgroup `memory.current` (what memcg OOM-kills
+/// on, page cache included) — deliberately NOT the same number as the WAL
+/// layer's RSS diagnostic, whose statm reader we reuse only as the fallback.
+fn process_memory_bytes() -> Option<usize> {
+    if let Ok(raw) = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        && let Ok(v) = raw.trim().parse::<usize>()
+    {
+        return Some(v);
+    }
+    crate::buffered_write_layer::process_rss_bytes()
+}
+
+/// Tag the fork stamps on sorted-run outputs (delta-rs optimize.rs). Kept in
+/// sync by the exact rev pin; a fork rename would need a deliberate bump.
+const SORTED_RUN_TAG: &str = "delta-rs.optimize.sort_by";
+
+fn is_sorted_run(tags: &HashMap<String, Option<String>>) -> bool {
+    tags.get(SORTED_RUN_TAG).is_some_and(|v| v.as_deref() == Some("true"))
+}
+
+/// Files whose newest event is within SEAL_LAG of now may still receive appends
+/// / DV-merge rewrites, so compacting them (a) races concurrent commits → OCC
+/// abort (the wedged optimize on today's partition, prod 2026-07-20) and (b)
+/// would need re-compaction. Only sealed time slices are compacted.
+/// 15min: a 5min lag was tried (shrinks the recent file count faster) but
+/// THRASHED the Foyer cache — rewriting the recent window every 5min churns file
+/// IDs faster than 1h-window queries reuse the warm bodies, so 1h latency stuck
+/// at 2-7s and never warmed while 3h (stable older files) did (prod 2026-07-21).
+fn seal_micros_now() -> i64 {
+    const SEAL_LAG_MICROS: i64 = 15 * 60 * 1_000_000;
+    Utc::now().timestamp_micros() - SEAL_LAG_MICROS
+}
+
+/// The metadata one planner walk collects per candidate file. Decoupling
+/// selection from the snapshot API is what makes the packing policy testable
+/// (and lets `select_all_hot_bins` parse each file's stats exactly once).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TailAdd {
+    pub path: String,
+    pub size: i64,
+    pub is_sorted_run: bool,
+    /// (min, max) event time from Add stats; None when stats are absent —
+    /// one field so a half-present range is unrepresentable.
+    pub event_range: Option<(i64, i64)>,
+}
+
+impl TailAdd {
+    /// Parse the raw Add stats JSON: the snapshot's parsed-stats column
+    /// (`stats_parsed`) isn't materialized on this path, so the kernel
+    /// `stat_min_i64`/`stat_max_i64` accessors return None for every file — the
+    /// 2026-07-20 event-time binning read them and silently selected NOTHING
+    /// (hot compaction was a no-op in prod while today-partitions grew to 474+
+    /// files).
+    fn from_stats(path: String, size: i64, is_sorted_run: bool, stats: Option<&str>) -> Self {
+        let range = stats.and_then(Database::event_time_range_from_stats);
+        Self { path, size, is_sorted_run, event_range: range }
+    }
+}
+
+/// Pick the files one light-optimize bin should rewrite. Pure so the packing
+/// policy — every clause of which is an incident scar — is unit-testable
+/// without a Delta table; see `light_optimize_tail` for why the selection is
+/// bounded at all (partition-wide rewrites lose every OCC race on the hot
+/// today-partition).
+///
+/// `sorted_run_cap` bounds which already-tagged sorted runs are re-admitted: the
+/// cold tier passes `i64::MAX` (its leveled re-merge folds any sub-target run),
+/// the hot tier passes `target/4` so each tick's small output run keeps folding
+/// into the next pack until it reaches ~1/4 target — otherwise a busy project
+/// accrues one 5-min run per tick (~100+ files/day again). Growing a run 4×
+/// before exclusion bounds rewrite amplification at ~3× per byte. Files at
+/// ≥ 7/8·target are always excluded — they're converged, and re-selecting one
+/// alone would rewrite it 1→1 forever.
+///
+/// Binning by EVENT time (not arrival/modification_time) is what makes the
+/// output runs time-DISJOINT, so file-range pruning can exclude files outside a
+/// query's window (arrival-time binning left every file overlapping →
+/// files_ranges_pruned=56→56, i.e. no pruning).
+pub(crate) fn select_tail_bin(adds: &[TailAdd], target_size: i64, min_files: usize, sorted_run_cap: i64, seal_micros: i64) -> Vec<String> {
+    let cap = target_size.max(1);
+    let converged = cap - cap / 8;
+    let mut fresh: Vec<(&str, i64, i64)> = adds
+        .iter()
+        .filter(|add| add.size < sorted_run_cap || !add.is_sorted_run)
+        .filter(|add| add.size < converged)
+        .filter_map(|add| match add.event_range {
+            Some((min, max)) if max <= seal_micros => Some((add.path.as_str(), min, add.size)),
+            _ => None,
+        })
+        .collect();
+    if fresh.len() < min_files {
+        return vec![];
+    }
+    fresh.sort_unstable_by_key(|(_, min, _)| *min);
+    // Pack the earliest contiguous slice up to `cap` → one time-disjoint run
+    // per tick. Small commit converges quickly and shrinks the conflict window;
+    // later ticks pack the next (strictly later) slice.
+    let mut bytes = 0i64;
+    let mut files: Vec<String> = vec![];
+    for (path, _, size) in fresh {
+        if !files.is_empty() && bytes + size > cap {
+            // A lone-file slice is already a run — rewriting it is pure churn.
+            // Skip past it to the next time slice instead of wedging the pass
+            // behind it.
+            if files.len() >= 2 {
+                break;
+            }
+            bytes = 0;
+            files.clear();
+        }
+        bytes += size;
+        files.push(path.to_string());
+    }
+    if files.len() < 2 {
+        files.clear();
+    }
+    files
+}
+
+/// Split staged bins into (committable, stale) against the live file set of the
+/// refreshed snapshot. One conflicting file used to fail one commit of one bin;
+/// with a batched wave commit, dropping only the stale bin's actions keeps the
+/// blast radius identical to the per-bin path (the dropped bin's files are just
+/// re-selected next tick). Pure + generic so the wave-assembly test needs no
+/// object store.
+fn split_live_bins<T>(bins: Vec<T>, targets: impl Fn(&T) -> &[String], live: &std::collections::HashSet<String>) -> (Vec<T>, Vec<T>) {
+    bins.into_iter().partition(|bin| targets(bin).iter().all(|t| live.contains(t)))
+}
+
+/// Drive one bin per project per round, each round being a WAVE: every project
+/// gets its Nth bin before any project gets its (N+1)th, the round's bins are
+/// staged in parallel (`op`, `buffer_unordered(concurrency)`) WITHOUT
+/// committing, and the whole round lands in ONE `commit_wave` call. Batching the
+/// commit is what collapses the OCC ladder: ~130 commits/tick against concurrent
+/// ingest appends retried to attempt 9-20 (~10s each), so 40-65s of a pass was
+/// commit waiting (prod 2026-07-29).
+///
+/// Stops when every project's tail is converged, the round cap is hit, the
+/// wall-clock deadline passes, or `should_pause` engages a safety brake. In
+/// every stop case the in-flight wave still finishes and commits — brakes are
+/// one-way "start no more work", never a cancellation.
+///
+/// Generic over the per-bin operation + the wave commit so the fairness
+/// invariant is unit-testable without a Delta table. Returns the count of bins
+/// that errored (staging failures + commit-side drops).
+/// Per-project outcome of one round's staging. A dedicated type because
+/// `Result<Option<T>>` overloaded `None`: "converged" (drop for the tick) and
+/// "bin vanished under a concurrent rewrite" (project verifiably HAS work —
+/// dropping it silenced its compaction for the rest of the tick, prod-shaped
+/// dedup race found in the 2026-07-29 review).
+enum BinOutcome<T> {
+    /// Bin staged; project stays in the round-robin.
+    Staged(T),
+    /// Tail converged — nothing left this tick; drop from the rotation.
+    Converged,
+    /// Selection went stale (concurrent rewrite); keep the project pending so
+    /// the next round's re-plan serves it a fresh bin.
+    Retry,
+}
+
+async fn round_robin_bins<F, Fut, T, C, CFut>(
+    projects: Vec<String>, max_rounds: usize, concurrency: usize, deadline: std::time::Instant, on_truncate: impl Fn(usize, &[String]),
+    should_pause: impl Fn() -> Option<&'static str>, op: F, commit_wave: C,
+) -> usize
+where
+    F: Fn(String, usize) -> Fut,
+    Fut: std::future::Future<Output = (String, Result<BinOutcome<T>>)>,
+    C: Fn(Vec<T>, usize) -> CFut,
+    CFut: std::future::Future<Output = usize>,
+{
+    let mut pending = projects;
+    let mut failed = 0usize;
+    for round in 0..max_rounds {
+        if pending.is_empty() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            on_truncate(round, &pending);
+            break;
+        }
+        if let Some(reason) = should_pause() {
+            info!(round, remaining = pending.len(), reason, event = "light_optimize_wave_paused");
+            // A pause is a truncation for fairness purposes: without rotating,
+            // a chronically-engaged brake restarts every tick at the
+            // debt-ordered head — the exact starvation the cursor fixes.
+            on_truncate(round, &pending);
+            break;
+        }
+        let outcomes: Vec<(String, Result<BinOutcome<T>>)> =
+            futures::stream::iter(std::mem::take(&mut pending)).map(|project_id| op(project_id, round)).buffer_unordered(concurrency).collect().await;
+        // Carry forward projects that still have work; converged or failed
+        // projects drop out for the rest of the tick.
+        let mut staged = Vec::with_capacity(outcomes.len());
+        for (project_id, outcome) in outcomes {
+            match outcome {
+                Ok(BinOutcome::Staged(bin)) => {
+                    staged.push(bin);
+                    pending.push(project_id);
+                }
+                Ok(BinOutcome::Retry) => pending.push(project_id),
+                Ok(BinOutcome::Converged) => {}
+                Err(_) => failed += 1,
+            }
+        }
+        if !staged.is_empty() {
+            failed += commit_wave(staged, round).await;
+        }
+    }
+    failed
 }
 
 fn choose_optimize_type(
@@ -9331,6 +10273,358 @@ mod tests {
         let d2 = chrono::NaiveDate::from_ymd_opt(2026, 6, 4).unwrap();
         let sets = Database::filesets_for_dates(&uris, &[d2]);
         assert!(sets[&d2].is_empty());
+    }
+
+    /// Every clause of `select_tail_bin` is an incident scar (see its doc), so
+    /// they're pinned individually here rather than through a Delta table.
+    #[test]
+    fn select_tail_bin_policy() {
+        const TARGET: i64 = 1000;
+        const SEAL: i64 = 10_000;
+        let f = |path: &str, size: i64, sorted: bool, min: i64, max: i64| super::TailAdd {
+            path: path.into(),
+            size,
+            is_sorted_run: sorted,
+            event_range: Some((min, max)),
+        };
+        // Seal lag: a file whose newest event is past the seal is still filling
+        // (prod 2026-07-20: compacting it lost every OCC race).
+        let unsealed = vec![f("a", 10, false, 1, 1), f("b", 10, false, 2, SEAL + 1)];
+        assert_eq!(super::select_tail_bin(&unsealed, TARGET, 2, TARGET / 4, SEAL), Vec::<String>::new(), "unsealed files leave < min_files");
+
+        // Converged (>= 7/8 target) files are never re-selected: rewriting one
+        // alone is a 1→1 rewrite forever.
+        let converged = vec![f("big", 900, false, 1, 2), f("a", 10, false, 3, 4), f("b", 10, false, 5, 6)];
+        assert_eq!(super::select_tail_bin(&converged, TARGET, 2, TARGET / 4, SEAL), vec!["a", "b"]);
+
+        // Sorted runs fold only while under the cap; an over-cap run is excluded.
+        let runs = vec![f("run_small", 100, true, 1, 2), f("run_big", 300, true, 3, 4), f("a", 10, false, 5, 6)];
+        assert_eq!(super::select_tail_bin(&runs, TARGET, 2, TARGET / 4, SEAL), vec!["run_small", "a"], "only the sub-cap run folds");
+
+        // Earliest contiguous slice up to cap, ordered by EVENT time (input
+        // order is deliberately scrambled) — this is what makes runs disjoint.
+        let pack = vec![f("third", 600, false, 30, 31), f("first", 600, false, 10, 11), f("second", 300, false, 20, 21)];
+        assert_eq!(super::select_tail_bin(&pack, TARGET, 2, TARGET / 4, SEAL), vec!["first", "second"], "packs earliest slice, stops at cap");
+
+        // min_files gate.
+        assert_eq!(super::select_tail_bin(&[f("a", 10, false, 1, 2), f("b", 10, false, 3, 4)], TARGET, 3, TARGET / 4, SEAL), Vec::<String>::new());
+
+        // A lone over-cap-adjacent file must not wedge the pass: selection skips
+        // past it to the next slice rather than returning a 1-file bin.
+        let lone = vec![f("lone", 800, false, 1, 2), f("a", 300, false, 10, 11), f("b", 300, false, 12, 13)];
+        assert_eq!(super::select_tail_bin(&lone, TARGET, 2, TARGET / 4, SEAL), vec!["a", "b"]);
+
+        // Files with no event-time stats can't be binned disjointly (the
+        // 2026-07-20 silent no-op read them as None and selected NOTHING).
+        let no_stats = vec![super::TailAdd { path: "x".into(), size: 10, is_sorted_run: false, event_range: None }, f("a", 10, false, 1, 2)];
+        assert_eq!(super::select_tail_bin(&no_stats, TARGET, 2, TARGET / 4, SEAL), Vec::<String>::new());
+    }
+
+    /// Wave commit blast radius: ONE stale bin must lose only its own actions.
+    /// Naive batching would fail the whole wave (11 bins for one conflict).
+    #[test]
+    fn wave_drops_only_the_stale_bin() {
+        let live: std::collections::HashSet<String> = ["f1", "f2", "f4"].iter().map(|s| s.to_string()).collect();
+        let bins = vec![
+            ("alpha", vec!["f1".to_string()]),
+            ("beta", vec!["f3".to_string()]), // f3 rewritten concurrently
+            ("gamma", vec!["f2".to_string(), "f4".to_string()]),
+        ];
+        let (fresh, stale) = super::split_live_bins(bins, |(_, t)| t.as_slice(), &live);
+        assert_eq!(fresh.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec!["alpha", "gamma"], "surviving bins still commit together");
+        assert_eq!(stale.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec!["beta"]);
+        // And the surviving bins' actions concatenate in removes-then-adds order
+        // per bin, which is what the single CommitBuilder receives.
+        let actions: Vec<&str> = fresh.iter().flat_map(|(n, _)| [*n, *n]).collect();
+        assert_eq!(actions.len(), 4);
+    }
+
+    fn test_add(path: &str) -> deltalake::kernel::Add {
+        deltalake::kernel::Add { path: path.to_string(), size: 1024, modification_time: 0, data_change: true, ..Default::default() }
+    }
+
+    fn staged_unit(project: &str, paths: &[&str], dedup: Option<super::DedupUnit>) -> super::StagedBin {
+        let targets: Vec<_> = paths.iter().map(|p| test_add(p)).collect();
+        let data_change = dedup.is_some();
+        let staged = vec![deltalake::kernel::Action::Add(test_add(&format!("{project}-new.parquet")))];
+        let (removes, adds) = super::staged_actions(&targets, staged, data_change);
+        super::StagedBin {
+            project_id: project.to_string(),
+            wave_id: format!("wave-{project}"),
+            target_paths: paths.iter().map(|p| p.to_string()).collect(),
+            removes,
+            adds,
+            stage_store: Arc::new(object_store::memory::InMemory::new()),
+            data_change,
+            dedup,
+        }
+    }
+
+    fn dedup_unit(date: &str, before: u64, after: u64) -> super::DedupUnit {
+        super::DedupUnit { key: None, date: date.to_string(), label: "chunk".into(), before, after }
+    }
+
+    /// THE load-bearing subtlety of the shared wave commit: hot compaction
+    /// preserves rows (data_change=false → snapshot-isolation downgrade →
+    /// Optimize), dedup DROPS rows (data_change=true → honest OCC → Write).
+    /// Flipping either direction is a correctness bug, not a tuning choice.
+    #[test]
+    fn staged_actions_carry_data_change_per_engine() {
+        use deltalake::{kernel::Action, protocol::DeltaOperation};
+        let flags = |bin: &super::StagedBin| -> Vec<bool> {
+            bin.removes
+                .iter()
+                .chain(bin.adds.iter())
+                .map(|a| match a {
+                    Action::Remove(r) => r.data_change,
+                    Action::Add(add) => add.data_change,
+                    other => panic!("unexpected action {other:?}"),
+                })
+                .collect()
+        };
+        let hot = staged_unit("alpha", &["f1", "f2"], None);
+        assert_eq!(flags(&hot), vec![false; 3], "compaction Removes AND Adds must be data-preserving");
+        let dedup = staged_unit("beta", &["f3"], Some(dedup_unit("2026-07-28", 10, 7)));
+        assert_eq!(flags(&dedup), vec![true; 2], "a row-dropping rewrite must not claim to preserve data");
+        // The operation is derived from the same flag so the two can't drift.
+        assert!(matches!(super::wave_operation(false, 256, None), DeltaOperation::Optimize { .. }));
+        assert!(matches!(super::wave_operation(true, 256, Some(vec!["date".into()])), DeltaOperation::Write { .. }));
+    }
+
+    /// A dedup wave has the same blast radius as a hot wave: the unit whose
+    /// target file was rewritten concurrently drops out alone.
+    #[test]
+    fn dedup_wave_drops_only_the_stale_unit() {
+        let live: std::collections::HashSet<String> = ["f1", "f4"].iter().map(|s| s.to_string()).collect();
+        let units = vec![
+            staged_unit("alpha", &["f1"], Some(dedup_unit("2026-07-28", 10, 6))),
+            staged_unit("beta", &["f2"], Some(dedup_unit("2026-07-28", 5, 4))), // f2 gone
+            staged_unit("gamma", &["f4"], Some(dedup_unit("2026-07-27", 8, 8))),
+        ];
+        let (fresh, stale) = super::split_live_bins(units, |b| &b.target_paths, &live);
+        assert_eq!(fresh.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["alpha", "gamma"]);
+        assert_eq!(stale.iter().map(|b| b.project_id.as_str()).collect::<Vec<_>>(), vec!["beta"]);
+    }
+
+    /// Dropped-row accounting must survive a PARTIAL wave: only landed units
+    /// removed rows from the table. Counting a stale unit's `before - after`
+    /// would report drops that never happened (and, via the dirty-bin
+    /// bookkeeping, certify a bin that still holds duplicates).
+    #[test]
+    fn dropped_rows_count_only_landed_units() {
+        let live: std::collections::HashSet<String> = ["f1"].iter().map(|s| s.to_string()).collect();
+        let units = vec![
+            staged_unit("alpha", &["f1"], Some(dedup_unit("2026-07-28", 10, 6))), // drops 4
+            staged_unit("beta", &["f2"], Some(dedup_unit("2026-07-28", 100, 1))), // never lands
+        ];
+        let (fresh, stale) = super::split_live_bins(units, |b| &b.target_paths, &live);
+        assert_eq!(super::wave_dropped_rows(&fresh), 4);
+        assert_eq!(super::wave_dropped_rows(&stale), 99, "the stale unit's rewrite is real but uncommitted — never added to the metric");
+        // Hot bins carry no dedup accounting at all.
+        assert_eq!(super::wave_dropped_rows(&[staged_unit("gamma", &["f9"], None)]), 0);
+    }
+
+    /// The staged-intent manifest is a cleanup aid, never a correctness input:
+    /// a torn tail from an unclean shutdown must cost entries, not a boot.
+    #[test]
+    fn staged_intent_manifest_skips_garbage_lines() {
+        let contents = concat!(
+            r#"{"wave_id":"w1","project_id":"a","paths":["p1","p2"]}"#,
+            "\n",
+            "not json at all\n",
+            "\n",
+            r#"{"wave_id":"w2","project_id":"b","paths":["p3"]"#, // torn tail, no newline
+        );
+        let entries = super::parse_staged_intents(contents);
+        assert_eq!(entries.len(), 1, "only the intact line survives: {entries:?}");
+        assert_eq!(entries[0].paths, vec!["p1", "p2"]);
+        assert!(super::parse_staged_intents("").is_empty());
+        assert!(super::parse_staged_intents("garbage").is_empty());
+    }
+
+    /// Boot reconcile deletes ONLY what the Delta log doesn't reference — a
+    /// referenced path belongs to a wave that committed, and deleting it would
+    /// destroy live data.
+    #[test]
+    fn staged_orphan_deletions_spares_committed_files_and_foreign_tables() {
+        let e = |wave: &str, table: &str, age_secs: u64, paths: &[&str]| super::StagedIntent {
+            wave_id: wave.into(),
+            table_name: table.into(),
+            project_id: "p".into(),
+            recorded_at: 100_000 - age_secs,
+            paths: paths.iter().map(|s| s.to_string()).collect(),
+        };
+        let old = super::STAGED_INTENT_MIN_AGE_SECS + 1;
+        let entries = vec![
+            e("w1", "logs", old, &["committed", "orphan1"]),
+            e("w2", "logs", old, &["orphan2"]),
+            // Another table's entry: NOT this reconcile's to judge — its paths
+            // never appear in this table's snapshot and must not be deleted.
+            e("w3", "metrics", old, &["metrics_staged"]),
+            // Young entry: may belong to a live instance on a shared volume
+            // (rolling deploy) — left alone.
+            e("w4", "logs", 10, &["young_staged"]),
+        ];
+        let referenced: std::collections::HashSet<String> = ["committed".to_string(), "unrelated".to_string()].into_iter().collect();
+        assert_eq!(super::staged_orphan_deletions(&entries, "logs", 100_000, &referenced), vec!["orphan1", "orphan2"]);
+        // Nothing to delete when every staged file landed.
+        let all_live: std::collections::HashSet<String> = ["committed", "orphan1", "orphan2"].iter().map(|s| s.to_string()).collect();
+        assert!(super::staged_orphan_deletions(&entries, "logs", 100_000, &all_live).is_empty());
+    }
+
+    /// Stats trimming (2026-07-29): the Add stats column list must be the narrow
+    /// prune set, not the whole 90+ column schema (18.4% of CPU in stats JSON
+    /// parsing), and must never include partition columns.
+    #[test]
+    fn stats_columns_are_the_prune_keys_only() {
+        let schema = get_schema("otel_logs_and_spans").unwrap_or_else(get_default_schema);
+        let stats_columns = super::stats_columns_for(schema);
+        let cols: Vec<&str> = stats_columns.split(',').collect();
+        assert!(cols.contains(&schema.time_column_name()), "the time column drives every query and the event-time binning");
+        for key in &schema.dedup_keys {
+            assert!(cols.contains(&key.as_str()), "dedup key {key} must keep stats");
+        }
+        for partition in &schema.partitions {
+            assert!(!cols.contains(&partition.as_str()), "partition column {partition} is in the path, not the stats");
+        }
+        assert!(cols.len() < schema.fields.len(), "must be a strict subset of the schema, got {} of {}", cols.len(), schema.fields.len());
+        assert_eq!(cols.len(), cols.iter().collect::<std::collections::HashSet<_>>().len(), "no duplicates");
+    }
+
+    /// Fairness guard for prod 2026-07-29: the old per-project drain gave the
+    /// most-fragmented project all 12 bins before project #2 got its first, so
+    /// on a 5-min cron most projects were never compacted. Every project must
+    /// get its Nth bin before any project gets its (N+1)th.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_robin_bins_gives_every_project_a_bin_before_anyone_gets_a_second() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+        let seen = calls.clone();
+        // Every project has unbounded work, so only the round cap stops it.
+        let failed = super::round_robin_bins(
+            vec!["a".into(), "b".into(), "c".into()],
+            3,
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            |_, _| panic!("must not truncate: deadline is far away"),
+            || None,
+            |project_id, round| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((project_id.clone(), round));
+                    (project_id, Ok(super::BinOutcome::Staged(())))
+                }
+            },
+            |_bins, _round| async { 0 },
+        )
+        .await;
+        assert_eq!(failed, 0);
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("a".to_string(), 0),
+                ("b".to_string(), 0),
+                ("c".to_string(), 0),
+                ("a".to_string(), 1),
+                ("b".to_string(), 1),
+                ("c".to_string(), 1),
+                ("a".to_string(), 2),
+                ("b".to_string(), 2),
+                ("c".to_string(), 2),
+            ],
+            "expected round-robin, got a per-project drain"
+        );
+    }
+
+    /// A dedup-raced bin (`Retry`) must NOT silence the project for the tick:
+    /// it stays in the rotation and gets a fresh bin next round (2026-07-29
+    /// review finding — `Ok(None)` overloading dropped it with the converged).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_robin_bins_keeps_a_vanished_bin_project_in_rotation() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+        let seen = calls.clone();
+        let failed = super::round_robin_bins(
+            vec!["raced".into()],
+            3,
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            |_, _| panic!("must not truncate"),
+            || None,
+            |project_id, round| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((project_id.clone(), round));
+                    // Round 0: selection went stale under a concurrent rewrite.
+                    let outcome = if round == 0 { super::BinOutcome::Retry } else { super::BinOutcome::Staged(()) };
+                    (project_id, Ok(outcome))
+                }
+            },
+            |bins: Vec<()>, _| async move {
+                assert!(!bins.is_empty());
+                0
+            },
+        )
+        .await;
+        assert_eq!(failed, 0);
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.iter().filter(|(p, _)| p == "raced").count(), 3, "raced project must be retried every round, not dropped");
+    }
+
+    /// A project whose tail is converged (`Ok(false)`) must stop consuming
+    /// rounds, so the remaining budget goes to projects that still have work.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_robin_bins_drops_converged_and_failed_projects() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+        let seen = calls.clone();
+        let failed = super::round_robin_bins(
+            vec!["converged".into(), "busy".into(), "broken".into()],
+            3,
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            |_, _| panic!("must not truncate"),
+            || None,
+            |project_id, round| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push((project_id.clone(), round));
+                    let outcome = match project_id.as_str() {
+                        "converged" => Ok(super::BinOutcome::Converged),
+                        "broken" => Err(anyhow::anyhow!("boom")),
+                        _ => Ok(super::BinOutcome::Staged(())),
+                    };
+                    (project_id, outcome)
+                }
+            },
+            |_bins, _round| async { 0 },
+        )
+        .await;
+        assert_eq!(failed, 1, "the erroring project counts once, then drops out");
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.iter().filter(|(p, _)| p == "converged").count(), 1, "converged project must not be retried");
+        assert_eq!(calls.iter().filter(|(p, _)| p == "broken").count(), 1, "failed project must not be retried");
+        assert_eq!(calls.iter().filter(|(p, _)| p == "busy").count(), 3, "busy project keeps its rounds");
+    }
+
+    /// The tick must stop starting rounds past its wall-clock budget rather than
+    /// overrunning its own cron period (prod 2026-07-29: "still in progress
+    /// after 600s" on a 300s schedule).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_robin_bins_stops_at_the_tick_deadline() {
+        let truncated = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, usize)>::new()));
+        let sink = truncated.clone();
+        let failed = super::round_robin_bins(
+            vec!["a".into(), "b".into()],
+            12,
+            1,
+            std::time::Instant::now(), // already expired
+            move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.len())),
+            || None,
+            |project_id, _| async move { (project_id, Ok(super::BinOutcome::Staged(()))) },
+            |_bins, _round| async { 0 },
+        )
+        .await;
+        assert_eq!(failed, 0);
+        assert_eq!(*truncated.lock().unwrap(), vec![(0, 2)], "must truncate on round 0 with both projects still pending");
     }
 
     #[test]

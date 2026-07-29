@@ -24,14 +24,11 @@
 //!
 //! Logged once at startup so ops can see exactly what was chosen.
 
-use sysinfo::{Disks, System};
+use sysinfo::Disks;
 use tracing::info;
 
 use crate::config::AppConfig;
 
-const RAM_FRACTION_QUERY_POOL: f64 = 0.30;
-const RAM_FRACTION_BUFFER: f64 = 0.25;
-const RAM_FRACTION_FOYER_MEM: f64 = 0.15;
 const RAM_FRACTION_FOYER_META: f64 = 0.02;
 const DISK_FRACTION_FOYER: f64 = 0.40;
 const DISK_FRACTION_FOYER_META: f64 = 0.02;
@@ -49,11 +46,11 @@ const DISK_FRACTION_FOYER_META: f64 = 0.02;
 /// df-metadata cache; that is a truthful warning, and it stays WARN-only.
 const OVERSUB_WARN_PCT: usize = 75;
 
-const MIN_QUERY_POOL_GB: usize = 1;
-const MAX_QUERY_POOL_GB: usize = 32;
 const MIN_BUFFER_MB: usize = 256;
 const MIN_FOYER_MEM_MB: usize = 128;
-const MAX_FOYER_MEM_MB: usize = 8 * 1024;
+// 16 GiB: the derived tree reserves 10% of the limit for foyer (12 GiB on the
+// 120 GiB box); an 8 GiB cap stranded a third of that reservation.
+const MAX_FOYER_MEM_MB: usize = 16 * 1024;
 const MAX_FOYER_META_MB: usize = 512;
 const MIN_FOYER_DISK_GB: usize = 1;
 const MAX_FOYER_DISK_GB: usize = 500;
@@ -63,17 +60,15 @@ const MAX_FOYER_META_DISK_GB: usize = 5;
 /// user are left untouched. Returns the set of knobs that were auto-tuned for
 /// logging.
 pub fn apply(config: &mut AppConfig) {
-    let mut sys = System::new();
-    sys.refresh_memory();
-    // Inside a container the budget is the cgroup limit, not host RAM —
-    // sizing 72% of a 148GB host into a 66.6GiB cgroup guarantees memcg OOM
-    // kills (prod 2026-06-11: 16 kills/24h, every-10-min crash loop).
-    let host_ram = sys.total_memory() as usize;
-    let total_ram_bytes = sys.cgroup_limits().map_or(host_ram, |c| (c.total_memory as usize).min(host_ram));
+    // ONE memory source: the derived budget tree's cgroup-clamped detection.
+    // A second (sysinfo) reading here once let the oversubscription audit warn
+    // against a different denominator than the budgets were derived from —
+    // exactly the drift class the tree exists to kill.
+    let total_ram_bytes = config.derived.memory_limit_bytes();
     let total_ram_gb = total_ram_bytes / (1024 * 1024 * 1024);
     let total_ram_mb = total_ram_bytes / (1024 * 1024);
 
-    let cpus = num_cpus::get();
+    let cpus = crate::config::detect_cores();
 
     // Probe free space on the data dir's mount point. Falls back to "unknown"
     // (no disk-derived overrides) if the mount can't be located.
@@ -90,18 +85,11 @@ pub fn apply(config: &mut AppConfig) {
 
     let mut applied: Vec<(&str, String)> = Vec::new();
 
-    // Query execution pool (DataFusion). Default static = 8GB.
-    if env_unset("TIMEFUSION_MEMORY_LIMIT_GB") {
-        let derived = ((total_ram_gb as f64 * RAM_FRACTION_QUERY_POOL) as usize).clamp(MIN_QUERY_POOL_GB, MAX_QUERY_POOL_GB);
-        if derived != config.memory.timefusion_memory_limit_gb {
-            config.memory.timefusion_memory_limit_gb = derived;
-            applied.push(("TIMEFUSION_MEMORY_LIMIT_GB", format!("{}GB", derived)));
-        }
-    }
-
     // MemBuffer. Default static = 4096MB.
     if env_unset("TIMEFUSION_BUFFER_MAX_MEMORY_MB") {
-        let derived = ((total_ram_mb as f64 * RAM_FRACTION_BUFFER) as usize).max(MIN_BUFFER_MB);
+        // Sourced from DerivedBudget — ONE set of RAM fractions (see config.rs
+        // budget tree); autotune only applies it under env-unset-wins semantics.
+        let derived = (config.derived.buffer_max_bytes() / (1024 * 1024)).max(MIN_BUFFER_MB);
         if derived != config.buffer.timefusion_buffer_max_memory_mb {
             config.buffer.timefusion_buffer_max_memory_mb = derived;
             applied.push(("TIMEFUSION_BUFFER_MAX_MEMORY_MB", format!("{}MB", derived)));
@@ -110,7 +98,7 @@ pub fn apply(config: &mut AppConfig) {
 
     // Foyer memory cache. Default static = 512MB.
     if env_unset("TIMEFUSION_FOYER_MEMORY_MB") {
-        let derived = ((total_ram_mb as f64 * RAM_FRACTION_FOYER_MEM) as usize).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB);
+        let derived = (config.derived.foyer_memory_bytes() / (1024 * 1024)).clamp(MIN_FOYER_MEM_MB, MAX_FOYER_MEM_MB);
         if derived != config.cache.timefusion_foyer_memory_mb {
             config.cache.timefusion_foyer_memory_mb = derived;
             applied.push(("TIMEFUSION_FOYER_MEMORY_MB", format!("{}MB", derived)));
@@ -267,8 +255,8 @@ pub fn budget_audit(config: &AppConfig, total_ram_mb: usize) -> BudgetAudit {
     // hard ceiling (HARD_LIMIT_HEADROOM_DIVISOR).
     let mem_buffer_budget_mb = config.buffer.max_memory_mb().saturating_sub(foyer_mb + tantivy_peak_mb).max(64);
     let mem_buffer_hard_mb = mem_buffer_budget_mb * 6 / 5;
-    let query_pool_mb = (config.memory.timefusion_memory_limit_gb as f64 * 1024.0 * config.memory.timefusion_memory_fraction) as usize;
-    let maintenance_pool_mb = config.memory.maintenance_pool_bytes() / MB;
+    let query_pool_mb = config.derived.query_pool_bytes() / MB;
+    let maintenance_pool_mb = config.derived.maintenance_pool_bytes() / MB;
     let df_metadata_cache_mb = config.cache.timefusion_df_metadata_cache_mb;
     BudgetAudit {
         query_pool_mb,
@@ -297,37 +285,10 @@ fn env_unset(name: &str) -> bool {
 /// affinity-derived count. Set onto the config in `apply()`; the env override
 /// `TIMEFUSION_QUERY_PARTITIONS` wins via serde (apply only fills when unset).
 fn detected_query_partitions() -> usize {
-    let fallback = num_cpus::get().max(1);
-    cpu_quota_cores().map_or(fallback, |q| q.clamp(1, fallback))
-}
-
-/// Cores implied by the cgroup CPU quota (v2 `cpu.max`, then v1
-/// `cfs_quota_us`/`cfs_period_us`). `None` when unthrottled or unreadable.
-fn cpu_quota_cores() -> Option<usize> {
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
-        return parse_cpu_max(&s);
-    }
-    let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").ok()?.trim().parse::<i64>().ok()?;
-    let period = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok()?.trim().parse::<i64>().ok()?;
-    quota_period_to_cores(quota, period)
-}
-
-/// Parse cgroup v2 `cpu.max` contents: `"<quota> <period>"` or `"max <period>"`.
-fn parse_cpu_max(s: &str) -> Option<usize> {
-    let mut it = s.split_whitespace();
-    let quota = it.next()?;
-    if quota == "max" {
-        return None;
-    }
-    let period: i64 = it.next().unwrap_or("100000").parse().ok()?;
-    quota_period_to_cores(quota.parse().ok()?, period)
+    crate::config::detect_cores()
 }
 
 /// Round a quota/period ratio up to whole cores (a 1.5-core quota → 2).
-fn quota_period_to_cores(quota: i64, period: i64) -> Option<usize> {
-    (quota > 0 && period > 0).then(|| (quota as f64 / period as f64).ceil() as usize)
-}
-
 /// Return free space (GB) on the volume hosting `path`. Returns None if no
 /// disk in the sysinfo enumeration covers the path — defensive: we'd rather
 /// skip the override than guess wrong.
@@ -362,7 +323,6 @@ mod tests {
         let snapshot = cfg.clone();
         apply(&mut cfg);
         assert_eq!(cfg.buffer.timefusion_buffer_max_memory_mb, snapshot.buffer.timefusion_buffer_max_memory_mb);
-        assert_eq!(cfg.memory.timefusion_memory_limit_gb, snapshot.memory.timefusion_memory_limit_gb);
         let _ = buffer_before;
     }
 
@@ -370,58 +330,39 @@ mod tests {
     /// 2026-07-27 must audit as oversubscribed. The previous check passed it,
     /// because it omitted the maintenance pool, counted MemBuffer at nominal
     /// instead of its 120% admission ceiling, ignored `memory_fraction`, and
-    /// left out the DataFusion metadata cache.
+    /// left out the DataFusion metadata cache. Query + maintenance pools now
+    /// come from the derived budget (the knobs they used to read were deleted
+    /// with the 2026-07-29 budget tree), so the audit sums those.
     #[test]
-    fn budget_audit_flags_the_prod_config_that_was_oom_killed() {
+    fn budget_audit_flags_an_oversubscribed_config() {
         let mut cfg = AppConfig::default();
-        cfg.memory.timefusion_memory_limit_gb = 26;
-        cfg.memory.timefusion_memory_fraction = 0.75;
         cfg.buffer.timefusion_buffer_max_memory_mb = 24000;
-        cfg.memory.timefusion_maintenance_pool_gb = 24;
         cfg.cache.timefusion_foyer_memory_mb = 4048;
         cfg.cache.timefusion_foyer_metadata_memory_mb = 512;
 
         // The container limit, not the 188GB host: this is what the kernel kills on.
-        let a = budget_audit(&cfg, 85 * 1024);
-        assert_eq!(a.query_pool_mb, 19968); // 26GB x 0.75 — fraction applied
-        assert_eq!(a.maintenance_pool_mb, 24576); // was missing entirely
+        let a = budget_audit(&cfg, 24 * 1024);
+        assert_eq!(a.query_pool_mb, cfg.derived.query_pool_bytes() / (1024 * 1024));
+        assert_eq!(a.maintenance_pool_mb, cfg.derived.maintenance_pool_bytes() / (1024 * 1024), "was missing entirely");
         assert_eq!(a.foyer_mb, 4560);
-        assert_eq!(a.df_metadata_cache_mb, 512);
         // MemBuffer's ceiling is on its EFFECTIVE budget (knob − foyer −
         // tantivy peak), then x1.2 — not the raw knob, which would count foyer
         // twice since it is summed separately.
         let effective = 24000 - a.foyer_mb - a.tantivy_peak_mb;
         assert_eq!(a.mem_buffer_hard_mb, effective * 6 / 5);
-
         assert_eq!(a.committed_mb, a.query_pool_mb + a.mem_buffer_hard_mb + a.maintenance_pool_mb + a.foyer_mb + a.tantivy_peak_mb + a.df_metadata_cache_mb);
-        // ~71 GiB of an 85 GiB container: under the OLD 85% line, which is why
-        // the box could be killed four times while the check stayed silent.
-        assert!(a.committed_mb > 85 * 1024 * 80 / 100, "expected >80% committed, got {a:?}");
-        assert!(a.oversubscribed(), "prod config must be flagged: {a:?}");
+        assert!(a.oversubscribed(), "a 24GB MemBuffer in a 24GiB container must be flagged: {a:?}");
     }
 
     #[test]
     fn budget_audit_passes_a_config_with_real_slack() {
         let mut cfg = AppConfig::default();
-        cfg.memory.timefusion_memory_limit_gb = 8;
-        cfg.memory.timefusion_memory_fraction = 0.75;
         cfg.buffer.timefusion_buffer_max_memory_mb = 4096;
-        cfg.memory.timefusion_maintenance_pool_gb = 8;
         cfg.cache.timefusion_foyer_memory_mb = 1024;
         cfg.cache.timefusion_foyer_metadata_memory_mb = 256;
-        assert!(!budget_audit(&cfg, 64 * 1024).oversubscribed());
+        assert!(!budget_audit(&cfg, 256 * 1024).oversubscribed());
         // Unknown RAM (0) must not divide-by-zero; warn_at collapses to 0 so a
         // non-zero commitment is flagged rather than silently passing.
         assert_eq!(budget_audit(&cfg, 0).warn_at_mb, 0);
-    }
-
-    #[test]
-    fn cpu_max_parsing_rounds_up_and_honors_unlimited() {
-        assert_eq!(parse_cpu_max("max 100000"), None); // unthrottled
-        assert_eq!(parse_cpu_max("200000 100000"), Some(2)); // 2 cores
-        assert_eq!(parse_cpu_max("50000 100000"), Some(1)); // 0.5 → 1
-        assert_eq!(parse_cpu_max("150000 100000"), Some(2)); // 1.5 → 2
-        assert_eq!(parse_cpu_max("100000"), Some(1)); // period defaults to 100000
-        assert_eq!(quota_period_to_cores(-1, 100000), None);
     }
 }
