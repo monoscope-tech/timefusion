@@ -6099,7 +6099,6 @@ impl Database {
                 removes,
                 adds,
                 stage_store,
-                data_change: true,
                 dedup: Some(DedupUnit { key: key.clone(), date: date_str.to_string(), label: label.to_string(), before: before as u64, after: after as u64 }),
             }));
         }
@@ -6349,27 +6348,24 @@ impl Database {
         // A wave's units all sit in memory as Delta actions only (their parquet
         // is already in R2), so the cap is about commit size, not memory.
         const DEDUP_WAVE_UNITS: usize = 8;
-        let mut staging = futures::stream::iter(ready.into_iter().map(|(project_id, date, bin)| {
-            let table_name = table_name;
-            async move {
-                let key: DirtyBinKey = (project_id.clone(), table_name.to_string(), date.clone(), bin);
-                self.dedup_dirty_bins.remove(&key);
-                self.persist_dirty_bins();
-                crate::metrics::maintenance_stats().dirty_bin_eligible.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
-                let started = std::time::Instant::now();
-                let staged = match chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
-                    Ok(parsed) => {
-                        tokio::time::timeout(
-                            DIRTY_BIN_BUDGET,
-                            self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())),
-                        )
-                        .await
-                    }
-                    Err(e) => Ok(Err(anyhow::anyhow!("invalid dirty-bin date {date}: {e}"))),
-                };
-                (key, started.elapsed(), staged)
-            }
+        let mut staging = futures::stream::iter(ready.into_iter().map(|(project_id, date, bin)| async move {
+            let key: DirtyBinKey = (project_id.clone(), table_name.to_string(), date.clone(), bin);
+            self.dedup_dirty_bins.remove(&key);
+            self.persist_dirty_bins();
+            crate::metrics::maintenance_stats().dirty_bin_eligible.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            info!(project_id, table_name, date, bin, event = "dirty_bin_dequeued");
+            let started = std::time::Instant::now();
+            let staged = match chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d") {
+                Ok(parsed) => {
+                    tokio::time::timeout(
+                        DIRTY_BIN_BUDGET,
+                        self.stage_dedup_partition_range(table, table_name, &project_id, parsed, Some(bin), Some(key.clone())),
+                    )
+                    .await
+                }
+                Err(e) => Ok(Err(anyhow::anyhow!("invalid dirty-bin date {date}: {e}"))),
+            };
+            (key, started.elapsed(), staged)
         }))
         .buffer_unordered(permits);
 
@@ -6731,16 +6727,7 @@ impl Database {
         // fork's snapshot-isolation downgrade applies and concurrent ingest
         // appends can't veto the wave (see `staged_actions`; aa50480).
         let (removes, adds) = staged_actions(&targets, adds, false);
-        Ok(BinOutcome::Staged(StagedBin {
-            project_id: project_id.to_string(),
-            wave_id,
-            target_paths: files,
-            removes,
-            adds,
-            stage_store,
-            data_change: false,
-            dedup: None,
-        }))
+        Ok(BinOutcome::Staged(StagedBin { project_id: project_id.to_string(), wave_id, target_paths: files, removes, adds, stage_store, dedup: None }))
     }
 
     /// Commit one WAVE: every staged unit's Remove+Add in a SINGLE transaction.
@@ -6764,7 +6751,7 @@ impl Database {
         &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date_markers: &[String], data_change: bool, bins: Vec<StagedBin>, round: usize,
     ) -> WaveResult {
         use deltalake::kernel::{Action, transaction::TableReference};
-        debug_assert!(bins.iter().all(|b| b.data_change == data_change), "a wave must not mix data-preserving and row-dropping units");
+        debug_assert!(bins.iter().all(|b| b.data_change() == data_change), "a wave must not mix data-preserving and row-dropping units");
         let engine = if data_change { "dedup" } else { "light optimize" };
         let mut bins = bins;
         let mut failed: Vec<StagedBin> = Vec::new();
@@ -7834,11 +7821,19 @@ struct StagedBin {
     adds: Vec<deltalake::kernel::Action>,
     /// Store the staged parquet was written to, for `cleanup_orphaned_parquet`.
     stage_store: Arc<dyn object_store::ObjectStore>,
-    /// Whether this unit's rewrite changes the LOGICAL data (see
-    /// [`staged_actions`]): false for hot compaction, true for dedup.
-    data_change: bool,
-    /// Dedup-only accounting; `None` for hot compaction bins.
+    /// Dedup-only accounting; `None` for hot compaction bins. Also THE source of
+    /// truth for `data_change` (see [`StagedBin::data_change`]) — a dedup unit
+    /// drops rows by definition, a compaction unit cannot.
     dedup: Option<DedupUnit>,
+}
+
+impl StagedBin {
+    /// Derived, never stored: a second `data_change` field could disagree with
+    /// `dedup`, and disagreeing here means committing a row-dropping rewrite
+    /// under snapshot isolation (see [`staged_actions`]).
+    fn data_change(&self) -> bool {
+        self.dedup.is_some()
+    }
 }
 
 /// Per-unit outcome of one wave commit. Per-unit (not a count) because dedup
@@ -8109,6 +8104,7 @@ enum BinOutcome<T> {
     Retry,
 }
 
+#[allow(clippy::too_many_arguments)] // scheduling params are positional by design; a struct would just rename them
 async fn round_robin_bins<F, Fut, T, C, CFut>(
     projects: Vec<String>, max_rounds: usize, concurrency: usize, deadline: std::time::Instant, on_truncate: impl Fn(usize, &[String]),
     should_pause: impl Fn() -> Option<&'static str>, op: F, commit_wave: C,
@@ -10345,9 +10341,8 @@ mod tests {
 
     fn staged_unit(project: &str, paths: &[&str], dedup: Option<super::DedupUnit>) -> super::StagedBin {
         let targets: Vec<_> = paths.iter().map(|p| test_add(p)).collect();
-        let data_change = dedup.is_some();
         let staged = vec![deltalake::kernel::Action::Add(test_add(&format!("{project}-new.parquet")))];
-        let (removes, adds) = super::staged_actions(&targets, staged, data_change);
+        let (removes, adds) = super::staged_actions(&targets, staged, dedup.is_some());
         super::StagedBin {
             project_id: project.to_string(),
             wave_id: format!("wave-{project}"),
@@ -10355,7 +10350,6 @@ mod tests {
             removes,
             adds,
             stage_store: Arc::new(object_store::memory::InMemory::new()),
-            data_change,
             dedup,
         }
     }

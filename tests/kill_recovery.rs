@@ -122,6 +122,8 @@ struct Tf {
     bucket: String,
     prefix: String,
     endpoint: String,
+    /// Child stdout capture (`.stderr.log` sibling for stderr) — see `spawn`.
+    boot_log: PathBuf,
     opts: TfOpts,
 }
 
@@ -140,7 +142,8 @@ impl Tf {
         let data_dir = std::env::temp_dir().join(format!("tf-kill-{test_name}-{id}"));
         let _ = std::fs::remove_dir_all(&data_dir);
         std::fs::create_dir_all(data_dir.join("wal")).ok();
-        let mut tf = Self { child: None, port: free_port()?, data_dir, bucket, prefix, endpoint, opts };
+        let boot_log = data_dir.join("boot.log");
+        let mut tf = Self { child: None, port: free_port()?, data_dir, bucket, prefix, endpoint, boot_log, opts };
         tf.spawn().await?;
         Ok(tf)
     }
@@ -173,8 +176,12 @@ impl Tf {
             .env("TIMEFUSION_FOYER_DISABLED", "true")
             .env("TIMEFUSION_ALLOW_INSECURE_AUTH", "true")
             .env("RUST_LOG", "warn,timefusion=info")
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
+            // Capture BOTH streams to a per-spawn file: tracing writes to
+            // stdout, so nulling it made every CI "never became ready" failure
+            // blind — five tests red since the suite landed with zero boot logs
+            // to read. The tail is surfaced in the wait_ready failure.
+            .stdout(Stdio::from(std::fs::File::create(&self.boot_log)?))
+            .stderr(Stdio::from(std::fs::File::create(self.boot_log.with_extension("stderr.log"))?));
         for (k, v) in &self.opts.extra_env {
             cmd.env(k, v);
         }
@@ -195,7 +202,26 @@ impl Tf {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        anyhow::bail!("timefusion never became ready on port {}", self.port)
+        let tail = |p: &std::path::Path| {
+            std::fs::read_to_string(p)
+                .map(|c| {
+                    c.lines().rev().take(40).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(
+                        "
+",
+                    )
+                })
+                .unwrap_or_default()
+        };
+        anyhow::bail!(
+            "timefusion never became ready on port {}
+--- child stdout (last 40 lines) ---
+{}
+--- child stderr ---
+{}",
+            self.port,
+            tail(&self.boot_log),
+            tail(&self.boot_log.with_extension("stderr.log"))
+        )
     }
 
     async fn connect(&self) -> Result<Client> {

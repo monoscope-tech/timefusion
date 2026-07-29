@@ -59,22 +59,25 @@ fn parse_cgroup_cpu_max(content: &str) -> Option<usize> {
 /// `/proc/meminfo` total → a conservative 8 GiB floor. Never panics.
 fn detect_memory_limit_bytes() -> usize {
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-        && let Some(v) = parse_cgroup_v2_memory_max(&s) {
-            return v;
-        }
+        && let Some(v) = parse_cgroup_v2_memory_max(&s)
+    {
+        return v;
+    }
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        && let Some(v) = parse_cgroup_v1_memory_limit(&s) {
-            return v;
-        }
+        && let Some(v) = parse_cgroup_v1_memory_limit(&s)
+    {
+        return v;
+    }
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo")
-        && let Some(v) = parse_meminfo_total_bytes(&s) {
-            // No cgroup limit → shared host: budget HALF the machine, loudly.
-            // Sizing from full host RAM inside a container is the 2026-06-11
-            // memcg OOM-loop (16 kills/24h); the old escape hatch (env knob)
-            // is gone, so the fallback itself must be conservative.
-            tracing::warn!("budget tree: no cgroup memory limit; deriving from HALF of host RAM ({} GiB)", v / 2 / GIB);
-            return v / 2;
-        }
+        && let Some(v) = parse_meminfo_total_bytes(&s)
+    {
+        // No cgroup limit → shared host: budget HALF the machine, loudly.
+        // Sizing from full host RAM inside a container is the 2026-06-11
+        // memcg OOM-loop (16 kills/24h); the old escape hatch (env knob)
+        // is gone, so the fallback itself must be conservative.
+        tracing::warn!("budget tree: no cgroup memory limit; deriving from HALF of host RAM ({} GiB)", v / 2 / GIB);
+        return v / 2;
+    }
     tracing::warn!("budget tree: could not detect memory limit from cgroup or /proc/meminfo; falling back to 8 GiB");
     8 * GIB
 }
@@ -95,9 +98,10 @@ pub(crate) fn detect_cores() -> usize {
     // core detector — autotune's `detected_query_partitions` reads it too, so
     // partitions and the budget tree can never size from different answers.
     if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max")
-        && let Some(c) = parse_cgroup_cpu_max(&s) {
-            return c.clamp(1, host);
-        }
+        && let Some(c) = parse_cgroup_cpu_max(&s)
+    {
+        return c.clamp(1, host);
+    }
     let v1 = || {
         let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").ok()?.trim().parse::<i64>().ok()?;
         let period = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok()?.trim().parse::<i64>().ok()?;

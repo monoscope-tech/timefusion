@@ -3020,7 +3020,8 @@ mod tests {
         let projects: Vec<String> = (0..3).map(|i| format!("cp{i}{test_id}")).collect();
 
         // Every call's units, so we can assert on the batching itself.
-        let calls: Arc<std::sync::Mutex<Vec<Vec<(String, String, DeltaWatermark)>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        type WatermarkCalls = Arc<std::sync::Mutex<Vec<Vec<(String, String, DeltaWatermark)>>>>;
+        let calls: WatermarkCalls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = calls.clone();
         let mut layer = crate::test_utils::test_helpers::test_layer(Arc::clone(&cfg)).unwrap();
         layer.coalesced_write_callback = Some(Arc::new(move |units: Vec<FlushUnit>| {
@@ -3031,7 +3032,8 @@ mod tests {
             })
         }));
         // Each project must be handed only ITS files (path-attributed upstream).
-        let indexed: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        type IndexedFiles = Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
+        let indexed: IndexedFiles = Arc::new(std::sync::Mutex::new(Vec::new()));
         let idx = indexed.clone();
         layer.tantivy_index_callback = Some(Arc::new(move |p: String, _t, _b, files: Vec<String>| {
             let idx = idx.clone();
