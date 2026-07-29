@@ -9,8 +9,7 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::config::{Credentials, Region};
 use datafusion_postgres::ServerOptions;
 use rand::RngExt;
-use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
-use testcontainers_modules::minio::MinIO;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
 use timefusion::{
     bootstrap::{self, Bootstrapped},
     buffered_write_layer::BufferedWriteLayer,
@@ -40,7 +39,17 @@ use uuid::Uuid;
 /// the precondition, so this was never a production write-path bug; the test
 /// environment was silently non-atomic. Any bump must keep conditional PUT —
 /// `harness_object_store_enforces_atomic_commits` guards it.
+///
+/// Built as a [`GenericImage`], NOT `testcontainers_modules::minio::MinIO`:
+/// the module's ready condition waits for "API:" on STDOUT, which only the
+/// ancient default image satisfies — modern MinIO banners on STDERR, so the
+/// module + this tag times out on every container start (CI 2026-07-29:
+/// 30 min of 60s startup timeouts, one per test, then the job was killed).
 pub const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
+
+pub fn pinned_minio_image() -> GenericImage {
+    GenericImage::new("minio/minio", MINIO_TAG).with_wait_for(WaitFor::message_on_stderr("API:"))
+}
 
 pub const FROZEN_START_MICROS: i64 = 1_900_000_000_000_000; // ~2030-03-15
 
@@ -180,7 +189,13 @@ impl E2eEnvBuilder {
         let (minio, endpoint) = match std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
             Ok(ep) => (None, ep),
             Err(_) => {
-                let minio = MinIO::default().with_tag(MINIO_TAG).start().await.context("start MinIO container")?;
+                let minio = pinned_minio_image()
+                    .with_cmd(["server", "/data"])
+                    .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                    .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                    .start()
+                    .await
+                    .context("start MinIO container")?;
                 let host = minio.get_host().await.context("get MinIO host")?.to_string();
                 let port = minio.get_host_port_ipv4(9000).await.context("get MinIO port")?;
                 let endpoint = format!("http://{host}:{port}");
@@ -269,7 +284,7 @@ impl E2eEnvBuilder {
 
 pub struct E2eEnv {
     /// None when running against an external MinIO (TIMEFUSION_TEST_S3_ENDPOINT).
-    _minio: Option<ContainerAsync<MinIO>>,
+    _minio: Option<ContainerAsync<GenericImage>>,
     pub data_dir: PathBuf,
     pub pg_port: u16,
     pub bucket: String,

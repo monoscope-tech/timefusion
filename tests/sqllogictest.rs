@@ -13,8 +13,7 @@ mod sqllogictest_tests {
     use dotenv::dotenv;
     use serial_test::serial;
     use sqllogictest::{AsyncDB, DBOutput, DefaultColumnType};
-    use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
-    use testcontainers_modules::minio::MinIO;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt, core::WaitFor, runners::AsyncRunner};
     use timefusion::database::Database;
     use tokio::{sync::Notify, time::sleep};
     use tokio_postgres::{NoTls, Row};
@@ -250,7 +249,7 @@ mod sqllogictest_tests {
     #[allow(clippy::large_enum_variant)]
     enum MinioGuard {
         Process(std::process::Child),
-        Container(#[allow(dead_code)] ContainerAsync<MinIO>),
+        Container(#[allow(dead_code)] ContainerAsync<GenericImage>),
         External,
     }
 
@@ -299,7 +298,16 @@ mod sqllogictest_tests {
         } else {
             // Pinned like the e2e harness: the default image predates conditional
             // PUT, which makes Delta commit versions non-atomic (see MINIO_TAG).
-            let minio = MinIO::default().with_tag("RELEASE.2025-09-07T16-13-09Z").start().await.context("start MinIO container")?;
+            // GenericImage because the MinIO module waits for "API:" on stdout,
+            // and modern images banner on stderr (see e2e::harness).
+            let minio = GenericImage::new("minio/minio", "RELEASE.2025-09-07T16-13-09Z")
+                .with_wait_for(WaitFor::message_on_stderr("API:"))
+                .with_cmd(["server", "/data"])
+                .with_env_var("MINIO_ROOT_USER", "minioadmin")
+                .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
+                .start()
+                .await
+                .context("start MinIO container")?;
             let host = minio.get_host().await.context("get MinIO host")?.to_string();
             let port = minio.get_host_port_ipv4(9000).await.context("get MinIO port")?;
             (MinioGuard::Container(minio), format!("http://{host}:{port}"))
