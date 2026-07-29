@@ -205,7 +205,11 @@ const_default!(d_write_backpressure_secs: u64 = 60);
 // flushed between the mem leg and the drain sees the assignment applied
 // twice, and a failed drain retries whole groups. Timestamp-range conjuncts
 // are widened to the union across coalesced statements.
-const_default!(d_dml_coalesce_secs: u64 = 0);
+// 3s ON by default since 2026-07-29: the drain hash-update storm (~3
+// same-shape UPDATEs/s, each rewriting most of the hot partition) OOM-looped
+// prod six times in one afternoon; coalescing collapses a window's statements
+// into one rewrite. Set to 0 to restore the synchronous per-statement path.
+const_default!(d_dml_coalesce_secs: u64 = 3);
 // Watchdog for a single bucket's Delta commit inside `flush_bucket`. A hung S3
 // commit / commit-lock wait otherwise pins `flush_lock` forever with no log:
 // flushes freeing zero memory while inserts wedge at the hard limit (prod
