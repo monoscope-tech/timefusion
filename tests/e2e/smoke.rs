@@ -58,3 +58,31 @@ async fn count_star_returns_correct_value() -> anyhow::Result<()> {
     assert_eq!(count, 7);
     Ok(())
 }
+
+/// The whole suite's OCC coverage is only as sound as the object store's
+/// put-if-absent. Delta commits via `PutMode::Create`; a store that answers it
+/// with a plain overwrite lets two writers "commit" the same version and the
+/// loser's actions — acked, committed rows — vanish with no error anywhere.
+/// That is exactly how `append_during_dv_merge_is_not_dropped` was flaky until
+/// 2026-07-30 (see `harness::MINIO_TAG`). Assert the precondition on the very
+/// store commits are written through, cache wrapper included, so a container
+/// image or storage-option change can never silently re-disarm it.
+#[serial_test::serial]
+#[tokio::test(flavor = "multi_thread")]
+async fn harness_object_store_enforces_atomic_commits() -> anyhow::Result<()> {
+    use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
+
+    let env = E2eEnv::builder().start().await?;
+    let store = env.db().resolve_table("e2e_project", "otel_logs_and_spans").await?.read().await.log_store().object_store(None);
+    let path = object_store::path::Path::from("_delta_log/put_if_absent_probe.json");
+    let create = || PutOptions { mode: PutMode::Create, ..Default::default() };
+
+    store.put_opts(&path, "first".into(), create()).await?;
+    let clobber = store.put_opts(&path, "second".into(), create()).await;
+    assert!(
+        matches!(clobber, Err(object_store::Error::AlreadyExists { .. })),
+        "object store did NOT enforce put-if-absent — Delta commit versions are not atomic here, so every concurrent-writer test in this suite is unsound: {clobber:?}"
+    );
+    assert_eq!(store.get(&path).await?.bytes().await?, "first".as_bytes(), "losing put overwrote the winning commit file");
+    Ok(())
+}

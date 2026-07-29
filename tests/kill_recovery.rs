@@ -47,7 +47,10 @@ async fn port_open(addr: &str) -> bool {
 /// Local-first MinIO, same resolution order as the sqllogictest harness:
 /// explicit endpoint → already-running :9000 → spawn the local `minio` binary.
 /// Docker is deliberately NOT a fallback here: this suite kills processes and
-/// needs a stable endpoint across restarts.
+/// needs a stable endpoint across restarts. Whichever MinIO answers must
+/// implement conditional PUT (`If-None-Match: *`) — Delta commit versions are
+/// only atomic because of it, and a pre-2024 MinIO turns two racing commits
+/// into a silent overwrite (see `e2e::harness::MINIO_TAG`).
 async fn ensure_minio() -> Result<String> {
     if let Ok(ep) = std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
         return Ok(ep);

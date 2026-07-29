@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use aws_sdk_s3::config::{Credentials, Region};
 use datafusion_postgres::ServerOptions;
 use rand::RngExt;
-use testcontainers::{ContainerAsync, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use testcontainers_modules::minio::MinIO;
 use timefusion::{
     bootstrap::{self, Bootstrapped},
@@ -20,6 +20,27 @@ use timefusion::{
 use tokio::sync::Notify;
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
+
+/// MinIO image, pinned to a release that implements conditional PUT
+/// (`If-None-Match: *`).
+///
+/// 2026-07-30: `MinIO::default()` in testcontainers-modules 0.11 is
+/// `RELEASE.2022-02-07`, which predates S3 conditional writes and answers
+/// `If-None-Match: *` with a plain 200 + overwrite. Delta's whole OCC design
+/// rests on `write_commit_entry` being an atomic put-if-absent (delta-rs uses
+/// `PutMode::Create`, object_store maps it to that header), so on that image
+/// two writers racing for version N BOTH commit "successfully" and the later
+/// PUT silently clobbers the earlier commit file — destroying its actions and
+/// with them an acked, committed AddFile.
+///
+/// That is what made `append_during_dv_merge_is_not_dropped` flaky (~1 in 3):
+/// `tolerate_concurrent_appends` makes a DV merge rebase onto — and therefore
+/// race for the same version as — a concurrent flush commit, and one 1-row
+/// flush commit per failure lost its file. Real object stores (S3, R2) enforce
+/// the precondition, so this was never a production write-path bug; the test
+/// environment was silently non-atomic. Any bump must keep conditional PUT —
+/// `harness_object_store_enforces_atomic_commits` guards it.
+pub const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
 
 pub const FROZEN_START_MICROS: i64 = 1_900_000_000_000_000; // ~2030-03-15
 
@@ -159,7 +180,7 @@ impl E2eEnvBuilder {
         let (minio, endpoint) = match std::env::var("TIMEFUSION_TEST_S3_ENDPOINT") {
             Ok(ep) => (None, ep),
             Err(_) => {
-                let minio = MinIO::default().start().await.context("start MinIO container")?;
+                let minio = MinIO::default().with_tag(MINIO_TAG).start().await.context("start MinIO container")?;
                 let host = minio.get_host().await.context("get MinIO host")?.to_string();
                 let port = minio.get_host_port_ipv4(9000).await.context("get MinIO port")?;
                 let endpoint = format!("http://{host}:{port}");
