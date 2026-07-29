@@ -494,6 +494,10 @@ pub struct MaintenanceStats {
     /// Chronic nonzero = compaction is being starved, not protected.
     pub light_optimize_wal_yields: AtomicU64,
     pub light_optimize_memory_brakes: AtomicU64,
+    /// Rounds where the WAL-backlog brake DEGRADED the wave to the one-project
+    /// service floor (instead of stopping the tick). Chronic nonzero = ingest is
+    /// outrunning flush often enough that compaction is running at the floor.
+    pub light_optimize_ticks_degraded: AtomicU64,
     pub dirty_bin_queue_depth: AtomicU64,
     pub dirty_bin_enqueued: AtomicU64,
     pub dirty_bin_eligible: AtomicU64,
@@ -532,6 +536,7 @@ static MAINTENANCE_STATS: MaintenanceStats = MaintenanceStats {
     light_optimize_waves_committed: AtomicU64::new(0),
     light_optimize_wal_yields: AtomicU64::new(0),
     light_optimize_memory_brakes: AtomicU64::new(0),
+    light_optimize_ticks_degraded: AtomicU64::new(0),
     dirty_bin_queue_depth: AtomicU64::new(0),
     dirty_bin_enqueued: AtomicU64::new(0),
     dirty_bin_eligible: AtomicU64::new(0),

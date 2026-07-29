@@ -204,6 +204,7 @@ impl StatsTableProvider {
             rows.push(("maintenance", "light_optimize_waves_committed_total".into(), m.light_optimize_waves_committed.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_wal_yields_total".into(), m.light_optimize_wal_yields.load(Relaxed).to_string()));
             rows.push(("maintenance", "light_optimize_memory_brakes_total".into(), m.light_optimize_memory_brakes.load(Relaxed).to_string()));
+            rows.push(("maintenance", "light_optimize_ticks_degraded_total".into(), m.light_optimize_ticks_degraded.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_queue_depth".into(), m.dirty_bin_queue_depth.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_enqueued_total".into(), m.dirty_bin_enqueued.load(Relaxed).to_string()));
             rows.push(("maintenance", "dirty_bin_eligible_total".into(), m.dirty_bin_eligible.load(Relaxed).to_string()));

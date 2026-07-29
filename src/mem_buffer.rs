@@ -166,35 +166,45 @@ pub struct MemBuffer {
     /// Flattened structure: (project_id, table_name) → TableBuffer
     /// Reduces 3 hash lookups to 1 for table access.
     tables: DashMap<TableKey, Arc<TableBuffer>>,
-    /// Running approximation of in-memory bytes across all live buckets.
-    /// Reported via `timefusion_stats` as `mem_buffer.estimated_bytes_approx`.
+    /// Running total of in-memory bytes across all live buckets — the value
+    /// [`MemBuffer::estimated_memory_bytes`] returns, and therefore what the
+    /// memory-reservation CAS, `pressure_pct`, and `unflushed_backlog_bytes`
+    /// all read. Maintained by DELTA at every site that changes any bucket's
+    /// `memory_bytes`, so it must stay in step with the sum of those atomics.
     ///
-    /// Accounting is intentionally cheap, not exact:
-    /// - `+= new_size` on every insert (pre-coalesce batch size).
-    /// - On coalesce, the bucket's `memory_bytes` field is overwritten to
-    ///   the post-concat size, but this MemBuffer-level total isn't
-    ///   decremented — so the running sum stays high until the bucket
-    ///   drains.
-    /// - `-= freed_bytes` on flushed-prefix drain and eviction (sees the
-    ///   post-coalesce bucket size, fully reconciling that bucket's
-    ///   contribution).
+    /// **Exhaustive list of mutation sites** (the historical bug was a missed
+    /// site — grep `memory_bytes` before adding one and update this list):
+    /// 1. `MemBuffer::insert_with_hold` — adds the net delta returned by
+    ///    `TableBuffer::insert_batch` (insert size *plus* the coalesce
+    ///    shrinkage, see 2).
+    /// 2. `TableBuffer::insert_batch` — `+= new_size` on push, then on
+    ///    coalesce `+= combined_size - folded_size` (negative). Both are
+    ///    folded into its returned net delta; the caller applies it. NOT
+    ///    re-derived — this is exactly what the old cache got wrong.
+    /// 3. `MemBuffer::insert_batches` — sums the net deltas of 2.
+    /// 4. `finish_flushed_snapshot` prefix drain — `-= applied`, the value
+    ///    actually subtracted from the bucket (clamped identically), and
+    ///    `-= residual` of the bucket if the drain removes it.
+    /// 5. `take_bucket_for_flush` — `-= swap(0)`; plus the residual of the
+    ///    bucket if the empty shell is removed.
+    /// 6. `restore_bucket` (failed-commit restore) — `+= added`.
+    /// 7. `evict_old_data` — `-= sum(memory_bytes)` of removed buckets.
+    /// 8. `reap_expired_empty_buckets` — `-= residual` of removed shells.
+    /// 9. `delete` (DML mem leg) — `-= total_freed`.
+    /// 10. `update` / `update_with_source` (DML mem legs) — signed delta.
+    /// 11. `clear` — `store(0)` alongside `tables.clear()`.
     ///
-    /// **Maximum drift bound**: at any instant, the over-reporting is at
-    /// most the sum of `(pre_coalesce_size - post_coalesce_size)` across
-    /// buckets that have coalesced since their last drain. The bucket-
-    /// level field is exact; only the MemBuffer-level sum drifts. With
-    /// 10-minute buckets and pressure-driven flushes, this converges
-    /// every retention window (single-digit minutes).
-    ///
-    /// **Why not exact**: making this exact requires holding a lock that
-    /// spans bucket coalesce + counter update for every insert. The hot
-    /// path is currently lock-free (per-bucket atomic) and the drift is
-    /// bounded, monotone, and self-correcting on drain.
-    ///
-    /// **Operator caution**: do NOT use this counter for back-pressure
-    /// decisions where a false-high reading would cause incorrect
-    /// throttling. The `pressure_pct` reported on `buffered_layer` is
-    /// what the flush task and the memory-reservation CAS actually use.
+    /// **Drift is bounded, never permanent.** Every subtraction goes through
+    /// [`apply_signed_delta`], which saturates at 0: an earlier version used
+    /// raw `fetch_sub` and a single mismatched subtraction wrapped the counter
+    /// to ~948 GB against a 44 GB budget, after which *every*
+    /// `try_reserve_memory` failed with "Memory limit exceeded" until restart.
+    /// Saturation makes that failure mode under-report instead of wedging
+    /// ingest, and [`MemBuffer::reconcile_estimated_bytes`] — called once per
+    /// flush-task timer tick — recomputes the authoritative sum, stores it,
+    /// and warns if the drift exceeded a few percent. So a future missed
+    /// mutation site shows up as a warn log within a minute rather than as a
+    /// permanent outage.
     estimated_bytes: AtomicUsize,
     /// Mirrors `WalManager::shards_per_topic` so `FlushableBucket.wal_first_positions`
     /// is always sized correctly when snapshotted at seal time.
@@ -366,15 +376,33 @@ pub struct MemBufferStats {
 /// Per-batch fixed overhead: RecordBatch struct, schema Arc bump, ArrayData
 /// metadata for each column, and DashMap/Mutex slots when held in a TimeBucket.
 /// Empirically ~64 B for the batch + 96 B per column (ArrayData + Buffer headers).
+/// Drift (as a % of the recomputed truth) that [`MemBuffer::reconcile_estimated_bytes`]
+/// tolerates silently. Anything above it is logged at warn as an accounting bug.
+const MAX_TOLERATED_DRIFT_PCT: usize = 2;
+
 const BATCH_FIXED_OVERHEAD: usize = 64;
 const PER_COLUMN_OVERHEAD: usize = 96;
 
+/// Apply a signed byte delta to a memory counter, **saturating at 0** on the
+/// way down. Never `fetch_sub`: an underflow wraps a `usize` counter to ~2^64
+/// and, on `MemBuffer::estimated_bytes`, permanently rejects every insert
+/// (prod: 948 GB reported against a 44 GB budget). Under-reporting is
+/// recoverable — the reconciler restores truth within a flush tick.
 fn apply_signed_delta(counter: &AtomicUsize, delta: i64) {
     if delta > 0 {
         counter.fetch_add(delta as usize, Ordering::Relaxed);
     } else if delta < 0 {
-        counter.fetch_sub((-delta) as usize, Ordering::Relaxed);
+        sub_saturating(counter, delta.unsigned_abs() as usize);
     }
+}
+
+/// `counter -= n`, floored at 0; returns the amount ACTUALLY subtracted (`< n`
+/// only when the counter was already below `n`). Callers that mirror a
+/// bucket-level subtraction onto `MemBuffer::estimated_bytes` must forward this
+/// return value, not `n` — subtracting the unclamped amount from the total is
+/// itself a drift source. See [`apply_signed_delta`] for the underflow history.
+fn sub_saturating(counter: &AtomicUsize, n: usize) -> usize {
+    counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(n))).map_or(0, |prev| prev.min(n))
 }
 
 pub fn estimate_batch_size(batch: &RecordBatch) -> usize {
@@ -851,19 +879,63 @@ impl MemBuffer {
         }
     }
 
-    /// Authoritative live MemBuffer size — sums every (table, bucket)'s
-    /// `memory_bytes` atomic directly. The internal `estimated_bytes`
-    /// AtomicUsize cache drifts because the in-bucket coalesce path
-    /// (`TimeBucket::insert_batch`) shrinks `bucket.memory_bytes` via
-    /// `.store(combined_size)` without telling MemBuffer about the savings.
-    /// Each coalesce leaks `(sum_before − combined_size)` upward, and any
-    /// `fetch_sub` underflow on this cache wraps to ~USIZE_MAX. Prod hit
-    /// 948 GB reported with a real budget of 44 GB — every `try_reserve_memory`
-    /// then rejected forever ("Memory limit exceeded"). Recomputing here is
-    /// O(N tables × N buckets), microseconds at prod scale (~30 projects ×
-    /// a handful of buckets each), and correct-by-construction.
+    /// Live MemBuffer size in bytes — a single relaxed atomic load of the
+    /// running total maintained by every mutation site (enumerated on
+    /// [`Self::estimated_bytes`]).
+    ///
+    /// History, because this method has been both things:
+    /// - It started as this cached counter, but the in-bucket coalesce path
+    ///   shrank `bucket.memory_bytes` without reporting the savings upward,
+    ///   leaking `(sum_before − combined_size)` per coalesce, and a mismatched
+    ///   `fetch_sub` wrapped the counter to ~948 GB against a 44 GB budget —
+    ///   after which every `try_reserve_memory` rejected forever ("Memory
+    ///   limit exceeded"). Fixed by summing the bucket atomics on every call.
+    /// - That sum is O(tables × buckets) with a DashMap shard lock per table,
+    ///   and `try_reserve_memory` calls it once per CAS *attempt*. At prod
+    ///   scale it became 10.3% of total process CPU — ~96% of the insert
+    ///   path's cost (profile 2026-07-30).
+    ///
+    /// So we are back to the counter, with both original failure modes closed:
+    /// coalesce now folds its shrinkage into the delta the insert site applies,
+    /// every subtraction saturates at 0 (see [`apply_signed_delta`]), and
+    /// [`Self::reconcile_estimated_bytes`] re-derives the authoritative sum
+    /// once per flush tick, storing it and warning on non-trivial drift. Any
+    /// residual error is therefore bounded by one tick, not permanent.
     pub fn estimated_memory_bytes(&self) -> usize {
+        self.estimated_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Authoritative sum of every live bucket's `memory_bytes`. O(tables ×
+    /// buckets) with a shard lock per table — NOT for the hot path; use
+    /// [`Self::estimated_memory_bytes`] there.
+    pub fn recompute_memory_bytes(&self) -> usize {
         self.tables.iter().map(|t| t.value().buckets.iter().map(|b| b.value().memory_bytes.load(Ordering::Relaxed)).sum::<usize>()).sum()
+    }
+
+    /// Periodic drift correction for [`Self::estimated_bytes`]: recompute the
+    /// authoritative sum, store it, and warn if the cached value was off by
+    /// more than [`MAX_TOLERATED_DRIFT_PCT`]. Called once per flush-task timer
+    /// tick (~`flush_interval_secs`) so one O(N) sweep per minute replaces one
+    /// per insert. Returns `(cached_before, truth)`.
+    ///
+    /// The warn is a bug detector: a non-trivial drift means some site that
+    /// mutates a bucket's `memory_bytes` is not reporting its delta (that is
+    /// exactly the class of bug that produced the 948 GB wedge), so treat it
+    /// as an action item, not noise.
+    pub fn reconcile_estimated_bytes(&self) -> (usize, usize) {
+        let truth = self.recompute_memory_bytes();
+        let cached = self.estimated_bytes.swap(truth, Ordering::Relaxed);
+        let drift = cached.abs_diff(truth);
+        if drift > 0 && drift as u128 * 100 > truth.max(1) as u128 * MAX_TOLERATED_DRIFT_PCT as u128 {
+            tracing::warn!(
+                target = "mem_buffer",
+                cached_bytes = cached,
+                recomputed_bytes = truth,
+                drift_bytes = drift,
+                "MemBuffer estimated_bytes drifted beyond tolerance — a bucket memory_bytes mutation site is not reporting its delta (see MemBuffer::estimated_bytes)"
+            );
+        }
+        (cached, truth)
     }
 
     pub fn compute_bucket_id(timestamp_micros: i64) -> i64 {
@@ -942,8 +1014,8 @@ impl MemBuffer {
     ) -> anyhow::Result<()> {
         let schema = batch.schema();
         let table = self.get_or_create_table(project_id, table_name, &schema)?;
-        let (batch_size, bucket_id) = table.insert_batch(batch, timestamp_micros, wal_hold)?;
-        self.estimated_bytes.fetch_add(batch_size, Ordering::Relaxed);
+        let (mem_delta, bucket_id) = table.insert_batch(batch, timestamp_micros, wal_hold)?;
+        apply_signed_delta(&self.estimated_bytes, mem_delta);
         // Drop any stale text-index cache entry for this bucket — the
         // `indexed_rows == snapshot_rows` check would reject it on the
         // next query anyway, but freeing the bytes now lets the LRU give
@@ -1034,14 +1106,14 @@ impl MemBuffer {
         let schema = batches[0].schema();
         let table = self.get_or_create_table(project_id, table_name, &schema)?;
 
-        let mut total_size = 0usize;
+        let mut total_delta = 0i64;
         let mut touched_buckets: std::collections::HashSet<i64> = std::collections::HashSet::new();
         for batch in batches {
             let (sz, bucket_id) = table.insert_batch(batch, timestamp_micros, None)?;
-            total_size += sz;
+            total_delta += sz;
             touched_buckets.insert(bucket_id);
         }
-        self.estimated_bytes.fetch_add(total_size, Ordering::Relaxed);
+        apply_signed_delta(&self.estimated_bytes, total_delta);
         for bucket_id in touched_buckets {
             self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
         }
@@ -1395,16 +1467,25 @@ impl MemBuffer {
             }
             bucket.flush_pinned_prefix.store(0, Ordering::Relaxed);
             drop(g);
-            bucket.memory_bytes.fetch_sub(freed.min(bucket.memory_bytes.load(Ordering::Relaxed)), Ordering::Relaxed);
+            // Mirror the CLAMPED amount onto the MemBuffer total — passing the
+            // raw `freed` would over-subtract whenever the bucket held less.
+            let applied = sub_saturating(&bucket.memory_bytes, freed);
             bucket.row_count.fetch_sub(rows.min(bucket.row_count.load(Ordering::Relaxed)), Ordering::Relaxed);
-            self.estimated_bytes.fetch_sub(freed, Ordering::Relaxed);
+            sub_saturating(&self.estimated_bytes, applied);
         }
         self.cache_invalidate(&Self::cache_key(&b.project_id, &b.table_name, b.bucket_id));
         // remove_if re-checks under the shard lock (bucket_ref dropped above,
         // so no self-deadlock); a racing insert that repopulated the bucket
         // keeps it AND its force_flushed marker — clearing the marker on a
         // survived bucket would re-mask its force-flushed Delta rows.
-        let bucket_removed = emptied && table.buckets.remove_if(&b.bucket_id, |_, bk| bk.batches.lock().is_empty()).is_some();
+        // Removing the bucket drops its `memory_bytes` atomic, so any residual
+        // it still carried leaves the authoritative sum — discount the total by
+        // the same amount or the cache drifts high (see `estimated_bytes`).
+        let removed = emptied.then(|| table.buckets.remove_if(&b.bucket_id, |_, bk| bk.batches.lock().is_empty())).flatten();
+        if let Some((_, shell)) = &removed {
+            sub_saturating(&self.estimated_bytes, shell.memory_bytes.load(Ordering::Relaxed));
+        }
+        let bucket_removed = removed.is_some();
         if bucket_removed {
             if let Some(mut s) = self.force_flushed.get_mut(&key) {
                 s.remove(&b.bucket_id);
@@ -1468,11 +1549,11 @@ impl MemBuffer {
             for id in expired {
                 // Re-check emptiness under the shard lock — a concurrent
                 // insert that repopulated the shell keeps it.
-                if table
-                    .buckets
-                    .remove_if(&id, |_, b| b.batches.lock().is_empty() && b.last_wal_pin_micros.load(Ordering::Relaxed) < arrival_cutoff_micros)
-                    .is_some()
+                if let Some((_, shell)) =
+                    table.buckets.remove_if(&id, |_, b| b.batches.lock().is_empty() && b.last_wal_pin_micros.load(Ordering::Relaxed) < arrival_cutoff_micros)
                 {
+                    // Residual bytes on a dropped shell must leave the total too.
+                    sub_saturating(&self.estimated_bytes, shell.memory_bytes.load(Ordering::Relaxed));
                     self.cache_invalidate(&Self::cache_key(&table.project_id, &table.table_name, id));
                     reaped += 1;
                 }
@@ -1531,13 +1612,17 @@ impl MemBuffer {
         drop(wal_g);
         drop(batches_g);
         drop(bucket_ref);
-        self.estimated_bytes.fetch_sub(freed, Ordering::Relaxed);
+        sub_saturating(&self.estimated_bytes, freed);
         self.cache_invalidate(&Self::cache_key(project_id, table_name, bucket_id));
 
         // Drop the now-empty bucket so stale empty shells don't accumulate.
         // `remove_if` re-checks emptiness under the shard write lock, so a concurrent insert that
         // repopulated the bucket between the take and here is preserved.
-        table.buckets.remove_if(&bucket_id, |_, b| b.batches.lock().is_empty());
+        // Discount any residual the dropped shell still carried, same as the
+        // prefix-drain removal — the atomic goes away with the bucket.
+        if let Some((_, shell)) = table.buckets.remove_if(&bucket_id, |_, b| b.batches.lock().is_empty()) {
+            sub_saturating(&self.estimated_bytes, shell.memory_bytes.load(Ordering::Relaxed));
+        }
 
         // Pad to shards_per_topic so watermark indices line up.
         let shards = self.shards_per_topic;
@@ -1669,7 +1754,7 @@ impl MemBuffer {
         }
 
         if freed_bytes > 0 {
-            self.estimated_bytes.fetch_sub(freed_bytes, Ordering::Relaxed);
+            sub_saturating(&self.estimated_bytes, freed_bytes);
         }
 
         // Evicted buckets can't mask Delta anymore — drop their marks too.
@@ -1756,14 +1841,14 @@ impl MemBuffer {
                 bucket.row_count.fetch_sub(bucket_rows_removed, Ordering::Relaxed);
             }
             if bucket_freed > 0 {
-                bucket.memory_bytes.fetch_sub(bucket_freed, Ordering::Relaxed);
+                bucket_freed = sub_saturating(&bucket.memory_bytes, bucket_freed);
             }
             total_deleted += bucket_rows_removed as u64;
             total_freed += bucket_freed;
         }
 
         if total_freed > 0 {
-            self.estimated_bytes.fetch_sub(total_freed, Ordering::Relaxed);
+            sub_saturating(&self.estimated_bytes, total_freed);
         }
 
         debug!("MemBuffer delete: project={}, table={}, rows_deleted={}", project_id, table_name, total_deleted);
@@ -2242,6 +2327,7 @@ impl MemBuffer {
 
     pub fn get_stats(&self) -> MemBufferStats {
         let (mut total_buckets, mut total_rows, mut total_batches) = (0, 0, 0);
+        let mut estimated_bytes = 0usize;
         let mut project_ids = std::collections::HashSet::new();
         let mut oldest: Option<i64> = None;
         // Only buckets the flush path should already have drained count toward
@@ -2256,6 +2342,7 @@ impl MemBuffer {
             total_buckets += table.buckets.len();
             for bucket in table.buckets.iter() {
                 total_rows += bucket.row_count.load(Ordering::Relaxed);
+                estimated_bytes += bucket.memory_bytes.load(Ordering::Relaxed);
                 let batch_count = bucket.batches.lock().len();
                 total_batches += batch_count;
                 if batch_count > 0 && *bucket.key() < current {
@@ -2270,9 +2357,11 @@ impl MemBuffer {
             total_rows,
             total_batches,
             replay_dml_noops: self.replay_dml_noops.load(Ordering::Relaxed),
-            // Authoritative — see `estimated_memory_bytes()` for why we don't
-            // trust the `estimated_bytes` AtomicUsize cache.
-            estimated_memory_bytes: self.estimated_memory_bytes(),
+            // Summed from the bucket atomics in the sweep above (free — the
+            // loop already visits every bucket), so `timefusion_stats` and the
+            // `mem_buffer.estimated_bytes` gauge report the authoritative value
+            // even if the hot-path cache has drifted since the last reconcile.
+            estimated_memory_bytes: estimated_bytes,
             oldest_bucket_micros: oldest,
         }
     }
@@ -2312,16 +2401,20 @@ impl TableBuffer {
     /// the bucket lock, but only once per N inserts instead of every insert,
     /// so writer→reader contention on the snapshot path drops by N×.
     ///
-    /// Returns `(new_batch_size_bytes, bucket_id)`. The size returned is the
-    /// incoming batch's contribution; coalesce-induced memory shrinkage is
-    /// reflected in `bucket.memory_bytes` directly (authoritative) but not
-    /// in the value returned (the caller's MemBuffer-level counter is
-    /// approximate by design — converges on drain/evict).
-    pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>) -> anyhow::Result<(usize, i64)> {
+    /// Returns `(net_memory_delta_bytes, bucket_id)` — the **signed** change
+    /// this call made to `bucket.memory_bytes`: `+new_size` for the pushed
+    /// batch, plus `(combined_size - folded_size)` if a coalesce fired. The
+    /// caller applies it verbatim to `MemBuffer::estimated_bytes`; returning
+    /// only the insert size is what leaked the coalesce savings and let the
+    /// MemBuffer-level total drift (see `MemBuffer::estimated_bytes`).
+    pub fn insert_batch(&self, batch: RecordBatch, timestamp_micros: i64, wal_hold: Option<(usize, walrus_rust::WalPosition)>) -> anyhow::Result<(i64, i64)> {
         let batch = compact_batch(batch);
         let bucket_id = MemBuffer::compute_bucket_id(timestamp_micros);
         let row_count = batch.num_rows();
         let new_size = estimate_batch_size(&batch);
+        // Accumulates every change this call makes to `bucket.memory_bytes`
+        // so the caller can mirror it exactly onto the MemBuffer total.
+        let mut net_delta = new_size as i64;
 
         let bucket = self.buckets.entry(bucket_id).or_insert_with(TimeBucket::new);
 
@@ -2381,8 +2474,15 @@ impl TableBuffer {
                             let combined_size = estimate_batch_size(&combined);
                             g.truncate(tail_start);
                             g.push(combined);
-                            let bucket_bytes = bucket.memory_bytes.load(Ordering::Relaxed);
-                            bucket.memory_bytes.store(bucket_bytes.saturating_sub(folded_size) + combined_size, Ordering::Relaxed);
+                            // Read-modify-write via a signed delta, not
+                            // load+store: other paths (prefix drain) mutate
+                            // this atomic without holding `batches`, so a
+                            // store would clobber their subtraction. The
+                            // same delta rides out in `net_delta` so the
+                            // MemBuffer total tracks the shrinkage.
+                            let coalesce_delta = combined_size as i64 - folded_size as i64;
+                            apply_signed_delta(&bucket.memory_bytes, coalesce_delta);
+                            net_delta += coalesce_delta;
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -2419,7 +2519,7 @@ impl TableBuffer {
         bucket.row_count.fetch_add(row_count, Ordering::Relaxed);
         bucket.update_timestamps(timestamp_micros);
 
-        Ok((new_size, bucket_id))
+        Ok((net_delta, bucket_id))
     }
 }
 
@@ -3758,5 +3858,108 @@ mod tests {
         let oldest = buffer.get_stats().oldest_bucket_micros.expect("flushable bucket present");
         let dwell_secs = (crate::clock::now_micros() - oldest) / 1_000_000;
         assert!(dwell_secs < 60, "dwell should be ~0 for a freshly-buffered backfill bucket, got {dwell_secs}s");
+    }
+
+    /// Regression guard for the 948 GB-wedge bug class (see
+    /// `MemBuffer::estimated_bytes`): the cached total must equal the
+    /// authoritative sum of the bucket atomics EXACTLY after any mixed
+    /// sequence of inserts, coalesces, DML, drains, evictions and reaps. A
+    /// missed or mis-computed mutation site shows up here as an inequality.
+    #[test]
+    fn cached_total_matches_recomputed_total_under_random_mutations() {
+        // Deterministic xorshift — no rand dep, and a failure is reproducible.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let buffer = MemBuffer::new();
+        let base = crate::clock::now_micros();
+        let bucket_span = bucket_duration_micros();
+
+        let check = |step: usize, op: &str| {
+            let cached = buffer.estimated_memory_bytes();
+            let truth = buffer.recompute_memory_bytes();
+            assert_eq!(cached, truth, "step {step} ({op}): cached total {cached} != recomputed {truth}");
+        };
+
+        for step in 0..400 {
+            // Spread across 3 projects × 3 buckets so coalesce, per-bucket
+            // drains and whole-table drops all get exercised.
+            let project = format!("p{}", next(3));
+            let bucket_offset = next(3) as i64;
+            let ts = base + bucket_offset * bucket_span;
+            match next(10) {
+                0..=5 => {
+                    // Insert — drives the coalesce path once a bucket passes
+                    // MAX_BATCH_COUNT_PER_BUCKET batches.
+                    buffer.insert(&project, "t1", create_test_batch(ts), ts).unwrap();
+                    check(step, "insert");
+                }
+                6 => {
+                    buffer.insert_batches(&project, "t1", vec![create_test_batch(ts), wide_view_row(ts)], ts).unwrap();
+                    check(step, "insert_batches");
+                }
+                7 => {
+                    // Take + drop the snapshot: rows leave the buffer for good.
+                    let bucket_id = MemBuffer::compute_bucket_id(ts);
+                    buffer.take_bucket_for_flush(&project, "t1", bucket_id);
+                    check(step, "take_bucket_for_flush");
+                }
+                8 => {
+                    buffer.delete(&project, "t1", None, None).unwrap();
+                    check(step, "delete");
+                }
+                _ => {
+                    buffer.evict_old_data(base + bucket_offset * bucket_span);
+                    buffer.reap_expired_empty_buckets(crate::clock::now_micros() + bucket_span);
+                    check(step, "evict + reap");
+                }
+            }
+        }
+        // Full teardown must land on exactly zero, not merely "close".
+        buffer.evict_old_data(base + 100 * bucket_span);
+        buffer.reap_expired_empty_buckets(crate::clock::now_micros() + 100 * bucket_span);
+        assert_eq!(buffer.estimated_memory_bytes(), buffer.recompute_memory_bytes(), "post-teardown cached total diverged");
+        assert_eq!(buffer.recompute_memory_bytes(), 0, "everything evicted but buckets still charge bytes");
+    }
+
+    /// The old counter used raw `fetch_sub`; one mismatched subtraction wrapped
+    /// it to ~948 GB and every `try_reserve_memory` rejected forever. Now a
+    /// too-large subtraction saturates at 0 (under-report, ingest keeps
+    /// flowing) and the reconciler restores truth on the next flush tick.
+    #[test]
+    fn oversized_subtraction_saturates_and_reconciler_restores_truth() {
+        let buffer = MemBuffer::new();
+        let ts = crate::clock::now_micros();
+        for _ in 0..8 {
+            buffer.insert("p1", "t1", create_test_batch(ts), ts).unwrap();
+        }
+        let truth = buffer.recompute_memory_bytes();
+        assert!(truth > 0);
+
+        // Simulate a mutation site subtracting far more than is charged.
+        sub_saturating(&buffer.estimated_bytes, truth + 1_000_000_000);
+        assert_eq!(buffer.estimated_memory_bytes(), 0, "underflow must saturate at 0, never wrap to ~usize::MAX");
+
+        let (cached_before, reconciled) = buffer.reconcile_estimated_bytes();
+        assert_eq!(cached_before, 0);
+        assert_eq!(reconciled, truth);
+        assert_eq!(buffer.estimated_memory_bytes(), truth, "reconciler must store the authoritative sum");
+    }
+
+    /// The specific leak the recompute-per-call version was introduced to fix:
+    /// coalesce shrinks a bucket's `memory_bytes`, and that shrinkage must ride
+    /// back to the MemBuffer total via `insert_batch`'s returned delta.
+    #[test]
+    fn coalesce_shrinkage_is_reported_to_the_membuffer_total() {
+        let buffer = MemBuffer::new();
+        let ts = crate::clock::now_micros();
+        for _ in 0..(MAX_BATCH_COUNT_PER_BUCKET * 4) {
+            buffer.insert("p1", "t1", create_test_batch(ts), ts).unwrap();
+        }
+        assert_eq!(buffer.estimated_memory_bytes(), buffer.recompute_memory_bytes(), "coalesce leaked (sum_before - combined_size) into the cached total");
     }
 }

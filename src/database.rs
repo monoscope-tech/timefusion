@@ -7031,22 +7031,28 @@ impl Database {
     }
 
     /// One-way safety brakes, checked at WAVE BOUNDARIES only (in-flight bins
-    /// always finish and commit). Both convert an overload into a truncated
-    /// tick rather than an incident: durability outranks compaction, and an
-    /// OOM-kill (exit 137) means WAL recovery and quarantine — our known
-    /// silent-loss sink. Never sizes concurrency; strictly "start no more work".
-    fn light_optimize_brake(&self) -> Option<&'static str> {
+    /// always finish and commit). Both convert an overload into a smaller tick
+    /// rather than an incident: durability outranks compaction, and an OOM-kill
+    /// (exit 137) means WAL recovery and quarantine — our known silent-loss
+    /// sink. Never sizes concurrency upward; strictly "start no more work".
+    ///
+    /// Two levels, because the failure modes differ. WAL backlog can be a
+    /// sustained property of a busy hour, so it DEGRADES to a service floor
+    /// (one project per tick) — a full stop there starves compaction
+    /// indefinitely, which degrades reads and merges. Memory near the cgroup
+    /// limit is an imminent OOM: hard STOP.
+    fn light_optimize_brake(&self) -> Option<Brake> {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.buffered_layer().is_some_and(|layer| layer.is_wal_over_threshold()) {
+        if self.buffered_layer().is_some_and(|layer| layer.is_wal_backlog_over_threshold()) {
             info!(event = "light_optimize_wal_yield");
             crate::metrics::maintenance_stats().light_optimize_wal_yields.fetch_add(1, Relaxed);
-            return Some("wal_over_threshold");
+            return Some(Brake::Degrade("wal_backlog_over_threshold"));
         }
         let limit = self.config.derived.memory_brake_limit_bytes();
         if limit > 0 && process_memory_bytes().is_some_and(|used| used > limit) {
             info!(limit, event = "light_optimize_memory_brake");
             crate::metrics::maintenance_stats().light_optimize_memory_brakes.fetch_add(1, Relaxed);
-            return Some("memory_brake");
+            return Some(Brake::Stop("memory_brake"));
         }
         None
     }
@@ -8104,10 +8110,19 @@ enum BinOutcome<T> {
     Retry,
 }
 
+/// A wave-boundary safety brake. Two levels: `Degrade` keeps a SERVICE FLOOR
+/// (one project, concurrency 1, for the rest of the tick) so a chronic overload
+/// signal throttles compaction instead of starving it; `Stop` ends the tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Brake {
+    Degrade(&'static str),
+    Stop(&'static str),
+}
+
 #[allow(clippy::too_many_arguments)] // scheduling params are positional by design; a struct would just rename them
 async fn round_robin_bins<F, Fut, T, C, CFut>(
     projects: Vec<String>, max_rounds: usize, concurrency: usize, deadline: std::time::Instant, on_truncate: impl Fn(usize, &[String]),
-    should_pause: impl Fn() -> Option<&'static str>, op: F, commit_wave: C,
+    should_pause: impl Fn() -> Option<Brake>, op: F, commit_wave: C,
 ) -> usize
 where
     F: Fn(String, usize) -> Fut,
@@ -8117,6 +8132,7 @@ where
 {
     let mut pending = projects;
     let mut failed = 0usize;
+    let mut concurrency = concurrency;
     for round in 0..max_rounds {
         if pending.is_empty() {
             break;
@@ -8125,13 +8141,32 @@ where
             on_truncate(round, &pending);
             break;
         }
-        if let Some(reason) = should_pause() {
-            info!(round, remaining = pending.len(), reason, event = "light_optimize_wave_paused");
-            // A pause is a truncation for fairness purposes: without rotating,
-            // a chronically-engaged brake restarts every tick at the
-            // debt-ordered head — the exact starvation the cursor fixes.
-            on_truncate(round, &pending);
-            break;
+        match should_pause() {
+            Some(Brake::Stop(reason)) => {
+                info!(round, remaining = pending.len(), reason, event = "light_optimize_wave_paused");
+                // A pause is a truncation for fairness purposes: without rotating,
+                // a chronically-engaged brake restarts every tick at the
+                // debt-ordered head — the exact starvation the cursor fixes.
+                on_truncate(round, &pending);
+                break;
+            }
+            // Service floor: keep the debt-ordered HEAD and cut the rest, so a
+            // sustained overload still compacts one project per tick instead of
+            // zero. The cut projects go through `on_truncate` exactly like a
+            // deadline truncation, so the rotation cursor resumes at the first
+            // project this tick never served — fairness across ticks holds.
+            Some(Brake::Degrade(reason)) => {
+                concurrency = 1;
+                crate::metrics::maintenance_stats().light_optimize_ticks_degraded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if pending.len() > 1 {
+                    let cut = pending.split_off(1);
+                    info!(round, served = 1, cut = cut.len(), reason, event = "light_optimize_wave_degraded");
+                    on_truncate(round, &cut);
+                } else {
+                    info!(round, served = pending.len(), cut = 0, reason, event = "light_optimize_wave_degraded");
+                }
+            }
+            None => {}
         }
         let outcomes: Vec<(String, Result<BinOutcome<T>>)> =
             futures::stream::iter(std::mem::take(&mut pending)).map(|project_id| op(project_id, round)).buffer_unordered(concurrency).collect().await;
@@ -10619,6 +10654,49 @@ mod tests {
         .await;
         assert_eq!(failed, 0);
         assert_eq!(*truncated.lock().unwrap(), vec![(0, 2)], "must truncate on round 0 with both projects still pending");
+    }
+
+    /// Prod 2026-07-29: a permanently-engaged WAL brake truncated every tick at
+    /// round 0, so ZERO waves committed for hours. `Degrade` must keep a service
+    /// floor — the debt-ordered head project keeps getting served every round —
+    /// while `Stop` keeps the old full-truncation behaviour.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn round_robin_bins_degrade_keeps_serving_the_head_project() {
+        let run = |brake: Option<super::Brake>| async move {
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+            let truncated = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, Vec<String>)>::new()));
+            let (seen, sink) = (calls.clone(), truncated.clone());
+            super::round_robin_bins(
+                vec!["head".into(), "b".into(), "c".into()],
+                3,
+                3,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                move |round, remaining: &[String]| sink.lock().unwrap().push((round, remaining.to_vec())),
+                move || brake,
+                |project_id, round| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push((project_id.clone(), round));
+                        (project_id, Ok(super::BinOutcome::Staged(())))
+                    }
+                },
+                |_bins, _round| async { 0 },
+            )
+            .await;
+            (calls.lock().unwrap().clone(), truncated.lock().unwrap().clone())
+        };
+
+        let (calls, truncated) = run(Some(super::Brake::Degrade("wal"))).await;
+        assert_eq!(
+            calls,
+            vec![("head".to_string(), 0), ("head".to_string(), 1), ("head".to_string(), 2)],
+            "degrade must serve exactly the head project, once per round"
+        );
+        assert_eq!(truncated, vec![(0, vec!["b".to_string(), "c".to_string()])], "the cut projects rotate exactly once, so the cursor resumes at 'b'");
+
+        let (calls, truncated) = run(Some(super::Brake::Stop("mem"))).await;
+        assert!(calls.is_empty(), "stop must start no work at all");
+        assert_eq!(truncated, vec![(0, vec!["head".to_string(), "b".to_string(), "c".to_string()])]);
     }
 
     #[test]

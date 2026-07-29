@@ -232,6 +232,22 @@ fn flushable_bytes(b: &crate::mem_buffer::FlushableBucket) -> u64 {
     b.batches.iter().map(crate::mem_buffer::estimate_batch_size).sum::<usize>() as u64
 }
 
+/// How recently a flush failure still counts as "flush is broken" for the
+/// compaction brake. Long enough to cover a few flush cycles, short enough that
+/// a single transient S3 error doesn't park compaction for the rest of the hour.
+const FLUSH_FAILURE_BRAKE_WINDOW_MICROS: i64 = 5 * 60 * 1_000_000;
+
+/// Pure brake predicate, split out so the thresholds are unit-testable with
+/// injected numbers (constructing a live `BufferedWriteLayer` needs S3 + WAL).
+fn wal_backlog_over_threshold(backlog_bytes: u64, max_unflushed_bytes: u64, last_flush_failure_micros: i64, now_micros: i64) -> bool {
+    if max_unflushed_bytes > 0 && backlog_bytes > max_unflushed_bytes {
+        return true;
+    }
+    // Flush broken ⇒ the backlog is about to be real regardless of its current
+    // size: brake so compaction isn't competing with recovery.
+    last_flush_failure_micros > 0 && now_micros.saturating_sub(last_flush_failure_micros) < FLUSH_FAILURE_BRAKE_WINDOW_MICROS
+}
+
 /// Resident set size of this process in bytes from `/proc/self/statm`
 /// (Linux only; None elsewhere). Compare against the MemBuffer's
 /// `estimate_batch_size` charge: a large RSS-below-estimate gap means the
@@ -406,6 +422,10 @@ pub struct BufferedWriteLayer {
     /// assert on what the global counters would be.
     flush_completed_total: AtomicU64,
     flush_failed_total: AtomicU64,
+    /// `clock::now_micros()` of the most recent flush failure (0 = never).
+    /// A broken flush is a durability backlog even while the backlog gauge is
+    /// briefly small, so the compaction brake ORs on its recency.
+    last_flush_failure_micros: std::sync::atomic::AtomicI64,
     backpressure_engaged_total: AtomicU64,
     backpressure_rejected_total: AtomicU64,
     backpressure_force_flush_total: AtomicU64,
@@ -555,6 +575,7 @@ impl BufferedWriteLayer {
             eviction_tick_notify: Arc::new(Notify::new()),
             flush_completed_total: AtomicU64::new(0),
             flush_failed_total: AtomicU64::new(0),
+            last_flush_failure_micros: std::sync::atomic::AtomicI64::new(0),
             backpressure_engaged_total: AtomicU64::new(0),
             backpressure_rejected_total: AtomicU64::new(0),
             backpressure_force_flush_total: AtomicU64::new(0),
@@ -679,10 +700,15 @@ impl BufferedWriteLayer {
 
         let max_bytes = self.max_memory_bytes();
         let hard_limit = max_bytes.saturating_add(max_bytes / HARD_LIMIT_HEADROOM_DIVISOR);
+        let threshold = self.config.buffer.pressure_flush_pct();
+        // Loop-invariant: only `reserved_bytes` is re-read per CAS attempt.
+        // `estimated_memory_bytes` is a cached atomic now, but it was an
+        // O(tables × buckets) sweep re-run on every retry — 10.3% of total
+        // process CPU in prod (profile 2026-07-30). Keep it hoisted.
+        let current_mem = self.mem_buffer.estimated_memory_bytes();
 
         for attempt in 0..MAX_CAS_RETRIES {
             let current_reserved = self.reserved_bytes.load(Ordering::Acquire);
-            let current_mem = self.mem_buffer.estimated_memory_bytes();
             let new_total = current_mem + current_reserved + estimated_size;
 
             if new_total > hard_limit {
@@ -698,9 +724,7 @@ impl BufferedWriteLayer {
                 // If post-reservation we crossed the configured pressure threshold,
                 // wake the flush task so it can drain completed buckets without
                 // waiting for the next tick.
-                let threshold = self.config.buffer.pressure_flush_pct();
-                let new_total_bytes = current_mem + current_reserved + estimated_size;
-                let pct = ((new_total_bytes as u128 * 100 / max_bytes.max(1) as u128).min(100)) as u32;
+                let pct = ((new_total as u128 * 100 / max_bytes.max(1) as u128).min(100)) as u32;
                 if pct >= threshold {
                     self.pressure_notify.notify_one();
                 }
@@ -859,7 +883,7 @@ impl BufferedWriteLayer {
                 }
                 Err(e) => {
                     warn!("force-flush: Delta commit failed; rows restored to MemBuffer (WAL holds them): {}", e);
-                    self.flush_failed_total.fetch_add(1, Ordering::Relaxed);
+                    self.note_flush_failure(1);
                 }
             }
         }
@@ -1639,11 +1663,20 @@ impl BufferedWriteLayer {
 
             if trigger == "pressure" {
                 debug!("Pressure-triggered flush at {}% (threshold {}%)", self.pressure_pct(), self.config.buffer.pressure_flush_pct());
+            } else {
+                // Once per timer tick (NOT on pressure wakeups, which can be
+                // frequent): re-derive MemBuffer's memory total from the bucket
+                // atomics so any accounting drift is bounded by one interval
+                // instead of accumulating. The hot path reads a cached atomic;
+                // this is the O(tables × buckets) sweep that used to run on
+                // every reservation attempt. Warns on non-trivial drift — see
+                // `MemBuffer::reconcile_estimated_bytes`.
+                self.mem_buffer.reconcile_estimated_bytes();
             }
 
             if let Err(e) = self.flush_completed_buckets().await {
                 crate::metrics::record_flush(false);
-                self.flush_failed_total.fetch_add(1, Ordering::Relaxed);
+                self.note_flush_failure(1);
                 error!("Flush task error: {}", e);
             }
 
@@ -1704,10 +1737,45 @@ impl BufferedWriteLayer {
         }
     }
 
+    fn note_flush_failure(&self, n: u64) {
+        self.flush_failed_total.fetch_add(n, Ordering::Relaxed);
+        self.last_flush_failure_micros.store(crate::clock::now_micros(), Ordering::Relaxed);
+    }
+
+    /// Bytes accepted (already durable in the WAL) but NOT yet in Delta:
+    /// MemBuffer's un-drained bucket bytes plus the reservation held for
+    /// in-flight writes and airborne flush commits. This is the flush *backlog*.
+    ///
+    /// Deliberately NOT on-disk WAL size: that gauge is ingest-rate × trim
+    /// retention (a workload property — ~30GB at 1GB/min healthy ingest), so it
+    /// sits permanently above the 12GiB threshold and any brake reading it is
+    /// permanently engaged (prod 2026-07-29: 105 projects planned, 0 completed,
+    /// wal_yields on 10/10 ticks, while flush was provably healthy). Per-shard
+    /// WAL cursor lag can't be measured cheaply (see `run_wal_gate_task`), so
+    /// the unflushed-bytes accounting the memory valve already maintains is the
+    /// honest proxy: it drops the moment flushes commit and only grows when
+    /// drain genuinely falls behind ingest.
+    pub fn unflushed_backlog_bytes(&self) -> u64 {
+        self.effective_memory_bytes() as u64
+    }
+
+    /// The COMPACTION brake predicate: is durability genuinely behind?
+    /// Compared against the same `effective_wal_max_unflushed_bytes` threshold
+    /// the emergency flush uses — whose name already documented this intent.
+    pub fn is_wal_backlog_over_threshold(&self) -> bool {
+        wal_backlog_over_threshold(
+            self.unflushed_backlog_bytes(),
+            self.config.effective_wal_max_unflushed_bytes(),
+            self.last_flush_failure_micros.load(Ordering::Relaxed),
+            crate::clock::now_micros(),
+        )
+    }
+
     /// The emergency-flush predicate: WAL over EITHER threshold (file count or
-    /// unflushed bytes). Cheap (two atomics behind `wal_stats`), so compaction
-    /// can consult it at wave boundaries and yield while durability catches up —
-    /// the flusher's own hysteresis is the only state, no second controller.
+    /// total on-disk bytes). Cheap (two atomics behind `wal_stats`). Kept on
+    /// TOTAL size on purpose: an extra flush is harmless, so a conservative
+    /// signal is correct here — unlike the compaction brake, where a permanently
+    /// engaged signal starves compaction (see `is_wal_backlog_over_threshold`).
     pub fn is_wal_over_threshold(&self) -> bool {
         let (file_count, total_bytes) = self.wal.wal_stats();
         let max_files = self.config.effective_wal_max_files();
@@ -2087,7 +2155,7 @@ impl BufferedWriteLayer {
                         );
                     }
                     crate::metrics::record_flush(false);
-                    self.flush_failed_total.fetch_add(source_buckets.len() as u64, Ordering::Relaxed);
+                    self.note_flush_failure(source_buckets.len() as u64);
                     stats.buckets_failed += source_buckets.len() as u64;
                     error!(
                         "Failed to flush coalesced commit: project={}, table={}, buckets={:?}: {}",
@@ -2941,6 +3009,24 @@ mod tests {
 
     use super::*;
     use crate::test_utils::test_helpers::{json_to_batch, test_span};
+
+    /// The compaction brake must read the flush BACKLOG, not the WAL directory
+    /// size. Prod 2026-07-29: on-disk WAL sat ~30GB (ingest rate × trim
+    /// retention) against a 12GiB threshold, so the old signal was permanently
+    /// engaged and compaction committed zero waves while flush was healthy.
+    #[test]
+    fn wal_backlog_brake_ignores_directory_size_and_fires_on_real_backlog() {
+        const MAX: u64 = 12 * 1024 * 1024 * 1024;
+        let now = 1_000_000_000i64;
+        // Healthy: on-disk WAL far over threshold is irrelevant; backlog ~0.
+        assert!(!wal_backlog_over_threshold(64 * 1024 * 1024, MAX, 0, now));
+        // Genuine backlog: unflushed bytes over threshold.
+        assert!(wal_backlog_over_threshold(MAX + 1, MAX, 0, now));
+        // Flush broken with a small backlog still brakes...
+        assert!(wal_backlog_over_threshold(1024, MAX, now - 60_000_000, now));
+        // ...but a stale failure does not.
+        assert!(!wal_backlog_over_threshold(1024, MAX, now - 10 * 60_000_000, now));
+    }
 
     /// The stored WAL SQL must be normalized (bare target cols + `source__`
     /// source cols) so replay's bare-schema parser resolves it — otherwise
