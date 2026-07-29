@@ -6,16 +6,18 @@
 //! Delta sidecar search and the MemBuffer bucket index so both interpret
 //! predicates identically.
 
+use std::collections::HashSet;
+
 use anyhow::{Result, anyhow};
 use tantivy::{
-    Index, Searcher, TantivyDocument,
+    Index, Searcher, TantivyDocument, Term,
     collector::TopDocs,
-    query::{BooleanQuery, Occur, Query, QueryParser},
-    schema::Value,
+    query::{BooleanQuery, Occur, Query, QueryParser, TermQuery},
+    schema::{Field, FieldType, IndexRecordOption, Value},
 };
 
 use crate::tantivy_index::{
-    schema::{ID_FIELD, ROW_ORDINAL_FIELD, TS_FIELD},
+    schema::{ID_FIELD, NGRAM3_TOKENIZER, ROW_ORDINAL_FIELD, TS_FIELD},
     udf::TextMatchPred,
 };
 
@@ -59,12 +61,27 @@ pub fn build_node_query(index: &Index, node: &crate::tantivy_index::udf::PredNod
     use crate::tantivy_index::udf::PredNode;
     let q = match node {
         PredNode::Leaf(p) => {
-            let Ok(field) = index.schema().get_field(&p.column) else {
+            let schema = index.schema();
+            let Ok(field) = schema.get_field(&p.column) else {
                 return Ok(PredsQuery::MissingField);
             };
-            let mut qp = QueryParser::for_index(index, vec![field]);
-            qp.set_conjunction_by_default();
-            qp.parse_query(&p.query).map_err(|e| anyhow!("parse query '{}': {e}", p.query))?
+            let tokenizer = match schema.get_field_entry(field).field_type() {
+                FieldType::Str(o) => o.get_indexing_options().map(|i| i.tokenizer().to_string()),
+                _ => None,
+            };
+            let ngram = tokenizer.as_deref() == Some(NGRAM3_TOKENIZER);
+            match &tokenizer {
+                // On ngram3 a trailing `*` is only a routing marker (prefix ⊆
+                // substring), so the literal can always be analyzed. On raw/
+                // default it carries real prefix semantics that a conjunction of
+                // whole terms would UNDER-match, so those keep the parser.
+                Some(tok) if ngram || !p.query.ends_with('*') => analyzed_conjunction_query(index, field, tok, &p.query)?,
+                _ => {
+                    let mut qp = QueryParser::for_index(index, vec![field]);
+                    qp.set_conjunction_by_default();
+                    qp.parse_query(&p.query).map_err(|e| anyhow!("parse query '{}': {e}", p.query))?
+                }
+            }
         }
         PredNode::And(kids) | PredNode::Or(kids) => {
             let occur = if matches!(node, PredNode::And(_)) { Occur::Must } else { Occur::Should };
@@ -79,6 +96,50 @@ pub fn build_node_query(index: &Index, node: &crate::tantivy_index::udf::PredNod
         }
     };
     Ok(PredsQuery::Query(q))
+}
+
+/// Compile a routed literal against `field` WITHOUT tantivy's `QueryParser`:
+/// run the field's own analyzer over the literal and AND the resulting terms.
+///
+/// The parser's grammar is fatal here: routed literals are user data, and a
+/// whitespace-adjacent `-` (`"accept -header"`) becomes a MustNot clause while
+/// bare `AND`/`OR`/`NOT` become operators — and on a raw-tokenized field any
+/// whitespace splits one indexed token into two unmatchable ones. Such a query
+/// parses "successfully" and returns ZERO hits, so the intersecting
+/// `id IN (hits)` prefilter silently drops matching rows.
+///
+/// Matching semantics vs. the old parser path: `QueryParser` turned a
+/// multi-token word into a PhraseQuery (for ngram3, consecutive trigrams). A
+/// conjunction of the same terms is a strict SUPERSET of that — always sound
+/// for a prefilter, which may only ever over-select. Preserved from the old
+/// path: whitespace splits into independently-required words, a word too short
+/// to produce a token simply broadens (is dropped), and a literal that yields
+/// no token at all errors out into a full scan.
+fn analyzed_conjunction_query(index: &Index, field: Field, tokenizer: &str, query: &str) -> Result<Box<dyn Query>> {
+    let mut analyzer = index.tokenizers().get(tokenizer).ok_or_else(|| anyhow!("tokenizer {tokenizer} not registered"))?;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+    // ngram3 keeps the parser's whitespace-AND behaviour (each word required
+    // independently, short words dropped). The other tokenizers must see the
+    // WHOLE literal: `default` splits it itself, and `raw` indexes the value as
+    // one token, so pre-splitting it would under-match.
+    let words: Vec<&str> = if tokenizer == NGRAM3_TOKENIZER { query.split_whitespace().collect() } else { vec![query] };
+    for word in words {
+        // Plan-time classification appends `*` for `LIKE 'foo%'`; on a 3-gram
+        // field a prefix match is a subset of the substring match, so dropping
+        // the marker keeps the prefilter a superset. (Non-ngram3 `*` queries
+        // never reach here — see the caller.)
+        let mut stream = analyzer.token_stream(word.trim_end_matches('*'));
+        stream.process(&mut |t| {
+            if seen.insert(t.text.clone()) {
+                clauses.push((Occur::Must, Box::new(TermQuery::new(Term::from_field_text(field, &t.text), IndexRecordOption::Basic)) as Box<dyn Query>));
+            }
+        });
+    }
+    if clauses.is_empty() {
+        return Err(anyhow!("query '{query}' produces no {tokenizer} terms"));
+    }
+    Ok(Box::new(BooleanQuery::new(clauses)))
 }
 
 /// Run a tantivy `Query` against the index and return hits up to `limit`.
@@ -134,4 +195,108 @@ pub fn query_with_searcher(searcher: &Searcher, query: &dyn Query, limit: Option
         hits.push(Hit { timestamp_micros: ts, id, row_ordinal: None });
     }
     Ok(hits)
+}
+
+#[cfg(test)]
+mod tests {
+    use tantivy::doc;
+
+    use super::*;
+    use crate::{
+        schema_loader::{FieldDef, TableSchema, TantivyFieldConfig},
+        tantivy_index::{schema::build_for_table, udf::PredNode},
+    };
+
+    /// Index three docs whose text contains tokens that tantivy's `QueryParser`
+    /// grammar would swallow (`-x` → MustNot, bare `NOT` → operator). Before
+    /// the parser was taken out of the substring path these queries parsed
+    /// "successfully" and returned zero hits, so the `id IN (hits)` prefilter
+    /// silently dropped the matching rows.
+    fn ngram_index() -> Index {
+        let table = TableSchema {
+            table_name: "t".into(),
+            partitions: vec![],
+            sorting_columns: vec![],
+            z_order_columns: vec![],
+            time_column: None,
+            dedup_keys: vec![],
+            dedup_tiebreak: None,
+            fields: ["body", "level"]
+                .into_iter()
+                .map(|name| FieldDef {
+                    name: name.into(),
+                    data_type: "String".into(),
+                    nullable: true,
+                    // body → ngram3 (default), level → raw single token.
+                    tantivy: Some(TantivyFieldConfig { indexed: true, tokenizer: (name == "level").then(|| "raw".to_string()), flatten: None }),
+                    dictionary: None,
+                    bloom_filter: false,
+                })
+                .collect(),
+        };
+        let built = build_for_table(&table);
+        let index = Index::create_in_ram(built.schema.clone());
+        crate::tantivy_index::schema::register_tokenizers(&index);
+        let (body, level) = (built.user_fields["body"].field, built.user_fields["level"].field);
+        let mut w = index.writer(15_000_000).expect("writer");
+        let docs = [("accept -header now", "-alpha"), ("err -1234 code", "ERROR"), ("foo NOT bar baz", "two words"), ("unrelated payload", "INFO")];
+        for (i, (text, lvl)) in docs.iter().enumerate() {
+            w.add_document(doc!(built.timestamp => i as i64, built.id => format!("id{i}"), body => *text, level => *lvl)).expect("add");
+        }
+        w.commit().expect("commit");
+        index
+    }
+
+    fn hit_ids(index: &Index, query: &str) -> Result<Vec<String>> {
+        hit_ids_on(index, "body", query)
+    }
+
+    fn hit_ids_on(index: &Index, column: &str, query: &str) -> Result<Vec<String>> {
+        let node = PredNode::Leaf(TextMatchPred { column: column.into(), query: query.into() });
+        let PredsQuery::Query(q) = build_node_query(index, &node)? else { panic!("field must exist") };
+        let mut ids: Vec<String> = query_index(index, &*q, None)?.into_iter().map(|h| h.id).collect();
+        ids.sort();
+        Ok(ids)
+    }
+
+    #[test]
+    fn query_grammar_chars_in_routed_substrings_still_hit() {
+        let index = ngram_index();
+        // `-` adjacent to whitespace used to become a MustNot clause.
+        assert_eq!(hit_ids(&index, "accept -header").unwrap(), vec!["id0"]);
+        assert_eq!(hit_ids(&index, "err -1234").unwrap(), vec!["id1"]);
+        // Bare `NOT` used to be parsed as an operator.
+        assert_eq!(hit_ids(&index, "foo NOT bar").unwrap(), vec!["id2"]);
+        // Single words and the full literal still work.
+        assert_eq!(hit_ids(&index, "header").unwrap(), vec!["id0"]);
+        assert_eq!(hit_ids(&index, "accept -header now").unwrap(), vec!["id0"]);
+        // Case-insensitive (LowerCaser in tf_ngram3).
+        assert_eq!(hit_ids(&index, "ACCEPT").unwrap(), vec!["id0"]);
+        // Prefix marker from `LIKE 'foo%'` routing is dropped (substring ⊇ prefix).
+        assert_eq!(hit_ids(&index, "accept*").unwrap(), vec!["id0"]);
+        // Still selective: a literal present in no doc returns nothing.
+        assert!(hit_ids(&index, "zzzqqq").unwrap().is_empty());
+    }
+
+    #[test]
+    fn short_tokens_broaden_and_all_short_literals_scan() {
+        let index = ngram_index();
+        // A <3-char word yields no trigram → dropped (broadens), never empties.
+        assert_eq!(hit_ids(&index, "header xy").unwrap(), vec!["id0"]);
+        // Nothing left to query → error, which callers treat as "no prefilter".
+        assert!(hit_ids(&index, "xy").is_err());
+    }
+
+    #[test]
+    fn raw_tokenized_terms_match_the_whole_indexed_value() {
+        let index = ngram_index();
+        assert_eq!(hit_ids_on(&index, "level", "ERROR").unwrap(), vec!["id1"]);
+        // A leading `-` used to parse as a lone MustNot clause (∅ hits), and
+        // whitespace used to AND-split a value indexed as ONE raw token.
+        assert_eq!(hit_ids_on(&index, "level", "-alpha").unwrap(), vec!["id0"]);
+        assert_eq!(hit_ids_on(&index, "level", "two words").unwrap(), vec!["id2"]);
+        // Raw stays exact/case-sensitive: no partial or case-folded matches.
+        assert!(hit_ids_on(&index, "level", "error").unwrap().is_empty());
+        assert!(hit_ids_on(&index, "level", "two").unwrap().is_empty());
+    }
 }

@@ -724,6 +724,69 @@ fn serialize_watermark_to_json(
 /// Key inside the watermark object naming the topic that produced it.
 const WATERMARK_TOPIC_KEY: &str = "topic";
 
+/// Key inside the watermark object holding the MULTI-topic map written by a
+/// cross-project coalesced commit: `{ "<project>:<table>": <single-topic map> }`.
+/// Only present when one commit carries more than one topic's watermark — a
+/// single-topic commit keeps the flat legacy shape byte-for-byte, so nothing
+/// changes on the non-coalesced path and an old binary reading those commits
+/// behaves exactly as before. An old binary reading a MULTI commit finds no
+/// top-level `topic` key, so it contributes nothing (under-advance = replay +
+/// dedup, never loss) — the safe rollback direction.
+const WATERMARK_TOPICS_KEY: &str = "topics";
+
+/// Serialize the watermarks of every (project, table) carried by ONE commit.
+/// Topics whose watermark has no positions are dropped (same rule as the
+/// single-topic form). Exactly one surviving topic ⇒ flat legacy shape.
+fn serialize_watermarks_to_json(
+    entries: impl IntoIterator<Item = (String, String, crate::buffered_write_layer::DeltaWatermark)>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut per_topic: Vec<(String, serde_json::Map<String, serde_json::Value>)> = entries
+        .into_iter()
+        .filter_map(|(project_id, table_name, wm)| {
+            let map = serialize_watermark_to_json(&wm, &project_id, &table_name);
+            (!map.is_empty()).then(|| (wal_topic(&project_id, &table_name), map))
+        })
+        .collect();
+    match per_topic.len() {
+        0 => serde_json::Map::new(),
+        1 => per_topic.pop().expect("len checked").1,
+        _ => {
+            // Dedup defensively: two units for the same topic in one commit
+            // would otherwise silently drop one. Take the per-shard MAX so the
+            // surviving entry can never be BEHIND either contributor (behind =
+            // over-replay, which is safe, but ahead would be loss).
+            let mut topics: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+            for (topic, map) in per_topic {
+                match topics.get_mut(&topic).and_then(serde_json::Value::as_object_mut) {
+                    Some(existing) => merge_max_watermark_maps(existing, map),
+                    None => {
+                        topics.insert(topic, serde_json::Value::Object(map));
+                    }
+                }
+            }
+            [(WATERMARK_TOPICS_KEY.to_string(), serde_json::Value::Object(topics))].into_iter().collect()
+        }
+    }
+}
+
+/// Per-shard MAX merge of two single-topic watermark maps, in place on `into`.
+fn merge_max_watermark_maps(into: &mut serde_json::Map<String, serde_json::Value>, from: serde_json::Map<String, serde_json::Value>) {
+    let pos = |v: &serde_json::Value| {
+        (v.get("block_id").and_then(serde_json::Value::as_u64).unwrap_or(0), v.get("offset").and_then(serde_json::Value::as_u64).unwrap_or(0))
+    };
+    for (shard, value) in from {
+        if shard.parse::<usize>().is_err() {
+            continue; // the "topic" key — already present and identical
+        }
+        match into.get(&shard) {
+            Some(existing) if pos(existing) >= pos(&value) => {}
+            _ => {
+                into.insert(shard, value);
+            }
+        }
+    }
+}
+
 /// Delete `datafusion-*` spill directories left behind by a previous process.
 ///
 /// DataFusion's `DiskManager` removes its temp dirs on `Drop`, which a SIGKILL
@@ -734,32 +797,46 @@ const WATERMARK_TOPIC_KEY: &str = "topic";
 /// concern rather than housekeeping.
 ///
 /// Safe despite the runtime env being built lazily (`get_or_init` on the first
-/// maintenance job, not at startup): each spill dir has exactly one owning
-/// runtime env, and the initializer runs once *before* that env exists, so
-/// nothing this process wrote can be present yet. Everything found belongs to a
-/// dead process — the WAL dir flock guarantees no second live TimeFusion.
+/// maintenance job, not at startup): the orphan list is snapshotted *inline*,
+/// before this env's DiskManager exists, so nothing this process wrote can be
+/// in it. Everything in the snapshot belongs to a dead process — the WAL dir
+/// flock guarantees no second live TimeFusion.
 ///
-/// Runs on a detached thread: prod's backlog was 186 GB across 205 dirs, and
-/// walking plus unlinking that inline would stall the maintenance job that
-/// happened to trigger initialization (and any caller blocked on the same
-/// `OnceCell`). Reclaiming a dead process's garbage is never urgent.
+/// Deletion runs on a detached thread: prod's backlog was 186 GB across 205
+/// dirs, and walking plus unlinking that inline would stall the maintenance
+/// job that happened to trigger initialization (and any caller blocked on the
+/// same `OnceCell`). Reclaiming a dead process's garbage is never urgent.
 fn reap_orphaned_spill_dirs(spill_dir: &std::path::Path) {
+    // Snapshot the orphan list synchronously, BEFORE the caller builds this
+    // env's DiskManager. `read_dir` streams lazily, so enumerating on the
+    // detached thread raced dirs the *new* DiskManager creates: with a large
+    // orphan backlog the slow size-walk was still iterating when the first
+    // sort's live spill dir appeared, and `remove_dir_all` yanked it mid-sort
+    // (prod 2026-07-29: light optimize failed with ENOENT on its own spill
+    // file). Only the pre-existing snapshot is deleted off-thread.
+    let orphans: Vec<std::path::PathBuf> = std::fs::read_dir(spill_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                // DiskManager names them `datafusion-XXXXXX`; touch nothing else.
+                .filter(|e| e.file_name().to_string_lossy().starts_with("datafusion-"))
+                .map(|e| e.path())
+                .collect()
+        })
+        .unwrap_or_default();
+    if orphans.is_empty() {
+        return;
+    }
     let dir = spill_dir.to_path_buf();
     std::thread::Builder::new()
         .name("spill-reap".into())
-        .spawn(move || reap_orphaned_spill_dirs_blocking(&dir))
+        .spawn(move || reap_orphaned_spill_dirs_blocking(&dir, orphans))
         .map_or_else(|e| warn!("spill reap: cannot spawn reaper for {spill_dir:?}: {e}"), |_| ());
 }
 
-fn reap_orphaned_spill_dirs_blocking(spill_dir: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(spill_dir) else { return };
+fn reap_orphaned_spill_dirs_blocking(spill_dir: &std::path::Path, orphans: Vec<std::path::PathBuf>) {
     let (mut dirs, mut bytes) = (0u64, 0u64);
-    for e in entries.flatten() {
-        // DiskManager names them `datafusion-XXXXXX`; touch nothing else.
-        if !e.file_name().to_string_lossy().starts_with("datafusion-") {
-            continue;
-        }
-        let path = e.path();
+    for path in orphans {
         let size = dir_size_bytes(&path);
         match std::fs::remove_dir_all(&path) {
             Ok(()) => {
@@ -801,15 +878,25 @@ fn parse_watermark_from_json(
     let Some(wm) = info.get(WAL_WATERMARK_KEY).and_then(|v| v.as_object()) else {
         return out;
     };
-    // Only apply a watermark to the topic that wrote it. A commit from another
-    // tenant of the same unified table, or a legacy commit with no topic at
-    // all, contributes nothing — an unattributable position is indistinguishable
-    // from another tenant's, and over-advancing a cursor loses acked writes,
-    // whereas under-advancing only replays duplicates (read-side dedup drops
-    // those).
-    if wm.get(WATERMARK_TOPIC_KEY).and_then(|v| v.as_str()) != Some(wal_topic(project_id, table_name).as_str()) {
-        return out;
-    }
+    let topic = wal_topic(project_id, table_name);
+    // A cross-project coalesced commit nests one map per topic. Selecting by
+    // key IS the topic scoping — a project only ever reads its own entry, so
+    // the crash-recovery resume position stays per-project exactly as it is on
+    // the one-commit-per-project path. An absent topic contributes nothing.
+    let wm = match wm.get(WATERMARK_TOPICS_KEY).and_then(|v| v.as_object()) {
+        Some(topics) => {
+            let Some(mine) = topics.get(&topic).and_then(|v| v.as_object()) else { return out };
+            mine
+        }
+        // Only apply a watermark to the topic that wrote it. A commit from another
+        // tenant of the same unified table, or a legacy commit with no topic at
+        // all, contributes nothing — an unattributable position is indistinguishable
+        // from another tenant's, and over-advancing a cursor loses acked writes,
+        // whereas under-advancing only replays duplicates (read-side dedup drops
+        // those).
+        None if wm.get(WATERMARK_TOPIC_KEY).and_then(|v| v.as_str()) == Some(topic.as_str()) => wm,
+        None => return out,
+    };
     for (shard_str, pos_val) in wm {
         let Ok(shard) = shard_str.parse::<usize>() else { continue };
         if shard >= shards {
@@ -855,8 +942,10 @@ fn base_commit_properties() -> CommitProperties {
 /// Empty when the watermark has no positions (e.g. WAL-replay-derived buckets);
 /// delta-rs writes the commit without the key in that case, and recovery
 /// silently skips that commit.
-fn build_watermark_commit_properties(watermark: &crate::buffered_write_layer::DeltaWatermark, project_id: &str, table_name: &str) -> CommitProperties {
-    let entries = serialize_watermark_to_json(watermark, project_id, table_name);
+/// Takes every (project, table, watermark) the commit carries — one entry on
+/// the per-project path, N on a coalesced cross-project commit.
+fn build_watermark_commit_properties(watermarks: impl IntoIterator<Item = (String, String, crate::buffered_write_layer::DeltaWatermark)>) -> CommitProperties {
+    let entries = serialize_watermarks_to_json(watermarks);
     if entries.is_empty() {
         return base_commit_properties();
     }
@@ -871,6 +960,33 @@ fn build_watermark_commit_properties(watermark: &crate::buffered_write_layer::De
 /// plain full-update behaviour.
 fn incremental_commit_properties(enabled: bool) -> CommitProperties {
     base_commit_properties().with_incremental_advance(enabled)
+}
+
+/// Active-file URIs of `table`, restricted to files whose log path contains
+/// every marker in `scope` (`partition=value` path segments). Equivalent to
+/// `get_file_uris()` + a filter, except the predicate runs on the *borrowed* log
+/// path: a skipped file costs no allocation, where `get_file_uris()` allocates a
+/// `Path` **and** a URI `String` for every active file before you can filter. On
+/// the 26k-file unified table that turns a single-partition walk from ~52k
+/// allocations into a few hundred. Empty `scope` = whole table. An unloaded
+/// snapshot yields an empty set (matching the `unwrap_or_default()` call sites).
+fn scoped_file_uris(table: &DeltaTable, scope: &[&str]) -> Vec<String> {
+    let Ok(state) = table.snapshot() else { return Vec::new() };
+    let log_store = table.log_store();
+    state
+        .log_data()
+        .into_iter()
+        .filter_map(|f| {
+            let path = f.path();
+            // Mirrors the fork's `object_store_path()`: prefer the percent-encoding-
+            // preserving parse, fall back to the lossy `from` exactly as it does, so
+            // the URIs produced here are byte-identical to `get_file_uris()`.
+            scope.iter().all(|m| path.contains(m)).then(|| {
+                let p = object_store::path::Path::parse(path.as_ref()).unwrap_or_else(|_| object_store::path::Path::from(path.as_ref()));
+                log_store.to_uri(&p)
+            })
+        })
+        .collect()
 }
 
 /// True for the retryable Delta OCC conflicts — a single retry on a refreshed
@@ -1009,6 +1125,66 @@ enum CommitProbe {
     /// Could not confirm (snapshot refresh / read failed) — leak the staged
     /// parquet rather than risk deleting files a landed commit references.
     Inconclusive,
+}
+
+/// One (project, table) flush unit handed to [`Database::insert_records_batches_coalesced`].
+pub struct CoalescedWriteUnit {
+    pub project_id: String,
+    pub table_name: String,
+    pub batches: Vec<RecordBatch>,
+    pub watermark: crate::buffered_write_layer::DeltaWatermark,
+}
+
+/// A unit whose parquet is uploaded and whose `Add` actions are waiting for the
+/// shared commit.
+struct StagedUnit {
+    table_ref: Arc<RwLock<DeltaTable>>,
+    schema: &'static crate::schema_loader::TableSchema,
+    dirty_bins: Vec<(String, i64)>,
+    adds: Vec<deltalake::kernel::Action>,
+    stage_store: Arc<dyn object_store::ObjectStore>,
+}
+
+/// Marks a commit error where landing could NOT be confirmed. The staged
+/// parquet must be left in place (deleting files a landed commit references
+/// creates dangling Adds — the 2026-07-09 incident shape).
+const INCONCLUSIVE_COMMIT_MARKER: &str = "landing-unconfirmed";
+
+/// Split a coalesced commit's newly-added file URIs per project. Files are
+/// written under the `project_id=<id>/` partition path, so the path IS the
+/// attribution — downstream consumers (tantivy sidecar, cache warming) keep
+/// receiving only their own project's files even though one commit produced
+/// them all. A single-project group returns the full list unfiltered, byte-for-
+/// byte what the per-project path returns.
+fn attribute_added_files(added: Vec<String>, projects: &[&str]) -> Vec<Vec<String>> {
+    if projects.len() == 1 {
+        return vec![added];
+    }
+    projects
+        .iter()
+        .map(|p| {
+            let marker = format!("project_id={p}/");
+            added.iter().filter(|u| u.contains(&marker)).cloned().collect()
+        })
+        .collect()
+}
+
+/// A prepared write plus the PHYSICAL-table key (`table_lock_key`) it must be
+/// coalesced under.
+type PreparedForPhysicalTable = (PreparedWrite, (String, String));
+
+/// Output of [`Database::prepare_staged_write`] — see its doc comment.
+struct PreparedWrite {
+    table_ref: Arc<RwLock<DeltaTable>>,
+    schema: &'static crate::schema_loader::TableSchema,
+    dirty_bins: Vec<(String, i64)>,
+    batches: Vec<RecordBatch>,
+    writer_properties: WriterProperties,
+    /// Store the staged parquet lands in — used to clean it up on a terminal
+    /// commit failure (those objects have no Add/Remove, so VACUUM never
+    /// reclaims them).
+    stage_store: Arc<dyn object_store::ObjectStore>,
+    staged_writer: Option<deltalake::writer::RecordBatchWriter>,
 }
 
 fn remove_for_add(add: &deltalake::kernel::Add) -> deltalake::kernel::Remove {
@@ -1317,6 +1493,22 @@ pub struct Database {
     /// in 25 min with zero OCC conflicts). Separate pool ⇒ today's
     /// compaction always has its reserve; total budget stays constant.
     light_optimize_runtime_env: Arc<std::sync::OnceLock<Arc<datafusion::execution::runtime_env::RuntimeEnv>>>,
+    /// Memoized `build_optimize_session_state` results, one per runtime env.
+    /// Building a `SessionState` re-registers every analyzer/optimizer rule and
+    /// the whole UDF/UDAF set; the maintenance loop did that on EVERY optimize
+    /// attempt (up to 12 bins × 4 retries per project per 5-min tick). Inputs
+    /// are constant for the process lifetime (query partitions + the OnceLock'd
+    /// runtime env), so build once and clone per use — a clone is a handful of
+    /// Arc bumps against a full rebuild.
+    ///
+    /// ONLY for `.with_session_state(...)` on delta-rs builders. A `SessionState`
+    /// clone SHARES its `catalog_list` Arc, so the `SessionContext::new_with_state`
+    /// dedup/recompress sites — which `register_table("__dedup_src", …)` — must
+    /// keep building a fresh state, or concurrent chunks overwrite each other's
+    /// registration and scan the wrong table (caught by
+    /// `dirty_dedup_bins_enqueue_seal_and_requeue`).
+    maintenance_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
+    light_optimize_session_state: Arc<std::sync::OnceLock<datafusion::execution::session_state::SessionState>>,
     /// Unified tables: one Delta table per schema, partitioned by [project_id, date]
     unified_tables: UnifiedTables,
     /// Custom project tables: isolated tables for projects with their own S3 bucket
@@ -1825,6 +2017,8 @@ impl Database {
             runtime_env: Arc::new(std::sync::OnceLock::new()),
             maintenance_runtime_env: Arc::new(std::sync::OnceLock::new()),
             light_optimize_runtime_env: Arc::new(std::sync::OnceLock::new()),
+            maintenance_session_state: Arc::new(std::sync::OnceLock::new()),
+            light_optimize_session_state: Arc::new(std::sync::OnceLock::new()),
             unified_tables: Arc::new(RwLock::new(HashMap::new())),
             custom_project_tables: Arc::new(RwLock::new(HashMap::new())),
             fast_resolve_cache: Arc::new(dashmap::DashMap::new()),
@@ -3354,17 +3548,28 @@ impl Database {
     /// new table's live file URIs (captured before the swap) for callers that
     /// need them (e.g. the tantivy GC hook).
     ///
+    /// `pre_uris` is `None` when the caller isn't tracking the file set (both
+    /// warm- and evict-after-compaction disabled) — the diff and its warm/evict
+    /// are then skipped entirely rather than degenerating into "everything is
+    /// new". `scope` must be the SAME partition markers the caller scoped
+    /// `pre_uris` with (see [`scoped_file_uris`]); diffing a scoped pre-set
+    /// against an unscoped live set would warm every other partition.
+    ///
     /// Both optimize paths — full Z-order and light — funnel through here so the
     /// warm/evict pair can't drift; the evict call was once missing from the
     /// light path, and a single helper keeps them in lockstep.
     async fn swap_and_refresh_cache(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, new_table: DeltaTable, pre_uris: Option<&std::collections::HashSet<String>>, scope: &[&str],
     ) -> Vec<String> {
         // Capture live URIs off `new_table` *before* the swap moves it in.
-        let live_uris: Vec<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-        let live_set: std::collections::HashSet<&String> = live_uris.iter().collect();
-        let added: Vec<String> = live_uris.iter().filter(|u| !pre_uris.contains(*u)).cloned().collect();
-        let removed: Vec<String> = pre_uris.iter().filter(|u| !live_set.contains(u)).cloned().collect();
+        let live_uris: Vec<String> = scoped_file_uris(&new_table, scope);
+        let (added, removed): (Vec<String>, Vec<String>) = match pre_uris {
+            Some(pre) => {
+                let live_set: std::collections::HashSet<&str> = live_uris.iter().map(String::as_str).collect();
+                (live_uris.iter().filter(|u| !pre.contains(*u)).cloned().collect(), pre.iter().filter(|u| !live_set.contains(u.as_str())).cloned().collect())
+            }
+            None => (Vec::new(), Vec::new()),
+        };
         let warm_store = new_table.log_store().object_store(None);
         let warm_table_uri = new_table.table_url().to_string();
         self.persist_snapshot(&new_table);
@@ -3571,6 +3776,20 @@ impl Database {
         self.light_optimize_runtime_env.get_or_init(|| self.build_spill_runtime_env(self.light_optimize_pool_bytes(), "light_optimize_spill")).clone()
     }
 
+    /// Heavy-maintenance session state, built once (see field doc).
+    fn maintenance_session_state(&self) -> datafusion::execution::session_state::SessionState {
+        self.maintenance_session_state
+            .get_or_init(|| build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env()))
+            .clone()
+    }
+
+    /// Light-optimize session state, built once (see field doc).
+    fn light_optimize_session_state(&self) -> datafusion::execution::session_state::SessionState {
+        self.light_optimize_session_state
+            .get_or_init(|| build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env()))
+            .clone()
+    }
+
     /// The DML serialization mutex for the PHYSICAL table backing
     /// `(project_id, table_name)`. Unified tables are one shared Delta table
     /// across all default projects, so their key drops the project — two
@@ -3682,6 +3901,77 @@ impl Database {
         Ok(table)
     }
 
+    /// Everything a staged (lock-free parquet upload) Delta write needs, built
+    /// once per (project, table) unit. Shared by `insert_records_batch` and the
+    /// cross-project coalesced flush path so both prepare writes identically.
+    ///
+    /// `staged_writer` is `None` when the fast path is unavailable — a batch
+    /// carries a column the table schema lacks (delta-rs' Default-mode
+    /// `RecordBatchWriter` cannot evolve schema on a partitioned table), or the
+    /// writer could not be built at all. That unit must take the locked
+    /// WriteBuilder merge path.
+    async fn prepare_staged_write(&self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>) -> Result<PreparedWrite> {
+        // Delta-kernel's `unshredded_variant()` expects Struct{Binary,Binary}
+        // on write, but our MemBuffer carries Struct{BinaryView,BinaryView}
+        // (matches what the parquet reader natively produces — no per-row
+        // casts on read). Cast just-before-write so the Delta commit
+        // accepts the schema.
+        let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
+
+        // Get or create the table
+        let table_ref = self.get_or_create_table(project_id, table_name).await?;
+
+        // Get the appropriate schema for this table
+        let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
+
+        let dirty_bins: Vec<(String, i64)> = if schema.dedup_keys.is_empty() {
+            Vec::new()
+        } else {
+            const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
+            batches
+                .iter()
+                .filter_map(|batch| batch.column_by_name("timestamp"))
+                .filter_map(|column| column.as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>())
+                .flat_map(|timestamps| {
+                    timestamps.iter().flatten().filter_map(|timestamp| {
+                        chrono::DateTime::from_timestamp_micros(timestamp).map(|time| (time.date_naive().to_string(), timestamp.div_euclid(BIN_MICROS)))
+                    })
+                })
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect()
+        };
+
+        // Cluster by the declared sort keys (timestamp-first) so the parquet
+        // SortingColumn footer is honest and the page index localizes the lead
+        // key. `sorted` is false when a schema-evolved bucket can't be combined
+        // (we then write unsorted) — declare the footer only when it's true.
+        let (batches, sorted) = sort_batches_by_schema(schema, batches);
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
+
+        let staging_table = { table_ref.read().await.clone() };
+        let stage_store = staging_table.log_store().object_store(None);
+        let staged_writer = match deltalake::writer::RecordBatchWriter::for_table(&staging_table) {
+            Ok(w) => {
+                let w = w.with_writer_properties(writer_properties.clone());
+                let arrow_schema = w.arrow_schema();
+                let table_fields: std::collections::HashSet<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
+                let evolves = batches.iter().any(|b| b.schema().fields().iter().any(|f| !table_fields.contains(f.name().as_str())));
+                (!evolves).then_some(w)
+            }
+            Err(e) => {
+                debug!("RecordBatchWriter::for_table failed, using merge path: {}", e);
+                None
+            }
+        };
+        Ok(PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer })
+    }
+
+    /// Insert batches and return the URIs of files newly added by this commit
+    /// (empty for the buffered-layer / batch-queue paths where the actual
+    /// Delta write happens later). Callers use the returned list to drive
+    /// cache warming and the tantivy sidecar without paying for a second
+    /// `update_state()` log scan.
     #[instrument(
         name = "delta.insert_batch",
         skip_all,
@@ -3693,11 +3983,6 @@ impl Database {
             use_queue = Empty,
         )
     )]
-    /// Insert batches and return the URIs of files newly added by this commit
-    /// (empty for the buffered-layer / batch-queue paths where the actual
-    /// Delta write happens later). Callers use the returned list to drive
-    /// cache warming and the tantivy sidecar without paying for a second
-    /// `update_state()` log scan.
     pub async fn insert_records_batch(
         &self, project_id: &str, table_name: &str, batches: Vec<RecordBatch>, skip_queue: bool, watermark: Option<&crate::buffered_write_layer::DeltaWatermark>,
     ) -> Result<Vec<String>> {
@@ -3755,46 +4040,11 @@ impl Database {
 
         span.record("use_queue", false);
 
-        // Delta-kernel's `unshredded_variant()` expects Struct{Binary,Binary}
-        // on write, but our MemBuffer carries Struct{BinaryView,BinaryView}
-        // (matches what the parquet reader natively produces — no per-row
-        // casts on read). Cast just-before-write so the Delta commit
-        // accepts the schema.
-        let batches: Vec<RecordBatch> = batches.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
-
-        // Get or create the table
-        let table_ref = self.get_or_create_table(&project_id, &table_name).await?;
-
-        // Get the appropriate schema for this table
-        let schema = get_schema(&table_name).unwrap_or_else(get_default_schema);
-
-        let dirty_bins: Vec<(String, i64)> = if schema.dedup_keys.is_empty() {
-            Vec::new()
-        } else {
-            const BIN_MICROS: i64 = 10 * 60 * 1_000_000;
-            batches
-                .iter()
-                .filter_map(|batch| batch.column_by_name("timestamp"))
-                .filter_map(|column| column.as_any().downcast_ref::<datafusion::arrow::array::TimestampMicrosecondArray>())
-                .flat_map(|timestamps| {
-                    timestamps.iter().flatten().filter_map(|timestamp| {
-                        chrono::DateTime::from_timestamp_micros(timestamp).map(|time| (time.date_naive().to_string(), timestamp.div_euclid(BIN_MICROS)))
-                    })
-                })
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect()
-        };
-
-        // Cluster by the declared sort keys (timestamp-first) so the parquet
-        // SortingColumn footer is honest and the page index localizes the lead
-        // key. `sorted` is false when a schema-evolved bucket can't be combined
-        // (we then write unsorted) — declare the footer only when it's true.
-        let (batches, sorted) = sort_batches_by_schema(schema, batches);
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
+        let PreparedWrite { table_ref, schema, dirty_bins, batches, writer_properties, stage_store, staged_writer } =
+            self.prepare_staged_write(&project_id, &table_name, batches).await?;
 
         // Hoist out of the retry loop — the watermark is the same on every attempt.
-        let commit_properties = watermark.map(|w| build_watermark_commit_properties(w, project_id.as_str(), table_name.as_str()));
+        let commit_properties = watermark.map(|w| build_watermark_commit_properties([(project_id.clone(), table_name.clone(), w.clone())]));
         // Let the post-commit hook advance the snapshot incrementally — carry
         // the materialized file list forward, append the committed files, drop
         // any removed ones — instead of re-materializing the whole active set.
@@ -3819,22 +4069,8 @@ impl Database {
         //
         // delta-rs' Default-mode RecordBatchWriter cannot evolve schema on a
         // partitioned table, so when a batch carries a column absent from the
-        // table schema we fall back to the locked WriteBuilder merge path below.
-        let staging_table = { table_ref.read().await.clone() };
-        let staged_writer = match deltalake::writer::RecordBatchWriter::for_table(&staging_table) {
-            Ok(w) => {
-                let w = w.with_writer_properties(writer_properties.clone());
-                let arrow_schema = w.arrow_schema();
-                let table_fields: std::collections::HashSet<&str> = arrow_schema.fields().iter().map(|f| f.name().as_str()).collect();
-                let evolves = batches.iter().any(|b| b.schema().fields().iter().any(|f| !table_fields.contains(f.name().as_str())));
-                (!evolves).then_some(w)
-            }
-            Err(e) => {
-                debug!("RecordBatchWriter::for_table failed, using merge path: {}", e);
-                None
-            }
-        };
-
+        // table schema `prepare_staged_write` returns no staged writer and we
+        // fall back to the locked WriteBuilder merge path below.
         if let Some(mut writer) = staged_writer {
             use deltalake::{
                 kernel::{Action, transaction::TableReference},
@@ -3871,7 +4107,7 @@ impl Database {
             // Store to clean up the staged parquet on a terminal commit failure —
             // those objects have no Add/Remove in the log, so Delta VACUUM won't
             // reclaim them; abandoning them leaks files on S3 forever.
-            let stage_store = staging_table.log_store().object_store(None);
+            let stage_store = stage_store.clone();
 
             let commit_lock = self.commit_lock(&project_id, &table_name).await;
             let mut retry_count = 0;
@@ -3909,8 +4145,16 @@ impl Database {
                         new_table.state = Some(finalized.snapshot());
                         drop(commit_guard);
                         let _t_record = std::time::Instant::now();
-                        let _committed =
-                            self.record_committed_write(&table_ref, &project_id, &table_name, new_table, &pre_uris, watermark.is_some(), &dirty_bins).await;
+                        let _committed = self
+                            .record_committed_write(
+                                &table_ref,
+                                &[(project_id.as_str(), dirty_bins.as_slice())],
+                                &table_name,
+                                new_table,
+                                &pre_uris,
+                                watermark.is_some(),
+                            )
+                            .await;
                         info!(
                             "commit_timing project={} table={} refresh_ms={} build_ms={} record_ms={} files={}",
                             project_id,
@@ -3947,8 +4191,16 @@ impl Database {
                                     project_id, table_name, e
                                 );
                                 let post = { table_ref.read().await.clone() };
-                                let committed =
-                                    self.record_committed_write(&table_ref, &project_id, &table_name, post, &pre_uris, watermark.is_some(), &dirty_bins).await;
+                                let committed = self
+                                    .record_committed_write(
+                                        &table_ref,
+                                        &[(project_id.as_str(), dirty_bins.as_slice())],
+                                        &table_name,
+                                        post,
+                                        &pre_uris,
+                                        watermark.is_some(),
+                                    )
+                                    .await;
                                 return Ok(committed);
                             }
                             CommitProbe::NotLanded => {
@@ -4004,7 +4256,16 @@ impl Database {
 
             match write_result {
                 Ok(new_table) => {
-                    let added = self.record_committed_write(&table_ref, &project_id, &table_name, new_table, &pre_uris, watermark.is_some(), &dirty_bins).await;
+                    let added = self
+                        .record_committed_write(
+                            &table_ref,
+                            &[(project_id.as_str(), dirty_bins.as_slice())],
+                            &table_name,
+                            new_table,
+                            &pre_uris,
+                            watermark.is_some(),
+                        )
+                        .await;
                     return Ok(added);
                 }
                 Err(e) => {
@@ -4033,6 +4294,243 @@ impl Database {
             max_retries,
             last_error.map(|e| e.to_string()).unwrap_or_else(|| "Unknown error".to_string())
         ))
+    }
+
+    /// Cross-project flush commit coalescing (C3).
+    ///
+    /// One tick's per-project flush units become ONE Delta commit per PHYSICAL
+    /// table. All default-storage projects share a single `_delta_log`, and
+    /// `table_lock_key` already funnels their commits through one mutex — so the
+    /// per-project commits were serialized anyway and merely multiplied log
+    /// entries, snapshot refreshes and Delta-log JSON parses. Custom-storage
+    /// projects have their own log and keep their own commit (the grouping key
+    /// IS `table_lock_key`, so isolation is structural, not a special case).
+    ///
+    /// Parallelism is unchanged in the part that matters: parquet encode +
+    /// upload still fan out `flush_parallelism`-wide per unit, OUTSIDE any lock.
+    /// Only the commit-log append is shared.
+    ///
+    /// Isolation guarantees, matching the per-project path exactly:
+    /// - a unit whose parquet staging fails is excluded from the commit and gets
+    ///   its own `Err` — the other projects still commit;
+    /// - a shared commit failure fails EVERY unit in that physical group
+    ///   identically (no partial settle: the caller requeues them all);
+    /// - a unit needing schema evolution is split OUT of the coalesced group and
+    ///   committed on its own via the locked WriteBuilder merge path, rather
+    ///   than dragging its co-tenants through it.
+    ///
+    /// Returns one result per input unit, in input order. `Ok` carries the URIs
+    /// of files that unit added (attributed by `project_id=` partition path when
+    /// the commit spanned projects, so the tantivy sidecar still indexes each
+    /// project's own files).
+    pub async fn insert_records_batches_coalesced(&self, units: Vec<CoalescedWriteUnit>) -> Vec<Result<Vec<String>>> {
+        use deltalake::{kernel::Action, protocol::DeltaOperation, writer::DeltaWriter};
+        use futures::stream::{self, StreamExt};
+        let parallelism = self.config.buffer.flush_parallelism();
+        let mut results: Vec<Result<Vec<String>>> = units.iter().map(|_| Ok(Vec::new())).collect();
+        let units = std::sync::Arc::new(units);
+
+        // ---- Phase 1: prepare (bounded-concurrent; table resolution + casts).
+        let prepared: Vec<(usize, Result<PreparedForPhysicalTable>)> = stream::iter(0..units.len())
+            .map(|i| {
+                let units = units.clone();
+                async move {
+                    let u = &units[i];
+                    let prep = self.prepare_staged_write(&u.project_id, &u.table_name, u.batches.clone()).await;
+                    let key = self.table_lock_key(&u.project_id, &u.table_name).await;
+                    (i, prep.map(|p| (p, key)))
+                }
+            })
+            .buffer_unordered(parallelism)
+            .collect()
+            .await;
+
+        // ---- Phase 2: stage parquet OUTSIDE any lock, `flush_parallelism`-wide.
+        // Schema-evolution units never reach here: they are split out to the solo
+        // (locked WriteBuilder) path so one project's merge can't stall the rest.
+        let mut solo: Vec<usize> = Vec::new();
+        let mut stageable: Vec<(usize, PreparedWrite, (String, String))> = Vec::new();
+        for (i, prep) in prepared {
+            match prep {
+                Err(e) => results[i] = Err(e),
+                Ok((p, _)) if p.staged_writer.is_none() => {
+                    debug!("coalesced flush: {}/{} needs schema evolution — splitting out of the shared commit", units[i].project_id, units[i].table_name);
+                    drop(p);
+                    solo.push(i);
+                }
+                Ok((p, key)) => stageable.push((i, p, key)),
+            }
+        }
+
+        let staged: Vec<(usize, (String, String), Result<StagedUnit>)> = stream::iter(stageable)
+            .map(|(i, prep, key)| async move {
+                let PreparedWrite { table_ref, schema, dirty_bins, batches, stage_store, staged_writer, .. } = prep;
+                let mut writer = staged_writer.expect("filtered above");
+                // RecordBatchWriter (unlike WriteBuilder) doesn't cast the batch
+                // to the table schema — cast first (Utf8View→Utf8 etc, missing
+                // columns filled with nulls), mirroring the per-project path.
+                let target_schema = writer.arrow_schema();
+                let adds = async {
+                    for b in &batches {
+                        let casted = deltalake::kernel::schema::cast_record_batch(b, target_schema.clone(), true, true)?;
+                        writer.write(casted).await?;
+                    }
+                    writer.flush().await
+                }
+                .await
+                .map(|adds| adds.into_iter().map(Action::Add).collect::<Vec<Action>>())
+                .map_err(|e| anyhow::anyhow!("staged parquet flush failed: {}", e));
+                (i, key, adds.map(|adds| StagedUnit { table_ref, schema, dirty_bins, adds, stage_store }))
+            })
+            .buffer_unordered(parallelism)
+            .collect()
+            .await;
+
+        // ---- Phase 3: one commit per PHYSICAL table.
+        let mut by_physical: std::collections::HashMap<(String, String), Vec<(usize, StagedUnit)>> = std::collections::HashMap::new();
+        for (i, key, unit) in staged {
+            match unit {
+                Err(e) => results[i] = Err(e),
+                // Nothing was written (all rows filtered out) — no Add to commit.
+                Ok(u) if u.adds.is_empty() => results[i] = Ok(Vec::new()),
+                Ok(u) => by_physical.entry(key).or_default().push((i, u)),
+            }
+        }
+
+        let committed: Vec<Vec<(usize, Result<Vec<String>>)>> = stream::iter(by_physical.into_values())
+            .map(|group| {
+                let units = units.clone();
+                async move {
+                    let indices: Vec<usize> = group.iter().map(|(i, _)| *i).collect();
+                    let table_name = units[indices[0]].table_name.clone();
+                    let projects: Vec<&str> = indices.iter().map(|i| units[*i].project_id.as_str()).collect();
+                    let table_ref = group[0].1.table_ref.clone();
+                    let schema = group[0].1.schema;
+                    let adds: Vec<Action> = group.iter().flat_map(|(_, u)| u.adds.iter().cloned()).collect();
+                    let watermarks = indices.iter().map(|i| (units[*i].project_id.clone(), units[*i].table_name.clone(), units[*i].watermark.clone()));
+                    let commit_properties = build_watermark_commit_properties(watermarks);
+                    let commit_properties = if self.config.maintenance.timefusion_incremental_snapshot {
+                        commit_properties.with_incremental_advance(true)
+                    } else {
+                        commit_properties
+                    };
+                    let per_project: Vec<(&str, &[(String, i64)])> =
+                        group.iter().map(|(i, u)| (units[*i].project_id.as_str(), u.dirty_bins.as_slice())).collect();
+                    let partition_by = (!schema.partitions.is_empty()).then(|| schema.partitions.clone());
+                    let op = DeltaOperation::Write { mode: deltalake::protocol::SaveMode::Append, partition_by, predicate: None };
+
+                    let outcome = self
+                        .commit_coalesced_group(&table_ref, &per_project, &table_name, adds.clone(), commit_properties, op)
+                        .await
+                        .map(|added| attribute_added_files(added, &projects));
+                    match outcome {
+                        Ok(per_project_added) => indices.into_iter().zip(per_project_added).map(|(i, a)| (i, Ok(a))).collect::<Vec<_>>(),
+                        Err(e) => {
+                            // Fail EVERY project in the group identically — no
+                            // partial settle. The caller requeues each one's buckets
+                            // with unchanged retry semantics.
+                            if !e.to_string().contains(INCONCLUSIVE_COMMIT_MARKER) {
+                                // Every unit in a physical group stages into the SAME
+                                // store (same Delta table), so one store deletes all.
+                                Self::cleanup_orphaned_parquet(&group[0].1.stage_store, &adds).await;
+                            }
+                            indices.into_iter().map(|i| (i, Err(anyhow::anyhow!("coalesced commit failed for {}: {}", table_name, e)))).collect()
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(parallelism)
+            .collect()
+            .await;
+        for (i, r) in committed.into_iter().flatten() {
+            results[i] = r;
+        }
+
+        // ---- Phase 4: schema-evolution units, each on its own (locked merge path).
+        let solo_results: Vec<(usize, Result<Vec<String>>)> = stream::iter(solo)
+            .map(|i| {
+                let units = units.clone();
+                async move {
+                    let u = &units[i];
+                    (i, self.insert_records_batch(&u.project_id, &u.table_name, u.batches.clone(), true, Some(&u.watermark)).await)
+                }
+            })
+            .buffer_unordered(parallelism)
+            .collect()
+            .await;
+        for (i, r) in solo_results {
+            results[i] = r;
+        }
+        results
+    }
+
+    /// The shared commit-log append for one physical table's coalesced group.
+    /// Mirrors the per-project staged-commit loop (same OCC retry budget +
+    /// backoff, same landed-despite-error probe); the only difference is that
+    /// the actions and the watermark metadata span several projects. Cleanup of
+    /// staged parquet is the caller's (it owns every unit's store).
+    async fn commit_coalesced_group(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, adds: Vec<deltalake::kernel::Action>,
+        commit_properties: CommitProperties, op: deltalake::protocol::DeltaOperation,
+    ) -> Result<Vec<String>> {
+        use deltalake::kernel::transaction::TableReference;
+        const MAX_RETRIES: u32 = 5;
+        // Any member resolves to the same physical lock (the group key IS
+        // `table_lock_key`), so serialization is identical to the per-project path.
+        let commit_lock = self.commit_lock(projects[0].0, table_name).await;
+        let mut retry_count = 0u32;
+        loop {
+            let commit_guard = commit_lock.lock().await;
+            if let Err(e) = refresh_table_snapshot(table_ref, self.config.maintenance.timefusion_incremental_snapshot).await {
+                debug!("pre-commit refresh failed (attempt {}): {}", retry_count + 1, e);
+            }
+            let mut new_table = { table_ref.read().await.clone() };
+            let commit_res = deltalake::kernel::transaction::CommitBuilder::from(commit_properties.clone())
+                .with_actions(adds.clone())
+                .build(Some(new_table.snapshot()? as &dyn TableReference), new_table.log_store(), op.clone())
+                .await;
+            match commit_res {
+                Ok(finalized) => {
+                    let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                    new_table.state = Some(finalized.snapshot());
+                    drop(commit_guard);
+                    let added = self.record_committed_write(table_ref, projects, table_name, new_table, &pre_uris, true).await;
+                    debug!("coalesced commit landed: table={} projects={} files={}", table_name, projects.len(), adds.len());
+                    return Ok(added);
+                }
+                Err(e) => {
+                    drop(commit_guard);
+                    if is_occ_conflict_err(&e.to_string()) {
+                        retry_count += 1;
+                        if retry_count >= MAX_RETRIES {
+                            return Err(anyhow::anyhow!("coalesced staged commit failed after {} retries: {}", MAX_RETRIES, e));
+                        }
+                        debug!("coalesced commit conflict, retrying ({}/{}): {}", retry_count, MAX_RETRIES, e);
+                        tokio::time::sleep(occ_backoff(retry_count as usize)).await;
+                        continue;
+                    }
+                    // Non-OCC: the commit MAY have landed (post-commit hook failed
+                    // after N.json was written). Same three-way probe as the
+                    // per-project path — never delete parquet a landed commit
+                    // references.
+                    let pre_uris: std::collections::HashSet<String> = new_table.get_file_uris().map(|it| it.collect()).unwrap_or_default();
+                    match self.probe_commit_landed(table_ref, &adds).await {
+                        CommitProbe::Landed => {
+                            warn!("coalesced commit for {} reported an error but LANDED (post-commit hook failed) — draining: {}", table_name, e);
+                            let post = { table_ref.read().await.clone() };
+                            return Ok(self.record_committed_write(table_ref, projects, table_name, post, &pre_uris, true).await);
+                        }
+                        CommitProbe::NotLanded => return Err(anyhow::anyhow!("coalesced staged commit failed: {}", e)),
+                        CommitProbe::Inconclusive => {
+                            warn!("coalesced commit for {} errored and landing is UNCONFIRMED — leaving staged parquet in place: {}", table_name, e);
+                            // Signal "do not delete the parquet" by returning a
+                            // distinct marker error the caller checks.
+                            return Err(anyhow::anyhow!("{}: coalesced staged commit failed (landing unconfirmed): {}", INCONCLUSIVE_COMMIT_MARKER, e));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Probe whether a staged commit landed despite returning an error: refresh
@@ -4084,15 +4582,27 @@ impl Database {
     /// paths: record the version for read-after-write, swap the shared handle
     /// (version-guarded), warm the just-written files, invalidate stats, and
     /// return the newly added file URIs.
+    ///
+    /// `projects` is every (project_id, dirty_bins) the commit carried — one on
+    /// the per-project path, N on a coalesced cross-project commit. Everything
+    /// per-project (last-written version for read-after-write, statistics
+    /// invalidation, dirty-bin enqueue) runs once per entry; the table-wide work
+    /// (snapshot persist, handle swap, warm, reconcile) runs once for the commit.
     #[allow(clippy::too_many_arguments)]
     async fn record_committed_write(
-        &self, table_ref: &Arc<RwLock<DeltaTable>>, project_id: &str, table_name: &str, new_table: DeltaTable, pre_uris: &std::collections::HashSet<String>,
-        warm: bool, dirty_bins: &[(String, i64)],
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, projects: &[(&str, &[(String, i64)])], table_name: &str, new_table: DeltaTable,
+        pre_uris: &std::collections::HashSet<String>, warm: bool,
     ) -> Vec<String> {
+        // Jitter anchor + logging identity: any member of the physical group is
+        // equivalent (they all commit to the same log).
+        let project_id = projects.first().map(|(p, _)| *p).unwrap_or("");
         let committed_version = new_table.version();
         if let Some(version) = committed_version {
-            self.last_written_versions.write().await.insert((project_id.to_string(), table_name.to_string()), version);
-            debug!("Stored last written version for {}/{}: {}", project_id, table_name, version);
+            let mut versions = self.last_written_versions.write().await;
+            for (project, _) in projects {
+                versions.insert((project.to_string(), table_name.to_string()), version);
+            }
+            debug!("Stored last written version for {}/{} (+{} coalesced): {}", project_id, table_name, projects.len().saturating_sub(1), version);
         } else {
             debug!("WARNING: No version available after write for {}/{}", project_id, table_name);
         }
@@ -4125,9 +4635,11 @@ impl Database {
                 }
             });
         }
-        self.statistics_extractor.invalidate(project_id, table_name).await;
-        for (date, bin) in dirty_bins {
-            self.enqueue_dirty_bin(project_id, table_name, date, *bin);
+        for (project, dirty_bins) in projects {
+            self.statistics_extractor.invalidate(project, table_name).await;
+            for (date, bin) in *dirty_bins {
+                self.enqueue_dirty_bin(project, table_name, date, *bin);
+            }
         }
         debug!("Invalidated statistics cache after write to {}/{}", project_id, table_name);
         // Periodic reconcile, OFF the flush path: every Nth commit (offset per
@@ -4265,8 +4777,11 @@ impl Database {
 
         // Pre-state file set, used to derive the files this optimize *adds*
         // (to warm) and *removes* (to evict) — see warm/evict_cache_for_uris.
+        // Reuses (moves) the walk above instead of a second copy, and is hoisted
+        // out of the OCC retry loop below: the live file set only changes on a
+        // *successful* commit, which returns.
         let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
-        let mut pre_uris: std::collections::HashSet<String> = if track_files { all_uris.iter().cloned().collect() } else { Default::default() };
+        let pre_uris: Option<std::collections::HashSet<String>> = track_files.then(|| all_uris.into_iter().collect());
 
         // Keep the active partition at the light-compaction target. A single
         // day-sized file would make 1h and 3h predicates select the same file
@@ -4350,9 +4865,6 @@ impl Database {
                     }
                 }
                 let table_clone = { table_ref.read().await.clone() };
-                if track_files {
-                    pre_uris = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
-                }
                 let result = {
                     let _rewrite_permit =
                         self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
@@ -4368,10 +4880,7 @@ impl Database {
                         // Avoid the BinaryView read for Variant columns (same issue as
                         // optimize_table_light); delta-rs's internal session defaults to
                         // schema_force_view_types=true.
-                        .with_session_state(Arc::new(build_optimize_session_state(
-                            self.config.memory.timefusion_query_partitions,
-                            self.maintenance_runtime_env(),
-                        )))
+                        .with_session_state(Arc::new(self.maintenance_session_state()))
                         .await
                 };
                 match result {
@@ -4426,7 +4935,7 @@ impl Database {
                 // Swap the optimized table in and refresh the cache (warm
                 // newly-added files, evict tombstoned ones). Returns the new
                 // live file URIs for the tantivy GC hook below.
-                let live_uris = self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                let live_uris = self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &[]).await;
                 // Tantivy compaction reindex + GC. Order matters: build
                 // indexes for the compaction's OUTPUT files first, then GC the
                 // inputs' entries — so window coverage never regresses (the
@@ -4440,7 +4949,9 @@ impl Database {
                     let delta_store = { table_ref.read().await.log_store().object_store(None) };
                     let added: Vec<(String, String, String)> = live_uris
                         .iter()
-                        .filter(|u| !pre_uris.contains(*u) && u.ends_with(".parquet"))
+                        // `None` (file tracking off) behaves as the empty pre-set,
+                        // exactly as before: every live parquet is treated as new.
+                        .filter(|u| !pre_uris.as_ref().is_some_and(|p| p.contains(*u)) && u.ends_with(".parquet"))
                         .filter_map(|u| Some((project_id_of_uri(u)?.to_string(), parquet_rel_of_uri(u)?.to_string(), u.clone())))
                         .collect();
                     let mut built = 0usize;
@@ -4698,6 +5209,17 @@ impl Database {
         // snapshot and retry rather than fail; an intermittently-written
         // partition lands on a later attempt. Mirrors the dedup retry loop.
         const MAX_ATTEMPTS: usize = 4;
+        // Pre-state file set for the warm/evict diff, hoisted out of the retry
+        // loop (only a successful commit — which returns — changes it) and
+        // scoped to the partition being compacted: `optimize().with_filters()`
+        // can only add/remove files under these markers, so diffing the whole
+        // table's URI set was pure waste. `None` when neither warm- nor
+        // evict-after-compaction is on, so the walk is skipped outright.
+        let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+        let scope: Vec<String> = std::iter::once(format!("date={date}/")).chain(project_id.map(|pid| format!("project_id={pid}/"))).collect();
+        let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
+        let pre_uris: Option<std::collections::HashSet<String>> =
+            if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
         for attempt in 0..MAX_ATTEMPTS {
             // Runs before every retry (attempt > 0), intentionally for BOTH the
             // OCC and transient-S3 arms: a concurrent writer may have committed
@@ -4711,7 +5233,6 @@ impl Database {
                 debug!("compact_date refresh failed (attempt {}): {}", attempt, e);
             }
             let table_clone = { table_ref.read().await.clone() };
-            let pre_uris: std::collections::HashSet<String> = table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default();
             // SortBy: sort the partition by the schema keys and declare it, so
             // cold/consolidated partitions keep an honest DESC footer for the
             // ordering pushdown (plain Compact concatenates → declare false).
@@ -4736,11 +5257,11 @@ impl Database {
                 .with_min_commit_interval(tokio::time::Duration::from_secs(10 * 60))
                 .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
                 // Variant columns: same BinaryView-avoidance session as optimize_table.
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
+                .with_session_state(Arc::new(self.maintenance_session_state()))
                 .await;
             match result {
                 Ok((new_table, metrics)) => {
-                    self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                    self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &scope).await;
                     info!("compact date={date} table={table_name}: {} files removed, {} files added", metrics.num_files_removed, metrics.num_files_added);
                     return Ok((metrics.num_files_removed, metrics.num_files_added));
                 }
@@ -4941,7 +5462,7 @@ impl Database {
                 // un-warmed and the tombstoned ones cached — the next query
                 // on a recompressed partition paid full S3 reads (1.5 s
                 // observed against OVH).
-                self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                self.swap_and_refresh_cache(table_ref, new_table, Some(&pre_uris), &[]).await;
                 Ok(())
             }
             Err(e) => {
@@ -5355,9 +5876,9 @@ impl Database {
                     .with_files(&paths)
                     .with_target_size(std::num::NonZeroU64::new(1).unwrap())
                     .with_max_concurrent_tasks(1)
-                    .with_writer_properties(self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, true))
+                    .with_writer_properties(self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, true))
                     .with_commit_properties(incremental_commit_properties(self.config.maintenance.timefusion_incremental_snapshot))
-                    .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.maintenance_runtime_env())))
+                    .with_session_state(Arc::new(self.maintenance_session_state()))
                     .await
                 {
                     Ok((new_table, _)) => {
@@ -5382,7 +5903,7 @@ impl Database {
                                 batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::Int64Array>().map(|array| array.value(0) as u64)
                             })
                             .unwrap_or(before);
-                        self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                        self.swap_and_refresh_cache(table_ref, new_table, Some(&pre_uris), &[]).await;
                         return Ok((before.saturating_sub(after), true));
                     }
                     Err(error) if replan + 1 < MAX_REPLANS && is_occ_conflict_err(&error.to_string()) => {
@@ -5497,7 +6018,7 @@ impl Database {
                     // mixes tiers — cast to Binary so the write accepts the schema.
                     let deduped: Vec<RecordBatch> = deduped.into_iter().map(cast_variant_columns_to_binary).collect::<DFResult<Vec<_>>>()?;
                     let (deduped, sorted) = sort_batches_by_schema(schema, deduped);
-                    let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, sorted);
+                    let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, sorted);
                     let mut writer = deltalake::writer::RecordBatchWriter::for_table(&staging_table)
                         .map_err(|e| anyhow::anyhow!("dedup rewrite writer: {e}"))?
                         .with_writer_properties(writer_properties);
@@ -5563,7 +6084,7 @@ impl Database {
                         // Release before post-commit work (swap + cache warm), matching
                         // the flush staged path — holding it would serialize appends.
                         drop(commit_guard);
-                        self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                        self.swap_and_refresh_cache(table_ref, new_table, Some(&pre_uris), &[]).await;
                         crate::metrics::record_compaction_dedup_dropped(dropped);
                         info!(
                             "dedup rewrite: table={} chunk=[{}] files={} dropped={} (before={} after={})",
@@ -5591,7 +6112,7 @@ impl Database {
                                 CommitProbe::Landed => {
                                     warn!("dedup rewrite for '{}' chunk=[{}] reported an error but LANDED (post-commit hook failed): {}", table_name, label, e);
                                     let post = { table_ref.read().await.clone() };
-                                    self.swap_and_refresh_cache(table_ref, post, &pre_uris).await;
+                                    self.swap_and_refresh_cache(table_ref, post, Some(&pre_uris), &[]).await;
                                     crate::metrics::record_compaction_dedup_dropped(dropped);
                                     return Ok((dropped, true));
                                 }
@@ -5950,7 +6471,8 @@ impl Database {
         // light-compacted files keep an honest DESC footer for the pushdown
         // (only when timefusion_optimize_sort_by is on; else memory-safe Compact).
         let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
-        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_compression_level, declare_sorted);
+        // Intermediate tier: this output is rewritten tonight by consolidate/recompress.
+        let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_intermediate, declare_sorted);
 
         // Per-project fan-out gated by TIMEFUSION_LIGHT_OPTIMIZE_CONCURRENCY
         // (default 1 = serial): each bin sort decompresses its ≤target_size
@@ -6036,16 +6558,23 @@ impl Database {
         // or recompress and blow the cgroup (their footprint is pool-invisible).
         let _rewrite_permit = self.maintenance_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("maintenance rewrite semaphore closed: {e}"))?;
         let mut last_err: Option<deltalake::DeltaTableError> = None;
+        // Pre-state file set for deriving the files this optimize adds (to warm)
+        // and removes (to evict). Hoisted out of the retry loop — only a
+        // successful commit (which returns) changes the file set — and scoped to
+        // the one hot `(project_id, today)` partition this optimize is filtered
+        // to. This is the highest-frequency walk in the process (up to
+        // 12 passes x 4 attempts per hot project per 5-min tick), and it was
+        // walking the whole 26k-file table each time.
+        let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
+        let (pid_marker, date_marker) = (format!("project_id={project_id}/"), format!("date={today}/"));
+        let scope = [pid_marker.as_str(), date_marker.as_str()];
+        let pre_uris: Option<std::collections::HashSet<String>> =
+            if track_files { Some(scoped_file_uris(&*table_ref.read().await, &scope).into_iter().collect()) } else { None };
         for attempt in 0..MAX_RETRIES {
             let table_clone = {
                 let table = table_ref.read().await;
                 table.clone()
             };
-            // Pre-state file set for deriving the files this optimize adds (to
-            // warm) and removes (to evict).
-            let track_files = self.config.maintenance.timefusion_warm_after_compaction || self.config.maintenance.timefusion_evict_after_compaction;
-            let pre_uris: std::collections::HashSet<String> =
-                if track_files { table_clone.get_file_uris().map(|it| it.collect()).unwrap_or_default() } else { Default::default() };
             if attempt == 0 {
                 info!(table_name, project_id, date = %today, target_size, max_concurrent_tasks = self.config.maintenance.timefusion_optimize_max_concurrent_tasks, event = "light_optimize_started");
             } else {
@@ -6072,7 +6601,7 @@ impl Database {
                 // the optimize-internal Parquet read uses `schema_force_view_types=true`
                 // (delta-rs's default), it returns BinaryView and the rewrite blows up
                 // mid-scan with "Expected ... Binary, got ... BinaryView".
-                .with_session_state(Arc::new(build_optimize_session_state(self.config.memory.timefusion_query_partitions, self.light_optimize_runtime_env())))
+                .with_session_state(Arc::new(self.light_optimize_session_state()))
                 .await;
             match optimize_result {
                 Ok((new_table, metrics)) => {
@@ -6098,7 +6627,7 @@ impl Database {
                     // Swap the optimized table in and refresh the cache (warm
                     // freshly-compacted files, evict the small files just
                     // tombstoned) via the shared helper.
-                    self.swap_and_refresh_cache(table_ref, new_table, &pre_uris).await;
+                    self.swap_and_refresh_cache(table_ref, new_table, pre_uris.as_ref(), &scope).await;
                     return Ok(());
                 }
                 Err(e) => {
@@ -8563,13 +9092,20 @@ mod tests {
         std::fs::write(&keep_file, b"keep").unwrap();
 
         assert_eq!(dir_size_bytes(&orphan), 2048);
-        reap_orphaned_spill_dirs_blocking(dir.path());
+        let orphans: Vec<_> =
+            std::fs::read_dir(dir.path()).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("datafusion-")).map(|e| e.path()).collect();
+        // A dir created AFTER the snapshot (a live DiskManager's) must survive —
+        // deleting it mid-sort was the 2026-07-29 light-optimize ENOENT failure.
+        let live = dir.path().join("datafusion-LiVe01");
+        std::fs::create_dir_all(&live).unwrap();
+        reap_orphaned_spill_dirs_blocking(dir.path(), orphans);
 
         assert!(!orphan.exists(), "orphaned spill dir survived");
+        assert!(live.exists(), "reaper deleted a live (post-snapshot) spill dir");
         assert!(keep_dir.exists() && keep_file.exists(), "reaper touched unrelated entries");
         // Idempotent / tolerant of an empty or absent dir.
-        reap_orphaned_spill_dirs_blocking(dir.path());
-        reap_orphaned_spill_dirs_blocking(&dir.path().join("does-not-exist"));
+        reap_orphaned_spill_dirs_blocking(dir.path(), vec![]);
+        reap_orphaned_spill_dirs_blocking(&dir.path().join("does-not-exist"), vec![]);
     }
 
     /// On the unified table every default project commits to ONE Delta log, so
@@ -8646,6 +9182,112 @@ mod tests {
         assert_eq!(max[0], Some(WalPosition { block_id: 6, offset: 0 }));
         assert_eq!(max[1], Some(WalPosition { block_id: 5, offset: 50 }));
         assert_eq!(max[2], None, "shard 2 unwritten by all commits stays None");
+    }
+
+    /// C3 crash-recovery invariant: ONE coalesced commit carries every included
+    /// project's watermark, and on replay each project resumes from ITS OWN
+    /// position. No project may inherit, skip, or lose a position because a
+    /// co-tenant's watermark rode the same commit — positions are per-topic
+    /// walrus offsets and are not comparable across topics (applying a busy
+    /// tenant's offset to a quiet one skips unreplayed entries = acked-write
+    /// loss on every boot).
+    #[test]
+    fn coalesced_commit_resumes_each_project_from_its_own_watermark() {
+        use walrus_rust::WalPosition;
+        let t = "otel_logs_and_spans";
+        let a = vec![Some(WalPosition { block_id: 900, offset: 10 }), None];
+        let b = vec![None, Some(WalPosition { block_id: 4, offset: 7 })];
+        let c = vec![Some(WalPosition { block_id: 1, offset: 1 }), Some(WalPosition { block_id: 2, offset: 2 })];
+        let json = serialize_watermarks_to_json([
+            ("proj_a".to_string(), t.to_string(), a.clone()),
+            ("proj_b".to_string(), t.to_string(), b.clone()),
+            ("proj_c".to_string(), t.to_string(), c.clone()),
+        ]);
+        let mut info = std::collections::HashMap::new();
+        info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
+
+        assert_eq!(parse_watermark_from_json(&info, 2, "proj_a", t), a, "proj_a must resume from its own position");
+        assert_eq!(parse_watermark_from_json(&info, 2, "proj_b", t), b, "proj_b must resume from its own position");
+        assert_eq!(parse_watermark_from_json(&info, 2, "proj_c", t), c, "proj_c must resume from its own position");
+        // A project that was NOT in the commit gets nothing — never a co-tenant's
+        // (far ahead) position.
+        assert_eq!(parse_watermark_from_json(&info, 2, "proj_d", t), vec![None, None]);
+        // Same project, different table is a different topic.
+        assert_eq!(parse_watermark_from_json(&info, 2, "proj_a", "otel_metrics"), vec![None, None]);
+        // And the per-shard MAX across a coalesced + a per-project commit still
+        // resolves per project (boot-time cursor derivation).
+        let mut solo = std::collections::HashMap::new();
+        solo.insert(
+            WAL_WATERMARK_KEY.to_string(),
+            serde_json::Value::Object(serialize_watermark_to_json(&vec![Some(WalPosition { block_id: 901, offset: 0 }), None], "proj_a", t)),
+        );
+        let max = max_watermark_across_commits([&info, &solo], 2, "proj_a", t);
+        assert_eq!(max, vec![Some(WalPosition { block_id: 901, offset: 0 }), None]);
+        assert_eq!(max_watermark_across_commits([&info, &solo], 2, "proj_b", t), b, "proj_b unaffected by proj_a's later solo commit");
+    }
+
+    /// A one-project "coalesced" commit must serialize to the EXACT legacy flat
+    /// shape — the non-coalesced path and any older binary reading these commits
+    /// must see no format change at all.
+    #[test]
+    fn single_project_coalesced_watermark_keeps_legacy_shape() {
+        use walrus_rust::WalPosition;
+        let wm = vec![Some(WalPosition { block_id: 3, offset: 4 }), None];
+        assert_eq!(
+            serialize_watermarks_to_json([("p".to_string(), "t".to_string(), wm.clone())]),
+            serialize_watermark_to_json(&wm, "p", "t"),
+            "single-topic coalesced commits must keep the flat legacy shape byte-for-byte"
+        );
+        // All-None topics drop out entirely; a commit with nothing to say writes
+        // no metadata (recovery silently skips it).
+        assert!(serialize_watermarks_to_json([("p".to_string(), "t".to_string(), vec![None, None])]).is_empty());
+        // Two topics where only one has positions collapses to the flat form.
+        let one = serialize_watermarks_to_json([("p".to_string(), "t".to_string(), wm.clone()), ("q".to_string(), "t".to_string(), vec![None, None])]);
+        assert_eq!(one, serialize_watermark_to_json(&wm, "p", "t"));
+    }
+
+    /// Two units for the SAME topic in one commit (should not happen — the flush
+    /// layer coalesces per (project, table) first — but must never silently drop
+    /// one): the survivor takes the per-shard MAX, so it can never sit BEHIND a
+    /// contributor's rows that this commit made durable.
+    #[test]
+    fn duplicate_topic_in_one_commit_takes_per_shard_max() {
+        use walrus_rust::WalPosition;
+        let json = serialize_watermarks_to_json([
+            ("p".to_string(), "t".to_string(), vec![Some(WalPosition { block_id: 5, offset: 100 }), Some(WalPosition { block_id: 1, offset: 0 })]),
+            ("p".to_string(), "t".to_string(), vec![Some(WalPosition { block_id: 5, offset: 40 }), Some(WalPosition { block_id: 9, offset: 0 })]),
+            ("q".to_string(), "t".to_string(), vec![Some(WalPosition { block_id: 2, offset: 0 })]),
+        ]);
+        let mut info = std::collections::HashMap::new();
+        info.insert(WAL_WATERMARK_KEY.to_string(), serde_json::Value::Object(json));
+        assert_eq!(
+            parse_watermark_from_json(&info, 2, "p", "t"),
+            vec![Some(WalPosition { block_id: 5, offset: 100 }), Some(WalPosition { block_id: 9, offset: 0 })]
+        );
+    }
+
+    /// Files are written under `project_id=<id>/`, so the path IS the per-project
+    /// attribution for a commit that spanned projects — the tantivy sidecar and
+    /// cache warming keep receiving only their own project's files. A
+    /// single-project group returns the whole list unfiltered (identical to the
+    /// per-project commit path).
+    #[test]
+    fn added_files_attribute_to_their_own_project() {
+        let added = vec![
+            "s3://b/t/project_id=alpha/date=2026-07-29/a.parquet".to_string(),
+            "s3://b/t/project_id=beta/date=2026-07-29/b.parquet".to_string(),
+            "s3://b/t/project_id=alpha/date=2026-07-29/c.parquet".to_string(),
+        ];
+        let split = attribute_added_files(added.clone(), &["alpha", "beta", "gamma"]);
+        assert_eq!(split[0], vec![added[0].clone(), added[2].clone()]);
+        assert_eq!(split[1], vec![added[1].clone()]);
+        assert!(split[2].is_empty(), "a project that added no files gets none of its co-tenants'");
+        // Single project → unfiltered, byte-for-byte the per-project behaviour
+        // (works even for tables/layouts without a project_id partition segment).
+        assert_eq!(
+            attribute_added_files(vec!["s3://b/t/date=2026-07-29/x.parquet".to_string()], &["alpha"]),
+            vec![vec!["s3://b/t/date=2026-07-29/x.parquet".to_string()]]
+        );
     }
 
     /// Out-of-range shard indices in the JSON (e.g. a writer with more shards
@@ -9012,6 +9654,37 @@ mod tests {
         Ok(())
     }
 
+    /// `scoped_file_uris` replaces `get_file_uris()` in every warm/evict diff,
+    /// so the load-bearing invariant is that it produces the SAME URIs — an
+    /// off-by-one in the `Path::parse`/`to_uri` reconstruction would silently
+    /// make every file look both added and removed (mass re-warm + wrong
+    /// evictions). Also pins the scoping: partition markers must select exactly
+    /// the matching files, and a non-matching marker must select none.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scoped_file_uris_matches_get_file_uris_and_filters_by_partition() -> Result<()> {
+        let (db, _ctx, prefix) = setup_test_database().await?;
+        let (p1, p2) = (format!("sfu_a_{prefix}"), format!("sfu_b_{prefix}"));
+        for pid in [&p1, &p2] {
+            let batch = json_to_batch(vec![test_span("sfu1", "span", pid)])?;
+            db.insert_records_batch(pid, "otel_logs_and_spans", vec![batch], true, None).await?;
+        }
+        let table_ref = get_unified_delta_table(db.unified_tables(), "otel_logs_and_spans").await.expect("table created");
+        let table = table_ref.read().await;
+
+        let expected: Vec<String> = table.get_file_uris()?.collect();
+        assert!(!expected.is_empty(), "expected active files");
+        assert_eq!(scoped_file_uris(&table, &[]), expected, "unscoped walk must be byte-identical to get_file_uris()");
+
+        let marker = format!("project_id={p1}/");
+        let scoped = scoped_file_uris(&table, &[marker.as_str()]);
+        assert!(!scoped.is_empty() && scoped.len() < expected.len(), "scope must select a proper non-empty subset");
+        assert!(scoped.iter().all(|u| u.contains(&marker)), "every scoped URI is in the scoped partition");
+        assert_eq!(scoped, expected.iter().filter(|u| u.contains(&marker)).cloned().collect::<Vec<_>>(), "scoped walk must equal the filtered full walk");
+        assert!(scoped_file_uris(&table, &["project_id=no_such_project"]).is_empty(), "a non-matching scope selects nothing");
+        Ok(())
+    }
+
     /// End-to-end test of `recompress_partition`. Skip behavior is the
     /// load-bearing property: if the footer-tier probe breaks, the daily
     /// cron rewrites every partition every night. We assert via file-set
@@ -9165,6 +9838,181 @@ mod tests {
         Ok(())
     }
 
+    /// C3 — cross-project flush commit coalescing, end to end.
+    ///
+    /// One tick's units for N default-storage projects must produce EXACTLY ONE
+    /// Delta commit (they all share one physical `_delta_log`, and
+    /// `table_lock_key` already serialized them behind one mutex), carrying every
+    /// project's files and every project's watermark. Each project's result must
+    /// list only its own files (path-attributed) so the tantivy sidecar keeps
+    /// indexing per project, and every project's rows must be queryable from that
+    /// same commit.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalesced_commit_spans_projects_in_one_delta_version() -> Result<()> {
+        use walrus_rust::WalPosition;
+        let (db, _ctx, prefix) = setup_test_database().await?;
+        let t = "otel_logs_and_spans";
+        let projects: Vec<String> = (0..3).map(|i| format!("coal{i}-{prefix}")).collect();
+
+        // Create the table first, so the version delta below measures the
+        // coalesced commit alone rather than the table-create commit.
+        db.insert_records_batch(&projects[0], t, vec![json_to_batch(vec![test_span("warm", "warm", &projects[0])])?], true, None).await?;
+        let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
+        let before = table_ref.read().await.version().unwrap_or(0);
+
+        let units: Vec<CoalescedWriteUnit> = projects
+            .iter()
+            .enumerate()
+            .map(|(i, p)| CoalescedWriteUnit {
+                project_id: p.clone(),
+                table_name: t.to_string(),
+                batches: vec![json_to_batch(vec![test_span(&format!("c{i}"), "span", p)]).unwrap()],
+                watermark: vec![Some(WalPosition { block_id: 100 + i as u64, offset: i as u64 })],
+            })
+            .collect();
+        let results = db.insert_records_batches_coalesced(units).await;
+
+        assert_eq!(results.len(), projects.len(), "one result per unit, in input order");
+        let added: Vec<Vec<String>> = results.into_iter().map(|r| r.expect("coalesced commit failed")).collect();
+
+        // ONE commit for all three projects — the whole point of C3.
+        let after = table_ref.read().await.version().unwrap_or(0);
+        assert_eq!(after, before + 1, "N default-storage projects must land in ONE Delta commit, got {} commits", after - before);
+
+        // Every project's files are in that commit, attributed to its own
+        // partition path (tantivy/warming inputs stay per project).
+        for (i, project) in projects.iter().enumerate() {
+            assert!(!added[i].is_empty(), "project {project} contributed no files to the coalesced commit");
+            assert!(added[i].iter().all(|u| u.contains(&format!("project_id={project}/"))), "project {project} was handed a co-tenant's files: {:?}", added[i]);
+        }
+
+        // The single commit carries EVERY project's watermark, and each project
+        // derives its own resume position from it (crash-recovery invariant).
+        let history: Vec<_> = table_ref.read().await.history(Some(1)).await?.collect();
+        assert_eq!(history.len(), 1);
+        let shards = 8;
+        for (i, project) in projects.iter().enumerate() {
+            let parsed = parse_watermark_from_json(&history[0].info, shards, project, t);
+            assert_eq!(parsed[0], Some(WalPosition { block_id: 100 + i as u64, offset: i as u64 }), "project {project} lost/mixed up its watermark");
+        }
+        // A project not in the commit inherits nothing.
+        assert!(parse_watermark_from_json(&history[0].info, shards, "outsider", t).iter().all(Option::is_none));
+
+        // All rows are readable from the shared commit.
+        let files = table_ref.read().await.get_file_uris().map(|it| it.collect::<Vec<_>>()).unwrap_or_default();
+        for project in &projects {
+            assert!(files.iter().any(|u| u.contains(&format!("project_id={project}/"))), "project {project} has no active file after the coalesced commit");
+        }
+        Ok(())
+    }
+
+    /// C3 requirement 5: if ONE project's batches need a schema merge, it must be
+    /// split OUT of the coalesced group and committed on its own (locked
+    /// WriteBuilder merge path) rather than dragging every co-tenant through the
+    /// slow path. Two default projects + one evolving project ⇒ exactly TWO
+    /// commits: one shared, one solo — and all three succeed.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn schema_evolution_project_splits_out_of_the_coalesced_group() -> Result<()> {
+        use datafusion::arrow::{
+            array::{Array, StringArray},
+            datatypes::{DataType, Field, Schema},
+        };
+        use walrus_rust::WalPosition;
+        let (db, _ctx, prefix) = setup_test_database().await?;
+        let t = "otel_logs_and_spans";
+        let (p1, p2, evolving) = (format!("se1-{prefix}"), format!("se2-{prefix}"), format!("se3-{prefix}"));
+
+        db.insert_records_batch(&p1, t, vec![json_to_batch(vec![test_span("warm", "warm", &p1)])?], true, None).await?;
+        let table_ref = get_unified_delta_table(db.unified_tables(), t).await.expect("table created");
+        let before = table_ref.read().await.version().unwrap_or(0);
+
+        // A batch carrying a column the table schema lacks — delta-rs' Default-mode
+        // RecordBatchWriter can't evolve schema on a partitioned table, so this
+        // unit has no staged writer and must take the solo merge path.
+        let base = json_to_batch(vec![test_span("e1", "span", &evolving)])?;
+        let mut fields: Vec<Field> = base.schema().fields().iter().map(|f| f.as_ref().clone()).collect();
+        fields.push(Field::new("c3_brand_new_column", DataType::Utf8, true));
+        let mut columns: Vec<Arc<dyn Array>> = base.columns().to_vec();
+        columns.push(Arc::new(StringArray::from(vec![Some("evolved")])));
+        let evolved_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)?;
+
+        let units = vec![
+            CoalescedWriteUnit {
+                project_id: p1.clone(),
+                table_name: t.to_string(),
+                batches: vec![json_to_batch(vec![test_span("s1", "span", &p1)])?],
+                watermark: vec![Some(WalPosition { block_id: 1, offset: 0 })],
+            },
+            CoalescedWriteUnit {
+                project_id: evolving.clone(),
+                table_name: t.to_string(),
+                batches: vec![evolved_batch],
+                watermark: vec![Some(WalPosition { block_id: 2, offset: 0 })],
+            },
+            CoalescedWriteUnit {
+                project_id: p2.clone(),
+                table_name: t.to_string(),
+                batches: vec![json_to_batch(vec![test_span("s2", "span", &p2)])?],
+                watermark: vec![Some(WalPosition { block_id: 3, offset: 0 })],
+            },
+        ];
+        let results = db.insert_records_batches_coalesced(units).await;
+        for (i, r) in results.iter().enumerate() {
+            assert!(r.is_ok(), "unit {i} failed: {:?}", r.as_ref().err());
+        }
+        // Results stay in INPUT order even though the evolving unit committed last.
+        assert!(results[0].as_ref().unwrap().iter().all(|u| u.contains(&format!("project_id={p1}/"))));
+        assert!(results[1].as_ref().unwrap().iter().all(|u| u.contains(&format!("project_id={evolving}/"))));
+        assert!(results[2].as_ref().unwrap().iter().all(|u| u.contains(&format!("project_id={p2}/"))));
+
+        // Two commits: the shared one for p1+p2, plus the evolving project's solo
+        // merge commit. Three would mean no coalescing; one would mean the merge
+        // path swallowed the co-tenants.
+        let after = get_unified_delta_table(db.unified_tables(), t).await.expect("table").read().await.version().unwrap_or(0);
+        assert_eq!(after, before + 2, "expected 1 coalesced + 1 solo schema-evolution commit");
+
+        // The evolution actually applied.
+        let table = get_unified_delta_table(db.unified_tables(), t).await.expect("table");
+        let guard = table.read().await;
+        let delta_schema = guard.snapshot()?.schema();
+        assert!(delta_schema.fields().any(|f| f.name() == "c3_brand_new_column"), "schema merge never landed");
+        Ok(())
+    }
+
+    /// A custom-storage project has its OWN `_delta_log` and must never be
+    /// coalesced into the shared unified-table commit. The grouping key IS
+    /// `table_lock_key`, so isolation is structural: same key ⇒ same physical
+    /// log ⇒ safe to share a commit; different key ⇒ separate commit.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn custom_storage_project_is_not_coalesced_with_default_storage() -> Result<()> {
+        let (db, _ctx, prefix) = setup_test_database().await?;
+        let t = "otel_logs_and_spans";
+        let custom = format!("cust-{prefix}");
+        db.storage_configs.write().await.insert(
+            (custom.clone(), t.to_string()),
+            StorageConfig {
+                project_id: custom.clone(),
+                table_name: t.to_string(),
+                s3_bucket: "timefusion-tests".to_string(),
+                s3_prefix: format!("custom-{prefix}"),
+                s3_region: "us-east-1".to_string(),
+                s3_access_key_id: "minioadmin".to_string(),
+                s3_secret_access_key: "minioadmin".to_string(),
+                s3_endpoint: Some("http://127.0.0.1:9000".to_string()),
+            },
+        );
+
+        let (a, b) = (db.table_lock_key("proj_a", t).await, db.table_lock_key("proj_b", t).await);
+        assert_eq!(a, b, "default-storage projects share a physical log → one coalesced commit");
+        assert_ne!(db.table_lock_key(&custom, t).await, a, "custom-storage project must group (and commit) separately");
+        // Same project on a different table is also a different physical log.
+        assert_ne!(db.table_lock_key("proj_a", "otel_metrics").await, a);
+        Ok(())
+    }
+
     /// Provider cache invalidation on snapshot version change.
     ///
     /// The cache keyed on `(project, table) → (version, Arc<OnceCell<Provider>>)`
@@ -9251,6 +10099,58 @@ mod tests {
         })
         .await
         .map_err(|_| anyhow::anyhow!("Test timed out after 30 seconds"))?
+    }
+
+    /// C3 end-to-end through the real stack (bootstrap → WAL → MemBuffer →
+    /// coalescing flush → Delta → SQL). With the flag on, two projects' rows
+    /// flushed in the same tick land in ONE Delta commit and both are queryable
+    /// immediately afterwards — same tick, same visibility as before coalescing.
+    #[serial]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn coalesced_flush_e2e_keeps_every_project_queryable() -> Result<()> {
+        // SAFETY: walrus reads WALRUS_DATA_DIR from process env; #[serial] protects it.
+        let prefix = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let mut cfg = (*create_test_config(&prefix)).clone();
+        cfg.buffer.timefusion_flush_coalesce_commits = true;
+        let cfg = Arc::new(cfg);
+        unsafe { std::env::set_var("WALRUS_DATA_DIR", cfg.core.wal_dir()) };
+        tokio::time::timeout(std::time::Duration::from_secs(50), async {
+            let b = crate::bootstrap::bootstrap(Arc::clone(&cfg)).await?;
+            let t = "otel_logs_and_spans";
+            let projects: Vec<String> = (0..3).map(|i| format!("e2e{i}_{prefix}")).collect();
+
+            // Create the Delta table first so the version delta measures only
+            // the coalesced flush commit.
+            b.db.insert_records_batch(&projects[0], t, vec![json_to_batch(vec![test_span("warm", "warm", &projects[0])])?], true, None).await?;
+            let table_ref = get_unified_delta_table(b.db.unified_tables(), t).await.expect("table created");
+            let before = table_ref.read().await.version().unwrap_or(0);
+
+            // skip_queue=false → WAL + MemBuffer, so the flush tick owns these rows.
+            for (i, project) in projects.iter().enumerate() {
+                let batch = json_to_batch(vec![test_span(&format!("row{i}"), "span", project)])?;
+                b.db.insert_records_batch(project, t, vec![batch], false, None).await?;
+            }
+            let stats = b.buffered_layer.flush_all_now().await?;
+            assert_eq!(stats.buckets_failed, 0, "coalesced e2e flush failed");
+            assert_eq!(stats.buckets_flushed, projects.len() as u64);
+
+            let after = get_unified_delta_table(b.db.unified_tables(), t).await.expect("table").read().await.version().unwrap_or(0);
+            assert_eq!(after, before + 1, "three projects flushed in one tick must produce ONE Delta commit");
+
+            use datafusion::arrow::array::AsArray;
+            for project in &projects {
+                let sql = format!("SELECT COUNT(*) FROM otel_logs_and_spans WHERE project_id = '{project}'");
+                let r = b.session_ctx.sql(&sql).await?.collect().await?;
+                let n = r[0].column(0).as_primitive::<arrow::datatypes::Int64Type>().value(0);
+                let expected = if project == &projects[0] { 2 } else { 1 }; // p0 also has its warm-up row
+                assert_eq!(n, expected, "{project} rows are not queryable after the coalesced commit");
+            }
+
+            b.shutdown.cancel();
+            Ok(())
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Test timed out after 50 seconds"))?
     }
 
     /// Regression for the pressure_flush e2e undercount (8-of-150): when

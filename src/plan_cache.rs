@@ -43,13 +43,17 @@ use datafusion::{
     sql::{parser::Statement as DfStatement, sqlparser::ast::Statement},
 };
 use datafusion_postgres::{
+    arrow_pg::encode_dataframe,
     hooks::{HookClient, QueryHook},
     pgwire::{
         api::{
             ClientInfo,
+            portal::Format,
             results::{Response, Tag},
         },
-        error::{PgWireError, PgWireResult},
+        error::{ErrorInfo, PgWireError, PgWireResult},
+        messages::response::TransactionStatus,
+        types::format::FormatOptions,
     },
 };
 use tracing::{debug, warn};
@@ -687,7 +691,14 @@ impl PlanCacheHook {
     /// placeholders on every execute, so the window never freezes, even for a
     /// reused (named) prepared statement whose parse hook runs only once.
     async fn try_mixed_time_fn_plan(&self, statement: &Statement, canonical: &str, session_context: &SessionContext) -> Option<LogicalPlan> {
+        // `has_placeholder` is a TEXT scan, so a string literal containing `$1`
+        // routes here even though the AST has no real bind. The template would
+        // then be returned with an unsubstituted `$1` ("no value for placeholder
+        // $1" — and cached). Bail to normal planning when the AST disagrees.
         let base = max_placeholder_index(statement);
+        if base == 0 {
+            return None;
+        }
         let (param_stmt, _) = parameterize_statement(statement, base, false)?;
         let shape_key = param_stmt.to_string();
         let plan = self.get_or_build_shape(&shape_key, param_stmt, 0, session_context).await?.plan;
@@ -710,59 +721,10 @@ impl PlanCacheHook {
     /// placeholder, the canonical text contains literal values (timestamps,
     /// UUIDs, etc.) which would never recur — caching that just pollutes the
     /// LRU and increases lock contention.
-    fn has_placeholder(sql: &str) -> bool {
-        // Naive `contains('$')` would false-positive on dollar-quoted literals
-        // like '$100' and cache statements with embedded literal values.
-        sql.as_bytes().windows(2).any(|w| w[0] == b'$' && w[1].is_ascii_digit())
-    }
-}
-
-#[async_trait]
-impl QueryHook for PlanCacheHook {
-    /// Deliberately a no-op for simple queries. The cache only fires on the
-    /// extended-query path (parameterised SQL with `$N` placeholders); ad-hoc
-    /// `psql` simple queries get one-shot literals so caching them by
-    /// canonical text would never produce a hit. The vendored
-    /// datafusion-postgres `SimpleQueryHandler::do_query` still runs
-    /// `state.optimize()` per call because `was_pre_optimized` returns false
-    /// for canonical SQL not present in our cache — see the optimize-skip patch
-    /// on apitoolkit/datafusion-postgres@timefusion-df54.
-    async fn handle_simple_query(
-        &self, _statement: &Statement, _session_context: &SessionContext, _client: &mut dyn HookClient,
-    ) -> Option<PgWireResult<Response>> {
-        None
-    }
-
-    /// Trailing placeholders the mixed path injects — the Parse/Describe path
-    /// hides these from the client's ParameterDescription. Equals the number of
-    /// values `extra_execute_params` appends for the same statement.
-    fn injected_param_count(&self, statement: &Statement) -> usize {
-        self.extra_execute_params(statement).len()
-    }
-
-    /// Fresh instant(s) for the time-fn placeholders the mixed now()+`$N` path
-    /// injected at parse (numbered above the client's binds). Appended to the
-    /// client's params before substitution, so `now()` is re-evaluated on every
-    /// execute. Empty for the pure path (M=0, substituted at parse) and for any
-    /// statement we didn't shape-cache — surplus is ignored by the executor.
-    fn extra_execute_params(&self, statement: &Statement) -> Vec<ScalarValue> {
-        if !self.time_fn_shapes
-            || !matches!(statement, Statement::Query(_))
-            || contains_unparameterizable_time_fn(statement)
-            || !stmt_uses_fn(statement, PARAMETERIZABLE_TIME_FNS)
-        {
-            return Vec::new();
-        }
-        let base = max_placeholder_index(statement);
-        if base == 0 {
-            return Vec::new(); // pure path substitutes at parse
-        }
-        parameterize_statement(statement, base, false).map_or(Vec::new(), |(_, values)| values)
-    }
-
-    async fn handle_extended_parse_query(
-        &self, statement: &Statement, session_context: &SessionContext, _client: &(dyn ClientInfo + Send + Sync),
-    ) -> Option<PgWireResult<LogicalPlan>> {
+    /// The cached-plan lookup shared by BOTH protocol paths: cheap AST-kind
+    /// gate, the time-fn guards, then the shape / verbatim caches. `None` =
+    /// not cacheable, caller falls back to the normal parse→optimize pipeline.
+    async fn cached_plan(&self, statement: &Statement, session_context: &SessionContext) -> Option<PgWireResult<LogicalPlan>> {
         // Cheap AST-variant check first; only then pay for to_string() and
         // the placeholder scan.
         if !Self::kind_is_cacheable(statement) {
@@ -845,9 +807,6 @@ impl QueryHook for PlanCacheHook {
         // `retain`; the rest skip and re-insert as if the cap hadn't
         // been crossed yet (their entries will be evicted by the next
         // sweep). Cheap single-atomic and converges the stampede.
-        // AtomicBool gate so only one sweep runs per overflow crossing.
-        // Cheap (one atomic) and converts the multi-thread retain
-        // stampede into a single sweep + a cohort of fast-path skips.
         // `cache.retain` with this closure can't panic, so the guard can
         // be a flat `.store(false)` at the end of the block rather than
         // a Drop-based scopeguard.
@@ -891,6 +850,100 @@ impl QueryHook for PlanCacheHook {
         }
         self.cache.insert(canonical, plan.clone());
         Some(Ok(plan))
+    }
+
+    fn has_placeholder(sql: &str) -> bool {
+        // Naive `contains('$')` would false-positive on dollar-quoted literals
+        // like '$100' and cache statements with embedded literal values.
+        sql.as_bytes().windows(2).any(|w| w[0] == b'$' && w[1].is_ascii_digit())
+    }
+}
+
+#[async_trait]
+impl QueryHook for PlanCacheHook {
+    /// Serve simple-protocol queries from the same caches the extended path
+    /// uses. `psql`/ad-hoc SQL arrives with literals inline, so the *shape*
+    /// cache is what fires here (literal-insensitive template + per-query
+    /// re-binding of the lifted literals) — a verbatim hit only happens for
+    /// repeated identical text. Everything the extended path bypasses
+    /// (unparameterizable time fns, non-DML kinds, unparameterizable ASTs)
+    /// still bypasses: `cached_plan` returning `None` falls through to the
+    /// vendored `session_context.sql()` path unchanged.
+    async fn handle_simple_query(
+        &self, statement: &Statement, session_context: &SessionContext, client: &mut dyn HookClient,
+    ) -> Option<PgWireResult<Response>> {
+        // The TransactionStatementHook runs AFTER us and is what rejects
+        // statements inside a failed transaction block; answering here would
+        // silently execute them. Defer to it.
+        if client.transaction_status() == TransactionStatus::Error {
+            return None;
+        }
+        // On a plan-build error, fall through rather than surfacing it: the
+        // vendored path will produce the same error with its own context.
+        let plan = self.cached_plan(statement, session_context).await?.ok()?;
+        // Mirror the vendored do_query: the statement timeout covers planning
+        // + DataFrame construction, and rows are encoded in unified text.
+        let timeout = client.metadata().get("statement_timeout_ms").and_then(|s| s.parse::<u64>().ok()).map(std::time::Duration::from_millis);
+        let exec = session_context.execute_logical_plan(plan);
+        let df = match timeout {
+            Some(d) => match tokio::time::timeout(d, exec).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return Some(Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "57014".to_string(),
+                        "canceling statement due to statement timeout".to_string(),
+                    )))));
+                }
+            },
+            None => exec.await,
+        };
+        let df = match df {
+            Ok(df) => df,
+            Err(e) => return Some(Err(PgWireError::ApiError(Box::new(e)))),
+        };
+        if matches!(df.logical_plan(), LogicalPlan::Dml(_)) {
+            return Some(match dml_completion(df).await {
+                Ok(Some(resp)) => Ok(resp),
+                Ok(None) => Err(PgWireError::ApiError("internal error: DML plan returned non-DML completion".to_string().into())),
+                Err(e) => Err(e),
+            });
+        }
+        let format_options = Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+        Some(encode_dataframe(df, &Format::UnifiedText, Some(format_options)).await.map(Response::Query))
+    }
+
+    /// Trailing placeholders the mixed path injects — the Parse/Describe path
+    /// hides these from the client's ParameterDescription. Equals the number of
+    /// values `extra_execute_params` appends for the same statement.
+    fn injected_param_count(&self, statement: &Statement) -> usize {
+        self.extra_execute_params(statement).len()
+    }
+
+    /// Fresh instant(s) for the time-fn placeholders the mixed now()+`$N` path
+    /// injected at parse (numbered above the client's binds). Appended to the
+    /// client's params before substitution, so `now()` is re-evaluated on every
+    /// execute. Empty for the pure path (M=0, substituted at parse) and for any
+    /// statement we didn't shape-cache — surplus is ignored by the executor.
+    fn extra_execute_params(&self, statement: &Statement) -> Vec<ScalarValue> {
+        if !self.time_fn_shapes
+            || !matches!(statement, Statement::Query(_))
+            || contains_unparameterizable_time_fn(statement)
+            || !stmt_uses_fn(statement, PARAMETERIZABLE_TIME_FNS)
+        {
+            return Vec::new();
+        }
+        let base = max_placeholder_index(statement);
+        if base == 0 {
+            return Vec::new(); // pure path substitutes at parse
+        }
+        parameterize_statement(statement, base, false).map_or(Vec::new(), |(_, values)| values)
+    }
+
+    async fn handle_extended_parse_query(
+        &self, statement: &Statement, session_context: &SessionContext, _client: &(dyn ClientInfo + Send + Sync),
+    ) -> Option<PgWireResult<LogicalPlan>> {
+        self.cached_plan(statement, session_context).await
     }
 
     async fn handle_extended_query(
@@ -1113,5 +1166,64 @@ mod tests {
         // Date/Time-returning fns must NOT take the shape path (type risk).
         assert!(contains_unparameterizable_time_fn(&parse("SELECT id FROM t WHERE d = current_date")));
         assert!(!contains_unparameterizable_time_fn(&parse("SELECT id FROM t WHERE ts > now()")));
+    }
+
+    /// SessionContext with one in-memory table, enough to plan the SELECTs the
+    /// simple-query path exercises.
+    fn test_ctx() -> SessionContext {
+        use datafusion::{
+            arrow::datatypes::{DataType, Field},
+            datasource::MemTable,
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true), Field::new("project_id", DataType::Utf8, true)]));
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(MemTable::try_new(schema.clone(), vec![vec![]]).unwrap())).unwrap();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn simple_query_path_caches_by_shape_and_bypasses_date_fns() {
+        let hook = PlanCacheHook::new(64, true);
+        let ctx = test_ctx();
+        let plan_for = async |sql: &str| hook.cached_plan(&parse(sql), &ctx).await.map(|r| r.expect("plan"));
+
+        // 1st and 2nd identical simple queries both come back cached (the shape
+        // is built once — the second is a pure hit, no new shape entry).
+        assert!(plan_for("SELECT id FROM t WHERE project_id = 'p'").await.is_some());
+        assert_eq!(hook.shape_counters(), (1, 0));
+        assert!(plan_for("SELECT id FROM t WHERE project_id = 'p'").await.is_some());
+        assert_eq!(hook.shape_counters(), (2, 0));
+        assert_eq!(hook.shapes.len(), 1, "identical query reuses the one shape");
+
+        // Same shape, different literal → still one shape entry, another hit.
+        assert!(plan_for("SELECT id FROM t WHERE project_id = 'q'").await.is_some());
+        assert_eq!(hook.shape_counters(), (3, 0));
+        assert_eq!(hook.shapes.len(), 1, "literals don't multiply shapes");
+
+        // Unparameterizable time fn keeps bypassing: no plan, no shape.
+        assert!(hook.cached_plan(&parse("SELECT current_date"), &ctx).await.is_none());
+        // Non-cacheable AST kind bypasses too.
+        assert!(hook.cached_plan(&parse("SET TIME ZONE 'UTC'"), &ctx).await.is_none());
+        assert_eq!(hook.shape_counters(), (3, 0));
+    }
+
+    /// A `'$1'` STRING LITERAL makes the text-based `has_placeholder` fire while
+    /// the AST holds no bind. Routing that into the mixed-time-fn path returned
+    /// an unsubstituted template — "no value for placeholder $1", cached. It
+    /// must plan through the pure-now() path instead.
+    #[tokio::test]
+    async fn string_literal_that_looks_like_a_placeholder_does_not_poison_the_cache() {
+        let hook = PlanCacheHook::new(64, true);
+        let ctx = test_ctx();
+        let stmt = parse("SELECT now(), '$1'");
+        for _ in 0..2 {
+            let plan = hook.cached_plan(&stmt, &ctx).await;
+            if let Some(r) = plan {
+                let plan = r.expect("planned");
+                assert!(plan.get_parameter_types().expect("param types").is_empty(), "no placeholder may survive into the served plan: {plan:?}");
+            }
+        }
+        // A real mixed now()+$N query still takes the mixed path.
+        assert!(hook.cached_plan(&parse("SELECT id, now() FROM t WHERE project_id = $1"), &ctx).await.is_some());
     }
 }

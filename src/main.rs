@@ -140,9 +140,11 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
                 // (watermark-gated) — no warm here, or every flush would issue
                 // the warm GETs twice.
                 let added = db.insert_records_batch(&project_id, &table_name, batches, true, Some(&wal_watermark)).await?;
-                if !added.is_empty() {
-                    db.mark_delta_has_files(&project_id, &table_name);
-                }
+                // Unconditional on a successful commit — the flag means "this
+                // (project, table) has Delta files", true as soon as the commit
+                // lands even if file attribution came back empty. See the
+                // coalesced callback in `bootstrap.rs` for the full rationale.
+                db.mark_delta_has_files(&project_id, &table_name);
                 Ok(added)
             })
         },
@@ -164,7 +166,9 @@ async fn async_main(cfg: &'static AppConfig) -> anyhow::Result<()> {
     timefusion::wal::boot_wal_gc(&cfg.core.wal_dir(), cfg.buffer.wal_gc_max_age());
 
     let t_layer = std::time::Instant::now();
-    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?.with_delta_writer(delta_write_callback);
+    let mut layer = BufferedWriteLayer::with_config(cfg_arc.clone(), registry)?
+        .with_delta_writer(delta_write_callback)
+        .with_coalesced_delta_writer(timefusion::bootstrap::coalesced_delta_write_callback(&db));
     info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
     let mut tantivy_svc_for_metrics: Option<Arc<timefusion::tantivy_index::service::TantivyIndexService>> = None;
     let indexed_tables = cfg.tantivy.indexed_tables();
@@ -470,6 +474,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut older_than_hours: u64 = 48;
     let mut all = false;
     let mut dry_run = false;
+    let mut project: Option<String> = None;
     let mut it = std::env::args().skip(2);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -480,8 +485,9 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
             }
             "--all" => all = true,
             "--dry-run" => dry_run = true,
+            "--project" => project = Some(it.next().context("--project needs a value")?),
             other => anyhow::bail!(
-                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--dry-run])"
+                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--dry-run])"
             ),
         }
     }
@@ -501,15 +507,16 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
         (Some(d), _) => format!("date={d}"),
         (None, true) => "all dates".to_string(),
         (None, false) => format!("older than {older_than_hours}h"),
-    };
+    } + &project.as_deref().map_or(String::new(), |p| format!(", project_id={p}"));
 
     // --dry-run: list candidate partitions + file counts, mutate nothing.
     if dry_run {
         let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
         println!("DRY RUN — {} candidate partition(s) of '{}' ({}):", dates.len(), table, scope);
         let mut total = 0usize;
+        let pid_frag = project.as_deref().map_or(String::new(), |p| format!("project_id={p}/"));
         for d in &dates {
-            let n = uris.iter().filter(|u| u.contains(&format!("date={d}"))).count();
+            let n = uris.iter().filter(|u| u.contains(&pid_frag) && u.contains(&format!("date={d}"))).count();
             total += n;
             println!("  date={d}: {n} files");
         }
@@ -521,7 +528,7 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     println!("compacting {} partition(s) of '{}' ({})", dates.len(), table, scope);
     let (mut tot_r, mut tot_a) = (0u64, 0u64);
     for d in &dates {
-        match db.compact_date(&table_ref, &table, *d, None).await {
+        match db.compact_date(&table_ref, &table, *d, project.as_deref()).await {
             Ok((r, a)) => {
                 tot_r += r;
                 tot_a += a;

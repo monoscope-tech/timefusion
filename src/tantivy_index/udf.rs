@@ -28,10 +28,15 @@ pub const TEXT_MATCH_NAME: &str = "text_match";
 pub const NGRAM_MIN_QUERY_LEN: usize = 3;
 
 /// Conservative: only allow alnum, dot, dash, underscore, slash, `@`, and
-/// space. Colon is deliberately *excluded* — Tantivy QueryParser treats it as
-/// field-delimiter syntax, and many other ASCII punctuation chars are query
-/// syntax; outside this allowlist we leave the predicate alone (the original
+/// space. Outside this allowlist we leave the predicate alone (the original
 /// `=` / `LIKE` still applies — correctness preserved).
+///
+/// The reader no longer feeds routed literals to tantivy's `QueryParser`
+/// except for `*`-suffixed prefix queries on raw/default fields (see
+/// `reader::analyzed_conjunction_query`), so the allowlist is now about
+/// keeping ROUTING conservative rather than about parser safety — a char the
+/// analyzer treats unexpectedly would still only ever narrow the prefilter.
+/// Colon stays excluded for the remaining parser path (field-delimiter syntax).
 pub fn is_tantivy_safe_term_char(c: char) -> bool {
     c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ' | '/' | '@')
 }
@@ -121,6 +126,48 @@ pub fn classify_like_pattern(pat: &str, escape: Option<char>, allow_substring: b
         (true, false) | (true, true) if !allow_substring => return None,
         (true, _) => out, // ngram3 will trigram-match the substring
     })
+}
+
+/// POSIX-regex metacharacters. A pattern containing any of these *unescaped*
+/// is not a plain substring and is never routed. Deliberately the same set
+/// monoscope's `escapeRegex` escapes (`Pkg/DeriveUtils.hs`), so a KQL
+/// has/contains term round-trips exactly; anything else bails.
+const REGEX_META: &str = ".^$*+?()[]{}|\\";
+
+/// Decode a `~` / `~*` pattern that is a PLAIN LITERAL SUBSTRING into that
+/// substring, or `None` when the pattern uses any regex feature.
+///
+/// `\X` unescapes to `X` only for X in [`REGEX_META`] — the exact convention
+/// monoscope emits. Any other backslash escape (`\d`, `\m`, `\y`, `\w`, …) is
+/// a character class or word-boundary assertion, not a literal, so it bails.
+/// Unescaped metacharacters bail. The decoded literal must also survive
+/// tantivy's `QueryParser` unchanged ([`is_tantivy_safe_term_char`]).
+///
+/// Anchors (`^foo`, `foo$` — monoscope's startswith/endswith) contain `^`/`$`
+/// and therefore bail: prefix/suffix routing over a 3-gram field needs its own
+/// correctness argument and is out of scope here.
+pub fn regex_literal_substring(pat: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut it = pat.chars();
+    while let Some(c) = it.next() {
+        let lit = if c == '\\' {
+            let n = it.next()?; // trailing backslash → invalid regex, bail
+            if !REGEX_META.contains(n) {
+                return None;
+            }
+            n
+        } else {
+            if REGEX_META.contains(c) {
+                return None;
+            }
+            c
+        };
+        if !is_tantivy_safe_term_char(lit) {
+            return None;
+        }
+        out.push(lit);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// Runtime classification of a DEFERRED (placeholder-routed) `text_match`.
@@ -490,5 +537,17 @@ mod tests {
         assert!(deferred_row_matches("eq", "abc", "xxabcyy"), "eq → containment superset");
         assert!(deferred_row_matches("like:tf_ngram3", "%a_b%", "zzaXbzz"));
         assert!(!deferred_row_matches("like:tf_ngram3", "%a_b%", "zzabzz"));
+    }
+
+    #[test]
+    fn regex_literal_substring_accepts_only_escaped_literals() {
+        // monoscope's `escapeRegex` output round-trips.
+        assert_eq!(regex_literal_substring("runServer"), Some("runServer".into()));
+        assert_eq!(regex_literal_substring("svc\\.user-api"), Some("svc.user-api".into()));
+        assert_eq!(regex_literal_substring("GET /v1/users"), Some("GET /v1/users".into()));
+        // Any live regex feature bails.
+        for p in ["run.*", "^foo", "foo$", "a|b", "f(o)o", "a[bc]", "x{2}", "\\d+", "\\yword\\y", "\\w", "trailing\\", "", "a\\+b"] {
+            assert_eq!(regex_literal_substring(p), None, "{p:?} must not decode to a literal");
+        }
     }
 }

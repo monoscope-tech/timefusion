@@ -1,7 +1,7 @@
 use std::{
     ops::Range,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -144,6 +144,12 @@ pub struct FoyerCacheConfig {
     /// multipart write (see `CachingMultipartUpload`). Always bounded by
     /// `block_size_bytes`; 0 = bound only by the block size.
     pub warm_inline_max_bytes: usize,
+    /// Per-upload cap on bytes teed into heap by `CachingMultipartUpload`.
+    /// Sized for flush outputs; big compaction outputs skip the tee and are
+    /// warmed post-commit via the read path. 0 = bounded only by the block size.
+    pub write_capture_max_bytes: usize,
+    /// Process-wide budget for in-flight write-capture buffers. 0 = unbudgeted.
+    pub write_capture_budget_bytes: usize,
     /// Disk block size for the main data cache — foyer's eviction unit and the
     /// hard cap on the largest entry that can persist to disk. Must be >= the
     /// largest file we want cached (compaction target size).
@@ -166,13 +172,15 @@ impl Default for FoyerCacheConfig {
             shards: 8,
             file_size_bytes: 16_777_216, // 16MB - good for Parquet files
             enable_stats: true,
-            parquet_metadata_size_hint: 1_048_576,  // 1MB - typical size for parquet metadata
-            metadata_memory_size_bytes: 67_108_864, // 64MB
-            metadata_disk_size_bytes: 536_870_912,  // 512MB
-            metadata_shards: 4,                     // Fewer shards for metadata cache
-            warm_inline_max_bytes: 0,               // bound by block size
-            block_size_bytes: 268_435_456,          // 256MB — fits 128MB compaction outputs
-            l1_max_entry_bytes: 16_777_216,         // 16MB
+            parquet_metadata_size_hint: 1_048_576,   // 1MB - typical size for parquet metadata
+            metadata_memory_size_bytes: 67_108_864,  // 64MB
+            metadata_disk_size_bytes: 536_870_912,   // 512MB
+            metadata_shards: 4,                      // Fewer shards for metadata cache
+            warm_inline_max_bytes: 0,                // bound by block size
+            write_capture_max_bytes: 33_554_432,     // 32MB — flush-sized files only
+            write_capture_budget_bytes: 268_435_456, // 256MB process-wide (8 x the per-upload cap)
+            block_size_bytes: 268_435_456,           // 256MB — fits 128MB compaction outputs
+            l1_max_entry_bytes: 16_777_216,          // 16MB
             cache_recent_days: 8,
         }
     }
@@ -209,6 +217,8 @@ impl FoyerCacheConfig {
             metadata_disk_size_bytes: cfg.cache.metadata_disk_size_bytes(),
             metadata_shards: cfg.cache.timefusion_foyer_metadata_shards,
             warm_inline_max_bytes: cfg.cache.warm_inline_max_bytes(),
+            write_capture_max_bytes: cfg.cache.write_capture_max_bytes(),
+            write_capture_budget_bytes: cfg.cache.write_capture_budget_bytes(),
             block_size_bytes,
             l1_max_entry_bytes: cfg.cache.l1_max_entry_bytes(),
             cache_recent_days: cfg.cache.timefusion_cache_recent_days,
@@ -231,6 +241,8 @@ impl FoyerCacheConfig {
             metadata_disk_size_bytes: 50 * 1024 * 1024,   // 50MB for tests
             metadata_shards: 2,
             warm_inline_max_bytes: 0,          // bound by block size
+            write_capture_max_bytes: 0,        // bound by block size in tests
+            write_capture_budget_bytes: 0,     // unbudgeted in tests
             block_size_bytes: 4 * 1024 * 1024, // 4MB — must be <= test disk size
             l1_max_entry_bytes: 1024 * 1024,   // 1MB
             cache_recent_days: 0,              // no age limit in tests (avoid date flakiness)
@@ -1370,6 +1382,46 @@ struct CachingMultipartUpload {
     buffer: Option<Vec<u8>>,
     max_warm_bytes: usize,
     l1_max_entry_bytes: usize,
+    /// Holds this upload's slice of the process-wide capture budget; dropping
+    /// it (abandon, complete, abort, or panic) returns the bytes.
+    reservation: Option<CaptureReservation>,
+}
+
+/// Bytes currently reserved by in-flight write captures. Each capturing upload
+/// reserves its full per-upload cap up front — the buffer's final size isn't
+/// known until `complete()`, so reserving the worst case is what makes the
+/// bound real rather than advisory.
+static WRITE_CAPTURE_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII claim on `WRITE_CAPTURE_INFLIGHT`.
+struct CaptureReservation(usize);
+
+impl CaptureReservation {
+    /// Reserve `bytes` if that keeps the process under `budget` (0 = unbudgeted).
+    /// Never blocks: over budget simply means this upload doesn't capture.
+    fn acquire(bytes: usize, budget: usize) -> Option<Self> {
+        if budget == 0 {
+            return Some(Self(0));
+        }
+        let mut cur = WRITE_CAPTURE_INFLIGHT.load(Ordering::Relaxed);
+        loop {
+            if cur.saturating_add(bytes) > budget {
+                return None;
+            }
+            match WRITE_CAPTURE_INFLIGHT.compare_exchange_weak(cur, cur + bytes, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => return Some(Self(bytes)),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+impl Drop for CaptureReservation {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            WRITE_CAPTURE_INFLIGHT.fetch_sub(self.0, Ordering::AcqRel);
+        }
+    }
 }
 
 impl std::fmt::Debug for CachingMultipartUpload {
@@ -1384,8 +1436,10 @@ impl MultipartUpload for CachingMultipartUpload {
         if let Some(buf) = self.buffer.as_mut() {
             if buf.len().saturating_add(data.content_length()) > self.max_warm_bytes {
                 // Too big to warm without risking memory / L1 eviction — give
-                // up capturing for this upload.
+                // up capturing for this upload and return its budget slice.
                 self.buffer = None;
+                self.reservation = None;
+                crate::metrics::record_write_capture_skipped();
             } else {
                 for chunk in data.iter() {
                     buf.extend_from_slice(chunk);
@@ -1397,6 +1451,7 @@ impl MultipartUpload for CachingMultipartUpload {
 
     async fn complete(&mut self) -> ObjectStoreResult<PutResult> {
         let result = self.inner.complete().await?;
+        let _reservation = self.reservation.take(); // released once this scope ends
         if let Some(buf) = self.buffer.take()
             && !buf.is_empty()
         {
@@ -1413,6 +1468,7 @@ impl MultipartUpload for CachingMultipartUpload {
 
     async fn abort(&mut self) -> ObjectStoreResult<()> {
         self.buffer = None;
+        self.reservation = None;
         self.inner.abort().await
     }
 }
@@ -1465,17 +1521,37 @@ impl ObjectStore for FoyerObjectStoreCache {
         // completed file warms the cache directly — no re-download of what we
         // just uploaded. Cap the buffer at the disk block size (the largest
         // entry foyer can persist), optionally tightened by warm_inline_max_bytes.
+        // `write_capture_max_bytes` tightens this to flush-file scale so a
+        // 256MB compaction output never sits in heap: it skips the tee here and
+        // is warmed post-commit through the read path (warm_cache_for_uris).
         let mut cap = self.config.block_size_bytes;
         if self.config.warm_inline_max_bytes > 0 {
             cap = cap.min(self.config.warm_inline_max_bytes);
+        }
+        if self.config.write_capture_max_bytes > 0 {
+            cap = cap.min(self.config.write_capture_max_bytes);
+        }
+        // A cap above the budget would make EVERY reservation fail (each
+        // acquires its full cap up front), silently disabling capture — most
+        // easily hit with `write_capture_max_mb=0`, whose documented meaning is
+        // "bounded only by the block size", not "off". Clamp instead.
+        if self.config.write_capture_budget_bytes > 0 {
+            cap = cap.min(self.config.write_capture_budget_bytes);
+        }
+        // Best-effort claim on the process-wide capture budget. Denied = this
+        // upload streams through un-teed; the upload itself never waits or fails.
+        let reservation = CaptureReservation::acquire(cap, self.config.write_capture_budget_bytes);
+        if reservation.is_none() {
+            crate::metrics::record_write_capture_skipped();
         }
         Ok(Box::new(CachingMultipartUpload {
             inner,
             location: location.clone(),
             cache: self.cache.clone(),
-            buffer: Some(Vec::new()),
+            buffer: reservation.is_some().then(Vec::new),
             max_warm_bytes: cap,
             l1_max_entry_bytes: self.config.l1_max_entry_bytes,
+            reservation,
         }))
     }
 
@@ -2191,6 +2267,145 @@ mod tests {
         let _ = cache.get(&big_path).await?;
         let stats = cache.get_stats().await;
         assert_eq!(stats.main.misses, 1, "over-cap multipart write should not be cached inline");
+
+        cache.shutdown().await?;
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    /// The per-upload write-capture cap must bound the tee independently of the
+    /// (much larger) block size: over-cap uploads abandon capture but still
+    /// upload correct, readable bytes. This is the memory fix — before it, a
+    /// 256MB compaction output sat in heap per concurrent upload.
+    #[tokio::test]
+    async fn test_write_capture_cap_bounds_tee() -> anyhow::Result<()> {
+        use object_store::MultipartUpload;
+
+        let test_id = format!("wcap_cap_{}", std::process::id());
+        let inner = Arc::new(InMemory::new());
+        // Block size stays 4MB; only the write-capture cap is tightened.
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.write_capture_max_bytes = 512 * 1024;
+            c.write_capture_budget_bytes = 0; // isolate the per-upload cap
+        });
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        cache.reset_stats().await;
+
+        // Under the cap → still captured (flush-sized files keep the feature).
+        let small_path = Path::from("table/date=2026-06-05/small.parquet");
+        let small = Bytes::from(vec![b'a'; 128 * 1024]);
+        let mut upload = cache.put_multipart(&small_path).await?;
+        upload.put_part(small.clone().into()).await?;
+        upload.complete().await?;
+        let _ = cache.get(&small_path).await?;
+        assert_eq!(cache.get_stats().await.main.hits, 1, "under-cap write should still warm the cache");
+
+        // Over the cap (but well under the 4MB block size) → capture abandoned.
+        cache.reset_stats().await;
+        let big_path = Path::from("table/date=2026-06-05/big.parquet");
+        let chunk = Bytes::from(vec![b'b'; 384 * 1024]);
+        let mut upload = cache.put_multipart(&big_path).await?;
+        upload.put_part(chunk.clone().into()).await?;
+        upload.put_part(chunk.clone().into()).await?; // 768KB > 512KB cap
+        upload.complete().await?;
+
+        // The object is fully and correctly uploaded regardless — only the
+        // cache tee was sacrificed, so the read is a genuine miss.
+        let fetched = inner.get(&big_path).await?.bytes().await?;
+        assert_eq!(fetched.len(), 768 * 1024, "upload must be unaffected by capture abandonment");
+        let _ = cache.get(&big_path).await?;
+        assert_eq!(cache.get_stats().await.main.misses, 1, "over-cap write must not be captured");
+
+        cache.shutdown().await?;
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    /// `write_capture_max_bytes = 0` means "bounded only by the block size", not
+    /// "disabled" — but the block size can exceed the budget, and a reservation
+    /// asks for its full cap, so without a clamp every acquire is denied and
+    /// capture silently stops entirely.
+    #[tokio::test]
+    async fn test_write_capture_cap_is_clamped_to_budget() -> anyhow::Result<()> {
+        use object_store::MultipartUpload;
+
+        let test_id = format!("wcap_clamp_{}", std::process::id());
+        let inner = Arc::new(InMemory::new());
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.write_capture_max_bytes = 0; // bounded by the (4MB) block size
+            c.write_capture_budget_bytes = 512 * 1024; // …which exceeds the budget
+        });
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        cache.reset_stats().await;
+
+        let path = Path::from("table/date=2026-06-05/clamped.parquet");
+        let data = Bytes::from(vec![b'd'; 128 * 1024]);
+        let mut upload = cache.put_multipart(&path).await?;
+        upload.put_part(data.clone().into()).await?;
+        upload.complete().await?;
+        let _ = cache.get(&path).await?;
+        assert_eq!(cache.get_stats().await.main.hits, 1, "capture must stay on when the cap is clamped to the budget");
+
+        cache.shutdown().await?;
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        Ok(())
+    }
+
+    /// The process-wide budget stops N concurrent captures from stacking. Once
+    /// exhausted, further uploads skip capture — but never block and never fail.
+    #[tokio::test]
+    async fn test_write_capture_budget_skips_without_failing_uploads() -> anyhow::Result<()> {
+        use object_store::MultipartUpload;
+
+        let test_id = format!("wcap_budget_{}", std::process::id());
+        let inner = Arc::new(InMemory::new());
+        // Budget fits exactly one concurrent capture (1x the per-upload cap).
+        let config = FoyerCacheConfig::test_config_with(&test_id, |c| {
+            c.write_capture_max_bytes = 512 * 1024;
+            c.write_capture_budget_bytes = 512 * 1024;
+        });
+        let cache_dir = config.cache_dir.clone();
+        let _ = std::fs::remove_dir_all(&cache_dir);
+        let cache = FoyerObjectStoreCache::new(inner.clone(), config).await?;
+        cache.reset_stats().await;
+
+        let first_path = Path::from("table/date=2026-06-05/first.parquet");
+        let second_path = Path::from("table/date=2026-06-05/second.parquet");
+        let data = Bytes::from(vec![b'c'; 64 * 1024]);
+
+        // Hold the first upload open so its reservation is still outstanding
+        // when the second one asks for budget.
+        let mut first = cache.put_multipart(&first_path).await?;
+        first.put_part(data.clone().into()).await?;
+        let mut second = cache.put_multipart(&second_path).await?; // over budget → no capture
+        second.put_part(data.clone().into()).await?;
+        second.complete().await?;
+        first.complete().await?;
+
+        // Both uploads succeeded with correct bytes.
+        assert_eq!(inner.get(&first_path).await?.bytes().await?.len(), data.len());
+        assert_eq!(inner.get(&second_path).await?.bytes().await?.len(), data.len());
+
+        // First was captured (hit), second was budget-skipped (miss).
+        let _ = cache.get(&first_path).await?;
+        let _ = cache.get(&second_path).await?;
+        let stats = cache.get_stats().await;
+        assert_eq!(stats.main.hits, 1, "the in-budget upload should be captured");
+        assert_eq!(stats.main.misses, 1, "the over-budget upload should skip capture");
+
+        // Reservations are released once the uploads finish, so capture works
+        // again — the budget is a transient bound, not a latch.
+        cache.reset_stats().await;
+        let third_path = Path::from("table/date=2026-06-05/third.parquet");
+        let mut third = cache.put_multipart(&third_path).await?;
+        third.put_part(data.clone().into()).await?;
+        third.complete().await?;
+        let _ = cache.get(&third_path).await?;
+        assert_eq!(cache.get_stats().await.main.hits, 1, "budget must be released when an upload completes");
 
         cache.shutdown().await?;
         let _ = std::fs::remove_dir_all(&cache_dir);

@@ -339,6 +339,10 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
         ("k2", "auth", "login successful"),
         ("k3", "billing", "charge declined"),
         ("k4", "billing", "charge succeeded"),
+        // Literals whose text contains tantivy query-grammar tokens.
+        ("k5", "auth", "accept -header now"),
+        ("k6", "billing", "err -1234 code"),
+        ("k7", "auth", "foo NOT bar baz"),
     ];
     db.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows.clone())], false, None).await?;
     db2.insert_records_batch(&p, TABLE, vec![make_batch(&p, rows)], false, None).await?;
@@ -369,6 +373,18 @@ async fn flushed_index_prefilter_is_actually_used() -> Result<()> {
     let r2_off = collect_ids(&ctx2, &q2).await?;
     assert_eq!(r2_on, r2_off);
     assert_eq!(r2_on, vec!["k3".to_string(), "k4".to_string()]);
+
+    // Regression: a routed substring literal carrying tantivy query-grammar
+    // tokens (whitespace-adjacent `-` → MustNot, bare `NOT` → operator) used to
+    // parse "successfully" into a query matching nothing, so the intersecting
+    // `id IN (hits)` prefilter silently dropped the row that actually matched.
+    for (pat, want) in [("accept -header", "k5"), ("err -1234", "k6"), ("foo NOT bar", "k7")] {
+        let q = format!("SELECT id FROM otel_logs_and_spans WHERE project_id='{p}' AND status_message LIKE '%{pat}%'");
+        let on = collect_ids(&ctx, &q).await?;
+        let off = collect_ids(&ctx2, &q).await?;
+        assert_eq!(on, off, "prefilter must match baseline for `LIKE '%{pat}%'`");
+        assert_eq!(on, vec![want.to_string()], "`LIKE '%{pat}%'` must return its matching row");
+    }
     Ok(())
 }
 

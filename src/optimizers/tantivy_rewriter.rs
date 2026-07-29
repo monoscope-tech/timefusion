@@ -36,6 +36,15 @@
 //! | `col LIKE '%mid%'`    | ❌    | ❌      | ✅ via ngram |
 //! | `col ILIKE 'lit'`     | ❌    | ✅ (lowercased literal) | ✅ |
 //! | `col ILIKE '%mid%'`   | ❌    | ❌      | ✅ |
+//! | `col::text ~* 'sub'`  | ❌    | ❌      | ✅ via ngram |
+//! | `col::text ~ 'sub'`   | ❌    | ❌      | ✅ via ngram |
+//!
+//! `~`/`~*` route ONLY when the pattern is a plain literal substring
+//! (`regex_literal_substring`) and the column is text-typed — this is the
+//! shape monoscope renders KQL `has`/`contains` into (`subject::text ~*
+//! escapeRegex(term)`). Anchored (`^`/`$`, i.e. startswith/endswith) and any
+//! other regex feature is left alone. Variant/List columns are excluded: the
+//! index holds our canonical rendering, not SQL's `::text` cast output.
 //!
 //! `_` (single-char wildcard) is never accelerated — semantics don't map
 //! cleanly to any tantivy primitive. Strings shorter than 3 chars on
@@ -64,9 +73,18 @@ use crate::{
     optimizers::extract_utf8_string,
     tantivy_index::{
         schema::{DEFAULT_TOKENIZER, NGRAM3_TOKENIZER, RAW_TOKENIZER},
-        udf::{NGRAM_MIN_QUERY_LEN, TEXT_MATCH_NAME, TextMatchUdf, classify_like_pattern, is_eq_term_safe},
+        udf::{NGRAM_MIN_QUERY_LEN, TEXT_MATCH_NAME, TextMatchUdf, classify_like_pattern, is_eq_term_safe, regex_literal_substring},
     },
 };
+
+/// Per-column index facts the rewriter needs: the resolved tokenizer, and
+/// whether the *stored* column is a plain string. The latter gates regex
+/// routing: on a Variant/List column the tantivy index holds our own
+/// canonical text rendering (`builder::variant_to_text`), which need not be
+/// byte-identical to what a SQL `col::text` cast produces — routing there
+/// could drop rows, so only text-typed columns are eligible.
+type IndexedCol = (&'static str, bool);
+type IndexedCols = HashMap<String, IndexedCol>;
 
 #[derive(Debug, Default)]
 pub struct TantivyPredicateRewriter {
@@ -120,7 +138,7 @@ fn rewrite_node(plan: LogicalPlan, allow_eq: bool) -> Result<Transformed<Logical
 /// cutoff would likely reject the hit set anyway).
 const MAX_ROUTED_IN_LIST: usize = 100;
 
-fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Result<Transformed<Expr>> {
+fn rewrite_expr(expr: Expr, indexed_columns: &IndexedCols, allow_eq: bool) -> Result<Transformed<Expr>> {
     // Skip the children of a text_match call (already a tantivy predicate).
     if let Expr::ScalarFunction(sf) = &expr
         && sf.func.name() == TEXT_MATCH_NAME
@@ -154,7 +172,7 @@ fn rewrite_expr(expr: Expr, indexed_columns: &HashMap<String, &'static str>, all
 /// queries, under the same gates as exact `=` routing (raw tokenizer,
 /// eq-term-safe literals, `route_equality` flag). Placeholder items defer to
 /// scan-time classification. `NOT IN` is never routed.
-fn match_indexed_in_list(expr: &Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Option<(String, Vec<Route>)> {
+fn match_indexed_in_list(expr: &Expr, indexed_columns: &IndexedCols, allow_eq: bool) -> Option<(String, Vec<Route>)> {
     use datafusion::logical_expr::expr::InList;
     let Expr::InList(InList { expr: col, list, negated: false }) = expr else {
         return None;
@@ -164,7 +182,7 @@ fn match_indexed_in_list(expr: &Expr, indexed_columns: &HashMap<String, &'static
     }
     let Expr::Column(c) = col.as_ref() else { return None };
     let name = c_name(c);
-    if *indexed_columns.get(&name)? != RAW_TOKENIZER {
+    if indexed_columns.get(&name)?.0 != RAW_TOKENIZER {
         return None;
     }
     let items: Option<Vec<Route>> = list
@@ -194,7 +212,7 @@ enum Route {
 /// `(column_name, route)`. Decision depends on the column's
 /// tokenizer — raw can't do substring; ngram3 can do everything; default
 /// is in between.
-fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'static str>, allow_eq: bool) -> Option<(String, Route)> {
+fn match_indexed_predicate(expr: &Expr, indexed_columns: &IndexedCols, allow_eq: bool) -> Option<(String, Route)> {
     match expr {
         // Exact `col = 'lit'` on a RAW-tokenized column: route as a term query.
         // Raw is a single case-sensitive token, so the tantivy match set equals
@@ -209,7 +227,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
                 _ => return None,
             };
             let name = c_name(c);
-            if *indexed_columns.get(&name)? != RAW_TOKENIZER {
+            if indexed_columns.get(&name)?.0 != RAW_TOKENIZER {
                 return None; // only exact-match (raw) columns; ngram3/default are lossy for `=`
             }
             match rhs {
@@ -230,7 +248,7 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
         }
         Expr::Like(Like { negated: false, expr: l, pattern: r, escape_char, case_insensitive }) => {
             let Expr::Column(c) = l.as_ref() else { return None };
-            let tok = *indexed_columns.get(&c_name(c))?;
+            let tok = indexed_columns.get(&c_name(c))?.0;
             // ILIKE on raw (case-sensitive single token) is not accelerable
             // without a parallel case-insensitive index — skip.
             if *case_insensitive && tok == RAW_TOKENIZER {
@@ -259,6 +277,47 @@ fn match_indexed_predicate(expr: &Expr, indexed_columns: &HashMap<String, &'stat
                 }
                 _ => None,
             }
+        }
+        // `col ~* 'substr'` / `col ~ 'substr'`, optionally through a
+        // `CAST(col AS Utf8)` — the shape monoscope renders every KQL
+        // has/contains into (`subject::text ~* escapeRegex(term)`). Routed as
+        // the ngram3 substring query, i.e. identical to `col ILIKE '%substr%'`.
+        //
+        // Superset argument (what the `id IN (hits)` prefilter requires):
+        // ngram3 lowercases + ASCII-folds both index and query side, so its
+        // hit set is the case- and diacritic-insensitive substring match —
+        // a superset of both `~` (case-sensitive) and `~*`. The original
+        // regex is preserved as the post-filter, so results are unchanged.
+        // Only PLAIN substrings route (see `regex_literal_substring`);
+        // anchors and any other regex feature fall through untouched.
+        Expr::BinaryExpr(BinaryExpr { left, op: Operator::RegexMatch | Operator::RegexIMatch, right }) => {
+            let c = column_through_string_cast(left)?;
+            let (tok, text_typed) = *indexed_columns.get(&c_name(c))?;
+            if tok != NGRAM3_TOKENIZER || !text_typed {
+                return None;
+            }
+            let Expr::Literal(s, _) = right.as_ref() else { return None };
+            let q = regex_literal_substring(&extract_utf8_string(s)?)?;
+            if q.chars().count() < NGRAM_MIN_QUERY_LEN {
+                return None;
+            }
+            Some((c_name(c), Route::Ready(q)))
+        }
+        _ => None,
+    }
+}
+
+/// The column under zero or more string casts. Monoscope emits `col::text`,
+/// which DataFusion may keep as a `Cast`/`TryCast` when the column is already
+/// Utf8-ish; the cast is value-preserving for string types, so seeing through
+/// it is safe (non-string sources are rejected by the `text_typed` gate).
+fn column_through_string_cast(e: &Expr) -> Option<&datafusion::common::Column> {
+    use arrow::datatypes::DataType;
+    use datafusion::logical_expr::expr::{Cast, TryCast};
+    match e {
+        Expr::Column(c) => Some(c),
+        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => {
+            matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View).then(|| column_through_string_cast(expr))?
         }
         _ => None,
     }
@@ -318,13 +377,13 @@ fn find_indexed_table(plan: &LogicalPlan) -> Option<String> {
 /// add runtime/hot-reload of schemas, this OnceLock must be replaced with an
 /// invalidatable structure — newly-added Tantivy-indexed tables would
 /// otherwise silently never accelerate.
-fn indexed_columns_for(table: &str) -> Option<&'static HashMap<String, &'static str>> {
-    static CACHE: OnceLock<HashMap<String, HashMap<String, &'static str>>> = OnceLock::new();
+fn indexed_columns_for(table: &str) -> Option<&'static IndexedCols> {
+    static CACHE: OnceLock<HashMap<String, IndexedCols>> = OnceLock::new();
     let map = CACHE.get_or_init(|| {
-        let mut m: HashMap<String, HashMap<String, &'static str>> = HashMap::new();
+        let mut m: HashMap<String, IndexedCols> = HashMap::new();
         for name in crate::schema_loader::registry().list_tables() {
             if let Some(schema) = crate::schema_loader::registry().get(&name) {
-                let cols: HashMap<String, &'static str> = schema
+                let cols: IndexedCols = schema
                     .fields
                     .iter()
                     .filter_map(|f| {
@@ -337,7 +396,7 @@ fn indexed_columns_for(table: &str) -> Option<&'static HashMap<String, &'static 
                             DEFAULT_TOKENIZER => DEFAULT_TOKENIZER,
                             _ => NGRAM3_TOKENIZER,
                         };
-                        Some((f.name.clone(), tok))
+                        Some((f.name.clone(), (tok, matches!(f.data_type.as_str(), "Utf8" | "LargeUtf8" | "Utf8View"))))
                     })
                     .collect();
                 if !cols.is_empty() {
@@ -410,6 +469,11 @@ mod tests {
         assert_eq!(classify_like_pattern("foo\\%", Some('\\'), false), None);
     }
 
+    /// Test column map; every entry is text-typed unless a test overrides it.
+    fn cols_of<const N: usize>(items: [(String, &'static str); N]) -> IndexedCols {
+        items.into_iter().map(|(k, tok)| (k, (tok, true))).collect()
+    }
+
     fn eq(col: &str, val: &str) -> Expr {
         Expr::BinaryExpr(BinaryExpr::new(Box::new(Expr::Column(datafusion::common::Column::new_unqualified(col))), Operator::Eq, Box::new(lit(val))))
     }
@@ -418,7 +482,7 @@ mod tests {
     fn match_eq_routed_on_raw_when_enabled() {
         // P0: exact `=` on a raw column is routed as a term query when the flag
         // is on — the high-card trace/span lookup acceleration.
-        let cols: HashMap<String, &'static str> = HashMap::from([("context___trace_id".to_string(), RAW_TOKENIZER)]);
+        let cols: IndexedCols = cols_of([("context___trace_id".to_string(), RAW_TOKENIZER)]);
         assert_eq!(
             match_indexed_predicate(&eq("context___trace_id", "d01762b88f4ed54d"), &cols, true),
             Some(("context___trace_id".into(), Route::Ready("d01762b88f4ed54d".into())))
@@ -428,14 +492,14 @@ mod tests {
     #[test]
     fn match_eq_not_routed_when_flag_off() {
         // route_equality=false reverts to bloom/stats-only (the prior behavior).
-        let cols: HashMap<String, &'static str> = HashMap::from([("context___trace_id".to_string(), RAW_TOKENIZER)]);
+        let cols: IndexedCols = cols_of([("context___trace_id".to_string(), RAW_TOKENIZER)]);
         assert_eq!(match_indexed_predicate(&eq("context___trace_id", "abc123"), &cols, false), None);
     }
 
     #[test]
     fn match_eq_not_routed_on_ngram3_or_neq() {
         // `=` only routes on raw (exact) tokenizers; ngram3 is lossy for equality.
-        let cols: HashMap<String, &'static str> = HashMap::from([("name".to_string(), NGRAM3_TOKENIZER), ("tid".to_string(), RAW_TOKENIZER)]);
+        let cols: IndexedCols = cols_of([("name".to_string(), NGRAM3_TOKENIZER), ("tid".to_string(), RAW_TOKENIZER)]);
         assert_eq!(match_indexed_predicate(&eq("name", "runServer"), &cols, true), None);
         // `!=` is never routed (no term form), regardless of the flag.
         let neq = Expr::BinaryExpr(BinaryExpr::new(
@@ -450,7 +514,7 @@ mod tests {
     fn match_eq_unsafe_literal_bails() {
         // Literals QueryParser would mis-handle against a single raw token are
         // left to the plain `=` (correctness over acceleration).
-        let cols: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER)]);
+        let cols: IndexedCols = cols_of([("tid".to_string(), RAW_TOKENIZER)]);
         assert_eq!(match_indexed_predicate(&eq("tid", "a:b"), &cols, true), None, "colon is query syntax");
         assert_eq!(match_indexed_predicate(&eq("tid", "foo bar"), &cols, true), None, "space → AND-split can't match one raw token");
         assert_eq!(match_indexed_predicate(&eq("tid", "a.b"), &cols, true), None, "dot conservatively excluded");
@@ -468,7 +532,7 @@ mod tests {
         // prefilter at all (else the 2026-06-16 empty/partial-union bug
         // returns). A top-level conjunct still routes.
         use crate::tantivy_index::udf::{PredNode, collect_text_match_tree};
-        let cols: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER), ("sid".to_string(), RAW_TOKENIZER)]);
+        let cols: IndexedCols = cols_of([("tid".to_string(), RAW_TOKENIZER), ("sid".to_string(), RAW_TOKENIZER)]);
 
         let or_pred = Expr::BinaryExpr(BinaryExpr::new(Box::new(eq("tid", "x")), Operator::Or, Box::new(eq("sid", "y"))));
         let rewritten = or_pred.transform_down(|e| rewrite_expr(e, &cols, true)).unwrap().data;
@@ -478,7 +542,7 @@ mod tests {
         }
 
         // One branch on an UN-indexed column → whole OR must be opaque.
-        let cols_partial: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER)]);
+        let cols_partial: IndexedCols = cols_of([("tid".to_string(), RAW_TOKENIZER)]);
         let or_pred = Expr::BinaryExpr(BinaryExpr::new(Box::new(eq("tid", "x")), Operator::Or, Box::new(eq("unindexed", "y"))));
         let rewritten = or_pred.transform_down(|e| rewrite_expr(e, &cols_partial, true)).unwrap().data;
         assert_eq!(collect_text_match_tree(&[rewritten]), None, "an OR with an unroutable branch must not seed the prefilter");
@@ -496,7 +560,7 @@ mod tests {
 
     #[test]
     fn in_list_routes_as_or_of_terms() {
-        let cols: HashMap<String, &'static str> = HashMap::from([("tid".to_string(), RAW_TOKENIZER), ("name".to_string(), NGRAM3_TOKENIZER)]);
+        let cols: IndexedCols = cols_of([("tid".to_string(), RAW_TOKENIZER), ("name".to_string(), NGRAM3_TOKENIZER)]);
         let in_list = |col: &str, items: &[&str], negated: bool| {
             Expr::InList(datafusion::logical_expr::expr::InList {
                 expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified(col))),
@@ -528,7 +592,7 @@ mod tests {
     fn match_ilike_skipped_on_raw_columns() {
         // ILIKE on a raw-tokenized (case-sensitive) column would silently
         // miss case variants; skip the rewrite.
-        let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), RAW_TOKENIZER)]);
+        let cols: IndexedCols = cols_of([("c".to_string(), RAW_TOKENIZER)]);
         let e = Expr::Like(Like {
             negated: false,
             expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
@@ -541,7 +605,7 @@ mod tests {
 
     #[test]
     fn match_ilike_substring_works_on_ngram3() {
-        let cols: HashMap<String, &'static str> = HashMap::from([("c".to_string(), NGRAM3_TOKENIZER)]);
+        let cols: IndexedCols = cols_of([("c".to_string(), NGRAM3_TOKENIZER)]);
         let e = Expr::Like(Like {
             negated: false,
             expr: Box::new(Expr::Column(datafusion::common::Column::new_unqualified("c"))),
@@ -550,5 +614,55 @@ mod tests {
             case_insensitive: true,
         });
         assert_eq!(match_indexed_predicate(&e, &cols, true), Some(("c".into(), Route::Ready("foo".into()))));
+    }
+
+    /// `col::text ~* 'lit'` — the shape monoscope renders every KQL
+    /// has/contains into. Before this it never matched, so the ngram3 index
+    /// was built on ingest and never read.
+    #[test]
+    fn match_regex_imatch_through_cast_routes_on_ngram3() {
+        use arrow::datatypes::DataType;
+        use datafusion::logical_expr::expr::Cast;
+        let cols = cols_of([("name".to_string(), NGRAM3_TOKENIZER), ("tid".to_string(), RAW_TOKENIZER)]);
+        let re = |col: &str, op: Operator, pat: &str, cast: bool| {
+            let c = Expr::Column(datafusion::common::Column::new_unqualified(col));
+            let lhs = if cast { Expr::Cast(Cast::new(Box::new(c), DataType::Utf8)) } else { c };
+            Expr::BinaryExpr(BinaryExpr::new(Box::new(lhs), op, Box::new(lit(pat))))
+        };
+
+        for op in [Operator::RegexIMatch, Operator::RegexMatch] {
+            assert_eq!(
+                match_indexed_predicate(&re("name", op, "runServer", true), &cols, true),
+                Some(("name".into(), Route::Ready("runServer".into()))),
+                "cast-wrapped {op:?} on an ngram3 column must route"
+            );
+            // Bare column (DataFusion may fold the no-op cast) routes too.
+            assert_eq!(match_indexed_predicate(&re("name", op, "runServer", false), &cols, true), Some(("name".into(), Route::Ready("runServer".into()))));
+        }
+        // `escapeRegex` output: `.` arrives as `\.` and decodes to a literal.
+        assert_eq!(
+            match_indexed_predicate(&re("name", Operator::RegexIMatch, "svc\\.user-api", true), &cols, true),
+            Some(("name".into(), Route::Ready("svc.user-api".into())))
+        );
+        // Unescaped metachars / anchors (startswith & endswith) / short
+        // patterns / raw-tokenized columns / non-literal RHS: never routed.
+        for (col, pat) in [
+            ("name", "run.*"),
+            ("name", "a|b"),
+            ("name", "^foo"),
+            ("name", "foo$"),
+            ("name", "fo(o)"),
+            ("name", "\\yword\\y"), // \y is a word boundary, not an escaped literal
+            ("name", "ab"),         // < NGRAM_MIN_QUERY_LEN
+            ("name", ""),
+            ("name", "a\\"), // trailing backslash
+            ("tid", "abcdef"),
+        ] {
+            assert_eq!(match_indexed_predicate(&re(col, Operator::RegexIMatch, pat, true), &cols, true), None, "{col} ~* {pat:?} must not route");
+        }
+        // Variant/List column (not text-typed): the index holds our canonical
+        // rendering, which `::text` need not reproduce — never routed.
+        let variant_cols: IndexedCols = HashMap::from([("body".to_string(), (NGRAM3_TOKENIZER, false))]);
+        assert_eq!(match_indexed_predicate(&re("body", Operator::RegexIMatch, "boom", true), &variant_cols, true), None);
     }
 }

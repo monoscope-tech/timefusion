@@ -56,6 +56,8 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
             })
         });
 
+    let coalesced_write_callback = coalesced_delta_write_callback(&db);
+
     let mut session_context = Arc::new(db.clone()).create_session_context();
     db.setup_session_udfs(&mut session_context)?;
     let registry: Arc<crate::functions::FnRegistry> = Arc::new(session_context.state());
@@ -65,7 +67,9 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     crate::wal::boot_wal_gc(&cfg.core.wal_dir(), cfg.buffer.wal_gc_max_age());
 
     let t_layer = std::time::Instant::now();
-    let mut layer = BufferedWriteLayer::with_config(Arc::clone(&cfg), registry)?.with_delta_writer(delta_write_callback);
+    let mut layer = BufferedWriteLayer::with_config(Arc::clone(&cfg), registry)?
+        .with_delta_writer(delta_write_callback)
+        .with_coalesced_delta_writer(coalesced_write_callback);
     tracing::info!("bootstrap.phase=buffered_write_layer_init elapsed_ms={}", t_layer.elapsed().as_millis());
 
     // Optional tantivy sidecar (mirrors main.rs). Disabled when no indexed
@@ -125,4 +129,42 @@ pub async fn bootstrap(cfg: Arc<AppConfig>) -> Result<Bootstrapped> {
     db.spawn_deferred_tantivy_reindex(Arc::clone(&buffered_layer));
 
     Ok(Bootstrapped { db, buffered_layer, session_ctx: Arc::new(session_context), shutdown: CancellationToken::new() })
+}
+
+/// The C3 coalescing flush writer: hands the whole tick's groups to
+/// `insert_records_batches_coalesced`, which emits one Delta commit per
+/// PHYSICAL table. Shared by `bootstrap` and `main` so the e2e path and prod
+/// wire the identical callback. Only used when
+/// `TIMEFUSION_FLUSH_COALESCE_COMMITS` is on.
+pub fn coalesced_delta_write_callback(db: &crate::database::Database) -> crate::buffered_write_layer::DeltaCoalescedWriteCallback {
+    let db = db.clone();
+    Arc::new(move |units: Vec<crate::buffered_write_layer::FlushUnit>| {
+        let db = db.clone();
+        Box::pin(async move {
+            let topics: Vec<(String, String)> = units.iter().map(|u| (u.project_id.clone(), u.table_name.clone())).collect();
+            let units = units
+                .into_iter()
+                .map(|u| crate::database::CoalescedWriteUnit { project_id: u.project_id, table_name: u.table_name, batches: u.batches, watermark: u.watermark })
+                .collect();
+            let results = db.insert_records_batches_coalesced(units).await;
+            // `insert_records_batches_coalesced` warms the flushed files itself
+            // (as insert_records_batch does) — no warm here, or every flush
+            // would issue the warm GETs twice.
+            // Mark on ANY settled commit, not just one with a non-empty added
+            // list: the flag means "this (project, table) has Delta files", which
+            // is true the moment the commit lands. Attribution can legitimately
+            // return an empty list for a project that did flush (e.g. a
+            // concurrent snapshot re-materialize makes the pre/post diff miss),
+            // and gating on it would leave `delta_scan_can_be_skipped` true —
+            // queries would skip Delta and read only MemBuffer. Tantivy indexing
+            // stays driven by the actual file list inside the insert path.
+            // Identical to the per-project callback in `main.rs`.
+            for ((project_id, table_name), result) in topics.iter().zip(&results) {
+                if result.is_ok() {
+                    db.mark_delta_has_files(project_id, table_name);
+                }
+            }
+            results
+        })
+    })
 }

@@ -152,6 +152,18 @@ const_default!(d_wal_corruption_threshold: usize = 10);
 // backfill. 8 doubles concurrency over the old 4 while bounding in-flight
 // encode memory; raise further (env) if CPU/R2 headroom allows.
 const_default!(d_flush_parallelism: usize = 8);
+// Cross-project flush commit coalescing (C3). All default-storage projects share
+// ONE physical Delta table, and `table_lock_key` already serializes their commits
+// behind a single mutex — so N per-project commits per tick produce N log entries,
+// N snapshot refreshes and N log-JSON parses where 1 would do (prod: ~1.5s commit
+// cadence ≈ 2400 commits/hour). When enabled, one tick produces one commit per
+// PHYSICAL table carrying every project's Add actions; parquet writes still fan
+// out `flush_parallelism`-wide, only the commit is shared. Custom-storage projects
+// have their own `_delta_log` and are never coalesced with default storage.
+// Default OFF: the coalesced path changes the durability-critical commit +
+// watermark shape, so it ships as an operator-enabled lever (env
+// `TIMEFUSION_FLUSH_COALESCE_COMMITS=true`) that needs a soak before default-on.
+const_default!(d_flush_coalesce_commits: bool = false);
 // Cold-boot Delta cursor reconciliation. R2 happily takes 64+ concurrent
 // gets per bucket; the original 8 left ~8× headroom. Depth 8 is half the
 // original 16 (the snapshot replaces the bulk of the scan) but keeps a
@@ -244,6 +256,8 @@ const_default!(d_metadata_memory_mb: usize = 512);
 const_default!(d_metadata_disk_gb: usize = 5);
 const_default!(d_metadata_shards: usize = 4);
 const_default!(d_warm_inline_max_mb: usize = 0);
+const_default!(d_write_capture_max_mb: usize = 32);
+const_default!(d_write_capture_budget_mb: usize = 256);
 const_default!(d_foyer_block_size_mb: usize = 256);
 const_default!(d_l1_max_entry_mb: usize = 16);
 const_default!(d_cache_recent_days: usize = 8);
@@ -251,6 +265,7 @@ const_default!(d_page_rows: usize = 20_000);
 const_default!(d_zstd_level: i32 = 3);
 // Tiered compression by partition age. Hot writes prioritize ingest latency;
 // older data is rewritten at progressively higher levels by `recompress_tier`.
+const_default!(d_zstd_level_intermediate: i32 = 1);
 const_default!(d_zstd_level_warm: i32 = 9);
 const_default!(d_zstd_level_cold: i32 = 19);
 const_default!(d_cold_cutoff_days: u64 = 14);
@@ -645,6 +660,10 @@ pub struct BufferConfig {
     pub timefusion_wal_corruption_threshold: usize,
     #[serde(default = "d_flush_parallelism")]
     pub timefusion_flush_parallelism: usize,
+    /// Coalesce one tick's per-project flush commits into one commit per
+    /// PHYSICAL Delta table (see `d_flush_coalesce_commits`).
+    #[serde(default = "d_flush_coalesce_commits")]
+    pub timefusion_flush_coalesce_commits: bool,
     #[serde(default)]
     pub timefusion_flush_immediately: bool,
     /// EXPERIMENTAL (default OFF), parity plan Defect 1: when set, `insert()`
@@ -772,6 +791,9 @@ impl BufferConfig {
     }
     pub fn flush_parallelism(&self) -> usize {
         self.timefusion_flush_parallelism.max(1)
+    }
+    pub fn flush_coalesce_commits(&self) -> bool {
+        self.timefusion_flush_coalesce_commits
     }
     pub fn dml_coalesce_secs(&self) -> u64 {
         self.timefusion_dml_coalesce_secs
@@ -908,6 +930,38 @@ pub struct CacheConfig {
     /// by the block size.
     #[serde(default = "d_warm_inline_max_mb")]
     pub timefusion_warm_inline_max_mb: usize,
+    /// Per-upload cap (MB) on the heap buffer a multipart write tees into to
+    /// warm the cache (see `CachingMultipartUpload`). Uploads that grow past
+    /// this abandon capture and stream through untouched — never blocked,
+    /// never failed.
+    ///
+    /// Sized for *flush* outputs, which are the writes that actually benefit:
+    /// a flush bucket's parquet is single-digit-to-low-tens of MB and is read
+    /// back within seconds by dashboards, so teeing it saves a real S3 GET.
+    /// Compaction/optimize outputs are written at
+    /// `timefusion_optimize_target_size` (256MB default) and are NOT worth
+    /// teeing: they're already warmed post-commit through the read path by
+    /// `timefusion_warm_after_compaction` (`warm_cache_for_uris`). 32MB keeps
+    /// flush capture intact while letting big compaction outputs skip the RAM
+    /// tee. Before this cap, capture was bounded only by the 256MB block size,
+    /// which prod heap profiles attributed ~42% of an 85GB heap to. 0 =
+    /// bounded only by the block size (pre-cap behaviour), further clamped to
+    /// the process-wide budget below so a cap larger than the budget cannot
+    /// deny every reservation and disable capture outright.
+    #[serde(default = "d_write_capture_max_mb")]
+    pub timefusion_write_capture_max_mb: usize,
+    /// Process-wide budget (MB) for in-flight write-capture buffers. Each
+    /// capturing upload reserves its full per-upload cap up front, so this
+    /// hard-bounds total capture heap regardless of how many uploads run
+    /// concurrently (flush_parallelism x delta-rs part concurrency, plus
+    /// optimize/dedup writes). Over budget = capture skipped for that upload
+    /// (best-effort, upload unaffected). It also CLAMPS the per-upload cap, so
+    /// a cap above the budget degrades capture rather than disabling it.
+    /// Default 8x the per-upload cap — one full reservation per flush writer
+    /// (`flush_parallelism`), so a flush wave never starves itself.
+    /// 0 = unbudgeted.
+    #[serde(default = "d_write_capture_budget_mb")]
+    pub timefusion_write_capture_budget_mb: usize,
     #[serde(default)]
     pub timefusion_foyer_disabled: bool,
 }
@@ -943,6 +997,12 @@ impl CacheConfig {
     pub fn warm_inline_max_bytes(&self) -> usize {
         self.timefusion_warm_inline_max_mb * MIB
     }
+    pub fn write_capture_max_bytes(&self) -> usize {
+        self.timefusion_write_capture_max_mb * MIB
+    }
+    pub fn write_capture_budget_bytes(&self) -> usize {
+        self.timefusion_write_capture_budget_mb * MIB
+    }
     pub fn block_size_bytes(&self) -> usize {
         self.timefusion_foyer_block_size_mb * MIB
     }
@@ -962,6 +1022,16 @@ pub struct ParquetConfig {
     /// Aliased by the legacy env name; lower = faster ingest.
     #[serde(default = "d_zstd_level", alias = "timefusion_zstd_level_hot")]
     pub timefusion_zstd_compression_level: i32,
+    /// ZSTD level for same-day INTERMEDIATE rewrites (hot-tail light optimize,
+    /// dedup) whose output is rewritten again the same night by consolidate /
+    /// recompress. Default 1: trades ~10-15% transient hot-day file size for
+    /// ~2-3x less compress CPU and faster decompress on recent-data queries.
+    /// Steady-state on-disk size is unchanged because nightly consolidate
+    /// rewrites at the warm tier — a tier-1 footer (`timefusion.compression_tier`)
+    /// is below both warm (9) and cold (19), so those partitions stay eligible
+    /// for re-tiering by the recompress probe.
+    #[serde(default = "d_zstd_level_intermediate")]
+    pub timefusion_zstd_level_intermediate: i32,
     #[serde(default = "d_zstd_level_warm")]
     pub timefusion_zstd_level_warm: i32,
     #[serde(default = "d_zstd_level_cold")]
@@ -1410,6 +1480,14 @@ mod tests {
         // quarantine acked rows. Pin the durable defaults.
         assert_eq!(config.buffer.wal_fsync_mode(), WalFsyncMode::SyncEach);
         assert!(config.buffer.wal_ack_fsync());
+        // Compression tiers ascend hot < warm < cold; intermediate (same-day
+        // rewrites that nightly consolidate/recompress will rewrite anyway)
+        // sits below hot and stays eligible for re-tiering.
+        let p = &config.parquet;
+        assert_eq!(p.timefusion_zstd_level_intermediate, 1);
+        assert!(p.timefusion_zstd_level_intermediate < p.timefusion_zstd_compression_level);
+        assert!(p.timefusion_zstd_level_intermediate < p.timefusion_zstd_level_warm);
+        assert!(p.timefusion_zstd_level_intermediate < p.timefusion_zstd_level_cold);
     }
 
     // Regression for the 2026-07-21 compaction outage: the derived maintenance
