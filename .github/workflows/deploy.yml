@@ -110,11 +110,18 @@ jobs:
           # unreachable — most often it's mid-boot from the *previous* deploy
           # (psql: "the database system is starting up"). Failing here deadlocked
           # every deploy after a slow boot (2026-07-20). Retry briefly, then proceed.
+          # timeout: a hung psql (e.g. protocol negotiation with newer psql,
+          # which needs max_protocol_version=3.0 against TF, or a wedged FLUSH)
+          # otherwise pins attempt 1 forever and the retry loop never runs
+          # (2026-07-30: flush step sat 25+ min on a single psql call).
+          # PGMAXPROTOCOLVERSION: env form (not URI param) — older libpq ignores
+          # unknown env vars but rejects unknown URI params.
+          export PGMAXPROTOCOLVERSION=3.0
           for attempt in $(seq 1 12); do
-            if psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH' 2>&1; then
+            if timeout 60 psql "$PGURL" -v ON_ERROR_STOP=1 -c 'FLUSH' 2>&1; then
               echo "flush ok (attempt $attempt)"; exit 0
             fi
-            echo "flush attempt $attempt failed (prod likely still booting); retrying in 15s"
+            echo "flush attempt $attempt failed or timed out; retrying in 15s"
             sleep 15
           done
           echo "::warning::pre-deploy FLUSH never succeeded; proceeding (tail is WAL-durable, replay will recover it)"
