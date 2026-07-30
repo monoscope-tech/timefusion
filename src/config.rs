@@ -146,10 +146,15 @@ const OPTIMIZE_MERGE_TASKS: usize = 2;
 /// proven-safe 2 rather than re-derived (06-11 OOM was uncapped concurrency,
 /// not a memory-sizing bug).
 const HEAVY_REWRITE_PERMITS: usize = 2;
-/// Per-sort budget: legacy blocking-sort peak was 5.8 GiB; 8 GiB constant
-/// stays conservative until the sorted-run transition is complete, then
-/// tighten (see doc §4).
-const PER_SORT_BUDGET_BYTES: usize = 8 * GIB;
+/// Per-sort budget. 8 GiB (from the legacy 5.8 GiB blocking-sort peak) capped
+/// wave concurrency k at 1-2 on prod's 24 GiB pool — hot compact ran serial
+/// on a 48-core box while ticks overran 2-3x (2026-07-30). Sorts run on a
+/// FairSpillPool with a dedicated spill dir, so this is a spill THRESHOLD,
+/// not a hard requirement: exceeding it degrades to bounded disk spill.
+/// Staging is R2-latency-dominated, so more spilling-capable parallel sorts
+/// beat fewer comfortable ones. 4 GiB doubles k; the memory brake (85% of
+/// cgroup) backstops the total.
+const PER_SORT_BUDGET_BYTES: usize = 4 * GIB;
 /// Heavy maintenance keeps at least this share of the maintenance pool.
 const HEAVY_MIN_SHARE: f64 = 0.25;
 /// Floor so a tiny box never zeroes the maintenance pool.
@@ -1800,7 +1805,8 @@ mod tests {
     }
 
     // Prod-shaped box (120 GiB / 48 cores, 11 hot projects): pools sum within
-    // the limit, K lands in the documented 4..=6 range, heavy keeps >= 1/4.
+    // the limit, K lands in the 8..=11 range (4 GiB per-sort spill threshold,
+    // 2026-07-30 — was 4..=6 at 8 GiB), heavy keeps >= 1/4.
     #[test]
     fn derived_budget_prod_box_120gib_48cores() {
         let b = DerivedBudget::from_limits(120 * GIB, 48);
@@ -1808,7 +1814,7 @@ mod tests {
         assert!(sum <= b.memory_limit_bytes(), "pools ({sum}) must not exceed the limit ({})", b.memory_limit_bytes());
         assert!(b.heavy_share_bytes() as f64 >= b.maintenance_pool_bytes() as f64 * 0.25 - 1.0);
         let k = b.light_optimize_k(11);
-        assert!((4..=6).contains(&k), "K={k} outside the documented 4..=6 range");
+        assert!((8..=11).contains(&k), "K={k} outside the documented 8..=11 range");
         assert_eq!(b.rewrite_permits(), 2);
         assert_eq!(b.optimize_merge_tasks(), 2);
     }

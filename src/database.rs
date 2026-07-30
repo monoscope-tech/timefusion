@@ -1714,12 +1714,34 @@ pub struct Database {
     /// on every 5-minute sweep tick forever — the 2026-07-04 crash-loop's
     /// pacing. Cleared on success; in-memory only (a restart retries once).
     dedup_backoff: Arc<dashmap::DashMap<String, (u32, std::time::Instant)>>,
-    /// Caps concurrent heavy maintenance rewrites (dedup / optimize /
-    /// recompress) that materialize Arrow. Their footprint is invisible to the
+    /// Caps concurrent HEAVY maintenance rewrites — and ONLY those: dedup
+    /// dirty-bin staging (`stage_dedup_chunk`), full optimize (Z-order /
+    /// consolidate), nightly light-consolidate (`optimize_table_light_inner`)
+    /// and `recompress_partition`. Their Arrow footprint is invisible to the
     /// DataFusion memory pool (a `SELECT * … collect()` doesn't reserve through
     /// it), so aggregate concurrency — not the pool — is the real bound against
     /// the cgroup OOM (prod 2026-07-04). Permits = `derived.rewrite_permits()`.
+    ///
+    /// The hot-tail WAVE engine deliberately does NOT share this semaphore —
+    /// see [`Self::light_rewrite_sem`].
     maintenance_rewrite_sem: Arc<tokio::sync::Semaphore>,
+    /// Caps concurrent hot-tail WAVE staging (`stage_hot_bin`) — and nothing
+    /// else. SEPARATE from `maintenance_rewrite_sem` on purpose: prod
+    /// 2026-07-30, one dedup dirty-bin drain held the shared rewrite permits
+    /// for 25+ minutes and starved hot compaction (62 bins selected, 1 wave
+    /// committed in 35 min; 5-min ticks overrunning 2-3x). The two engines are
+    /// individually bounded and target disjoint partitions (dedup skips today,
+    /// hot compaction only selects today), so serializing them against each
+    /// other is pure loss.
+    ///
+    /// Sized to the light pool's OWN slice (`derived.max_light_optimize_k()`,
+    /// the same K `light_optimize_pool_bytes` was budgeted for) rather than the
+    /// heavy permit count: heavy permits (2) are far below K, so borrowing them
+    /// here would cap waves at 2 and re-create the starvation this split fixes.
+    /// Its purpose is a single instrumented choke point (permit-wait ms in
+    /// `wave_bin_staged`) plus a hard ceiling should a future caller drive
+    /// staging outside `round_robin_bins`' K.
+    light_rewrite_sem: Arc<tokio::sync::Semaphore>,
     /// Caps concurrent user DML MERGE-UPDATEs (hash enrichment). Each scans the
     /// time-windowed target to hash-join keys; ungated bursts starve reads on a
     /// CPU-throttled box (prod 2026-07-19). Permits = `timefusion_dml_merge_concurrency`.
@@ -2083,6 +2105,7 @@ impl Database {
 
         // Captured before `cfg` is moved into the struct literal below.
         let maint_rewrite_permits = cfg.derived.rewrite_permits().max(1);
+        let light_rewrite_permits = cfg.derived.max_light_optimize_k().max(1);
         let dml_merge_permits = cfg.maintenance.timefusion_dml_merge_concurrency.max(1);
         let heavy_scan_permits = cfg.memory.timefusion_max_concurrent_scan_readers.max(1);
         let maintenance_shutdown = CancellationToken::new();
@@ -2118,6 +2141,7 @@ impl Database {
             dedup_dirty_bins,
             dedup_backoff: Arc::new(dashmap::DashMap::new()),
             maintenance_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(maint_rewrite_permits)),
+            light_rewrite_sem: Arc::new(tokio::sync::Semaphore::new(light_rewrite_permits)),
             dml_merge_sem: Arc::new(tokio::sync::Semaphore::new(dml_merge_permits)),
             heavy_scan_sem: Arc::new(tokio::sync::Semaphore::new(heavy_scan_permits)),
             maintenance_job_sem: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -2371,7 +2395,9 @@ impl Database {
         // got compacted ~every 40 min because dedup churning an old-date backlog
         // wedged the shared serial pass >600s. Compaction touches only today; dedup
         // skips today — disjoint partitions, so decoupling is safe. Peak heap stays
-        // bounded by maintenance_rewrite_sem, acquired per rewrite.
+        // bounded by the wave engine's OWN light_rewrite_sem (+ the light pool
+        // slice it is sized from), never the heavy maintenance_rewrite_sem:
+        // sharing that one re-couples the two engines (prod 2026-07-30).
         spawn_cron_job("Hot compact", &self.config.maintenance.timefusion_light_optimize_schedule, cancel.clone(), {
             let db = db.clone();
             move || {
@@ -6717,14 +6743,20 @@ impl Database {
             debug!(table_name, project_id, mapped = targets.len(), selected = files.len(), event = "light_optimize_bin_vanished");
             return Ok(BinOutcome::Retry);
         }
-        // NO maintenance_rewrite_sem here, deliberately: that semaphore (2
-        // permits, shared with dedup/recompress) exists because heavy rewrites'
-        // Arrow is pool-invisible. Wave staging is different: its concurrency
-        // is already bounded by K, its sorts run in the light pool sized for
-        // exactly K concurrent sorts, and its writer buffers are budgeted by
-        // writer_reserve in the derived tree. Taking the shared permit would
-        // cap waves at 2 (or 0 while dedup holds both) and burn the tick
-        // deadline waiting — starving the parallelism the pool paid for.
+        // The wave engine's OWN permit — NEVER maintenance_rewrite_sem. That
+        // semaphore (2 permits, dedup/optimize/recompress) exists because heavy
+        // rewrites' Arrow is pool-invisible; taking it here would cap waves at 2
+        // (or 0 while a dedup drain holds both — prod 2026-07-30: 25+ min of
+        // hot-compact starvation) and burn the tick deadline waiting. Wave
+        // staging is already bounded by K and sized by the light pool slice, so
+        // this permit is a ceiling + the instrumented wait point below.
+        let permit_wait = std::time::Instant::now();
+        let _light_permit = self.light_rewrite_sem.acquire().await.map_err(|e| anyhow::anyhow!("light rewrite semaphore closed: {e}"))?;
+        let permit_wait_ms = permit_wait.elapsed().as_millis() as u64;
+        let stage_started = std::time::Instant::now();
+        // Bytes read into this rewrite — free here (the Adds are already mapped)
+        // and the divisor that turns staging duration into observed R2 throughput.
+        let bytes_in: i64 = targets.iter().map(|a| a.size).sum();
         let stage_store = staging_table.log_store().object_store(None);
         let mut adds: Vec<Action> = Vec::new();
         let staged: Result<()> = async {
@@ -6794,6 +6826,18 @@ impl Database {
         // fork's snapshot-isolation downgrade applies and concurrent ingest
         // appends can't veto the wave (see `staged_actions`; aa50480).
         let (removes, adds) = staged_actions(&targets, adds, false);
+        // Splits a slow tick into its two causes: permit contention vs the
+        // object-store rewrite itself (bytes_in / staging_ms = observed R2
+        // throughput). One line per staged bin — waves are ~K per round.
+        info!(
+            table_name,
+            project_id,
+            selected_files = targets.len(),
+            bytes_in,
+            staging_ms = stage_started.elapsed().as_millis() as u64,
+            permit_wait_ms,
+            event = "wave_bin_staged"
+        );
         Ok(BinOutcome::Staged(StagedBin { project_id: project_id.to_string(), wave_id, target_paths: files, removes, adds, stage_store, dedup: None }))
     }
 
@@ -11336,6 +11380,24 @@ mod tests {
         let ctx1 = Arc::new(db.clone()).create_session_context();
         let ctx2 = Arc::new(db.clone()).create_session_context();
         assert!(Arc::ptr_eq(&ctx1.runtime_env(), &ctx2.runtime_env()), "contexts must share one RuntimeEnv/memory pool");
+        Ok(())
+    }
+
+    /// prod 2026-07-30: a dedup dirty-bin drain held every heavy rewrite permit
+    /// for 25+ min and starved hot compaction (62 bins selected, 1 wave in 35
+    /// min). The wave engine must hold its OWN permits, so exhausting the heavy
+    /// semaphore leaves wave staging fully able to proceed.
+    #[tokio::test]
+    async fn wave_staging_permits_are_independent_of_heavy_rewrite_permits() -> Result<()> {
+        let db = Database::with_config(create_test_config("rewrite-sem-split")).await?;
+        assert!(!Arc::ptr_eq(&db.maintenance_rewrite_sem, &db.light_rewrite_sem), "wave staging must not share the heavy rewrite semaphore");
+        assert_eq!(db.light_rewrite_sem.available_permits(), db.config.derived.max_light_optimize_k().max(1));
+        // Dedup/optimize/recompress take every heavy permit…
+        let heavy = db.maintenance_rewrite_sem.clone().acquire_many_owned(db.maintenance_rewrite_sem.available_permits() as u32).await?;
+        assert_eq!(db.maintenance_rewrite_sem.available_permits(), 0);
+        // …and a wave still stages immediately.
+        assert!(db.light_rewrite_sem.try_acquire().is_ok(), "hot-compact waves must not wait on a dedup drain");
+        drop(heavy);
         Ok(())
     }
 
