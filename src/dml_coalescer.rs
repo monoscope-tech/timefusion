@@ -484,24 +484,43 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
         // Predicate: same shape the group was parked with. Bare column names —
         // requalification in the merge routes them (project_id binds to the
         // source side, which the join equates with the target's anyway).
+        //
+        // WINDOW SLICING: the merge hash-join builds against every target row
+        // in the predicate window — independent of source chunking — and a
+        // burst group's full window exhausted a 24 GB pool (2026-07-30,
+        // HashJoinInput 3.7 GB × several partitions). Each target row lies in
+        // exactly one time slice, so merging the SAME source against each
+        // slice is semantically identical with join memory ÷ slices.
         let tz: Arc<str> = Arc::from("UTC");
         let (ts_upper, upper_incl) = meta.ts_upper;
-        let mut conj = vec![
-            col("context___span_id").is_not_null(),
-            col("context___trace_id").is_not_null(),
-            col("date").gt_eq(lit(ScalarValue::Date32(Some(meta.date_bounds.0)))),
-            col("date").lt_eq(lit(ScalarValue::Date32(Some(meta.date_bounds.1)))),
-            col("timestamp").gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(meta.ts_lower), Some(tz.clone())))),
-            if upper_incl {
-                col("timestamp").lt_eq(lit(ScalarValue::TimestampMicrosecond(Some(ts_upper), Some(tz.clone()))))
-            } else {
-                col("timestamp").lt(lit(ScalarValue::TimestampMicrosecond(Some(ts_upper), Some(tz))))
-            },
-        ];
-        if meta.projects.len() > 1 {
-            conj.push(in_list(col("project_id"), meta.projects.iter().map(lit).collect(), false));
-        }
-        let predicate = conj.into_iter().reduce(Expr::and);
+        let slices = (meta.rows / 150_000).clamp(1, 32) as i64;
+        let span = (ts_upper - meta.ts_lower).max(slices);
+        let base_conj = |lo: i64, hi: i64, hi_incl: bool| {
+            let mut conj = vec![
+                col("context___span_id").is_not_null(),
+                col("context___trace_id").is_not_null(),
+                col("date").gt_eq(lit(ScalarValue::Date32(Some(meta.date_bounds.0)))),
+                col("date").lt_eq(lit(ScalarValue::Date32(Some(meta.date_bounds.1)))),
+                col("timestamp").gt_eq(lit(ScalarValue::TimestampMicrosecond(Some(lo), Some(tz.clone())))),
+                if hi_incl {
+                    col("timestamp").lt_eq(lit(ScalarValue::TimestampMicrosecond(Some(hi), Some(tz.clone()))))
+                } else {
+                    col("timestamp").lt(lit(ScalarValue::TimestampMicrosecond(Some(hi), Some(tz.clone()))))
+                },
+            ];
+            if meta.projects.len() > 1 {
+                conj.push(in_list(col("project_id"), meta.projects.iter().map(lit).collect(), false));
+            }
+            conj.into_iter().reduce(Expr::and)
+        };
+        let slice_bounds: Vec<(i64, i64, bool)> = (0..slices)
+            .map(|i| {
+                let lo = meta.ts_lower + span * i / slices;
+                let hi = if i + 1 == slices { ts_upper } else { meta.ts_lower + span * (i + 1) / slices };
+                // interior slice upper bounds are exclusive; the last keeps the meta's inclusivity
+                (lo, hi, if i + 1 == slices { upper_incl } else { false })
+            })
+            .collect();
         // Rebuilt equivalents of the two parked shapes (no empty-list literal
         // needed): scalar `tag` → append-or-singleton; list `new_hashes` →
         // take-or-concat.
@@ -536,17 +555,32 @@ pub async fn redrive_dml_quarantine(db: &Arc<crate::database::Database>, dir: &s
             }
         };
         let mut failed = false;
-        for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
-            let source = UpdateSource { batch: round, schema: merged.schema(), join_keys: meta.join_keys.clone() };
-            if let Err(e) =
-                merge_bisect(db, &meta.table_name, &meta.project_id, predicate.clone(), vec![("hashes".into(), assignment.clone())], source, session.clone())
-                    .await
-            {
-                error!(
-                    "dml redrive: merge failed for {path:?}: {e}; leaving parked (already-applied rounds are idempotent-safe: re-appended tags only on retried rows)"
-                );
-                failed = true;
-                break;
+        'slices: for (si, &(lo, hi, hi_incl)) in slice_bounds.iter().enumerate() {
+            let predicate = base_conj(lo, hi, hi_incl);
+            if slice_bounds.len() > 1 {
+                info!("dml redrive: {path:?} slice {}/{} [{lo}..{hi}]", si + 1, slice_bounds.len());
+            }
+            for round in rounds.iter().flat_map(|r| chunk_rows(r, MAX_MERGE_ROWS)) {
+                let source = UpdateSource { batch: round, schema: merged.schema(), join_keys: meta.join_keys.clone() };
+                if let Err(e) = merge_bisect(
+                    db,
+                    &meta.table_name,
+                    &meta.project_id,
+                    predicate.clone(),
+                    vec![("hashes".into(), assignment.clone())],
+                    source,
+                    session.clone(),
+                )
+                .await
+                {
+                    error!(
+                        "dml redrive: merge failed for {path:?} (slice {}/{}): {e}; leaving parked (applied slices re-append tags only on retried rows)",
+                        si + 1,
+                        slice_bounds.len()
+                    );
+                    failed = true;
+                    break 'slices;
+                }
             }
         }
         if failed {
