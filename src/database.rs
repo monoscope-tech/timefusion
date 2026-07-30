@@ -5663,6 +5663,13 @@ impl Database {
         Ok(dates.into_iter().collect())
     }
 
+    /// Projects present in `date`'s live file set, most-fragmented first.
+    /// Drives the CLI's per-project consolidate/dedup loops.
+    pub async fn partition_projects(&self, table_ref: &Arc<RwLock<DeltaTable>>, date: chrono::NaiveDate) -> Result<Vec<String>> {
+        let uris: Vec<String> = { table_ref.read().await.get_file_uris().map(|it| it.collect()).unwrap_or_default() };
+        Ok(Self::hot_project_ids(&uris, date))
+    }
+
     /// Rewrites a date partition at a higher ZSTD level using Z-order (or
     /// Compact if no z_order_columns). Skips partitions whose probe file
     /// already advertises a tier `>= target_level` via Parquet footer KV
@@ -5856,7 +5863,8 @@ impl Database {
         let dates: Vec<chrono::NaiveDate> = self.partition_dates(table_ref).await?.into_iter().filter(|d| Self::date_is_cold(today, *d, after_days)).collect();
         info!("consolidate: table={} sweeping {} sealed partition(s) older than {}d", table_name, dates.len(), after_days);
         for date in dates {
-            if let Err(e) = self.consolidate_date_binned(table_ref, table_name, date).await {
+            let target = self.optimize_target_for_date(date);
+            if let Err(e) = self.consolidate_date_binned(table_ref, table_name, date, target, None).await {
                 warn!("consolidate: skipping date={} after error: {}", date, e);
             }
         }
@@ -5874,8 +5882,12 @@ impl Database {
     /// one ≤target sort (the whole-day SortBy died of external-sort starvation,
     /// prod 2026-07-21). Converges: outputs ≥ 7/8·target (and lone tail runs)
     /// are excluded from re-selection by `light_optimize_tail`.
-    async fn consolidate_date_binned(&self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate) -> Result<()> {
-        let target_size = self.optimize_target_for_date(date);
+    /// `target_size`/`only_project` are caller-supplied so the off-box CLI can
+    /// consolidate a still-hot date to the cold (1GB) target for one tenant
+    /// without waiting for the partition to seal.
+    pub async fn consolidate_date_binned(
+        &self, table_ref: &Arc<RwLock<DeltaTable>>, table_name: &str, date: chrono::NaiveDate, target_size: i64, only_project: Option<&str>,
+    ) -> Result<()> {
         let schema = get_schema(table_name).unwrap_or_else(get_default_schema);
         let (optimize_type, declare_sorted) = choose_optimize_type(schema, false, self.config.maintenance.timefusion_optimize_sort_by);
         let writer_properties = self.create_writer_properties(schema, self.config.parquet.timefusion_zstd_level_warm, declare_sorted);
@@ -5885,7 +5897,7 @@ impl Database {
         // that keeps losing OCC to a dedup); a normal day converges in
         // partition_bytes/target passes.
         const MAX_PASSES: usize = 128;
-        for project_id in Self::hot_project_ids(&uris, date) {
+        for project_id in Self::hot_project_ids(&uris, date).into_iter().filter(|p| only_project.is_none_or(|only| only == p)) {
             let partition_filters =
                 vec![PartitionFilter::try_from(("project_id", "=", project_id.as_str()))?, PartitionFilter::try_from(("date", "=", date_str.as_str()))?];
             for _ in 0..MAX_PASSES {
@@ -6936,7 +6948,7 @@ impl Database {
         // wrote. Bins are ordered by compaction debt.
         let mut planned = {
             let table = table_ref.read().await;
-            Self::select_all_hot_bins(&table, &today_str, target_size, min_files, target_size / 4)?
+            Self::select_all_hot_bins(&table, &today_str, target_size, min_files, target_size / 2)?
         };
         // Rotation cursor: start where the last truncated tick stopped so the
         // same tail is never skipped twice in a row (a truncated tick otherwise
@@ -7008,7 +7020,7 @@ impl Database {
                     if round + 1 < MAX_WAVES && std::time::Instant::now() < deadline {
                         let next = {
                             let table = table_ref.read().await;
-                            Self::select_all_hot_bins(&table, today_str, target_size, min_files, target_size / 4).unwrap_or_default()
+                            Self::select_all_hot_bins(&table, today_str, target_size, min_files, target_size / 2).unwrap_or_default()
                         };
                         *plan.lock().await = next.into_iter().collect();
                     }
@@ -8876,10 +8888,13 @@ impl TailAdd {
 ///
 /// `sorted_run_cap` bounds which already-tagged sorted runs are re-admitted: the
 /// cold tier passes `i64::MAX` (its leveled re-merge folds any sub-target run),
-/// the hot tier passes `target/4` so each tick's small output run keeps folding
-/// into the next pack until it reaches ~1/4 target — otherwise a busy project
-/// accrues one 5-min run per tick (~100+ files/day again). Growing a run 4×
-/// before exclusion bounds rewrite amplification at ~3× per byte. Files at
+/// the hot tier passes `target/2` so each tick's small output run keeps folding
+/// into the next pack until it reaches ~1/2 target — otherwise a busy project
+/// accrues one 5-min run per tick (~100+ files/day again). Was `target/4`:
+/// on the busiest tenant that stranded a 64–128MB band today's queries had to
+/// open by the hundreds (2026-07-30, 696 live files p50 22MB); folding one
+/// level further costs ~1 extra rewrite per byte and halves steady-state file
+/// count. Files at
 /// ≥ 7/8·target are always excluded — they're converged, and re-selecting one
 /// alone would rewrite it 1→1 forever.
 ///

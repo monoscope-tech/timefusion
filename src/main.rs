@@ -506,6 +506,9 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     let mut all = false;
     let mut dry_run = false;
     let mut project: Option<String> = None;
+    let mut consolidate = false;
+    let mut dedup = false;
+    let mut target_size_mb: Option<i64> = None;
     let mut it = std::env::args().skip(2);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -517,10 +520,18 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
             "--all" => all = true,
             "--dry-run" => dry_run = true,
             "--project" => project = Some(it.next().context("--project needs a value")?),
+            "--consolidate" => consolidate = true,
+            "--dedup" => dedup = true,
+            "--target-size-mb" => {
+                target_size_mb = Some(it.next().context("--target-size-mb needs a value")?.parse().context("--target-size-mb must be an integer")?)
+            }
             other => anyhow::bail!(
-                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--dry-run])"
+                "unknown argument: {other} (usage: timefusion optimize [--table T] [--date YYYY-MM-DD | --older-than-hours N | --all] [--project ID] [--consolidate [--target-size-mb N]] [--dedup] [--dry-run])"
             ),
         }
+    }
+    if target_size_mb.is_some() && !consolidate {
+        anyhow::bail!("--target-size-mb only applies to --consolidate");
     }
 
     let db = Database::with_config(Arc::new(cfg.clone())).await?;
@@ -557,6 +568,38 @@ async fn run_optimize_cli(cfg: &'static AppConfig) -> anyhow::Result<()> {
     }
 
     println!("compacting {} partition(s) of '{}' ({})", dates.len(), table, scope);
+    if consolidate || dedup {
+        // Leveled event-time-disjoint consolidation (the cold sweep's engine,
+        // pointed at any date/target) and/or a dedup pass, per project so a
+        // busy day's tens of GB never sit in one merge. Oldest event-time
+        // slices rewrite first; incremental per-run commits make an
+        // interrupted run resumable.
+        for d in &dates {
+            let projects = match project.clone() {
+                Some(p) => vec![p],
+                None => db.partition_projects(&table_ref, *d).await?,
+            };
+            if consolidate {
+                let target = target_size_mb.map_or(cfg.parquet.timefusion_cold_optimize_target_size, |mb| mb * 1024 * 1024);
+                for p in &projects {
+                    println!("  consolidate date={d} project={p} target={}MB", target / (1024 * 1024));
+                    if let Err(e) = db.consolidate_date_binned(&table_ref, &table, *d, target, Some(p)).await {
+                        eprintln!("  consolidate date={d} project={p}: FAILED: {e}");
+                    }
+                }
+            }
+            if dedup {
+                for p in &projects {
+                    match db.dedup_partition(&table_ref, &table, p, *d).await {
+                        Ok((dropped, complete)) => println!("  dedup date={d} project={p}: dropped={dropped} complete={complete}"),
+                        Err(e) => eprintln!("  dedup date={d} project={p}: FAILED: {e}"),
+                    }
+                }
+            }
+        }
+        db.shutdown().await?;
+        return Ok(());
+    }
     let (mut tot_r, mut tot_a) = (0u64, 0u64);
     for d in &dates {
         match db.compact_date(&table_ref, &table, *d, project.as_deref()).await {
